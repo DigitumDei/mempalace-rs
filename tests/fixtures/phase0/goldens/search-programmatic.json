@@ -1,0 +1,94 @@
+{
+  "room_filtered": {
+    "filters": {
+      "room": "auth-migration",
+      "wing": null
+    },
+    "query": "auth migration parity",
+    "results": [
+      {
+        "room": "auth-migration",
+        "similarity": 0.49,
+        "source_file": "team.txt",
+        "text": "The team decided the auth-migration must preserve CLI and MCP parity.",
+        "wing": "wing_team"
+      },
+      {
+        "room": "auth-migration",
+        "similarity": 0.069,
+        "source_file": "code.txt",
+        "text": "Code notes: auth-migration keeps search filter semantics exact while storage changes underneath.",
+        "wing": "wing_code"
+      }
+    ]
+  },
+  "unfiltered": {
+    "filters": {
+      "room": null,
+      "wing": null
+    },
+    "query": "auth migration parity",
+    "results": [
+      {
+        "room": "auth-migration",
+        "similarity": 0.49,
+        "source_file": "team.txt",
+        "text": "The team decided the auth-migration must preserve CLI and MCP parity.",
+        "wing": "wing_team"
+      },
+      {
+        "room": "auth-migration",
+        "similarity": 0.069,
+        "source_file": "code.txt",
+        "text": "Code notes: auth-migration keeps search filter semantics exact while storage changes underneath.",
+        "wing": "wing_code"
+      },
+      {
+        "room": "backend",
+        "similarity": -0.267,
+        "source_file": "auth.py",
+        "text": "def issue_session(user_id: str) -> str:\n    \"\"\"\n    We switched from opaque session blobs to signed session tokens because the\n    old format made auth debugging painful during the Rust migration work.\n    \"\"\"\n    if not user_id:\n        raise ValueError(\"user_id is required\")\n\n    token = f\"session:{user_id}:signed\"\n    return token\n\n\ndef refresh_token(token: str) -> str:\n    \"\"\"\n    The auth migration plan keeps refresh logic local-first and deterministic.\n    We chose signed tokens over a database-backed session lookup because the\n    CLI and MCP tools need predictable offline behavior.\n    \"\"\"\n    if not token.startswith(\"session:\"):\n        raise ValueError(\"invalid token format\")\n    return token + \":refreshed\"",
+        "wing": "project_alpha"
+      }
+    ]
+  },
+  "wing_and_room_filtered": {
+    "filters": {
+      "room": "auth-migration",
+      "wing": "wing_team"
+    },
+    "query": "auth migration parity",
+    "results": [
+      {
+        "room": "auth-migration",
+        "similarity": 0.49,
+        "source_file": "team.txt",
+        "text": "The team decided the auth-migration must preserve CLI and MCP parity.",
+        "wing": "wing_team"
+      }
+    ]
+  },
+  "wing_filtered": {
+    "filters": {
+      "room": null,
+      "wing": "wing_team"
+    },
+    "query": "auth migration parity",
+    "results": [
+      {
+        "room": "auth-migration",
+        "similarity": 0.49,
+        "source_file": "team.txt",
+        "text": "The team decided the auth-migration must preserve CLI and MCP parity.",
+        "wing": "wing_team"
+      },
+      {
+        "room": "phase0-rollout",
+        "similarity": -0.848,
+        "source_file": "rollout.txt",
+        "text": "Phase 0 rollout stays on the team wing so graph traversal captures connected_via semantics.",
+        "wing": "wing_team"
+      }
+    ]
+  }
+}

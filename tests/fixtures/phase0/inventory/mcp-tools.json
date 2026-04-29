@@ -1,0 +1,325 @@
+{
+  "mempalace_add_drawer": {
+    "description": "File verbatim content into the palace. Checks for duplicates first.",
+    "input_schema": {
+      "properties": {
+        "added_by": {
+          "description": "Who is filing this (default: mcp)",
+          "type": "string"
+        },
+        "content": {
+          "description": "Verbatim content to store \u2014 exact words, never summarized",
+          "type": "string"
+        },
+        "room": {
+          "description": "Room (aspect: backend, decisions, meetings...)",
+          "type": "string"
+        },
+        "source_file": {
+          "description": "Where this came from (optional)",
+          "type": "string"
+        },
+        "wing": {
+          "description": "Wing (project name)",
+          "type": "string"
+        }
+      },
+      "required": [
+        "wing",
+        "room",
+        "content"
+      ],
+      "type": "object"
+    }
+  },
+  "mempalace_check_duplicate": {
+    "description": "Check if content already exists in the palace before filing",
+    "input_schema": {
+      "properties": {
+        "content": {
+          "description": "Content to check",
+          "type": "string"
+        },
+        "threshold": {
+          "description": "Similarity threshold 0-1 (default 0.9)",
+          "type": "number"
+        }
+      },
+      "required": [
+        "content"
+      ],
+      "type": "object"
+    }
+  },
+  "mempalace_delete_drawer": {
+    "description": "Delete a drawer by ID. Irreversible.",
+    "input_schema": {
+      "properties": {
+        "drawer_id": {
+          "description": "ID of the drawer to delete",
+          "type": "string"
+        }
+      },
+      "required": [
+        "drawer_id"
+      ],
+      "type": "object"
+    }
+  },
+  "mempalace_diary_read": {
+    "description": "Read your recent diary entries (in AAAK). See what past versions of yourself recorded \u2014 your journal across sessions.",
+    "input_schema": {
+      "properties": {
+        "agent_name": {
+          "description": "Your name \u2014 each agent gets their own diary wing",
+          "type": "string"
+        },
+        "last_n": {
+          "description": "Number of recent entries to read (default: 10)",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "agent_name"
+      ],
+      "type": "object"
+    }
+  },
+  "mempalace_diary_write": {
+    "description": "Write to your personal agent diary in AAAK format. Your observations, thoughts, what you worked on, what matters. Each agent has their own diary with full history. Write in AAAK for compression \u2014 e.g. 'SESSION:2026-04-04|built.palace.graph+diary.tools|ALC.req:agent.diaries.in.aaak|\u2605\u2605\u2605'. Use entity codes from the AAAK spec.",
+    "input_schema": {
+      "properties": {
+        "agent_name": {
+          "description": "Your name \u2014 each agent gets their own diary wing",
+          "type": "string"
+        },
+        "entry": {
+          "description": "Your diary entry in AAAK format \u2014 compressed, entity-coded, emotion-marked",
+          "type": "string"
+        },
+        "topic": {
+          "description": "Topic tag (optional, default: general)",
+          "type": "string"
+        }
+      },
+      "required": [
+        "agent_name",
+        "entry"
+      ],
+      "type": "object"
+    }
+  },
+  "mempalace_find_tunnels": {
+    "description": "Find rooms that bridge two wings \u2014 the hallways connecting different domains. E.g. what topics connect wing_code to wing_team?",
+    "input_schema": {
+      "properties": {
+        "wing_a": {
+          "description": "First wing (optional)",
+          "type": "string"
+        },
+        "wing_b": {
+          "description": "Second wing (optional)",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    }
+  },
+  "mempalace_get_aaak_spec": {
+    "description": "Get the AAAK dialect specification \u2014 the compressed memory format MemPalace uses. Call this if you need to read or write AAAK-compressed memories.",
+    "input_schema": {
+      "properties": {},
+      "type": "object"
+    }
+  },
+  "mempalace_get_taxonomy": {
+    "description": "Full taxonomy: wing \u2192 room \u2192 drawer count",
+    "input_schema": {
+      "properties": {},
+      "type": "object"
+    }
+  },
+  "mempalace_graph_stats": {
+    "description": "Palace graph overview: total rooms, tunnel connections, edges between wings.",
+    "input_schema": {
+      "properties": {},
+      "type": "object"
+    }
+  },
+  "mempalace_kg_add": {
+    "description": "Add a fact to the knowledge graph. Subject \u2192 predicate \u2192 object with optional time window. E.g. ('Max', 'started_school', 'Year 7', valid_from='2026-09-01').",
+    "input_schema": {
+      "properties": {
+        "object": {
+          "description": "The entity being connected to",
+          "type": "string"
+        },
+        "predicate": {
+          "description": "The relationship type (e.g. 'loves', 'works_on', 'daughter_of')",
+          "type": "string"
+        },
+        "source_closet": {
+          "description": "Closet ID where this fact appears (optional)",
+          "type": "string"
+        },
+        "subject": {
+          "description": "The entity doing/being something",
+          "type": "string"
+        },
+        "valid_from": {
+          "description": "When this became true (YYYY-MM-DD, optional)",
+          "type": "string"
+        }
+      },
+      "required": [
+        "subject",
+        "predicate",
+        "object"
+      ],
+      "type": "object"
+    }
+  },
+  "mempalace_kg_invalidate": {
+    "description": "Mark a fact as no longer true. E.g. ankle injury resolved, job ended, moved house.",
+    "input_schema": {
+      "properties": {
+        "ended": {
+          "description": "When it stopped being true (YYYY-MM-DD, default: today)",
+          "type": "string"
+        },
+        "object": {
+          "description": "Connected entity",
+          "type": "string"
+        },
+        "predicate": {
+          "description": "Relationship",
+          "type": "string"
+        },
+        "subject": {
+          "description": "Entity",
+          "type": "string"
+        }
+      },
+      "required": [
+        "subject",
+        "predicate",
+        "object"
+      ],
+      "type": "object"
+    }
+  },
+  "mempalace_kg_query": {
+    "description": "Query the knowledge graph for an entity's relationships. Returns typed facts with temporal validity. E.g. 'Max' \u2192 child_of Alice, loves chess, does swimming. Filter by date with as_of to see what was true at a point in time.",
+    "input_schema": {
+      "properties": {
+        "as_of": {
+          "description": "Date filter \u2014 only facts valid at this date (YYYY-MM-DD, optional)",
+          "type": "string"
+        },
+        "direction": {
+          "description": "outgoing (entity\u2192?), incoming (?\u2192entity), or both (default: both)",
+          "type": "string"
+        },
+        "entity": {
+          "description": "Entity to query (e.g. 'Max', 'MyProject', 'Alice')",
+          "type": "string"
+        }
+      },
+      "required": [
+        "entity"
+      ],
+      "type": "object"
+    }
+  },
+  "mempalace_kg_stats": {
+    "description": "Knowledge graph overview: entities, triples, current vs expired facts, relationship types.",
+    "input_schema": {
+      "properties": {},
+      "type": "object"
+    }
+  },
+  "mempalace_kg_timeline": {
+    "description": "Chronological timeline of facts. Shows the story of an entity (or everything) in order.",
+    "input_schema": {
+      "properties": {
+        "entity": {
+          "description": "Entity to get timeline for (optional \u2014 omit for full timeline)",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    }
+  },
+  "mempalace_list_rooms": {
+    "description": "List rooms within a wing (or all rooms if no wing given)",
+    "input_schema": {
+      "properties": {
+        "wing": {
+          "description": "Wing to list rooms for (optional)",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    }
+  },
+  "mempalace_list_wings": {
+    "description": "List all wings with drawer counts",
+    "input_schema": {
+      "properties": {},
+      "type": "object"
+    }
+  },
+  "mempalace_search": {
+    "description": "Semantic search. Returns verbatim drawer content with similarity scores.",
+    "input_schema": {
+      "properties": {
+        "limit": {
+          "description": "Max results (default 5)",
+          "type": "integer"
+        },
+        "query": {
+          "description": "What to search for",
+          "type": "string"
+        },
+        "room": {
+          "description": "Filter by room (optional)",
+          "type": "string"
+        },
+        "wing": {
+          "description": "Filter by wing (optional)",
+          "type": "string"
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "type": "object"
+    }
+  },
+  "mempalace_status": {
+    "description": "Palace overview \u2014 total drawers, wing and room counts",
+    "input_schema": {
+      "properties": {},
+      "type": "object"
+    }
+  },
+  "mempalace_traverse": {
+    "description": "Walk the palace graph from a room. Shows connected ideas across wings \u2014 the tunnels. Like following a thread through the palace: start at 'chromadb-setup' in wing_code, discover it connects to wing_myproject (planning) and wing_user (feelings about it).",
+    "input_schema": {
+      "properties": {
+        "max_hops": {
+          "description": "How many connections to follow (default: 2)",
+          "type": "integer"
+        },
+        "start_room": {
+          "description": "Room to start from (e.g. 'chromadb-setup', 'riley-school')",
+          "type": "string"
+        }
+      },
+      "required": [
+        "start_room"
+      ],
+      "type": "object"
+    }
+  }
+}

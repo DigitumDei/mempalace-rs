@@ -1,0 +1,27 @@
+## L0 - IDENTITY
+I am the MemPalace phase 0 reference capture.
+Traits: deterministic, local-first, test-oriented.
+Mission: freeze the Python surface before Rust implementation.
+
+## L1 — ESSENTIAL STORY
+
+[auth-migration]
+  - The team decided the auth-migration must preserve CLI and MCP parity.  (team.txt)
+  - Code notes: auth-migration keeps search filter semantics exact while storage changes underneath.  (code.txt)
+
+[backend]
+  - def issue_session(user_id: str) -> str:     """     We switched from opaque session blobs to signed session tokens because the     old format made auth debugging painful during the Rust migration w...  (auth.py)
+
+[phase0-rollout]
+  - Phase 0 rollout stays on the team wing so graph traversal captures connected_via semantics.  (rollout.txt)
+
+[planning]
+  - # Rust migration notes  Phase 0 locks the Python reference behavior before any Rust rewrite starts.  We decided to harvest fixtures first because search formatting, wake-up text, and MCP payload sh...  (plan.md)
+
+[release-readiness]
+  - Release readiness depends on reproducible fixtures and drift checks before Phase 1 starts.  (user.txt)
+
+[technical]
+  - > Why are we doing Phase 0 before writing Rust code? Because the current Python behavior is the only working product contract and we need goldens before we replace the storage layer.  (product_strategy.txt)
+  - > What must stay the same? The CLI commands, MCP tool names, search filter semantics, wake-up structure, and the AAAK spec should keep the same public shape.  (product_strategy.txt)
+  - > What can change? The backend can move from ChromaDB to LanceDB and SQLite, but only if the user-facing behavior stays grounded in the same fixture corpus.  (product_strategy.txt)

@@ -1,0 +1,11 @@
+{
+  "rendered": "wing_code|planning|?|?\n0:RUS|cli_mcp_rust|\"We decided to preserve CLI parity and MCP tool names...\"|determ|DECISION",
+  "source": "We decided to preserve CLI parity and MCP tool names because fixture drift would make the Rust rewrite impossible to evaluate.",
+  "stats": {
+    "compressed_chars": 115,
+    "compressed_tokens": 38,
+    "original_chars": 126,
+    "original_tokens": 42,
+    "ratio": 1.105263157894737
+  }
+}

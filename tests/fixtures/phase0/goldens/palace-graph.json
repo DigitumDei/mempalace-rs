@@ -1,0 +1,68 @@
+{
+  "stats": {
+    "rooms_per_wing": {
+      "project_alpha": 2,
+      "strategy_convos": 1,
+      "wing_code": 1,
+      "wing_team": 2,
+      "wing_user": 1
+    },
+    "top_tunnels": [
+      {
+        "count": 2,
+        "room": "auth-migration",
+        "wings": [
+          "wing_code",
+          "wing_team"
+        ]
+      }
+    ],
+    "total_edges": 2,
+    "total_rooms": 6,
+    "tunnel_rooms": 1
+  },
+  "traverse": [
+    {
+      "count": 2,
+      "halls": [
+        "hall_discoveries",
+        "hall_facts"
+      ],
+      "hop": 0,
+      "room": "auth-migration",
+      "wings": [
+        "wing_code",
+        "wing_team"
+      ]
+    },
+    {
+      "connected_via": [
+        "wing_team"
+      ],
+      "count": 1,
+      "halls": [
+        "hall_events"
+      ],
+      "hop": 1,
+      "room": "phase0-rollout",
+      "wings": [
+        "wing_team"
+      ]
+    }
+  ],
+  "tunnels": [
+    {
+      "count": 2,
+      "halls": [
+        "hall_discoveries",
+        "hall_facts"
+      ],
+      "recent": "2026-04-02",
+      "room": "auth-migration",
+      "wings": [
+        "wing_code",
+        "wing_team"
+      ]
+    }
+  ]
+}

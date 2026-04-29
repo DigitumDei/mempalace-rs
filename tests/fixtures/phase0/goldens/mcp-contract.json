@@ -1,0 +1,419 @@
+{
+  "error": {
+    "error": {
+      "code": -32601,
+      "message": "Unknown tool: mempalace_nope"
+    },
+    "id": 5,
+    "jsonrpc": "2.0"
+  },
+  "initialize": {
+    "id": 1,
+    "jsonrpc": "2.0",
+    "result": {
+      "capabilities": {
+        "tools": {}
+      },
+      "protocolVersion": "2024-11-05",
+      "serverInfo": {
+        "name": "mempalace",
+        "version": "2.0.0"
+      }
+    }
+  },
+  "search": {
+    "id": 4,
+    "jsonrpc": "2.0",
+    "result": {
+      "content": [
+        {
+          "text": "{\n  \"filters\": {\n    \"room\": null,\n    \"wing\": null\n  },\n  \"query\": \"auth migration parity\",\n  \"results\": [\n    {\n      \"room\": \"auth-migration\",\n      \"source_file\": \"code.txt\",\n      \"text\": \"Code notes: auth-migration keeps search filter semantics exact while storage changes underneath.\",\n      \"wing\": \"wing_code\"\n    },\n    {\n      \"room\": \"auth-migration\",\n      \"source_file\": \"team.txt\",\n      \"text\": \"The team decided the auth-migration must preserve CLI and MCP parity.\",\n      \"wing\": \"wing_team\"\n    }\n  ]\n}",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  "status": {
+    "id": 3,
+    "jsonrpc": "2.0",
+    "result": {
+      "content": [
+        {
+          "text": "{\n  \"total_drawers\": 9,\n  \"wings\": {\n    \"project_alpha\": 2,\n    \"strategy_convos\": 3,\n    \"wing_team\": 2,\n    \"wing_code\": 1,\n    \"wing_user\": 1\n  },\n  \"rooms\": {\n    \"backend\": 1,\n    \"planning\": 1,\n    \"technical\": 3,\n    \"auth-migration\": 2,\n    \"release-readiness\": 1,\n    \"phase0-rollout\": 1\n  },\n  \"palace_path\": \"/tmp/mempalace-phase0-home/.mempalace/palace\",\n  \"protocol\": \"IMPORTANT \\u2014 MemPalace Memory Protocol:\\n1. ON WAKE-UP: Call mempalace_status to load palace overview + AAAK spec.\\n2. BEFORE RESPONDING about any person, project, or past event: call mempalace_kg_query or mempalace_search FIRST. Never guess \\u2014 verify.\\n3. IF UNSURE about a fact (name, gender, age, relationship): say \\\"let me check\\\" and query the palace. Wrong is worse than slow.\\n4. AFTER EACH SESSION: call mempalace_diary_write to record what happened, what you learned, what matters.\\n5. WHEN FACTS CHANGE: call mempalace_kg_invalidate on the old fact, mempalace_kg_add for the new one.\\n\\nThis protocol ensures the AI KNOWS before it speaks. Storage is not memory \\u2014 but storage + this protocol = memory.\",\n  \"aaak_dialect\": \"AAAK is a compressed memory dialect that MemPalace uses for efficient storage.\\nIt is designed to be readable by both humans and LLMs without decoding.\\n\\nFORMAT:\\n  ENTITIES: 3-letter uppercase codes. ALC=Alice, JOR=Jordan, RIL=Riley, MAX=Max, BEN=Ben.\\n  EMOTIONS: *action markers* before/during text. *warm*=joy, *fierce*=determined, *raw*=vulnerable, *bloom*=tenderness.\\n  STRUCTURE: Pipe-separated fields. FAM: family | PROJ: projects | \\u26a0: warnings/reminders.\\n  DATES: ISO format (2026-03-31). COUNTS: Nx = N mentions (e.g., 570x).\\n  IMPORTANCE: \\u2605 to \\u2605\\u2605\\u2605\\u2605\\u2605 (1-5 scale).\\n  HALLS: hall_facts, hall_events, hall_discoveries, hall_preferences, hall_advice.\\n  WINGS: wing_user, wing_agent, wing_team, wing_code, wing_myproject, wing_hardware, wing_ue5, wing_ai_research.\\n  ROOMS: Hyphenated slugs representing named ideas (e.g., chromadb-setup, gpu-pricing).\\n\\nEXAMPLE:\\n  FAM: ALC\\u2192\\u2661JOR | 2D(kids): RIL(18,sports) MAX(11,chess+swimming) | BEN(contributor)\\n\\nRead AAAK naturally \\u2014 expand codes mentally, treat *markers* as emotional context.\\nWhen WRITING AAAK: use entity codes, mark emotions, keep structure tight.\"\n}",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  "status_payload": {
+    "aaak_dialect": "AAAK is a compressed memory dialect that MemPalace uses for efficient storage.\nIt is designed to be readable by both humans and LLMs without decoding.\n\nFORMAT:\n  ENTITIES: 3-letter uppercase codes. ALC=Alice, JOR=Jordan, RIL=Riley, MAX=Max, BEN=Ben.\n  EMOTIONS: *action markers* before/during text. *warm*=joy, *fierce*=determined, *raw*=vulnerable, *bloom*=tenderness.\n  STRUCTURE: Pipe-separated fields. FAM: family | PROJ: projects | \u26a0: warnings/reminders.\n  DATES: ISO format (2026-03-31). COUNTS: Nx = N mentions (e.g., 570x).\n  IMPORTANCE: \u2605 to \u2605\u2605\u2605\u2605\u2605 (1-5 scale).\n  HALLS: hall_facts, hall_events, hall_discoveries, hall_preferences, hall_advice.\n  WINGS: wing_user, wing_agent, wing_team, wing_code, wing_myproject, wing_hardware, wing_ue5, wing_ai_research.\n  ROOMS: Hyphenated slugs representing named ideas (e.g., chromadb-setup, gpu-pricing).\n\nEXAMPLE:\n  FAM: ALC\u2192\u2661JOR | 2D(kids): RIL(18,sports) MAX(11,chess+swimming) | BEN(contributor)\n\nRead AAAK naturally \u2014 expand codes mentally, treat *markers* as emotional context.\nWhen WRITING AAAK: use entity codes, mark emotions, keep structure tight.",
+    "palace_path": "/tmp/mempalace-phase0-home/.mempalace/palace",
+    "protocol": "IMPORTANT \u2014 MemPalace Memory Protocol:\n1. ON WAKE-UP: Call mempalace_status to load palace overview + AAAK spec.\n2. BEFORE RESPONDING about any person, project, or past event: call mempalace_kg_query or mempalace_search FIRST. Never guess \u2014 verify.\n3. IF UNSURE about a fact (name, gender, age, relationship): say \"let me check\" and query the palace. Wrong is worse than slow.\n4. AFTER EACH SESSION: call mempalace_diary_write to record what happened, what you learned, what matters.\n5. WHEN FACTS CHANGE: call mempalace_kg_invalidate on the old fact, mempalace_kg_add for the new one.\n\nThis protocol ensures the AI KNOWS before it speaks. Storage is not memory \u2014 but storage + this protocol = memory.",
+    "rooms": {
+      "auth-migration": 2,
+      "backend": 1,
+      "phase0-rollout": 1,
+      "planning": 1,
+      "release-readiness": 1,
+      "technical": 3
+    },
+    "total_drawers": 9,
+    "wings": {
+      "project_alpha": 2,
+      "strategy_convos": 3,
+      "wing_code": 1,
+      "wing_team": 2,
+      "wing_user": 1
+    }
+  },
+  "tools_list": {
+    "id": 2,
+    "jsonrpc": "2.0",
+    "result": {
+      "tools": [
+        {
+          "description": "Palace overview \u2014 total drawers, wing and room counts",
+          "inputSchema": {
+            "properties": {},
+            "type": "object"
+          },
+          "name": "mempalace_status"
+        },
+        {
+          "description": "List all wings with drawer counts",
+          "inputSchema": {
+            "properties": {},
+            "type": "object"
+          },
+          "name": "mempalace_list_wings"
+        },
+        {
+          "description": "List rooms within a wing (or all rooms if no wing given)",
+          "inputSchema": {
+            "properties": {
+              "wing": {
+                "description": "Wing to list rooms for (optional)",
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "name": "mempalace_list_rooms"
+        },
+        {
+          "description": "Full taxonomy: wing \u2192 room \u2192 drawer count",
+          "inputSchema": {
+            "properties": {},
+            "type": "object"
+          },
+          "name": "mempalace_get_taxonomy"
+        },
+        {
+          "description": "Get the AAAK dialect specification \u2014 the compressed memory format MemPalace uses. Call this if you need to read or write AAAK-compressed memories.",
+          "inputSchema": {
+            "properties": {},
+            "type": "object"
+          },
+          "name": "mempalace_get_aaak_spec"
+        },
+        {
+          "description": "Query the knowledge graph for an entity's relationships. Returns typed facts with temporal validity. E.g. 'Max' \u2192 child_of Alice, loves chess, does swimming. Filter by date with as_of to see what was true at a point in time.",
+          "inputSchema": {
+            "properties": {
+              "as_of": {
+                "description": "Date filter \u2014 only facts valid at this date (YYYY-MM-DD, optional)",
+                "type": "string"
+              },
+              "direction": {
+                "description": "outgoing (entity\u2192?), incoming (?\u2192entity), or both (default: both)",
+                "type": "string"
+              },
+              "entity": {
+                "description": "Entity to query (e.g. 'Max', 'MyProject', 'Alice')",
+                "type": "string"
+              }
+            },
+            "required": [
+              "entity"
+            ],
+            "type": "object"
+          },
+          "name": "mempalace_kg_query"
+        },
+        {
+          "description": "Add a fact to the knowledge graph. Subject \u2192 predicate \u2192 object with optional time window. E.g. ('Max', 'started_school', 'Year 7', valid_from='2026-09-01').",
+          "inputSchema": {
+            "properties": {
+              "object": {
+                "description": "The entity being connected to",
+                "type": "string"
+              },
+              "predicate": {
+                "description": "The relationship type (e.g. 'loves', 'works_on', 'daughter_of')",
+                "type": "string"
+              },
+              "source_closet": {
+                "description": "Closet ID where this fact appears (optional)",
+                "type": "string"
+              },
+              "subject": {
+                "description": "The entity doing/being something",
+                "type": "string"
+              },
+              "valid_from": {
+                "description": "When this became true (YYYY-MM-DD, optional)",
+                "type": "string"
+              }
+            },
+            "required": [
+              "subject",
+              "predicate",
+              "object"
+            ],
+            "type": "object"
+          },
+          "name": "mempalace_kg_add"
+        },
+        {
+          "description": "Mark a fact as no longer true. E.g. ankle injury resolved, job ended, moved house.",
+          "inputSchema": {
+            "properties": {
+              "ended": {
+                "description": "When it stopped being true (YYYY-MM-DD, default: today)",
+                "type": "string"
+              },
+              "object": {
+                "description": "Connected entity",
+                "type": "string"
+              },
+              "predicate": {
+                "description": "Relationship",
+                "type": "string"
+              },
+              "subject": {
+                "description": "Entity",
+                "type": "string"
+              }
+            },
+            "required": [
+              "subject",
+              "predicate",
+              "object"
+            ],
+            "type": "object"
+          },
+          "name": "mempalace_kg_invalidate"
+        },
+        {
+          "description": "Chronological timeline of facts. Shows the story of an entity (or everything) in order.",
+          "inputSchema": {
+            "properties": {
+              "entity": {
+                "description": "Entity to get timeline for (optional \u2014 omit for full timeline)",
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "name": "mempalace_kg_timeline"
+        },
+        {
+          "description": "Knowledge graph overview: entities, triples, current vs expired facts, relationship types.",
+          "inputSchema": {
+            "properties": {},
+            "type": "object"
+          },
+          "name": "mempalace_kg_stats"
+        },
+        {
+          "description": "Walk the palace graph from a room. Shows connected ideas across wings \u2014 the tunnels. Like following a thread through the palace: start at 'chromadb-setup' in wing_code, discover it connects to wing_myproject (planning) and wing_user (feelings about it).",
+          "inputSchema": {
+            "properties": {
+              "max_hops": {
+                "description": "How many connections to follow (default: 2)",
+                "type": "integer"
+              },
+              "start_room": {
+                "description": "Room to start from (e.g. 'chromadb-setup', 'riley-school')",
+                "type": "string"
+              }
+            },
+            "required": [
+              "start_room"
+            ],
+            "type": "object"
+          },
+          "name": "mempalace_traverse"
+        },
+        {
+          "description": "Find rooms that bridge two wings \u2014 the hallways connecting different domains. E.g. what topics connect wing_code to wing_team?",
+          "inputSchema": {
+            "properties": {
+              "wing_a": {
+                "description": "First wing (optional)",
+                "type": "string"
+              },
+              "wing_b": {
+                "description": "Second wing (optional)",
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "name": "mempalace_find_tunnels"
+        },
+        {
+          "description": "Palace graph overview: total rooms, tunnel connections, edges between wings.",
+          "inputSchema": {
+            "properties": {},
+            "type": "object"
+          },
+          "name": "mempalace_graph_stats"
+        },
+        {
+          "description": "Semantic search. Returns verbatim drawer content with similarity scores.",
+          "inputSchema": {
+            "properties": {
+              "limit": {
+                "description": "Max results (default 5)",
+                "type": "integer"
+              },
+              "query": {
+                "description": "What to search for",
+                "type": "string"
+              },
+              "room": {
+                "description": "Filter by room (optional)",
+                "type": "string"
+              },
+              "wing": {
+                "description": "Filter by wing (optional)",
+                "type": "string"
+              }
+            },
+            "required": [
+              "query"
+            ],
+            "type": "object"
+          },
+          "name": "mempalace_search"
+        },
+        {
+          "description": "Check if content already exists in the palace before filing",
+          "inputSchema": {
+            "properties": {
+              "content": {
+                "description": "Content to check",
+                "type": "string"
+              },
+              "threshold": {
+                "description": "Similarity threshold 0-1 (default 0.9)",
+                "type": "number"
+              }
+            },
+            "required": [
+              "content"
+            ],
+            "type": "object"
+          },
+          "name": "mempalace_check_duplicate"
+        },
+        {
+          "description": "File verbatim content into the palace. Checks for duplicates first.",
+          "inputSchema": {
+            "properties": {
+              "added_by": {
+                "description": "Who is filing this (default: mcp)",
+                "type": "string"
+              },
+              "content": {
+                "description": "Verbatim content to store \u2014 exact words, never summarized",
+                "type": "string"
+              },
+              "room": {
+                "description": "Room (aspect: backend, decisions, meetings...)",
+                "type": "string"
+              },
+              "source_file": {
+                "description": "Where this came from (optional)",
+                "type": "string"
+              },
+              "wing": {
+                "description": "Wing (project name)",
+                "type": "string"
+              }
+            },
+            "required": [
+              "wing",
+              "room",
+              "content"
+            ],
+            "type": "object"
+          },
+          "name": "mempalace_add_drawer"
+        },
+        {
+          "description": "Delete a drawer by ID. Irreversible.",
+          "inputSchema": {
+            "properties": {
+              "drawer_id": {
+                "description": "ID of the drawer to delete",
+                "type": "string"
+              }
+            },
+            "required": [
+              "drawer_id"
+            ],
+            "type": "object"
+          },
+          "name": "mempalace_delete_drawer"
+        },
+        {
+          "description": "Write to your personal agent diary in AAAK format. Your observations, thoughts, what you worked on, what matters. Each agent has their own diary with full history. Write in AAAK for compression \u2014 e.g. 'SESSION:2026-04-04|built.palace.graph+diary.tools|ALC.req:agent.diaries.in.aaak|\u2605\u2605\u2605'. Use entity codes from the AAAK spec.",
+          "inputSchema": {
+            "properties": {
+              "agent_name": {
+                "description": "Your name \u2014 each agent gets their own diary wing",
+                "type": "string"
+              },
+              "entry": {
+                "description": "Your diary entry in AAAK format \u2014 compressed, entity-coded, emotion-marked",
+                "type": "string"
+              },
+              "topic": {
+                "description": "Topic tag (optional, default: general)",
+                "type": "string"
+              }
+            },
+            "required": [
+              "agent_name",
+              "entry"
+            ],
+            "type": "object"
+          },
+          "name": "mempalace_diary_write"
+        },
+        {
+          "description": "Read your recent diary entries (in AAAK). See what past versions of yourself recorded \u2014 your journal across sessions.",
+          "inputSchema": {
+            "properties": {
+              "agent_name": {
+                "description": "Your name \u2014 each agent gets their own diary wing",
+                "type": "string"
+              },
+              "last_n": {
+                "description": "Number of recent entries to read (default: 10)",
+                "type": "integer"
+              }
+            },
+            "required": [
+              "agent_name"
+            ],
+            "type": "object"
+          },
+          "name": "mempalace_diary_read"
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,9 @@
+## L0 - IDENTITY
+I am the MemPalace phase 0 reference capture.
+Traits: deterministic, local-first, test-oriented.
+Mission: freeze the Python surface before Rust implementation.
+
+## L1 — ESSENTIAL STORY
+
+[auth-migration]
+  - Code notes: auth-migration keeps search filter semantics exact while storage changes underneath.  (code.txt)

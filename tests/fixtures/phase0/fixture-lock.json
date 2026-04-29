@@ -1,0 +1,27 @@
+{
+  "generated_by": "scripts/phase0_capture.py",
+  "generated_hashes": {
+    "goldens/aaak.json": "ab6ec8fa8705cd067518395ed5e3e4b39e63efd640b4ddbd86d697fb8d8f0e5b",
+    "goldens/knowledge-graph.json": "41f9aaf6354b3fec19604912b4de177f475bfdb6f952a687e07afc29ba66a5de",
+    "goldens/mcp-contract.json": "434039f0f8d3b8e457f35ed01e72d2b03178927ff34e2153e617368af97dde34",
+    "goldens/palace-graph.json": "fb2ac6eff8121d7a564b7d7ce895e32c1b58dd9e1f089786077476cc662dfc67",
+    "inventory/cli-help.json": "2592f920cd18bc6df625474721d4564120d8b537a3f2de3bfe57c5db74129579",
+    "inventory/environment.json": "f42db39ff92f7fd30e895796f7db4e2da00d5e02ebe6a4b917da06128dd88b53",
+    "inventory/mcp-tools.json": "ce906cdbac2128ca75fae4261acfcbb335958e7d1446bd6a6182d601990ae930"
+  },
+  "input_hashes": {
+    "inputs/convos/product_strategy.txt": "0153de51c16a1c6e6407b9548325a75d78364fb71d6762b4d4638a533ec98658",
+    "inputs/project_alpha/backend/auth.py": "b9ba831346216b5c9a9f7391f70455ca62cdcc19208ff7a1a99b2385c49c9266",
+    "inputs/project_alpha/docs/plan.md": "a4540dce586d67050511d576682ad0ce8c8fcbb6254f1c302056fc538bdeffe5",
+    "inputs/project_alpha/mempalace.yaml": "6fb9b86c165722382d670661a4dab6d7e0aa2f8859b62e427e359e00a1458e03"
+  },
+  "phase": "0",
+  "python": "3.11",
+  "tolerant_generated_files": [
+    "goldens/search-cli.txt",
+    "goldens/search-programmatic.json",
+    "goldens/wake-up-wing-code.txt",
+    "goldens/wake-up.txt"
+  ],
+  "version": 1
+}

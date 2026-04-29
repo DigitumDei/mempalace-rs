@@ -1,0 +1,8 @@
+> Why are we doing Phase 0 before writing Rust code?
+Because the current Python behavior is the only working product contract and we need goldens before we replace the storage layer.
+
+> What must stay the same?
+The CLI commands, MCP tool names, search filter semantics, wake-up structure, and the AAAK spec should keep the same public shape.
+
+> What can change?
+The backend can move from ChromaDB to LanceDB and SQLite, but only if the user-facing behavior stays grounded in the same fixture corpus.

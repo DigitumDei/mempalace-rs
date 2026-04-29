@@ -22,6 +22,8 @@ See the [Quickstart guide](docs/Quickstart.md) for the full walkthrough — buil
 
 ## Overview
 
+MemPalace provides a palace-style memory store with:
+
 - Semantic search via local embeddings (no external API calls)
 - A knowledge graph for structured facts, relationships, and timelines
 - An AAAK dialect for compact, human-readable memory storage

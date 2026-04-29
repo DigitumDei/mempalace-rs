@@ -937,13 +937,14 @@ fn write_project_config(
 }
 
 fn wing_name_for_dir(project_dir: &Path) -> String {
-    project_dir
+    let name = project_dir
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or("project")
         .to_lowercase()
         .replace('-', "_")
-        .replace(' ', "_")
+        .replace(' ', "_");
+    format!("wing_{name}")
 }
 
 fn count_project_files(project_dir: &Path) -> std::io::Result<usize> {
@@ -1415,7 +1416,7 @@ mod tests {
         let status = run_cli(["status"], &context, stub_provider).unwrap();
         assert_eq!(status.exit_code, 0);
         assert!(status.stdout.contains("MemPalace Status"));
-        assert!(status.stdout.contains("WING: project_alpha"));
+        assert!(status.stdout.contains("WING: wing_project_alpha"));
 
         let wake_up = run_cli(["wake-up"], &context, stub_provider).unwrap();
         assert_eq!(wake_up.exit_code, 0);
@@ -1529,7 +1530,7 @@ mod tests {
 
         let status = run_cli(["status"], &context, stub_provider).unwrap();
         assert!(status.stdout.contains("WING: overridewing"));
-        assert!(!status.stdout.contains("WING: project_alpha"));
+        assert!(!status.stdout.contains("WING: wing_project_alpha"));
         fs::remove_dir_all(config_root).unwrap();
     }
 
@@ -1596,14 +1597,14 @@ mod tests {
         run_cli(["mine", project_beta.to_str().unwrap()], &context, stub_provider).unwrap();
 
         let wing_search = run_cli(
-            ["search", "reconciliation", "--wing", "project_beta"],
+            ["search", "reconciliation", "--wing", "wing_project_beta"],
             &context,
             stub_provider,
         )
         .unwrap();
         assert_eq!(wing_search.exit_code, 0);
-        assert!(wing_search.stdout.contains("project_beta"));
-        assert!(!wing_search.stdout.contains("project_alpha"));
+        assert!(wing_search.stdout.contains("wing_project_beta"));
+        assert!(!wing_search.stdout.contains("wing_project_alpha"));
 
         let room_search =
             run_cli(["search", "roadmap", "--room", "planning"], &context, stub_provider).unwrap();
@@ -1611,7 +1612,7 @@ mod tests {
         assert!(room_search.stdout.contains("planning"));
 
         let wake_up =
-            run_cli(["wake-up", "--wing", "project_beta"], &context, stub_provider).unwrap();
+            run_cli(["wake-up", "--wing", "wing_project_beta"], &context, stub_provider).unwrap();
         assert_eq!(wake_up.exit_code, 0);
         assert!(wake_up.stdout.contains("[planning]"));
         assert!(wake_up.stdout.contains("roadmap.md"));

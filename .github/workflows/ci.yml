@@ -1,0 +1,284 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  workspace-build:
+    name: Workspace Build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install protobuf compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build all workspace targets
+        run: cargo check --workspace --all-targets --locked
+
+  embeddings-tests:
+    name: Embeddings Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build mempalace-embeddings tests
+        run: cargo test -p mempalace-embeddings --locked --no-run
+
+      - name: Run mempalace-embeddings tests
+        run: cargo test -p mempalace-embeddings --locked -- --nocapture
+
+  embedding-baselines:
+    name: Embedding Baselines
+    runs-on: ubuntu-latest
+    needs: embeddings-tests
+    timeout-minutes: 30
+    env:
+      MEMPALACE_EMBED_CACHE: /home/runner/.cache/mempalace/embeddings
+      MEMPALACE_EMBED_ALLOW_DOWNLOADS: "1"
+      MEMPALACE_EMBED_ITERATIONS: "15"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Cache embedding assets
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.MEMPALACE_EMBED_CACHE }}
+          key: embedding-assets-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Capture balanced warm baseline
+        run: |
+          cargo run -p mempalace-embeddings --example embedding_bench --release --locked \
+            | tee balanced-benchmark.txt
+
+      - name: Capture low_cpu warm baseline
+        run: |
+          MEMPALACE_EMBED_PROFILE=low_cpu \
+            cargo run -p mempalace-embeddings --example embedding_bench --release --locked \
+            | tee low-cpu-benchmark.txt
+
+      - name: Publish embedding benchmark summary
+        run: |
+          {
+            echo "## Embedding Baselines"
+            echo
+            echo "$(cat balanced-benchmark.txt)"
+            echo "$(cat low-cpu-benchmark.txt)"
+            echo
+            echo "Reference host: github-actions ubuntu-latest"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload embedding benchmark artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: embedding-baselines
+          path: |
+            balanced-benchmark.txt
+            low-cpu-benchmark.txt
+
+  storage-tests:
+    name: Storage Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install protobuf compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build mempalace-storage tests
+        run: cargo test -p mempalace-storage --locked --no-run
+
+      - name: Run mempalace-storage tests
+        run: cargo test -p mempalace-storage --locked -- --nocapture
+
+  ingest-tests:
+    name: Ingest Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install protobuf compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build mempalace-ingest tests
+        run: cargo test -p mempalace-ingest --locked --no-run
+
+      - name: Run mempalace-ingest tests
+        run: cargo test -p mempalace-ingest --locked -- --nocapture
+
+  graph-tests:
+    name: Graph Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install protobuf compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build mempalace-graph tests
+        run: cargo test -p mempalace-graph --locked --no-run
+
+      - name: Run mempalace-graph tests
+        run: cargo test -p mempalace-graph --locked -- --nocapture
+
+  mcp-tests:
+    name: MCP Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install protobuf compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build mempalace-mcp tests
+        run: cargo test -p mempalace-mcp --locked --no-run
+
+      - name: Run mempalace-mcp tests
+        run: cargo test -p mempalace-mcp --locked -- --nocapture
+
+  cli-tests:
+    name: CLI Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install protobuf compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build mempalace-cli tests
+        run: cargo test -p mempalace-cli --locked --no-run
+
+      - name: Run mempalace-cli tests
+        run: cargo test -p mempalace-cli --locked -- --nocapture
+
+  build-and-package:
+    name: Build And Package
+    runs-on: ubuntu-latest
+    needs:
+      - workspace-build
+      - embeddings-tests
+      - embedding-baselines
+      - storage-tests
+      - ingest-tests
+      - graph-tests
+      - mcp-tests
+      - cli-tests
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install packaging dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release artifacts
+        run: cargo build --release --locked -p mempalace-cli -p mempalace-mcp
+
+      - name: Smoke packaged binaries
+        run: |
+          ./target/release/mempalace-cli --help
+          ./target/release/mempalace-mcp --help
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mempalace-release-binaries
+          path: |
+            target/release/mempalace-cli
+            target/release/mempalace-mcp
+          if-no-files-found: error

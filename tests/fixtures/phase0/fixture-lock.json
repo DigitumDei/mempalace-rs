@@ -18,6 +18,7 @@
   "phase": "0",
   "python": "3.11",
   "tolerant_generated_files": [
+    "goldens/aaak.json",
     "goldens/search-cli.txt",
     "goldens/search-programmatic.json",
     "goldens/wake-up-wing-code.txt",

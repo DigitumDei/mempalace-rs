@@ -1,0 +1,29 @@
+{
+  "dependency_inputs": {
+    "pyproject": {
+      "dependencies": [
+        "chromadb>=0.4.0",
+        "pyyaml>=6.0"
+      ],
+      "optional_dependencies": {
+        "dev": [
+          "pytest>=7.0",
+          "build>=1.0",
+          "twine>=4.0"
+        ]
+      },
+      "requires_python": ">=3.9"
+    },
+    "requirements_txt": [
+      "chromadb>=0.4.0",
+      "pyyaml>=6.0"
+    ]
+  },
+  "python_implementation": "CPython",
+  "python_version": "3.11",
+  "resolved_packages": {
+    "PyYAML": "6.0.3",
+    "chromadb": "1.5.7",
+    "pytest": "9.0.3"
+  }
+}

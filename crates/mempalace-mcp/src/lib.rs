@@ -1431,7 +1431,7 @@ pub fn phase0_contract_fixture() -> Result<Value> {
 }
 
 fn fixture_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../tests/fixtures/phase0")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/phase0")
 }
 
 #[cfg(test)]

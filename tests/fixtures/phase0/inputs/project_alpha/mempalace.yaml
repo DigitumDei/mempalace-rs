@@ -1,0 +1,18 @@
+wing: project_alpha
+rooms:
+  - name: backend
+    description: Backend code and auth decisions
+    keywords:
+      - auth
+      - token
+      - oauth
+      - session
+  - name: planning
+    description: Roadmap and migration planning
+    keywords:
+      - phase
+      - roadmap
+      - migration
+      - spec
+  - name: general
+    description: General fallback room

@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(gh run *)",
-      "Read(//d/SourceCode/**)",
-      "Read(//d/SourceCode/mempalace/tests/fixtures/phase0/**)"
-    ]
-  }
-}

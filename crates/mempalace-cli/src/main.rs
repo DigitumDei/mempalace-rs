@@ -944,7 +944,7 @@ fn wing_name_for_dir(project_dir: &Path) -> String {
         .to_lowercase()
         .replace('-', "_")
         .replace(' ', "_");
-    format!("wing_{name}")
+    if name.starts_with("wing_") { name } else { format!("wing_{name}") }
 }
 
 fn count_project_files(project_dir: &Path) -> std::io::Result<usize> {

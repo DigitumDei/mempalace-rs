@@ -1,0 +1,23 @@
+[package]
+name = "mempalace-graph"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+aho-corasick = "1.1.4"
+mempalace-core = { path = "../mempalace-core" }
+mempalace-storage = { path = "../mempalace-storage" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+time.workspace = true
+
+[dev-dependencies]
+async-trait = "0.1.89"
+tempfile = "3.23.0"
+tokio = { version = "1.48.0", features = ["macros", "rt"] }
+
+[lints]
+workspace = true

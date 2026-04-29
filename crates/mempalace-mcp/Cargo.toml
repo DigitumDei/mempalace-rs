@@ -1,0 +1,28 @@
+[package]
+name = "mempalace-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mempalace-config = { path = "../mempalace-config" }
+mempalace-core = { path = "../mempalace-core" }
+mempalace-embeddings = { path = "../mempalace-embeddings" }
+mempalace-graph = { path = "../mempalace-graph" }
+mempalace-search = { path = "../mempalace-search" }
+mempalace-storage = { path = "../mempalace-storage" }
+blake3 = "1.8.2"
+dirs.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio = { version = "1.48.0", features = ["io-std", "io-util", "macros", "rt-multi-thread", "sync"] }
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3.23.0"
+
+[lints]
+workspace = true

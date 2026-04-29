@@ -1,0 +1,12 @@
+[package]
+name = "mempalace-import"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mempalace-core = { path = "../mempalace-core" }
+
+[lints]
+workspace = true

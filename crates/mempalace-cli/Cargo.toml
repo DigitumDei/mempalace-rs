@@ -1,0 +1,26 @@
+[package]
+name = "mempalace-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+clap = { version = "4.5.50", features = ["derive"] }
+dirs.workspace = true
+mempalace-config = { path = "../mempalace-config" }
+mempalace-core = { path = "../mempalace-core" }
+mempalace-ingest = { path = "../mempalace-ingest" }
+mempalace-embeddings = { path = "../mempalace-embeddings" }
+mempalace-search = { path = "../mempalace-search" }
+mempalace-storage = { path = "../mempalace-storage" }
+serde_json.workspace = true
+serde_yaml.workspace = true
+tokio = { version = "1.48.0", features = ["rt-multi-thread"] }
+tempfile = "3.23.0"
+time.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

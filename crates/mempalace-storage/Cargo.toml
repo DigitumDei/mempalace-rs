@@ -1,0 +1,27 @@
+[package]
+name = "mempalace-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+arrow-array = "56.2"
+arrow-schema = "56.2"
+async-trait = "0.1.89"
+futures = "0.3.31"
+lancedb = { version = "0.23.1", default-features = false }
+mempalace-core = { path = "../mempalace-core" }
+rusqlite = { version = "0.39.0", features = ["bundled"] }
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3.23.0"
+tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

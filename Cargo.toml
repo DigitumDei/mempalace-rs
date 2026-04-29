@@ -1,0 +1,49 @@
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+version = "0.1.0"
+rust-version = "1.88"
+
+[workspace.dependencies]
+dirs = "6.0.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+serde_yaml = "0.9.34"
+thiserror = "2.0.17"
+toml = "0.9.8"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
+time = { version = "0.3.44", features = ["formatting", "macros", "parsing", "serde"] }
+
+[workspace.lints.clippy]
+checked_conversions = "deny"
+dbg_macro = "deny"
+explicit_into_iter_loop = "deny"
+explicit_iter_loop = "deny"
+manual_assert = "deny"
+manual_ok_or = "deny"
+todo = "deny"
+undocumented_unsafe_blocks = "deny"
+unwrap_used = "deny"
+
+[workspace.lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid"
+
+[workspace.lints.rustdoc]
+bare_urls = "deny"
+broken_intra_doc_links = "deny"
+
+[profile.dev]
+debug = 0
+incremental = false
+strip = "debuginfo"
+
+[profile.test]
+debug = 0
+incremental = false
+strip = "debuginfo"

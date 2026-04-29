@@ -1,0 +1,21 @@
+[package]
+name = "mempalace-config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+dirs.workspace = true
+mempalace-core = { path = "../mempalace-core" }
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+tokio = { version = "1.48.0", features = ["rt-multi-thread"] }
+toml.workspace = true
+
+[dev-dependencies]
+time.workspace = true
+
+[lints]
+workspace = true

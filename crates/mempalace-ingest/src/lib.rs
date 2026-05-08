@@ -2201,7 +2201,7 @@ mod tests {
         let decisions = engine
             .drawer_store()
             .list_drawers(&DrawerFilter {
-                wing: Some(WingId::new("phase0_convos").unwrap()),
+                wing: Some(WingId::new("wing_phase0_convos").unwrap()),
                 room: Some(RoomId::new("decision").unwrap()),
                 ..DrawerFilter::default()
             })
@@ -2210,7 +2210,7 @@ mod tests {
         let exchange = engine
             .drawer_store()
             .list_drawers(&DrawerFilter {
-                wing: Some(WingId::new("phase0_convos").unwrap()),
+                wing: Some(WingId::new("wing_phase0_convos").unwrap()),
                 source_file: Some("product_strategy.txt".to_owned()),
                 ..DrawerFilter::default()
             })
@@ -2421,7 +2421,7 @@ mod tests {
         let drawers = engine
             .drawer_store()
             .list_drawers(&DrawerFilter {
-                wing: Some(WingId::new("overridewing").unwrap()),
+                wing: Some(WingId::new("wing_overridewing").unwrap()),
                 ..DrawerFilter::default()
             })
             .await

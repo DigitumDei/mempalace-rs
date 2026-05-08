@@ -578,7 +578,7 @@ where
         SearchRuntimePolicy { rerank_enabled: config.low_cpu.effective_rerank_enabled() },
     );
 
-    let wing_id = wing.as_deref().map(WingId::new).transpose().map_err(id_error)?;
+    let wing_id = wing.as_deref().map(WingId::normalized).transpose().map_err(id_error)?;
     let room_id = room.as_deref().map(RoomId::new).transpose().map_err(id_error)?;
     let rendered = runtime
         .block_on(search.search_text(
@@ -682,7 +682,7 @@ where
         .block_on(search.wake_up(
             engine.drawer_store(),
             &WakeUpRequest {
-                wing: wing.as_deref().map(WingId::new).transpose().map_err(id_error)?,
+                wing: wing.as_deref().map(WingId::normalized).transpose().map_err(id_error)?,
                 layer1: wake_up_layer1_config(&config),
                 ..WakeUpRequest::default()
             },

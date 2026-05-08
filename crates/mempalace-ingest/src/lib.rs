@@ -1799,7 +1799,7 @@ fn canonicalize_optional(value: Option<&str>) -> String {
 }
 
 fn wing_id(value: &str) -> Result<WingId> {
-    WingId::new(canonicalize_label(value)).map_err(|err| IngestError::Core(err.into()))
+    WingId::normalized(value).map_err(|err| IngestError::Core(err.into()))
 }
 
 fn room_id(value: &str) -> Result<RoomId> {

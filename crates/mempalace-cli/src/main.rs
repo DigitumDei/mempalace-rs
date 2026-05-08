@@ -1529,7 +1529,9 @@ mod tests {
         assert_eq!(output.exit_code, 0);
 
         let status = run_cli(["status"], &context, stub_provider).unwrap();
-        assert!(status.stdout.contains("WING: overridewing"));
+        // --wing overridewing is normalized to wing_overridewing so that explicit
+        // CLI overrides match the wing_-prefixed convention used everywhere else.
+        assert!(status.stdout.contains("WING: wing_overridewing"));
         assert!(!status.stdout.contains("WING: wing_project_alpha"));
         fs::remove_dir_all(config_root).unwrap();
     }

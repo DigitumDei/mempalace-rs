@@ -126,6 +126,21 @@ CREATE INDEX IF NOT EXISTS idx_kg_facts_subject_predicate_object_active
 ON knowledge_graph_facts(subject_entity_id, predicate, object_entity_id, valid_to);
         "#,
     ),
+    (
+        "0005_change_log",
+        r#"
+CREATE TABLE IF NOT EXISTS change_log (
+    change_id   TEXT PRIMARY KEY,
+    event_type  TEXT NOT NULL,
+    occurred_at TEXT NOT NULL,
+    entity_id   TEXT NOT NULL,
+    actor       TEXT,
+    details_json TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_change_log_occurred_at ON change_log(occurred_at ASC);
+        "#,
+    ),
 ];
 
 pub trait IngestManifestStore {
@@ -194,6 +209,30 @@ pub trait ToolStateStore {
     fn get_config(&self, key: &str) -> Result<Option<ConfigEntry>>;
 }
 
+/// A single write event recorded in the change log.
+#[derive(Debug, Clone)]
+pub struct ChangeEvent {
+    /// Operation type: "drawer_added", "drawer_deleted", "diary_written",
+    /// "kg_fact_added", or "kg_fact_invalidated".
+    pub event_type: String,
+    pub occurred_at: OffsetDateTime,
+    /// Primary identifier of the affected entity (drawer id, fact triple, etc.).
+    pub entity_id: String,
+    /// The agent or tool that performed the write, if known.
+    pub actor: Option<String>,
+    /// Optional JSON with extra context (wing, room, subject/predicate/object, …).
+    pub details_json: Option<String>,
+}
+
+pub trait ChangeLogStore {
+    fn append_event(&self, event: &ChangeEvent) -> Result<()>;
+    fn get_changes_since(
+        &self,
+        since: OffsetDateTime,
+        limit: usize,
+    ) -> Result<Vec<ChangeEvent>>;
+}
+
 #[derive(Debug, Clone)]
 pub struct SqliteOperationalStore {
     path: PathBuf,
@@ -210,6 +249,7 @@ impl SqliteOperationalStore {
             "0002_ingest_files_source_key",
             "0003_knowledge_graph_facts",
             "0004_knowledge_graph_fact_lookup_index",
+            "0005_change_log",
         ]
     }
 
@@ -897,6 +937,60 @@ impl ToolStateStore for SqliteOperationalStore {
     }
 }
 
+impl ChangeLogStore for SqliteOperationalStore {
+    fn append_event(&self, event: &ChangeEvent) -> Result<()> {
+        let change_id = format!(
+            "{}:{}",
+            event.occurred_at.unix_timestamp_nanos(),
+            event.entity_id
+        );
+        let connection = self.open_connection()?;
+        connection.execute(
+            "INSERT OR IGNORE INTO change_log
+                 (change_id, event_type, occurred_at, entity_id, actor, details_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                change_id,
+                event.event_type,
+                encode_time(event.occurred_at),
+                event.entity_id,
+                event.actor,
+                event.details_json,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn get_changes_since(&self, since: OffsetDateTime, limit: usize) -> Result<Vec<ChangeEvent>> {
+        let connection = self.open_connection()?;
+        let mut statement = connection.prepare(
+            "SELECT event_type, occurred_at, entity_id, actor, details_json
+             FROM change_log
+             WHERE occurred_at > ?1
+             ORDER BY occurred_at ASC
+             LIMIT ?2",
+        )?;
+        statement
+            .query_map(params![encode_time(since), limit as i64], |row| {
+                Ok(ChangeEvent {
+                    event_type: row.get(0)?,
+                    occurred_at: decode_time(row.get(1)?).map_err(|err| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            1,
+                            rusqlite::types::Type::Text,
+                            Box::new(err),
+                        )
+                    })?,
+                    entity_id: row.get(2)?,
+                    actor: row.get(3)?,
+                    details_json: row.get(4)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
+    }
+}
+
 fn parse_status(raw: String) -> rusqlite::Result<IngestRunStatus> {
     match raw.as_str() {
         "pending" => Ok(IngestRunStatus::Pending),
@@ -1059,8 +1153,8 @@ mod tests {
     use time::macros::datetime;
 
     use super::{
-        EntityRegistryStore, GraphStore, IngestManifestStore, KnowledgeGraphStore, MIGRATIONS,
-        SqliteOperationalStore, ToolStateStore,
+        ChangeEvent, ChangeLogStore, EntityRegistryStore, GraphStore, IngestManifestStore,
+        KnowledgeGraphStore, MIGRATIONS, SqliteOperationalStore, ToolStateStore,
     };
     use crate::types::{
         ConfigEntry, EntityRecord, GraphDocument, IngestManifestEntry, IngestRunStatus,
@@ -1069,6 +1163,64 @@ mod tests {
     use mempalace_core::DrawerId;
     use serde_json::json;
     use time::macros::date;
+
+    #[test]
+    fn change_log_records_and_queries_events() {
+        let tempdir = tempdir().unwrap();
+        let store = SqliteOperationalStore::new(tempdir.path().join("storage.sqlite3"));
+        store.ensure_schema().unwrap();
+
+        let t0 = datetime!(2026-05-08 10:00:00 UTC);
+        let t1 = datetime!(2026-05-08 10:01:00 UTC);
+        let t2 = datetime!(2026-05-08 10:02:00 UTC);
+        let t3 = datetime!(2026-05-08 10:03:00 UTC);
+
+        store
+            .append_event(&ChangeEvent {
+                event_type: "drawer_added".to_owned(),
+                occurred_at: t1,
+                entity_id: "drawer_wing_code_backend_abc".to_owned(),
+                actor: Some("claude".to_owned()),
+                details_json: Some(r#"{"wing":"wing_code","room":"backend"}"#.to_owned()),
+            })
+            .unwrap();
+        store
+            .append_event(&ChangeEvent {
+                event_type: "kg_fact_added".to_owned(),
+                occurred_at: t2,
+                entity_id: "Alice → works_on → MemPalace".to_owned(),
+                actor: None,
+                details_json: None,
+            })
+            .unwrap();
+        store
+            .append_event(&ChangeEvent {
+                event_type: "drawer_deleted".to_owned(),
+                occurred_at: t3,
+                entity_id: "drawer_wing_code_backend_abc".to_owned(),
+                actor: None,
+                details_json: None,
+            })
+            .unwrap();
+
+        // since t0 returns all three
+        let all = store.get_changes_since(t0, 50).unwrap();
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].event_type, "drawer_added");
+        assert_eq!(all[0].actor.as_deref(), Some("claude"));
+        assert_eq!(all[1].event_type, "kg_fact_added");
+        assert_eq!(all[2].event_type, "drawer_deleted");
+
+        // since t1 returns the last two
+        let after_t1 = store.get_changes_since(t1, 50).unwrap();
+        assert_eq!(after_t1.len(), 2);
+        assert_eq!(after_t1[0].event_type, "kg_fact_added");
+
+        // limit is respected
+        let limited = store.get_changes_since(t0, 1).unwrap();
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].event_type, "drawer_added");
+    }
 
     #[test]
     fn applies_all_migrations() {

@@ -412,6 +412,23 @@
             "type": "object"
           },
           "name": "mempalace_diary_read"
+        },
+        {
+          "description": "Get all palace changes since a given timestamp. Call this at session start (or when coordinating with teammates) to catch up on what other agents have written. Returns events in chronological order with operation type, affected entity, actor, and timestamp.",
+          "inputSchema": {
+            "properties": {
+              "limit": {
+                "description": "Max events to return (default 50)",
+                "type": "integer"
+              },
+              "since": {
+                "description": "ISO 8601 timestamp — return only events after this point (optional, default: epoch)",
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "name": "mempalace_get_changes_since"
         }
       ]
     }

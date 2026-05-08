@@ -578,7 +578,7 @@ where
         SearchRuntimePolicy { rerank_enabled: config.low_cpu.effective_rerank_enabled() },
     );
 
-    let wing_id = wing.as_deref().map(WingId::new).transpose().map_err(id_error)?;
+    let wing_id = wing.as_deref().map(WingId::normalized).transpose().map_err(id_error)?;
     let room_id = room.as_deref().map(RoomId::new).transpose().map_err(id_error)?;
     let rendered = runtime
         .block_on(search.search_text(
@@ -682,7 +682,7 @@ where
         .block_on(search.wake_up(
             engine.drawer_store(),
             &WakeUpRequest {
-                wing: wing.as_deref().map(WingId::new).transpose().map_err(id_error)?,
+                wing: wing.as_deref().map(WingId::normalized).transpose().map_err(id_error)?,
                 layer1: wake_up_layer1_config(&config),
                 ..WakeUpRequest::default()
             },
@@ -1529,7 +1529,9 @@ mod tests {
         assert_eq!(output.exit_code, 0);
 
         let status = run_cli(["status"], &context, stub_provider).unwrap();
-        assert!(status.stdout.contains("WING: overridewing"));
+        // --wing overridewing is normalized to wing_overridewing so that explicit
+        // CLI overrides match the wing_-prefixed convention used everywhere else.
+        assert!(status.stdout.contains("WING: wing_overridewing"));
         assert!(!status.stdout.contains("WING: wing_project_alpha"));
         fs::remove_dir_all(config_root).unwrap();
     }

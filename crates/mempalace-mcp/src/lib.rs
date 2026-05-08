@@ -938,8 +938,12 @@ where
     }
 
     async fn tool_find_tunnels(&mut self, arguments: &Value) -> ToolResult<Value> {
-        let wing_a = optional_string(arguments, "wing_a")?;
-        let wing_b = optional_string(arguments, "wing_b")?;
+        let wing_a = optional_string(arguments, "wing_a")?
+            .map(|value| parse_wing_id(&value).map(|wing| wing.as_str().to_owned()))
+            .transpose()?;
+        let wing_b = optional_string(arguments, "wing_b")?
+            .map(|value| parse_wing_id(&value).map(|wing| wing.as_str().to_owned()))
+            .transpose()?;
         let snapshot = self.graph_snapshot().await?;
         Ok(json!(find_tunnels(&snapshot, wing_a.as_deref(), wing_b.as_deref())))
     }
@@ -1267,7 +1271,7 @@ fn optional_f32(arguments: &Value, field: &'static str) -> ToolResult<Option<f32
 }
 
 fn parse_wing_id(value: &str) -> ToolResult<WingId> {
-    WingId::new(value).map_err(|error| ToolError::InvalidParams(error.to_string()))
+    WingId::normalized(value).map_err(|error| ToolError::InvalidParams(error.to_string()))
 }
 
 fn parse_room_id(value: &str) -> ToolResult<RoomId> {
@@ -2562,5 +2566,79 @@ mod tests {
 
         assert_eq!(facts.len(), 1);
         assert_eq!(facts[0]["source_closet"], "freeform source ref");
+    }
+
+    #[tokio::test]
+    async fn wing_param_normalizes_symmetrically_across_writes_and_reads() {
+        let harness = test_harness().await;
+
+        let add = harness
+            .server
+            .handle_request(tool_call(
+                400,
+                "mempalace_add_drawer",
+                json!({
+                    "wing":"ghosttest",
+                    "room":"bugs",
+                    "content":"Ghost-wing repro: writing wing=ghosttest must land in wing_ghosttest.",
+                    "source_file":"ghost.md",
+                    "added_by":"tester"
+                }),
+            ))
+            .await;
+        let add_payload = decode_tool_payload(&add).unwrap();
+        assert_eq!(add_payload["success"], true);
+        assert_eq!(
+            add_payload["wing"], "wing_ghosttest",
+            "wing should be normalized on write: {add_payload}"
+        );
+
+        for wing_input in ["ghosttest", "wing_ghosttest", "GhostTest"] {
+            let rooms = harness
+                .server
+                .handle_request(tool_call(
+                    401,
+                    "mempalace_list_rooms",
+                    json!({"wing": wing_input}),
+                ))
+                .await;
+            let rooms_payload = decode_tool_payload(&rooms).unwrap();
+            assert_eq!(
+                rooms_payload["rooms"]["bugs"], 1,
+                "list_rooms({wing_input}) should resolve to wing_ghosttest"
+            );
+
+            let search = harness
+                .server
+                .handle_request(tool_call(
+                    402,
+                    "mempalace_search",
+                    json!({
+                        "query":"Ghost-wing repro",
+                        "wing": wing_input,
+                        "limit":5
+                    }),
+                ))
+                .await;
+            let search_payload = decode_tool_payload(&search).unwrap();
+            let results = search_payload["results"].as_array().unwrap();
+            assert!(
+                results.iter().any(|r| r["wing"] == "wing_ghosttest"),
+                "search({wing_input}) should find wing_ghosttest drawer; got {search_payload}"
+            );
+        }
+
+        let wings =
+            harness.server.handle_request(tool_call(403, "mempalace_list_wings", json!({}))).await;
+        let wings_payload = decode_tool_payload(&wings).unwrap();
+        let wings_obj = wings_payload["wings"].as_object().unwrap();
+        assert!(
+            wings_obj.contains_key("wing_ghosttest"),
+            "wing_ghosttest should exist: {wings_payload}"
+        );
+        assert!(
+            !wings_obj.contains_key("ghosttest"),
+            "no ghost wing should be created: {wings_payload}"
+        );
     }
 }

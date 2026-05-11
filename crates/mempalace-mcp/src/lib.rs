@@ -18,7 +18,8 @@ use mempalace_graph::{
 };
 use mempalace_search::{SearchRuntime, SearchRuntimePolicy};
 use mempalace_storage::{
-    DrawerFilter, DrawerStore, DuplicateStrategy, IngestCommitRequest, StorageEngine,
+    ChangeEvent, ChangeLogStore, DrawerFilter, DrawerStore, DuplicateStrategy,
+    IngestCommitRequest, StorageEngine,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -153,10 +154,11 @@ enum ToolName {
     DeleteDrawer,
     DiaryWrite,
     DiaryRead,
+    GetChangesSince,
 }
 
 impl ToolName {
-    fn all() -> [Self; 19] {
+    fn all() -> [Self; 20] {
         [
             Self::Status,
             Self::ListWings,
@@ -177,6 +179,7 @@ impl ToolName {
             Self::DeleteDrawer,
             Self::DiaryWrite,
             Self::DiaryRead,
+            Self::GetChangesSince,
         ]
     }
 
@@ -201,6 +204,7 @@ impl ToolName {
             Self::DeleteDrawer => "mempalace_delete_drawer",
             Self::DiaryWrite => "mempalace_diary_write",
             Self::DiaryRead => "mempalace_diary_read",
+            Self::GetChangesSince => "mempalace_get_changes_since",
         }
     }
 
@@ -396,6 +400,17 @@ impl ToolName {
                     "required":["agent_name"]
                 }),
             },
+            Self::GetChangesSince => ToolDefinition {
+                name: self.as_str(),
+                description: "Get all palace changes since a given timestamp. Call this at session start (or when coordinating with teammates) to catch up on what other agents have written. Returns events in chronological order with operation type, affected entity, actor, and timestamp.",
+                input_schema: json!({
+                    "type":"object",
+                    "properties":{
+                        "since":{"type":"string","description":"ISO 8601 timestamp — return only events after this point (optional, default: epoch)"},
+                        "limit":{"type":"integer","description":"Max events to return (default 50)"}
+                    }
+                }),
+            },
         }
     }
 }
@@ -580,6 +595,7 @@ where
             ToolName::DeleteDrawer => runtime.tool_delete_drawer(&call.arguments).await,
             ToolName::DiaryWrite => runtime.tool_diary_write(&call.arguments).await,
             ToolName::DiaryRead => runtime.tool_diary_read(&call.arguments).await,
+            ToolName::GetChangesSince => runtime.tool_get_changes_since(&call.arguments).await,
         };
 
         match result {
@@ -760,7 +776,7 @@ where
                 None,
                 None,
                 source_file.clone(),
-                added_by,
+                added_by.clone(),
                 "mcp".to_owned(),
                 content,
                 now,
@@ -778,6 +794,16 @@ where
             })
             .await
             .map_tool()?;
+
+        self.log_change(ChangeEvent {
+            event_type: "drawer_added".to_owned(),
+            occurred_at: now,
+            entity_id: drawer_id.as_str().to_owned(),
+            actor: Some(added_by),
+            details_json: Some(
+                json!({"wing": wing.as_str(), "room": room.as_str()}).to_string(),
+            ),
+        });
 
         Ok(json!({
             "success": true,
@@ -801,6 +827,13 @@ where
                 "error": format!("Drawer not found: {}", drawer_id.as_str()),
             }));
         }
+        self.log_change(ChangeEvent {
+            event_type: "drawer_deleted".to_owned(),
+            occurred_at: OffsetDateTime::now_utc(),
+            entity_id: drawer_id.as_str().to_owned(),
+            actor: None,
+            details_json: None,
+        });
         Ok(json!({ "success": true, "drawer_id": drawer_id }))
     }
 
@@ -839,6 +872,14 @@ where
             })
             .await
             .map_tool()?;
+
+        self.log_change(ChangeEvent {
+            event_type: "diary_written".to_owned(),
+            occurred_at: now,
+            entity_id: drawer_id.as_str().to_owned(),
+            actor: Some(agent_name.clone()),
+            details_json: Some(json!({"topic": topic}).to_string()),
+        });
 
         Ok(json!({
             "success": true,
@@ -980,6 +1021,7 @@ where
         let source_drawer_id =
             source_closet.as_deref().and_then(|value| parse_drawer_id(value).ok());
         let runtime = KnowledgeGraphRuntime::new(self.storage.operational_store());
+        let now = OffsetDateTime::now_utc();
         let triple_id = runtime
             .add_fact(
                 AddFactRequest {
@@ -994,9 +1036,20 @@ where
                     source_drawer_id,
                     source_file: source_closet,
                 },
-                OffsetDateTime::now_utc(),
+                now,
             )
             .map_tool_internal()?;
+
+        self.log_change(ChangeEvent {
+            event_type: "kg_fact_added".to_owned(),
+            occurred_at: now,
+            entity_id: triple_id.clone(),
+            actor: None,
+            details_json: Some(
+                json!({"subject": subject, "predicate": predicate, "object": object}).to_string(),
+            ),
+        });
+
         Ok(json!({
             "success": true,
             "triple_id": triple_id,
@@ -1014,10 +1067,26 @@ where
             .map(parse_date)
             .transpose()?
             .unwrap_or_else(|| OffsetDateTime::now_utc().date());
+        let now = OffsetDateTime::now_utc();
         let runtime = KnowledgeGraphRuntime::new(self.storage.operational_store());
         let invalidated = runtime
-            .invalidate(&subject, &predicate, &object, ended, OffsetDateTime::now_utc())
+            .invalidate(&subject, &predicate, &object, ended, now)
             .map_tool_internal()?;
+
+        if invalidated > 0 {
+            self.log_change(ChangeEvent {
+                event_type: "kg_fact_invalidated".to_owned(),
+                occurred_at: now,
+                entity_id: format!("{subject} → {predicate} → {object}"),
+                actor: None,
+                details_json: Some(
+                    json!({"subject": subject, "predicate": predicate, "object": object,
+                           "ended": format_date(ended)})
+                    .to_string(),
+                ),
+            });
+        }
+
         Ok(json!({
             "success": invalidated > 0,
             "invalidated": invalidated,
@@ -1122,6 +1191,57 @@ where
             content_hash: hash_text(&content),
             embedding,
         })
+    }
+
+    fn log_change(&self, event: ChangeEvent) {
+        let _ = self.storage.operational_store().append_event(&event);
+    }
+
+    async fn tool_get_changes_since(&mut self, arguments: &Value) -> ToolResult<Value> {
+        let since_str = optional_string(arguments, "since")?;
+        let since = since_str
+            .as_deref()
+            .map(|s| {
+                OffsetDateTime::parse(s, &Rfc3339).map_err(|_| {
+                    ToolError::InvalidParams(format!(
+                        "invalid `since` timestamp `{s}`; expected ISO 8601 e.g. 2026-05-08T10:00:00Z"
+                    ))
+                })
+            })
+            .transpose()?
+            .unwrap_or(OffsetDateTime::UNIX_EPOCH);
+        let limit = optional_usize(arguments, "limit")?.unwrap_or(50);
+
+        let events = self
+            .storage
+            .operational_store()
+            .get_changes_since(since, limit)
+            .map_tool_internal()?;
+
+        let count = events.len();
+        let event_list = events
+            .into_iter()
+            .map(|ev| {
+                let details: Value = ev
+                    .details_json
+                    .as_deref()
+                    .and_then(|s| serde_json::from_str(s).ok())
+                    .unwrap_or(Value::Null);
+                json!({
+                    "event_type": ev.event_type,
+                    "occurred_at": format_rfc3339(ev.occurred_at).unwrap_or_default(),
+                    "entity_id": ev.entity_id,
+                    "actor": ev.actor,
+                    "details": details,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        Ok(json!({
+            "since": since_str.unwrap_or_else(|| "epoch".to_owned()),
+            "count": count,
+            "events": event_list,
+        }))
     }
 }
 
@@ -2640,5 +2760,101 @@ mod tests {
             !wings_obj.contains_key("ghosttest"),
             "no ghost wing should be created: {wings_payload}"
         );
+    }
+
+    #[tokio::test]
+    async fn get_changes_since_returns_events_for_all_mutating_tools() {
+        let harness = test_harness().await;
+
+        let t_before = OffsetDateTime::now_utc();
+        // Allow a tiny gap so the events are strictly after t_before.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        harness
+            .server
+            .handle_request(tool_call(
+                500,
+                "mempalace_add_drawer",
+                json!({"wing":"wing_changes_test","room":"notes",
+                       "content":"Changefeed test: unique content for changefeed coverage.",
+                       "added_by":"test-agent"}),
+            ))
+            .await;
+
+        let add_drawer_id = {
+            let res = harness
+                .server
+                .handle_request(tool_call(
+                    501,
+                    "mempalace_search",
+                    json!({"query":"Changefeed test: unique content for changefeed coverage.",
+                           "wing":"wing_changes_test","limit":1}),
+                ))
+                .await;
+            let p = decode_tool_payload(&res).unwrap();
+            p["results"][0]["wing"].as_str().unwrap().to_owned()
+        };
+        let _ = add_drawer_id; // used to drain the search; drawer_id not needed
+
+        harness
+            .server
+            .handle_request(tool_call(
+                502,
+                "mempalace_diary_write",
+                json!({"agent_name":"change-bot","entry":"SESSION:test","topic":"changefeed"}),
+            ))
+            .await;
+
+        harness
+            .server
+            .handle_request(tool_call(
+                503,
+                "mempalace_kg_add",
+                json!({"subject":"ChangeFeed","predicate":"is","object":"Working"}),
+            ))
+            .await;
+
+        harness
+            .server
+            .handle_request(tool_call(
+                504,
+                "mempalace_kg_invalidate",
+                json!({"subject":"ChangeFeed","predicate":"is","object":"Working"}),
+            ))
+            .await;
+
+        let since_str = t_before
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let changes = harness
+            .server
+            .handle_request(tool_call(
+                505,
+                "mempalace_get_changes_since",
+                json!({"since": since_str, "limit": 100}),
+            ))
+            .await;
+        let payload = decode_tool_payload(&changes).unwrap();
+        let events = payload["events"].as_array().unwrap();
+
+        let types: Vec<&str> =
+            events.iter().filter_map(|e| e["event_type"].as_str()).collect();
+        assert!(types.contains(&"drawer_added"), "expected drawer_added in {types:?}");
+        assert!(types.contains(&"diary_written"), "expected diary_written in {types:?}");
+        assert!(types.contains(&"kg_fact_added"), "expected kg_fact_added in {types:?}");
+        assert!(types.contains(&"kg_fact_invalidated"), "expected kg_fact_invalidated in {types:?}");
+
+        // actor is recorded for drawer_added and diary_written
+        let drawer_event = events.iter().find(|e| e["event_type"] == "drawer_added").unwrap();
+        assert_eq!(drawer_event["actor"], "test-agent");
+
+        let diary_event = events.iter().find(|e| e["event_type"] == "diary_written").unwrap();
+        assert_eq!(diary_event["actor"], "change-bot");
+
+        // kg add captures subject/predicate/object in details
+        let kg_event = events.iter().find(|e| e["event_type"] == "kg_fact_added").unwrap();
+        assert_eq!(kg_event["details"]["subject"], "ChangeFeed");
+        assert_eq!(kg_event["details"]["predicate"], "is");
+        assert_eq!(kg_event["details"]["object"], "Working");
     }
 }

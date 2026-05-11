@@ -10,8 +10,8 @@ pub use engine::StorageEngine;
 pub use error::{Result, StorageError};
 pub use lance::LanceDrawerStore;
 pub use sqlite::{
-    EntityRegistryStore, GraphStore, IngestManifestStore, KnowledgeGraphStore,
-    SqliteOperationalStore, ToolStateStore,
+    ChangeEvent, ChangeLogStore, EntityRegistryStore, GraphStore, IngestManifestStore,
+    KnowledgeGraphStore, SqliteOperationalStore, ToolStateStore,
 };
 pub use types::{
     ConfigEntry, DrawerFilter, DrawerMatch, DrawerStore, DuplicateStrategy, EntityRecord,

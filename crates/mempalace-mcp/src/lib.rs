@@ -38,6 +38,10 @@ const DUPLICATE_SEARCH_LIMIT: usize = 5;
 const DIARY_ROOM: &str = "diary";
 const DIARY_HALL: &str = "hall_diary";
 const DIARY_TOPIC_PREFIX: &str = "diary:";
+// Project-specific wake-up history scans farther back because global changes
+// are interleaved across wings, but stops collecting as soon as the limit is met.
+const WAKE_UP_PROJECT_SEARCH_MULTIPLIER: usize = 20;
+const WAKE_UP_PROJECT_MIN_SEARCH_LIMIT: usize = 50;
 
 pub const PALACE_PROTOCOL: &str = "IMPORTANT — MemPalace Memory Protocol:\n1. ON WAKE-UP: Call mempalace_wake_up with agent_name to load identity, palace status, recent changes, current project context, and recent diaries across agents.\n2. BEFORE RESPONDING about any person, project, or past event: call mempalace_kg_query or mempalace_search FIRST. Never guess — verify.\n3. IF UNSURE about a fact (name, gender, age, relationship): say \"let me check\" and query the palace. Wrong is worse than slow.\n4. AFTER EACH SESSION: call mempalace_diary_write to record what happened, what you learned, what matters.\n5. WHEN FACTS CHANGE: call mempalace_kg_invalidate on the old fact, mempalace_kg_add for the new one.\n6. WHEN IDENTITY CHANGES: call mempalace_identity_update so future sessions wake up with the corrected identity.\n\nThis protocol ensures the AI KNOWS before it speaks. Storage is not memory — but storage + this protocol = memory.";
 
@@ -699,20 +703,25 @@ where
         let latest_changes = render_change_events(latest_events)?;
 
         let project_changes = if let Some(wing) = &wing {
-            let search_limit = project_limit.saturating_mul(20).max(project_limit).max(50);
-            let events = self
+            let search_limit = project_limit
+                .saturating_mul(WAKE_UP_PROJECT_SEARCH_MULTIPLIER)
+                .max(project_limit)
+                .max(WAKE_UP_PROJECT_MIN_SEARCH_LIMIT);
+            let all_events = self
                 .storage
                 .operational_store()
                 .get_recent_changes(search_limit)
-                .map_tool_internal()?
-                .into_iter()
-                .filter(|event| change_event_matches_wing(event, wing.as_str()))
-                .rev()
-                .take(project_limit)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect::<Vec<_>>();
+                .map_tool_internal()?;
+            let mut events = Vec::with_capacity(project_limit);
+            for event in all_events.into_iter().rev() {
+                if change_event_matches_wing(&event, wing.as_str()) {
+                    events.push(event);
+                    if events.len() >= project_limit {
+                        break;
+                    }
+                }
+            }
+            events.reverse();
             render_change_events(events)?
         } else {
             Vec::new()

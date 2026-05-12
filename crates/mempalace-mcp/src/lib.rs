@@ -39,7 +39,7 @@ const DIARY_ROOM: &str = "diary";
 const DIARY_HALL: &str = "hall_diary";
 const DIARY_TOPIC_PREFIX: &str = "diary:";
 
-pub const PALACE_PROTOCOL: &str = "IMPORTANT — MemPalace Memory Protocol:\n1. ON WAKE-UP: Call mempalace_wake_up to load identity, recent palace changes, and current project context.\n2. BEFORE RESPONDING about any person, project, or past event: call mempalace_kg_query or mempalace_search FIRST. Never guess — verify.\n3. IF UNSURE about a fact (name, gender, age, relationship): say \"let me check\" and query the palace. Wrong is worse than slow.\n4. AFTER EACH SESSION: call mempalace_diary_write to record what happened, what you learned, what matters.\n5. WHEN FACTS CHANGE: call mempalace_kg_invalidate on the old fact, mempalace_kg_add for the new one.\n6. WHEN IDENTITY CHANGES: call mempalace_identity_update so future sessions wake up with the corrected identity.\n\nThis protocol ensures the AI KNOWS before it speaks. Storage is not memory — but storage + this protocol = memory.";
+pub const PALACE_PROTOCOL: &str = "IMPORTANT — MemPalace Memory Protocol:\n1. ON WAKE-UP: Call mempalace_wake_up with agent_name to load identity, palace status, recent changes, current project context, and your diary.\n2. BEFORE RESPONDING about any person, project, or past event: call mempalace_kg_query or mempalace_search FIRST. Never guess — verify.\n3. IF UNSURE about a fact (name, gender, age, relationship): say \"let me check\" and query the palace. Wrong is worse than slow.\n4. AFTER EACH SESSION: call mempalace_diary_write to record what happened, what you learned, what matters.\n5. WHEN FACTS CHANGE: call mempalace_kg_invalidate on the old fact, mempalace_kg_add for the new one.\n6. WHEN IDENTITY CHANGES: call mempalace_identity_update so future sessions wake up with the corrected identity.\n\nThis protocol ensures the AI KNOWS before it speaks. Storage is not memory — but storage + this protocol = memory.";
 
 pub const AAAK_SPEC: &str = "AAAK is a compressed memory dialect that MemPalace uses for efficient storage.\nIt is designed to be readable by both humans and LLMs without decoding.\n\nFORMAT:\n  ENTITIES: 3-letter uppercase codes. ALC=Alice, JOR=Jordan, RIL=Riley, MAX=Max, BEN=Ben.\n  EMOTIONS: *action markers* before/during text. *warm*=joy, *fierce*=determined, *raw*=vulnerable, *bloom*=tenderness.\n  STRUCTURE: Pipe-separated fields. FAM: family | PROJ: projects | ⚠: warnings/reminders.\n  DATES: ISO format (2026-03-31). COUNTS: Nx = N mentions (e.g., 570x).\n  IMPORTANCE: ★ to ★★★★★ (1-5 scale).\n  HALLS: hall_facts, hall_events, hall_discoveries, hall_preferences, hall_advice.\n  WINGS: wing_user, wing_agent, wing_team, wing_code, wing_myproject, wing_hardware, wing_ue5, wing_ai_research.\n  ROOMS: Hyphenated slugs representing named ideas (e.g., chromadb-setup, gpu-pricing).\n\nEXAMPLE:\n  FAM: ALC→♡JOR | 2D(kids): RIL(18,sports) MAX(11,chess+swimming) | BEN(contributor)\n\nRead AAAK naturally — expand codes mentally, treat *markers* as emotional context.\nWhen WRITING AAAK: use entity codes, mark emotions, keep structure tight.";
 
@@ -225,13 +225,15 @@ impl ToolName {
         match self {
             Self::WakeUp => ToolDefinition {
                 name: self.as_str(),
-                description: "Wake up into the palace. Returns identity.txt, a short recent change history across all projects and agents, and a short recent history for the current project wing when provided.",
+                description: "Wake up into the palace. Returns identity.txt, palace status, recent palace changes, current project history when provided, and recent diary entries when agent_name is provided.",
                 input_schema: json!({
                     "type":"object",
                     "properties":{
                         "wing":{"type":"string","description":"Current project wing for project-specific history (optional, e.g. wing_myproject)"},
+                        "agent_name":{"type":"string","description":"Agent name for recent diary entries (optional, e.g. claude)"},
                         "latest_limit":{"type":"integer","description":"Max recent changes across the whole palace (default 8)"},
-                        "project_limit":{"type":"integer","description":"Max recent changes for the current project wing (default 8)"}
+                        "project_limit":{"type":"integer","description":"Max recent changes for the current project wing (default 8)"},
+                        "diary_limit":{"type":"integer","description":"Max recent diary entries for agent_name (default 10)"}
                     }
                 }),
             },
@@ -682,10 +684,13 @@ where
     async fn tool_wake_up(&mut self, arguments: &Value) -> ToolResult<Value> {
         let wing =
             optional_string(arguments, "wing")?.map(|value| parse_wing_id(&value)).transpose()?;
+        let agent_name = optional_string(arguments, "agent_name")?;
         let latest_limit = optional_usize(arguments, "latest_limit")?.unwrap_or(8).min(25);
         let project_limit = optional_usize(arguments, "project_limit")?.unwrap_or(8).min(25);
+        let diary_limit = optional_usize(arguments, "diary_limit")?.unwrap_or(10).min(25);
 
         let identity = self.read_identity_text()?;
+        let status = self.status_payload().await?;
         let latest_events = self
             .storage
             .operational_store()
@@ -712,10 +717,19 @@ where
         } else {
             Vec::new()
         };
+        let diary = if let Some(agent_name) = agent_name {
+            self.diary_read_payload(agent_name, diary_limit).await?
+        } else {
+            json!({
+                "entries": [],
+                "message": "Pass `agent_name` to include recent diary entries.",
+            })
+        };
 
         Ok(json!({
             "identity_path": self.identity_path(),
             "identity": identity,
+            "status": status,
             "latest_changes": latest_changes,
             "current_project": {
                 "wing": wing.as_ref().map(|wing| wing.as_str()).unwrap_or("unspecified"),
@@ -726,10 +740,15 @@ where
                     json!("Pass `wing` to include current project history.")
                 },
             },
+            "diary": diary,
         }))
     }
 
     async fn tool_status(&mut self) -> ToolResult<Value> {
+        self.status_payload().await
+    }
+
+    async fn status_payload(&mut self) -> ToolResult<Value> {
         let drawers = self.list_all_drawers().await?;
         let mut wings = BTreeMap::<String, usize>::new();
         let mut rooms = BTreeMap::<String, usize>::new();
@@ -1046,6 +1065,10 @@ where
     async fn tool_diary_read(&mut self, arguments: &Value) -> ToolResult<Value> {
         let agent_name = required_string(arguments, "agent_name")?;
         let last_n = optional_usize(arguments, "last_n")?.unwrap_or(10);
+        self.diary_read_payload(agent_name, last_n).await
+    }
+
+    async fn diary_read_payload(&mut self, agent_name: String, last_n: usize) -> ToolResult<Value> {
         let room = parse_room_id(DIARY_ROOM)?;
         let primary_wing = parse_wing_id(&diary_wing_name(&agent_name))?;
         let mut drawers = self
@@ -2202,13 +2225,19 @@ mod tests {
             .handle_request(tool_call(
                 602,
                 "mempalace_wake_up",
-                json!({"wing":"wakeup_project","latest_limit":10,"project_limit":5}),
+                json!({"wing":"wakeup_project","agent_name":"Wake Bot","latest_limit":10,"project_limit":5}),
             ))
             .await;
         let payload = decode_tool_payload(&response).unwrap();
 
         assert_eq!(payload["identity"], "## L0 - IDENTITY\nAgent identity for tests.");
+        assert_eq!(payload["status"]["total_drawers"], 4);
+        assert_eq!(payload["status"]["protocol"], PALACE_PROTOCOL);
+        assert_eq!(payload["status"]["aaak_dialect"], AAAK_SPEC);
         assert_eq!(payload["current_project"]["wing"], "wing_wakeup_project");
+        assert_eq!(payload["diary"]["agent"], "Wake Bot");
+        assert_eq!(payload["diary"]["showing"], 1);
+        assert_eq!(payload["diary"]["entries"][0]["topic"], "wakeup");
 
         let latest = payload["latest_changes"].as_array().unwrap();
         assert!(

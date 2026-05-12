@@ -14,7 +14,7 @@ The AI does the actual filing — it knows the conversation context, so it class
 
 ## Init Hook — Session Orientation
 
-The init hook fires on the **first user message of each session** and injects context instructing the AI to call `mempalace_status` and `mempalace_diary_read` before it responds. This means Claude arrives in every session already oriented — it knows what project it's in, what was decided last time, and what still needs doing.
+The init hook fires on the **first user message of each session** and injects context instructing the AI to call `mempalace_wake_up` before it responds. This means Claude arrives in every session already oriented — it knows its identity, palace status, recent changes, what was decided last time, and what still needs doing.
 
 It uses a `/tmp/claude-mp-<session_id>` marker file to fire exactly once per session. The marker files are small and are cleared automatically on reboot.
 
@@ -148,7 +148,7 @@ User sends first message of session → Claude Code fires UserPromptSubmit hook
                                                           ↓
                                                    Claude Code injects context into AI turn
                                                           ↓
-                                                   AI calls mempalace_status + diary_read
+                                                   AI calls mempalace_wake_up
                                                           ↓
                                                    AI responds, already oriented
 ```

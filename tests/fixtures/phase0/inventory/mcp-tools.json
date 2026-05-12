@@ -369,9 +369,17 @@
     }
   },
   "mempalace_wake_up": {
-    "description": "Wake up into the palace. Returns identity.txt, a short recent change history across all projects and agents, and a short recent history for the current project wing when provided.",
+    "description": "Wake up into the palace. Returns identity.txt, palace status, recent palace changes, current project history when provided, and recent diary entries when agent_name is provided.",
     "input_schema": {
       "properties": {
+        "agent_name": {
+          "description": "Agent name for recent diary entries (optional, e.g. claude)",
+          "type": "string"
+        },
+        "diary_limit": {
+          "description": "Max recent diary entries for agent_name (default 10)",
+          "type": "integer"
+        },
         "latest_limit": {
           "description": "Max recent changes across the whole palace (default 8)",
           "type": "integer"

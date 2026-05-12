@@ -2159,8 +2159,8 @@ mod tests {
     #[tokio::test]
     async fn ingests_conversation_fixture_in_both_modes_in_same_wing() {
         let tempdir = tempdir().unwrap();
-        let fixture_root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures/phase0/inputs/convos");
+        let fixture_root =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/phase0/inputs/convos");
         let engine = open_engine(tempdir.path()).await;
         let mut provider =
             FakeEmbeddingProvider::new(EmbeddingProfile::Balanced.metadata().dimensions);

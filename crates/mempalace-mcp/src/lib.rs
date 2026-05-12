@@ -18,8 +18,8 @@ use mempalace_graph::{
 };
 use mempalace_search::{SearchRuntime, SearchRuntimePolicy};
 use mempalace_storage::{
-    ChangeEvent, ChangeLogStore, DrawerFilter, DrawerStore, DuplicateStrategy,
-    IngestCommitRequest, StorageEngine,
+    ChangeEvent, ChangeLogStore, DrawerFilter, DrawerStore, DuplicateStrategy, IngestCommitRequest,
+    StorageEngine,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -38,8 +38,14 @@ const DUPLICATE_SEARCH_LIMIT: usize = 5;
 const DIARY_ROOM: &str = "diary";
 const DIARY_HALL: &str = "hall_diary";
 const DIARY_TOPIC_PREFIX: &str = "diary:";
+// Project-specific wake-up history scans farther back because global changes
+// are interleaved across wings, but stops collecting as soon as the limit is met.
+const WAKE_UP_PROJECT_SEARCH_MULTIPLIER: usize = 20;
+const WAKE_UP_PROJECT_MIN_SEARCH_LIMIT: usize = 50;
+const IDENTITY_UPDATE_MAX_CONTENT_BYTES: usize = 16 * 1024;
+const IDENTITY_MAX_BYTES: usize = 64 * 1024;
 
-pub const PALACE_PROTOCOL: &str = "IMPORTANT — MemPalace Memory Protocol:\n1. ON WAKE-UP: Call mempalace_status to load palace overview + AAAK spec.\n2. BEFORE RESPONDING about any person, project, or past event: call mempalace_kg_query or mempalace_search FIRST. Never guess — verify.\n3. IF UNSURE about a fact (name, gender, age, relationship): say \"let me check\" and query the palace. Wrong is worse than slow.\n4. AFTER EACH SESSION: call mempalace_diary_write to record what happened, what you learned, what matters.\n5. WHEN FACTS CHANGE: call mempalace_kg_invalidate on the old fact, mempalace_kg_add for the new one.\n\nThis protocol ensures the AI KNOWS before it speaks. Storage is not memory — but storage + this protocol = memory.";
+pub const PALACE_PROTOCOL: &str = "IMPORTANT — MemPalace Memory Protocol:\n1. ON WAKE-UP: Call mempalace_wake_up with agent_name to load identity, palace status, recent changes, current project context, and recent diaries across agents.\n2. BEFORE RESPONDING about any person, project, or past event: call mempalace_kg_query or mempalace_search FIRST. Never guess — verify.\n3. IF UNSURE about a fact (name, gender, age, relationship): say \"let me check\" and query the palace. Wrong is worse than slow.\n4. AFTER EACH SESSION: call mempalace_diary_write to record what happened, what you learned, what matters.\n5. WHEN FACTS CHANGE: call mempalace_kg_invalidate on the old fact, mempalace_kg_add for the new one.\n6. WHEN IDENTITY CHANGES: call mempalace_identity_update so future sessions wake up with the corrected identity.\n\nThis protocol ensures the AI KNOWS before it speaks. Storage is not memory — but storage + this protocol = memory.";
 
 pub const AAAK_SPEC: &str = "AAAK is a compressed memory dialect that MemPalace uses for efficient storage.\nIt is designed to be readable by both humans and LLMs without decoding.\n\nFORMAT:\n  ENTITIES: 3-letter uppercase codes. ALC=Alice, JOR=Jordan, RIL=Riley, MAX=Max, BEN=Ben.\n  EMOTIONS: *action markers* before/during text. *warm*=joy, *fierce*=determined, *raw*=vulnerable, *bloom*=tenderness.\n  STRUCTURE: Pipe-separated fields. FAM: family | PROJ: projects | ⚠: warnings/reminders.\n  DATES: ISO format (2026-03-31). COUNTS: Nx = N mentions (e.g., 570x).\n  IMPORTANCE: ★ to ★★★★★ (1-5 scale).\n  HALLS: hall_facts, hall_events, hall_discoveries, hall_preferences, hall_advice.\n  WINGS: wing_user, wing_agent, wing_team, wing_code, wing_myproject, wing_hardware, wing_ue5, wing_ai_research.\n  ROOMS: Hyphenated slugs representing named ideas (e.g., chromadb-setup, gpu-pricing).\n\nEXAMPLE:\n  FAM: ALC→♡JOR | 2D(kids): RIL(18,sports) MAX(11,chess+swimming) | BEN(contributor)\n\nRead AAAK naturally — expand codes mentally, treat *markers* as emotional context.\nWhen WRITING AAAK: use entity codes, mark emotions, keep structure tight.";
 
@@ -135,6 +141,7 @@ pub struct ToolDefinition {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ToolName {
+    WakeUp,
     Status,
     ListWings,
     ListRooms,
@@ -155,11 +162,14 @@ enum ToolName {
     DiaryWrite,
     DiaryRead,
     GetChangesSince,
+    IdentityRead,
+    IdentityUpdate,
 }
 
 impl ToolName {
-    fn all() -> [Self; 20] {
+    fn all() -> [Self; 23] {
         [
+            Self::WakeUp,
             Self::Status,
             Self::ListWings,
             Self::ListRooms,
@@ -180,11 +190,14 @@ impl ToolName {
             Self::DiaryWrite,
             Self::DiaryRead,
             Self::GetChangesSince,
+            Self::IdentityRead,
+            Self::IdentityUpdate,
         ]
     }
 
     fn as_str(self) -> &'static str {
         match self {
+            Self::WakeUp => "mempalace_wake_up",
             Self::Status => "mempalace_status",
             Self::ListWings => "mempalace_list_wings",
             Self::ListRooms => "mempalace_list_rooms",
@@ -205,6 +218,8 @@ impl ToolName {
             Self::DiaryWrite => "mempalace_diary_write",
             Self::DiaryRead => "mempalace_diary_read",
             Self::GetChangesSince => "mempalace_get_changes_since",
+            Self::IdentityRead => "mempalace_identity_read",
+            Self::IdentityUpdate => "mempalace_identity_update",
         }
     }
 
@@ -214,6 +229,20 @@ impl ToolName {
 
     fn definition(self) -> ToolDefinition {
         match self {
+            Self::WakeUp => ToolDefinition {
+                name: self.as_str(),
+                description: "Wake up into the palace. Returns identity.txt, palace status, recent palace changes, current project history when provided, and recent diary entries across all agents.",
+                input_schema: json!({
+                    "type":"object",
+                    "properties":{
+                        "wing":{"type":"string","description":"Current project wing for project-specific history (optional, e.g. wing_myproject)"},
+                        "agent_name":{"type":"string","description":"Current agent name for wake-up context (optional, e.g. claude)"},
+                        "latest_limit":{"type":"integer","description":"Max recent changes across the whole palace (default 8)"},
+                        "project_limit":{"type":"integer","description":"Max recent changes for the current project wing (default 8)"},
+                        "diary_limit":{"type":"integer","description":"Max recent diary entries across all agents (default 10)"}
+                    }
+                }),
+            },
             Self::Status => ToolDefinition {
                 name: self.as_str(),
                 description: "Palace overview — total drawers, wing and room counts",
@@ -411,6 +440,24 @@ impl ToolName {
                     }
                 }),
             },
+            Self::IdentityRead => ToolDefinition {
+                name: self.as_str(),
+                description: "Read the configured identity.txt used by mempalace_wake_up.",
+                input_schema: json!({"type":"object","properties":{}}),
+            },
+            Self::IdentityUpdate => ToolDefinition {
+                name: self.as_str(),
+                description: "Update identity.txt for future wake-ups. Use replace for a full corrected identity or append for a dated note.",
+                input_schema: json!({
+                    "type":"object",
+                    "properties":{
+                        "content":{"type":"string","description":"Identity text or note to write, max 16 KiB per update","maxLength":IDENTITY_UPDATE_MAX_CONTENT_BYTES},
+                        "agent_name":{"type":"string","description":"Agent making the update (optional)"},
+                        "mode":{"type":"string","description":"replace or append (default replace)"}
+                    },
+                    "required":["content"]
+                }),
+            },
         }
     }
 }
@@ -576,6 +623,7 @@ where
 
         let mut runtime = self.runtime.lock().await;
         let result = match tool {
+            ToolName::WakeUp => runtime.tool_wake_up(&call.arguments).await,
             ToolName::Status => runtime.tool_status().await,
             ToolName::ListWings => runtime.tool_list_wings().await,
             ToolName::ListRooms => runtime.tool_list_rooms(&call.arguments).await,
@@ -596,6 +644,8 @@ where
             ToolName::DiaryWrite => runtime.tool_diary_write(&call.arguments).await,
             ToolName::DiaryRead => runtime.tool_diary_read(&call.arguments).await,
             ToolName::GetChangesSince => runtime.tool_get_changes_since(&call.arguments).await,
+            ToolName::IdentityRead => runtime.tool_identity_read().await,
+            ToolName::IdentityUpdate => runtime.tool_identity_update(&call.arguments).await,
         };
 
         match result {
@@ -637,7 +687,72 @@ where
         })
     }
 
+    async fn tool_wake_up(&mut self, arguments: &Value) -> ToolResult<Value> {
+        let wing =
+            optional_string(arguments, "wing")?.map(|value| parse_wing_id(&value)).transpose()?;
+        let agent_name = optional_string(arguments, "agent_name")?;
+        let latest_limit = optional_usize(arguments, "latest_limit")?.unwrap_or(8).min(25);
+        let project_limit = optional_usize(arguments, "project_limit")?.unwrap_or(8).min(25);
+        let diary_limit = optional_usize(arguments, "diary_limit")?.unwrap_or(10).min(25);
+
+        let identity = self.read_identity_text()?;
+        let status = self.status_payload().await?;
+        let latest_events = self
+            .storage
+            .operational_store()
+            .get_recent_changes(latest_limit)
+            .map_tool_internal()?;
+        let latest_changes = render_change_events(latest_events)?;
+
+        let project_changes = if let Some(wing) = &wing {
+            let search_limit = project_limit
+                .saturating_mul(WAKE_UP_PROJECT_SEARCH_MULTIPLIER)
+                .max(project_limit)
+                .max(WAKE_UP_PROJECT_MIN_SEARCH_LIMIT);
+            let all_events = self
+                .storage
+                .operational_store()
+                .get_recent_changes(search_limit)
+                .map_tool_internal()?;
+            let mut events = Vec::with_capacity(project_limit);
+            for event in all_events.into_iter().rev() {
+                if change_event_matches_wing(&event, wing.as_str()) {
+                    events.push(event);
+                    if events.len() >= project_limit {
+                        break;
+                    }
+                }
+            }
+            events.reverse();
+            render_change_events(events)?
+        } else {
+            Vec::new()
+        };
+        let diary = self.diary_read_all_payload(agent_name.as_deref(), diary_limit).await?;
+
+        Ok(json!({
+            "identity_path": self.identity_path(),
+            "identity": identity,
+            "status": status,
+            "latest_changes": latest_changes,
+            "current_project": {
+                "wing": wing.as_ref().map(|wing| wing.as_str()).unwrap_or("unspecified"),
+                "changes": project_changes,
+                "message": if wing.is_some() {
+                    Value::Null
+                } else {
+                    json!("Pass `wing` to include current project history.")
+                },
+            },
+            "diary": diary,
+        }))
+    }
+
     async fn tool_status(&mut self) -> ToolResult<Value> {
+        self.status_payload().await
+    }
+
+    async fn status_payload(&mut self) -> ToolResult<Value> {
         let drawers = self.list_all_drawers().await?;
         let mut wings = BTreeMap::<String, usize>::new();
         let mut rooms = BTreeMap::<String, usize>::new();
@@ -652,6 +767,81 @@ where
             "palace_path": self.config.palace_path,
             "protocol": PALACE_PROTOCOL,
             "aaak_dialect": AAAK_SPEC,
+        }))
+    }
+
+    async fn tool_identity_read(&mut self) -> ToolResult<Value> {
+        Ok(json!({
+            "identity_path": self.identity_path(),
+            "identity": self.read_identity_text()?,
+        }))
+    }
+
+    async fn tool_identity_update(&mut self, arguments: &Value) -> ToolResult<Value> {
+        let content = required_string(arguments, "content")?;
+        let content = content.trim();
+        if content.is_empty() {
+            return Err(ToolError::InvalidParams("identity content cannot be blank".to_owned()));
+        }
+        if content.len() > IDENTITY_UPDATE_MAX_CONTENT_BYTES {
+            return Err(ToolError::InvalidParams(format!(
+                "identity content exceeds {} byte limit",
+                IDENTITY_UPDATE_MAX_CONTENT_BYTES
+            )));
+        }
+        let agent_name = optional_string(arguments, "agent_name")?;
+        let mode = optional_string(arguments, "mode")?.unwrap_or_else(|| "replace".to_owned());
+        if mode != "replace" && mode != "append" {
+            return Err(ToolError::InvalidParams(
+                "identity update mode must be `replace` or `append`".to_owned(),
+            ));
+        }
+
+        let path = self.identity_path();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|source| {
+                ToolError::Internal(McpError::Io { path: parent.to_path_buf(), source })
+            })?;
+        }
+
+        let next_identity = if mode == "append" && path.exists() {
+            let mut existing = fs::read_to_string(&path).map_err(|source| {
+                ToolError::Internal(McpError::Io { path: path.clone(), source })
+            })?;
+            if !existing.ends_with('\n') {
+                existing.push('\n');
+            }
+            existing.push_str(content);
+            existing.push('\n');
+            existing
+        } else {
+            format!("{content}\n")
+        };
+        if next_identity.len() > IDENTITY_MAX_BYTES {
+            return Err(ToolError::InvalidParams(format!(
+                "identity.txt would exceed {} byte limit",
+                IDENTITY_MAX_BYTES
+            )));
+        }
+
+        fs::write(&path, &next_identity)
+            .map_err(|source| ToolError::Internal(McpError::Io { path: path.clone(), source }))?;
+
+        let now = OffsetDateTime::now_utc();
+        self.log_change(ChangeEvent {
+            event_type: "identity_updated".to_owned(),
+            occurred_at: now,
+            entity_id: path.display().to_string(),
+            actor: agent_name.clone(),
+            details_json: Some(json!({"mode": mode, "path": path}).to_string()),
+        });
+
+        Ok(json!({
+            "success": true,
+            "identity_path": path,
+            "mode": mode,
+            "agent": agent_name,
+            "timestamp": format_rfc3339(now)?,
         }))
     }
 
@@ -800,9 +990,7 @@ where
             occurred_at: now,
             entity_id: drawer_id.as_str().to_owned(),
             actor: Some(added_by),
-            details_json: Some(
-                json!({"wing": wing.as_str(), "room": room.as_str()}).to_string(),
-            ),
+            details_json: Some(json!({"wing": wing.as_str(), "room": room.as_str()}).to_string()),
         });
 
         Ok(json!({
@@ -893,6 +1081,10 @@ where
     async fn tool_diary_read(&mut self, arguments: &Value) -> ToolResult<Value> {
         let agent_name = required_string(arguments, "agent_name")?;
         let last_n = optional_usize(arguments, "last_n")?.unwrap_or(10);
+        self.diary_read_payload(agent_name, last_n).await
+    }
+
+    async fn diary_read_payload(&mut self, agent_name: String, last_n: usize) -> ToolResult<Value> {
         let room = parse_room_id(DIARY_ROOM)?;
         let primary_wing = parse_wing_id(&diary_wing_name(&agent_name))?;
         let mut drawers = self
@@ -959,6 +1151,46 @@ where
 
         Ok(json!({
             "agent": agent_name,
+            "entries": entries,
+            "total": total,
+            "showing": total.min(last_n),
+        }))
+    }
+
+    async fn diary_read_all_payload(
+        &mut self,
+        current_agent: Option<&str>,
+        last_n: usize,
+    ) -> ToolResult<Value> {
+        let room = parse_room_id(DIARY_ROOM)?;
+        let mut drawers = self
+            .storage
+            .drawer_store()
+            .list_drawers(&DrawerFilter { room: Some(room), ..DrawerFilter::default() })
+            .await
+            .map_tool()?;
+        drawers.retain(|drawer| drawer.ingest_mode == "diary");
+
+        if drawers.is_empty() {
+            return Ok(json!({
+                "scope": "all_agents",
+                "current_agent": current_agent,
+                "entries": [],
+                "message": "No diary entries yet.",
+            }));
+        }
+
+        drawers.sort_by(|left, right| right.filed_at.cmp(&left.filed_at));
+        let total = drawers.len();
+        let entries = drawers
+            .into_iter()
+            .take(last_n)
+            .map(|drawer| render_diary_entry(drawer, true))
+            .collect::<ToolResult<Vec<_>>>()?;
+
+        Ok(json!({
+            "scope": "all_agents",
+            "current_agent": current_agent,
             "entries": entries,
             "total": total,
             "showing": total.min(last_n),
@@ -1069,9 +1301,8 @@ where
             .unwrap_or_else(|| OffsetDateTime::now_utc().date());
         let now = OffsetDateTime::now_utc();
         let runtime = KnowledgeGraphRuntime::new(self.storage.operational_store());
-        let invalidated = runtime
-            .invalidate(&subject, &predicate, &object, ended, now)
-            .map_tool_internal()?;
+        let invalidated =
+            runtime.invalidate(&subject, &predicate, &object, ended, now).map_tool_internal()?;
 
         if invalidated > 0 {
             self.log_change(ChangeEvent {
@@ -1197,6 +1428,25 @@ where
         let _ = self.storage.operational_store().append_event(&event);
     }
 
+    fn identity_path(&self) -> PathBuf {
+        self.config
+            .palace_path
+            .parent()
+            .map(|parent| parent.join("identity.txt"))
+            .unwrap_or_else(|| PathBuf::from("identity.txt"))
+    }
+
+    fn read_identity_text(&self) -> ToolResult<String> {
+        let path = self.identity_path();
+        match fs::read_to_string(&path) {
+            Ok(text) => Ok(text.trim().to_owned()),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                Ok(format!("## L0 — IDENTITY\nNo identity configured. Create {}", path.display()))
+            }
+            Err(source) => Err(ToolError::Internal(McpError::Io { path, source })),
+        }
+    }
+
     async fn tool_get_changes_since(&mut self, arguments: &Value) -> ToolResult<Value> {
         let since_str = optional_string(arguments, "since")?;
         let since = since_str
@@ -1212,30 +1462,11 @@ where
             .unwrap_or(OffsetDateTime::UNIX_EPOCH);
         let limit = optional_usize(arguments, "limit")?.unwrap_or(50);
 
-        let events = self
-            .storage
-            .operational_store()
-            .get_changes_since(since, limit)
-            .map_tool_internal()?;
+        let events =
+            self.storage.operational_store().get_changes_since(since, limit).map_tool_internal()?;
 
         let count = events.len();
-        let event_list = events
-            .into_iter()
-            .map(|ev| {
-                let details: Value = ev
-                    .details_json
-                    .as_deref()
-                    .and_then(|s| serde_json::from_str(s).ok())
-                    .unwrap_or(Value::Null);
-                json!({
-                    "event_type": ev.event_type,
-                    "occurred_at": format_rfc3339(ev.occurred_at).unwrap_or_default(),
-                    "entity_id": ev.entity_id,
-                    "actor": ev.actor,
-                    "details": details,
-                })
-            })
-            .collect::<Vec<_>>();
+        let event_list = render_change_events(events)?;
 
         Ok(json!({
             "since": since_str.unwrap_or_else(|| "epoch".to_owned()),
@@ -1289,6 +1520,71 @@ impl TryFrom<JsonRpcRequest> for ToolCallRequest {
             });
         }
         Ok(Self { id: request.id, name, arguments })
+    }
+}
+
+fn render_change_events(events: Vec<ChangeEvent>) -> ToolResult<Vec<Value>> {
+    events
+        .into_iter()
+        .map(|event| {
+            let details = change_event_details(&event);
+            let occurred_at = format_rfc3339(event.occurred_at)?;
+            let actor = event.actor.clone();
+            Ok(json!({
+                "event_type": event.event_type,
+                "occurred_at": occurred_at,
+                "entity_id": event.entity_id,
+                "actor": actor,
+                "details": details,
+                "summary": summarize_change_event(&event, &details),
+            }))
+        })
+        .collect()
+}
+
+fn change_event_details(event: &ChangeEvent) -> Value {
+    event
+        .details_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str(raw).ok())
+        .unwrap_or(Value::Null)
+}
+
+fn change_event_matches_wing(event: &ChangeEvent, wing: &str) -> bool {
+    change_event_details(event)
+        .get("wing")
+        .and_then(Value::as_str)
+        .map(|event_wing| event_wing == wing)
+        .unwrap_or(false)
+}
+
+fn summarize_change_event(event: &ChangeEvent, details: &Value) -> String {
+    let actor = event.actor.as_deref().unwrap_or("unknown");
+    match event.event_type.as_str() {
+        "drawer_added" => format!(
+            "{actor} added drawer in {}/{}",
+            details.get("wing").and_then(Value::as_str).unwrap_or("unknown-wing"),
+            details.get("room").and_then(Value::as_str).unwrap_or("unknown-room")
+        ),
+        "drawer_deleted" => format!("{actor} deleted drawer {}", event.entity_id),
+        "diary_written" => format!(
+            "{actor} wrote diary entry on {}",
+            details.get("topic").and_then(Value::as_str).unwrap_or("general")
+        ),
+        "kg_fact_added" => format!(
+            "{actor} added fact: {} -> {} -> {}",
+            details.get("subject").and_then(Value::as_str).unwrap_or("?"),
+            details.get("predicate").and_then(Value::as_str).unwrap_or("?"),
+            details.get("object").and_then(Value::as_str).unwrap_or("?")
+        ),
+        "kg_fact_invalidated" => format!(
+            "{actor} invalidated fact: {} -> {} -> {}",
+            details.get("subject").and_then(Value::as_str).unwrap_or("?"),
+            details.get("predicate").and_then(Value::as_str).unwrap_or("?"),
+            details.get("object").and_then(Value::as_str).unwrap_or("?")
+        ),
+        "identity_updated" => format!("{actor} updated identity"),
+        other => format!("{actor} recorded {other} for {}", event.entity_id),
     }
 }
 
@@ -1421,6 +1717,22 @@ fn parse_direction(value: &str) -> ToolResult<QueryDirection> {
 
 fn format_date(value: Date) -> String {
     value.to_string()
+}
+
+fn render_diary_entry(drawer: DrawerRecord, include_agent: bool) -> ToolResult<Value> {
+    let topic = drawer.source_file.strip_prefix(DIARY_TOPIC_PREFIX).unwrap_or("general").to_owned();
+    let date = drawer.date.map(format_date).unwrap_or_else(|| drawer.filed_at.date().to_string());
+    let timestamp = format_rfc3339(drawer.filed_at)?;
+    let mut entry = json!({
+        "date": date,
+        "timestamp": timestamp,
+        "topic": topic,
+        "content": drawer.content,
+    });
+    if include_agent {
+        entry["agent"] = json!(drawer.added_by);
+    }
+    Ok(entry)
 }
 
 fn round_similarity(value: f32) -> f32 {
@@ -1950,6 +2262,185 @@ mod tests {
         assert_eq!(payload["total_drawers"], 2);
         assert_eq!(payload["protocol"], PALACE_PROTOCOL);
         assert_eq!(payload["aaak_dialect"], AAAK_SPEC);
+    }
+
+    #[tokio::test]
+    async fn wake_up_returns_identity_and_recent_project_changes() {
+        let harness = test_harness().await;
+        let identity_path = {
+            let runtime = harness.server.runtime.lock().await;
+            runtime.identity_path()
+        };
+        fs::write(&identity_path, "## L0 - IDENTITY\nAgent identity for tests.\n").unwrap();
+
+        harness
+            .server
+            .handle_request(tool_call(
+                600,
+                "mempalace_add_drawer",
+                json!({"wing":"wing_wakeup_project","room":"notes",
+                       "content":"Wake-up project history test content.",
+                       "added_by":"wakeup-agent"}),
+            ))
+            .await;
+        harness
+            .server
+            .handle_request(tool_call(
+                601,
+                "mempalace_diary_write",
+                json!({"agent_name":"Wake Bot","entry":"SESSION:wakeup.changed","topic":"wakeup"}),
+            ))
+            .await;
+        harness
+            .server
+            .handle_request(tool_call(
+                602,
+                "mempalace_diary_write",
+                json!({"agent_name":"Other Bot","entry":"SESSION:other.agent.changed","topic":"handoff"}),
+            ))
+            .await;
+
+        let response = harness
+            .server
+            .handle_request(tool_call(
+                603,
+                "mempalace_wake_up",
+                json!({"wing":"wakeup_project","agent_name":"Wake Bot","latest_limit":10,"project_limit":5}),
+            ))
+            .await;
+        let payload = decode_tool_payload(&response).unwrap();
+
+        assert_eq!(payload["identity"], "## L0 - IDENTITY\nAgent identity for tests.");
+        assert_eq!(payload["status"]["total_drawers"], 5);
+        assert_eq!(payload["status"]["protocol"], PALACE_PROTOCOL);
+        assert_eq!(payload["status"]["aaak_dialect"], AAAK_SPEC);
+        assert_eq!(payload["current_project"]["wing"], "wing_wakeup_project");
+        assert_eq!(payload["diary"]["scope"], "all_agents");
+        assert_eq!(payload["diary"]["current_agent"], "Wake Bot");
+        assert_eq!(payload["diary"]["showing"], 2);
+        let diary_entries = payload["diary"]["entries"].as_array().unwrap();
+        assert!(
+            diary_entries
+                .iter()
+                .any(|entry| entry["agent"] == "Wake Bot" && entry["topic"] == "wakeup"),
+            "expected Wake Bot diary entry in wake-up diary: {payload}"
+        );
+        assert!(
+            diary_entries
+                .iter()
+                .any(|entry| entry["agent"] == "Other Bot" && entry["topic"] == "handoff"),
+            "expected Other Bot diary entry in wake-up diary: {payload}"
+        );
+
+        let latest = payload["latest_changes"].as_array().unwrap();
+        assert!(
+            latest.iter().any(|event| event["event_type"] == "diary_written"),
+            "expected diary_written in latest changes: {payload}"
+        );
+        assert!(
+            latest.iter().any(|event| event["summary"]
+                .as_str()
+                .unwrap()
+                .contains("wakeup-agent added drawer")),
+            "expected drawer summary in latest changes: {payload}"
+        );
+
+        let project = payload["current_project"]["changes"].as_array().unwrap();
+        assert_eq!(project.len(), 1);
+        assert_eq!(project[0]["event_type"], "drawer_added");
+        assert_eq!(project[0]["details"]["wing"], "wing_wakeup_project");
+    }
+
+    #[tokio::test]
+    async fn identity_update_supports_replace_and_append() {
+        let harness = test_harness().await;
+
+        let replace = harness
+            .server
+            .handle_request(tool_call(
+                610,
+                "mempalace_identity_update",
+                json!({"content":"## L0 - IDENTITY\nReplacement identity.","agent_name":"identity-agent"}),
+            ))
+            .await;
+        let replace_payload = decode_tool_payload(&replace).unwrap();
+        assert_eq!(replace_payload["success"], true);
+        assert_eq!(replace_payload["mode"], "replace");
+
+        let append = harness
+            .server
+            .handle_request(tool_call(
+                611,
+                "mempalace_identity_update",
+                json!({"content":"Append note.","agent_name":"identity-agent","mode":"append"}),
+            ))
+            .await;
+        assert_eq!(decode_tool_payload(&append).unwrap()["success"], true);
+
+        let read = harness
+            .server
+            .handle_request(tool_call(612, "mempalace_identity_read", json!({})))
+            .await;
+        let read_payload = decode_tool_payload(&read).unwrap();
+        assert_eq!(
+            read_payload["identity"],
+            "## L0 - IDENTITY\nReplacement identity.\nAppend note."
+        );
+
+        let changes = harness
+            .server
+            .handle_request(tool_call(613, "mempalace_get_changes_since", json!({"limit": 10})))
+            .await;
+        let payload = decode_tool_payload(&changes).unwrap();
+        let identity_updates = payload["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|event| event["event_type"] == "identity_updated")
+            .count();
+        assert_eq!(identity_updates, 2);
+    }
+
+    #[tokio::test]
+    async fn identity_update_rejects_oversized_content() {
+        let harness = test_harness().await;
+        let response = harness
+            .server
+            .handle_request(tool_call(
+                614,
+                "mempalace_identity_update",
+                json!({"content":"x".repeat(IDENTITY_UPDATE_MAX_CONTENT_BYTES + 1)}),
+            ))
+            .await;
+
+        assert_eq!(response["error"]["code"], -32602);
+        assert!(
+            response["error"]["message"].as_str().unwrap().contains("identity content exceeds")
+        );
+    }
+
+    #[tokio::test]
+    async fn identity_update_rejects_oversized_final_file() {
+        let harness = test_harness().await;
+        let identity_path = {
+            let runtime = harness.server.runtime.lock().await;
+            runtime.identity_path()
+        };
+        fs::write(&identity_path, "x".repeat(IDENTITY_MAX_BYTES - 2)).unwrap();
+
+        let response = harness
+            .server
+            .handle_request(tool_call(
+                615,
+                "mempalace_identity_update",
+                json!({"content":"y","mode":"append"}),
+            ))
+            .await;
+
+        assert_eq!(response["error"]["code"], -32602);
+        assert!(
+            response["error"]["message"].as_str().unwrap().contains("identity.txt would exceed")
+        );
     }
 
     #[tokio::test]
@@ -2716,11 +3207,7 @@ mod tests {
         for wing_input in ["ghosttest", "wing_ghosttest", "GhostTest"] {
             let rooms = harness
                 .server
-                .handle_request(tool_call(
-                    401,
-                    "mempalace_list_rooms",
-                    json!({"wing": wing_input}),
-                ))
+                .handle_request(tool_call(401, "mempalace_list_rooms", json!({"wing": wing_input})))
                 .await;
             let rooms_payload = decode_tool_payload(&rooms).unwrap();
             assert_eq!(
@@ -2823,9 +3310,7 @@ mod tests {
             ))
             .await;
 
-        let since_str = t_before
-            .format(&time::format_description::well_known::Rfc3339)
-            .unwrap();
+        let since_str = t_before.format(&time::format_description::well_known::Rfc3339).unwrap();
         let changes = harness
             .server
             .handle_request(tool_call(
@@ -2837,12 +3322,14 @@ mod tests {
         let payload = decode_tool_payload(&changes).unwrap();
         let events = payload["events"].as_array().unwrap();
 
-        let types: Vec<&str> =
-            events.iter().filter_map(|e| e["event_type"].as_str()).collect();
+        let types: Vec<&str> = events.iter().filter_map(|e| e["event_type"].as_str()).collect();
         assert!(types.contains(&"drawer_added"), "expected drawer_added in {types:?}");
         assert!(types.contains(&"diary_written"), "expected diary_written in {types:?}");
         assert!(types.contains(&"kg_fact_added"), "expected kg_fact_added in {types:?}");
-        assert!(types.contains(&"kg_fact_invalidated"), "expected kg_fact_invalidated in {types:?}");
+        assert!(
+            types.contains(&"kg_fact_invalidated"),
+            "expected kg_fact_invalidated in {types:?}"
+        );
 
         // actor is recorded for drawer_added and diary_written
         let drawer_event = events.iter().find(|e| e["event_type"] == "drawer_added").unwrap();

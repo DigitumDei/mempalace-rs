@@ -634,8 +634,8 @@ mod tests {
     use super::{
         Dialect, IdentitySource, Layer1Config, LayerRetrieveRequest, SearchError, SearchRuntime,
         SearchRuntimePolicy, WakeUpFormat, WakeUpRequest, default_identity_path,
-        default_identity_path_from_home, generate_layer1, lexical_overlap_score,
-        normalized_terms, render_search_results, trim_similarity,
+        default_identity_path_from_home, generate_layer1, lexical_overlap_score, normalized_terms,
+        render_search_results, trim_similarity,
     };
     use async_trait::async_trait;
     use mempalace_core::{DrawerId, DrawerRecord, EmbeddingProfile, RoomId, SearchQuery, WingId};

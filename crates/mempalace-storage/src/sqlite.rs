@@ -226,11 +226,8 @@ pub struct ChangeEvent {
 
 pub trait ChangeLogStore {
     fn append_event(&self, event: &ChangeEvent) -> Result<()>;
-    fn get_changes_since(
-        &self,
-        since: OffsetDateTime,
-        limit: usize,
-    ) -> Result<Vec<ChangeEvent>>;
+    fn get_changes_since(&self, since: OffsetDateTime, limit: usize) -> Result<Vec<ChangeEvent>>;
+    fn get_recent_changes(&self, limit: usize) -> Result<Vec<ChangeEvent>>;
 }
 
 #[derive(Debug, Clone)]
@@ -939,11 +936,7 @@ impl ToolStateStore for SqliteOperationalStore {
 
 impl ChangeLogStore for SqliteOperationalStore {
     fn append_event(&self, event: &ChangeEvent) -> Result<()> {
-        let change_id = format!(
-            "{}:{}",
-            event.occurred_at.unix_timestamp_nanos(),
-            event.entity_id
-        );
+        let change_id = format!("{}:{}", event.occurred_at.unix_timestamp_nanos(), event.entity_id);
         let connection = self.open_connection()?;
         connection.execute(
             "INSERT OR IGNORE INTO change_log
@@ -988,6 +981,36 @@ impl ChangeLogStore for SqliteOperationalStore {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(StorageError::from)
+    }
+
+    fn get_recent_changes(&self, limit: usize) -> Result<Vec<ChangeEvent>> {
+        let connection = self.open_connection()?;
+        let mut statement = connection.prepare(
+            "SELECT event_type, occurred_at, entity_id, actor, details_json
+             FROM change_log
+             ORDER BY occurred_at DESC
+             LIMIT ?1",
+        )?;
+        let mut events = statement
+            .query_map(params![limit as i64], |row| {
+                Ok(ChangeEvent {
+                    event_type: row.get(0)?,
+                    occurred_at: decode_time(row.get(1)?).map_err(|err| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            1,
+                            rusqlite::types::Type::Text,
+                            Box::new(err),
+                        )
+                    })?,
+                    entity_id: row.get(2)?,
+                    actor: row.get(3)?,
+                    details_json: row.get(4)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(StorageError::from)?;
+        events.reverse();
+        Ok(events)
     }
 }
 

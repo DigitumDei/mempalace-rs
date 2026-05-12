@@ -178,7 +178,8 @@
           "type": "string"
         },
         "content": {
-          "description": "Identity text or note to write",
+          "description": "Identity text or note to write, max 16 KiB per update",
+          "maxLength": 16384,
           "type": "string"
         },
         "mode": {

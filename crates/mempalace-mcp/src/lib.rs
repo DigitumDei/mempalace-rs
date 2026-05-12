@@ -42,6 +42,8 @@ const DIARY_TOPIC_PREFIX: &str = "diary:";
 // are interleaved across wings, but stops collecting as soon as the limit is met.
 const WAKE_UP_PROJECT_SEARCH_MULTIPLIER: usize = 20;
 const WAKE_UP_PROJECT_MIN_SEARCH_LIMIT: usize = 50;
+const IDENTITY_UPDATE_MAX_CONTENT_BYTES: usize = 16 * 1024;
+const IDENTITY_MAX_BYTES: usize = 64 * 1024;
 
 pub const PALACE_PROTOCOL: &str = "IMPORTANT — MemPalace Memory Protocol:\n1. ON WAKE-UP: Call mempalace_wake_up with agent_name to load identity, palace status, recent changes, current project context, and recent diaries across agents.\n2. BEFORE RESPONDING about any person, project, or past event: call mempalace_kg_query or mempalace_search FIRST. Never guess — verify.\n3. IF UNSURE about a fact (name, gender, age, relationship): say \"let me check\" and query the palace. Wrong is worse than slow.\n4. AFTER EACH SESSION: call mempalace_diary_write to record what happened, what you learned, what matters.\n5. WHEN FACTS CHANGE: call mempalace_kg_invalidate on the old fact, mempalace_kg_add for the new one.\n6. WHEN IDENTITY CHANGES: call mempalace_identity_update so future sessions wake up with the corrected identity.\n\nThis protocol ensures the AI KNOWS before it speaks. Storage is not memory — but storage + this protocol = memory.";
 
@@ -449,7 +451,7 @@ impl ToolName {
                 input_schema: json!({
                     "type":"object",
                     "properties":{
-                        "content":{"type":"string","description":"Identity text or note to write"},
+                        "content":{"type":"string","description":"Identity text or note to write, max 16 KiB per update","maxLength":IDENTITY_UPDATE_MAX_CONTENT_BYTES},
                         "agent_name":{"type":"string","description":"Agent making the update (optional)"},
                         "mode":{"type":"string","description":"replace or append (default replace)"}
                     },
@@ -781,6 +783,12 @@ where
         if content.is_empty() {
             return Err(ToolError::InvalidParams("identity content cannot be blank".to_owned()));
         }
+        if content.len() > IDENTITY_UPDATE_MAX_CONTENT_BYTES {
+            return Err(ToolError::InvalidParams(format!(
+                "identity content exceeds {} byte limit",
+                IDENTITY_UPDATE_MAX_CONTENT_BYTES
+            )));
+        }
         let agent_name = optional_string(arguments, "agent_name")?;
         let mode = optional_string(arguments, "mode")?.unwrap_or_else(|| "replace".to_owned());
         if mode != "replace" && mode != "append" {
@@ -809,6 +817,12 @@ where
         } else {
             format!("{content}\n")
         };
+        if next_identity.len() > IDENTITY_MAX_BYTES {
+            return Err(ToolError::InvalidParams(format!(
+                "identity.txt would exceed {} byte limit",
+                IDENTITY_MAX_BYTES
+            )));
+        }
 
         fs::write(&path, &next_identity)
             .map_err(|source| ToolError::Internal(McpError::Io { path: path.clone(), source }))?;
@@ -2385,6 +2399,48 @@ mod tests {
             .filter(|event| event["event_type"] == "identity_updated")
             .count();
         assert_eq!(identity_updates, 2);
+    }
+
+    #[tokio::test]
+    async fn identity_update_rejects_oversized_content() {
+        let harness = test_harness().await;
+        let response = harness
+            .server
+            .handle_request(tool_call(
+                614,
+                "mempalace_identity_update",
+                json!({"content":"x".repeat(IDENTITY_UPDATE_MAX_CONTENT_BYTES + 1)}),
+            ))
+            .await;
+
+        assert_eq!(response["error"]["code"], -32602);
+        assert!(
+            response["error"]["message"].as_str().unwrap().contains("identity content exceeds")
+        );
+    }
+
+    #[tokio::test]
+    async fn identity_update_rejects_oversized_final_file() {
+        let harness = test_harness().await;
+        let identity_path = {
+            let runtime = harness.server.runtime.lock().await;
+            runtime.identity_path()
+        };
+        fs::write(&identity_path, "x".repeat(IDENTITY_MAX_BYTES - 2)).unwrap();
+
+        let response = harness
+            .server
+            .handle_request(tool_call(
+                615,
+                "mempalace_identity_update",
+                json!({"content":"y","mode":"append"}),
+            ))
+            .await;
+
+        assert_eq!(response["error"]["code"], -32602);
+        assert!(
+            response["error"]["message"].as_str().unwrap().contains("identity.txt would exceed")
+        );
     }
 
     #[tokio::test]

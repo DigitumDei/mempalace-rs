@@ -157,14 +157,8 @@ mod tests {
 
     #[test]
     fn wing_id_normalized_replaces_invalid_chars() {
-        assert_eq!(
-            WingId::normalized("my project").unwrap().as_str(),
-            "wing_my_project"
-        );
-        assert_eq!(
-            WingId::normalized("foo:bar").unwrap().as_str(),
-            "wing_foo_bar"
-        );
+        assert_eq!(WingId::normalized("my project").unwrap().as_str(), "wing_my_project");
+        assert_eq!(WingId::normalized("foo:bar").unwrap().as_str(), "wing_foo_bar");
     }
 
     #[test]

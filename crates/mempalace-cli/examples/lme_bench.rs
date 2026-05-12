@@ -59,11 +59,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .as_array()
         .or_else(|| data.get("data").and_then(Value::as_array))
         .ok_or("dataset must be a JSON array or object with a 'data' key")?;
-    let entries: &[Value] = if limit > 0 && limit < entries_ref.len() {
-        &entries_ref[..limit]
-    } else {
-        entries_ref
-    };
+    let entries: &[Value] =
+        if limit > 0 && limit < entries_ref.len() { &entries_ref[..limit] } else { entries_ref };
     let n = entries.len();
 
     // Build embedding provider — model loaded here, once.
@@ -146,8 +143,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Search.
         let t_search = Instant::now();
-        let query =
-            SearchQuery { text: question, wing: None, room: None, limit: 10, profile };
+        let query = SearchQuery { text: question, wing: None, room: None, limit: 10, profile };
         let search_results =
             rt.block_on(search_rt.search(engine.drawer_store(), &query)).unwrap_or_default();
         let search_ms = t_search.elapsed().as_millis();
@@ -206,18 +202,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("    Recall@5:       {:.3}  ({:.0}/{n})", r5_total / n as f64, r5_total);
         println!("    Recall@10:      {:.3}  ({:.0}/{n})", r10_total / n as f64, r10_total);
         println!("    NDCG@10:        {:.3}", ndcg_total / n as f64);
-        println!(
-            "    Avg ingest:     {:.0} ms/question",
-            ingest_ms_total as f64 / n as f64
-        );
-        println!(
-            "    Avg search:     {:.0} ms/question",
-            search_ms_total as f64 / n as f64
-        );
-        println!(
-            "    Total time:     {:.1}s",
-            (ingest_ms_total + search_ms_total) as f64 / 1000.0
-        );
+        println!("    Avg ingest:     {:.0} ms/question", ingest_ms_total as f64 / n as f64);
+        println!("    Avg search:     {:.0} ms/question", search_ms_total as f64 / n as f64);
+        println!("    Total time:     {:.1}s", (ingest_ms_total + search_ms_total) as f64 / 1000.0);
     }
 
     // Save JSONL
@@ -314,10 +301,8 @@ fn ndcg_at_k(ranked: &[String], correct: &[String], k: usize) -> f64 {
     let mut ideal = relevances.clone();
     ideal.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
 
-    let dcg: f64 =
-        relevances.iter().enumerate().map(|(i, &r)| r / (i as f64 + 2.0).log2()).sum();
-    let idcg: f64 =
-        ideal.iter().enumerate().map(|(i, &r)| r / (i as f64 + 2.0).log2()).sum();
+    let dcg: f64 = relevances.iter().enumerate().map(|(i, &r)| r / (i as f64 + 2.0).log2()).sum();
+    let idcg: f64 = ideal.iter().enumerate().map(|(i, &r)| r / (i as f64 + 2.0).log2()).sum();
 
     if idcg > 0.0 { dcg / idcg } else { 0.0 }
 }

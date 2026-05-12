@@ -39,7 +39,7 @@ const DIARY_ROOM: &str = "diary";
 const DIARY_HALL: &str = "hall_diary";
 const DIARY_TOPIC_PREFIX: &str = "diary:";
 
-pub const PALACE_PROTOCOL: &str = "IMPORTANT — MemPalace Memory Protocol:\n1. ON WAKE-UP: Call mempalace_wake_up with agent_name to load identity, palace status, recent changes, current project context, and your diary.\n2. BEFORE RESPONDING about any person, project, or past event: call mempalace_kg_query or mempalace_search FIRST. Never guess — verify.\n3. IF UNSURE about a fact (name, gender, age, relationship): say \"let me check\" and query the palace. Wrong is worse than slow.\n4. AFTER EACH SESSION: call mempalace_diary_write to record what happened, what you learned, what matters.\n5. WHEN FACTS CHANGE: call mempalace_kg_invalidate on the old fact, mempalace_kg_add for the new one.\n6. WHEN IDENTITY CHANGES: call mempalace_identity_update so future sessions wake up with the corrected identity.\n\nThis protocol ensures the AI KNOWS before it speaks. Storage is not memory — but storage + this protocol = memory.";
+pub const PALACE_PROTOCOL: &str = "IMPORTANT — MemPalace Memory Protocol:\n1. ON WAKE-UP: Call mempalace_wake_up with agent_name to load identity, palace status, recent changes, current project context, and recent diaries across agents.\n2. BEFORE RESPONDING about any person, project, or past event: call mempalace_kg_query or mempalace_search FIRST. Never guess — verify.\n3. IF UNSURE about a fact (name, gender, age, relationship): say \"let me check\" and query the palace. Wrong is worse than slow.\n4. AFTER EACH SESSION: call mempalace_diary_write to record what happened, what you learned, what matters.\n5. WHEN FACTS CHANGE: call mempalace_kg_invalidate on the old fact, mempalace_kg_add for the new one.\n6. WHEN IDENTITY CHANGES: call mempalace_identity_update so future sessions wake up with the corrected identity.\n\nThis protocol ensures the AI KNOWS before it speaks. Storage is not memory — but storage + this protocol = memory.";
 
 pub const AAAK_SPEC: &str = "AAAK is a compressed memory dialect that MemPalace uses for efficient storage.\nIt is designed to be readable by both humans and LLMs without decoding.\n\nFORMAT:\n  ENTITIES: 3-letter uppercase codes. ALC=Alice, JOR=Jordan, RIL=Riley, MAX=Max, BEN=Ben.\n  EMOTIONS: *action markers* before/during text. *warm*=joy, *fierce*=determined, *raw*=vulnerable, *bloom*=tenderness.\n  STRUCTURE: Pipe-separated fields. FAM: family | PROJ: projects | ⚠: warnings/reminders.\n  DATES: ISO format (2026-03-31). COUNTS: Nx = N mentions (e.g., 570x).\n  IMPORTANCE: ★ to ★★★★★ (1-5 scale).\n  HALLS: hall_facts, hall_events, hall_discoveries, hall_preferences, hall_advice.\n  WINGS: wing_user, wing_agent, wing_team, wing_code, wing_myproject, wing_hardware, wing_ue5, wing_ai_research.\n  ROOMS: Hyphenated slugs representing named ideas (e.g., chromadb-setup, gpu-pricing).\n\nEXAMPLE:\n  FAM: ALC→♡JOR | 2D(kids): RIL(18,sports) MAX(11,chess+swimming) | BEN(contributor)\n\nRead AAAK naturally — expand codes mentally, treat *markers* as emotional context.\nWhen WRITING AAAK: use entity codes, mark emotions, keep structure tight.";
 
@@ -225,15 +225,15 @@ impl ToolName {
         match self {
             Self::WakeUp => ToolDefinition {
                 name: self.as_str(),
-                description: "Wake up into the palace. Returns identity.txt, palace status, recent palace changes, current project history when provided, and recent diary entries when agent_name is provided.",
+                description: "Wake up into the palace. Returns identity.txt, palace status, recent palace changes, current project history when provided, and recent diary entries across all agents.",
                 input_schema: json!({
                     "type":"object",
                     "properties":{
                         "wing":{"type":"string","description":"Current project wing for project-specific history (optional, e.g. wing_myproject)"},
-                        "agent_name":{"type":"string","description":"Agent name for recent diary entries (optional, e.g. claude)"},
+                        "agent_name":{"type":"string","description":"Current agent name for wake-up context (optional, e.g. claude)"},
                         "latest_limit":{"type":"integer","description":"Max recent changes across the whole palace (default 8)"},
                         "project_limit":{"type":"integer","description":"Max recent changes for the current project wing (default 8)"},
-                        "diary_limit":{"type":"integer","description":"Max recent diary entries for agent_name (default 10)"}
+                        "diary_limit":{"type":"integer","description":"Max recent diary entries across all agents (default 10)"}
                     }
                 }),
             },
@@ -717,14 +717,7 @@ where
         } else {
             Vec::new()
         };
-        let diary = if let Some(agent_name) = agent_name {
-            self.diary_read_payload(agent_name, diary_limit).await?
-        } else {
-            json!({
-                "entries": [],
-                "message": "Pass `agent_name` to include recent diary entries.",
-            })
-        };
+        let diary = self.diary_read_all_payload(agent_name.as_deref(), diary_limit).await?;
 
         Ok(json!({
             "identity_path": self.identity_path(),
@@ -1135,6 +1128,46 @@ where
 
         Ok(json!({
             "agent": agent_name,
+            "entries": entries,
+            "total": total,
+            "showing": total.min(last_n),
+        }))
+    }
+
+    async fn diary_read_all_payload(
+        &mut self,
+        current_agent: Option<&str>,
+        last_n: usize,
+    ) -> ToolResult<Value> {
+        let room = parse_room_id(DIARY_ROOM)?;
+        let mut drawers = self
+            .storage
+            .drawer_store()
+            .list_drawers(&DrawerFilter { room: Some(room), ..DrawerFilter::default() })
+            .await
+            .map_tool()?;
+        drawers.retain(|drawer| drawer.ingest_mode == "diary");
+
+        if drawers.is_empty() {
+            return Ok(json!({
+                "scope": "all_agents",
+                "current_agent": current_agent,
+                "entries": [],
+                "message": "No diary entries yet.",
+            }));
+        }
+
+        drawers.sort_by(|left, right| right.filed_at.cmp(&left.filed_at));
+        let total = drawers.len();
+        let entries = drawers
+            .into_iter()
+            .take(last_n)
+            .map(|drawer| render_diary_entry(drawer, true))
+            .collect::<ToolResult<Vec<_>>>()?;
+
+        Ok(json!({
+            "scope": "all_agents",
+            "current_agent": current_agent,
             "entries": entries,
             "total": total,
             "showing": total.min(last_n),
@@ -1661,6 +1694,22 @@ fn parse_direction(value: &str) -> ToolResult<QueryDirection> {
 
 fn format_date(value: Date) -> String {
     value.to_string()
+}
+
+fn render_diary_entry(drawer: DrawerRecord, include_agent: bool) -> ToolResult<Value> {
+    let topic = drawer.source_file.strip_prefix(DIARY_TOPIC_PREFIX).unwrap_or("general").to_owned();
+    let date = drawer.date.map(format_date).unwrap_or_else(|| drawer.filed_at.date().to_string());
+    let timestamp = format_rfc3339(drawer.filed_at)?;
+    let mut entry = json!({
+        "date": date,
+        "timestamp": timestamp,
+        "topic": topic,
+        "content": drawer.content,
+    });
+    if include_agent {
+        entry["agent"] = json!(drawer.added_by);
+    }
+    Ok(entry)
 }
 
 fn round_similarity(value: f32) -> f32 {
@@ -2219,11 +2268,19 @@ mod tests {
                 json!({"agent_name":"Wake Bot","entry":"SESSION:wakeup.changed","topic":"wakeup"}),
             ))
             .await;
+        harness
+            .server
+            .handle_request(tool_call(
+                602,
+                "mempalace_diary_write",
+                json!({"agent_name":"Other Bot","entry":"SESSION:other.agent.changed","topic":"handoff"}),
+            ))
+            .await;
 
         let response = harness
             .server
             .handle_request(tool_call(
-                602,
+                603,
                 "mempalace_wake_up",
                 json!({"wing":"wakeup_project","agent_name":"Wake Bot","latest_limit":10,"project_limit":5}),
             ))
@@ -2231,13 +2288,26 @@ mod tests {
         let payload = decode_tool_payload(&response).unwrap();
 
         assert_eq!(payload["identity"], "## L0 - IDENTITY\nAgent identity for tests.");
-        assert_eq!(payload["status"]["total_drawers"], 4);
+        assert_eq!(payload["status"]["total_drawers"], 5);
         assert_eq!(payload["status"]["protocol"], PALACE_PROTOCOL);
         assert_eq!(payload["status"]["aaak_dialect"], AAAK_SPEC);
         assert_eq!(payload["current_project"]["wing"], "wing_wakeup_project");
-        assert_eq!(payload["diary"]["agent"], "Wake Bot");
-        assert_eq!(payload["diary"]["showing"], 1);
-        assert_eq!(payload["diary"]["entries"][0]["topic"], "wakeup");
+        assert_eq!(payload["diary"]["scope"], "all_agents");
+        assert_eq!(payload["diary"]["current_agent"], "Wake Bot");
+        assert_eq!(payload["diary"]["showing"], 2);
+        let diary_entries = payload["diary"]["entries"].as_array().unwrap();
+        assert!(
+            diary_entries
+                .iter()
+                .any(|entry| entry["agent"] == "Wake Bot" && entry["topic"] == "wakeup"),
+            "expected Wake Bot diary entry in wake-up diary: {payload}"
+        );
+        assert!(
+            diary_entries
+                .iter()
+                .any(|entry| entry["agent"] == "Other Bot" && entry["topic"] == "handoff"),
+            "expected Other Bot diary entry in wake-up diary: {payload}"
+        );
 
         let latest = payload["latest_changes"].as_array().unwrap();
         assert!(

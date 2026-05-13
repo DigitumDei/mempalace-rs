@@ -399,8 +399,12 @@
           "type": "string"
         },
         "diary_limit": {
-          "description": "Max recent diary entries across all agents (default 10)",
+          "description": "Minimum recent diary entries across all agents (default 10; wake-up also includes every entry since diary_since)",
           "type": "integer"
+        },
+        "diary_since": {
+          "description": "Return wake-up diary entries filed at or after this RFC 3339 timestamp (optional, default: 24 hours ago)",
+          "type": "string"
         },
         "latest_limit": {
           "description": "Max recent changes across the whole palace (default 8)",

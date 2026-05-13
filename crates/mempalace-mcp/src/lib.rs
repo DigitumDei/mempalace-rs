@@ -240,7 +240,8 @@ impl ToolName {
                         "agent_name":{"type":"string","description":"Current agent name for wake-up context (optional, e.g. claude)"},
                         "latest_limit":{"type":"integer","description":"Max recent changes across the whole palace (default 8)"},
                         "project_limit":{"type":"integer","description":"Max recent changes for the current project wing (default 8)"},
-                        "diary_limit":{"type":"integer","description":"Max recent diary entries across all agents (default 10)"}
+                        "diary_limit":{"type":"integer","description":"Minimum recent diary entries across all agents (default 10; wake-up also includes every entry since diary_since)"},
+                        "diary_since":{"type":"string","description":"Return wake-up diary entries filed at or after this RFC 3339 timestamp (optional, default: 24 hours ago)"}
                     }
                 }),
             },
@@ -699,6 +700,11 @@ where
         let latest_limit = optional_usize(arguments, "latest_limit")?.unwrap_or(8).min(25);
         let project_limit = optional_usize(arguments, "project_limit")?.unwrap_or(8).min(25);
         let diary_limit = optional_usize(arguments, "diary_limit")?.unwrap_or(10).min(25);
+        let diary_since = optional_string(arguments, "diary_since")?
+            .as_deref()
+            .map(parse_since_timestamp)
+            .transpose()?
+            .unwrap_or_else(|| OffsetDateTime::now_utc() - Duration::days(1));
 
         let identity = self.read_identity_text()?;
         let status = self.status_payload().await?;
@@ -733,7 +739,8 @@ where
         } else {
             Vec::new()
         };
-        let diary = self.wake_up_diary_payload(agent_name.as_deref(), diary_limit).await?;
+        let diary =
+            self.wake_up_diary_payload(agent_name.as_deref(), diary_since, diary_limit).await?;
 
         Ok(json!({
             "identity_path": self.identity_path(),
@@ -1092,8 +1099,7 @@ where
     }
 
     async fn tool_diary_read(&mut self, arguments: &Value) -> ToolResult<Value> {
-        let last_n = optional_usize(arguments, "last_n")?.unwrap_or(10);
-        let filters = DiaryReadFilters::from_arguments(arguments, last_n)?;
+        let filters = DiaryReadFilters::from_arguments(arguments)?;
         self.diary_read_payload(filters).await
     }
 
@@ -1146,10 +1152,10 @@ where
     async fn wake_up_diary_payload(
         &mut self,
         current_agent: Option<&str>,
+        since: OffsetDateTime,
         minimum_entries: usize,
     ) -> ToolResult<Value> {
         let room = parse_room_id(DIARY_ROOM)?;
-        let since = OffsetDateTime::now_utc() - Duration::days(1);
         let mut drawers = self
             .storage
             .drawer_store()
@@ -1727,7 +1733,7 @@ struct DiaryReadFilters {
 }
 
 impl DiaryReadFilters {
-    fn from_arguments(arguments: &Value, last_n: usize) -> ToolResult<Self> {
+    fn from_arguments(arguments: &Value) -> ToolResult<Self> {
         let now = OffsetDateTime::now_utc();
         let agent_name = optional_string(arguments, "agent_name")?;
         let wing =
@@ -1738,6 +1744,7 @@ impl DiaryReadFilters {
             .map(parse_since_timestamp)
             .transpose()?
             .unwrap_or_else(|| now - Duration::days(1));
+        let last_n = optional_usize(arguments, "last_n")?.unwrap_or(10);
         Ok(Self { agent_name, wing, topic, since, last_n })
     }
 }
@@ -2525,6 +2532,52 @@ mod tests {
         assert!(diary_entries.iter().any(|entry| entry["content"] == "SESSION:old-11"));
         assert!(diary_entries.iter().any(|entry| entry["content"] == "SESSION:old-02"));
         assert!(!diary_entries.iter().any(|entry| entry["content"] == "SESSION:old-01"));
+    }
+
+    #[tokio::test]
+    async fn wake_up_diary_since_overrides_default_window() {
+        let harness = test_harness().await;
+        let old_base = datetime!(2026-04-01 00:00:00 UTC);
+        let drawers = (0..12)
+            .map(|index| {
+                test_diary_drawer(
+                    &format!("diary_wakeup_since_{index:02}"),
+                    &format!("SESSION:since-{index:02}"),
+                    old_base + Duration::minutes(index),
+                )
+            })
+            .collect::<Vec<_>>();
+        let runtime = harness.server.runtime.lock().await;
+        runtime
+            .storage
+            .drawer_store()
+            .put_drawers(&drawers, DuplicateStrategy::Error)
+            .await
+            .unwrap();
+        drop(runtime);
+
+        let payload = decode_tool_payload(
+            &harness
+                .server
+                .handle_request(tool_call(
+                    606,
+                    "mempalace_wake_up",
+                    json!({
+                        "agent_name":"Wake Bot",
+                        "diary_limit":10,
+                        "diary_since":"2026-04-01T00:00:00Z"
+                    }),
+                ))
+                .await,
+        )
+        .unwrap();
+
+        let diary_entries = payload["diary"]["entries"].as_array().unwrap();
+        assert_eq!(payload["diary"]["since"], "2026-04-01T00:00:00Z");
+        assert_eq!(payload["diary"]["showing"], 12);
+        assert_eq!(diary_entries.len(), 12);
+        assert!(diary_entries.iter().any(|entry| entry["content"] == "SESSION:since-00"));
+        assert!(diary_entries.iter().any(|entry| entry["content"] == "SESSION:since-11"));
     }
 
     #[tokio::test]

@@ -67,38 +67,59 @@
     }
   },
   "mempalace_diary_read": {
-    "description": "Read your recent diary entries (in AAAK). See what past versions of yourself recorded \u2014 your journal across sessions.",
+    "description": "Read recent diary entries across all wings. Defaults to entries since the past day; optional filters narrow by wing, agent author, or topic.",
     "input_schema": {
       "properties": {
         "agent_name": {
-          "description": "Your name \u2014 each agent gets their own diary wing",
+          "description": "Filter by diary author (optional, default: all agents)",
           "type": "string"
         },
         "last_n": {
           "description": "Number of recent entries to read (default: 10)",
           "type": "integer"
+        },
+        "since": {
+          "description": "Return entries filed at or after this RFC 3339 timestamp (optional, default: 24 hours ago)",
+          "type": "string"
+        },
+        "topic": {
+          "description": "Filter by topic tag (optional, default: all topics)",
+          "type": "string"
+        },
+        "wing": {
+          "description": "Filter by wing (optional, default: all wings)",
+          "type": "string"
         }
       },
-      "required": [
-        "agent_name"
-      ],
       "type": "object"
     }
   },
   "mempalace_diary_write": {
-    "description": "Write to your personal agent diary in AAAK format. Your observations, thoughts, what you worked on, what matters. Each agent has their own diary with full history. Write in AAAK for compression \u2014 e.g. 'SESSION:2026-04-04|built.palace.graph+diary.tools|ALC.req:agent.diaries.in.aaak|\u2605\u2605\u2605'. Use entity codes from the AAAK spec.",
+    "description": "Write a diary entry in AAAK format. Project-scoped entries are stored in the specified project wing; agent-scoped entries are stored in the shared wing_agents diary. The agent name is recorded as author attribution, not as the storage partition.",
     "input_schema": {
       "properties": {
         "agent_name": {
-          "description": "Your name \u2014 each agent gets their own diary wing",
+          "description": "Your name \u2014 recorded as the diary author",
           "type": "string"
         },
         "entry": {
           "description": "Your diary entry in AAAK format \u2014 compressed, entity-coded, emotion-marked",
           "type": "string"
         },
+        "scope": {
+          "description": "Where to store the entry: agent or project (optional, default: agent)",
+          "enum": [
+            "agent",
+            "project"
+          ],
+          "type": "string"
+        },
         "topic": {
           "description": "Topic tag (optional, default: general)",
+          "type": "string"
+        },
+        "wing": {
+          "description": "Project wing for project-scoped entries. Ignored for agent-scoped entries, which always use wing_agents.",
           "type": "string"
         }
       },

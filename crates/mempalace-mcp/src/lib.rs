@@ -24,7 +24,7 @@ use mempalace_storage::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
-use time::{Date, OffsetDateTime, format_description::well_known::Rfc3339};
+use time::{Date, Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Mutex, Semaphore, TryAcquireError};
 
@@ -38,6 +38,7 @@ const DUPLICATE_SEARCH_LIMIT: usize = 5;
 const DIARY_ROOM: &str = "diary";
 const DIARY_HALL: &str = "hall_diary";
 const DIARY_TOPIC_PREFIX: &str = "diary:";
+const SHARED_AGENT_DIARY_WING: &str = "wing_agents";
 // Project-specific wake-up history scans farther back because global changes
 // are interleaved across wings, but stops collecting as soon as the limit is met.
 const WAKE_UP_PROJECT_SEARCH_MULTIPLIER: usize = 20;
@@ -406,27 +407,31 @@ impl ToolName {
             },
             Self::DiaryWrite => ToolDefinition {
                 name: self.as_str(),
-                description: "Write to your personal agent diary in AAAK format. Your observations, thoughts, what you worked on, what matters. Each agent has their own diary with full history. Write in AAAK for compression — e.g. 'SESSION:2026-04-04|built.palace.graph+diary.tools|ALC.req:agent.diaries.in.aaak|★★★'. Use entity codes from the AAAK spec.",
+                description: "Write a diary entry in AAAK format. Project-scoped entries are stored in the specified project wing; agent-scoped entries are stored in the shared wing_agents diary. The agent name is recorded as author attribution, not as the storage partition.",
                 input_schema: json!({
                     "type":"object",
                     "properties":{
-                        "agent_name":{"type":"string","description":"Your name — each agent gets their own diary wing"},
+                        "agent_name":{"type":"string","description":"Your name — recorded as the diary author"},
                         "entry":{"type":"string","description":"Your diary entry in AAAK format — compressed, entity-coded, emotion-marked"},
-                        "topic":{"type":"string","description":"Topic tag (optional, default: general)"}
+                        "topic":{"type":"string","description":"Topic tag (optional, default: general)"},
+                        "scope":{"type":"string","description":"Where to store the entry: agent or project (optional, default: agent)","enum":["agent","project"]},
+                        "wing":{"type":"string","description":"Project wing for project-scoped entries. Ignored for agent-scoped entries, which always use wing_agents."}
                     },
                     "required":["agent_name","entry"]
                 }),
             },
             Self::DiaryRead => ToolDefinition {
                 name: self.as_str(),
-                description: "Read your recent diary entries (in AAAK). See what past versions of yourself recorded — your journal across sessions.",
+                description: "Read recent diary entries across all wings. Defaults to entries since the past day; optional filters narrow by wing, agent author, or topic.",
                 input_schema: json!({
                     "type":"object",
                     "properties":{
-                        "agent_name":{"type":"string","description":"Your name — each agent gets their own diary wing"},
+                        "agent_name":{"type":"string","description":"Filter by diary author (optional, default: all agents)"},
+                        "wing":{"type":"string","description":"Filter by wing (optional, default: all wings)"},
+                        "topic":{"type":"string","description":"Filter by topic tag (optional, default: all topics)"},
+                        "since":{"type":"string","description":"Return entries filed at or after this RFC 3339 timestamp (optional, default: 24 hours ago)"},
                         "last_n":{"type":"integer","description":"Number of recent entries to read (default: 10)"}
-                    },
-                    "required":["agent_name"]
+                    }
                 }),
             },
             Self::GetChangesSince => ToolDefinition {
@@ -1029,7 +1034,10 @@ where
         let agent_name = required_string(arguments, "agent_name")?;
         let entry = required_string(arguments, "entry")?;
         let topic = optional_string(arguments, "topic")?.unwrap_or_else(|| "general".to_owned());
-        let wing = parse_wing_id(&diary_wing_name(&agent_name))?;
+        let scope = optional_string(arguments, "scope")?.unwrap_or_else(|| "agent".to_owned());
+        let wing_name = diary_write_wing_name(&scope, optional_string(arguments, "wing")?)?;
+        let wing = parse_wing_id(&wing_name)?;
+        let stored_wing = wing.as_str().to_owned();
         let room = parse_room_id(DIARY_ROOM)?;
         let now = OffsetDateTime::now_utc();
         let drawer_id = generated_drawer_id("diary", wing.as_str(), room.as_str(), &entry, now)?;
@@ -1066,7 +1074,10 @@ where
             occurred_at: now,
             entity_id: drawer_id.as_str().to_owned(),
             actor: Some(agent_name.clone()),
-            details_json: Some(json!({"topic": topic}).to_string()),
+            details_json: Some(
+                json!({"topic": topic.clone(), "scope": scope.clone(), "wing": stored_wing.clone()})
+                    .to_string(),
+            ),
         });
 
         Ok(json!({
@@ -1074,51 +1085,39 @@ where
             "entry_id": drawer_id,
             "agent": agent_name,
             "topic": topic,
+            "scope": scope,
+            "wing": stored_wing,
             "timestamp": format_rfc3339(now)?,
         }))
     }
 
     async fn tool_diary_read(&mut self, arguments: &Value) -> ToolResult<Value> {
-        let agent_name = required_string(arguments, "agent_name")?;
         let last_n = optional_usize(arguments, "last_n")?.unwrap_or(10);
-        self.diary_read_payload(agent_name, last_n).await
+        let filters = DiaryReadFilters::from_arguments(arguments, last_n)?;
+        self.diary_read_payload(filters).await
     }
 
-    async fn diary_read_payload(&mut self, agent_name: String, last_n: usize) -> ToolResult<Value> {
+    async fn diary_read_payload(&mut self, filters: DiaryReadFilters) -> ToolResult<Value> {
         let room = parse_room_id(DIARY_ROOM)?;
-        let primary_wing = parse_wing_id(&diary_wing_name(&agent_name))?;
         let mut drawers = self
             .storage
             .drawer_store()
             .list_drawers(&DrawerFilter {
-                wing: Some(primary_wing),
+                wing: filters.wing.clone(),
                 room: Some(room.clone()),
                 ..DrawerFilter::default()
             })
             .await
             .map_tool()?;
-        drawers.retain(|drawer| drawer.added_by == agent_name);
-
-        let legacy_wing_name = legacy_diary_wing_name(&agent_name);
-        if legacy_wing_name != diary_wing_name(&agent_name) {
-            let legacy_wing = parse_wing_id(&legacy_wing_name)?;
-            let mut legacy_drawers = self
-                .storage
-                .drawer_store()
-                .list_drawers(&DrawerFilter {
-                    wing: Some(legacy_wing),
-                    room: Some(room),
-                    ..DrawerFilter::default()
-                })
-                .await
-                .map_tool()?;
-            legacy_drawers.retain(|drawer| drawer.added_by == agent_name);
-            drawers.extend(legacy_drawers);
-        }
+        drawers.retain(|drawer| diary_entry_matches(drawer, &filters));
 
         if drawers.is_empty() {
             return Ok(json!({
-                "agent": agent_name,
+                "scope": "all_wings",
+                "agent": filters.agent_name.clone(),
+                "wing": filters.wing.as_ref().map(|wing| wing.as_str()),
+                "topic": filters.topic.clone(),
+                "since": format_rfc3339(filters.since)?,
                 "entries": [],
                 "message": "No diary entries yet.",
             }));
@@ -1128,32 +1127,19 @@ where
         let total = drawers.len();
         let entries = drawers
             .into_iter()
-            .take(last_n)
-            .map(|drawer| {
-                let topic = drawer
-                    .source_file
-                    .strip_prefix(DIARY_TOPIC_PREFIX)
-                    .unwrap_or("general")
-                    .to_owned();
-                let date = drawer
-                    .date
-                    .map(format_date)
-                    .unwrap_or_else(|| drawer.filed_at.date().to_string());
-                let timestamp = format_rfc3339(drawer.filed_at)?;
-                Ok::<Value, ToolError>(json!({
-                    "date": date,
-                    "timestamp": timestamp,
-                    "topic": topic,
-                    "content": drawer.content,
-                }))
-            })
+            .take(filters.last_n)
+            .map(|drawer| render_diary_entry(drawer, true))
             .collect::<ToolResult<Vec<_>>>()?;
 
         Ok(json!({
-            "agent": agent_name,
+            "scope": "all_wings",
+            "agent": filters.agent_name.clone(),
+            "wing": filters.wing.as_ref().map(|wing| wing.as_str()),
+            "topic": filters.topic.clone(),
+            "since": format_rfc3339(filters.since)?,
             "entries": entries,
             "total": total,
-            "showing": total.min(last_n),
+            "showing": total.min(filters.last_n),
         }))
     }
 
@@ -1162,39 +1148,10 @@ where
         current_agent: Option<&str>,
         last_n: usize,
     ) -> ToolResult<Value> {
-        let room = parse_room_id(DIARY_ROOM)?;
-        let mut drawers = self
-            .storage
-            .drawer_store()
-            .list_drawers(&DrawerFilter { room: Some(room), ..DrawerFilter::default() })
-            .await
-            .map_tool()?;
-        drawers.retain(|drawer| drawer.ingest_mode == "diary");
-
-        if drawers.is_empty() {
-            return Ok(json!({
-                "scope": "all_agents",
-                "current_agent": current_agent,
-                "entries": [],
-                "message": "No diary entries yet.",
-            }));
-        }
-
-        drawers.sort_by(|left, right| right.filed_at.cmp(&left.filed_at));
-        let total = drawers.len();
-        let entries = drawers
-            .into_iter()
-            .take(last_n)
-            .map(|drawer| render_diary_entry(drawer, true))
-            .collect::<ToolResult<Vec<_>>>()?;
-
-        Ok(json!({
-            "scope": "all_agents",
-            "current_agent": current_agent,
-            "entries": entries,
-            "total": total,
-            "showing": total.min(last_n),
-        }))
+        let filters = DiaryReadFilters::default_with_last_n(last_n);
+        let mut payload = self.diary_read_payload(filters).await?;
+        payload["current_agent"] = json!(current_agent);
+        Ok(payload)
     }
 
     async fn tool_traverse(&mut self, arguments: &Value) -> ToolResult<Value> {
@@ -1719,13 +1676,78 @@ fn format_date(value: Date) -> String {
     value.to_string()
 }
 
+#[derive(Debug, Clone)]
+struct DiaryReadFilters {
+    agent_name: Option<String>,
+    wing: Option<WingId>,
+    topic: Option<String>,
+    since: OffsetDateTime,
+    last_n: usize,
+}
+
+impl DiaryReadFilters {
+    fn from_arguments(arguments: &Value, last_n: usize) -> ToolResult<Self> {
+        let now = OffsetDateTime::now_utc();
+        let agent_name = optional_string(arguments, "agent_name")?;
+        let wing =
+            optional_string(arguments, "wing")?.map(|wing| parse_wing_id(&wing)).transpose()?;
+        let topic = optional_string(arguments, "topic")?;
+        let since = optional_string(arguments, "since")?
+            .as_deref()
+            .map(parse_since_timestamp)
+            .transpose()?
+            .unwrap_or_else(|| now - Duration::days(1));
+        Ok(Self { agent_name, wing, topic, since, last_n })
+    }
+
+    fn default_with_last_n(last_n: usize) -> Self {
+        Self {
+            agent_name: None,
+            wing: None,
+            topic: None,
+            since: OffsetDateTime::now_utc() - Duration::days(1),
+            last_n,
+        }
+    }
+}
+
+fn parse_since_timestamp(value: &str) -> ToolResult<OffsetDateTime> {
+    OffsetDateTime::parse(value, &Rfc3339).map_err(|_| {
+        ToolError::InvalidParams(format!(
+            "invalid `since` timestamp `{value}`; expected ISO 8601 e.g. 2026-05-08T10:00:00Z"
+        ))
+    })
+}
+
+fn diary_entry_matches(drawer: &DrawerRecord, filters: &DiaryReadFilters) -> bool {
+    if drawer.ingest_mode != "diary" || drawer.filed_at < filters.since {
+        return false;
+    }
+    if let Some(agent_name) = filters.agent_name.as_deref() {
+        if drawer.added_by != agent_name {
+            return false;
+        }
+    }
+    if let Some(topic) = filters.topic.as_deref() {
+        if diary_entry_topic(drawer) != topic {
+            return false;
+        }
+    }
+    true
+}
+
+fn diary_entry_topic(drawer: &DrawerRecord) -> &str {
+    drawer.source_file.strip_prefix(DIARY_TOPIC_PREFIX).unwrap_or("general")
+}
+
 fn render_diary_entry(drawer: DrawerRecord, include_agent: bool) -> ToolResult<Value> {
-    let topic = drawer.source_file.strip_prefix(DIARY_TOPIC_PREFIX).unwrap_or("general").to_owned();
+    let topic = diary_entry_topic(&drawer).to_owned();
     let date = drawer.date.map(format_date).unwrap_or_else(|| drawer.filed_at.date().to_string());
     let timestamp = format_rfc3339(drawer.filed_at)?;
     let mut entry = json!({
         "date": date,
         "timestamp": timestamp,
+        "wing": drawer.wing.as_str(),
         "topic": topic,
         "content": drawer.content,
     });
@@ -1789,14 +1811,31 @@ fn infer_entity_kind(name: &str) -> EntityKind {
     EntityKind::Unknown
 }
 
+#[cfg(test)]
 fn diary_wing_name(agent_name: &str) -> String {
     format!("wing_{}", diary_slugify(agent_name))
 }
 
+fn diary_write_wing_name(scope: &str, wing: Option<String>) -> ToolResult<String> {
+    match scope {
+        "agent" => Ok(SHARED_AGENT_DIARY_WING.to_owned()),
+        "project" => wing.ok_or_else(|| {
+            ToolError::InvalidParams(
+                "missing required string field `wing` for project-scoped diary entry".to_owned(),
+            )
+        }),
+        other => Err(ToolError::InvalidParams(format!(
+            "invalid `scope` `{other}`; expected agent or project"
+        ))),
+    }
+}
+
+#[cfg(test)]
 fn legacy_diary_wing_name(agent_name: &str) -> String {
     format!("wing_{}", legacy_slugify(agent_name))
 }
 
+#[cfg(test)]
 fn diary_slugify(value: &str) -> String {
     value
         .trim()
@@ -1814,6 +1853,7 @@ fn diary_slugify(value: &str) -> String {
         .collect()
 }
 
+#[cfg(test)]
 fn legacy_slugify(value: &str) -> String {
     value
         .trim()
@@ -2315,7 +2355,7 @@ mod tests {
         assert_eq!(payload["status"]["protocol"], PALACE_PROTOCOL);
         assert_eq!(payload["status"]["aaak_dialect"], AAAK_SPEC);
         assert_eq!(payload["current_project"]["wing"], "wing_wakeup_project");
-        assert_eq!(payload["diary"]["scope"], "all_agents");
+        assert_eq!(payload["diary"]["scope"], "all_wings");
         assert_eq!(payload["diary"]["current_agent"], "Wake Bot");
         assert_eq!(payload["diary"]["showing"], 2);
         let diary_entries = payload["diary"]["entries"].as_array().unwrap();
@@ -2490,18 +2530,20 @@ mod tests {
             .await;
         let read_payload = decode_tool_payload(&read).unwrap();
         assert_eq!(read_payload["showing"], 1);
+        assert_eq!(read_payload["entries"][0]["agent"], "Codex Bot");
+        assert_eq!(read_payload["entries"][0]["wing"], SHARED_AGENT_DIARY_WING);
         assert_eq!(read_payload["entries"][0]["topic"], "phase8");
     }
 
     #[tokio::test]
-    async fn diary_tools_preserve_allowed_punctuation_in_wing_ids() {
+    async fn diary_write_stores_project_and_agent_entries_in_context_wings() {
         let harness = test_harness().await;
         let first = harness
             .server
             .handle_request(tool_call(
                 90,
                 "mempalace_diary_write",
-                json!({"agent_name":"Worker-One","entry":"SESSION:dash","topic":"ops"}),
+                json!({"agent_name":"Worker-One","entry":"SESSION:project","topic":"ops","scope":"project","wing":"wing_mempalace-rs"}),
             ))
             .await;
         let second = harness
@@ -2509,39 +2551,41 @@ mod tests {
             .handle_request(tool_call(
                 91,
                 "mempalace_diary_write",
-                json!({"agent_name":"Worker One","entry":"SESSION:space","topic":"ops"}),
+                json!({"agent_name":"Worker One","entry":"SESSION:agent","topic":"ops","scope":"agent","wing":"wing_ignored"}),
             ))
             .await;
         assert_eq!(decode_tool_payload(&first).unwrap()["success"], true);
         assert_eq!(decode_tool_payload(&second).unwrap()["success"], true);
 
-        let worker_dash = decode_tool_payload(
+        let project_entries = decode_tool_payload(
             &harness
                 .server
                 .handle_request(tool_call(
                     92,
                     "mempalace_diary_read",
-                    json!({"agent_name":"Worker-One","last_n":10}),
+                    json!({"wing":"wing_mempalace-rs","last_n":10}),
                 ))
                 .await,
         )
         .unwrap();
-        let worker_space = decode_tool_payload(
+        let agent_entries = decode_tool_payload(
             &harness
                 .server
                 .handle_request(tool_call(
                     93,
                     "mempalace_diary_read",
-                    json!({"agent_name":"Worker One","last_n":10}),
+                    json!({"wing":SHARED_AGENT_DIARY_WING,"last_n":10}),
                 ))
                 .await,
         )
         .unwrap();
 
-        assert_eq!(worker_dash["entries"].as_array().unwrap().len(), 1);
-        assert_eq!(worker_dash["entries"][0]["content"], "SESSION:dash");
-        assert_eq!(worker_space["entries"].as_array().unwrap().len(), 1);
-        assert_eq!(worker_space["entries"][0]["content"], "SESSION:space");
+        assert_eq!(project_entries["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(project_entries["entries"][0]["content"], "SESSION:project");
+        assert_eq!(project_entries["entries"][0]["wing"], "wing_mempalace-rs");
+        assert_eq!(agent_entries["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(agent_entries["entries"][0]["content"], "SESSION:agent");
+        assert_eq!(agent_entries["entries"][0]["wing"], SHARED_AGENT_DIARY_WING);
         assert_eq!(diary_wing_name("Worker-One"), "wing_worker-one");
         assert_eq!(diary_wing_name("Worker.One"), "wing_worker.one");
     }
@@ -2583,7 +2627,7 @@ mod tests {
             .handle_request(tool_call(
                 94,
                 "mempalace_diary_read",
-                json!({"agent_name":"Worker-One","last_n":10}),
+                json!({"agent_name":"Worker-One","last_n":10,"since":"2026-04-01T00:00:00Z"}),
             ))
             .await;
         let payload = decode_tool_payload(&read).unwrap();
@@ -2994,7 +3038,7 @@ mod tests {
                 .handle_request(tool_call(
                     97,
                     "mempalace_diary_read",
-                    json!({"agent_name":"Worker-One","last_n":10}),
+                    json!({"agent_name":"Worker-One","last_n":10,"since":"2026-04-01T00:00:00Z"}),
                 ))
                 .await,
         )
@@ -3063,7 +3107,7 @@ mod tests {
                 .handle_request(tool_call(
                     98,
                     "mempalace_diary_read",
-                    json!({"agent_name":"Worker-One","last_n":10}),
+                    json!({"agent_name":"Worker-One","last_n":10,"since":"2026-04-01T00:00:00Z"}),
                 ))
                 .await,
         )
@@ -3133,7 +3177,7 @@ mod tests {
                 .handle_request(tool_call(
                     299,
                     "mempalace_diary_read",
-                    json!({"agent_name":"Worker One","last_n":10}),
+                    json!({"agent_name":"Worker One","last_n":10,"since":"2026-04-01T00:00:00Z"}),
                 ))
                 .await,
         )
@@ -3142,6 +3186,121 @@ mod tests {
         let entries = payload["entries"].as_array().unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["content"], "SESSION:space-agent");
+    }
+
+    #[tokio::test]
+    async fn diary_read_filters_by_since_wing_agent_and_topic() {
+        let harness = test_harness().await;
+        let matching = DrawerRecord {
+            id: DrawerId::new("diary_filter_matching").unwrap(),
+            wing: WingId::new("wing_project").unwrap(),
+            room: RoomId::new(DIARY_ROOM).unwrap(),
+            hall: Some(DIARY_HALL.to_owned()),
+            date: Some(date!(2026 - 05 - 12)),
+            source_file: format!("{DIARY_TOPIC_PREFIX}release"),
+            chunk_index: 0,
+            ingest_mode: "diary".to_owned(),
+            extract_mode: None,
+            added_by: "Codex".to_owned(),
+            filed_at: datetime!(2026-05-12 12:00:00 UTC),
+            importance: None,
+            emotional_weight: None,
+            weight: None,
+            content: "SESSION:matching".to_owned(),
+            content_hash: hash_text("SESSION:matching"),
+            embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
+        };
+        let old = DrawerRecord {
+            id: DrawerId::new("diary_filter_old").unwrap(),
+            wing: WingId::new("wing_project").unwrap(),
+            room: RoomId::new(DIARY_ROOM).unwrap(),
+            hall: Some(DIARY_HALL.to_owned()),
+            date: Some(date!(2026 - 05 - 10)),
+            source_file: format!("{DIARY_TOPIC_PREFIX}release"),
+            chunk_index: 0,
+            ingest_mode: "diary".to_owned(),
+            extract_mode: None,
+            added_by: "Codex".to_owned(),
+            filed_at: datetime!(2026-05-10 12:00:00 UTC),
+            importance: None,
+            emotional_weight: None,
+            weight: None,
+            content: "SESSION:old".to_owned(),
+            content_hash: hash_text("SESSION:old"),
+            embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
+        };
+        let wrong_topic = DrawerRecord {
+            id: DrawerId::new("diary_filter_wrong_topic").unwrap(),
+            wing: WingId::new("wing_project").unwrap(),
+            room: RoomId::new(DIARY_ROOM).unwrap(),
+            hall: Some(DIARY_HALL.to_owned()),
+            date: Some(date!(2026 - 05 - 12)),
+            source_file: format!("{DIARY_TOPIC_PREFIX}planning"),
+            chunk_index: 0,
+            ingest_mode: "diary".to_owned(),
+            extract_mode: None,
+            added_by: "Codex".to_owned(),
+            filed_at: datetime!(2026-05-12 13:00:00 UTC),
+            importance: None,
+            emotional_weight: None,
+            weight: None,
+            content: "SESSION:wrong-topic".to_owned(),
+            content_hash: hash_text("SESSION:wrong-topic"),
+            embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
+        };
+        let wrong_agent = DrawerRecord {
+            id: DrawerId::new("diary_filter_wrong_agent").unwrap(),
+            wing: WingId::new("wing_project").unwrap(),
+            room: RoomId::new(DIARY_ROOM).unwrap(),
+            hall: Some(DIARY_HALL.to_owned()),
+            date: Some(date!(2026 - 05 - 12)),
+            source_file: format!("{DIARY_TOPIC_PREFIX}release"),
+            chunk_index: 0,
+            ingest_mode: "diary".to_owned(),
+            extract_mode: None,
+            added_by: "Other".to_owned(),
+            filed_at: datetime!(2026-05-12 14:00:00 UTC),
+            importance: None,
+            emotional_weight: None,
+            weight: None,
+            content: "SESSION:wrong-agent".to_owned(),
+            content_hash: hash_text("SESSION:wrong-agent"),
+            embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
+        };
+
+        let runtime = harness.server.runtime.lock().await;
+        runtime
+            .storage
+            .drawer_store()
+            .put_drawers(&[matching, old, wrong_topic, wrong_agent], DuplicateStrategy::Error)
+            .await
+            .unwrap();
+        drop(runtime);
+
+        let payload = decode_tool_payload(
+            &harness
+                .server
+                .handle_request(tool_call(
+                    301,
+                    "mempalace_diary_read",
+                    json!({
+                        "agent_name":"Codex",
+                        "wing":"wing_project",
+                        "topic":"release",
+                        "since":"2026-05-11T00:00:00Z",
+                        "last_n":10
+                    }),
+                ))
+                .await,
+        )
+        .unwrap();
+
+        let entries = payload["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["content"], "SESSION:matching");
+        assert_eq!(entries[0]["agent"], "Codex");
+        assert_eq!(entries[0]["wing"], "wing_project");
+        assert_eq!(payload["topic"], "release");
     }
 
     #[tokio::test]

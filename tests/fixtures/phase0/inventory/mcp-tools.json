@@ -95,7 +95,7 @@
     }
   },
   "mempalace_diary_write": {
-    "description": "Write a diary entry in AAAK format. Project-scoped entries are stored in the specified project wing; agent-scoped entries are stored in the shared wing_agents diary. The agent name is recorded as author attribution, not as the storage partition.",
+    "description": "Write a diary entry. Project-scoped entries are stored in the specified project wing; agent-scoped entries are stored in the shared wing_agents diary. The agent name is recorded as author attribution, not as the storage partition.",
     "input_schema": {
       "properties": {
         "agent_name": {
@@ -103,7 +103,7 @@
           "type": "string"
         },
         "entry": {
-          "description": "Your diary entry in AAAK format \u2014 compressed, entity-coded, emotion-marked",
+          "description": "Your diary entry",
           "type": "string"
         },
         "scope": {

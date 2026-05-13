@@ -408,12 +408,12 @@ impl ToolName {
             },
             Self::DiaryWrite => ToolDefinition {
                 name: self.as_str(),
-                description: "Write a diary entry in AAAK format. Project-scoped entries are stored in the specified project wing; agent-scoped entries are stored in the shared wing_agents diary. The agent name is recorded as author attribution, not as the storage partition.",
+                description: "Write a diary entry. Project-scoped entries are stored in the specified project wing; agent-scoped entries are stored in the shared wing_agents diary. The agent name is recorded as author attribution, not as the storage partition.",
                 input_schema: json!({
                     "type":"object",
                     "properties":{
                         "agent_name":{"type":"string","description":"Your name — recorded as the diary author"},
-                        "entry":{"type":"string","description":"Your diary entry in AAAK format — compressed, entity-coded, emotion-marked"},
+                        "entry":{"type":"string","description":"Your diary entry"},
                         "topic":{"type":"string","description":"Topic tag (optional, default: general)"},
                         "scope":{"type":"string","description":"Where to store the entry: agent or project (optional, default: agent)","enum":["agent","project"]},
                         "wing":{"type":"string","description":"Project wing for project-scoped entries. Ignored for agent-scoped entries, which always use wing_agents."}

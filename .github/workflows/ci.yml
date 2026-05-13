@@ -57,6 +57,40 @@ jobs:
       - name: Run mempalace-embeddings tests
         run: cargo test -p mempalace-embeddings --locked -- --nocapture
 
+  remaining-package-tests:
+    name: ${{ matrix.package }} Tests
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        package:
+          - mempalace-config
+          - mempalace-core
+          - mempalace-dialect
+          - mempalace-import
+          - mempalace-search
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install protobuf compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build ${{ matrix.package }} tests
+        run: cargo test -p ${{ matrix.package }} --locked --no-run
+
+      - name: Run ${{ matrix.package }} tests
+        run: cargo test -p ${{ matrix.package }} --locked -- --nocapture
+
   embedding-baselines:
     name: Embedding Baselines
     runs-on: ubuntu-latest
@@ -244,6 +278,7 @@ jobs:
     needs:
       - workspace-build
       - embeddings-tests
+      - remaining-package-tests
       - embedding-baselines
       - storage-tests
       - ingest-tests

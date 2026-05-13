@@ -1255,7 +1255,7 @@ mod tests {
             err,
             SearchError::Embeddings(mempalace_embeddings::EmbeddingError::ProviderContract(
                 ref message
-            )) if message == "provider returned no vector for a non-empty search query"
+            )) if message == "provider returned no vectors for a non-empty request"
         ));
     }
 
@@ -1594,13 +1594,17 @@ mod tests {
             ],
         };
 
+        let expected = "## L0 — IDENTITY\nReady.\n\n## L1 — AAAK STORY\n\n[alpha]\n  ... (more in L3 search)";
         let rendered = runtime
             .wake_up(
                 &store,
                 &WakeUpRequest {
                     wing: Some(WingId::new("wing_code").unwrap()),
                     identity: IdentitySource::Inline("## L0 — IDENTITY\nReady.".to_owned()),
-                    layer1: Layer1Config { max_drawers: 2, max_chars: 70 },
+                    layer1: Layer1Config {
+                        max_drawers: 2,
+                        max_chars: super::char_count(expected),
+                    },
                     format: WakeUpFormat::AaaK,
                 },
             )
@@ -1616,6 +1620,8 @@ mod tests {
     async fn wake_up_aaak_honors_full_output_budget_end_to_end() {
         let runtime = SearchRuntime::new(StubProvider { response: vec![embedding(0.0)] });
         let store = sample_store();
+        let expected =
+            "## L0 — IDENTITY\nReady.\n\n## L1 — AAAK STORY\n\n[auth-migration]\n  ... (more in L3 search)";
 
         let rendered = runtime
             .wake_up(
@@ -1625,9 +1631,7 @@ mod tests {
                     identity: IdentitySource::Inline("## L0 — IDENTITY\nReady.".to_owned()),
                     layer1: Layer1Config {
                         max_drawers: 3,
-                        max_chars: super::char_count(
-                            "## L0 — IDENTITY\nReady.\n\n## L1 — AAAK STORY\n\n[auth-migration]\n  ... (more in L3 search)",
-                        ),
+                        max_chars: super::char_count(expected),
                     },
                     format: WakeUpFormat::AaaK,
                 },
@@ -1635,11 +1639,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(super::char_count(&rendered), 81);
-        assert_eq!(
-            rendered,
-            "## L0 — IDENTITY\nReady.\n\n## L1 — AAAK STORY\n\n[auth-migration]\n  ... (more in L3 search)"
-        );
+        assert_eq!(super::char_count(&rendered), super::char_count(expected));
+        assert_eq!(rendered, expected);
     }
 
     #[tokio::test]

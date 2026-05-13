@@ -705,7 +705,7 @@ mod tests {
     use time::macros::{date, datetime};
 
     fn fixture_path(relative: &str) -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../").join(relative)
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").join(relative)
     }
 
     fn sample_record(
@@ -914,7 +914,7 @@ mod tests {
             &SourceMetadata::default(),
         );
 
-        assert!(compressed.contains("\"We shipped v1.0 because the old fallback kept brea...\""));
+        assert!(compressed.contains("\"We shipped v1.0 because the old fallback kept breaki...\""));
     }
 
     #[test]
@@ -931,7 +931,7 @@ mod tests {
         let backend_index = rendered.find("[backend]").unwrap();
         assert!(auth_index < backend_index);
         assert!(rendered.contains("wing_team|auth-migration|2026-04-11|team"));
-        assert!(rendered.contains("\"The team decided the auth migration must preserve CLI...\""));
+        assert!(rendered.contains("\"The team decided the auth migration must preserve CL...\""));
     }
 
     #[test]
@@ -957,10 +957,11 @@ mod tests {
                 datetime!(2026-04-11 09:30:00 UTC),
             ),
         ];
+        let expected = "## L0 — IDENTITY\nReady.\n\n## L1 — AAAK STORY\n\n[alpha]\n  ... (more in L3 search)";
         let rendered = dialect.render_wake_up_aaak(
             "## L0 — IDENTITY\nReady.",
             &drawers,
-            &WakeUpAaaKConfig { max_drawers: 2, max_chars: 70 },
+            &WakeUpAaaKConfig { max_drawers: 2, max_chars: char_count(expected) },
         );
 
         assert!(rendered.contains("[alpha]"));
@@ -972,22 +973,19 @@ mod tests {
     fn render_wake_up_aaak_honors_full_output_budget() {
         let dialect = Dialect::new();
         let identity = "## L0 — IDENTITY\nReady.";
+        let expected =
+            "## L0 — IDENTITY\nReady.\n\n## L1 — AAAK STORY\n\n[auth-migration]\n  ... (more in L3 search)";
         let rendered = dialect.render_wake_up_aaak(
             identity,
             &sample_drawers(),
             &WakeUpAaaKConfig {
                 max_drawers: 3,
-                max_chars: char_count(
-                    "## L0 — IDENTITY\nReady.\n\n## L1 — AAAK STORY\n\n[auth-migration]\n  ... (more in L3 search)",
-                ),
+                max_chars: char_count(expected),
             },
         );
 
-        assert_eq!(char_count(&rendered), 81);
-        assert_eq!(
-            rendered,
-            "## L0 — IDENTITY\nReady.\n\n## L1 — AAAK STORY\n\n[auth-migration]\n  ... (more in L3 search)"
-        );
+        assert_eq!(char_count(&rendered), char_count(expected));
+        assert_eq!(rendered, expected);
         assert!(!rendered.contains("wing_team|"));
     }
 

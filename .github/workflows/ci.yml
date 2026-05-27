@@ -317,3 +317,46 @@ jobs:
             target/release/mempalace-cli
             target/release/mempalace-mcp
           if-no-files-found: error
+
+  publish-nightly:
+    name: Publish Nightly Release
+    runs-on: ubuntu-latest
+    needs: build-and-package
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: mempalace-release-binaries
+          path: artifacts
+
+      - name: Stage nightly assets
+        run: |
+          mkdir -p nightly
+          short_sha="${GITHUB_SHA::7}"
+          cp artifacts/mempalace-cli "nightly/mempalace-cli-linux-x86_64"
+          cp artifacts/mempalace-mcp "nightly/mempalace-mcp-linux-x86_64"
+          chmod +x nightly/*
+          (cd nightly && sha256sum * > SHA256SUMS)
+          echo "SHORT_SHA=$short_sha" >> "$GITHUB_ENV"
+
+      - name: Publish rolling nightly release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: nightly
+          name: Nightly (${{ env.SHORT_SHA }})
+          body: |
+            Rolling nightly build from `main` @ ${{ github.sha }}.
+
+            Overwritten on every push to `main`. Not a stable release.
+          prerelease: true
+          make_latest: false
+          target_commitish: ${{ github.sha }}
+          files: nightly/*
+          fail_on_unmatched_files: true

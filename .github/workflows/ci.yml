@@ -293,38 +293,29 @@ jobs:
       - name: Install packaging dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler musl-tools
+          sudo apt-get install -y protobuf-compiler
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-unknown-linux-musl
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
-        with:
-          key: musl
 
       - name: Build release artifacts
-        env:
-          CC_x86_64_unknown_linux_musl: musl-gcc
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
-        run: cargo build --release --locked --target x86_64-unknown-linux-musl -p mempalace-cli -p mempalace-mcp
+        run: cargo build --release --locked -p mempalace-cli -p mempalace-mcp
 
       - name: Smoke packaged binaries
         run: |
-          ./target/x86_64-unknown-linux-musl/release/mempalace-cli --help
-          ./target/x86_64-unknown-linux-musl/release/mempalace-mcp --help
-          file ./target/x86_64-unknown-linux-musl/release/mempalace-cli
-          ldd ./target/x86_64-unknown-linux-musl/release/mempalace-cli || true
+          ./target/release/mempalace-cli --help
+          ./target/release/mempalace-mcp --help
 
       - name: Upload release artifacts
         uses: actions/upload-artifact@v4
         with:
           name: mempalace-release-binaries
           path: |
-            target/x86_64-unknown-linux-musl/release/mempalace-cli
-            target/x86_64-unknown-linux-musl/release/mempalace-mcp
+            target/release/mempalace-cli
+            target/release/mempalace-mcp
           if-no-files-found: error
 
   publish-nightly:

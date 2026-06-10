@@ -209,8 +209,29 @@ pub trait ToolStateStore {
     fn get_config(&self, key: &str) -> Result<Option<ConfigEntry>>;
 }
 
+/// An opaque cursor that identifies a position in the change log for stable
+/// forward pagination.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChangeCursor {
+    /// RFC 3339 `occurred_at` value of the last row on the previous page.
+    pub occurred_at: OffsetDateTime,
+    /// SQLite rowid of the last row on the previous page, used as a tiebreaker
+    /// when multiple events share the same `occurred_at`.
+    pub rowid: i64,
+}
+
+/// A page of change events returned by [`ChangeLogStore::get_changes_page`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChangePage {
+    /// Change events for this page, ordered `(occurred_at ASC, rowid ASC)`.
+    pub events: Vec<ChangeEvent>,
+    /// Cursor to pass on the next call to continue pagination; `None` when the
+    /// last page has been reached.
+    pub next_cursor: Option<ChangeCursor>,
+}
+
 /// A single write event recorded in the change log.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ChangeEvent {
     /// Operation type: "drawer_added", "drawer_deleted", "diary_written",
     /// "kg_fact_added", or "kg_fact_invalidated".
@@ -228,6 +249,20 @@ pub trait ChangeLogStore {
     fn append_event(&self, event: &ChangeEvent) -> Result<()>;
     fn get_changes_since(&self, since: OffsetDateTime, limit: usize) -> Result<Vec<ChangeEvent>>;
     fn get_recent_changes(&self, limit: usize) -> Result<Vec<ChangeEvent>>;
+    /// Cursor-paginated forward scan of the change log.
+    ///
+    /// - `since`: if provided, only return events with `occurred_at >= since`.
+    ///   Ignored when a `cursor` is provided (the cursor already encodes the
+    ///   position).
+    /// - `cursor`: opaque cursor from the previous [`ChangePage::next_cursor`].
+    /// - `limit`: maximum events per page (exclusive; the implementation fetches
+    ///   `limit + 1` internally to detect whether another page exists).
+    fn get_changes_page(
+        &self,
+        since: Option<OffsetDateTime>,
+        cursor: Option<ChangeCursor>,
+        limit: usize,
+    ) -> Result<ChangePage>;
 }
 
 #[derive(Debug, Clone)]
@@ -1012,6 +1047,76 @@ impl ChangeLogStore for SqliteOperationalStore {
         events.reverse();
         Ok(events)
     }
+
+    fn get_changes_page(
+        &self,
+        since: Option<OffsetDateTime>,
+        cursor: Option<ChangeCursor>,
+        limit: usize,
+    ) -> Result<ChangePage> {
+        let fetch_limit = limit.saturating_add(1) as i64;
+        let connection = self.open_connection()?;
+
+        // We read `rowid` as column 0 (used to build the next cursor), then the
+        // normal event columns at 1..=5.
+        let mut rows: Vec<(i64, ChangeEvent)> = match cursor {
+            Some(ref c) => {
+                // Cursor path: row-value comparison for stable forward pagination.
+                // (occurred_at, rowid) > (cursor_occurred_at, cursor_rowid)
+                let cursor_ts = encode_time(c.occurred_at);
+                let mut stmt = connection.prepare(
+                    "SELECT rowid, event_type, occurred_at, entity_id, actor, details_json
+                     FROM change_log
+                     WHERE (occurred_at, rowid) > (?1, ?2)
+                     ORDER BY occurred_at ASC, rowid ASC
+                     LIMIT ?3",
+                )?;
+                stmt.query_map(params![cursor_ts, c.rowid, fetch_limit], decode_page_row)?
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(StorageError::from)?
+            }
+            None => match since {
+                Some(since_dt) => {
+                    let since_ts = encode_time(since_dt);
+                    let mut stmt = connection.prepare(
+                        "SELECT rowid, event_type, occurred_at, entity_id, actor, details_json
+                         FROM change_log
+                         WHERE occurred_at >= ?1
+                         ORDER BY occurred_at ASC, rowid ASC
+                         LIMIT ?2",
+                    )?;
+                    stmt.query_map(params![since_ts, fetch_limit], decode_page_row)?
+                        .collect::<std::result::Result<Vec<_>, _>>()
+                        .map_err(StorageError::from)?
+                }
+                None => {
+                    let mut stmt = connection.prepare(
+                        "SELECT rowid, event_type, occurred_at, entity_id, actor, details_json
+                         FROM change_log
+                         ORDER BY occurred_at ASC, rowid ASC
+                         LIMIT ?1",
+                    )?;
+                    stmt.query_map(params![fetch_limit], decode_page_row)?
+                        .collect::<std::result::Result<Vec<_>, _>>()
+                        .map_err(StorageError::from)?
+                }
+            },
+        };
+
+        // If we got more than `limit` rows we know there is a next page.
+        let next_cursor = if rows.len() > limit {
+            rows.pop(); // discard the sentinel row
+            // Build the cursor from the last row that we ARE returning.
+            rows.last().map(|(rowid, event)| ChangeCursor {
+                occurred_at: event.occurred_at,
+                rowid: *rowid,
+            })
+        } else {
+            None
+        };
+
+        Ok(ChangePage { events: rows.into_iter().map(|(_, event)| event).collect(), next_cursor })
+    }
 }
 
 fn parse_status(raw: String) -> rusqlite::Result<IngestRunStatus> {
@@ -1098,6 +1203,20 @@ impl SqliteOperationalStore {
     }
 }
 
+fn decode_page_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, ChangeEvent)> {
+    let rowid: i64 = row.get(0)?;
+    let event = ChangeEvent {
+        event_type: row.get(1)?,
+        occurred_at: decode_time(row.get(2)?).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(err))
+        })?,
+        entity_id: row.get(3)?,
+        actor: row.get(4)?,
+        details_json: row.get(5)?,
+    };
+    Ok((rowid, event))
+}
+
 fn encode_time(value: OffsetDateTime) -> String {
     value
         .format(&time::format_description::well_known::Rfc3339)
@@ -1170,14 +1289,16 @@ fn decode_fact_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<KnowledgeGraphFa
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use rusqlite::OptionalExtension;
     use tempfile::tempdir;
     use time::macros::datetime;
 
     use super::{
-        ChangeEvent, ChangeLogStore, EntityRegistryStore, GraphStore, IngestManifestStore,
-        KnowledgeGraphStore, MIGRATIONS, SqliteOperationalStore, ToolStateStore,
+        ChangeCursor, ChangeEvent, ChangeLogStore, ChangePage, EntityRegistryStore, GraphStore,
+        IngestManifestStore, KnowledgeGraphStore, MIGRATIONS, SqliteOperationalStore,
+        ToolStateStore,
     };
     use crate::types::{
         ConfigEntry, EntityRecord, GraphDocument, IngestManifestEntry, IngestRunStatus,
@@ -1243,6 +1364,117 @@ mod tests {
         let limited = store.get_changes_since(t0, 1).unwrap();
         assert_eq!(limited.len(), 1);
         assert_eq!(limited[0].event_type, "drawer_added");
+    }
+
+    #[test]
+    fn change_log_cursor_pagination_walks_all_pages() {
+        let tempdir = tempdir().unwrap();
+        let store = SqliteOperationalStore::new(tempdir.path().join("storage.sqlite3"));
+        store.ensure_schema().unwrap();
+
+        // Five events: e1 and e2 share the same occurred_at to exercise the
+        // rowid tiebreaker path.
+        let t_shared = datetime!(2026-06-01 09:00:00 UTC);
+        let t3 = datetime!(2026-06-01 09:01:00 UTC);
+        let t4 = datetime!(2026-06-01 09:02:00 UTC);
+        let t5 = datetime!(2026-06-01 09:03:00 UTC);
+
+        for (i, ts) in [t_shared, t_shared, t3, t4, t5].iter().enumerate() {
+            store
+                .append_event(&ChangeEvent {
+                    event_type: format!("event_{i}"),
+                    occurred_at: *ts,
+                    entity_id: format!("entity_{i}"),
+                    actor: None,
+                    details_json: None,
+                })
+                .unwrap();
+        }
+
+        // Walk all pages with a page size of 2 and collect every event.
+        let mut all_seen: Vec<String> = Vec::new();
+        let mut cursor: Option<ChangeCursor> = None;
+        let page_size = 2;
+        loop {
+            let page = store.get_changes_page(None, cursor.clone(), page_size).unwrap();
+            assert!(page.events.len() <= page_size, "page has more events than the page size");
+            for event in &page.events {
+                all_seen.push(event.event_type.clone());
+            }
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+
+        // All five events must be present, in order, with no duplicates.
+        assert_eq!(all_seen.len(), 5, "expected exactly 5 events across all pages");
+        assert_eq!(all_seen, vec!["event_0", "event_1", "event_2", "event_3", "event_4"]);
+    }
+
+    #[test]
+    fn change_log_cursor_pagination_final_page_has_no_next_cursor() {
+        let tempdir = tempdir().unwrap();
+        let store = SqliteOperationalStore::new(tempdir.path().join("storage.sqlite3"));
+        store.ensure_schema().unwrap();
+
+        let t1 = datetime!(2026-06-01 10:00:00 UTC);
+        store
+            .append_event(&ChangeEvent {
+                event_type: "drawer_added".to_owned(),
+                occurred_at: t1,
+                entity_id: "e1".to_owned(),
+                actor: None,
+                details_json: None,
+            })
+            .unwrap();
+
+        // Single event with a page size of 5 — the last page must have no cursor.
+        let page = store.get_changes_page(None, None, 5).unwrap();
+        assert_eq!(page.events.len(), 1);
+        assert!(page.next_cursor.is_none(), "last page must not have a next cursor");
+    }
+
+    #[test]
+    fn change_log_cursor_pagination_since_filter_combined() {
+        let tempdir = tempdir().unwrap();
+        let store = SqliteOperationalStore::new(tempdir.path().join("storage.sqlite3"));
+        store.ensure_schema().unwrap();
+
+        let t1 = datetime!(2026-06-01 08:00:00 UTC);
+        let t2 = datetime!(2026-06-01 09:00:00 UTC);
+        let t3 = datetime!(2026-06-01 10:00:00 UTC);
+        let t4 = datetime!(2026-06-01 11:00:00 UTC);
+        let t5 = datetime!(2026-06-01 12:00:00 UTC);
+
+        for (i, ts) in [t1, t2, t3, t4, t5].iter().enumerate() {
+            store
+                .append_event(&ChangeEvent {
+                    event_type: format!("ev_{i}"),
+                    occurred_at: *ts,
+                    entity_id: format!("e_{i}"),
+                    actor: None,
+                    details_json: None,
+                })
+                .unwrap();
+        }
+
+        // With since=t2 we should skip event at t1 and get ev_1..ev_4.
+        let mut all_seen: Vec<String> = Vec::new();
+        let mut cursor: Option<ChangeCursor> = None;
+        loop {
+            let page = store.get_changes_page(Some(t2), cursor.clone(), 2).unwrap();
+            for event in &page.events {
+                all_seen.push(event.event_type.clone());
+            }
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        // ev_0 is at t1 (before since=t2) so we should see 4 events: ev_1..ev_4.
+        assert_eq!(all_seen.len(), 4, "expected 4 events after since filter");
+        assert_eq!(all_seen, vec!["ev_1", "ev_2", "ev_3", "ev_4"]);
     }
 
     #[test]

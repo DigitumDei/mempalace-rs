@@ -3858,6 +3858,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "mempalace-federation"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "mempalace-graph"
 version = "0.1.0"
 dependencies = [

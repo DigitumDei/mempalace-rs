@@ -683,6 +683,69 @@ fn percentile_millis(samples: &[Duration], percentile: f64) -> Option<f64> {
     ordered.get(index).map(Duration::as_secs_f64).map(|seconds| seconds * 1_000.0)
 }
 
+/// A deterministic, zero-dependency [`EmbeddingProvider`] for use in tests.
+///
+/// Vectors are assembled from a small seed pattern chosen by keyword matching
+/// on the input text, then repeated or truncated to the profile's dimension
+/// count. Scores are therefore meaningfully ordered within a single test run
+/// but are **not** comparable to real embedding scores or across profiles.
+#[derive(Debug, Clone)]
+pub struct DeterministicStubProvider {
+    profile: mempalace_core::EmbeddingProfile,
+}
+
+impl DeterministicStubProvider {
+    /// Creates a stub provider pinned to the given embedding profile.
+    pub fn new(profile: mempalace_core::EmbeddingProfile) -> Self {
+        Self { profile }
+    }
+
+    /// Returns a deterministic vector for the given text based on keyword seeds.
+    pub fn vector_for(&self, text: &str) -> Vec<f32> {
+        let lower = text.to_ascii_lowercase();
+        let seed = if ["auth", "migration", "parity"].iter().any(|token| lower.contains(token)) {
+            [1.0, 0.0, 0.0, 0.0]
+        } else if ["session", "diary", "ops"].iter().any(|token| lower.contains(token)) {
+            [0.0, 1.0, 0.0, 0.0]
+        } else if ["rust", "cli"].iter().any(|token| lower.contains(token)) {
+            [0.0, 0.0, 1.0, 0.0]
+        } else {
+            [0.0, 0.0, 0.0, 1.0]
+        };
+        let dims = self.profile.metadata().dimensions;
+        let mut values = Vec::with_capacity(dims);
+        while values.len() < dims {
+            values.extend(seed);
+        }
+        values.truncate(dims);
+        values
+    }
+}
+
+impl EmbeddingProvider for DeterministicStubProvider {
+    fn profile(&self) -> &'static EmbeddingProfileMetadata {
+        self.profile.metadata()
+    }
+
+    fn startup_validation(&self) -> Result<StartupValidation> {
+        Ok(StartupValidation {
+            status: StartupValidationStatus::Ready,
+            cache_root: std::path::PathBuf::from("/tmp/stub"),
+            model_id: self.profile.metadata().model_id,
+            detail: "stub".to_owned(),
+        })
+    }
+
+    fn embed(&mut self, request: &EmbeddingRequest) -> Result<EmbeddingResponse> {
+        EmbeddingResponse::from_vectors(
+            request.texts().iter().map(|text| self.vector_for(text)).collect(),
+            self.profile.metadata().dimensions,
+            self.profile,
+            self.profile.metadata().model_id,
+        )
+    }
+}
+
 /// Errors produced by the embeddings crate.
 #[derive(Debug, Error)]
 pub enum EmbeddingError {

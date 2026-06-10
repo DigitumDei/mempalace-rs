@@ -186,7 +186,7 @@ impl IntoResponse for ServerError {
 
 // ─── Token auth ──────────────────────────────────────────────────────────────
 
-/// A single entry in the bearer-token file.
+/// A single entry in the bearer-token file as stored on disk.
 #[derive(Debug, Clone, serde::Deserialize)]
 struct TokenEntry {
     /// The raw bearer token string.
@@ -195,6 +195,20 @@ struct TokenEntry {
     name: String,
     /// If `false`, the token is treated as non-existent during auth.
     enabled: bool,
+}
+
+/// An in-memory token entry with its bearer token pre-hashed.
+///
+/// Hashing once at load time keeps the raw secret out of memory and avoids
+/// rehashing every stored token on each incoming request.
+#[derive(Debug, Clone)]
+struct TokenRegistryEntry {
+    /// Human-readable identity name (returned as the auth principal).
+    name: String,
+    /// If `false`, the token is treated as non-existent during auth.
+    enabled: bool,
+    /// BLAKE3 hash of the bearer token.
+    token_hash: blake3::Hash,
 }
 
 /// In-memory registry of bearer tokens loaded from a JSON file.
@@ -208,7 +222,7 @@ pub struct TokenRegistry {
 
 #[derive(Debug)]
 struct TokenRegistryInner {
-    entries: Vec<TokenEntry>,
+    entries: Vec<TokenRegistryEntry>,
     mtime: Option<SystemTime>,
 }
 
@@ -227,8 +241,16 @@ impl TokenRegistry {
             path: path.clone(),
             source,
         })?;
-        let entries: Vec<TokenEntry> = serde_json::from_str(&raw)
+        let file_entries: Vec<TokenEntry> = serde_json::from_str(&raw)
             .map_err(|err| ServerError::TokenFile(err.to_string()))?;
+        let entries = file_entries
+            .into_iter()
+            .map(|entry| TokenRegistryEntry {
+                name: entry.name,
+                enabled: entry.enabled,
+                token_hash: blake3::hash(entry.token.as_bytes()),
+            })
+            .collect();
         let mtime = std::fs::metadata(path)
             .and_then(|m| m.modified())
             .ok();
@@ -256,7 +278,13 @@ impl TokenRegistry {
         }
         match Self::read_file(&self.path) {
             Ok(new_inner) => *guard = new_inner,
-            Err(err) => warn!("failed to reload token file: {err}"),
+            Err(err) => {
+                // Keep serving the last-good token set, but record the current
+                // mtime so we don't retry disk I/O + write-lock on every request
+                // until the file actually changes again.
+                warn!("failed to reload token file: {err}");
+                guard.mtime = current_mtime;
+            }
         }
     }
 
@@ -270,9 +298,8 @@ impl TokenRegistry {
             if !entry.enabled {
                 continue;
             }
-            let stored_hash = blake3::hash(entry.token.as_bytes());
             let eq: bool =
-                presented_hash.as_bytes().ct_eq(stored_hash.as_bytes()).into();
+                presented_hash.as_bytes().ct_eq(entry.token_hash.as_bytes()).into();
             if eq {
                 return Some(entry.name.clone());
             }
@@ -440,6 +467,7 @@ where
     let limit = body
         .limit
         .unwrap_or(5)
+        .max(1)
         .min(state.config.low_cpu.effective_search_results_limit());
 
     let wing = body.wing.as_deref().map(WingId::new).transpose()?;
@@ -674,7 +702,7 @@ async fn route_drawers_list<P>(
 where
     P: EmbeddingProvider + Send + Sync + 'static,
 {
-    let limit = params.limit.unwrap_or(DEFAULT_PAGE_LIMIT).min(MAX_PAGE_LIMIT);
+    let limit = params.limit.unwrap_or(DEFAULT_PAGE_LIMIT).max(1).min(MAX_PAGE_LIMIT);
     let wing = params.wing.as_deref().map(WingId::new).transpose()?;
     let room = params.room.as_deref().map(RoomId::new).transpose()?;
 
@@ -931,7 +959,7 @@ async fn route_changes<P>(
 where
     P: EmbeddingProvider + Send + Sync + 'static,
 {
-    let limit = params.limit.unwrap_or(DEFAULT_PAGE_LIMIT).min(MAX_PAGE_LIMIT);
+    let limit = params.limit.unwrap_or(DEFAULT_PAGE_LIMIT).max(1).min(MAX_PAGE_LIMIT);
 
     let since = params
         .since

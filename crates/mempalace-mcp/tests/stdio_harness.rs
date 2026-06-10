@@ -1,7 +1,7 @@
 use std::io::{BufRead, BufReader as StdBufReader, Write};
 use std::process::{Command, Stdio};
 
-use mempalace_config::{LowCpuRuntimeConfig, MempalaceConfig};
+use mempalace_config::{LowCpuRuntimeConfig, MempalaceConfig, ServerRuntimeConfig};
 use mempalace_core::EmbeddingProfile;
 use mempalace_mcp::{DeterministicStubProvider, McpServer, serve_transport};
 use tempfile::TempDir;
@@ -14,6 +14,10 @@ async fn test_server(tempdir: &TempDir) -> McpServer<DeterministicStubProvider> 
         palace_path: tempdir.path().join("palace"),
         embedding_profile: EmbeddingProfile::Balanced,
         low_cpu: LowCpuRuntimeConfig::defaults_for_profile(EmbeddingProfile::Balanced),
+        server: ServerRuntimeConfig {
+            bind: "127.0.0.1:8765".parse().unwrap(),
+            token_file: tempdir.path().join("server_tokens.json"),
+        },
     };
     McpServer::from_parts(config, DeterministicStubProvider::new(EmbeddingProfile::Balanced))
         .await

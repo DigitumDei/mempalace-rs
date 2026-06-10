@@ -1900,7 +1900,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::mpsc;
 
-    use mempalace_config::LowCpuRuntimeConfig;
+    use mempalace_config::{LowCpuRuntimeConfig, ServerRuntimeConfig};
     use mempalace_embeddings::{StartupValidation, StartupValidationStatus};
     use tempfile::TempDir;
     use time::macros::{date, datetime};
@@ -1929,9 +1929,13 @@ mod tests {
         let config = MempalaceConfig {
             schema_version: 1,
             collection_name: "mempalace_drawers".to_owned(),
-            palace_path,
+            palace_path: palace_path.clone(),
             embedding_profile,
             low_cpu,
+            server: ServerRuntimeConfig {
+                bind: "127.0.0.1:8765".parse().unwrap(),
+                token_file: tempdir.path().join("server_tokens.json"),
+            },
         };
         let server =
             McpServer::from_parts(config, DeterministicStubProvider::new(embedding_profile))
@@ -2257,6 +2261,10 @@ mod tests {
                 wake_up_drawers_limit: 8,
                 degraded_mode: false,
                 rerank_enabled: false,
+            },
+            server: ServerRuntimeConfig {
+                bind: "127.0.0.1:8765".parse().unwrap(),
+                token_file: tempdir.path().join("server_tokens.json"),
             },
         };
         let (started_tx, started_rx) = mpsc::channel();

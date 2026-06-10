@@ -3859,14 +3859,18 @@ dependencies = [
 name = "mempalace-cli"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "clap",
  "dirs",
  "mempalace-config",
  "mempalace-core",
  "mempalace-embeddings",
+ "mempalace-federation",
  "mempalace-ingest",
  "mempalace-search",
+ "mempalace-server",
  "mempalace-storage",
+ "reqwest",
  "serde_json",
  "serde_yaml",
  "tempfile",

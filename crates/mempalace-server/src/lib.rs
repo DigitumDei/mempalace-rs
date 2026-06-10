@@ -1233,7 +1233,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Method, Request, StatusCode, header};
     use http_body_util::BodyExt;
-    use mempalace_config::LowCpuRuntimeConfig;
+    use mempalace_config::{LowCpuRuntimeConfig, ServerRuntimeConfig};
     use mempalace_core::EmbeddingProfile;
     use mempalace_embeddings::DeterministicStubProvider;
     use serde_json::Value;
@@ -1273,6 +1273,10 @@ mod tests {
             palace_path,
             embedding_profile: EmbeddingProfile::Balanced,
             low_cpu: LowCpuRuntimeConfig::defaults_for_profile(EmbeddingProfile::Balanced),
+            server: ServerRuntimeConfig {
+                bind: "127.0.0.1:8765".parse().unwrap(),
+                token_file: tempdir.path().join("tokens.json"),
+            },
         };
         let tokens = TokenRegistry::load(token_file).unwrap();
         let provider = DeterministicStubProvider::new(EmbeddingProfile::Balanced);

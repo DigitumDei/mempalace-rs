@@ -1,5 +1,6 @@
 use std::env;
 use std::fs;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use mempalace_core::{EmbeddingProfile, MempalaceError, Result};
@@ -11,6 +12,8 @@ pub const DEFAULT_COLLECTION_NAME: &str = "mempalace_drawers";
 const CONFIG_FILE_NAME: &str = "config.json";
 const PROJECT_CONFIG_FILE_NAME: &str = "mempalace.yaml";
 const LEGACY_PROJECT_CONFIG_FILE_NAME: &str = "mempal.yaml";
+const DEFAULT_SERVER_BIND: &str = "127.0.0.1:8765";
+const DEFAULT_SERVER_TOKEN_FILE: &str = "server_tokens.json";
 const DEFAULT_LOW_CPU_WORKER_THREADS: usize = 1;
 const DEFAULT_LOW_CPU_MAX_BLOCKING_THREADS: usize = 1;
 const DEFAULT_LOW_CPU_QUEUE_LIMIT: usize = 32;
@@ -28,6 +31,26 @@ pub struct ResolvedPaths {
     pub palace_dir: PathBuf,
     pub config_file: PathBuf,
     pub people_map_file: PathBuf,
+}
+
+/// File-level representation of the optional `[server]` config section.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerConfigFileV1 {
+    /// Bind address for the federation HTTP server (e.g. `"127.0.0.1:8765"`).
+    #[serde(default)]
+    pub bind: Option<String>,
+    /// Path to the bearer-token JSON file.  `~/`-prefixed strings are expanded.
+    #[serde(default)]
+    pub token_file: Option<String>,
+}
+
+/// Resolved runtime configuration for the federation HTTP server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerRuntimeConfig {
+    /// Socket address the server will bind to.
+    pub bind: SocketAddr,
+    /// Resolved path to the bearer-token JSON file.
+    pub token_file: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -198,6 +221,8 @@ pub struct ConfigFileV1 {
     pub embedding_profile: Option<EmbeddingProfile>,
     #[serde(default)]
     pub low_cpu: Option<LowCpuConfigFileV1>,
+    #[serde(default)]
+    pub server: Option<ServerConfigFileV1>,
 }
 
 impl Default for ConfigFileV1 {
@@ -208,17 +233,25 @@ impl Default for ConfigFileV1 {
             collection_name: default_collection_name(),
             embedding_profile: Some(EmbeddingProfile::Balanced),
             low_cpu: None,
+            server: None,
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MempalaceConfig {
+    /// Config schema version.
     pub schema_version: u32,
+    /// SQLite collection table name.
     pub collection_name: String,
+    /// Path to the palace directory.
     pub palace_path: PathBuf,
+    /// Embedding profile in use.
     pub embedding_profile: EmbeddingProfile,
+    /// Low-CPU runtime constraints.
     pub low_cpu: LowCpuRuntimeConfig,
+    /// Federation HTTP server settings.
+    pub server: ServerRuntimeConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -262,13 +295,17 @@ impl ConfigLoader {
             .or(file.palace_path)
             .unwrap_or_else(|| paths.palace_dir.display().to_string());
 
+        let resolved_palace = expand_path(&palace_path)?;
+        let server = resolve_server_config(file.server, &paths.base_dir, &paths.config_file)?;
+
         Ok(MempalaceConfig {
             schema_version: file.version,
             collection_name: file.collection_name,
-            palace_path: expand_path(&palace_path)?,
+            palace_path: resolved_palace,
             embedding_profile,
             low_cpu: LowCpuRuntimeConfig::defaults_for_profile(embedding_profile)
                 .with_overrides(file.low_cpu, &paths.config_file)?,
+            server,
         })
     }
 
@@ -388,6 +425,38 @@ pub fn build_runtime(config: &MempalaceConfig) -> std::io::Result<Runtime> {
         .worker_threads(config.low_cpu.worker_threads)
         .max_blocking_threads(config.low_cpu.max_blocking_threads)
         .build()
+}
+
+fn resolve_server_config(
+    file_section: Option<ServerConfigFileV1>,
+    base_dir: &Path,
+    config_path: &Path,
+) -> Result<ServerRuntimeConfig> {
+    let default_bind: SocketAddr = DEFAULT_SERVER_BIND
+        .parse()
+        .expect("DEFAULT_SERVER_BIND is a valid socket address");
+    let default_token_file = base_dir.join(DEFAULT_SERVER_TOKEN_FILE);
+
+    let Some(section) = file_section else {
+        return Ok(ServerRuntimeConfig { bind: default_bind, token_file: default_token_file });
+    };
+
+    let bind = match section.bind {
+        None => default_bind,
+        Some(ref s) => s.parse::<SocketAddr>().map_err(|_| MempalaceError::ConfigParse {
+            path: config_path.to_path_buf(),
+            message: format!(
+                "server.bind `{s}` is not a valid socket address; expected e.g. \"127.0.0.1:8765\""
+            ),
+        })?,
+    };
+
+    let token_file = match section.token_file {
+        None => default_token_file,
+        Some(ref s) => expand_path(s)?,
+    };
+
+    Ok(ServerRuntimeConfig { bind, token_file })
 }
 
 fn default_collection_name() -> String {
@@ -711,6 +780,72 @@ mod tests {
 
         let err = ConfigLoader::load_with_env(Some(&base)).unwrap_err();
         assert!(err.to_string().contains("unsupported config schema version"));
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    // ─── Server config tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn server_defaults_when_section_absent() {
+        let base = temp_dir();
+        fs::create_dir_all(&base).unwrap();
+        // No server section
+        fs::write(base.join("config.json"), r#"{"version":1}"#).unwrap();
+
+        let config = ConfigLoader::load_with_env(Some(&base)).unwrap();
+
+        let bind: std::net::SocketAddr = "127.0.0.1:8765".parse().unwrap();
+        assert_eq!(config.server.bind, bind);
+        assert_eq!(config.server.token_file, base.join("server_tokens.json"));
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn server_explicit_values_are_parsed() {
+        let base = temp_dir();
+        fs::create_dir_all(&base).unwrap();
+        fs::write(
+            base.join("config.json"),
+            r#"{
+  "version": 1,
+  "server": {
+    "bind": "0.0.0.0:9999",
+    "token_file": "/tmp/my_tokens.json"
+  }
+}"#,
+        )
+        .unwrap();
+
+        let config = ConfigLoader::load_with_env(Some(&base)).unwrap();
+
+        let expected_bind: std::net::SocketAddr = "0.0.0.0:9999".parse().unwrap();
+        assert_eq!(config.server.bind, expected_bind);
+        assert_eq!(config.server.token_file, PathBuf::from("/tmp/my_tokens.json"));
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn invalid_server_bind_is_rejected_with_precise_error() {
+        let base = temp_dir();
+        fs::create_dir_all(&base).unwrap();
+        fs::write(
+            base.join("config.json"),
+            r#"{"version":1,"server":{"bind":"not-an-address"}}"#,
+        )
+        .unwrap();
+
+        let err = ConfigLoader::load_with_env(Some(&base)).unwrap_err();
+        assert!(
+            err.to_string().contains("server.bind"),
+            "expected server.bind error message, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("not-an-address"),
+            "error should contain the bad value, got: {err}"
+        );
 
         fs::remove_dir_all(base).unwrap();
     }

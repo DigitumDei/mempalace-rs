@@ -25,6 +25,8 @@ tracing.workspace = true
 
 [dev-dependencies]
 async-trait = "0.1.89"
+axum = { version = "0.8", default-features = true }
+mempalace-server = { path = "../mempalace-server" }
 tempfile = "3.23.0"
 
 [lints]

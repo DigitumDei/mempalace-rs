@@ -3979,6 +3979,7 @@ name = "mempalace-mcp"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "axum",
  "blake3",
  "dirs",
  "mempalace-config",
@@ -3988,6 +3989,7 @@ dependencies = [
  "mempalace-graph",
  "mempalace-remote",
  "mempalace-search",
+ "mempalace-server",
  "mempalace-storage",
  "serde",
  "serde_json",

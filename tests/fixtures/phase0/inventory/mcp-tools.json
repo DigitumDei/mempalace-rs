@@ -67,7 +67,7 @@
     }
   },
   "mempalace_diary_read": {
-    "description": "Read recent diary entries across all wings. Defaults to entries since the past day; optional filters narrow by wing, agent author, or topic.",
+    "description": "Read recent diary entries across all wings. Defaults to entries since the past day; optional filters narrow by wing, agent author, or topic. Always local; never federated.",
     "input_schema": {
       "properties": {
         "agent_name": {
@@ -95,7 +95,7 @@
     }
   },
   "mempalace_diary_write": {
-    "description": "Write a diary entry. Project-scoped entries are stored in the specified project wing; agent-scoped entries are stored in the shared wing_agents diary. The agent name is recorded as author attribution, not as the storage partition.",
+    "description": "Write a diary entry. Project-scoped entries are stored in the specified project wing; agent-scoped entries are stored in the shared wing_agents diary. The agent name is recorded as author attribution, not as the storage partition. Always local; never federated.",
     "input_schema": {
       "properties": {
         "agent_name": {
@@ -131,7 +131,7 @@
     }
   },
   "mempalace_find_tunnels": {
-    "description": "Find rooms that bridge two wings \u2014 the hallways connecting different domains. E.g. what topics connect wing_code to wing_team?",
+    "description": "Find rooms that bridge two wings \u2014 the hallways connecting different domains. E.g. what topics connect wing_code to wing_team? Local palace only; not federated in v1.",
     "input_schema": {
       "properties": {
         "wing_a": {
@@ -154,7 +154,7 @@
     }
   },
   "mempalace_get_changes_since": {
-    "description": "Get all palace changes since a given timestamp. Call this at session start (or when coordinating with teammates) to catch up on what other agents have written. Returns events in chronological order with operation type, affected entity, actor, and timestamp.",
+    "description": "Get all palace changes since a given timestamp. Call this at session start (or when coordinating with teammates) to catch up on what other agents have written. Returns events in chronological order with operation type, affected entity, actor, and timestamp. Local palace only; federated change feeds are future work.",
     "input_schema": {
       "properties": {
         "limit": {
@@ -177,7 +177,7 @@
     }
   },
   "mempalace_graph_stats": {
-    "description": "Palace graph overview: total rooms, tunnel connections, edges between wings.",
+    "description": "Palace graph overview: total rooms, tunnel connections, edges between wings. Local palace only; not federated in v1.",
     "input_schema": {
       "properties": {},
       "type": "object"
@@ -372,7 +372,7 @@
     }
   },
   "mempalace_traverse": {
-    "description": "Walk the palace graph from a room. Shows connected ideas across wings \u2014 the tunnels. Like following a thread through the palace: start at 'chromadb-setup' in wing_code, discover it connects to wing_myproject (planning) and wing_user (feelings about it).",
+    "description": "Walk the palace graph from a room. Shows connected ideas across wings \u2014 the tunnels. Like following a thread through the palace: start at 'chromadb-setup' in wing_code, discover it connects to wing_myproject (planning) and wing_user (feelings about it). Local palace only; not federated in v1.",
     "input_schema": {
       "properties": {
         "max_hops": {
@@ -391,7 +391,7 @@
     }
   },
   "mempalace_wake_up": {
-    "description": "Wake up into the palace. Returns identity.txt, palace status, recent palace changes, current project history when provided, and recent diary entries across all agents.",
+    "description": "Wake up into the palace. Returns identity.txt, palace status, recent palace changes, current project history when provided, and recent diary entries across all agents. Local palace only; federated change feeds are future work.",
     "input_schema": {
       "properties": {
         "agent_name": {

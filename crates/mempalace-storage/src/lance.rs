@@ -267,8 +267,12 @@ impl DrawerStore for LanceDrawerStore {
             return Ok(0);
         }
         let table = self.table().await?;
-        table.delete(&format!("id IN ({})", quote_ids(ids))).await?;
-        Ok(ids.len())
+        let predicate = format!("id IN ({})", quote_ids(ids));
+        // LanceDB's delete does not report affected rows; count matches first so
+        // callers can distinguish "deleted" from "was never there".
+        let existing = table.count_rows(Some(predicate.clone())).await?;
+        table.delete(&predicate).await?;
+        Ok(existing)
     }
 
     async fn search_drawers(&self, request: &SearchRequest) -> Result<Vec<DrawerMatch>> {

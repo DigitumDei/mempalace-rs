@@ -96,7 +96,7 @@ impl FederationRouter {
                 RouteMode::Local => "local".to_owned(),
                 RouteMode::Remote => {
                     if let Some(name) = &rule.remote {
-                        format!("remote:{name}")
+                        format_remote_origin(name)
                     } else {
                         "remote".to_owned()
                     }
@@ -478,7 +478,14 @@ impl FederationRouter {
                     })));
                 }
                 Err(e) if e.is_degradable() => continue,
-                Err(_) => continue,
+                Err(e) => {
+                    tracing::warn!(
+                        remote = %name,
+                        error = %e,
+                        "non-degradable error during remote drawer delete"
+                    );
+                    continue;
+                }
             }
         }
         Ok(None)
@@ -779,7 +786,7 @@ impl FederationRouter {
         match api.kg_add_fact(req).await {
             Ok(mut resp) => {
                 if let Some(obj) = resp.as_object_mut() {
-                    obj.insert("applied_to".to_owned(), json!(format!("remote:{remote_name}")));
+                    obj.insert("applied_to".to_owned(), json!(format_remote_origin(remote_name)));
                 }
                 Ok(Some(resp))
             }
@@ -823,7 +830,7 @@ impl FederationRouter {
         match api.kg_invalidate(req).await {
             Ok(mut resp) => {
                 if let Some(obj) = resp.as_object_mut() {
-                    obj.insert("applied_to".to_owned(), json!(format!("remote:{remote_name}")));
+                    obj.insert("applied_to".to_owned(), json!(format_remote_origin(remote_name)));
                 }
                 Ok(Some(resp))
             }
@@ -975,17 +982,26 @@ fn merge_kg_timeline(local: Value, mut remote: Value, remote_name: &str) -> Valu
     payload
 }
 
+/// Format a remote name as an `origin` label, guarding against a doubled
+/// `remote:` prefix in case a configured remote name already carries one.
+fn format_remote_origin(name: &str) -> String {
+    if name.starts_with("remote:") {
+        name.to_owned()
+    } else {
+        format!("remote:{name}")
+    }
+}
+
 /// Merge two KG stats payloads: sum numeric fields, union relationship types.
 fn merge_kg_stats(local: Value, remote: Value) -> Value {
     let mut merged = local.clone();
     if let Some(obj) = merged.as_object_mut() {
         for key in &["entities", "triples", "current_facts", "expired_facts"] {
-            if let (Some(local_val), Some(remote_val)) =
-                (obj.get(*key), remote.get(*key))
-            {
-                let sum = local_val.as_u64().unwrap_or(0) + remote_val.as_u64().unwrap_or(0);
-                obj[*key] = json!(sum);
-            }
+            // Default missing keys to 0 on either side so a key present on only
+            // one palace still contributes to the merged total.
+            let local_val = obj.get(*key).and_then(|v| v.as_u64()).unwrap_or(0);
+            let remote_val = remote.get(*key).and_then(|v| v.as_u64()).unwrap_or(0);
+            obj.insert((*key).to_owned(), json!(local_val + remote_val));
         }
         // Union relationship_types
         let mut types_set = std::collections::BTreeSet::new();

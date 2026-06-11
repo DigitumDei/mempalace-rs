@@ -13,6 +13,7 @@ serde_json.workspace = true
 serde_yaml.workspace = true
 tokio = { version = "1.48.0", features = ["rt-multi-thread"] }
 toml.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 time.workspace = true

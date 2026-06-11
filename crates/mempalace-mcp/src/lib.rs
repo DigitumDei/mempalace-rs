@@ -1900,7 +1900,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::mpsc;
 
-    use mempalace_config::{LowCpuRuntimeConfig, ServerRuntimeConfig};
+    use mempalace_config::{FederationRuntimeConfig, LowCpuRuntimeConfig, ServerRuntimeConfig};
     use mempalace_embeddings::{StartupValidation, StartupValidationStatus};
     use tempfile::TempDir;
     use time::macros::{date, datetime};
@@ -1936,6 +1936,7 @@ mod tests {
                 bind: "127.0.0.1:8765".parse().unwrap(),
                 token_file: tempdir.path().join("server_tokens.json"),
             },
+            federation: FederationRuntimeConfig::default(),
         };
         let server =
             McpServer::from_parts(config, DeterministicStubProvider::new(embedding_profile))
@@ -2266,6 +2267,7 @@ mod tests {
                 bind: "127.0.0.1:8765".parse().unwrap(),
                 token_file: tempdir.path().join("server_tokens.json"),
             },
+            federation: FederationRuntimeConfig::default(),
         };
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();

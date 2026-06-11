@@ -76,15 +76,14 @@ impl FederationRouter {
     pub fn wing_availability(&self, local_wings: &BTreeMap<String, usize>) -> Value {
         let mut avail = serde_json::Map::new();
         for wing_name in local_wings.keys() {
-            let route = resolve_route(
-                &self.rules,
-                None,
-                RouteQuery { wing: Some(wing_name), room: None, source_file: None },
-            );
-            let status = match route.mode {
-                RouteMode::Local => "local",
-                RouteMode::Remote => "remote",
-                RouteMode::Combined => "combined",
+            let status = if let Some(rule) = self.rules.wings.get(wing_name) {
+                match rule.mode {
+                    RouteMode::Local => "local",
+                    RouteMode::Remote => "remote",
+                    RouteMode::Combined => "combined",
+                }
+            } else {
+                "local"
             };
             avail.insert(wing_name.clone(), json!(status));
         }
@@ -819,7 +818,16 @@ fn merge_search_results(
         return remote.into_iter().take(limit).collect();
     }
     if remote.is_empty() {
-        return local.into_iter().take(limit).collect();
+        return local
+            .into_iter()
+            .map(|mut v| {
+                if v.get("origin").is_none() {
+                    v["origin"] = json!("local");
+                }
+                v
+            })
+            .take(limit)
+            .collect();
     }
 
     let mut merged: Vec<Value> = Vec::with_capacity(limit);
@@ -835,7 +843,11 @@ fn merge_search_results(
         if rank < local.len() {
             let item = &local[rank];
             if !is_duplicate_search_item(item, &mut seen_hashes, &mut seen_texts) {
-                merged.push(item.clone());
+                let mut annotated = item.clone();
+                if annotated.get("origin").is_none() {
+                    annotated["origin"] = json!("local");
+                }
+                merged.push(annotated);
             }
         }
         if merged.len() >= limit {

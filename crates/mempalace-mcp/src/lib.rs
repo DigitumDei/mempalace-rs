@@ -854,7 +854,9 @@ where
                 .as_object()
                 .map(|obj| obj.iter().filter_map(|(k, v)| v.as_u64().map(|n| (k.clone(), n as usize))).collect())
                 .unwrap_or_default();
-            payload["wing_availability"] = router.wing_availability(&local_wings);
+            if router.has_remotes() {
+                payload["wing_availability"] = router.wing_availability(&local_wings);
+            }
         }
         Ok(payload)
     }
@@ -966,7 +968,9 @@ where
                 .as_object()
                 .map(|obj| obj.iter().filter_map(|(k, v)| v.as_u64().map(|n| (k.clone(), n as usize))).collect())
                 .unwrap_or_default();
-            payload["wing_availability"] = router.wing_availability(&local_wings);
+            if router.has_remotes() {
+                payload["wing_availability"] = router.wing_availability(&local_wings);
+            }
         }
         Ok(payload)
     }
@@ -991,7 +995,9 @@ where
         if let Some(router) = &self.federation {
             let route = router.resolve_drawer_route(wing.as_deref());
             payload = router.rooms_merge(payload, wing.as_deref(), &route).await?;
-            payload["wing_availability"] = router.wing_availability(&room_wings);
+            if router.has_remotes() {
+                payload["wing_availability"] = router.wing_availability(&room_wings);
+            }
         }
         Ok(payload)
     }
@@ -1012,7 +1018,9 @@ where
         if let Some(router) = &self.federation {
             let route = router.resolve_drawer_route(None);
             payload = router.taxonomy_merge(payload, &route).await?;
-            payload["wing_availability"] = router.wing_availability(&wings);
+            if router.has_remotes() {
+                payload["wing_availability"] = router.wing_availability(&wings);
+            }
         }
         Ok(payload)
     }

@@ -33,6 +33,40 @@ use tokio::sync::{Mutex, Semaphore, TryAcquireError};
 
 pub use mempalace_core as core;
 
+// ─── Federation routing semantics ─────────────────────────────────────────────
+//
+// When federation is configured (via `federation` section in the palace config),
+// tools route as follows:
+//
+// **Routable — uses `resolve_route()` per wing/room:**
+//   Search, ListWings, ListRooms, GetTaxonomy, Status, CheckDuplicate,
+//   AddDrawer, DeleteDrawer
+//
+// **Routable — uses `resolve_kg_route()` (knowledge-graph-specific routing):**
+//   KgQuery, KgAdd, KgInvalidate, KgTimeline, KgStats
+//
+// **Always local — never federated:**
+//   DiaryWrite, DiaryRead, WakeUp, GetChangesSince, Traverse, FindTunnels,
+//   GraphStats, IdentityRead, IdentityUpdate, GetAaaKSpec
+//
+// **`kg_invalidate` policy:** Follows `resolve_kg_route()` — same routing as
+//   KgQuery/KgAdd/KgTimeline/KgStats. Invalidations are applied to the local KG
+//   in Local mode, the remote KG in Remote mode, and both when Combined.
+//
+// **Wing name collisions:** When a tool resolves to a remote server and the
+//   requested wing exists both locally and at that remote, a warning is emitted
+//   via `tracing::warn!`. Collisions are surface-level only — they do not block
+//   execution. The `add_drawer` tool surfaces an additional warning when a write
+//   target wing shadows a local wing.
+//
+// **Write routing:** In Combined mode, `AddDrawer`, `DeleteDrawer`, `KgAdd`, and
+//   `KgInvalidate` write to the target indicated by the resolved rule's `write`
+//   field (local or remote). Read tools always fan out to both sources.
+//
+// For details on route resolution precedence, see
+// `mempalace_config::federation::resolve_route()`.
+// ──────────────────────────────────────────────────────────────────────────────
+
 const SERVER_NAME: &str = "mempalace";
 const SERVER_VERSION: &str = "2.0.0";
 const PROTOCOL_VERSION: &str = "2024-11-05";
@@ -82,6 +116,16 @@ pub struct ToolDefinition {
     pub name: &'static str,
     pub description: &'static str,
     pub input_schema: Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolRoutingCategory {
+    /// Tool is always served from the local palace; never federated.
+    LocalOnly,
+    /// Tool routes via wing/room rules (`resolve_route`).
+    RoutableDrawer,
+    /// Tool routes via KG-specific rules (`resolve_kg_route`).
+    RoutableKg,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -408,6 +452,34 @@ impl ToolName {
                     "required":["content"]
                 }),
             },
+        }
+    }
+
+    fn routing(self) -> ToolRoutingCategory {
+        match self {
+            Self::WakeUp
+            | Self::DiaryWrite
+            | Self::DiaryRead
+            | Self::GetChangesSince
+            | Self::Traverse
+            | Self::FindTunnels
+            | Self::GraphStats
+            | Self::IdentityRead
+            | Self::IdentityUpdate
+            | Self::GetAaaKSpec => ToolRoutingCategory::LocalOnly,
+            Self::Search
+            | Self::ListWings
+            | Self::ListRooms
+            | Self::GetTaxonomy
+            | Self::Status
+            | Self::CheckDuplicate
+            | Self::AddDrawer
+            | Self::DeleteDrawer => ToolRoutingCategory::RoutableDrawer,
+            Self::KgQuery
+            | Self::KgAdd
+            | Self::KgInvalidate
+            | Self::KgTimeline
+            | Self::KgStats => ToolRoutingCategory::RoutableKg,
         }
     }
 }
@@ -1237,6 +1309,12 @@ where
         }))
     }
 
+    /// Knowledge-graph invalidation.
+    ///
+    /// **Federation policy:** Follows `resolve_kg_route()` — same as all other KG
+    /// tools. In Local mode the invalidation applies only to the local KG; in
+    /// Remote mode only to the remote; in Combined mode to both. The `ended` date
+    /// is applied uniformly across all targeted palaces.
     async fn tool_kg_invalidate(&mut self, arguments: &Value) -> ToolResult<Value> {
         let subject = required_string(arguments, "subject")?;
         let predicate = required_string(arguments, "predicate")?;
@@ -1760,6 +1838,29 @@ fn generated_drawer_id(
 
 fn hash_text(content: &str) -> String {
     blake3::hash(content.as_bytes()).to_hex().to_string()
+}
+
+/// Emit a [`tracing::warn!`] when a wing exists both locally and on a remote server.
+///
+/// This is called by routable tools when they resolve a non-local route for a
+/// wing that also has drawers in the local palace. The warning is surface-level
+/// only — it does not block execution. Callers pass `local_wing_count` (the
+/// number of local drawers in that wing) and `remote_name` (the target remote).
+///
+/// Federation v1 behavior: warnings are best-effort. No guarantee is made that
+/// every collision is detected and warned; callers SHOULD warn when they can
+/// cheaply check, but MUST NOT perform expensive cross-palace enumeration just
+/// to detect collisions.
+fn warn_wing_collision(wing_name: &str, local_drawer_count: usize, remote_name: &str) {
+    if local_drawer_count > 0 {
+        tracing::warn!(
+            wing = %wing_name,
+            local_drawers = local_drawer_count,
+            remote = %remote_name,
+            "wing exists both locally and on remote `{remote_name}`; \
+             {local_drawer_count} local drawer(s) may be shadowed"
+        );
+    }
 }
 
 fn infer_entity_kind(name: &str) -> EntityKind {

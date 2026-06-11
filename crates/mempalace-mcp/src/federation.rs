@@ -343,12 +343,10 @@ impl FederationRouter {
                                         obj.entry(wing.clone()).or_insert_with(|| json!({}));
                                     if let Some(wing_map) = wing_entry.as_object_mut() {
                                         for (room, count) in rooms_obj {
-                                            let c = count.as_u64().unwrap_or(0) as usize;
-                                            *wing_map
-                                                .entry(room.clone())
-                                                .or_insert(json!(0))
-                                                .as_u64_mut()
-                                                .unwrap_or(&mut 0) += c as u64;
+                                            let c = count.as_u64().unwrap_or(0);
+                                            let entry = wing_map.entry(room.clone()).or_insert(json!(0));
+                                            let val = entry.as_u64().unwrap_or(0);
+                                            *entry = json!(val + c);
                                         }
                                     }
                                 }
@@ -382,10 +380,10 @@ impl FederationRouter {
                             (merged.get_mut("wings").and_then(|v| v.as_object_mut()), remote_wings.as_object())
                         {
                             for (wing, count) in robj {
-                                let c = count.as_u64().unwrap_or(0) as usize;
-                                *obj.entry(wing.clone()).or_insert(json!(0))
-                                    .as_u64_mut()
-                                    .unwrap_or(&mut 0) += c as u64;
+                                let c = count.as_u64().unwrap_or(0);
+                                let entry = obj.entry(wing.clone()).or_insert(json!(0));
+                                let val = entry.as_u64().unwrap_or(0);
+                                *entry = json!(val + c);
                             }
                         }
                     }
@@ -413,10 +411,10 @@ impl FederationRouter {
                             (merged.get_mut("rooms").and_then(|v| v.as_object_mut()), remote_rooms.as_object())
                         {
                             for (room, count) in robj {
-                                let c = count.as_u64().unwrap_or(0) as usize;
-                                *obj.entry(room.clone()).or_insert(json!(0))
-                                    .as_u64_mut()
-                                    .unwrap_or(&mut 0) += c as u64;
+                                let c = count.as_u64().unwrap_or(0);
+                                let entry = obj.entry(room.clone()).or_insert(json!(0));
+                                let val = entry.as_u64().unwrap_or(0);
+                                *entry = json!(val + c);
                             }
                         }
                     }

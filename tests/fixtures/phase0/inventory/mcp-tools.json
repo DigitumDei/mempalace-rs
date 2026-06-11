@@ -154,11 +154,18 @@
     }
   },
   "mempalace_get_changes_since": {
-    "description": "Get all palace changes since a given timestamp. Call this at session start (or when coordinating with teammates) to catch up on what other agents have written. Returns events in chronological order with operation type, affected entity, actor, and timestamp. Local palace only; federated change feeds are future work.",
+    "description": "Get all palace changes since a given timestamp. Call this at session start (or when coordinating with teammates) to catch up on what other agents have written. Returns events in chronological order with operation type, affected entity, actor, and timestamp. When federation is active, remote changes are merged in: each event carries an `origin` field (`\"local\"` or `\"remote:<name>\"`), and a top-level `remotes` object reports per-remote `{ next_cursor, count }` or `{ unreachable: true, error }`. CLOCK-SKEW CAVEAT: timestamps across machines are not directly comparable. Persist the per-origin `next_cursor` values from `remotes` and pass them back via `cursors` rather than reusing a single max-timestamp across origins. `limit` applies per origin (local and each remote each receive `limit` events independently).",
     "input_schema": {
       "properties": {
+        "cursors": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Per-remote opaque cursor strings from a previous response's `remotes.<name>.next_cursor`. Pass back to continue pagination for specific remotes without re-fetching already-seen events.",
+          "type": "object"
+        },
         "limit": {
-          "description": "Max events to return (default 50)",
+          "description": "Max events to return per origin (default 50)",
           "type": "integer"
         },
         "since": {
@@ -391,7 +398,7 @@
     }
   },
   "mempalace_wake_up": {
-    "description": "Wake up into the palace. Returns identity.txt, palace status, recent palace changes, current project history when provided, and recent diary entries across all agents. Local palace only; federated change feeds are future work.",
+    "description": "Wake up into the palace. Returns identity.txt, palace status, recent palace changes, current project history when provided, and recent diary entries across all agents. When federation is active the response also includes `remote_changes`: a per-remote map of change events from the last 24 hours (each event carries `origin: \"remote:<name>\"`), unreachable remotes appear as `{ \"unreachable\": true, \"error\": \"...\" }`, and a `next_cursor` is provided per remote for continuation via mempalace_get_changes_since.",
     "input_schema": {
       "properties": {
         "agent_name": {

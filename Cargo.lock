@@ -3996,6 +3996,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "mempalace-remote"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "mempalace-federation",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "mempalace-search"
 version = "0.1.0"
 dependencies = [

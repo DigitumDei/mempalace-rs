@@ -17,7 +17,13 @@ tokio = { version = "1.48.0", features = ["sync"] }
 tracing.workspace = true
 
 [dev-dependencies]
-tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread", "sync"] }
+axum = { version = "0.8", default-features = true }
+mempalace-config = { path = "../mempalace-config" }
+mempalace-core = { path = "../mempalace-core" }
+mempalace-embeddings = { path = "../mempalace-embeddings" }
+mempalace-server = { path = "../mempalace-server" }
+tempfile = "3.23.0"
+tokio = { version = "1.48.0", features = ["macros", "net", "rt-multi-thread", "sync"] }
 
 [lints]
 workspace = true

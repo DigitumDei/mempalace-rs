@@ -1181,7 +1181,8 @@ mod tests {
         ) -> mempalace_remote::Result<CheckDuplicateResponse> {
             self.check_fail("check_duplicate")?;
             Ok(CheckDuplicateResponse {
-                matches: self.duplicate_matches.clone(),
+                is_duplicate: !self.duplicate_matches.is_empty(),
+                matches: json!(self.duplicate_matches.clone()),
             })
         }
 
@@ -1193,8 +1194,8 @@ mod tests {
             Ok(AddDrawerResponse {
                 success: self.add_drawer_success,
                 drawer_id: Some("rem-drawer-1".to_owned()),
-                wing: req.wing,
-                room: req.room,
+                wing: Some(req.wing),
+                room: Some(req.room),
             })
         }
 
@@ -1216,7 +1217,11 @@ mod tests {
             if self.delete_succeeds {
                 Ok(())
             } else {
-                Err(RemoteError::NotFound("not found".to_owned()))
+                Err(RemoteError::RemoteRejected {
+                    remote: "mock".to_owned(),
+                    status: 404,
+                    body: "not found".to_owned(),
+                })
             }
         }
 
@@ -1260,18 +1265,21 @@ mod tests {
             Ok(self.rooms.clone())
         }
 
-        async fn get_changes(
+        async fn changes(
             &self,
             _query: ChangesQuery,
         ) -> mempalace_remote::Result<ChangesResponse> {
-            Ok(ChangesResponse { events: vec![], cursor: None })
+            Ok(ChangesResponse { events: vec![], next_cursor: None })
         }
     }
 
     impl MockRemote {
         fn check_fail(&self, endpoint: &str) -> mempalace_remote::Result<()> {
             if self.fail_on.as_deref() == Some(endpoint) {
-                Err(RemoteError::Connection("mock failure".to_owned()))
+                Err(RemoteError::Unreachable {
+                    remote: "mock".to_owned(),
+                    message: "mock failure".to_owned(),
+                })
             } else {
                 Ok(())
             }

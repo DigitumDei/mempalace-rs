@@ -107,6 +107,8 @@ pub enum McpError {
     Json(#[from] serde_json::Error),
     #[error("time formatting error: {0}")]
     TimeFormat(String),
+    #[error("federation error: {0}")]
+    Federation(String),
     #[error("io error at {path}: {source}")]
     Io {
         path: PathBuf,
@@ -728,55 +730,10 @@ where
     ///
     /// **LocalOnly** tools are passed through with no routing logic.
     ///
-    /// **RoutableDrawer** tools resolve via `resolve_route()`. When the resolved
-    /// rule's mode is not `Local` and the arguments contain a `wing` field, a
-    /// wing-collision warning is emitted if any local drawers exist for that wing.
-    ///
-    /// **RoutableKg** tools resolve via `resolve_kg_route()`. No wing collision
-    /// check is performed since KG tools apply to the whole graph, not per-wing.
-    ///
-    /// This method is best-effort: warnings are surface-level and do not block
-    /// execution. Federation v1 has no remote HTTP client, so all tool calls
-    /// still execute against the local palace.
-    async fn apply_routing(&self, tool: ToolName, arguments: &Value) {
-        let category = tool.routing();
-        match category {
-            ToolRoutingCategory::LocalOnly => {}
-            ToolRoutingCategory::RoutableDrawer => {
-                let federation = &self.config.federation;
-                let wing = optional_wing_from_args(arguments);
-                let route = resolve_route(
-                    federation,
-                    None,
-                    RouteQuery { wing, room: None, source_file: None },
-                );
-                if route.mode != RouteMode::Local {
-                    if let Some(wing_name) = wing {
-                        if let Ok(wing_id) = WingId::normalized(wing_name) {
-                            let count = self
-                                .storage
-                                .drawer_store()
-                                .list_drawers(&DrawerFilter {
-                                    wing: Some(wing_id),
-                                    ..DrawerFilter::default()
-                                })
-                                .await
-                                .map(|d| d.len())
-                                .unwrap_or(0);
-                            warn_wing_collision(
-                                wing_name,
-                                count,
-                                route.remote.as_deref().unwrap_or("remote"),
-                            );
-                        }
-                    }
-                }
-            }
-            ToolRoutingCategory::RoutableKg => {
-                let _route = resolve_kg_route(&self.config.federation);
-            }
-        }
-    }
+    /// Routing hints are resolved per-request by individual tool handlers that
+    /// support federation; this method is a no-op placeholder for future proactive
+    /// routing logic.
+    async fn apply_routing(&self, _tool: ToolName, _arguments: &Value) {}
 
     async fn tool_wake_up(&mut self, arguments: &Value) -> ToolResult<Value> {
         let wing =
@@ -848,8 +805,7 @@ where
     async fn tool_status(&mut self) -> ToolResult<Value> {
         let mut payload = self.status_payload().await?;
         if let Some(router) = &self.federation {
-            let route = router.resolve_drawer_route(None);
-            payload = router.status_merge(payload, &route).await?;
+            payload = router.status_merge(payload).await?;
             let local_wings: BTreeMap<String, usize> = payload["wings"]
                 .as_object()
                 .map(|obj| obj.iter().filter_map(|(k, v)| v.as_u64().map(|n| (k.clone(), n as usize))).collect())
@@ -962,8 +918,7 @@ where
         }
         let mut payload = json!({ "wings": wings });
         if let Some(router) = &self.federation {
-            let route = router.resolve_drawer_route(None);
-            payload = router.wings_merge(payload, &route).await?;
+            payload = router.wings_merge(payload).await?;
             let local_wings: BTreeMap<String, usize> = payload["wings"]
                 .as_object()
                 .map(|obj| obj.iter().filter_map(|(k, v)| v.as_u64().map(|n| (k.clone(), n as usize))).collect())
@@ -993,8 +948,7 @@ where
             "rooms": rooms,
         });
         if let Some(router) = &self.federation {
-            let route = router.resolve_drawer_route(wing.as_deref());
-            payload = router.rooms_merge(payload, wing.as_deref(), &route).await?;
+            payload = router.rooms_merge(payload, wing.as_deref()).await?;
             if router.has_remotes() {
                 payload["wing_availability"] = router.wing_availability(&room_wings);
             }
@@ -1016,8 +970,7 @@ where
         }
         let mut payload = json!({ "taxonomy": taxonomy });
         if let Some(router) = &self.federation {
-            let route = router.resolve_drawer_route(None);
-            payload = router.taxonomy_merge(payload, &route).await?;
+            payload = router.taxonomy_merge(payload).await?;
             if router.has_remotes() {
                 payload["wing_availability"] = router.wing_availability(&wings);
             }
@@ -1969,10 +1922,6 @@ fn optional_f32(arguments: &Value, field: &'static str) -> ToolResult<Option<f32
     }
 }
 
-fn optional_wing_from_args(arguments: &Value) -> Option<&str> {
-    arguments.get("wing").and_then(|v| v.as_str())
-}
-
 fn parse_wing_id(value: &str) -> ToolResult<WingId> {
     WingId::normalized(value).map_err(|error| ToolError::InvalidParams(error.to_string()))
 }
@@ -2108,22 +2057,6 @@ fn hash_text(content: &str) -> String {
 /// only — it does not block execution. Callers pass `local_wing_count` (the
 /// number of local drawers in that wing) and `remote_name` (the target remote).
 ///
-/// Federation v1 behavior: warnings are best-effort. No guarantee is made that
-/// every collision is detected and warned; callers SHOULD warn when they can
-/// cheaply check, but MUST NOT perform expensive cross-palace enumeration just
-/// to detect collisions.
-fn warn_wing_collision(wing_name: &str, local_drawer_count: usize, remote_name: &str) {
-    if local_drawer_count > 0 {
-        tracing::warn!(
-            wing = %wing_name,
-            local_drawers = local_drawer_count,
-            remote = %remote_name,
-            "wing exists both locally and on remote `{remote_name}`; \
-             {local_drawer_count} local drawer(s) may be shadowed"
-        );
-    }
-}
-
 fn infer_entity_kind(name: &str) -> EntityKind {
     let trimmed = name.trim();
     if trimmed.is_empty() {
@@ -4008,17 +3941,6 @@ mod tests {
     }
 
     // ── Routing / Federation tests ─────────────────────────────────────────
-
-    #[test]
-    fn warn_wing_collision_emits_no_warning_for_empty_wing() {
-        // The function should not panic when local_drawer_count is 0.
-        warn_wing_collision("wing_code", 0, "remote-alpha");
-    }
-
-    #[test]
-    fn warn_wing_collision_emits_warning_for_non_empty_wing() {
-        warn_wing_collision("wing_code", 3, "remote-alpha");
-    }
 
     #[test]
     fn routing_categories_are_consistent_with_semantics_doc() {

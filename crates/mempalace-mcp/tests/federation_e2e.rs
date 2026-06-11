@@ -855,3 +855,630 @@ async fn wing_availability_reflects_rules() {
         "list_wings wing_availability must reflect remote rule; got: {wings_avail}"
     );
 }
+
+// ─── Issue #19 tests: federated wake-up and changes feed ─────────────────────
+
+// ─── Test 7: wake_up_includes_remote_changes_from_hub ────────────────────────
+
+/// Seed 2 drawers on the hub via routed adds, then call `mempalace_wake_up`.
+/// The response must include `remote_changes.hub.events` with both seeded
+/// entity ids, every event tagged `origin == "remote:hub"`, and the standard
+/// local sections (identity, status, diary) still present.
+#[tokio::test]
+async fn wake_up_includes_remote_changes_from_hub() {
+    let hub_dir = TempDir::new().unwrap();
+    let local_dir = TempDir::new().unwrap();
+
+    let addr = spawn_server(&hub_dir).await;
+    let hub_url = format!("http://{addr}");
+
+    // Route "wing_wake" as Combined/write=Remote so adds land on the hub.
+    let mut wing_rules = BTreeMap::new();
+    wing_rules.insert("wing_wake".to_owned(), combined_wing_rule_remote_write());
+
+    let server = mcp_server_with_hub(
+        &local_dir,
+        &hub_url,
+        wing_rules,
+        RouteMode::Local,
+        None,
+    )
+    .await;
+
+    // Seed two drawers on the hub. Use distinct embedding clusters so the stub
+    // provider gives each drawer a unique vector and duplicate detection does
+    // not reject the second add.
+    // Cluster 1: "auth migration parity" → [1,0,0,0]
+    // Cluster 2: "rust cli tooling"      → [0,0,1,0]
+    let add1 = call_tool(
+        &server,
+        1,
+        "mempalace_add_drawer",
+        json!({
+            "wing": "wing_wake",
+            "room": "general",
+            "content": "wake up test hub auth migration parity cluster one",
+            "added_by": "wake-test"
+        }),
+    )
+    .await;
+    assert_eq!(add1["success"], true, "hub add 1 must succeed: {add1}");
+    assert_eq!(add1["origin"], "hub", "add1 must go to hub: {add1}");
+    let entity_id1 = add1["drawer_id"].as_str().unwrap().to_owned();
+
+    let add2 = call_tool(
+        &server,
+        2,
+        "mempalace_add_drawer",
+        json!({
+            "wing": "wing_wake",
+            "room": "general",
+            "content": "wake up test hub rust cli tooling cluster two",
+            "added_by": "wake-test"
+        }),
+    )
+    .await;
+    assert_eq!(add2["success"], true, "hub add 2 must succeed: {add2}");
+    assert_eq!(add2["origin"], "hub", "add2 must go to hub: {add2}");
+    let entity_id2 = add2["drawer_id"].as_str().unwrap().to_owned();
+
+    // Call mempalace_wake_up.
+    let wake = call_tool(
+        &server,
+        3,
+        "mempalace_wake_up",
+        json!({"agent_name": "wake-test", "latest_limit": 25}),
+    )
+    .await;
+
+    // Standard local sections must still be present.
+    assert!(wake.get("identity").is_some(), "wake_up must include identity: {wake}");
+    assert!(wake.get("status").is_some(), "wake_up must include status: {wake}");
+    assert!(wake.get("diary").is_some(), "wake_up must include diary: {wake}");
+
+    // remote_changes must exist and include a "hub" key.
+    let remote_changes = wake
+        .get("remote_changes")
+        .expect("wake_up with federation must include remote_changes");
+    let hub_changes = remote_changes
+        .get("hub")
+        .expect("remote_changes must include 'hub' entry");
+
+    // Must not be an unreachable marker.
+    assert!(
+        hub_changes.get("unreachable").is_none() || hub_changes["unreachable"] == false,
+        "hub must be reachable in wake_up: {hub_changes}"
+    );
+
+    let events = hub_changes["events"]
+        .as_array()
+        .expect("hub remote_changes must have events array");
+    assert!(
+        !events.is_empty(),
+        "hub remote_changes.events must be non-empty: {hub_changes}"
+    );
+
+    // Every event must carry origin == "remote:hub".
+    for event in events {
+        assert_eq!(
+            event["origin"].as_str(),
+            Some("remote:hub"),
+            "every hub remote_change event must have origin=remote:hub; event: {event}"
+        );
+    }
+
+    // Both seeded entity ids must appear.
+    let entity_ids: Vec<&str> = events
+        .iter()
+        .filter_map(|e| e["entity_id"].as_str())
+        .collect();
+    assert!(
+        entity_ids.contains(&entity_id1.as_str()),
+        "wake_up hub events must include entity_id {entity_id1}; ids: {entity_ids:?}"
+    );
+    assert!(
+        entity_ids.contains(&entity_id2.as_str()),
+        "wake_up hub events must include entity_id {entity_id2}; ids: {entity_ids:?}"
+    );
+}
+
+// ─── Test 8: wake_up_with_down_remote_marks_unreachable_and_succeeds ─────────
+
+/// Point the hub config at a dropped-listener address (down remote).
+/// `mempalace_wake_up` must still succeed (identity present) and
+/// `remote_changes.hub` must have `unreachable == true` with a non-empty error.
+#[tokio::test]
+async fn wake_up_with_down_remote_marks_unreachable_and_succeeds() {
+    // Bind a port to get a free address, then drop so nothing listens.
+    let dead_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let dead_addr = dead_listener.local_addr().unwrap();
+    drop(dead_listener);
+    let dead_url = format!("http://{dead_addr}");
+
+    let local_dir = TempDir::new().unwrap();
+
+    let mut remotes = BTreeMap::new();
+    remotes.insert(
+        "hub".to_owned(),
+        ResolvedRemote {
+            name: "hub".to_owned(),
+            url: dead_url.clone(),
+            token: Some(TEST_TOKEN.to_owned()),
+            // Short timeout so the test does not block.
+            timeout: Duration::from_millis(500),
+        },
+    );
+
+    let federation = FederationRuntimeConfig {
+        remotes,
+        default_mode: RouteMode::Local,
+        default_remote: None,
+        wings: BTreeMap::new(),
+        kg: None,
+    };
+
+    let config = MempalaceConfig {
+        schema_version: 1,
+        collection_name: "mempalace_drawers".to_owned(),
+        palace_path: local_dir.path().join("palace"),
+        embedding_profile: EmbeddingProfile::Balanced,
+        low_cpu: LowCpuRuntimeConfig::defaults_for_profile(EmbeddingProfile::Balanced),
+        server: ServerRuntimeConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            token_file: local_dir.path().join("server_tokens.json"),
+        },
+        federation,
+    };
+
+    let server =
+        McpServer::from_parts(config, DeterministicStubProvider::new(EmbeddingProfile::Balanced))
+            .await
+            .unwrap();
+
+    // wake_up must succeed despite the dead remote.
+    let wake = call_tool(
+        &server,
+        1,
+        "mempalace_wake_up",
+        json!({"agent_name": "down-test"}),
+    )
+    .await;
+
+    // Standard sections must still be present (graceful degradation).
+    assert!(
+        wake.get("identity").is_some(),
+        "wake_up must include identity even with dead remote: {wake}"
+    );
+    assert!(
+        wake.get("status").is_some(),
+        "wake_up must include status even with dead remote: {wake}"
+    );
+
+    // remote_changes must exist with an unreachable marker for "hub".
+    let remote_changes = wake
+        .get("remote_changes")
+        .expect("wake_up with federation must include remote_changes even when remote is down");
+    let hub_changes = remote_changes
+        .get("hub")
+        .expect("remote_changes must include 'hub' entry");
+
+    assert_eq!(
+        hub_changes["unreachable"], true,
+        "hub must be marked unreachable when down: {hub_changes}"
+    );
+    let error_str = hub_changes["error"].as_str().unwrap_or("");
+    assert!(
+        !error_str.is_empty(),
+        "hub unreachable marker must include non-empty error: {hub_changes}"
+    );
+}
+
+// ─── Test 9: get_changes_since_cursor_continuation_across_two_pages ──────────
+
+/// Seed 3 drawers on the hub via routed adds. Call `mempalace_get_changes_since`
+/// with `limit: 2`. Assert exactly 2 remote-origin events and a non-null
+/// `remotes.hub.next_cursor`. Then call again with that cursor and assert the
+/// remaining event comes back, no entity_id overlap between pages, and
+/// `remotes.hub.next_cursor` is null on the final page.
+/// Also verify ascending `occurred_at` order within each response.
+#[tokio::test]
+async fn get_changes_since_cursor_continuation_across_two_pages() {
+    let hub_dir = TempDir::new().unwrap();
+    let local_dir = TempDir::new().unwrap();
+
+    let addr = spawn_server(&hub_dir).await;
+    let hub_url = format!("http://{addr}");
+
+    let mut wing_rules = BTreeMap::new();
+    wing_rules.insert("wing_pages".to_owned(), combined_wing_rule_remote_write());
+
+    let server = mcp_server_with_hub(
+        &local_dir,
+        &hub_url,
+        wing_rules,
+        RouteMode::Local,
+        None,
+    )
+    .await;
+
+    // Seed 3 drawers on the hub using distinct embedding clusters so duplicate
+    // detection does not reject any add.
+    // Cluster 1: "auth migration parity" → [1,0,0,0]
+    // Cluster 2: "rust cli tooling"      → [0,0,1,0]
+    // Cluster 3: (no keyword match)      → [0,0,0,1]  — different content hash prevents dup
+    let contents = [
+        "cursor pagination test auth migration parity hub event one",
+        "cursor pagination test rust cli tooling hub event two",
+        "cursor pagination test hub event three qwerty unique zxcvb",
+    ];
+    let mut hub_entity_ids = Vec::new();
+    for (i, content) in contents.iter().enumerate() {
+        let add = call_tool(
+            &server,
+            i as u64 + 1,
+            "mempalace_add_drawer",
+            json!({
+                "wing": "wing_pages",
+                "room": "pagination",
+                "content": content,
+                "added_by": "page-test"
+            }),
+        )
+        .await;
+        assert_eq!(add["success"], true, "hub add {i} must succeed: {add}");
+        assert_eq!(add["origin"], "hub", "add {i} must go to hub: {add}");
+        hub_entity_ids.push(add["drawer_id"].as_str().unwrap().to_owned());
+    }
+
+    // First page: limit=2, no cursor, since=epoch.
+    let page1 = call_tool(
+        &server,
+        10,
+        "mempalace_get_changes_since",
+        json!({"since": "2000-01-01T00:00:00Z", "limit": 2}),
+    )
+    .await;
+
+    let page1_events = page1["events"].as_array().expect("events must be array");
+    // Count only remote-origin events (local side has 0 drawers in wing_pages,
+    // but may have 0 local changes since we only added via remote route).
+    let page1_remote: Vec<&Value> = page1_events
+        .iter()
+        .filter(|e| e["origin"].as_str().map_or(false, |o| o.starts_with("remote:")))
+        .collect();
+    assert_eq!(
+        page1_remote.len(), 2,
+        "first page must return exactly 2 remote-origin events; events: {page1_events:?}"
+    );
+
+    // Verify ascending occurred_at order on page 1.
+    for pair in page1_remote.windows(2) {
+        let t0 = pair[0]["occurred_at"].as_str().unwrap_or("");
+        let t1 = pair[1]["occurred_at"].as_str().unwrap_or("");
+        assert!(
+            t0 <= t1,
+            "events must be ascending by occurred_at; got {t0} then {t1}"
+        );
+    }
+
+    // remotes.hub.next_cursor must be a non-null string.
+    let remotes_meta = page1.get("remotes").expect("page1 must include remotes meta");
+    let hub_cursor1 = remotes_meta["hub"]["next_cursor"]
+        .as_str()
+        .expect("remotes.hub.next_cursor must be a string on page 1");
+
+    let page1_entity_ids: Vec<&str> = page1_remote
+        .iter()
+        .filter_map(|e| e["entity_id"].as_str())
+        .collect();
+
+    // Second page: pass the cursor for hub.
+    let page2 = call_tool(
+        &server,
+        11,
+        "mempalace_get_changes_since",
+        json!({
+            "since": "2000-01-01T00:00:00Z",
+            "limit": 2,
+            "cursors": {"hub": hub_cursor1}
+        }),
+    )
+    .await;
+
+    let page2_events = page2["events"].as_array().expect("events must be array");
+    let page2_remote: Vec<&Value> = page2_events
+        .iter()
+        .filter(|e| e["origin"].as_str().map_or(false, |o| o.starts_with("remote:")))
+        .collect();
+    assert!(
+        !page2_remote.is_empty(),
+        "second page must return at least 1 remote-origin event; events: {page2_events:?}"
+    );
+
+    // No entity_id overlap between pages.
+    let page2_entity_ids: Vec<&str> = page2_remote
+        .iter()
+        .filter_map(|e| e["entity_id"].as_str())
+        .collect();
+    for id in &page2_entity_ids {
+        assert!(
+            !page1_entity_ids.contains(id),
+            "entity_id {id} appeared on both page 1 and page 2 — overlap not allowed"
+        );
+    }
+
+    // All 3 hub entity ids must appear across the two pages combined.
+    let all_ids: Vec<&str> =
+        page1_entity_ids.iter().chain(page2_entity_ids.iter()).copied().collect();
+    for expected_id in &hub_entity_ids {
+        assert!(
+            all_ids.contains(&expected_id.as_str()),
+            "entity_id {expected_id} must appear across the two pages; got: {all_ids:?}"
+        );
+    }
+
+    // Final page cursor must be null (no more data).
+    let page2_remotes = page2.get("remotes").expect("page2 must include remotes meta");
+    assert!(
+        page2_remotes["hub"]["next_cursor"].is_null(),
+        "remotes.hub.next_cursor must be null on the last page; got: {page2_remotes}"
+    );
+}
+
+// ─── Test 10: diary_events_never_appear_in_remote_changes ────────────────────
+
+/// Get a diary event into the hub palace (via an in-process McpServer before
+/// spawning the HTTP server) plus one normal drawer event on the hub.
+/// Federated `mempalace_get_changes_since` must show the drawer event with
+/// `origin == "remote:hub"` and NO event with `event_type == "diary_written"`
+/// from a remote origin.
+/// Locally-written diary entries must still appear with `origin == "local"`.
+#[tokio::test]
+async fn diary_events_never_appear_in_remote_changes() {
+    let hub_dir = TempDir::new().unwrap();
+    let local_dir = TempDir::new().unwrap();
+
+    // ── Step 1: seed a diary entry directly into the hub palace BEFORE spawning
+    // the HTTP server (to avoid concurrent engine access on the same dir).
+    {
+        let hub_mcp = McpServer::from_parts(
+            MempalaceConfig {
+                schema_version: 1,
+                collection_name: "mempalace_drawers".to_owned(),
+                palace_path: hub_dir.path().join("palace"),
+                embedding_profile: EmbeddingProfile::Balanced,
+                low_cpu: LowCpuRuntimeConfig::defaults_for_profile(EmbeddingProfile::Balanced),
+                server: ServerRuntimeConfig {
+                    bind: "127.0.0.1:0".parse().unwrap(),
+                    token_file: hub_dir.path().join("server_tokens.json"),
+                },
+                federation: FederationRuntimeConfig::default(),
+            },
+            DeterministicStubProvider::new(EmbeddingProfile::Balanced),
+        )
+        .await
+        .unwrap();
+
+        let diary_resp = call_tool(
+            &hub_mcp,
+            1,
+            "mempalace_diary_write",
+            json!({
+                "agent_name": "hub-agent",
+                "entry": "hub diary entry — must not appear in federated changes feed",
+                "topic": "diary-filter-test"
+            }),
+        )
+        .await;
+        assert_eq!(
+            diary_resp["success"], true,
+            "hub diary_write must succeed: {diary_resp}"
+        );
+        // hub_mcp is dropped here — the palace engine is released before HTTP spawn.
+    }
+
+    // ── Step 2: spawn the HTTP server over the hub dir (now free of in-process engine).
+    let addr = spawn_server(&hub_dir).await;
+    let hub_url = format!("http://{addr}");
+
+    // ── Step 3: set up the federated MCP server.
+    let mut wing_rules = BTreeMap::new();
+    wing_rules.insert("wing_diary_filter".to_owned(), combined_wing_rule_remote_write());
+
+    let server = mcp_server_with_hub(
+        &local_dir,
+        &hub_url,
+        wing_rules,
+        RouteMode::Local,
+        None,
+    )
+    .await;
+
+    // ── Step 4: add a normal drawer on the hub to ensure at least one drawer event.
+    // Use "auth migration parity" cluster so the stub provider gives a distinct vector.
+    let hub_add = call_tool(
+        &server,
+        2,
+        "mempalace_add_drawer",
+        json!({
+            "wing": "wing_diary_filter",
+            "room": "general",
+            "content": "diary filter test hub drawer auth migration parity unique",
+            "added_by": "diary-filter-test"
+        }),
+    )
+    .await;
+    assert_eq!(hub_add["success"], true, "hub drawer add must succeed: {hub_add}");
+    assert_eq!(hub_add["origin"], "hub", "hub drawer must go to hub: {hub_add}");
+    let hub_drawer_id = hub_add["drawer_id"].as_str().unwrap().to_owned();
+
+    // ── Step 5: write a diary entry LOCALLY on the local MCP server.
+    let local_diary = call_tool(
+        &server,
+        3,
+        "mempalace_diary_write",
+        json!({
+            "agent_name": "local-agent",
+            "entry": "local diary entry — must appear with origin=local",
+            "topic": "local-diary-test"
+        }),
+    )
+    .await;
+    assert_eq!(
+        local_diary["success"], true,
+        "local diary_write must succeed: {local_diary}"
+    );
+
+    // ── Step 6: call federated get_changes_since.
+    let changes = call_tool(
+        &server,
+        4,
+        "mempalace_get_changes_since",
+        json!({"since": "2000-01-01T00:00:00Z"}),
+    )
+    .await;
+
+    let events = changes["events"].as_array().expect("events must be array");
+
+    // The hub drawer event must appear with origin remote:hub.
+    let hub_drawer_event = events.iter().find(|e| e["entity_id"].as_str() == Some(&hub_drawer_id));
+    assert!(
+        hub_drawer_event.is_some(),
+        "hub drawer event must appear in changes; entity_id={hub_drawer_id}; events: {events:?}"
+    );
+    assert_eq!(
+        hub_drawer_event.unwrap()["origin"].as_str(),
+        Some("remote:hub"),
+        "hub drawer event must have origin=remote:hub"
+    );
+
+    // No event with event_type == "diary_written" must appear with a remote origin.
+    let remote_diary_events: Vec<&Value> = events
+        .iter()
+        .filter(|e| {
+            e["event_type"].as_str() == Some("diary_written")
+                && e["origin"].as_str().map_or(false, |o| o.starts_with("remote:"))
+        })
+        .collect();
+    assert!(
+        remote_diary_events.is_empty(),
+        "no diary_written event must appear with remote origin; found: {remote_diary_events:?}"
+    );
+
+    // The local diary_written event must appear with origin == "local".
+    let local_diary_event = events.iter().find(|e| {
+        e["event_type"].as_str() == Some("diary_written")
+            && e["origin"].as_str() == Some("local")
+    });
+    assert!(
+        local_diary_event.is_some(),
+        "local diary_written event must appear with origin=local; events: {events:?}"
+    );
+}
+
+// ─── Test 11: get_changes_since_includes_local_and_remote_origins ─────────────
+
+/// One local add + one routed remote add → both origins present in one merged
+/// response, and `remotes.hub.count` equals the number of hub-origin events.
+#[tokio::test]
+async fn get_changes_since_includes_local_and_remote_origins() {
+    let hub_dir = TempDir::new().unwrap();
+    let local_dir = TempDir::new().unwrap();
+
+    let addr = spawn_server(&hub_dir).await;
+    let hub_url = format!("http://{addr}");
+
+    let mut wing_rules = BTreeMap::new();
+    wing_rules.insert("wing_mixed".to_owned(), combined_wing_rule_remote_write());
+
+    let server = mcp_server_with_hub(
+        &local_dir,
+        &hub_url,
+        wing_rules,
+        RouteMode::Local,
+        None,
+    )
+    .await;
+
+    // Add a drawer to the hub via routed write (wing_mixed → write=Remote).
+    // "auth migration parity" cluster → [1,0,0,0] vector.
+    let hub_add = call_tool(
+        &server,
+        1,
+        "mempalace_add_drawer",
+        json!({
+            "wing": "wing_mixed",
+            "room": "general",
+            "content": "mixed origins test hub drawer auth migration parity unique",
+            "added_by": "mixed-test"
+        }),
+    )
+    .await;
+    assert_eq!(hub_add["success"], true, "hub add must succeed: {hub_add}");
+    assert_eq!(hub_add["origin"], "hub", "hub add must go to hub: {hub_add}");
+
+    // Add a drawer locally (wing without a remote rule → default Local).
+    // "rust cli tooling" cluster → [0,0,1,0] vector.
+    let local_add = call_tool(
+        &server,
+        2,
+        "mempalace_add_drawer",
+        json!({
+            "wing": "wing_local_only_mixed",
+            "room": "notes",
+            "content": "mixed origins test local drawer rust cli tooling unique",
+            "added_by": "mixed-test"
+        }),
+    )
+    .await;
+    assert_eq!(local_add["success"], true, "local add must succeed: {local_add}");
+
+    // get_changes_since should merge both origins.
+    let changes = call_tool(
+        &server,
+        3,
+        "mempalace_get_changes_since",
+        json!({"since": "2000-01-01T00:00:00Z"}),
+    )
+    .await;
+
+    let events = changes["events"].as_array().expect("events must be array");
+
+    let has_local = events
+        .iter()
+        .any(|e| e["origin"].as_str() == Some("local"));
+    let has_remote_hub = events
+        .iter()
+        .any(|e| e["origin"].as_str() == Some("remote:hub"));
+
+    assert!(
+        has_local,
+        "changes must include at least one local-origin event; events: {events:?}"
+    );
+    assert!(
+        has_remote_hub,
+        "changes must include at least one remote:hub-origin event; events: {events:?}"
+    );
+
+    // remotes meta: hub count must equal the number of hub-origin events in the list.
+    let remotes_meta = changes.get("remotes").expect("federated changes must include remotes meta");
+    let hub_count = remotes_meta["hub"]["count"]
+        .as_u64()
+        .expect("remotes.hub.count must be a number");
+    let actual_hub_count = events
+        .iter()
+        .filter(|e| e["origin"].as_str() == Some("remote:hub"))
+        .count() as u64;
+    assert_eq!(
+        hub_count, actual_hub_count,
+        "remotes.hub.count must equal number of remote:hub events in events array"
+    );
+
+    // Total count field must equal total events length.
+    let total_count = changes["count"].as_u64().expect("count must be a number");
+    assert_eq!(
+        total_count,
+        events.len() as u64,
+        "top-level count must equal events.len()"
+    );
+}

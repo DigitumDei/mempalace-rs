@@ -960,8 +960,10 @@ mod tests {
     fn merge_empty_remote_returns_local() {
         let local =
             vec![json!({"wing":"w","room":"r1","similarity":0.9,"text":"only local"})];
-        let merged = merge_search_results(local.clone(), vec![], 5);
-        assert_eq!(merged, local);
+        let merged = merge_search_results(local, vec![], 5);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0]["text"], "only local");
+        assert_eq!(merged[0]["origin"], "local");
     }
 
     #[test]

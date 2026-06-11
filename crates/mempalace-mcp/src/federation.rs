@@ -143,7 +143,7 @@ impl FederationRouter {
             Ok(results) => (results, vec![]),
             Err(e) => {
                 let remote_name = route.remote.as_deref().unwrap_or("unknown");
-                (vec![], vec![format!("remote `{remote_name}` unreachable: {e}")])
+                (vec![], vec![format!("remote `{remote_name}` unreachable: {e:?}")])
             }
         }
     }
@@ -335,7 +335,7 @@ impl FederationRouter {
                 Ok(remote) => {
                     if let Some(remote_taxonomy) = remote.get("taxonomy") {
                         if let (Some(obj), Some(robj)) =
-                            (merged.get_mut("taxonomy"), remote_taxonomy.as_object())
+                            (merged.get_mut("taxonomy").and_then(|v| v.as_object_mut()), remote_taxonomy.as_object())
                         {
                             for (wing, rooms) in robj {
                                 if let Some(rooms_obj) = rooms.as_object() {
@@ -379,7 +379,7 @@ impl FederationRouter {
                 Ok(remote) => {
                     if let Some(remote_wings) = remote.get("wings") {
                         if let (Some(obj), Some(robj)) =
-                            (merged.get_mut("wings"), remote_wings.as_object())
+                            (merged.get_mut("wings").and_then(|v| v.as_object_mut()), remote_wings.as_object())
                         {
                             for (wing, count) in robj {
                                 let c = count.as_u64().unwrap_or(0) as usize;
@@ -410,7 +410,7 @@ impl FederationRouter {
                 Ok(remote) => {
                     if let Some(remote_rooms) = remote.get("rooms") {
                         if let (Some(obj), Some(robj)) =
-                            (merged.get_mut("rooms"), remote_rooms.as_object())
+                            (merged.get_mut("rooms").and_then(|v| v.as_object_mut()), remote_rooms.as_object())
                         {
                             for (room, count) in robj {
                                 let c = count.as_u64().unwrap_or(0) as usize;
@@ -422,7 +422,7 @@ impl FederationRouter {
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(remote = %name, e, "failed to fetch rooms from remote");
+                    tracing::warn!(remote = %name, %e, "failed to fetch rooms from remote");
                 }
             }
         }
@@ -823,7 +823,7 @@ fn merge_search_results(
         // Interleave: local at this rank first
         if rank < local.len() {
             let item = &local[rank];
-            if !is_duplicate_search_item(item, &seen_hashes, &mut seen_texts) {
+            if !is_duplicate_search_item(item, &mut seen_hashes, &mut seen_texts) {
                 merged.push(item.clone());
             }
         }
@@ -833,7 +833,7 @@ fn merge_search_results(
         // Then remote at the same rank
         if rank < remote.len() {
             let item = &remote[rank];
-            if !is_duplicate_search_item(item, &seen_hashes, &mut seen_texts) {
+            if !is_duplicate_search_item(item, &mut seen_hashes, &mut seen_texts) {
                 merged.push(item.clone());
             }
         }

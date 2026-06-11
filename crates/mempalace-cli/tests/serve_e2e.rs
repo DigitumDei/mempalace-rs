@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 
-use mempalace_config::{LowCpuRuntimeConfig, MempalaceConfig, ServerRuntimeConfig};
+use mempalace_config::{FederationRuntimeConfig, LowCpuRuntimeConfig, MempalaceConfig, ServerRuntimeConfig};
 use mempalace_core::EmbeddingProfile;
 use mempalace_embeddings::DeterministicStubProvider;
 use mempalace_server::{TokenRegistry, build_router};
@@ -42,6 +42,7 @@ fn test_config(tempdir: &TempDir) -> MempalaceConfig {
             bind: "127.0.0.1:0".parse().unwrap(),
             token_file: tempdir.path().join("tokens.json"),
         },
+        federation: FederationRuntimeConfig::default(),
     }
 }
 

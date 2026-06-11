@@ -3892,6 +3892,7 @@ dependencies = [
  "time",
  "tokio",
  "toml",
+ "tracing",
 ]
 
 [[package]]

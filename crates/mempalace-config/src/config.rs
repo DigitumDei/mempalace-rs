@@ -7,6 +7,10 @@ use mempalace_core::{EmbeddingProfile, MempalaceError, Result};
 use serde::{Deserialize, Serialize};
 use tokio::runtime::{Builder, Runtime};
 
+use crate::federation::{
+    FederationConfigV1, FederationRuntimeConfig, ProjectRoutingConfig, resolve_federation_config,
+};
+
 pub const DEFAULT_BASE_DIR: &str = "~/.mempalace";
 pub const DEFAULT_COLLECTION_NAME: &str = "mempalace_drawers";
 const CONFIG_FILE_NAME: &str = "config.json";
@@ -223,6 +227,9 @@ pub struct ConfigFileV1 {
     pub low_cpu: Option<LowCpuConfigFileV1>,
     #[serde(default)]
     pub server: Option<ServerConfigFileV1>,
+    /// Optional federation routing section.
+    #[serde(default)]
+    pub federation: Option<FederationConfigV1>,
 }
 
 impl Default for ConfigFileV1 {
@@ -234,6 +241,7 @@ impl Default for ConfigFileV1 {
             embedding_profile: Some(EmbeddingProfile::Balanced),
             low_cpu: None,
             server: None,
+            federation: None,
         }
     }
 }
@@ -252,13 +260,20 @@ pub struct MempalaceConfig {
     pub low_cpu: LowCpuRuntimeConfig,
     /// Federation HTTP server settings.
     pub server: ServerRuntimeConfig,
+    /// Federation routing configuration.
+    pub federation: FederationRuntimeConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectConfig {
+    /// Wing name for this project.
     pub wing: String,
+    /// Rooms defined within this project's wing.
     #[serde(default)]
     pub rooms: Vec<ProjectRoomConfig>,
+    /// Optional per-project federation routing override.
+    #[serde(default)]
+    pub routing: Option<ProjectRoutingConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -297,6 +312,11 @@ impl ConfigLoader {
 
         let resolved_palace = expand_path(&palace_path)?;
         let server = resolve_server_config(file.server, &paths.base_dir, &paths.config_file)?;
+        let federation = resolve_federation_config(
+            file.federation,
+            &paths.config_file,
+            |name| env::var(name).ok(),
+        )?;
 
         Ok(MempalaceConfig {
             schema_version: file.version,
@@ -306,6 +326,7 @@ impl ConfigLoader {
             low_cpu: LowCpuRuntimeConfig::defaults_for_profile(embedding_profile)
                 .with_overrides(file.low_cpu, &paths.config_file)?,
             server,
+            federation,
         })
     }
 

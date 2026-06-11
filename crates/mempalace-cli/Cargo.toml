@@ -6,21 +6,27 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+axum = { version = "0.8", default-features = true }
 clap = { version = "4.5.50", features = ["derive"] }
 dirs.workspace = true
 mempalace-config = { path = "../mempalace-config" }
 mempalace-core = { path = "../mempalace-core" }
 mempalace-ingest = { path = "../mempalace-ingest" }
 mempalace-embeddings = { path = "../mempalace-embeddings" }
+mempalace-federation = { path = "../mempalace-federation" }
 mempalace-search = { path = "../mempalace-search" }
+mempalace-server = { path = "../mempalace-server" }
 mempalace-storage = { path = "../mempalace-storage" }
 serde_json.workspace = true
 serde_yaml.workspace = true
-tokio = { version = "1.48.0", features = ["rt-multi-thread"] }
+tokio = { version = "1.48.0", features = ["rt-multi-thread", "net", "signal"] }
 tempfile = "3.23.0"
 time.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 [lints]
 workspace = true

@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
@@ -11,8 +12,10 @@ use mempalace_config::{
 };
 use mempalace_core::{EmbeddingProfile, RoomId, SearchQuery, WingId};
 use mempalace_embeddings::{
-    EmbeddingProvider, FastembedProvider, FastembedProviderConfig, env_flag, log_startup_validation,
+    DeterministicStubProvider, EmbeddingProvider, FastembedProvider, FastembedProviderConfig,
+    env_flag, log_startup_validation,
 };
+use mempalace_server::{TokenRegistry, build_router};
 use mempalace_ingest::{
     ConversationExtractMode, ConversationIngestRequest, IngestSummary, ProjectIngestRequest,
     ingest_conversations, ingest_project,
@@ -236,6 +239,13 @@ enum Commands {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// Run the federation HTTP server over this palace.
+    Serve {
+        #[arg(long, help = "Bind address, e.g. 127.0.0.1:8765 (default: from config)")]
+        bind: Option<SocketAddr>,
+        #[arg(long = "token-file", help = "Path to the bearer token JSON file (default: ~/.mempalace/server_tokens.json)")]
+        token_file: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
@@ -292,7 +302,7 @@ where
     I: IntoIterator<Item = T>,
     T: Into<std::ffi::OsString> + Clone,
     F: Fn(EmbeddingProfile, PathBuf) -> Result<P, Box<dyn std::error::Error>> + Copy,
-    P: EmbeddingProvider,
+    P: EmbeddingProvider + Send + Sync + 'static,
 {
     run_cli_with_validation_factory(args, context, provider_factory, provider_factory)
 }
@@ -307,7 +317,7 @@ where
     I: IntoIterator<Item = T>,
     T: Into<std::ffi::OsString> + Clone,
     F: Fn(EmbeddingProfile, PathBuf) -> Result<P, Box<dyn std::error::Error>>,
-    P: EmbeddingProvider,
+    P: EmbeddingProvider + Send + Sync + 'static,
     G: Fn(EmbeddingProfile, PathBuf) -> Result<Q, Box<dyn std::error::Error>>,
     Q: EmbeddingProvider,
 {
@@ -349,7 +359,7 @@ fn execute<F, P, G, Q>(
 ) -> Result<CliOutput, clap::Error>
 where
     F: Fn(EmbeddingProfile, PathBuf) -> Result<P, Box<dyn std::error::Error>>,
-    P: EmbeddingProvider,
+    P: EmbeddingProvider + Send + Sync + 'static,
     G: Fn(EmbeddingProfile, PathBuf) -> Result<Q, Box<dyn std::error::Error>>,
     Q: EmbeddingProvider,
 {
@@ -387,6 +397,13 @@ where
         }
         Commands::Split { .. } => Ok(deferred_command("split")),
         Commands::Compress { .. } => Ok(deferred_command("compress")),
+        Commands::Serve { bind, token_file } => execute_serve(
+            bind,
+            token_file,
+            cli.palace.as_deref(),
+            context,
+            provider_factory,
+        ),
     }
 }
 
@@ -695,6 +712,103 @@ where
         "=".repeat(WAKE_UP_SEPARATOR_WIDTH),
         rendered
     )))
+}
+
+fn execute_serve<F, P>(
+    bind_override: Option<SocketAddr>,
+    token_file_override: Option<PathBuf>,
+    palace_override: Option<&Path>,
+    context: &CliContext,
+    provider_factory: F,
+) -> Result<CliOutput, clap::Error>
+where
+    F: Fn(EmbeddingProfile, PathBuf) -> Result<P, Box<dyn std::error::Error>>,
+    P: EmbeddingProvider + Send + Sync + 'static,
+{
+    let config = load_runtime_config(palace_override, context).map_err(config_error)?;
+
+    // Resolve bind address: CLI flag > config section > default (already in config)
+    let bind = bind_override.unwrap_or(config.server.bind);
+
+    // Resolve token file: CLI flag > config section > default
+    let token_file = token_file_override.unwrap_or_else(|| config.server.token_file.clone());
+
+    // Load the token registry — friendly error if the file is missing.
+    let tokens = TokenRegistry::load(token_file.clone()).map_err(|err| {
+        clap::Error::raw(
+            clap::error::ErrorKind::Io,
+            format!(
+                "failed to load token file `{}`: {err}\n\n\
+                 Hint: create the file with at least one entry, e.g.:\n\
+                   [\n\
+                     {{\"token\": \"<your-secret-token>\", \"name\": \"you\", \"enabled\": true}}\n\
+                   ]\n",
+                token_file.display()
+            ),
+        )
+    })?;
+
+    eprintln!(
+        "WARNING: The federation server speaks plain HTTP. Bearer tokens must only be used \
+         on trusted networks or behind a TLS-terminating reverse proxy."
+    );
+    eprintln!("Starting MemPalace federation server");
+    eprintln!("  Palace:     {}", config.palace_path.display());
+    eprintln!("  Bind:       {bind}");
+    eprintln!("  Token file: {}", token_file.display());
+
+    let runtime = build_runtime(&config).map_err(runtime_error)?;
+
+    // Use MEMPALACE_STUB_EMBEDDINGS if set, mirroring the MCP binary.
+    let serve_result = if std::env::var_os("MEMPALACE_STUB_EMBEDDINGS").is_some() {
+        let provider = DeterministicStubProvider::new(config.embedding_profile);
+        runtime.block_on(run_serve(config, provider, tokens, bind))
+    } else {
+        let provider = provider_factory(config.embedding_profile, default_embedding_cache_dir())
+            .map_err(provider_error)?;
+        runtime.block_on(run_serve(config, provider, tokens, bind))
+    };
+
+    match serve_result {
+        Ok(()) => Ok(CliOutput::success("")),
+        Err(err) => Ok(CliOutput::failure(1, format!("federation server error: {err}\n"))),
+    }
+}
+
+async fn run_serve<P>(
+    config: MempalaceConfig,
+    provider: P,
+    tokens: TokenRegistry,
+    bind: SocketAddr,
+) -> Result<(), mempalace_server::ServerError>
+where
+    P: EmbeddingProvider + Send + Sync + 'static,
+{
+    let router = build_router(config, provider, tokens).await?;
+    let listener =
+        tokio::net::TcpListener::bind(bind).await.map_err(|source| {
+            mempalace_server::ServerError::Io {
+                path: PathBuf::from(bind.to_string()),
+                source,
+            }
+        })?;
+    eprintln!(
+        "Listening on http://{}",
+        listener.local_addr().map_err(|source| mempalace_server::ServerError::Io {
+            path: PathBuf::from("local_addr"),
+            source,
+        })?
+    );
+    axum::serve(listener, router)
+        .with_graceful_shutdown(async {
+            let _ = tokio::signal::ctrl_c().await;
+            eprintln!("\nShutting down federation server...");
+        })
+        .await
+        .map_err(|source| mempalace_server::ServerError::Io {
+            path: PathBuf::from("axum::serve"),
+            source,
+        })
 }
 
 fn render_mine_summary(

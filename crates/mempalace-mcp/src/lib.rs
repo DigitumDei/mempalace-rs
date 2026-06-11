@@ -6,11 +6,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use blake3::Hasher;
-use mempalace_config::{ConfigLoader, LowCpuRuntimeConfig, MempalaceConfig};
-use mempalace_core::{DrawerId, DrawerRecord, EmbeddingProfile, RoomId, SearchQuery, WingId};
+use mempalace_config::{ConfigLoader, MempalaceConfig};
+use mempalace_core::{
+    DIARY_HALL, DIARY_ROOM, DIARY_TOPIC_PREFIX, DrawerId, DrawerRecord, EmbeddingProfile, RoomId,
+    SHARED_AGENT_DIARY_WING, SearchQuery, WingId,
+};
 use mempalace_embeddings::{
     EmbeddingError, EmbeddingProvider, EmbeddingRequest, FastembedProvider,
-    FastembedProviderConfig, StartupValidation, StartupValidationStatus, env_flag,
+    FastembedProviderConfig, env_flag,
 };
 use mempalace_graph::{
     AddFactRequest, EntityKind, KnowledgeGraphRuntime, PalaceGraphSnapshot, QueryDirection,
@@ -35,10 +38,6 @@ const SERVER_VERSION: &str = "2.0.0";
 const PROTOCOL_VERSION: &str = "2024-11-05";
 const DEFAULT_DUPLICATE_THRESHOLD: f32 = 0.9;
 const DUPLICATE_SEARCH_LIMIT: usize = 5;
-const DIARY_ROOM: &str = "diary";
-const DIARY_HALL: &str = "hall_diary";
-const DIARY_TOPIC_PREFIX: &str = "diary:";
-const SHARED_AGENT_DIARY_WING: &str = "wing_agents";
 // Project-specific wake-up history scans farther back because global changes
 // are interleaved across wings, but stops collecting as soon as the limit is met.
 const WAKE_UP_PROJECT_SEARCH_MULTIPLIER: usize = 20;
@@ -50,62 +49,7 @@ pub const PALACE_PROTOCOL: &str = "IMPORTANT — MemPalace Memory Protocol:\n1. 
 
 pub const AAAK_SPEC: &str = "AAAK is a compressed memory dialect that MemPalace uses for efficient storage.\nIt is designed to be readable by both humans and LLMs without decoding.\n\nFORMAT:\n  ENTITIES: 3-letter uppercase codes. ALC=Alice, JOR=Jordan, RIL=Riley, MAX=Max, BEN=Ben.\n  EMOTIONS: *action markers* before/during text. *warm*=joy, *fierce*=determined, *raw*=vulnerable, *bloom*=tenderness.\n  STRUCTURE: Pipe-separated fields. FAM: family | PROJ: projects | ⚠: warnings/reminders.\n  DATES: ISO format (2026-03-31). COUNTS: Nx = N mentions (e.g., 570x).\n  IMPORTANCE: ★ to ★★★★★ (1-5 scale).\n  HALLS: hall_facts, hall_events, hall_discoveries, hall_preferences, hall_advice.\n  WINGS: wing_user, wing_agent, wing_team, wing_code, wing_myproject, wing_hardware, wing_ue5, wing_ai_research.\n  ROOMS: Hyphenated slugs representing named ideas (e.g., chromadb-setup, gpu-pricing).\n\nEXAMPLE:\n  FAM: ALC→♡JOR | 2D(kids): RIL(18,sports) MAX(11,chess+swimming) | BEN(contributor)\n\nRead AAAK naturally — expand codes mentally, treat *markers* as emotional context.\nWhen WRITING AAAK: use entity codes, mark emotions, keep structure tight.";
 
-#[derive(Debug, Clone)]
-pub struct DeterministicStubProvider {
-    profile: EmbeddingProfile,
-}
-
-impl DeterministicStubProvider {
-    pub fn new(profile: EmbeddingProfile) -> Self {
-        Self { profile }
-    }
-
-    fn vector_for(&self, text: &str) -> Vec<f32> {
-        let lower = text.to_ascii_lowercase();
-        let seed = if ["auth", "migration", "parity"].iter().any(|token| lower.contains(token)) {
-            [1.0, 0.0, 0.0, 0.0]
-        } else if ["session", "diary", "ops"].iter().any(|token| lower.contains(token)) {
-            [0.0, 1.0, 0.0, 0.0]
-        } else if ["rust", "cli"].iter().any(|token| lower.contains(token)) {
-            [0.0, 0.0, 1.0, 0.0]
-        } else {
-            [0.0, 0.0, 0.0, 1.0]
-        };
-        let mut values = Vec::with_capacity(self.profile.metadata().dimensions);
-        while values.len() < self.profile.metadata().dimensions {
-            values.extend(seed);
-        }
-        values.truncate(self.profile.metadata().dimensions);
-        values
-    }
-}
-
-impl EmbeddingProvider for DeterministicStubProvider {
-    fn profile(&self) -> &'static mempalace_core::EmbeddingProfileMetadata {
-        self.profile.metadata()
-    }
-
-    fn startup_validation(&self) -> mempalace_embeddings::Result<StartupValidation> {
-        Ok(StartupValidation {
-            status: StartupValidationStatus::Ready,
-            cache_root: PathBuf::from("/tmp/stub"),
-            model_id: self.profile.metadata().model_id,
-            detail: "stub".to_owned(),
-        })
-    }
-
-    fn embed(
-        &mut self,
-        request: &EmbeddingRequest,
-    ) -> mempalace_embeddings::Result<mempalace_embeddings::EmbeddingResponse> {
-        mempalace_embeddings::EmbeddingResponse::from_vectors(
-            request.texts().iter().map(|text| self.vector_for(text)).collect(),
-            self.profile.metadata().dimensions,
-            self.profile,
-            self.profile.metadata().model_id,
-        )
-    }
-}
+pub use mempalace_embeddings::DeterministicStubProvider;
 
 #[derive(Debug, Error)]
 pub enum McpError {
@@ -1956,6 +1900,8 @@ mod tests {
     use std::sync::Arc;
     use std::sync::mpsc;
 
+    use mempalace_config::{LowCpuRuntimeConfig, ServerRuntimeConfig};
+    use mempalace_embeddings::{StartupValidation, StartupValidationStatus};
     use tempfile::TempDir;
     use time::macros::{date, datetime};
     use tokio::io::{AsyncReadExt, BufReader};
@@ -1983,9 +1929,13 @@ mod tests {
         let config = MempalaceConfig {
             schema_version: 1,
             collection_name: "mempalace_drawers".to_owned(),
-            palace_path,
+            palace_path: palace_path.clone(),
             embedding_profile,
             low_cpu,
+            server: ServerRuntimeConfig {
+                bind: "127.0.0.1:8765".parse().unwrap(),
+                token_file: tempdir.path().join("server_tokens.json"),
+            },
         };
         let server =
             McpServer::from_parts(config, DeterministicStubProvider::new(embedding_profile))
@@ -2311,6 +2261,10 @@ mod tests {
                 wake_up_drawers_limit: 8,
                 degraded_mode: false,
                 rerank_enabled: false,
+            },
+            server: ServerRuntimeConfig {
+                bind: "127.0.0.1:8765".parse().unwrap(),
+                token_file: tempdir.path().join("server_tokens.json"),
             },
         };
         let (started_tx, started_rx) = mpsc::channel();

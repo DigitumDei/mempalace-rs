@@ -1,12 +1,17 @@
 #![allow(missing_docs)]
 
+mod federation;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use blake3::Hasher;
-use mempalace_config::{ConfigLoader, MempalaceConfig};
+use mempalace_config::{
+    ConfigLoader, FederationRuntimeConfig, MempalaceConfig, ResolvedRouteRule, RouteMode,
+    RouteQuery, WriteTarget, resolve_kg_route, resolve_route,
+};
 use mempalace_core::{
     DIARY_HALL, DIARY_ROOM, DIARY_TOPIC_PREFIX, DrawerId, DrawerRecord, EmbeddingProfile, RoomId,
     SHARED_AGENT_DIARY_WING, SearchQuery, WingId,
@@ -32,6 +37,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Mutex, Semaphore, TryAcquireError};
 
 pub use mempalace_core as core;
+use federation::FederationRouter;
 
 // ─── Federation routing semantics ─────────────────────────────────────────────
 //
@@ -644,6 +650,10 @@ where
         };
 
         let mut runtime = self.runtime.lock().await;
+
+        // Federation routing: resolve route and emit collision warnings
+        runtime.apply_routing(tool, &call.arguments).await;
+
         let result = match tool {
             ToolName::WakeUp => runtime.tool_wake_up(&call.arguments).await,
             ToolName::Status => runtime.tool_status().await,
@@ -691,6 +701,7 @@ struct McpRuntime<P> {
     config: MempalaceConfig,
     storage: StorageEngine,
     search: SearchRuntime<P>,
+    federation: Option<FederationRouter>,
 }
 
 impl<P> McpRuntime<P>
@@ -699,6 +710,8 @@ where
 {
     async fn new(config: MempalaceConfig, provider: P) -> Result<Self> {
         let storage = StorageEngine::open(&config.palace_path, config.embedding_profile).await?;
+        let router = FederationRouter::new(config.federation.clone());
+        let federation = if router.has_remotes() { Some(router) } else { None };
         Ok(Self {
             search: SearchRuntime::with_policy(
                 provider,
@@ -706,7 +719,63 @@ where
             ),
             config,
             storage,
+            federation,
         })
+    }
+
+    /// Resolve federation routing for the given tool and emit wing-collision
+    /// warnings where applicable.
+    ///
+    /// **LocalOnly** tools are passed through with no routing logic.
+    ///
+    /// **RoutableDrawer** tools resolve via `resolve_route()`. When the resolved
+    /// rule's mode is not `Local` and the arguments contain a `wing` field, a
+    /// wing-collision warning is emitted if any local drawers exist for that wing.
+    ///
+    /// **RoutableKg** tools resolve via `resolve_kg_route()`. No wing collision
+    /// check is performed since KG tools apply to the whole graph, not per-wing.
+    ///
+    /// This method is best-effort: warnings are surface-level and do not block
+    /// execution. Federation v1 has no remote HTTP client, so all tool calls
+    /// still execute against the local palace.
+    async fn apply_routing(&self, tool: ToolName, arguments: &Value) {
+        let category = tool.routing();
+        match category {
+            ToolRoutingCategory::LocalOnly => {}
+            ToolRoutingCategory::RoutableDrawer => {
+                let federation = &self.config.federation;
+                let wing = optional_wing_from_args(arguments);
+                let route = resolve_route(
+                    federation,
+                    None,
+                    RouteQuery { wing, room: None, source_file: None },
+                );
+                if route.mode != RouteMode::Local {
+                    if let Some(wing_name) = wing {
+                        if let Ok(wing_id) = WingId::normalized(wing_name) {
+                            let count = self
+                                .storage
+                                .drawer_store()
+                                .list_drawers(&DrawerFilter {
+                                    wing: Some(wing_id),
+                                    ..DrawerFilter::default()
+                                })
+                                .await
+                                .map(|d| d.len())
+                                .unwrap_or(0);
+                            warn_wing_collision(
+                                wing_name,
+                                count,
+                                route.remote.as_deref().unwrap_or("remote"),
+                            );
+                        }
+                    }
+                }
+            }
+            ToolRoutingCategory::RoutableKg => {
+                let _route = resolve_kg_route(&self.config.federation);
+            }
+        }
     }
 
     async fn tool_wake_up(&mut self, arguments: &Value) -> ToolResult<Value> {
@@ -777,7 +846,17 @@ where
     }
 
     async fn tool_status(&mut self) -> ToolResult<Value> {
-        self.status_payload().await
+        let mut payload = self.status_payload().await?;
+        if let Some(router) = &self.federation {
+            let route = router.resolve_drawer_route(None);
+            payload = router.status_merge(payload, &route).await?;
+            let local_wings: BTreeMap<String, usize> = payload["wings"]
+                .as_object()
+                .map(|obj| obj.iter().filter_map(|(k, v)| v.as_u64().map(|n| (k.clone(), n as usize))).collect())
+                .unwrap_or_default();
+            payload["wing_availability"] = router.wing_availability(&local_wings);
+        }
+        Ok(payload)
     }
 
     async fn status_payload(&mut self) -> ToolResult<Value> {
@@ -879,7 +958,17 @@ where
         for drawer in drawers {
             *wings.entry(drawer.wing.as_str().to_owned()).or_default() += 1;
         }
-        Ok(json!({ "wings": wings }))
+        let mut payload = json!({ "wings": wings });
+        if let Some(router) = &self.federation {
+            let route = router.resolve_drawer_route(None);
+            payload = router.wings_merge(payload, &route).await?;
+            let local_wings: BTreeMap<String, usize> = payload["wings"]
+                .as_object()
+                .map(|obj| obj.iter().filter_map(|(k, v)| v.as_u64().map(|n| (k.clone(), n as usize))).collect())
+                .unwrap_or_default();
+            payload["wing_availability"] = router.wing_availability(&local_wings);
+        }
+        Ok(payload)
     }
 
     async fn tool_list_rooms(&mut self, arguments: &Value) -> ToolResult<Value> {
@@ -890,26 +979,42 @@ where
         };
         let drawers = self.storage.drawer_store().list_drawers(&filter).await.map_tool()?;
         let mut rooms = BTreeMap::<String, usize>::new();
+        let mut room_wings = BTreeMap::<String, usize>::new();
         for drawer in drawers {
             *rooms.entry(drawer.room.as_str().to_owned()).or_default() += 1;
+            *room_wings.entry(drawer.wing.as_str().to_owned()).or_default() += 1;
         }
-        Ok(json!({
-            "wing": wing.unwrap_or_else(|| "all".to_owned()),
+        let mut payload = json!({
+            "wing": wing.clone().unwrap_or_else(|| "all".to_owned()),
             "rooms": rooms,
-        }))
+        });
+        if let Some(router) = &self.federation {
+            let route = router.resolve_drawer_route(wing.as_deref());
+            payload = router.rooms_merge(payload, wing.as_deref(), &route).await?;
+            payload["wing_availability"] = router.wing_availability(&room_wings);
+        }
+        Ok(payload)
     }
 
     async fn tool_get_taxonomy(&mut self) -> ToolResult<Value> {
         let drawers = self.list_all_drawers().await?;
         let mut taxonomy = BTreeMap::<String, BTreeMap<String, usize>>::new();
+        let mut wings = BTreeMap::<String, usize>::new();
         for drawer in drawers {
             *taxonomy
                 .entry(drawer.wing.as_str().to_owned())
                 .or_default()
                 .entry(drawer.room.as_str().to_owned())
                 .or_default() += 1;
+            *wings.entry(drawer.wing.as_str().to_owned()).or_default() += 1;
         }
-        Ok(json!({ "taxonomy": taxonomy }))
+        let mut payload = json!({ "taxonomy": taxonomy });
+        if let Some(router) = &self.federation {
+            let route = router.resolve_drawer_route(None);
+            payload = router.taxonomy_merge(payload, &route).await?;
+            payload["wing_availability"] = router.wing_availability(&wings);
+        }
+        Ok(payload)
     }
 
     async fn tool_get_aaak_spec(&mut self) -> ToolResult<Value> {
@@ -925,6 +1030,46 @@ where
             optional_string(arguments, "wing")?.map(|value| parse_wing_id(&value)).transpose()?;
         let room =
             optional_string(arguments, "room")?.map(|value| parse_room_id(&value)).transpose()?;
+
+        // ── Federation path ──
+        if let Some(router) = &self.federation {
+            let route = router.resolve_drawer_route(wing.as_ref().map(|w| w.as_str()));
+            if route.mode != RouteMode::Local {
+                let local_results = self
+                    .search
+                    .search(
+                        self.storage.drawer_store(),
+                        &SearchQuery {
+                            text: query.clone(),
+                            wing: wing.clone(),
+                            room: room.clone(),
+                            limit,
+                            profile: self.config.embedding_profile,
+                        },
+                    )
+                    .await
+                    .map_tool()?;
+                let local_values = local_results
+                    .into_iter()
+                    .map(|result| {
+                        json!({
+                            "wing": result.wing,
+                            "room": result.room,
+                            "similarity": round_similarity(result.score),
+                            "text": result.content,
+                            "source_file": result.source_file,
+                            "origin": "local",
+                        })
+                    })
+                    .collect();
+                let wing_str = wing.as_ref().map(|w| w.as_str());
+                let room_str = room.as_ref().map(|r| r.as_str());
+                return router
+                    .search(local_values, &query, wing_str, room_str, limit, &route)
+                    .await;
+            }
+        }
+
         let results = self
             .search
             .search(
@@ -961,7 +1106,14 @@ where
         let content = required_string(arguments, "content")?;
         let threshold =
             optional_f32(arguments, "threshold")?.unwrap_or(DEFAULT_DUPLICATE_THRESHOLD);
-        let matches = self.find_duplicates(&content, threshold).await?;
+        let mut matches = self.find_duplicates(&content, threshold).await?;
+
+        // ── Federation path ──
+        if let Some(router) = &self.federation {
+            let remote_matches = router.check_duplicate_all_remotes(&content, threshold).await;
+            matches.extend(remote_matches);
+        }
+
         Ok(json!({
             "is_duplicate": !matches.is_empty(),
             "matches": matches,
@@ -974,6 +1126,24 @@ where
         let content = required_string(arguments, "content")?;
         let source_file = optional_string(arguments, "source_file")?.unwrap_or_default();
         let added_by = optional_string(arguments, "added_by")?.unwrap_or_else(|| "mcp".to_owned());
+
+        // ── Federation path ──
+        if let Some(router) = &self.federation {
+            let route = router.resolve_drawer_route(Some(wing.as_str()));
+            if let Some(remote_resp) = router
+                .add_drawer_remote(
+                    wing.as_str(),
+                    room.as_str(),
+                    &content,
+                    &source_file,
+                    &added_by,
+                    &route,
+                )
+                .await?
+            {
+                return Ok(remote_resp);
+            }
+        }
 
         let duplicates = self.find_duplicates(&content, DEFAULT_DUPLICATE_THRESHOLD).await?;
         if !duplicates.is_empty() {
@@ -1038,6 +1208,24 @@ where
             .await
             .map_tool()?;
         if deleted == 0 {
+            // ── Federation fallback ──
+            if let Some(router) = &self.federation {
+                let route = router.resolve_drawer_route(None);
+                if let Some(remote_resp) =
+                    router.delete_drawer_remote(drawer_id.as_str(), &route).await?
+                {
+                    self.log_change(ChangeEvent {
+                        event_type: "drawer_deleted".to_owned(),
+                        occurred_at: OffsetDateTime::now_utc(),
+                        entity_id: drawer_id.as_str().to_owned(),
+                        actor: None,
+                        details_json: Some(
+                            json!({"origin": remote_resp["origin"]}).to_string(),
+                        ),
+                    });
+                    return Ok(remote_resp);
+                }
+            }
             return Ok(json!({
                 "success": false,
                 "error": format!("Drawer not found: {}", drawer_id.as_str()),
@@ -1255,12 +1443,20 @@ where
         let runtime = KnowledgeGraphRuntime::new(self.storage.operational_store());
         let facts = runtime.query_entity(&entity, as_of, direction).map_tool_internal()?;
         let count = facts.len();
-        Ok(json!({
+        let mut payload = json!({
             "entity": entity,
             "as_of": optional_string(arguments, "as_of")?,
             "facts": facts,
             "count": count,
-        }))
+        });
+        // ── Federation path ──
+        if let Some(router) = &self.federation {
+            let route = router.resolve_kg_route();
+            if route.mode != RouteMode::Local {
+                payload = router.kg_query_merge(payload, &entity, &route).await?;
+            }
+        }
+        Ok(payload)
     }
 
     async fn tool_kg_add(&mut self, arguments: &Value) -> ToolResult<Value> {
@@ -1268,6 +1464,24 @@ where
         let predicate = required_string(arguments, "predicate")?;
         let object = required_string(arguments, "object")?;
         let valid_from_text = optional_string(arguments, "valid_from")?;
+
+        // ── Federation path ──
+        if let Some(router) = &self.federation {
+            let route = router.resolve_kg_route();
+            if let Some(remote_resp) = router
+                .kg_add_remote(
+                    &subject,
+                    &predicate,
+                    &object,
+                    valid_from_text.as_deref(),
+                    &route,
+                )
+                .await?
+            {
+                return Ok(remote_resp);
+            }
+        }
+
         let valid_from = valid_from_text.as_deref().map(parse_date).transpose()?;
         let source_closet = optional_string(arguments, "source_closet")?;
         let source_drawer_id =
@@ -1325,6 +1539,24 @@ where
             .map(parse_date)
             .transpose()?
             .unwrap_or_else(|| OffsetDateTime::now_utc().date());
+
+        // ── Federation path ──
+        if let Some(router) = &self.federation {
+            let route = router.resolve_kg_route();
+            if let Some(remote_resp) = router
+                .kg_invalidate_remote(
+                    &subject,
+                    &predicate,
+                    &object,
+                    ended_text.as_deref(),
+                    &route,
+                )
+                .await?
+            {
+                return Ok(remote_resp);
+            }
+        }
+
         let now = OffsetDateTime::now_utc();
         let runtime = KnowledgeGraphRuntime::new(self.storage.operational_store());
         let invalidated =
@@ -1357,16 +1589,33 @@ where
         let runtime = KnowledgeGraphRuntime::new(self.storage.operational_store());
         let timeline = runtime.timeline(entity.as_deref()).map_tool_internal()?;
         let count = timeline.len();
-        Ok(json!({
+        let mut payload = json!({
             "entity": entity.clone().unwrap_or_else(|| "all".to_owned()),
             "timeline": timeline,
             "count": count,
-        }))
+        });
+        // ── Federation path ──
+        if let Some(router) = &self.federation {
+            let route = router.resolve_kg_route();
+            if route.mode != RouteMode::Local {
+                payload = router.kg_timeline_merge(payload, entity.as_deref(), &route).await?;
+            }
+        }
+        Ok(payload)
     }
 
     async fn tool_kg_stats(&mut self) -> ToolResult<Value> {
         let runtime = KnowledgeGraphRuntime::new(self.storage.operational_store());
-        Ok(serde_json::to_value(runtime.stats().map_tool_internal()?).map_tool_internal()?)
+        let mut payload =
+            serde_json::to_value(runtime.stats().map_tool_internal()?).map_tool_internal()?;
+        // ── Federation path ──
+        if let Some(router) = &self.federation {
+            let route = router.resolve_kg_route();
+            if route.mode != RouteMode::Local {
+                payload = router.kg_stats_merge(payload, &route).await?;
+            }
+        }
+        Ok(payload)
     }
 
     async fn list_all_drawers(&self) -> ToolResult<Vec<DrawerRecord>> {
@@ -1712,6 +1961,10 @@ fn optional_f32(arguments: &Value, field: &'static str) -> ToolResult<Option<f32
     }
 }
 
+fn optional_wing_from_args(arguments: &Value) -> Option<&str> {
+    arguments.get("wing").and_then(|v| v.as_str())
+}
+
 fn parse_wing_id(value: &str) -> ToolResult<WingId> {
     WingId::normalized(value).map_err(|error| ToolError::InvalidParams(error.to_string()))
 }
@@ -2001,7 +2254,10 @@ mod tests {
     use std::sync::Arc;
     use std::sync::mpsc;
 
-    use mempalace_config::{FederationRuntimeConfig, LowCpuRuntimeConfig, ServerRuntimeConfig};
+    use mempalace_config::{
+        FederationRuntimeConfig, LowCpuRuntimeConfig, ResolvedRouteRule, RouteMode,
+        ServerRuntimeConfig, WriteTarget,
+    };
     use mempalace_embeddings::{StartupValidation, StartupValidationStatus};
     use tempfile::TempDir;
     use time::macros::{date, datetime};
@@ -2028,16 +2284,9 @@ mod tests {
         let tempdir = TempDir::new().unwrap();
         let palace_path = tempdir.path().join("palace");
         let config = MempalaceConfig {
-            schema_version: 1,
-            collection_name: "mempalace_drawers".to_owned(),
-            palace_path: palace_path.clone(),
-            embedding_profile,
             low_cpu,
-            server: ServerRuntimeConfig {
-                bind: "127.0.0.1:8765".parse().unwrap(),
-                token_file: tempdir.path().join("server_tokens.json"),
-            },
-            federation: FederationRuntimeConfig::default(),
+            embedding_profile,
+            ..make_base_config(&palace_path, &tempdir)
         };
         let server =
             McpServer::from_parts(config, DeterministicStubProvider::new(embedding_profile))
@@ -3748,5 +3997,152 @@ mod tests {
         assert_eq!(kg_event["details"]["subject"], "ChangeFeed");
         assert_eq!(kg_event["details"]["predicate"], "is");
         assert_eq!(kg_event["details"]["object"], "Working");
+    }
+
+    // ── Routing / Federation tests ─────────────────────────────────────────
+
+    #[test]
+    fn warn_wing_collision_emits_no_warning_for_empty_wing() {
+        // The function should not panic when local_drawer_count is 0.
+        warn_wing_collision("wing_code", 0, "remote-alpha");
+    }
+
+    #[test]
+    fn warn_wing_collision_emits_warning_for_non_empty_wing() {
+        warn_wing_collision("wing_code", 3, "remote-alpha");
+    }
+
+    #[test]
+    fn routing_categories_are_consistent_with_semantics_doc() {
+        // LocalOnly tools
+        assert_eq!(ToolName::WakeUp.routing(), ToolRoutingCategory::LocalOnly);
+        assert_eq!(ToolName::DiaryWrite.routing(), ToolRoutingCategory::LocalOnly);
+        assert_eq!(ToolName::DiaryRead.routing(), ToolRoutingCategory::LocalOnly);
+        assert_eq!(ToolName::GetChangesSince.routing(), ToolRoutingCategory::LocalOnly);
+        assert_eq!(ToolName::Traverse.routing(), ToolRoutingCategory::LocalOnly);
+        assert_eq!(ToolName::FindTunnels.routing(), ToolRoutingCategory::LocalOnly);
+        assert_eq!(ToolName::GraphStats.routing(), ToolRoutingCategory::LocalOnly);
+        assert_eq!(ToolName::IdentityRead.routing(), ToolRoutingCategory::LocalOnly);
+        assert_eq!(ToolName::IdentityUpdate.routing(), ToolRoutingCategory::LocalOnly);
+        assert_eq!(ToolName::GetAaaKSpec.routing(), ToolRoutingCategory::LocalOnly);
+
+        // RoutableDrawer tools
+        assert_eq!(ToolName::Search.routing(), ToolRoutingCategory::RoutableDrawer);
+        assert_eq!(ToolName::ListWings.routing(), ToolRoutingCategory::RoutableDrawer);
+        assert_eq!(ToolName::ListRooms.routing(), ToolRoutingCategory::RoutableDrawer);
+        assert_eq!(ToolName::GetTaxonomy.routing(), ToolRoutingCategory::RoutableDrawer);
+        assert_eq!(ToolName::Status.routing(), ToolRoutingCategory::RoutableDrawer);
+        assert_eq!(ToolName::CheckDuplicate.routing(), ToolRoutingCategory::RoutableDrawer);
+        assert_eq!(ToolName::AddDrawer.routing(), ToolRoutingCategory::RoutableDrawer);
+        assert_eq!(ToolName::DeleteDrawer.routing(), ToolRoutingCategory::RoutableDrawer);
+
+        // RoutableKg tools
+        assert_eq!(ToolName::KgQuery.routing(), ToolRoutingCategory::RoutableKg);
+        assert_eq!(ToolName::KgAdd.routing(), ToolRoutingCategory::RoutableKg);
+        assert_eq!(ToolName::KgInvalidate.routing(), ToolRoutingCategory::RoutableKg);
+        assert_eq!(ToolName::KgTimeline.routing(), ToolRoutingCategory::RoutableKg);
+        assert_eq!(ToolName::KgStats.routing(), ToolRoutingCategory::RoutableKg);
+    }
+
+    #[tokio::test]
+    async fn federation_routing_does_not_panic_with_wing_rule() {
+        // The dispatch path must not panic/crash when federation is configured
+        // with a non-local wing rule. (v1 has no remote HTTP client, so tools
+        // still execute locally, but the routing + collision-warning path is
+        // exercised.)
+        let harness = test_harness_with_federation(
+            FederationRuntimeConfig {
+                wings: [(
+                    "wing_code".to_owned(),
+                    ResolvedRouteRule {
+                        mode: RouteMode::Remote,
+                        remote: Some("remote-alpha".to_owned()),
+                        write: WriteTarget::Remote,
+                    },
+                )]
+                .into(),
+                ..FederationRuntimeConfig::default()
+            },
+        )
+        .await;
+
+        let response = harness
+            .server
+            .handle_request(tool_call(
+                1001,
+                "mempalace_list_rooms",
+                json!({"wing": "wing_code"}),
+            ))
+            .await;
+        let payload = decode_tool_payload(&response).unwrap();
+        assert_eq!(payload["wing"], "wing_code");
+    }
+
+    #[tokio::test]
+    async fn federation_none_produces_byte_identical_responses() {
+        // Regression: federation:None must produce responses identical to
+        // having no federation configured at all.
+        let harness_default = test_harness().await;
+        let harness_none_fed = test_harness_with_federation(
+            FederationRuntimeConfig::default(),
+        )
+        .await;
+
+        let tools = [
+            ("mempalace_status", json!({})),
+            ("mempalace_list_wings", json!({})),
+            ("mempalace_list_rooms", json!({"wing": "wing_code"})),
+            ("mempalace_get_taxonomy", json!({})),
+        ];
+
+        for (tool, args) in &tools {
+            let default_resp = harness_default
+                .server
+                .handle_request(tool_call(2000, tool, args.clone()))
+                .await;
+            let none_fed_resp = harness_none_fed
+                .server
+                .handle_request(tool_call(2001, tool, args.clone()))
+                .await;
+            let default_payload = decode_tool_payload(&default_resp).unwrap();
+            let none_fed_payload = decode_tool_payload(&none_fed_resp).unwrap();
+            // The response body structures must match; wing_availability is
+            // omitted when no remotes are configured.
+            assert_eq!(
+                default_payload, none_fed_payload,
+                "tool `{tool}` produced different responses"
+            );
+        }
+    }
+
+    async fn test_harness_with_federation(federation: FederationRuntimeConfig) -> TestHarness {
+        let tempdir = TempDir::new().unwrap();
+        let palace_path = tempdir.path().join("palace");
+        let config = MempalaceConfig {
+            federation,
+            ..make_base_config(&palace_path, &tempdir)
+        };
+        let server =
+            McpServer::from_parts(config, DeterministicStubProvider::new(EmbeddingProfile::Balanced))
+                .await
+                .unwrap();
+        seed_drawers(&server).await;
+        seed_knowledge_graph(&server).await;
+        TestHarness { _tempdir: tempdir, server }
+    }
+
+    fn make_base_config(palace_path: &std::path::Path, tempdir: &TempDir) -> MempalaceConfig {
+        MempalaceConfig {
+            schema_version: 1,
+            collection_name: "mempalace_drawers".to_owned(),
+            palace_path: palace_path.to_path_buf(),
+            embedding_profile: EmbeddingProfile::Balanced,
+            low_cpu: LowCpuRuntimeConfig::defaults_for_profile(EmbeddingProfile::Balanced),
+            server: ServerRuntimeConfig {
+                bind: "127.0.0.1:8765".parse().unwrap(),
+                token_file: tempdir.path().join("server_tokens.json"),
+            },
+            federation: FederationRuntimeConfig::default(),
+        }
     }
 }

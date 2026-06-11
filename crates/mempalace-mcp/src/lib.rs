@@ -4112,8 +4112,11 @@ mod tests {
                 .server
                 .handle_request(tool_call(2001, tool, args.clone()))
                 .await;
-            let default_payload = decode_tool_payload(&default_resp).unwrap();
-            let none_fed_payload = decode_tool_payload(&none_fed_resp).unwrap();
+            let mut default_payload = decode_tool_payload(&default_resp).unwrap();
+            let mut none_fed_payload = decode_tool_payload(&none_fed_resp).unwrap();
+            // Strip palace_path — each harness uses its own TempDir.
+            default_payload.as_object_mut().map(|obj| obj.remove("palace_path"));
+            none_fed_payload.as_object_mut().map(|obj| obj.remove("palace_path"));
             // The response body structures must match; wing_availability is
             // omitted when no remotes are configured.
             assert_eq!(

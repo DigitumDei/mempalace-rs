@@ -146,8 +146,17 @@ impl RemoteClient {
         }
 
         if !status.is_success() {
-            // Best-effort: read the body and try to parse as ErrorBody.
-            let raw = response.text().await.unwrap_or_default();
+            // Read the body in chunks, stopping at MAX_ERROR_BODY to avoid
+            // memory exhaustion from large error responses (e.g. HTML pages).
+            let mut response = response;
+            let mut bytes = Vec::new();
+            while let Ok(Some(chunk)) = response.chunk().await {
+                bytes.extend_from_slice(&chunk);
+                if bytes.len() >= MAX_ERROR_BODY {
+                    break;
+                }
+            }
+            let raw = String::from_utf8_lossy(&bytes).into_owned();
             let body = if let Ok(err_body) = serde_json::from_str::<ErrorBody>(&raw) {
                 format!("{}: {}", err_body.code, err_body.message)
             } else if raw.len() > MAX_ERROR_BODY {

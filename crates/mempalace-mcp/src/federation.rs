@@ -6,16 +6,18 @@ use mempalace_config::{
     FederationRuntimeConfig, ResolvedRouteRule, RouteMode, WriteTarget, resolve_kg_route,
     resolve_route, RouteQuery,
 };
+use mempalace_core::{DIARY_ROOM, SHARED_AGENT_DIARY_WING};
 use mempalace_federation::{
     AddDrawerRequest, DrawerSearchRequest, RemoteDrawerResult,
 };
 use mempalace_remote::{
-    RemoteApi, RemoteClient, RemoteEndpoint,
+    RemoteApi, RemoteClient, RemoteEndpoint, RemoteError,
 };
 use serde_json::{Value, json};
 use tokio::task::JoinSet;
 
 use crate::{McpError, ToolError, ToolResult};
+
 
 pub struct FederationRouter {
     pub rules: FederationRuntimeConfig,
@@ -73,37 +75,48 @@ impl FederationRouter {
     /// Compute wing availability annotations for the local wing set, keyed by
     /// wing name. `local_wings` is the set of wing names present in the local
     /// palace. Returns a map of `wing_name → "local" | "remote:<name>" | "combined"`.
+    /// Uses the same resolution precedence as real routing (resolve_route with
+    /// wing rule, then default_mode). Per-project routing is not wired at the
+    /// MCP layer (always None) because the stdio server has no per-project context.
     pub fn wing_availability(&self, local_wings: &BTreeMap<String, usize>) -> Value {
         let mut avail = serde_json::Map::new();
-        for wing_name in local_wings.keys() {
-            let status = if let Some(rule) = self.rules.wings.get(wing_name) {
-                match rule.mode {
-                    RouteMode::Local => "local",
-                    RouteMode::Remote => "remote",
-                    RouteMode::Combined => "combined",
+        let all_wing_names: std::collections::BTreeSet<&str> = local_wings
+            .keys()
+            .map(|s| s.as_str())
+            .chain(self.rules.wings.keys().map(|s| s.as_str()))
+            .collect();
+
+        for wing_name in all_wing_names {
+            let rule = resolve_route(
+                &self.rules,
+                None,
+                RouteQuery { wing: Some(wing_name), room: None, source_file: None },
+            );
+            let status = match rule.mode {
+                RouteMode::Local => "local".to_owned(),
+                RouteMode::Remote => {
+                    if let Some(name) = &rule.remote {
+                        format!("remote:{name}")
+                    } else {
+                        "remote".to_owned()
+                    }
                 }
-            } else {
-                "local"
+                RouteMode::Combined => "combined".to_owned(),
             };
-            avail.insert(wing_name.clone(), json!(status));
-        }
-        // Also include wings configured in federation rules that are not
-        // present locally (pure-remote or remote-biased wings).
-        for (name, rule) in &self.rules.wings {
-            if !avail.contains_key(name) {
-                let status = match rule.mode {
-                    RouteMode::Local => "local",
-                    RouteMode::Remote => "remote",
-                    RouteMode::Combined => "combined",
-                };
-                avail.insert(name.clone(), json!(status));
-            }
+            avail.insert(wing_name.to_owned(), json!(status));
         }
         Value::Object(avail)
     }
 
-    pub fn resolve_drawer_route(&self, wing: Option<&str>) -> ResolvedRouteRule {
-        resolve_route(&self.rules, None, RouteQuery { wing, room: None, source_file: None })
+    /// Resolve the route for a drawer operation. Accepts room and source_file so
+    /// the diary hard-override can fire correctly (see resolve_route precedence).
+    pub fn resolve_drawer_route(
+        &self,
+        wing: Option<&str>,
+        room: Option<&str>,
+        source_file: Option<&str>,
+    ) -> ResolvedRouteRule {
+        resolve_route(&self.rules, None, RouteQuery { wing, room, source_file })
     }
 
     pub fn resolve_kg_route(&self) -> ResolvedRouteRule {
@@ -116,7 +129,99 @@ impl FederationRouter {
 
     // ─── Search ──────────────────────────────────────────────────────────────────
 
-    /// Fan out search to local + remotes, merge results.
+    /// Plan the search fan-out for a query. Returns `(include_local, remote_targets)`.
+    ///
+    /// Diary guard fires first: if `wing == Some(SHARED_AGENT_DIARY_WING)` or
+    /// `room == Some(DIARY_ROOM)` the result is always `(true, vec![])` — diary
+    /// content is never federated.
+    ///
+    /// When `wing` is given, routing follows the resolved rule for that wing:
+    /// - Local  → `(true, vec![])`
+    /// - Remote → `(false, vec![remote])` (or `(false, vec![])` if the remote is
+    ///   not built / has no name)
+    /// - Combined → `(true, vec![remote])` (or `(true, vec![])` as above)
+    ///
+    /// When `wing` is `None` (global search), `include_local` is always `true`
+    /// and the remote targets are the deduped, name-ordered set of every remote
+    /// referenced by a non-Local rule: the default route (if non-Local) plus every
+    /// wing entry in `self.rules.wings` whose mode is non-Local. Only remotes
+    /// actually present in `self.remotes` are included.
+    pub fn plan_search_targets(
+        &self,
+        wing: Option<&str>,
+        room: Option<&str>,
+    ) -> (bool, Vec<String>) {
+        // ── Diary guard ───────────────────────────────────────────────────────
+        if wing == Some(SHARED_AGENT_DIARY_WING) || room == Some(DIARY_ROOM) {
+            return (true, vec![]);
+        }
+
+        if let Some(w) = wing {
+            // ── Specific wing ─────────────────────────────────────────────────
+            let rule = resolve_route(
+                &self.rules,
+                None,
+                RouteQuery { wing: Some(w), room, source_file: None },
+            );
+            match rule.mode {
+                RouteMode::Local => (true, vec![]),
+                RouteMode::Remote => {
+                    let targets = rule
+                        .remote
+                        .as_ref()
+                        .filter(|name| self.remotes.contains_key(*name))
+                        .map(|name| vec![name.clone()])
+                        .unwrap_or_default();
+                    (false, targets)
+                }
+                RouteMode::Combined => {
+                    let targets = rule
+                        .remote
+                        .as_ref()
+                        .filter(|name| self.remotes.contains_key(*name))
+                        .map(|name| vec![name.clone()])
+                        .unwrap_or_default();
+                    (true, targets)
+                }
+            }
+        } else {
+            // ── Global search: include_local always true ───────────────────────
+            // Collect all non-Local remote names: default route + all wing rules.
+            let mut target_set = std::collections::BTreeSet::new();
+
+            // Default route.
+            let default_rule = resolve_route(
+                &self.rules,
+                None,
+                RouteQuery { wing: None, room, source_file: None },
+            );
+            if default_rule.mode != RouteMode::Local {
+                if let Some(name) = &default_rule.remote {
+                    if self.remotes.contains_key(name) {
+                        target_set.insert(name.clone());
+                    }
+                }
+            }
+
+            // Per-wing rules.
+            for rule in self.rules.wings.values() {
+                if rule.mode != RouteMode::Local {
+                    if let Some(name) = &rule.remote {
+                        if self.remotes.contains_key(name) {
+                            target_set.insert(name.clone());
+                        }
+                    }
+                }
+            }
+
+            (true, target_set.into_iter().collect())
+        }
+    }
+
+    /// Fan out search to one or more remotes concurrently and merge with local
+    /// results. `remote_targets` is the list of remote names to query; when empty
+    /// the local results are returned unchanged.
+    ///
     /// Reads never hard-fail on remote outage.
     pub async fn search(
         &self,
@@ -125,77 +230,83 @@ impl FederationRouter {
         wing: Option<&str>,
         room: Option<&str>,
         limit: usize,
-        route: &ResolvedRouteRule,
+        remote_targets: &[String],
     ) -> ToolResult<Value> {
-        let (remote_results, warnings) =
-            self.do_remote_search_degradable(query, wing, room, limit, route)
-                .await;
-        match route.mode {
-            RouteMode::Local => {
-                Ok(search_payload(query, wing, room, limit, local_results, &[]))
-            }
-            RouteMode::Remote => {
-                Ok(search_payload(query, wing, room, limit, remote_results, &warnings))
-            }
-            RouteMode::Combined => {
-                let merged = merge_search_results(local_results, remote_results, limit);
-                Ok(search_payload(query, wing, room, limit, merged, &warnings))
+        if remote_targets.is_empty() {
+            return Ok(search_payload(query, wing, room, local_results, &[]));
+        }
+
+        // Fan out to all target remotes concurrently.
+        let mut set: JoinSet<(String, Result<Vec<Value>, String>)> = JoinSet::new();
+        for name in remote_targets {
+            let name = name.clone();
+            let query_str = query.to_owned();
+            let wing_owned = wing.map(|s| s.to_owned());
+            let room_owned = room.map(|s| s.to_owned());
+            let api = match self.remotes.get(&name) {
+                Some(a) => Arc::clone(a),
+                None => continue,
+            };
+            set.spawn(async move {
+                let req = DrawerSearchRequest {
+                    query: query_str,
+                    wing: wing_owned,
+                    room: room_owned,
+                    limit: Some(limit),
+                };
+                match api.search_drawers(req).await {
+                    Ok(response) => {
+                        let results = response
+                            .results
+                            .into_iter()
+                            .map(|r| drawer_result_to_value(r, &name))
+                            .collect();
+                        (name, Ok(results))
+                    }
+                    Err(e) => (name.clone(), Err(format!("remote `{name}` search failed: {e}"))),
+                }
+            });
+        }
+
+        // Collect results in deterministic name order.
+        let mut remote_results_by_name: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+        let mut warnings: Vec<String> = Vec::new();
+        while let Some(res) = set.join_next().await {
+            match res {
+                Ok((name, Ok(results))) => {
+                    remote_results_by_name.insert(name, results);
+                }
+                Ok((name, Err(msg))) => {
+                    tracing::warn!(remote = %name, "search degraded: {msg}");
+                    warnings.push(msg);
+                }
+                Err(join_err) => {
+                    tracing::warn!("search task panicked: {join_err}");
+                }
             }
         }
-    }
 
-    async fn do_remote_search_degradable(
-        &self,
-        query: &str,
-        wing: Option<&str>,
-        room: Option<&str>,
-        limit: usize,
-        route: &ResolvedRouteRule,
-    ) -> (Vec<Value>, Vec<String>) {
-        match self.do_remote_search(query, wing, room, limit, route).await {
-            Ok(results) => (results, vec![]),
-            Err(e) => {
-                let remote_name = route.remote.as_deref().unwrap_or("unknown");
-                (vec![], vec![format!("remote `{remote_name}` unreachable: {e:?}")])
-            }
+        // N-way interleave: local first at each rank, then remotes in name order.
+        let mut all_origins: Vec<(String, Vec<Value>)> = Vec::new();
+        if !local_results.is_empty() {
+            all_origins.push(("local".to_owned(), local_results));
         }
-    }
+        for (name, results) in remote_results_by_name {
+            all_origins.push((name, results));
+        }
 
-    async fn do_remote_search(
-        &self,
-        query: &str,
-        wing: Option<&str>,
-        room: Option<&str>,
-        limit: usize,
-        route: &ResolvedRouteRule,
-    ) -> ToolResult<Vec<Value>> {
-        let Some(remote_api) = self.remote_for_rule(route) else {
-            return Ok(vec![]);
-        };
-        let req = DrawerSearchRequest {
-            query: query.to_owned(),
-            wing: wing.map(|s| s.to_owned()),
-            room: room.map(|s| s.to_owned()),
-            limit: Some(limit),
-        };
-        let response = remote_api.search_drawers(req).await.map_err(|e| {
-            ToolError::Internal(McpError::Federation(format!(
-                "remote `{}` search failed: {e}",
-                route.remote.as_deref().unwrap_or("unknown")
-            )))
-        })?;
-        let results = response
-            .results
-            .into_iter()
-            .map(|r| drawer_result_to_value(r, route.remote.as_deref().unwrap_or("remote")))
-            .collect();
-        Ok(results)
+        let merged = merge_search_results_nway(all_origins, limit);
+        Ok(search_payload(query, wing, room, merged, &warnings))
     }
 
     // ─── Add drawer ──────────────────────────────────────────────────────────────
 
     /// Route an add-drawer operation. Returns `None` when the caller should
     /// execute locally; `Some(remote_result)` when routed to a remote.
+    ///
+    /// Pre-add duplicate check is performed before posting the add request; if
+    /// the duplicate check itself fails (transport error) a warning is emitted
+    /// and the add proceeds (the server re-checks anyway).
     pub async fn add_drawer_remote(
         &self,
         wing: &str,
@@ -204,6 +315,7 @@ impl FederationRouter {
         source_file: &str,
         added_by: &str,
         route: &ResolvedRouteRule,
+        duplicate_threshold: f32,
     ) -> ToolResult<Option<Value>> {
         let target_remote = match route.mode {
             RouteMode::Local => None,
@@ -222,6 +334,38 @@ impl FederationRouter {
         let Some(api) = self.remotes.get(remote_name) else {
             return Ok(None);
         };
+
+        // ── Pre-add duplicate check ───────────────────────────────────────────
+        let pre_check_req = mempalace_federation::CheckDuplicateRequest {
+            content: content.to_owned(),
+            threshold: Some(duplicate_threshold),
+        };
+        match api.check_duplicate(pre_check_req).await {
+            Ok(resp) if resp.is_duplicate => {
+                let mut matches = resp.matches.as_array().cloned().unwrap_or_default();
+                // Annotate each match with origin.
+                for m in &mut matches {
+                    if let Some(obj) = m.as_object_mut() {
+                        obj.insert("origin".to_owned(), json!(remote_name));
+                    }
+                }
+                return Ok(Some(json!({
+                    "success": false,
+                    "reason": "duplicate",
+                    "matches": matches,
+                })));
+            }
+            Ok(_) => {
+                // Not a duplicate — proceed with add.
+            }
+            Err(e) => {
+                tracing::warn!(
+                    remote = %remote_name,
+                    "pre-add duplicate check failed (proceeding with add): {e}"
+                );
+            }
+        }
+
         let req = AddDrawerRequest {
             wing: wing.to_owned(),
             room: room.to_owned(),
@@ -231,6 +375,7 @@ impl FederationRouter {
         };
         match api.add_drawer(req).await {
             Ok(resp) => {
+                // resp.success is true on 2xx; keep a defensive branch just in case.
                 if resp.success {
                     Ok(Some(json!({
                         "success": true,
@@ -240,13 +385,22 @@ impl FederationRouter {
                         "origin": remote_name,
                     })))
                 } else {
+                    // Defensive: server indicated failure on 2xx (shouldn't happen in v1).
                     Ok(Some(json!({
                         "success": false,
-                        "reason": "duplicate",
-                        "matches": [],
+                        "reason": "rejected",
                         "origin": remote_name,
                     })))
                 }
+            }
+            Err(RemoteError::RemoteRejected { status: 409, .. }) => {
+                // Race condition: duplicate inserted between pre-check and add.
+                Ok(Some(json!({
+                    "success": false,
+                    "reason": "duplicate",
+                    "matches": [],
+                    "origin": remote_name,
+                })))
             }
             Err(e) => Err(ToolError::Internal(McpError::Federation(format!(
                 "remote `{remote_name}` add_drawer failed: {e}"
@@ -294,44 +448,37 @@ impl FederationRouter {
             });
         }
         let mut results = vec![];
-        while let Some(Ok(batch)) = set.join_next().await {
-            results.extend(batch);
+        while let Some(res) = set.join_next().await {
+            match res {
+                Ok(batch) => results.extend(batch),
+                Err(join_err) => {
+                    tracing::warn!("check_duplicate task panicked: {join_err}");
+                }
+            }
         }
         results
     }
 
     // ─── Delete drawer ───────────────────────────────────────────────────────────
 
-    /// Try to delete a drawer from remotes in config order, after local deletion
-    /// has failed. Returns the response if found on a remote.
+    /// Try to delete a drawer from ALL configured remotes in config order (BTreeMap
+    /// name order — deterministic). Returns the first success with "origin".
+    /// Deletion is by drawer id; the wing is not known here.
     pub async fn delete_drawer_remote(
         &self,
         drawer_id: &str,
-        route: &ResolvedRouteRule,
     ) -> ToolResult<Option<Value>> {
-        let remote_names: Vec<&str> = match route.mode {
-            RouteMode::Local => return Ok(None),
-            RouteMode::Remote | RouteMode::Combined => {
-                if let Some(name) = &route.remote {
-                    vec![name.as_str()]
-                } else {
-                    return Ok(None);
+        for (name, api) in &self.remotes {
+            match api.delete_drawer(drawer_id).await {
+                Ok(()) => {
+                    return Ok(Some(json!({
+                        "success": true,
+                        "drawer_id": drawer_id,
+                        "origin": name,
+                    })));
                 }
-            }
-        };
-        for name in remote_names {
-            if let Some(api) = self.remotes.get(name) {
-                match api.delete_drawer(drawer_id).await {
-                    Ok(()) => {
-                        return Ok(Some(json!({
-                            "success": true,
-                            "drawer_id": drawer_id,
-                            "origin": name,
-                        })));
-                    }
-                    Err(e) if e.is_degradable() => continue,
-                    Err(_) => continue,
-                }
+                Err(e) if e.is_degradable() => continue,
+                Err(_) => continue,
             }
         }
         Ok(None)
@@ -339,42 +486,53 @@ impl FederationRouter {
 
     // ─── Taxonomy / Status ───────────────────────────────────────────────────────
 
-    /// Fan out taxonomy, wings, and rooms queries, merging into the local payload.
+    /// Fan out taxonomy queries to all remotes concurrently, merging into the
+    /// local payload. Wing-collision warnings are emitted when a wing appears
+    /// both locally and on a remote but its resolved route is Local-only.
     pub async fn taxonomy_merge(
         &self,
         local_taxonomy: Value,
     ) -> ToolResult<Value> {
-        let mut merged = local_taxonomy;
+        let mut set: JoinSet<(String, Result<Value, mempalace_remote::RemoteError>)> = JoinSet::new();
         for (name, api) in &self.remotes {
-            match api.taxonomy().await {
-                Ok(remote) => {
-                    if let Some(remote_taxonomy) = remote.get("taxonomy") {
-                        if let (Some(obj), Some(robj)) =
-                            (merged.get_mut("taxonomy").and_then(|v| v.as_object_mut()), remote_taxonomy.as_object())
-                        {
-                            for (wing, rooms) in robj {
-                                if let Some(rooms_obj) = rooms.as_object() {
-                                    let wing_entry =
-                                        obj.entry(wing.clone()).or_insert_with(|| json!({}));
-                                    if let Some(wing_map) = wing_entry.as_object_mut() {
-                                        for (room, count) in rooms_obj {
-                                            let c = count.as_u64().unwrap_or(0);
-                                            let entry = wing_map.entry(room.clone()).or_insert(json!(0));
-                                            let val = entry.as_u64().unwrap_or(0);
-                                            *entry = json!(val + c);
-                                        }
-                                    }
+            let name = name.clone();
+            let api = Arc::clone(api);
+            set.spawn(async move { (name, api.taxonomy().await) });
+        }
+
+        let mut remote_results: BTreeMap<String, Value> = BTreeMap::new();
+        while let Some(res) = set.join_next().await {
+            match res {
+                Ok((name, Ok(payload))) => { remote_results.insert(name, payload); }
+                Ok((name, Err(e))) => {
+                    tracing::warn!(remote = %name, %e, "failed to fetch taxonomy from remote");
+                }
+                Err(join_err) => {
+                    tracing::warn!("taxonomy task panicked: {join_err}");
+                }
+            }
+        }
+
+        let mut merged = local_taxonomy;
+        for (_name, remote) in &remote_results {
+            if let Some(remote_taxonomy) = remote.get("taxonomy") {
+                if let (Some(obj), Some(robj)) =
+                    (merged.get_mut("taxonomy").and_then(|v| v.as_object_mut()), remote_taxonomy.as_object())
+                {
+                    for (wing, rooms) in robj {
+                        if let Some(rooms_obj) = rooms.as_object() {
+                            let wing_entry =
+                                obj.entry(wing.clone()).or_insert_with(|| json!({}));
+                            if let Some(wing_map) = wing_entry.as_object_mut() {
+                                for (room, count) in rooms_obj {
+                                    let c = count.as_u64().unwrap_or(0);
+                                    let entry = wing_map.entry(room.clone()).or_insert(json!(0));
+                                    let val = entry.as_u64().unwrap_or(0);
+                                    *entry = json!(val + c);
                                 }
                             }
                         }
                     }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        remote = %name,
-                        %e,
-                        "failed to fetch taxonomy from remote"
-                    );
                 }
             }
         }
@@ -385,25 +543,61 @@ impl FederationRouter {
         &self,
         local_wings: Value,
     ) -> ToolResult<Value> {
-        let mut merged = local_wings;
+        let mut set: JoinSet<(String, Result<Value, mempalace_remote::RemoteError>)> = JoinSet::new();
         for (name, api) in &self.remotes {
-            match api.wings().await {
-                Ok(remote) => {
-                    if let Some(remote_wings) = remote.get("wings") {
-                        if let (Some(obj), Some(robj)) =
-                            (merged.get_mut("wings").and_then(|v| v.as_object_mut()), remote_wings.as_object())
-                        {
-                            for (wing, count) in robj {
-                                let c = count.as_u64().unwrap_or(0);
-                                let entry = obj.entry(wing.clone()).or_insert(json!(0));
-                                let val = entry.as_u64().unwrap_or(0);
-                                *entry = json!(val + c);
+            let name = name.clone();
+            let api = Arc::clone(api);
+            set.spawn(async move { (name, api.wings().await) });
+        }
+
+        let mut remote_results: BTreeMap<String, Value> = BTreeMap::new();
+        while let Some(res) = set.join_next().await {
+            match res {
+                Ok((name, Ok(payload))) => { remote_results.insert(name, payload); }
+                Ok((name, Err(e))) => {
+                    tracing::warn!(remote = %name, %e, "failed to fetch wings from remote");
+                }
+                Err(join_err) => {
+                    tracing::warn!("wings task panicked: {join_err}");
+                }
+            }
+        }
+
+        // Collect local wing names for collision detection.
+        let local_wing_names: std::collections::BTreeSet<String> = local_wings
+            .get("wings")
+            .and_then(|v| v.as_object())
+            .map(|obj| obj.keys().cloned().collect())
+            .unwrap_or_default();
+
+        let mut merged = local_wings;
+        for (remote_name, remote) in &remote_results {
+            if let Some(remote_wings) = remote.get("wings") {
+                if let (Some(obj), Some(robj)) =
+                    (merged.get_mut("wings").and_then(|v| v.as_object_mut()), remote_wings.as_object())
+                {
+                    for (wing, count) in robj {
+                        // Wing-collision warning: wing exists locally AND on remote
+                        // but the resolved route is Local-only.
+                        if local_wing_names.contains(wing) {
+                            let rule = resolve_route(
+                                &self.rules,
+                                None,
+                                RouteQuery { wing: Some(wing.as_str()), room: None, source_file: None },
+                            );
+                            if rule.mode == RouteMode::Local {
+                                tracing::warn!(
+                                    wing = %wing,
+                                    remote = %remote_name,
+                                    "wing exists on remote but is configured local-only; results stay split"
+                                );
                             }
                         }
+                        let c = count.as_u64().unwrap_or(0);
+                        let entry = obj.entry(wing.clone()).or_insert(json!(0));
+                        let val = entry.as_u64().unwrap_or(0);
+                        *entry = json!(val + c);
                     }
-                }
-                Err(e) => {
-                    tracing::warn!(remote = %name, %e, "failed to fetch wings from remote");
                 }
             }
         }
@@ -415,25 +609,40 @@ impl FederationRouter {
         local_rooms: Value,
         wing_filter: Option<&str>,
     ) -> ToolResult<Value> {
-        let mut merged = local_rooms;
+        let wing_filter_owned = wing_filter.map(|s| s.to_owned());
+        let mut set: JoinSet<(String, Result<Value, mempalace_remote::RemoteError>)> = JoinSet::new();
         for (name, api) in &self.remotes {
-            match api.rooms(wing_filter).await {
-                Ok(remote) => {
-                    if let Some(remote_rooms) = remote.get("rooms") {
-                        if let (Some(obj), Some(robj)) =
-                            (merged.get_mut("rooms").and_then(|v| v.as_object_mut()), remote_rooms.as_object())
-                        {
-                            for (room, count) in robj {
-                                let c = count.as_u64().unwrap_or(0);
-                                let entry = obj.entry(room.clone()).or_insert(json!(0));
-                                let val = entry.as_u64().unwrap_or(0);
-                                *entry = json!(val + c);
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
+            let name = name.clone();
+            let api = Arc::clone(api);
+            let wf = wing_filter_owned.clone();
+            set.spawn(async move { (name, api.rooms(wf.as_deref()).await) });
+        }
+
+        let mut remote_results: BTreeMap<String, Value> = BTreeMap::new();
+        while let Some(res) = set.join_next().await {
+            match res {
+                Ok((name, Ok(payload))) => { remote_results.insert(name, payload); }
+                Ok((name, Err(e))) => {
                     tracing::warn!(remote = %name, %e, "failed to fetch rooms from remote");
+                }
+                Err(join_err) => {
+                    tracing::warn!("rooms task panicked: {join_err}");
+                }
+            }
+        }
+
+        let mut merged = local_rooms;
+        for (_name, remote) in &remote_results {
+            if let Some(remote_rooms) = remote.get("rooms") {
+                if let (Some(obj), Some(robj)) =
+                    (merged.get_mut("rooms").and_then(|v| v.as_object_mut()), remote_rooms.as_object())
+                {
+                    for (room, count) in robj {
+                        let c = count.as_u64().unwrap_or(0);
+                        let entry = obj.entry(room.clone()).or_insert(json!(0));
+                        let val = entry.as_u64().unwrap_or(0);
+                        *entry = json!(val + c);
+                    }
                 }
             }
         }
@@ -444,26 +653,40 @@ impl FederationRouter {
         &self,
         mut local_status: Value,
     ) -> ToolResult<Value> {
-        let mut federation_info = vec![];
+        let mut set: JoinSet<(String, String, Result<mempalace_federation::InfoResponse, mempalace_remote::RemoteError>)> = JoinSet::new();
         for (name, api) in &self.remotes {
-            let remote_url = self
+            let name = name.clone();
+            let url = self
                 .rules
                 .remotes
-                .get(name)
-                .map(|r| r.url.as_str())
-                .unwrap_or("");
+                .get(&name)
+                .map(|r| r.url.clone())
+                .unwrap_or_default();
+            let api = Arc::clone(api);
+            set.spawn(async move { (name, url, api.info().await) });
+        }
+
+        let mut info_results: BTreeMap<String, (String, Result<mempalace_federation::InfoResponse, mempalace_remote::RemoteError>)> = BTreeMap::new();
+        while let Some(res) = set.join_next().await {
+            match res {
+                Ok((name, url, result)) => { info_results.insert(name, (url, result)); }
+                Err(join_err) => {
+                    tracing::warn!("status task panicked: {join_err}");
+                }
+            }
+        }
+
+        let mut federation_info = vec![];
+        for (name, (url, result)) in &info_results {
             let mut entry = json!({
                 "name": name,
-                "url": remote_url,
+                "url": url,
                 "reachable": false,
                 "federation_api_version": null,
             });
-            match api.info().await {
-                Ok(info) => {
-                    entry["reachable"] = json!(true);
-                    entry["federation_api_version"] = json!(info.federation_api_version);
-                }
-                Err(_) => {}
+            if let Ok(info) = result {
+                entry["reachable"] = json!(true);
+                entry["federation_api_version"] = json!(info.federation_api_version);
             }
             federation_info.push(entry);
         }
@@ -498,7 +721,16 @@ impl FederationRouter {
         };
         let remote_payload = match api.kg_query(req).await {
             Ok(resp) => resp,
-            Err(_) => return Ok(local_payload),
+            Err(e) => {
+                tracing::warn!(
+                    remote = %remote_name,
+                    "kg_query failed: {e}"
+                );
+                let mut payload = local_payload;
+                let warn_msg = format!("remote `{remote_name}` kg_query failed: {e}");
+                payload["warnings"] = json!([warn_msg]);
+                return Ok(payload);
+            }
         };
         match route.mode {
             RouteMode::Local => unreachable!(),
@@ -545,7 +777,12 @@ impl FederationRouter {
             valid_from: valid_from.map(|s| s.to_owned()),
         };
         match api.kg_add_fact(req).await {
-            Ok(resp) => Ok(Some(resp)),
+            Ok(mut resp) => {
+                if let Some(obj) = resp.as_object_mut() {
+                    obj.insert("applied_to".to_owned(), json!(format!("remote:{remote_name}")));
+                }
+                Ok(Some(resp))
+            }
             Err(e) => Err(ToolError::Internal(McpError::Federation(format!(
                 "remote `{remote_name}` kg_add_fact failed: {e}"
             )))),
@@ -584,7 +821,12 @@ impl FederationRouter {
             ended: ended.map(|s| s.to_owned()),
         };
         match api.kg_invalidate(req).await {
-            Ok(resp) => Ok(Some(resp)),
+            Ok(mut resp) => {
+                if let Some(obj) = resp.as_object_mut() {
+                    obj.insert("applied_to".to_owned(), json!(format!("remote:{remote_name}")));
+                }
+                Ok(Some(resp))
+            }
             Err(e) => Err(ToolError::Internal(McpError::Federation(format!(
                 "remote `{remote_name}` kg_invalidate failed: {e}"
             )))),
@@ -608,7 +850,16 @@ impl FederationRouter {
         };
         let remote_payload = match api.kg_timeline(entity).await {
             Ok(resp) => resp,
-            Err(_) => return Ok(local_payload),
+            Err(e) => {
+                tracing::warn!(
+                    remote = %remote_name,
+                    "kg_timeline failed: {e}"
+                );
+                let mut payload = local_payload;
+                let warn_msg = format!("remote `{remote_name}` kg_timeline failed: {e}");
+                payload["warnings"] = json!([warn_msg]);
+                return Ok(payload);
+            }
         };
         match route.mode {
             RouteMode::Local => unreachable!(),
@@ -639,7 +890,16 @@ impl FederationRouter {
         };
         let remote_payload = match api.kg_stats().await {
             Ok(resp) => resp,
-            Err(_) => return Ok(local_payload),
+            Err(e) => {
+                tracing::warn!(
+                    remote = %remote_name,
+                    "kg_stats failed: {e}"
+                );
+                let mut payload = local_payload;
+                let warn_msg = format!("remote `{remote_name}` kg_stats failed: {e}");
+                payload["warnings"] = json!([warn_msg]);
+                return Ok(payload);
+            }
         };
         match route.mode {
             RouteMode::Local => unreachable!(),
@@ -771,7 +1031,7 @@ fn drawer_result_to_value(result: RemoteDrawerResult, origin: &str) -> Value {
     let mut v = json!({
         "wing": result.wing,
         "room": result.room,
-        "similarity": result.score,
+        "similarity": crate::round_similarity(result.score),
         "text": result.content,
         "source_file": result.source_file,
         "origin": origin,
@@ -786,7 +1046,6 @@ fn search_payload(
     query: &str,
     wing: Option<&str>,
     room: Option<&str>,
-    limit: usize,
     results: Vec<Value>,
     warnings: &[String],
 ) -> Value {
@@ -797,7 +1056,6 @@ fn search_payload(
             "room": room,
         },
         "results": results,
-        "limit": limit,
     });
     if !warnings.is_empty() {
         payload["warnings"] = json!(warnings);
@@ -805,28 +1063,28 @@ fn search_payload(
     payload
 }
 
-/// Merge local and remote search results by rank interleave (round-robin across
-/// origins in rank order). Raw scores are never compared across embedding
-/// profiles. Deduplication prefers local on content-hash match; falls back to
-/// text-content matching when hashes are absent.
-fn merge_search_results(
-    local: Vec<Value>,
-    remote: Vec<Value>,
+/// N-way rank interleave across origins. `origins` is a list of (origin_name,
+/// results) pairs. Local (if present) is expected to be first in the list.
+/// Deduplication prefers the first seen (local preferred since it's first).
+/// Truncates to `limit`.
+pub(crate) fn merge_search_results_nway(
+    origins: Vec<(String, Vec<Value>)>,
     limit: usize,
 ) -> Vec<Value> {
-    if local.is_empty() {
-        return remote.into_iter().take(limit).collect();
+    if origins.is_empty() {
+        return vec![];
     }
-    if remote.is_empty() {
-        return local
+    if origins.len() == 1 {
+        let (origin_name, results) = origins.into_iter().next().unwrap();
+        return results
             .into_iter()
+            .take(limit)
             .map(|mut v| {
                 if v.get("origin").is_none() {
-                    v["origin"] = json!("local");
+                    v["origin"] = json!(origin_name);
                 }
                 v
             })
-            .take(limit)
             .collect();
     }
 
@@ -834,30 +1092,21 @@ fn merge_search_results(
     let mut seen_hashes = std::collections::HashSet::new();
     let mut seen_texts = std::collections::HashSet::new();
 
-    let max_rank = local.len().max(remote.len());
-    for rank in 0..max_rank {
-        if merged.len() >= limit {
-            break;
-        }
-        // Interleave: local at this rank first
-        if rank < local.len() {
-            let item = &local[rank];
-            if !is_duplicate_search_item(item, &mut seen_hashes, &mut seen_texts) {
-                let mut annotated = item.clone();
-                if annotated.get("origin").is_none() {
-                    annotated["origin"] = json!("local");
-                }
-                merged.push(annotated);
+    let max_rank = origins.iter().map(|(_, r)| r.len()).max().unwrap_or(0);
+    'outer: for rank in 0..max_rank {
+        for (origin_name, results) in &origins {
+            if merged.len() >= limit {
+                break 'outer;
             }
-        }
-        if merged.len() >= limit {
-            break;
-        }
-        // Then remote at the same rank
-        if rank < remote.len() {
-            let item = &remote[rank];
-            if !is_duplicate_search_item(item, &mut seen_hashes, &mut seen_texts) {
-                merged.push(item.clone());
+            if rank < results.len() {
+                let item = &results[rank];
+                if !is_duplicate_search_item(item, &mut seen_hashes, &mut seen_texts) {
+                    let mut annotated = item.clone();
+                    if annotated.get("origin").is_none() {
+                        annotated["origin"] = json!(origin_name);
+                    }
+                    merged.push(annotated);
+                }
             }
         }
     }
@@ -871,14 +1120,25 @@ fn is_duplicate_search_item(
     seen_hashes: &mut std::collections::HashSet<String>,
     seen_texts: &mut std::collections::HashSet<String>,
 ) -> bool {
-    // Prefer content_hash for dedup, fall back to text content.
-    if let Some(hash) = item["content_hash"].as_str() {
-        if !hash.is_empty() {
-            return !seen_hashes.insert(hash.to_owned());
-        }
+    // An item is a duplicate if EITHER its hash (if non-empty) is already seen
+    // OR its text is already seen. This prevents a local item (no hash) and a
+    // remote item (with hash, same text) from both appearing.
+    let hash = item["content_hash"].as_str().filter(|h| !h.is_empty());
+    let text = item["text"].as_str();
+
+    let hash_dup = hash.map(|h| seen_hashes.contains(h)).unwrap_or(false);
+    let text_dup = text.map(|t| seen_texts.contains(t)).unwrap_or(false);
+
+    if hash_dup || text_dup {
+        return true;
     }
-    if let Some(text) = item["text"].as_str() {
-        return !seen_texts.insert(text.to_owned());
+
+    // Not a duplicate — register both hash and text for future items.
+    if let Some(h) = hash {
+        seen_hashes.insert(h.to_owned());
+    }
+    if let Some(t) = text {
+        seen_texts.insert(t.to_owned());
     }
     false
 }
@@ -900,6 +1160,19 @@ mod tests {
     };
     use mempalace_remote::RemoteError;
 
+    // ─── merge_search_results_nway unit tests ────────────────────────────────
+
+    fn local_origins(items: Vec<Value>) -> Vec<(String, Vec<Value>)> {
+        vec![("local".to_owned(), items)]
+    }
+
+    fn two_origins(local: Vec<Value>, remote: Vec<Value>) -> Vec<(String, Vec<Value>)> {
+        let mut v = vec![];
+        if !local.is_empty() { v.push(("local".to_owned(), local)); }
+        if !remote.is_empty() { v.push(("alpha".to_owned(), remote)); }
+        v
+    }
+
     #[test]
     fn merge_interleaves_and_dedupes() {
         let local = vec![
@@ -910,7 +1183,7 @@ mod tests {
             json!({"wing":"w","room":"r1","similarity":0.85,"text":"hello remote"}),
             json!({"wing":"w","room":"r3","similarity":0.7,"text":"new remote"}),
         ];
-        let merged = merge_search_results(local, remote, 10);
+        let merged = merge_search_results_nway(two_origins(local, remote), 10);
         // Rank interleave: L0, R0, L1, R1 — no deduping (all texts differ)
         assert_eq!(merged.len(), 4);
         assert_eq!(merged[0]["text"], "hello local");
@@ -927,7 +1200,7 @@ mod tests {
         let remote = vec![
             json!({"wing":"w","room":"r1","similarity":0.85,"text":"same content"}),
         ];
-        let merged = merge_search_results(local, remote, 10);
+        let merged = merge_search_results_nway(two_origins(local, remote), 10);
         assert_eq!(merged.len(), 1);
     }
 
@@ -941,7 +1214,7 @@ mod tests {
             json!({"wing":"w","room":"r3","similarity":0.7,"text":"c"}),
             json!({"wing":"w","room":"r4","similarity":0.6,"text":"d"}),
         ];
-        let merged = merge_search_results(local, remote, 2);
+        let merged = merge_search_results_nway(two_origins(local, remote), 2);
         assert_eq!(merged.len(), 2);
     }
 
@@ -952,7 +1225,7 @@ mod tests {
             json!({"wing":"w","room":"r2","similarity":0.8,"text":"b"}),
             json!({"wing":"w","room":"r3","similarity":0.7,"text":"c"}),
         ];
-        let merged = merge_search_results(local, vec![], 2);
+        let merged = merge_search_results_nway(local_origins(local), 2);
         assert_eq!(merged.len(), 2);
     }
 
@@ -960,7 +1233,7 @@ mod tests {
     fn merge_empty_remote_returns_local() {
         let local =
             vec![json!({"wing":"w","room":"r1","similarity":0.9,"text":"only local"})];
-        let merged = merge_search_results(local, vec![], 5);
+        let merged = merge_search_results_nway(local_origins(local), 5);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0]["text"], "only local");
         assert_eq!(merged[0]["origin"], "local");
@@ -973,7 +1246,10 @@ mod tests {
             json!({"wing":"w","room":"r2","similarity":0.8,"text":"b"}),
             json!({"wing":"w","room":"r3","similarity":0.7,"text":"c"}),
         ];
-        let merged = merge_search_results(vec![], remote, 2);
+        let merged = merge_search_results_nway(
+            vec![("alpha".to_owned(), remote)],
+            2
+        );
         assert_eq!(merged.len(), 2);
     }
 
@@ -987,7 +1263,7 @@ mod tests {
     fn merge_dedupes_on_content_hash() {
         let local = vec![json!({"wing":"w","room":"r1","similarity":0.9,"text":"hello","content_hash":"abc123"})];
         let remote = vec![json!({"wing":"w","room":"r2","similarity":0.8,"text":"hello","content_hash":"abc123"})];
-        let merged = merge_search_results(local, remote, 10);
+        let merged = merge_search_results_nway(two_origins(local, remote), 10);
         // Local preferred on hash collision — remote skipped.
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0]["wing"], "w");
@@ -998,7 +1274,7 @@ mod tests {
     fn merge_dedupes_on_text_fallback() {
         let local = vec![json!({"wing":"w","room":"r1","text":"content"})];
         let remote = vec![json!({"wing":"w","room":"r2","text":"content"})];
-        let merged = merge_search_results(local, remote, 10);
+        let merged = merge_search_results_nway(two_origins(local, remote), 10);
         // No content_hash, falls back to text dedupe.
         assert_eq!(merged.len(), 1);
     }
@@ -1014,12 +1290,34 @@ mod tests {
             json!({"wing":"w","room":"r3","text":"alpha"}),
             json!({"wing":"w","room":"r4","text":"gamma"}),
         ];
-        let merged = merge_search_results(local, remote, 10);
+        let merged = merge_search_results_nway(two_origins(local, remote), 10);
         // L0, R0(skipped), L1, R1
         assert_eq!(merged.len(), 3);
         assert_eq!(merged[0]["text"], "alpha");
         assert_eq!(merged[1]["text"], "beta");
         assert_eq!(merged[2]["text"], "gamma");
+    }
+
+    #[test]
+    fn merge_three_way_interleave() {
+        // 3-origin N-way merge
+        let local = vec![json!({"text":"L0"}), json!({"text":"L1"})];
+        let r1 = vec![json!({"text":"R1_0"}), json!({"text":"R1_1"})];
+        let r2 = vec![json!({"text":"R2_0"}), json!({"text":"R2_1"})];
+        let origins = vec![
+            ("local".to_owned(), local),
+            ("remote1".to_owned(), r1),
+            ("remote2".to_owned(), r2),
+        ];
+        let merged = merge_search_results_nway(origins, 10);
+        // rank 0: L0, R1_0, R2_0; rank 1: L1, R1_1, R2_1
+        assert_eq!(merged.len(), 6);
+        assert_eq!(merged[0]["text"], "L0");
+        assert_eq!(merged[1]["text"], "R1_0");
+        assert_eq!(merged[2]["text"], "R2_0");
+        assert_eq!(merged[3]["text"], "L1");
+        assert_eq!(merged[4]["text"], "R1_1");
+        assert_eq!(merged[5]["text"], "R2_1");
     }
 
     #[test]
@@ -1112,12 +1410,33 @@ mod tests {
         assert_eq!(avail["wing_code"], "local");
     }
 
+    #[test]
+    fn wing_availability_default_combined_gives_combined() {
+        // When default_mode is Combined and no wing-specific rule, availability
+        // should be "combined".
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), make_resolved_remote("alpha"));
+        let rules = FederationRuntimeConfig {
+            remotes,
+            default_mode: RouteMode::Combined,
+            default_remote: Some("alpha".to_owned()),
+            wings: BTreeMap::new(),
+            kg: None,
+        };
+        let router_obj = FederationRouter::new(rules);
+        let mut wings = BTreeMap::new();
+        wings.insert("wing_code".to_owned(), 5);
+        let avail = router_obj.wing_availability(&wings);
+        assert_eq!(avail["wing_code"], "combined");
+    }
+
     // ─── E2E federation tests with mock remote ──────────────────────────────
 
     struct MockRemote {
         info_response: Value,
         search_results: Vec<Value>,
         add_drawer_success: bool,
+        add_drawer_409: bool,
         duplicate_matches: Vec<Value>,
         taxonomy: Value,
         wings: Value,
@@ -1142,6 +1461,7 @@ mod tests {
                 }),
                 search_results: vec![],
                 add_drawer_success: true,
+                add_drawer_409: false,
                 duplicate_matches: vec![],
                 taxonomy: json!({"taxonomy": {}}),
                 wings: json!({"wings": {}}),
@@ -1205,6 +1525,13 @@ mod tests {
             req: AddDrawerRequest,
         ) -> mempalace_remote::Result<AddDrawerResponse> {
             self.check_fail("add_drawer")?;
+            if self.add_drawer_409 {
+                return Err(RemoteError::RemoteRejected {
+                    remote: "mock".to_owned(),
+                    status: 409,
+                    body: "conflict".to_owned(),
+                });
+            }
             Ok(AddDrawerResponse {
                 success: self.add_drawer_success,
                 drawer_id: Some("rem-drawer-1".to_owned()),
@@ -1350,8 +1677,7 @@ mod tests {
         let router = make_router(remotes);
 
         let local = vec![json!({"wing":"w","room":"r1","similarity":0.9,"text":"local hit"})];
-        let route = make_combined_route("alpha");
-        let result = router.search(local, "test", Some("w"), None, 10, &route).await.unwrap();
+        let result = router.search(local, "test", Some("w"), None, 10, &["alpha".to_owned()]).await.unwrap();
 
         let results = result["results"].as_array().unwrap();
         assert_eq!(results.len(), 2);
@@ -1371,15 +1697,15 @@ mod tests {
         let router = make_router(remotes);
 
         let local = vec![json!({"wing":"w","room":"r1","similarity":0.9,"text":"local only"})];
-        let route = make_combined_route("alpha");
-        let result = router.search(local, "test", Some("w"), None, 10, &route).await.unwrap();
+        let result = router.search(local, "test", Some("w"), None, 10, &["alpha".to_owned()]).await.unwrap();
 
         let results = result["results"].as_array().unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0]["text"], "local only");
         let warnings = result["warnings"].as_array().unwrap();
         assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].as_str().unwrap().contains("unreachable"));
+        // Use Display format (not "unreachable"); check it mentions the remote name
+        assert!(warnings[0].as_str().unwrap().contains("alpha"));
     }
 
     #[tokio::test]
@@ -1391,7 +1717,7 @@ mod tests {
 
         let route = make_combined_route("alpha");
         let result = router
-            .add_drawer_remote("w", "r", "content", "file.txt", "agent", &route)
+            .add_drawer_remote("w", "r", "content", "file.txt", "agent", &route, 0.9)
             .await
             .unwrap()
             .unwrap();
@@ -1399,6 +1725,50 @@ mod tests {
         assert_eq!(result["success"], true);
         assert_eq!(result["origin"], "alpha");
         assert_eq!(result["drawer_id"], "rem-drawer-1");
+    }
+
+    #[tokio::test]
+    async fn e2e_add_drawer_pre_check_duplicate_returns_matches_with_origin() {
+        let mut mock = MockRemote::default();
+        mock.duplicate_matches = vec![json!({"drawer_id":"dup-1","similarity":0.95})];
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+
+        let route = make_combined_route("alpha");
+        let result = router
+            .add_drawer_remote("w", "r", "content", "file.txt", "agent", &route, 0.9)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(result["success"], false);
+        assert_eq!(result["reason"], "duplicate");
+        let matches = result["matches"].as_array().unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0]["origin"], "alpha");
+    }
+
+    #[tokio::test]
+    async fn e2e_add_drawer_409_race_returns_duplicate_shape() {
+        let mut mock = MockRemote::default();
+        mock.add_drawer_409 = true;
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+
+        let route = make_combined_route("alpha");
+        let result = router
+            .add_drawer_remote("w", "r", "content", "file.txt", "agent", &route, 0.9)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(result["success"], false);
+        assert_eq!(result["reason"], "duplicate");
+        let matches = result["matches"].as_array().unwrap();
+        assert_eq!(matches.len(), 0);
+        assert_eq!(result["origin"], "alpha");
     }
 
     #[tokio::test]
@@ -1414,7 +1784,7 @@ mod tests {
             write: WriteTarget::Local,
         };
         let result = router
-            .add_drawer_remote("w", "r", "content", "file.txt", "agent", &route)
+            .add_drawer_remote("w", "r", "content", "file.txt", "agent", &route, 0.9)
             .await
             .unwrap();
 
@@ -1436,14 +1806,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn e2e_delete_drawer_tries_all_remotes_in_order() {
+        // First remote fails (non-degradable 404), second succeeds.
+        let mut mock_fail = MockRemote::default();
+        mock_fail.delete_succeeds = false;
+        let mock_ok = MockRemote::default();
+
+        let mut remotes = BTreeMap::new();
+        remotes.insert("aaa".to_owned(), Arc::new(mock_fail) as Arc<dyn RemoteApi>);
+        remotes.insert("bbb".to_owned(), Arc::new(mock_ok) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+
+        let result = router.delete_drawer_remote("drawer-1").await.unwrap().unwrap();
+
+        // BTreeMap order: "aaa" before "bbb"; aaa fails, bbb succeeds
+        assert_eq!(result["success"], true);
+        assert_eq!(result["drawer_id"], "drawer-1");
+        assert_eq!(result["origin"], "bbb");
+    }
+
+    #[tokio::test]
     async fn e2e_delete_drawer_remote_succeeds() {
         let mock = MockRemote::default();
         let mut remotes = BTreeMap::new();
         remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
         let router = make_router(remotes);
 
-        let route = make_combined_route("alpha");
-        let result = router.delete_drawer_remote("drawer-1", &route).await.unwrap().unwrap();
+        let result = router.delete_drawer_remote("drawer-1").await.unwrap().unwrap();
 
         assert_eq!(result["success"], true);
         assert_eq!(result["drawer_id"], "drawer-1");
@@ -1451,19 +1840,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn e2e_delete_drawer_local_route_returns_none() {
-        let mock = MockRemote::default();
-        let mut remotes = BTreeMap::new();
-        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
-        let router = make_router(remotes);
-
-        let route = ResolvedRouteRule {
-            mode: RouteMode::Local,
-            remote: None,
-            write: WriteTarget::Local,
-        };
-        let result = router.delete_drawer_remote("drawer-1", &route).await.unwrap();
-
+    async fn e2e_delete_drawer_no_remotes_returns_none() {
+        let router = FederationRouter::new(FederationRuntimeConfig::default());
+        let result = router.delete_drawer_remote("drawer-1").await.unwrap();
         assert!(result.is_none());
     }
 
@@ -1606,7 +1985,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn e2e_kg_query_degradable_on_remote_outage() {
+    async fn e2e_kg_query_degradable_on_remote_outage_adds_warning() {
         let mut mock = MockRemote::default();
         mock.fail_on = Some("kg_query".to_owned());
         let mut remotes = BTreeMap::new();
@@ -1626,10 +2005,45 @@ mod tests {
         };
         let result = router.kg_query_merge(local, "Alice", &route).await.unwrap();
 
-        // Should return local results gracefully when remote fails
+        // Should return local results with a warning when remote fails
         assert_eq!(result["count"], 1);
         let facts = result["facts"].as_array().unwrap();
         assert_eq!(facts.len(), 1);
+        let warnings = result["warnings"].as_array().unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].as_str().unwrap().contains("alpha"));
+    }
+
+    #[tokio::test]
+    async fn e2e_kg_add_returns_applied_to_remote() {
+        let mock = MockRemote::default();
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+
+        let route = ResolvedRouteRule {
+            mode: RouteMode::Remote,
+            remote: Some("alpha".to_owned()),
+            write: WriteTarget::Remote,
+        };
+        let result = router.kg_add_remote("A", "loves", "B", None, &route).await.unwrap().unwrap();
+        assert_eq!(result["applied_to"], "remote:alpha");
+    }
+
+    #[tokio::test]
+    async fn e2e_kg_invalidate_returns_applied_to_remote() {
+        let mock = MockRemote::default();
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+
+        let route = ResolvedRouteRule {
+            mode: RouteMode::Remote,
+            remote: Some("alpha".to_owned()),
+            write: WriteTarget::Remote,
+        };
+        let result = router.kg_invalidate_remote("A", "loves", "B", None, &route).await.unwrap().unwrap();
+        assert_eq!(result["applied_to"], "remote:alpha");
     }
 
     #[tokio::test]
@@ -1639,12 +2053,12 @@ mod tests {
         remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
         let router = make_router(remotes);
 
-        // Simulate local wings
+        // Simulate local wings; default_mode=Combined → "combined"
         let mut local_wings = BTreeMap::new();
         local_wings.insert("wing_code".to_owned(), 5);
 
         let avail = router.wing_availability(&local_wings);
-        assert_eq!(avail["wing_code"], "local");
+        assert_eq!(avail["wing_code"], "combined");
     }
 
     #[tokio::test]
@@ -1676,11 +2090,287 @@ mod tests {
         };
         let router = FederationRouter::with_remotes(rules, remotes);
 
-        // wing_external is configured but not local → should appear as remote
+        // wing_external is configured but not local → should appear as "remote:alpha"
         let local_wings = BTreeMap::new();
         let avail = router.wing_availability(&local_wings);
         assert!(avail.get("wing_external").is_some());
-        // The wing_external rule has mode=Remote, so it can't be local
-        assert_eq!(avail["wing_external"], "remote");
+        // The wing_external rule has mode=Remote → "remote:alpha"
+        assert_eq!(avail["wing_external"], "remote:alpha");
+    }
+
+    #[tokio::test]
+    async fn e2e_kg_timeline_degradable_adds_warning() {
+        let mut mock = MockRemote::default();
+        mock.fail_on = Some("kg_timeline".to_owned());
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+
+        let local = json!({"entity":"all","timeline":[],"count":0});
+        let route = ResolvedRouteRule {
+            mode: RouteMode::Combined,
+            remote: Some("alpha".to_owned()),
+            write: WriteTarget::Remote,
+        };
+        let result = router.kg_timeline_merge(local, None, &route).await.unwrap();
+        let warnings = result["warnings"].as_array().unwrap();
+        assert!(warnings[0].as_str().unwrap().contains("alpha"));
+    }
+
+    #[tokio::test]
+    async fn e2e_kg_stats_degradable_adds_warning() {
+        let mut mock = MockRemote::default();
+        mock.fail_on = Some("kg_stats".to_owned());
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+
+        let local = json!({"entities":5,"triples":10,"current_facts":8,"expired_facts":2,"relationship_types":["loves"]});
+        let route = ResolvedRouteRule {
+            mode: RouteMode::Combined,
+            remote: Some("alpha".to_owned()),
+            write: WriteTarget::Remote,
+        };
+        let result = router.kg_stats_merge(local, &route).await.unwrap();
+        assert_eq!(result["entities"], 5);
+        let warnings = result["warnings"].as_array().unwrap();
+        assert!(warnings[0].as_str().unwrap().contains("alpha"));
+    }
+
+    // ─── plan_search_targets unit tests ─────────────────────────────────────
+
+    fn make_router_with_rules(
+        remotes: BTreeMap<String, Arc<dyn RemoteApi>>,
+        wings: BTreeMap<String, ResolvedRouteRule>,
+        default_mode: RouteMode,
+        default_remote: Option<String>,
+    ) -> FederationRouter {
+        let mut rules_remotes = BTreeMap::new();
+        for name in remotes.keys() {
+            rules_remotes.insert(name.clone(), make_resolved_remote(name));
+        }
+        let rules = FederationRuntimeConfig {
+            remotes: rules_remotes,
+            default_mode,
+            default_remote,
+            wings,
+            kg: None,
+        };
+        FederationRouter::with_remotes(rules, remotes)
+    }
+
+    fn mock_remote_arc() -> Arc<dyn RemoteApi> {
+        Arc::new(MockRemote::default()) as Arc<dyn RemoteApi>
+    }
+
+    #[test]
+    fn plan_search_diary_wing_guard_wins_over_remote_wing_rule() {
+        // Even if the diary wing has a Remote rule, plan_search_targets returns (true, []).
+        let mut wings = BTreeMap::new();
+        wings.insert(
+            SHARED_AGENT_DIARY_WING.to_owned(),
+            ResolvedRouteRule {
+                mode: RouteMode::Remote,
+                remote: Some("alpha".to_owned()),
+                write: WriteTarget::Local,
+            },
+        );
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), mock_remote_arc());
+        let router = make_router_with_rules(
+            remotes, wings, RouteMode::Local, None,
+        );
+        let (include_local, targets) =
+            router.plan_search_targets(Some(SHARED_AGENT_DIARY_WING), None);
+        assert!(include_local);
+        assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn plan_search_diary_room_guard() {
+        // room == DIARY_ROOM triggers the guard regardless of wing.
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), mock_remote_arc());
+        let router = make_router_with_rules(
+            remotes,
+            BTreeMap::new(),
+            RouteMode::Combined,
+            Some("alpha".to_owned()),
+        );
+        let (include_local, targets) =
+            router.plan_search_targets(Some("wing_code"), Some(DIARY_ROOM));
+        assert!(include_local);
+        assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn plan_search_explicit_wing_remote() {
+        let mut wings = BTreeMap::new();
+        wings.insert(
+            "wing_ext".to_owned(),
+            ResolvedRouteRule {
+                mode: RouteMode::Remote,
+                remote: Some("alpha".to_owned()),
+                write: WriteTarget::Local,
+            },
+        );
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), mock_remote_arc());
+        let router = make_router_with_rules(
+            remotes, wings, RouteMode::Local, None,
+        );
+        let (include_local, targets) =
+            router.plan_search_targets(Some("wing_ext"), None);
+        assert!(!include_local);
+        assert_eq!(targets, vec!["alpha".to_owned()]);
+    }
+
+    #[test]
+    fn plan_search_explicit_wing_combined() {
+        let mut wings = BTreeMap::new();
+        wings.insert(
+            "wing_combo".to_owned(),
+            ResolvedRouteRule {
+                mode: RouteMode::Combined,
+                remote: Some("alpha".to_owned()),
+                write: WriteTarget::Remote,
+            },
+        );
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), mock_remote_arc());
+        let router = make_router_with_rules(
+            remotes, wings, RouteMode::Local, None,
+        );
+        let (include_local, targets) =
+            router.plan_search_targets(Some("wing_combo"), None);
+        assert!(include_local);
+        assert_eq!(targets, vec!["alpha".to_owned()]);
+    }
+
+    #[test]
+    fn plan_search_explicit_wing_local() {
+        let mut wings = BTreeMap::new();
+        wings.insert(
+            "wing_local".to_owned(),
+            ResolvedRouteRule {
+                mode: RouteMode::Local,
+                remote: None,
+                write: WriteTarget::Local,
+            },
+        );
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), mock_remote_arc());
+        let router = make_router_with_rules(
+            remotes, wings, RouteMode::Combined, Some("alpha".to_owned()),
+        );
+        let (include_local, targets) =
+            router.plan_search_targets(Some("wing_local"), None);
+        assert!(include_local);
+        assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn plan_search_no_wing_default_local_two_wing_rules_different_remotes() {
+        // wing=None, default_mode=Local, two wing rules pointing at two different remotes.
+        // Both remotes should appear in targets.
+        let mut wings = BTreeMap::new();
+        wings.insert(
+            "wing_a".to_owned(),
+            ResolvedRouteRule {
+                mode: RouteMode::Remote,
+                remote: Some("alpha".to_owned()),
+                write: WriteTarget::Local,
+            },
+        );
+        wings.insert(
+            "wing_b".to_owned(),
+            ResolvedRouteRule {
+                mode: RouteMode::Remote,
+                remote: Some("beta".to_owned()),
+                write: WriteTarget::Local,
+            },
+        );
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), mock_remote_arc());
+        remotes.insert("beta".to_owned(), mock_remote_arc());
+        let router = make_router_with_rules(
+            remotes, wings, RouteMode::Local, None,
+        );
+        let (include_local, mut targets) =
+            router.plan_search_targets(None, None);
+        assert!(include_local, "global search always includes local");
+        targets.sort();
+        assert_eq!(targets, vec!["alpha".to_owned(), "beta".to_owned()]);
+    }
+
+    #[test]
+    fn plan_search_no_wing_default_combined_includes_default_remote() {
+        // wing=None, default_mode=Combined → default remote is included.
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), mock_remote_arc());
+        let router = make_router_with_rules(
+            remotes,
+            BTreeMap::new(),
+            RouteMode::Combined,
+            Some("alpha".to_owned()),
+        );
+        let (include_local, targets) = router.plan_search_targets(None, None);
+        assert!(include_local);
+        assert_eq!(targets, vec!["alpha".to_owned()]);
+    }
+
+    #[test]
+    fn plan_search_targets_filtered_to_built_remotes() {
+        // A wing rule names "ghost" which was never built into self.remotes
+        // (e.g. client construction failed). Should be excluded from targets.
+        let mut wings = BTreeMap::new();
+        wings.insert(
+            "wing_a".to_owned(),
+            ResolvedRouteRule {
+                mode: RouteMode::Remote,
+                remote: Some("ghost".to_owned()),
+                write: WriteTarget::Local,
+            },
+        );
+        wings.insert(
+            "wing_b".to_owned(),
+            ResolvedRouteRule {
+                mode: RouteMode::Remote,
+                remote: Some("alpha".to_owned()),
+                write: WriteTarget::Local,
+            },
+        );
+        // Only "alpha" is in remotes, not "ghost".
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), mock_remote_arc());
+        let router = make_router_with_rules(
+            remotes, wings, RouteMode::Local, None,
+        );
+        let (include_local, targets) = router.plan_search_targets(None, None);
+        assert!(include_local);
+        assert_eq!(targets, vec!["alpha".to_owned()]);
+    }
+
+    // ─── Dedup cross-side test ───────────────────────────────────────────────
+
+    #[test]
+    fn dedup_local_no_hash_and_remote_with_hash_same_text() {
+        // Local item has no content_hash; remote item has a hash but same text.
+        // The text-based dedup should catch the duplicate.
+        let local = vec![json!({"text": "shared content", "wing": "w", "room": "r"})];
+        let remote = vec![json!({
+            "text": "shared content",
+            "wing": "w",
+            "room": "r2",
+            "content_hash": "abc123"
+        })];
+        let origins = vec![
+            ("local".to_owned(), local),
+            ("alpha".to_owned(), remote),
+        ];
+        let merged = merge_search_results_nway(origins, 10);
+        assert_eq!(merged.len(), 1, "cross-side duplicate should be deduped to 1");
+        // Local item is preferred (it was inserted first).
+        assert!(merged[0].get("content_hash").is_none());
     }
 }

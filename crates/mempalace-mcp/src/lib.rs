@@ -8,10 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use blake3::Hasher;
-use mempalace_config::{
-    ConfigLoader, FederationRuntimeConfig, MempalaceConfig, ResolvedRouteRule, RouteMode,
-    RouteQuery, WriteTarget, resolve_kg_route, resolve_route,
-};
+use mempalace_config::{ConfigLoader, MempalaceConfig, RouteMode};
 use mempalace_core::{
     DIARY_HALL, DIARY_ROOM, DIARY_TOPIC_PREFIX, DrawerId, DrawerRecord, EmbeddingProfile, RoomId,
     SHARED_AGENT_DIARY_WING, SearchQuery, WingId,
@@ -55,19 +52,26 @@ use federation::FederationRouter;
 //   DiaryWrite, DiaryRead, WakeUp, GetChangesSince, Traverse, FindTunnels,
 //   GraphStats, IdentityRead, IdentityUpdate, GetAaaKSpec
 //
-// **`kg_invalidate` policy:** Follows `resolve_kg_route()` — same routing as
-//   KgQuery/KgAdd/KgTimeline/KgStats. Invalidations are applied to the local KG
-//   in Local mode, the remote KG in Remote mode, and both when Combined.
+// **`kg_add`/`kg_invalidate` policy:** Both follow `resolve_kg_route()` and write
+//   to the write-target side ONLY (local or the configured remote). The response
+//   reports the touched side via `"applied_to": "local"` | `"remote:<name>"`.
+//   In Local mode the write is local; in Remote mode the write goes to the remote
+//   KG only; Combined uses the resolved `write` field (local or remote).
 //
-// **Wing name collisions:** When a tool resolves to a remote server and the
-//   requested wing exists both locally and at that remote, a warning is emitted
-//   via `tracing::warn!`. Collisions are surface-level only — they do not block
-//   execution. The `add_drawer` tool surfaces an additional warning when a write
-//   target wing shadows a local wing.
+// **Wing name collisions:** During `list_wings` merging, a wing that exists both
+//   locally and on a remote while its resolved route is Local-only triggers a
+//   `tracing::warn!` (results stay split); collisions never block execution.
+//
+// **Wing names are the federation join key** — the same wing name on both sides
+//   is merged-by-name in combined reads.
 //
 // **Write routing:** In Combined mode, `AddDrawer`, `DeleteDrawer`, `KgAdd`, and
 //   `KgInvalidate` write to the target indicated by the resolved rule's `write`
 //   field (local or remote). Read tools always fan out to both sources.
+//
+// **Per-project routing** (`resolve_route`'s `project_routing` parameter) is not
+//   wired at the MCP layer — the stdio server has no per-project context, so it
+//   is always `None`.
 //
 // For details on route resolution precedence, see
 // `mempalace_config::federation::resolve_route()`.
@@ -228,7 +232,7 @@ impl ToolName {
         match self {
             Self::WakeUp => ToolDefinition {
                 name: self.as_str(),
-                description: "Wake up into the palace. Returns identity.txt, palace status, recent palace changes, current project history when provided, and recent diary entries across all agents.",
+                description: "Wake up into the palace. Returns identity.txt, palace status, recent palace changes, current project history when provided, and recent diary entries across all agents. Local palace only; federated change feeds are future work.",
                 input_schema: json!({
                     "type":"object",
                     "properties":{
@@ -326,7 +330,7 @@ impl ToolName {
             },
             Self::Traverse => ToolDefinition {
                 name: self.as_str(),
-                description: "Walk the palace graph from a room. Shows connected ideas across wings — the tunnels. Like following a thread through the palace: start at 'chromadb-setup' in wing_code, discover it connects to wing_myproject (planning) and wing_user (feelings about it).",
+                description: "Walk the palace graph from a room. Shows connected ideas across wings — the tunnels. Like following a thread through the palace: start at 'chromadb-setup' in wing_code, discover it connects to wing_myproject (planning) and wing_user (feelings about it). Local palace only; not federated in v1.",
                 input_schema: json!({
                     "type":"object",
                     "properties":{
@@ -338,7 +342,7 @@ impl ToolName {
             },
             Self::FindTunnels => ToolDefinition {
                 name: self.as_str(),
-                description: "Find rooms that bridge two wings — the hallways connecting different domains. E.g. what topics connect wing_code to wing_team?",
+                description: "Find rooms that bridge two wings — the hallways connecting different domains. E.g. what topics connect wing_code to wing_team? Local palace only; not federated in v1.",
                 input_schema: json!({
                     "type":"object",
                     "properties":{
@@ -349,7 +353,7 @@ impl ToolName {
             },
             Self::GraphStats => ToolDefinition {
                 name: self.as_str(),
-                description: "Palace graph overview: total rooms, tunnel connections, edges between wings.",
+                description: "Palace graph overview: total rooms, tunnel connections, edges between wings. Local palace only; not federated in v1.",
                 input_schema: json!({"type":"object","properties":{}}),
             },
             Self::Search => ToolDefinition {
@@ -404,7 +408,7 @@ impl ToolName {
             },
             Self::DiaryWrite => ToolDefinition {
                 name: self.as_str(),
-                description: "Write a diary entry. Project-scoped entries are stored in the specified project wing; agent-scoped entries are stored in the shared wing_agents diary. The agent name is recorded as author attribution, not as the storage partition.",
+                description: "Write a diary entry. Project-scoped entries are stored in the specified project wing; agent-scoped entries are stored in the shared wing_agents diary. The agent name is recorded as author attribution, not as the storage partition. Always local; never federated.",
                 input_schema: json!({
                     "type":"object",
                     "properties":{
@@ -419,7 +423,7 @@ impl ToolName {
             },
             Self::DiaryRead => ToolDefinition {
                 name: self.as_str(),
-                description: "Read recent diary entries across all wings. Defaults to entries since the past day; optional filters narrow by wing, agent author, or topic.",
+                description: "Read recent diary entries across all wings. Defaults to entries since the past day; optional filters narrow by wing, agent author, or topic. Always local; never federated.",
                 input_schema: json!({
                     "type":"object",
                     "properties":{
@@ -433,7 +437,7 @@ impl ToolName {
             },
             Self::GetChangesSince => ToolDefinition {
                 name: self.as_str(),
-                description: "Get all palace changes since a given timestamp. Call this at session start (or when coordinating with teammates) to catch up on what other agents have written. Returns events in chronological order with operation type, affected entity, actor, and timestamp.",
+                description: "Get all palace changes since a given timestamp. Call this at session start (or when coordinating with teammates) to catch up on what other agents have written. Returns events in chronological order with operation type, affected entity, actor, and timestamp. Local palace only; federated change feeds are future work.",
                 input_schema: json!({
                     "type":"object",
                     "properties":{
@@ -653,9 +657,6 @@ where
 
         let mut runtime = self.runtime.lock().await;
 
-        // Federation routing: resolve route and emit collision warnings
-        runtime.apply_routing(tool, &call.arguments).await;
-
         let result = match tool {
             ToolName::WakeUp => runtime.tool_wake_up(&call.arguments).await,
             ToolName::Status => runtime.tool_status().await,
@@ -724,16 +725,6 @@ where
             federation,
         })
     }
-
-    /// Resolve federation routing for the given tool and emit wing-collision
-    /// warnings where applicable.
-    ///
-    /// **LocalOnly** tools are passed through with no routing logic.
-    ///
-    /// Routing hints are resolved per-request by individual tool handlers that
-    /// support federation; this method is a no-op placeholder for future proactive
-    /// routing logic.
-    async fn apply_routing(&self, _tool: ToolName, _arguments: &Value) {}
 
     async fn tool_wake_up(&mut self, arguments: &Value) -> ToolResult<Value> {
         let wing =
@@ -994,39 +985,44 @@ where
 
         // ── Federation path ──
         if let Some(router) = &self.federation {
-            let route = router.resolve_drawer_route(wing.as_ref().map(|w| w.as_str()));
-            if route.mode != RouteMode::Local {
-                let local_results = self
-                    .search
-                    .search(
-                        self.storage.drawer_store(),
-                        &SearchQuery {
-                            text: query.clone(),
-                            wing: wing.clone(),
-                            room: room.clone(),
-                            limit,
-                            profile: self.config.embedding_profile,
-                        },
-                    )
-                    .await
-                    .map_tool()?;
-                let local_values = local_results
-                    .into_iter()
-                    .map(|result| {
-                        json!({
-                            "wing": result.wing,
-                            "room": result.room,
-                            "similarity": round_similarity(result.score),
-                            "text": result.content,
-                            "source_file": result.source_file,
-                            "origin": "local",
+            let wing_str = wing.as_ref().map(|w| w.as_str());
+            let room_str = room.as_ref().map(|r| r.as_str());
+            let (include_local, remote_targets) =
+                router.plan_search_targets(wing_str, room_str);
+            if !remote_targets.is_empty() {
+                // Fan out: run local search when include_local, then merge with remotes.
+                let local_values: Vec<Value> = if include_local {
+                    self.search
+                        .search(
+                            self.storage.drawer_store(),
+                            &SearchQuery {
+                                text: query.clone(),
+                                wing: wing.clone(),
+                                room: room.clone(),
+                                limit,
+                                profile: self.config.embedding_profile,
+                            },
+                        )
+                        .await
+                        .map_tool()?
+                        .into_iter()
+                        .map(|result| {
+                            json!({
+                                "wing": result.wing,
+                                "room": result.room,
+                                "similarity": round_similarity(result.score),
+                                "text": result.content,
+                                "source_file": result.source_file,
+                                "content_hash": hash_text(&result.content),
+                                "origin": "local",
+                            })
                         })
-                    })
-                    .collect();
-                let wing_str = wing.as_ref().map(|w| w.as_str());
-                let room_str = room.as_ref().map(|r| r.as_str());
+                        .collect()
+                } else {
+                    vec![]
+                };
                 return router
-                    .search(local_values, &query, wing_str, room_str, limit, &route)
+                    .search(local_values, &query, wing_str, room_str, limit, &remote_targets)
                     .await;
             }
         }
@@ -1090,7 +1086,13 @@ where
 
         // ── Federation path ──
         if let Some(router) = &self.federation {
-            let route = router.resolve_drawer_route(Some(wing.as_str()));
+            // Pass room and source_file so diary hard-override can fire (e.g.
+            // room == DIARY_ROOM or source_file starts with DIARY_TOPIC_PREFIX).
+            let route = router.resolve_drawer_route(
+                Some(wing.as_str()),
+                Some(room.as_str()),
+                if source_file.is_empty() { None } else { Some(source_file.as_str()) },
+            );
             if let Some(remote_resp) = router
                 .add_drawer_remote(
                     wing.as_str(),
@@ -1099,9 +1101,12 @@ where
                     &source_file,
                     &added_by,
                     &route,
+                    DEFAULT_DUPLICATE_THRESHOLD,
                 )
                 .await?
             {
+                // Remote handled the add — no local change-log entry needed.
+                // The remote palace records its own change event.
                 return Ok(remote_resp);
             }
         }
@@ -1171,9 +1176,8 @@ where
         if deleted == 0 {
             // ── Federation fallback ──
             if let Some(router) = &self.federation {
-                let route = router.resolve_drawer_route(None);
                 if let Some(remote_resp) =
-                    router.delete_drawer_remote(drawer_id.as_str(), &route).await?
+                    router.delete_drawer_remote(drawer_id.as_str()).await?
                 {
                     self.log_change(ChangeEvent {
                         event_type: "drawer_deleted".to_owned(),
@@ -1477,11 +1481,17 @@ where
             ),
         });
 
-        Ok(json!({
+        let mut payload = json!({
             "success": true,
             "triple_id": triple_id,
             "fact": format!("{subject} → {predicate} → {object}"),
-        }))
+        });
+        if self.federation.is_some() {
+            if let Some(obj) = payload.as_object_mut() {
+                obj.insert("applied_to".to_owned(), json!("local"));
+            }
+        }
+        Ok(payload)
     }
 
     /// Knowledge-graph invalidation.
@@ -1537,12 +1547,18 @@ where
             });
         }
 
-        Ok(json!({
+        let mut payload = json!({
             "success": invalidated > 0,
             "invalidated": invalidated,
             "fact": format!("{subject} → {predicate} → {object}"),
             "ended": ended_text.unwrap_or_else(|| "today".to_owned()),
-        }))
+        });
+        if self.federation.is_some() {
+            if let Some(obj) = payload.as_object_mut() {
+                obj.insert("applied_to".to_owned(), json!("local"));
+            }
+        }
+        Ok(payload)
     }
 
     async fn tool_kg_timeline(&mut self, arguments: &Value) -> ToolResult<Value> {
@@ -2027,7 +2043,7 @@ fn render_diary_entry(drawer: DrawerRecord, include_agent: bool) -> ToolResult<V
     Ok(entry)
 }
 
-fn round_similarity(value: f32) -> f32 {
+pub(crate) fn round_similarity(value: f32) -> f32 {
     (value * 1_000.0).round() / 1_000.0
 }
 
@@ -2050,13 +2066,6 @@ fn hash_text(content: &str) -> String {
     blake3::hash(content.as_bytes()).to_hex().to_string()
 }
 
-/// Emit a [`tracing::warn!`] when a wing exists both locally and on a remote server.
-///
-/// This is called by routable tools when they resolve a non-local route for a
-/// wing that also has drawers in the local palace. The warning is surface-level
-/// only — it does not block execution. Callers pass `local_wing_count` (the
-/// number of local drawers in that wing) and `remote_name` (the target remote).
-///
 fn infer_entity_kind(name: &str) -> EntityKind {
     let trimmed = name.trim();
     if trimmed.is_empty() {
@@ -3977,9 +3986,8 @@ mod tests {
     #[tokio::test]
     async fn federation_routing_does_not_panic_with_wing_rule() {
         // The dispatch path must not panic/crash when federation is configured
-        // with a non-local wing rule. (v1 has no remote HTTP client, so tools
-        // still execute locally, but the routing + collision-warning path is
-        // exercised.)
+        // with a non-local wing rule. No live remote is wired, so no remote HTTP
+        // calls are made; tools fall through to local execution.
         let harness = test_harness_with_federation(
             FederationRuntimeConfig {
                 wings: [(
@@ -4023,6 +4031,8 @@ mod tests {
             ("mempalace_list_wings", json!({})),
             ("mempalace_list_rooms", json!({"wing": "wing_code"})),
             ("mempalace_get_taxonomy", json!({})),
+            ("mempalace_search", json!({"query": "auth migration parity", "limit": 2})),
+            ("mempalace_kg_stats", json!({})),
         ];
 
         for (tool, args) in &tools {
@@ -4046,6 +4056,124 @@ mod tests {
                 "tool `{tool}` produced different responses"
             );
         }
+
+        // ── Additional byte-identical read tools ──────────────────────────────
+
+        // mempalace_check_duplicate — use content that matches a seeded drawer.
+        let seeded_content =
+            "Code notes: auth-migration keeps search filter semantics exact while storage changes underneath.";
+        {
+            let default_resp = harness_default
+                .server
+                .handle_request(tool_call(
+                    2010,
+                    "mempalace_check_duplicate",
+                    json!({"content": seeded_content, "threshold": 0.9}),
+                ))
+                .await;
+            let none_fed_resp = harness_none_fed
+                .server
+                .handle_request(tool_call(
+                    2011,
+                    "mempalace_check_duplicate",
+                    json!({"content": seeded_content, "threshold": 0.9}),
+                ))
+                .await;
+            assert_eq!(
+                decode_tool_payload(&default_resp).unwrap(),
+                decode_tool_payload(&none_fed_resp).unwrap(),
+                "mempalace_check_duplicate produced different responses"
+            );
+        }
+
+        // mempalace_kg_query — use the seeded entity "Rust Rewrite".
+        {
+            let default_resp = harness_default
+                .server
+                .handle_request(tool_call(
+                    2012,
+                    "mempalace_kg_query",
+                    json!({"entity": "Rust Rewrite", "direction": "outgoing"}),
+                ))
+                .await;
+            let none_fed_resp = harness_none_fed
+                .server
+                .handle_request(tool_call(
+                    2013,
+                    "mempalace_kg_query",
+                    json!({"entity": "Rust Rewrite", "direction": "outgoing"}),
+                ))
+                .await;
+            assert_eq!(
+                decode_tool_payload(&default_resp).unwrap(),
+                decode_tool_payload(&none_fed_resp).unwrap(),
+                "mempalace_kg_query produced different responses"
+            );
+        }
+
+        // mempalace_kg_timeline — full timeline (no entity filter).
+        {
+            let default_resp = harness_default
+                .server
+                .handle_request(tool_call(2014, "mempalace_kg_timeline", json!({})))
+                .await;
+            let none_fed_resp = harness_none_fed
+                .server
+                .handle_request(tool_call(2015, "mempalace_kg_timeline", json!({})))
+                .await;
+            assert_eq!(
+                decode_tool_payload(&default_resp).unwrap(),
+                decode_tool_payload(&none_fed_resp).unwrap(),
+                "mempalace_kg_timeline produced different responses"
+            );
+        }
+
+        // ── Key-set comparison for one mutating call per harness ──────────────
+        // mempalace_add_drawer — fresh unique content so it succeeds.
+        // Values contain generated ids/timestamps, so we compare sorted key lists only.
+        let unique_content = "federation_none_regression_test_drawer_unique_content_xyz";
+        let default_add = harness_default
+            .server
+            .handle_request(tool_call(
+                2020,
+                "mempalace_add_drawer",
+                json!({"wing": "wing_fed_test", "room": "reg", "content": unique_content}),
+            ))
+            .await;
+        let none_fed_add = harness_none_fed
+            .server
+            .handle_request(tool_call(
+                2021,
+                "mempalace_add_drawer",
+                json!({"wing": "wing_fed_test", "room": "reg", "content": unique_content}),
+            ))
+            .await;
+        let default_add_payload = decode_tool_payload(&default_add).unwrap();
+        let none_fed_add_payload = decode_tool_payload(&none_fed_add).unwrap();
+        // Both must succeed.
+        assert_eq!(default_add_payload["success"], true);
+        assert_eq!(none_fed_add_payload["success"], true);
+        // Compare sorted top-level key sets (not values — ids/timestamps differ).
+        let default_keys: Vec<String> = default_add_payload
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let none_fed_keys: Vec<String> = none_fed_add_payload
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        assert_eq!(
+            default_keys, none_fed_keys,
+            "mempalace_add_drawer top-level keys differ between federation:none and no federation"
+        );
     }
 
     async fn test_harness_with_federation(federation: FederationRuntimeConfig) -> TestHarness {

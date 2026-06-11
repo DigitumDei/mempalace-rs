@@ -45,6 +45,9 @@ MemPalace provides a palace-style memory store with:
 | `mempalace-config` | Configuration management |
 | `mempalace-dialect` | AAAK dialect encoding/decoding |
 | `mempalace-import` | Migration from Python palace state |
+| `mempalace-federation` | Shared wire DTOs for the federation REST API |
+| `mempalace-server` | Axum federation REST server (`mempalace serve`) |
+| `mempalace-remote` | Federation HTTP client (RemoteApi trait + RemoteClient) |
 
 ## Requirements
 

@@ -67,8 +67,11 @@ jobs:
           - mempalace-config
           - mempalace-core
           - mempalace-dialect
+          - mempalace-federation
           - mempalace-import
+          - mempalace-remote
           - mempalace-search
+          - mempalace-server
 
     steps:
       - name: Checkout

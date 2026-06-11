@@ -164,3 +164,113 @@ Fields:
   - `name`: required string
   - `description`: optional string
   - `keywords`: optional string list
+
+### Project-level routing block
+
+An optional `routing` block in `mempalace.yaml` sets a default route for the wing declared in that file:
+
+```yaml
+wing: wing_myproject
+routing:
+  mode: combined
+  remote: work
+  write: local
+```
+
+- `mode`: `local`, `remote`, or `combined`
+- `remote`: name of a remote defined in `~/.mempalace/config.json` federation.remotes. May be omitted when exactly one remote is configured.
+- `write`: `local` or `remote`. Only meaningful for `combined` mode. Default: `local`.
+
+## Federation Config
+
+The optional `federation` section of `~/.mempalace/config.json` controls routing of wing reads and writes to remote palace servers.
+
+### Shape
+
+```jsonc
+{
+  "federation": {
+    "remotes": [
+      {
+        "name": "work",
+        "url": "https://palace.intra.example",
+        "token_env": "MEMPALACE_WORK_TOKEN",
+        "timeout_ms": 5000
+      }
+    ],
+    "default_mode": "local",
+    "wings": {
+      "wing_teamdocs": { "mode": "remote", "remote": "work" },
+      "wing_bigrepo":  { "mode": "combined", "remote": "work", "write": "local" }
+    },
+    "kg": { "mode": "combined", "remote": "work", "write": "remote" }
+  }
+}
+```
+
+### Field Definitions
+
+#### `federation.remotes`
+
+- Type: array of remote objects
+- Optional; defaults to empty
+- Each remote object:
+  - `name`: unique string identifier referenced by routing rules and `remote` fields elsewhere
+  - `url`: must be an `http://` or `https://` URL — any other scheme fails config load
+  - `token`: inline bearer token string (optional)
+  - `token_env`: name of an environment variable holding the bearer token (optional, preferred over `token` — keeps secrets out of config.json)
+  - Token resolution: the environment variable value wins if both are set; if `token_env` is set but the variable is not present in the environment, the config loader warns and falls back to the inline `token` (or proceeds unauthenticated if neither is set)
+  - `timeout_ms`: HTTP request timeout in milliseconds. Default: `5000`
+
+Validation:
+- Duplicate `name` values across remotes fail config load.
+- `url` must parse as a valid `http` or `https` URL; other schemes fail config load.
+
+#### `federation.default_mode`
+
+- Type: string enum: `local` | `remote` | `combined`
+- Optional. Default: `local`
+- `remote` or `combined` requires exactly one remote to be configured, or each routing rule must supply an explicit `remote` name; a missing or ambiguous remote reference fails config load.
+
+#### `federation.wings`
+
+- Type: object mapping wing name → routing rule
+- Optional
+- Each routing rule:
+  - `mode`: `local` | `remote` | `combined` (required)
+  - `remote`: name of an entry in `federation.remotes`. May be omitted when exactly one remote is configured; required (and fails config load if missing) when multiple remotes are configured.
+  - `write`: `local` | `remote`. Only meaningful for `combined` mode. Default: `local`.
+
+#### `federation.kg`
+
+- Type: routing rule (same shape as a wings entry)
+- Optional
+- Controls knowledge-graph read/write routing independently of wing routing.
+
+### Resolution Precedence
+
+Routes are resolved in this order (first match wins):
+
+1. Explicit per-wing rule in `federation.wings`
+2. Project `mempalace.yaml` `routing` block for the wing declared in that file
+3. `federation.default_mode`
+4. `local` (hard default when no federation config is present)
+
+**Hard overrides — always local regardless of config:**
+The following are unconditionally resolved to local storage; any config rule that attempts to route them remote is warned about and ignored:
+- Wing `wing_agents`
+- Room `diary` (within any wing)
+- Any source whose name begins with `diary:` prefix
+
+### Validation Errors vs. Warnings
+
+Config load fails with a precise error message for:
+- Unknown remote reference in a routing rule (name not present in `federation.remotes`)
+- Duplicate remote names in `federation.remotes`
+- Non-`http`/`https` URL in a remote definition
+- `remote` field missing or ambiguous when `mode` is `remote` or `combined` and multiple remotes are configured
+
+Config load succeeds with a warning (does not fail) for:
+- `token_env` set but the named environment variable is absent at startup
+- `write` set on a rule whose `mode` is not `combined` (ignored)
+- A non-local rule for `wing_agents` (ignored; the diary hard override applies at resolution time)

@@ -27,7 +27,7 @@ use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
 
 use axum::body::Body;
-use axum::extract::{Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{Request, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -37,20 +37,21 @@ use blake3::Hasher;
 use mempalace_config::MempalaceConfig;
 use mempalace_core::{
     DIARY_ROOM, DIARY_TOPIC_PREFIX, DrawerId, DrawerRecord, RoomId,
-    SHARED_AGENT_DIARY_WING, SearchQuery, WingId, resolve_records,
+    SHARED_AGENT_DIARY_WING, SearchQuery, SourceLocator, WingId, mined_drawer_id, resolve_records,
 };
 use mempalace_embeddings::{EmbeddingProvider, EmbeddingRequest};
 use mempalace_federation::{
     AddDrawerRequest, AddDrawerResponse, ChangesQuery, ChangesResponse, ChangeEventDto,
     CheckDuplicateRequest, CheckDuplicateResponse, DrawerSearchRequest, DrawerSearchResponse,
-    ErrorBody, FEDERATION_API_VERSION, InfoResponse, KgAddFactRequest, KgInvalidateRequest,
-    KgQueryRequest, ListDrawersQuery, ListDrawersResponse, RemoteDrawerResult,
+    ErrorBody, FEDERATION_API_VERSION, IngestBatchRequest, IngestBatchResponse, IngestFileResult,
+    InfoResponse, KgAddFactRequest, KgInvalidateRequest, KgQueryRequest, ListDrawersQuery,
+    ListDrawersResponse, RemoteDrawerResult,
 };
 use mempalace_graph::{AddFactRequest, EntityKind, KnowledgeGraphRuntime, QueryDirection};
 use mempalace_search::{SearchRuntime, SearchRuntimePolicy};
 use mempalace_storage::{
     ChangeEvent, ChangeLogStore, ChangeCursor, DrawerFilter, DrawerStore, DuplicateStrategy,
-    IngestCommitRequest, StorageEngine,
+    IngestCommitRequest, IngestManifestStore, StorageEngine,
 };
 use serde_json::{Value, json};
 use subtle::ConstantTimeEq;
@@ -380,7 +381,16 @@ where
     // Unauthenticated routes
     let public = Router::new().route("/v1/health", get(route_health));
 
-    // Authenticated routes — wrapped with the auth middleware
+    // Authenticated routes — wrapped with the auth middleware.
+    //
+    // The ingest/batch route gets a 16 MiB body limit (vs axum's 2 MiB default)
+    // and is merged in as a separate sub-router so the limit is scoped to it
+    // only; all other routes keep the default.
+    let ingest_route = Router::new()
+        .route("/v1/ingest/batch", post(route_ingest_batch::<P>))
+        .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
+        .layer(middleware::from_fn_with_state(Arc::clone(&state), auth_middleware::<P>));
+
     let protected = Router::new()
         .route("/v1/info", get(route_info::<P>))
         .route("/v1/drawers/search", post(route_drawers_search::<P>))
@@ -400,7 +410,7 @@ where
         .route("/v1/changes", get(route_changes::<P>))
         .layer(middleware::from_fn_with_state(Arc::clone(&state), auth_middleware::<P>));
 
-    Ok(public.merge(protected).with_state(state))
+    Ok(public.merge(protected).merge(ingest_route).with_state(state))
 }
 
 // ─── Auth middleware ──────────────────────────────────────────────────────────
@@ -451,6 +461,7 @@ where
             "kg".to_owned(),
             "changes".to_owned(),
             "taxonomy".to_owned(),
+            "ingest".to_owned(),
         ],
     }))
 }
@@ -1005,12 +1016,430 @@ where
     Ok(Json(ChangesResponse { events, next_cursor }))
 }
 
+// ─── Ingest: batch ───────────────────────────────────────────────────────────
+
+async fn route_ingest_batch<P>(
+    State(state): State<Arc<ServerState<P>>>,
+    auth: axum::extract::Extension<AuthIdentity>,
+    Json(body): Json<IngestBatchRequest>,
+) -> Result<impl IntoResponse, ServerError>
+where
+    P: EmbeddingProvider + Send + Sync + 'static,
+{
+    let identity = auth.0.0;
+
+    // ── Validate wing ──────────────────────────────────────────────────────────
+    let wing = WingId::new(&body.wing)?;
+
+    // ── Diary guard: wing-level ───────────────────────────────────────────────
+    if is_diary_wing_or_room(wing.as_str(), "") {
+        return Err(ServerError::DiaryNotFederated);
+    }
+
+    // ── Request-level validation ──────────────────────────────────────────────
+    if body.files.is_empty() {
+        return Err(ServerError::InvalidParams("files must not be empty".to_owned()));
+    }
+    if body.repo_id.is_empty() {
+        return Err(ServerError::InvalidParams("repo_id must not be empty".to_owned()));
+    }
+
+    // ── Diary guard: any chunk's room ─────────────────────────────────────────
+    for file in &body.files {
+        for chunk in &file.chunks {
+            if is_diary_wing_or_room("", &chunk.room) {
+                return Err(ServerError::DiaryNotFederated);
+            }
+        }
+    }
+
+    // ── Determine added_by ────────────────────────────────────────────────────
+    let added_by = match &body.agent {
+        Some(agent) if agent != &identity => format!("{identity}:{agent}"),
+        _ => identity.clone(),
+    };
+
+    // ── resolve_root for this wing (may be empty) ─────────────────────────────
+    let resolve_root = state
+        .config
+        .server
+        .checkouts
+        .get(wing.as_str())
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    let now = OffsetDateTime::now_utc();
+    let wing_str = wing.as_str().to_owned();
+    let repo_id_hash = hash_text(&body.repo_id);
+
+    let mut file_results: Vec<IngestFileResult> = Vec::with_capacity(body.files.len());
+    let mut files_ingested: usize = 0;
+    let mut files_skipped: usize = 0;
+    let mut files_failed: usize = 0;
+    let mut total_drawers_written: usize = 0;
+    // Track whether we emitted the missing-checkout warning (at most once per request)
+    let mut warned_missing_checkout = false;
+
+    for file in &body.files {
+        let source_key =
+            format!("projects:{wing_str}:{repo_id_hash}:{}", file.relative_path);
+
+        // ── Per-file validation ────────────────────────────────────────────────
+        // relative_path safety: locator resolution joins it onto the server's
+        // checkout root, so traversal or absolute paths would let a token
+        // holder read files outside the checkout.
+        if let Some(err) = invalid_ingest_relative_path(&file.relative_path) {
+            file_results.push(IngestFileResult {
+                relative_path: file.relative_path.clone(),
+                status: "failed".to_owned(),
+                drawers_written: 0,
+                error: Some(err),
+            });
+            files_failed += 1;
+            continue;
+        }
+
+        // Duplicate chunk_index values would collide on the same drawer id and
+        // silently overwrite each other.
+        {
+            let mut seen = std::collections::BTreeSet::new();
+            if let Some(chunk) = file.chunks.iter().find(|c| !seen.insert(c.chunk_index)) {
+                file_results.push(IngestFileResult {
+                    relative_path: file.relative_path.clone(),
+                    status: "failed".to_owned(),
+                    drawers_written: 0,
+                    error: Some(format!("duplicate chunk_index {}", chunk.chunk_index)),
+                });
+                files_failed += 1;
+                continue;
+            }
+        }
+
+        // Validate byte ranges when file_hash is Some
+        if file.file_hash.is_some() {
+            let mut range_error: Option<String> = None;
+            for chunk in &file.chunks {
+                match (chunk.byte_start, chunk.byte_end, chunk.line_start, chunk.line_end) {
+                    (Some(bs), Some(be), Some(_), Some(_)) => {
+                        if be < bs {
+                            range_error = Some(format!(
+                                "chunk {}: byte_end ({}) < byte_start ({})",
+                                chunk.chunk_index, be, bs
+                            ));
+                            break;
+                        }
+                    }
+                    _ => {
+                        range_error = Some(format!(
+                            "chunk {}: file_hash is set but byte/line ranges are missing",
+                            chunk.chunk_index
+                        ));
+                        break;
+                    }
+                }
+            }
+            if let Some(err) = range_error {
+                file_results.push(IngestFileResult {
+                    relative_path: file.relative_path.clone(),
+                    status: "failed".to_owned(),
+                    drawers_written: 0,
+                    error: Some(err),
+                });
+                files_failed += 1;
+                continue;
+            }
+        }
+
+        // Validate empty chunk text
+        if let Some(chunk) = file.chunks.iter().find(|c| c.text.is_empty()) {
+            file_results.push(IngestFileResult {
+                relative_path: file.relative_path.clone(),
+                status: "failed".to_owned(),
+                drawers_written: 0,
+                error: Some(format!("chunk {}: text must not be empty", chunk.chunk_index)),
+            });
+            files_failed += 1;
+            continue;
+        }
+
+        // ── Skip-unchanged check ───────────────────────────────────────────────
+        let existing =
+            state.storage.operational_store().get_ingested_file(&source_key);
+        match existing {
+            Ok(Some(record)) if record.content_hash == file.content_hash => {
+                file_results.push(IngestFileResult {
+                    relative_path: file.relative_path.clone(),
+                    status: "skipped_unchanged".to_owned(),
+                    drawers_written: 0,
+                    error: None,
+                });
+                files_skipped += 1;
+                continue;
+            }
+            Err(err) => {
+                file_results.push(IngestFileResult {
+                    relative_path: file.relative_path.clone(),
+                    status: "failed".to_owned(),
+                    drawers_written: 0,
+                    error: Some(err.to_string()),
+                });
+                files_failed += 1;
+                continue;
+            }
+            _ => {} // not found or hash mismatch — proceed to ingest
+        }
+
+        // ── Validate room ids and build text list for embedding ────────────────
+        let mut chunk_rooms: Vec<RoomId> = Vec::with_capacity(file.chunks.len());
+        let mut room_error: Option<String> = None;
+        for chunk in &file.chunks {
+            match RoomId::new(&chunk.room) {
+                Ok(room) => chunk_rooms.push(room),
+                Err(err) => {
+                    room_error = Some(err.to_string());
+                    break;
+                }
+            }
+        }
+        if let Some(err) = room_error {
+            file_results.push(IngestFileResult {
+                relative_path: file.relative_path.clone(),
+                status: "failed".to_owned(),
+                drawers_written: 0,
+                error: Some(err),
+            });
+            files_failed += 1;
+            continue;
+        }
+
+        // ── Embed chunks ──────────────────────────────────────────────────────
+        let texts: Vec<String> = file.chunks.iter().map(|c| c.text.clone()).collect();
+
+        // Determine batch size
+        let batch_size = if state.config.low_cpu.enabled {
+            state.config.low_cpu.effective_ingest_batch_size()
+        } else {
+            texts.len().max(1) // all at once
+        };
+
+        let mut all_vectors: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
+        let mut embed_error: Option<String> = None;
+
+        for batch in texts.chunks(batch_size.max(1)) {
+            let request = match EmbeddingRequest::new(batch.to_vec()) {
+                Ok(r) => r,
+                Err(err) => {
+                    embed_error = Some(err.to_string());
+                    break;
+                }
+            };
+            let response = {
+                let mut search = state.search.lock().await;
+                search.provider_mut().embed(&request)
+            };
+            match response {
+                Ok(resp) => {
+                    all_vectors.extend_from_slice(resp.vectors());
+                }
+                Err(err) => {
+                    embed_error = Some(err.to_string());
+                    break;
+                }
+            }
+        }
+
+        if let Some(err) = embed_error {
+            file_results.push(IngestFileResult {
+                relative_path: file.relative_path.clone(),
+                status: "failed".to_owned(),
+                drawers_written: 0,
+                error: Some(err),
+            });
+            files_failed += 1;
+            continue;
+        }
+
+        // ── Build DrawerRecords ───────────────────────────────────────────────
+        let mut drawers: Vec<DrawerRecord> = Vec::with_capacity(file.chunks.len());
+        let mut build_error: Option<String> = None;
+        let mut built_locator_row = false;
+
+        for (i, chunk) in file.chunks.iter().enumerate() {
+            let room = chunk_rooms[i].clone();
+            let drawer_id = match mined_drawer_id(&wing, &room, &source_key, chunk.chunk_index) {
+                Ok(id) => id,
+                Err(err) => {
+                    build_error = Some(err.to_string());
+                    break;
+                }
+            };
+
+            let embedding = match all_vectors.get(i) {
+                Some(v) => v.clone(),
+                None => {
+                    build_error = Some(format!(
+                        "chunk {}: no embedding vector returned",
+                        chunk.chunk_index
+                    ));
+                    break;
+                }
+            };
+
+            let (locator, content) = if let Some(file_hash) = &file.file_hash {
+                // Locator path — ranges were validated above to all be Some
+                let bs = chunk.byte_start.unwrap_or(0);
+                let be = chunk.byte_end.unwrap_or(0);
+                let ls = chunk.line_start.unwrap_or(1);
+                let le = chunk.line_end.unwrap_or(1);
+                built_locator_row = true;
+                (
+                    Some(SourceLocator {
+                        byte_start: bs,
+                        byte_end: be,
+                        line_start: ls,
+                        line_end: le,
+                        file_hash: file_hash.clone(),
+                        resolve_root: resolve_root.clone(),
+                        commit_hash: body.commit_hash.clone(),
+                    }),
+                    String::new(),
+                )
+            } else {
+                // Content path — store text verbatim (non-UTF-8 / no-ranges fallback)
+                (None, chunk.text.clone())
+            };
+
+            drawers.push(DrawerRecord {
+                id: drawer_id,
+                wing: wing.clone(),
+                room,
+                hall: None,
+                date: None,
+                source_file: file.relative_path.clone(),
+                chunk_index: chunk.chunk_index,
+                ingest_mode: "projects".to_owned(),
+                extract_mode: None,
+                added_by: added_by.clone(),
+                filed_at: now,
+                importance: None,
+                emotional_weight: None,
+                weight: None,
+                content,
+                content_hash: hash_text(&chunk.text),
+                embedding,
+                locator,
+            });
+        }
+
+        if let Some(err) = build_error {
+            file_results.push(IngestFileResult {
+                relative_path: file.relative_path.clone(),
+                status: "failed".to_owned(),
+                drawers_written: 0,
+                error: Some(err),
+            });
+            files_failed += 1;
+            continue;
+        }
+
+        // Warn once if we built locator rows but have no resolve_root
+        if built_locator_row && resolve_root.is_empty() && !warned_missing_checkout {
+            warned_missing_checkout = true;
+        }
+
+        // ── Commit ────────────────────────────────────────────────────────────
+        let n = drawers.len();
+        match state
+            .storage
+            .replace_source_drawers(
+                "projects",
+                &source_key,
+                &file.relative_path,
+                file.content_hash.clone(),
+                drawers,
+            )
+            .await
+        {
+            Ok(()) => {
+                file_results.push(IngestFileResult {
+                    relative_path: file.relative_path.clone(),
+                    status: "ingested".to_owned(),
+                    drawers_written: n,
+                    error: None,
+                });
+                files_ingested += 1;
+                total_drawers_written += n;
+            }
+            Err(err) => {
+                file_results.push(IngestFileResult {
+                    relative_path: file.relative_path.clone(),
+                    status: "failed".to_owned(),
+                    drawers_written: 0,
+                    error: Some(err.to_string()),
+                });
+                files_failed += 1;
+            }
+        }
+    }
+
+    // ── Warnings ──────────────────────────────────────────────────────────────
+    let mut warnings: Vec<String> = Vec::new();
+    if warned_missing_checkout {
+        warnings.push(format!(
+            "no checkout configured for wing '{wing_str}'; locator results will resolve as \
+             stale placeholders until server.checkouts is set"
+        ));
+    }
+
+    // ── Change event (only when at least one file was ingested) ───────────────
+    if files_ingested > 0 {
+        state.storage.operational_store().append_event(&ChangeEvent {
+            event_type: "mine_batch".to_owned(),
+            occurred_at: now,
+            entity_id: format!("mine_batch:{wing_str}"),
+            actor: Some(identity),
+            details_json: Some(
+                json!({
+                    "repo_id": body.repo_id,
+                    "files_ingested": files_ingested,
+                    "files_skipped": files_skipped,
+                    "files_failed": files_failed,
+                    "drawers_written": total_drawers_written,
+                    "commit_hash": body.commit_hash,
+                })
+                .to_string(),
+            ),
+        })?;
+    }
+
+    Ok(Json(IngestBatchResponse { files: file_results, warnings }))
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 /// Returns `true` when the wing or room identifies diary content that must not
 /// be exposed via the federation API.
 fn is_diary_wing_or_room(wing: &str, room: &str) -> bool {
     wing == SHARED_AGENT_DIARY_WING || room == DIARY_ROOM
+}
+
+/// Returns `Some(error)` when `relative_path` is not a safe repo-relative path
+/// for batch ingest. The path is later joined onto the server's checkout root
+/// during locator resolution, so absolute paths, drive letters, backslashes,
+/// and `..` traversal must all be rejected.
+fn invalid_ingest_relative_path(path: &str) -> Option<String> {
+    if path.is_empty() {
+        return Some("relative_path must not be empty".to_owned());
+    }
+    if path.starts_with('/') || path.contains('\\') || path.contains(':') {
+        return Some(format!(
+            "relative_path `{path}` must be a forward-slash repo-relative path"
+        ));
+    }
+    if path.split('/').any(|segment| segment == "..") {
+        return Some(format!("relative_path `{path}` must not contain `..` segments"));
+    }
+    None
 }
 
 /// Returns `true` when the change event is diary-related and should be
@@ -1781,5 +2210,616 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    // ─── Ingest harness variant ───────────────────────────────────────────────
+
+    /// Builds a harness with a custom checkouts map.
+    async fn make_harness_with_checkouts(
+        checkouts: std::collections::BTreeMap<String, std::path::PathBuf>,
+    ) -> Harness {
+        let tempdir = TempDir::new().unwrap();
+        let palace_path = tempdir.path().join("palace");
+
+        let token_file = tempdir.path().join("tokens.json");
+        std::fs::write(
+            &token_file,
+            serde_json::to_string(&serde_json::json!([
+                {"token": ALICE_TOKEN, "name": "alice", "enabled": true},
+                {"token": BOB_TOKEN, "name": "bob", "enabled": false},
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let config = MempalaceConfig {
+            schema_version: 1,
+            collection_name: "mempalace_drawers".to_owned(),
+            palace_path,
+            embedding_profile: EmbeddingProfile::Balanced,
+            low_cpu: LowCpuRuntimeConfig::defaults_for_profile(EmbeddingProfile::Balanced),
+            server: ServerRuntimeConfig {
+                bind: "127.0.0.1:8765".parse().unwrap(),
+                token_file: tempdir.path().join("tokens.json"),
+                checkouts,
+            },
+            federation: FederationRuntimeConfig::default(),
+        };
+        let tokens = TokenRegistry::load(token_file).unwrap();
+        let provider = DeterministicStubProvider::new(EmbeddingProfile::Balanced);
+        let router = build_router(config, provider, tokens).await.unwrap();
+        Harness { router, _tempdir: tempdir }
+    }
+
+    // ─── 9. Ingest batch ──────────────────────────────────────────────────────
+
+    /// Happy path: 2 files (one with file_hash+ranges, one content-row without)
+    /// → both "ingested", correct drawers_written, search finds them.
+    #[tokio::test]
+    async fn ingest_batch_happy_path_two_files() {
+        let harness = make_harness().await;
+
+        let req = json!({
+            "wing": "wing_project",
+            "repo_id": "github.com/acme/myrepo",
+            "commit_hash": "abc123",
+            "files": [
+                {
+                    // file_hash present → locator rows (will be stale since no checkout)
+                    "relative_path": "src/auth.rs",
+                    "content_hash": "ch-auth-v1",
+                    "file_hash": "fh-auth-v1",
+                    "chunks": [
+                        {
+                            "chunk_index": 0,
+                            "room": "backend",
+                            "text": "authentication logic password hashing",
+                            "byte_start": 0, "byte_end": 37,
+                            "line_start": 1, "line_end": 2
+                        }
+                    ]
+                },
+                {
+                    // no file_hash → content rows
+                    "relative_path": "docs/readme.md",
+                    "content_hash": "ch-readme-v1",
+                    "chunks": [
+                        {
+                            "chunk_index": 0,
+                            "room": "docs",
+                            "text": "project documentation overview guide"
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/ingest/batch",
+                ALICE_TOKEN,
+                req,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+
+        let files = body["files"].as_array().unwrap();
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0]["status"], "ingested");
+        assert_eq!(files[0]["drawers_written"], 1u64);
+        assert_eq!(files[1]["status"], "ingested");
+        assert_eq!(files[1]["drawers_written"], 1u64);
+
+        // Warnings should mention missing checkout since file_hash was set
+        let warnings = body["warnings"].as_array().unwrap();
+        assert!(!warnings.is_empty(), "expected missing-checkout warning");
+        assert!(warnings[0].as_str().unwrap().contains("no checkout configured"));
+
+        // List drawers should show 2 rows in the wing
+        let list_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_get("/v1/drawers?wing=wing_project", ALICE_TOKEN))
+            .await
+            .unwrap();
+        assert_eq!(list_resp.status(), StatusCode::OK);
+        let list_body = body_json(list_resp).await;
+        let drawers = list_body["drawers"].as_array().unwrap();
+        assert_eq!(drawers.len(), 2);
+    }
+
+    /// Idempotent re-push: same request twice → second round is skipped_unchanged.
+    #[tokio::test]
+    async fn ingest_batch_idempotent_repush() {
+        let harness = make_harness().await;
+
+        let req = json!({
+            "wing": "wing_idem",
+            "repo_id": "github.com/acme/repo2",
+            "files": [
+                {
+                    "relative_path": "src/main.rs",
+                    "content_hash": "stable-hash",
+                    "chunks": [
+                        {
+                            "chunk_index": 0, "room": "backend",
+                            "text": "main entry point program"
+                        }
+                    ]
+                }
+            ]
+        });
+
+        // First push
+        let resp1 = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(Method::POST, "/v1/ingest/batch", ALICE_TOKEN, req.clone()))
+            .await
+            .unwrap();
+        assert_eq!(resp1.status(), StatusCode::OK);
+        let body1 = body_json(resp1).await;
+        assert_eq!(body1["files"][0]["status"], "ingested");
+
+        // Second push — same content_hash
+        let resp2 = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(Method::POST, "/v1/ingest/batch", ALICE_TOKEN, req))
+            .await
+            .unwrap();
+        assert_eq!(resp2.status(), StatusCode::OK);
+        let body2 = body_json(resp2).await;
+        assert_eq!(body2["files"][0]["status"], "skipped_unchanged");
+        assert_eq!(body2["files"][0]["drawers_written"], 0u64);
+    }
+
+    /// Changed file: modified content_hash + fewer chunks → "ingested" and dropped
+    /// chunk's drawer is gone.
+    #[tokio::test]
+    async fn ingest_batch_changed_file_drops_old_drawers() {
+        let harness = make_harness().await;
+
+        // Initial: 2 chunks
+        let req_v1 = json!({
+            "wing": "wing_change",
+            "repo_id": "github.com/acme/change-test",
+            "files": [
+                {
+                    "relative_path": "src/lib.rs",
+                    "content_hash": "hash-v1",
+                    "chunks": [
+                        {"chunk_index": 0, "room": "backend",
+                         "text": "library initialization setup configuration"},
+                        {"chunk_index": 1, "room": "backend",
+                         "text": "library helper utilities functions methods"}
+                    ]
+                }
+            ]
+        });
+
+        let r1 = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(Method::POST, "/v1/ingest/batch", ALICE_TOKEN, req_v1))
+            .await
+            .unwrap();
+        assert_eq!(r1.status(), StatusCode::OK);
+        let b1 = body_json(r1).await;
+        assert_eq!(b1["files"][0]["drawers_written"], 2u64);
+
+        // Modified: 1 chunk only, different content_hash
+        let req_v2 = json!({
+            "wing": "wing_change",
+            "repo_id": "github.com/acme/change-test",
+            "files": [
+                {
+                    "relative_path": "src/lib.rs",
+                    "content_hash": "hash-v2",
+                    "chunks": [
+                        {"chunk_index": 0, "room": "backend",
+                         "text": "library initialization setup configuration"}
+                    ]
+                }
+            ]
+        });
+
+        let r2 = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(Method::POST, "/v1/ingest/batch", ALICE_TOKEN, req_v2))
+            .await
+            .unwrap();
+        assert_eq!(r2.status(), StatusCode::OK);
+        let b2 = body_json(r2).await;
+        assert_eq!(b2["files"][0]["status"], "ingested");
+        assert_eq!(b2["files"][0]["drawers_written"], 1u64);
+
+        // Only 1 drawer should remain
+        let list_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_get("/v1/drawers?wing=wing_change", ALICE_TOKEN))
+            .await
+            .unwrap();
+        let list_body = body_json(list_resp).await;
+        let drawers = list_body["drawers"].as_array().unwrap();
+        assert_eq!(drawers.len(), 1, "dropped chunk should be gone");
+    }
+
+    /// Diary wing → 422.
+    #[tokio::test]
+    async fn ingest_batch_diary_wing_rejected() {
+        let harness = make_harness().await;
+        let resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/ingest/batch",
+                ALICE_TOKEN,
+                json!({
+                    "wing": "wing_agents",
+                    "repo_id": "github.com/acme/repo",
+                    "files": [
+                        {
+                            "relative_path": "f.rs",
+                            "content_hash": "ch",
+                            "chunks": [
+                                {"chunk_index": 0, "room": "general", "text": "some text"}
+                            ]
+                        }
+                    ]
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = body_json(resp).await;
+        assert_eq!(body["code"], "diary_not_federated");
+    }
+
+    /// Diary chunk room → 422.
+    #[tokio::test]
+    async fn ingest_batch_diary_chunk_room_rejected() {
+        let harness = make_harness().await;
+        let resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/ingest/batch",
+                ALICE_TOKEN,
+                json!({
+                    "wing": "wing_project",
+                    "repo_id": "github.com/acme/repo",
+                    "files": [
+                        {
+                            "relative_path": "f.rs",
+                            "content_hash": "ch",
+                            "chunks": [
+                                {"chunk_index": 0, "room": "diary", "text": "diary text"}
+                            ]
+                        }
+                    ]
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = body_json(resp).await;
+        assert_eq!(body["code"], "diary_not_federated");
+    }
+
+    /// Empty files array → 400.
+    #[tokio::test]
+    async fn ingest_batch_empty_files_returns_400() {
+        let harness = make_harness().await;
+        let resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/ingest/batch",
+                ALICE_TOKEN,
+                json!({"wing": "wing_x", "repo_id": "github.com/acme/r", "files": []}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Missing token → 401.
+    #[tokio::test]
+    async fn ingest_batch_without_token_returns_401() {
+        let harness = make_harness().await;
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/ingest/batch")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&json!({
+                "wing": "wing_x",
+                "repo_id": "github.com/acme/r",
+                "files": []
+            })).unwrap()))
+            .unwrap();
+        let resp = harness.router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// byte_end < byte_start → file result "failed" (200 with per-file error).
+    #[tokio::test]
+    async fn ingest_batch_invalid_byte_range_fails_file_not_request() {
+        let harness = make_harness().await;
+        let resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/ingest/batch",
+                ALICE_TOKEN,
+                json!({
+                    "wing": "wing_range",
+                    "repo_id": "github.com/acme/repo",
+                    "files": [
+                        {
+                            "relative_path": "src/bad.rs",
+                            "content_hash": "ch-bad",
+                            "file_hash": "fh-bad",
+                            "chunks": [
+                                {
+                                    "chunk_index": 0, "room": "backend",
+                                    "text": "some code here",
+                                    "byte_start": 10, "byte_end": 5,  // invalid: end < start
+                                    "line_start": 1, "line_end": 1
+                                }
+                            ]
+                        }
+                    ]
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "overall request should be 200");
+        let body = body_json(resp).await;
+        let files = body["files"].as_array().unwrap();
+        assert_eq!(files[0]["status"], "failed");
+        assert!(files[0]["error"].as_str().unwrap().contains("byte_end"));
+    }
+
+    /// Checkout-mapped wing: file_hash matches the file's bytes → search result is non-stale.
+    #[tokio::test]
+    async fn ingest_batch_checkout_mapped_resolves_non_stale() {
+        use mempalace_core::hash_bytes;
+        use std::collections::BTreeMap;
+
+        // Write a real file into a tempdir
+        let checkout_dir = TempDir::new().unwrap();
+        let file_content = b"fn authenticate(user: &str, pass: &str) -> bool { true }";
+        let rel_path = "src/auth.rs";
+        std::fs::create_dir_all(checkout_dir.path().join("src")).unwrap();
+        std::fs::write(checkout_dir.path().join(rel_path), file_content).unwrap();
+
+        let file_hash = hash_bytes(file_content);
+        let byte_start: u64 = 0;
+        let byte_end: u64 = file_content.len() as u64;
+
+        let wing = "wing_checkout";
+        let mut checkouts = BTreeMap::new();
+        checkouts.insert(wing.to_owned(), checkout_dir.path().to_path_buf());
+        let harness = make_harness_with_checkouts(checkouts).await;
+
+        let resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/ingest/batch",
+                ALICE_TOKEN,
+                json!({
+                    "wing": wing,
+                    "repo_id": "github.com/acme/checkout-test",
+                    "commit_hash": "deadbeef",
+                    "files": [
+                        {
+                            "relative_path": rel_path,
+                            "content_hash": "ch-auth-checkout",
+                            "file_hash": file_hash,
+                            "chunks": [
+                                {
+                                    "chunk_index": 0,
+                                    "room": "backend",
+                                    "text": std::str::from_utf8(file_content).unwrap(),
+                                    "byte_start": byte_start,
+                                    "byte_end": byte_end,
+                                    "line_start": 1,
+                                    "line_end": 1
+                                }
+                            ]
+                        }
+                    ]
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["files"][0]["status"], "ingested");
+        // No missing-checkout warning
+        assert!(body["warnings"].as_array().unwrap().is_empty(), "should have no warnings");
+
+        // Search should find the drawer and it should NOT be stale
+        let search_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/drawers/search",
+                ALICE_TOKEN,
+                json!({"query": "authenticate user password", "limit": 5}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(search_resp.status(), StatusCode::OK);
+        let search_body = body_json(search_resp).await;
+        let results = search_body["results"].as_array().unwrap();
+        assert!(!results.is_empty(), "search should find the ingested drawer");
+        // stale field absent or false means not stale
+        let stale = results[0].get("stale").and_then(|v| v.as_bool()).unwrap_or(false);
+        assert!(!stale, "locator should resolve non-stale with matching file hash");
+    }
+
+    /// Unmapped wing: locator rows with empty resolve_root → search returns stale.
+    #[tokio::test]
+    async fn ingest_batch_unmapped_wing_produces_stale_and_warning() {
+        // No checkouts configured — use default harness
+        let harness = make_harness().await;
+
+        let resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/ingest/batch",
+                ALICE_TOKEN,
+                json!({
+                    "wing": "wing_unmapped",
+                    "repo_id": "github.com/acme/unmapped",
+                    "files": [
+                        {
+                            "relative_path": "src/stale.rs",
+                            "content_hash": "ch-stale",
+                            "file_hash": "some-file-hash-that-wont-match",
+                            "chunks": [
+                                {
+                                    "chunk_index": 0,
+                                    "room": "backend",
+                                    "text": "stale locator row from unmapped wing",
+                                    "byte_start": 0, "byte_end": 36,
+                                    "line_start": 1, "line_end": 1
+                                }
+                            ]
+                        }
+                    ]
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["files"][0]["status"], "ingested");
+
+        let warnings = body["warnings"].as_array().unwrap();
+        assert!(!warnings.is_empty(), "should warn about missing checkout");
+        assert!(warnings[0].as_str().unwrap().contains("wing_unmapped"));
+
+        // Search should find it but stale=true
+        let search_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/drawers/search",
+                ALICE_TOKEN,
+                json!({"query": "stale locator row unmapped", "limit": 5}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(search_resp.status(), StatusCode::OK);
+        let search_body = body_json(search_resp).await;
+        let results = search_body["results"].as_array().unwrap();
+        assert!(!results.is_empty(), "search must find the drawer");
+        let stale = results[0].get("stale").and_then(|v| v.as_bool()).unwrap_or(false);
+        assert!(stale, "result from unmapped wing must be stale=true");
+    }
+
+    /// Path traversal / absolute / backslash relative_path → per-file "failed".
+    #[tokio::test]
+    async fn ingest_batch_rejects_unsafe_relative_paths() {
+        let harness = make_harness().await;
+        let resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/ingest/batch",
+                ALICE_TOKEN,
+                json!({
+                    "wing": "wing_paths",
+                    "repo_id": "github.com/acme/paths",
+                    "files": [
+                        {"relative_path": "../../etc/passwd", "content_hash": "c1",
+                         "chunks": [{"chunk_index": 0, "room": "general", "text": "x y z"}]},
+                        {"relative_path": "/abs/path.rs", "content_hash": "c2",
+                         "chunks": [{"chunk_index": 0, "room": "general", "text": "x y z"}]},
+                        {"relative_path": "src\\win.rs", "content_hash": "c3",
+                         "chunks": [{"chunk_index": 0, "room": "general", "text": "x y z"}]},
+                        {"relative_path": "src/ok.rs", "content_hash": "c4",
+                         "chunks": [{"chunk_index": 0, "room": "general",
+                                     "text": "perfectly safe path content"}]}
+                    ]
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let files = body["files"].as_array().unwrap();
+        assert_eq!(files[0]["status"], "failed");
+        assert_eq!(files[1]["status"], "failed");
+        assert_eq!(files[2]["status"], "failed");
+        assert_eq!(files[3]["status"], "ingested", "safe path must still ingest");
+    }
+
+    /// Duplicate chunk_index within one file → per-file "failed".
+    #[tokio::test]
+    async fn ingest_batch_rejects_duplicate_chunk_index() {
+        let harness = make_harness().await;
+        let resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/ingest/batch",
+                ALICE_TOKEN,
+                json!({
+                    "wing": "wing_dup",
+                    "repo_id": "github.com/acme/dup",
+                    "files": [
+                        {"relative_path": "src/dup.rs", "content_hash": "c1",
+                         "chunks": [
+                            {"chunk_index": 0, "room": "general", "text": "first chunk text"},
+                            {"chunk_index": 0, "room": "general", "text": "second chunk text"}
+                         ]}
+                    ]
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["files"][0]["status"], "failed");
+        assert!(body["files"][0]["error"].as_str().unwrap().contains("duplicate chunk_index"));
+    }
+
+    /// info endpoint now includes "ingest" capability.
+    #[tokio::test]
+    async fn info_includes_ingest_capability() {
+        let harness = make_harness().await;
+        let resp = harness.router.oneshot(authed_get("/v1/info", ALICE_TOKEN)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let caps = body["capabilities"].as_array().unwrap();
+        let cap_strings: Vec<&str> =
+            caps.iter().filter_map(|v| v.as_str()).collect();
+        assert!(cap_strings.contains(&"ingest"), "capabilities must include 'ingest'");
     }
 }

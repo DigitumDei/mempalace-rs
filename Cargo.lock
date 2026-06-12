@@ -3967,6 +3967,7 @@ dependencies = [
  "mempalace-config",
  "mempalace-core",
  "mempalace-embeddings",
+ "mempalace-federation",
  "mempalace-storage",
  "serde_json",
  "tempfile",

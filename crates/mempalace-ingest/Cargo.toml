@@ -9,6 +9,7 @@ rust-version.workspace = true
 mempalace-core = { path = "../mempalace-core" }
 mempalace-config = { path = "../mempalace-config" }
 mempalace-embeddings = { path = "../mempalace-embeddings" }
+mempalace-federation = { path = "../mempalace-federation" }
 mempalace-storage = { path = "../mempalace-storage" }
 serde_json.workspace = true
 thiserror.workspace = true

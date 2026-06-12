@@ -538,6 +538,7 @@ where
                         .low_cpu
                         .enabled
                         .then_some(config.low_cpu.effective_ingest_batch_size()),
+                    branch: false,
                 },
             ))
             .map_err(ingest_error)?,

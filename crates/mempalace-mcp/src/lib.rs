@@ -1794,12 +1794,25 @@ where
                 }
             }
 
-            // Sort combined events by occurred_at ascending (RFC 3339 is
-            // lexicographically comparable; best-effort display order only).
-            all_events.sort_by(|a, b| {
-                let ta = a["occurred_at"].as_str().unwrap_or("");
-                let tb = b["occurred_at"].as_str().unwrap_or("");
-                ta.cmp(tb)
+            // Sort combined events by occurred_at ascending (best-effort
+            // display order only — cross-machine clocks may skew). Parse the
+            // timestamps so differing UTC offsets or subsecond precision
+            // across remotes still compare chronologically; unparseable
+            // timestamps sort last, by raw string among themselves.
+            let parse_occurred_at = |event: &Value| {
+                event["occurred_at"]
+                    .as_str()
+                    .and_then(|s| OffsetDateTime::parse(s, &Rfc3339).ok())
+            };
+            all_events.sort_by(|a, b| match (parse_occurred_at(a), parse_occurred_at(b)) {
+                (Some(ta), Some(tb)) => ta.cmp(&tb),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => {
+                    let sa = a["occurred_at"].as_str().unwrap_or("");
+                    let sb = b["occurred_at"].as_str().unwrap_or("");
+                    sa.cmp(sb)
+                }
             });
 
             let count = all_events.len();

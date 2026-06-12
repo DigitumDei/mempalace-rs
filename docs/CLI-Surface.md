@@ -37,11 +37,14 @@ Flags:
 - `--limit <N>` default: `0`, meaning no explicit limit
 - `--dry-run`
 - `--extract <exchange|general>` default: `exchange`
+- `--reindex`
+  Re-process files that were previously ingested and are unchanged on disk by bypassing the unchanged-content skip. In `projects` mode this converts existing content rows to locator rows — use it as the one-time migration step after upgrading a palace from pre-locator storage.
 
 Behavior:
 - `projects` uses the project ingest path.
 - `convos` uses the conversation ingest path.
 - In low-CPU mode, ingest batching is clamped by the resolved low-CPU runtime config.
+- `--reindex` bypasses the unchanged-content skip in both `projects` and `convos` modes.
 
 ### `search <query>`
 

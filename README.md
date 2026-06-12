@@ -29,6 +29,7 @@ MemPalace provides a palace-style memory store with:
 - An AAAK dialect for compact, human-readable memory storage
 - An MCP server (`mempalace-mcp`) for agent integration (19 tools)
 - A CLI (`mempalace-cli`) for direct palace management
+- Locator-based mined storage: project file chunks store byte/line ranges instead of duplicated text; snippets are resolved lazily from the checkout at read time with stale detection
 
 ## Crates
 
@@ -61,6 +62,7 @@ MemPalace provides a palace-style memory store with:
 - [CLI surface](docs/CLI-Surface.md) — all commands
 - [Config schema](docs/Config-Schema.md) — `~/.mempalace/config.json`
 - [Low-CPU mode](docs/Operator-Low-CPU.md) — constrained environments
+- [Mined storage](docs/Mined-Storage.md) — locator model, stale semantics, discovery rules
 - [Hook setup](hooks/README.md) — auto-save for Claude Code
 
 ## License

@@ -3,6 +3,7 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::Read as _;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
@@ -30,8 +31,29 @@ const CONVO_MIN_CHUNK_SIZE: usize = 30;
 const LARGE_FILE_TRUNCATION_BYTES: usize = 200_000;
 
 const PROJECT_READABLE_EXTENSIONS: &[&str] = &[
-    ".txt", ".md", ".py", ".js", ".ts", ".jsx", ".tsx", ".json", ".yaml", ".yml", ".html", ".css",
-    ".java", ".go", ".rs", ".rb", ".sh", ".csv", ".sql", ".toml",
+    // Text / markup
+    ".txt", ".md", ".html", ".xml", ".csv", ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg",
+    ".conf", ".properties",
+    // Web / frontend
+    ".js", ".ts", ".jsx", ".tsx", ".css", ".vue", ".svelte", ".astro",
+    // Systems languages
+    ".rs", ".c", ".h", ".cc", ".cpp", ".cxx", ".hh", ".hpp", ".m", ".mm", ".zig", ".nim",
+    // JVM / Android
+    ".java", ".kt", ".kts", ".scala", ".sbt", ".groovy", ".gradle",
+    // .NET
+    ".cs", ".fs", ".fsi", ".fsx",
+    // Scripting / dynamic
+    ".py", ".rb", ".php", ".lua", ".pl", ".pm", ".r", ".jl", ".dart",
+    // Shell
+    ".sh", ".bash", ".zsh", ".fish", ".ps1", ".psm1", ".psd1", ".bat", ".cmd",
+    // Functional / BEAM
+    ".ex", ".exs", ".erl", ".hrl", ".clj", ".cljc", ".cljs", ".edn",
+    // Mobile / other
+    ".swift", ".go",
+    // SQL / data
+    ".sql",
+    // IaC / config
+    ".tf", ".tfvars", ".hcl", ".proto", ".graphql", ".gql", ".dockerfile",
 ];
 const CONVO_EXTENSIONS: &[&str] = &[".txt", ".md", ".json", ".jsonl"];
 const DEFAULT_SKIP_DIRS: &[&str] = &[
@@ -47,14 +69,32 @@ const DEFAULT_SKIP_DIRS: &[&str] = &[
     "coverage",
     ".mempalace",
 ];
+/// Exact file names (case-sensitive) that are always skipped in project discovery.
+/// Also see: `.env`-prefix skip in `project_file_skip_by_name`.
 const PROJECT_SKIP_FILES: &[&str] = &[
     "mempalace.yaml",
     "mempalace.yml",
     "mempal.yaml",
     "mempal.yml",
     ".gitignore",
+    // Lockfiles
     "package-lock.json",
+    "Cargo.lock",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "poetry.lock",
+    "composer.lock",
+    "Gemfile.lock",
 ];
+
+/// Extensionless file names (case-sensitive) that are always included in project discovery.
+const PROJECT_READABLE_BASENAMES: &[&str] =
+    &["Dockerfile", "Makefile", "Rakefile", "Gemfile", "Jenkinsfile", "Vagrantfile"];
+
+/// Binary-sniff prefix size: if any of the first N bytes is NUL (0x00) → binary.
+const BINARY_SNIFF_BYTES: usize = 8192;
+/// Shebang-check prefix size for extensionless files.
+const SHEBANG_READ_BYTES: usize = 256;
 
 const TOPIC_KEYWORDS: &[(&str, &[&str])] = &[
     (
@@ -865,12 +905,75 @@ async fn replace_source_drawers(
     Ok(())
 }
 
+/// Returns `true` if `file_name` should be skipped for secrets / lockfile hygiene.
+///
+/// Handles exact matches from `PROJECT_SKIP_FILES` and the `.env`-prefix rule
+/// (`.env`, `.env.local`, `.env.production`, etc.).
+fn project_file_skip_by_name(file_name: &str) -> bool {
+    if PROJECT_SKIP_FILES.contains(&file_name) {
+        return true;
+    }
+    // Skip any file whose name starts with ".env" (covers .env, .env.local, …)
+    if file_name.starts_with(".env") {
+        return true;
+    }
+    false
+}
+
+/// Read up to `limit` bytes from `path`.  Returns `None` on any I/O error.
+fn read_prefix(path: &Path, limit: usize) -> Option<Vec<u8>> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut buf = vec![0u8; limit];
+    let n = file.read(&mut buf).ok()?;
+    buf.truncate(n);
+    Some(buf)
+}
+
+/// Returns `true` if the file looks like binary (NUL byte in the first `BINARY_SNIFF_BYTES`).
+/// I/O error → `false` (treat as text; the subsequent read_text_document call will handle it).
+fn looks_binary(path: &Path) -> bool {
+    read_prefix(path, BINARY_SNIFF_BYTES)
+        .map(|buf| buf.contains(&0u8))
+        .unwrap_or(false)
+}
+
+/// For an extensionless file that is NOT in the basename allowlist: returns `true` if the
+/// first bytes start with `#!`.  I/O error → `false`.
+fn has_shebang(path: &Path) -> bool {
+    read_prefix(path, SHEBANG_READ_BYTES)
+        .map(|buf| buf.starts_with(b"#!"))
+        .unwrap_or(false)
+}
+
 fn discover_project_files(root: &Path) -> Result<DiscoveryReport> {
-    discover_files(root, PROJECT_READABLE_EXTENSIONS, true)
+    let extension_set = PROJECT_READABLE_EXTENSIONS.iter().copied().collect::<BTreeSet<_>>();
+    discover_files(root, |path, file_name| {
+        // Secrets / lockfile hygiene (includes the .env prefix rule).
+        if project_file_skip_by_name(file_name) {
+            return false;
+        }
+
+        let raw_ext = path.extension().and_then(|value| value.to_str()).unwrap_or_default();
+        let has_ext = !raw_ext.is_empty();
+        let normalized_suffix = format!(".{}", raw_ext.to_ascii_lowercase());
+
+        let accepted = (has_ext && extension_set.contains(normalized_suffix.as_str()))
+            || (!has_ext
+                && (PROJECT_READABLE_BASENAMES.contains(&file_name) || has_shebang(path)));
+
+        // Binary sniff: exclude files with a NUL byte in the first 8 KiB even
+        // when the extension claims text (misnamed binaries).
+        accepted && !looks_binary(path)
+    })
 }
 
 fn discover_conversation_files(root: &Path) -> Result<DiscoveryReport> {
-    discover_files(root, CONVO_EXTENSIONS, false)
+    let extension_set = CONVO_EXTENSIONS.iter().copied().collect::<BTreeSet<_>>();
+    discover_files(root, move |path, _file_name| {
+        let suffix = path.extension().and_then(|value| value.to_str()).unwrap_or_default();
+        let normalized_suffix = format!(".{}", suffix.to_ascii_lowercase());
+        extension_set.contains(normalized_suffix.as_str())
+    })
 }
 
 fn apply_limit(
@@ -889,13 +992,14 @@ struct DiscoveryReport {
     ignored_files: usize,
 }
 
+/// Walk `root` applying ignore rules, accepting files for which `accept_file`
+/// returns `true`. The closure receives the absolute path and the (lossy) file
+/// name; everything it rejects counts toward `ignored_files`.
 fn discover_files(
     root: &Path,
-    extensions: &[&str],
-    skip_project_config: bool,
+    accept_file: impl Fn(&Path, &str) -> bool,
 ) -> Result<DiscoveryReport> {
     let ignore_matcher = IgnoreMatcher::load(root)?;
-    let extension_set = extensions.iter().copied().collect::<BTreeSet<_>>();
     let mut ignored_files = 0;
     let mut files = Vec::new();
     let mut stack = vec![root.to_path_buf()];
@@ -925,14 +1029,7 @@ fn discover_files(
             }
 
             let file_name = path.file_name().and_then(|value| value.to_str()).unwrap_or_default();
-            if skip_project_config && PROJECT_SKIP_FILES.contains(&file_name) {
-                ignored_files += 1;
-                continue;
-            }
-
-            let suffix = path.extension().and_then(|value| value.to_str()).unwrap_or_default();
-            let normalized_suffix = format!(".{}", suffix.to_ascii_lowercase());
-            if !extension_set.contains(normalized_suffix.as_str()) {
+            if !accept_file(&path, file_name) {
                 ignored_files += 1;
                 continue;
             }
@@ -3216,5 +3313,118 @@ mod tests {
         .unwrap();
         assert_eq!(third.skipped_unchanged, 0, "reindex=true: nothing should be skipped");
         assert!(third.ingested_files >= 1, "reindex=true: files must be re-ingested");
+    }
+
+    // ── Stage-4 discovery broadening tests ────────────────────────────────────
+
+    /// New-extension files (e.g. .cs, .vue, .tf) are discovered.
+    #[test]
+    fn discovers_new_extension_files() {
+        let tempdir = tempdir().unwrap();
+        fs::write(tempdir.path().join("main.cs"), "class Program {}").unwrap();
+        fs::write(tempdir.path().join("app.vue"), "<template/>").unwrap();
+        fs::write(tempdir.path().join("deploy.tf"), "resource \"aws_s3_bucket\" \"b\" {}").unwrap();
+        // Also a file with no known extension — should be ignored.
+        fs::write(tempdir.path().join("random.xyz"), "irrelevant").unwrap();
+
+        let report = discover_project_files(tempdir.path()).unwrap();
+        let names: Vec<_> = report.files.iter().map(|f| f.relative_path.as_str()).collect();
+        assert!(names.contains(&"app.vue"), "app.vue not found: {names:?}");
+        assert!(names.contains(&"deploy.tf"), "deploy.tf not found: {names:?}");
+        assert!(names.contains(&"main.cs"), "main.cs not found: {names:?}");
+        assert!(!names.contains(&"random.xyz"), "random.xyz should be ignored: {names:?}");
+        assert!(report.ignored_files >= 1);
+    }
+
+    /// Dockerfile and Makefile (no extension) are discovered via the basename allowlist.
+    #[test]
+    fn discovers_extensionless_basenames() {
+        let tempdir = tempdir().unwrap();
+        fs::write(tempdir.path().join("Dockerfile"), "FROM ubuntu:22.04").unwrap();
+        fs::write(tempdir.path().join("Makefile"), "all:\n\techo done").unwrap();
+        // A random extensionless file should NOT be discovered.
+        fs::write(tempdir.path().join("notes"), "just notes").unwrap();
+
+        let report = discover_project_files(tempdir.path()).unwrap();
+        let names: Vec<_> = report.files.iter().map(|f| f.relative_path.as_str()).collect();
+        assert!(names.contains(&"Dockerfile"), "Dockerfile not found: {names:?}");
+        assert!(names.contains(&"Makefile"), "Makefile not found: {names:?}");
+        assert!(!names.contains(&"notes"), "notes should be ignored: {names:?}");
+    }
+
+    /// An extensionless file with a shebang line is discovered; one without is not.
+    #[test]
+    fn shebang_detection_for_extensionless_files() {
+        let tempdir = tempdir().unwrap();
+        fs::write(tempdir.path().join("build"), "#!/usr/bin/env bash\necho hi").unwrap();
+        fs::write(tempdir.path().join("noshebang"), "just plain text with no shebang").unwrap();
+
+        let report = discover_project_files(tempdir.path()).unwrap();
+        let names: Vec<_> = report.files.iter().map(|f| f.relative_path.as_str()).collect();
+        assert!(names.contains(&"build"), "shebang file 'build' not found: {names:?}");
+        assert!(!names.contains(&"noshebang"), "noshebang should be ignored: {names:?}");
+    }
+
+    /// A file with an allowlisted extension that contains a NUL byte is treated as binary
+    /// and excluded; the ignored_files counter is incremented.
+    #[test]
+    fn binary_sniff_excludes_nul_byte_files() {
+        let tempdir = tempdir().unwrap();
+        // Build a .h file that contains a NUL byte within the first 8 KiB.
+        let mut binary_h = b"// header\n".to_vec();
+        binary_h.extend(vec![0u8; 100]); // NUL bytes
+        binary_h.extend(b"// rest of header\n");
+        // Pad to ensure it's > 100 bytes so it's unambiguously "binary" not empty.
+        binary_h.extend(vec![b'x'; 7900]);
+        fs::write(tempdir.path().join("data.h"), &binary_h).unwrap();
+        // Also write a clean .h for comparison.
+        fs::write(tempdir.path().join("clean.h"), "// clean header\nvoid foo();\n").unwrap();
+
+        let report = discover_project_files(tempdir.path()).unwrap();
+        let names: Vec<_> = report.files.iter().map(|f| f.relative_path.as_str()).collect();
+        assert!(!names.contains(&"data.h"), "binary data.h must be excluded: {names:?}");
+        assert!(names.contains(&"clean.h"), "clean.h must be included: {names:?}");
+        // ignored_files must include the binary file.
+        assert!(report.ignored_files >= 1, "ignored_files should be >= 1, got {}", report.ignored_files);
+    }
+
+    /// .env and .env.local are never discovered — even if they start with #!.
+    #[test]
+    fn env_files_always_skipped() {
+        let tempdir = tempdir().unwrap();
+        fs::write(tempdir.path().join(".env"), "SECRET=abc\n").unwrap();
+        fs::write(tempdir.path().join(".env.local"), "SECRET=local\n").unwrap();
+        fs::write(tempdir.path().join(".env.production"), "#!/bin/sh\nSECRET=prod\n").unwrap();
+
+        let report = discover_project_files(tempdir.path()).unwrap();
+        let names: Vec<_> = report.files.iter().map(|f| f.relative_path.as_str()).collect();
+        assert!(!names.contains(&".env"), ".env must be skipped: {names:?}");
+        assert!(!names.contains(&".env.local"), ".env.local must be skipped: {names:?}");
+        assert!(!names.contains(&".env.production"), ".env.production must be skipped: {names:?}");
+        assert_eq!(report.files.len(), 0, "no files should be discovered: {names:?}");
+    }
+
+    /// Cargo.lock and yarn.lock are skipped.
+    #[test]
+    fn lockfiles_are_skipped() {
+        let tempdir = tempdir().unwrap();
+        fs::write(tempdir.path().join("Cargo.lock"), "[package]\nname = \"foo\"\n").unwrap();
+        fs::write(tempdir.path().join("yarn.lock"), "# yarn lockfile v1\n").unwrap();
+        fs::write(tempdir.path().join("pnpm-lock.yaml"), "lockfileVersion: 5\n").unwrap();
+        fs::write(tempdir.path().join("poetry.lock"), "[[package]]\nname = \"foo\"\n").unwrap();
+        fs::write(tempdir.path().join("composer.lock"), "{}").unwrap();
+        fs::write(tempdir.path().join("Gemfile.lock"), "GEM\n").unwrap();
+        // A regular file that should still be found.
+        fs::write(tempdir.path().join("main.rs"), "fn main() {}\n").unwrap();
+
+        let report = discover_project_files(tempdir.path()).unwrap();
+        let names: Vec<_> = report.files.iter().map(|f| f.relative_path.as_str()).collect();
+        assert!(!names.contains(&"Cargo.lock"), "Cargo.lock must be skipped");
+        assert!(!names.contains(&"yarn.lock"), "yarn.lock must be skipped");
+        assert!(!names.contains(&"pnpm-lock.yaml"), "pnpm-lock.yaml must be skipped");
+        assert!(!names.contains(&"poetry.lock"), "poetry.lock must be skipped");
+        assert!(!names.contains(&"composer.lock"), "composer.lock must be skipped");
+        assert!(!names.contains(&"Gemfile.lock"), "Gemfile.lock must be skipped");
+        assert!(names.contains(&"main.rs"), "main.rs must be discovered: {names:?}");
     }
 }

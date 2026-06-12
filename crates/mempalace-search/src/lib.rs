@@ -11,7 +11,7 @@ pub use mempalace_dialect as dialect;
 pub use mempalace_embeddings as embeddings;
 pub use mempalace_storage as storage;
 
-use mempalace_core::{DrawerRecord, SearchQuery, SearchResult};
+use mempalace_core::{DrawerRecord, SearchQuery, SearchResult, resolve_records};
 use mempalace_dialect::{Dialect, WakeUpAaaKConfig};
 use mempalace_embeddings::{EmbeddingProvider, EmbeddingRequest};
 use mempalace_storage::{DrawerFilter, DrawerMatch, DrawerStore, SearchRequest};
@@ -225,7 +225,7 @@ where
         };
         let candidate_limit =
             if rerank_enabled { query.limit.saturating_mul(2) } else { query.limit };
-        let matches = store
+        let mut matches = store
             .search_drawers(&SearchRequest {
                 embedding: query_embedding,
                 limit: candidate_limit,
@@ -234,10 +234,20 @@ where
             })
             .await?;
 
+        // Resolve locator-backed records in place BEFORE ranking so that
+        // rerank's lexical_overlap_score operates on real text.
+        let mut records: Vec<DrawerRecord> =
+            matches.iter().map(|m| m.record.clone()).collect();
+        let stale_flags = resolve_records(&mut records);
+        // Write resolved content back into the matches.
+        for (m, resolved) in matches.iter_mut().zip(records.into_iter()) {
+            m.record.content = resolved.content;
+        }
+
         let ranked = if rerank_enabled {
-            rerank_matches(&query.text, matches, query.limit)
+            rerank_matches(&query.text, matches, stale_flags, query.limit)
         } else {
-            rank_matches(matches, query.limit)
+            rank_matches(matches, stale_flags, query.limit)
         };
 
         Ok(ranked
@@ -249,6 +259,7 @@ where
                 score: entry.score,
                 content: entry.record.content.clone(),
                 source_file: source_label(&entry.record.source_file).to_owned(),
+                stale: entry.stale,
             })
             .collect())
     }
@@ -273,6 +284,8 @@ where
             })
             .await?;
 
+        // Resolve locator-backed records before rendering so snippets show real text.
+        resolve_records(&mut drawers);
         order_layer_drawers(&mut drawers);
 
         if drawers.is_empty() {
@@ -474,16 +487,22 @@ async fn list_layer_drawers<S>(
 where
     S: DrawerStore,
 {
-    Ok(store.list_drawers(&DrawerFilter { wing, ..DrawerFilter::default() }).await?)
+    let mut drawers =
+        store.list_drawers(&DrawerFilter { wing, ..DrawerFilter::default() }).await?;
+    // Resolve locator-backed records so wake_up/AAaK rendering sees real text.
+    resolve_records(&mut drawers);
+    Ok(drawers)
 }
 
-fn rank_matches(matches: Vec<DrawerMatch>, limit: usize) -> Vec<RankedMatch> {
+fn rank_matches(matches: Vec<DrawerMatch>, stale_flags: Vec<bool>, limit: usize) -> Vec<RankedMatch> {
     let mut ranked = matches
         .into_iter()
-        .map(|matched| RankedMatch {
+        .zip(stale_flags)
+        .map(|(matched, stale)| RankedMatch {
             score: normalize_score(matched.distance),
             distance: matched.distance,
             record: matched.record,
+            stale,
         })
         .collect::<Vec<_>>();
 
@@ -492,17 +511,20 @@ fn rank_matches(matches: Vec<DrawerMatch>, limit: usize) -> Vec<RankedMatch> {
     ranked
 }
 
-fn rerank_matches(query: &str, matches: Vec<DrawerMatch>, limit: usize) -> Vec<RankedMatch> {
+fn rerank_matches(query: &str, matches: Vec<DrawerMatch>, stale_flags: Vec<bool>, limit: usize) -> Vec<RankedMatch> {
     let query_terms = normalized_terms(query);
     let mut ranked = matches
         .into_iter()
-        .map(|matched| {
+        .zip(stale_flags)
+        .map(|(matched, stale)| {
             let base_score = normalize_score(matched.distance);
+            // lexical overlap uses record.content which has been resolved in place
             let lexical_score = lexical_overlap_score(&query_terms, &matched.record.content);
             RankedMatch {
                 score: (base_score * 0.7) + (lexical_score * 0.3),
                 distance: matched.distance,
                 record: matched.record,
+                stale,
             }
         })
         .collect::<Vec<_>>();
@@ -626,6 +648,7 @@ struct RankedMatch {
     score: f32,
     distance: Option<f32>,
     record: DrawerRecord,
+    stale: bool,
 }
 
 #[cfg(test)]
@@ -1320,6 +1343,7 @@ mod tests {
                     content: "The team decided the auth-migration must preserve CLI and MCP parity."
                         .to_owned(),
                     source_file: "team.txt".to_owned(),
+                    stale: false,
                 },
                 mempalace_core::SearchResult {
                     drawer_id: None,
@@ -1329,6 +1353,7 @@ mod tests {
                     content: "Code notes: auth-migration keeps search filter semantics exact while storage changes underneath."
                         .to_owned(),
                     source_file: "code.txt".to_owned(),
+                    stale: false,
                 },
             ],
             None,
@@ -2004,6 +2029,203 @@ mod tests {
             (lexical_overlap_score(&normalized_terms("日本語 café"), "日本語 café notes") - 1.0)
                 .abs()
                 < 1e-6
+        );
+    }
+
+    // ─── Locator-backed stale resolution tests ────────────────────────────────
+
+    use mempalace_core::locator::SourceLocator;
+    use serde_json::json as sjson;
+
+    fn make_locator_record(
+        id: &str,
+        wing: &str,
+        room: &str,
+        source_file: &str,
+        resolve_root: &str,
+        file_hash: &str,
+        byte_start: u64,
+        byte_end: u64,
+        score: Option<f32>,
+    ) -> DrawerRecord {
+        DrawerRecord {
+            id: DrawerId::new(id).unwrap(),
+            wing: WingId::new(wing).unwrap(),
+            room: RoomId::new(room).unwrap(),
+            hall: None,
+            date: None,
+            source_file: source_file.to_owned(),
+            chunk_index: 0,
+            ingest_mode: "projects".to_owned(),
+            extract_mode: None,
+            added_by: "tester".to_owned(),
+            filed_at: datetime!(2026-01-01 00:00:00 UTC),
+            importance: score,
+            emotional_weight: None,
+            weight: None,
+            content: String::new(), // locator rows start with empty content
+            content_hash: "hash".to_owned(),
+            embedding: embedding(score.unwrap_or(0.0)),
+            locator: Some(SourceLocator {
+                byte_start,
+                byte_end,
+                line_start: 1,
+                line_end: 1,
+                file_hash: file_hash.to_owned(),
+                resolve_root: resolve_root.to_owned(),
+                commit_hash: None,
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn search_resolves_locator_backed_records_non_stale() {
+        use std::io::Write as _;
+        use tempfile::NamedTempFile;
+
+        // Write a real file on disk.
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(b"hello world locator text").unwrap();
+        let path = file.path();
+        let root = path.parent().unwrap().to_str().unwrap().to_owned();
+        let filename = path.file_name().unwrap().to_str().unwrap().to_owned();
+        let file_hash = mempalace_core::hash_bytes(b"hello world locator text");
+
+        // Locator-backed record + authored record.
+        let locator_record = make_locator_record(
+            "wing_test/code/0001",
+            "wing_test",
+            "code",
+            &filename,
+            &root,
+            &file_hash,
+            0,
+            5, // "hello"
+            Some(0.0),
+        );
+        let authored_record = record(
+            "wing_test/notes/0001",
+            "wing_test",
+            "notes",
+            "notes.txt",
+            "authored note content",
+            Some(0.01),
+            datetime!(2026-04-11 09:00:00 UTC),
+        );
+
+        let store = StubStore { drawers: vec![locator_record, authored_record] };
+        let mut runtime = SearchRuntime::new(StubProvider { response: vec![embedding(0.0)] });
+        let query = SearchQuery {
+            text: "hello".to_owned(),
+            wing: None,
+            room: None,
+            limit: 5,
+            profile: EmbeddingProfile::Balanced,
+        };
+
+        let results = runtime.search(&store, &query).await.unwrap();
+
+        // Locator-backed result must have resolved text.
+        let locator_result = results.iter().find(|r| r.room.as_str() == "code").unwrap();
+        assert_eq!(locator_result.content, "hello", "locator resolved text should be 'hello'");
+        assert!(!locator_result.stale, "fresh locator row must not be stale");
+
+        // Authored result unchanged.
+        let authored_result = results.iter().find(|r| r.room.as_str() == "notes").unwrap();
+        assert_eq!(authored_result.content, "authored note content");
+        assert!(!authored_result.stale);
+
+        // Stale must be absent from JSON for non-stale result.
+        let authored_json = serde_json::to_value(authored_result).unwrap();
+        assert!(
+            authored_json.as_object().unwrap().get("stale").is_none(),
+            "stale must be absent when false"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_marks_stale_when_source_file_modified() {
+        use std::io::Write as _;
+        use tempfile::NamedTempFile;
+
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(b"original content").unwrap();
+        let path = file.path();
+        let root = path.parent().unwrap().to_str().unwrap().to_owned();
+        let filename = path.file_name().unwrap().to_str().unwrap().to_owned();
+        // Use wrong hash to simulate modified file.
+        let stale_record = make_locator_record(
+            "wing_test/code/0001",
+            "wing_test",
+            "code",
+            &filename,
+            &root,
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+            0,
+            8, // "original"
+            Some(0.0),
+        );
+
+        let store = StubStore { drawers: vec![stale_record] };
+        let mut runtime = SearchRuntime::new(StubProvider { response: vec![embedding(0.0)] });
+        let query = SearchQuery {
+            text: "original".to_owned(),
+            wing: None,
+            room: None,
+            limit: 5,
+            profile: EmbeddingProfile::Balanced,
+        };
+
+        let results = runtime.search(&store, &query).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].stale, "stale flag must be set when file hash mismatches");
+        // Serialized JSON must contain the stale key.
+        let json = serde_json::to_value(&results[0]).unwrap();
+        assert_eq!(json.as_object().unwrap().get("stale"), Some(&sjson!(true)));
+    }
+
+    #[tokio::test]
+    async fn recall_resolves_locator_backed_records() {
+        use std::io::Write as _;
+        use tempfile::NamedTempFile;
+
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(b"recall file content here").unwrap();
+        let path = file.path();
+        let root = path.parent().unwrap().to_str().unwrap().to_owned();
+        let filename = path.file_name().unwrap().to_str().unwrap().to_owned();
+        let file_hash = mempalace_core::hash_bytes(b"recall file content here");
+
+        let locator_record = make_locator_record(
+            "wing_test/notes/0001",
+            "wing_test",
+            "notes",
+            &filename,
+            &root,
+            &file_hash,
+            0,
+            6, // "recall"
+            Some(0.9),
+        );
+
+        let store = StubStore { drawers: vec![locator_record] };
+        let runtime = SearchRuntime::new(StubProvider { response: vec![embedding(0.0)] });
+        let rendered = runtime
+            .recall(
+                &store,
+                &LayerRetrieveRequest {
+                    wing: Some(WingId::new("wing_test").unwrap()),
+                    room: None,
+                    limit: 10,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Should show resolved text, not empty string.
+        assert!(
+            rendered.contains("recall"),
+            "recall output must contain resolved text; got: {rendered}"
         );
     }
 }

@@ -37,7 +37,7 @@ use blake3::Hasher;
 use mempalace_config::MempalaceConfig;
 use mempalace_core::{
     DIARY_ROOM, DIARY_TOPIC_PREFIX, DrawerId, DrawerRecord, RoomId,
-    SHARED_AGENT_DIARY_WING, SearchQuery, WingId,
+    SHARED_AGENT_DIARY_WING, SearchQuery, WingId, resolve_records,
 };
 use mempalace_embeddings::{EmbeddingProvider, EmbeddingRequest};
 use mempalace_federation::{
@@ -508,6 +508,7 @@ where
             content_hash: None,
             filed_at: None,
             added_by: None,
+            stale: result.stale,
         })
         .collect();
 
@@ -636,7 +637,7 @@ where
     P: EmbeddingProvider + Send + Sync + 'static,
 {
     let drawer_id = DrawerId::new(&id)?;
-    let drawer = state
+    let mut drawer = state
         .storage
         .drawer_store()
         .get_drawer(&drawer_id)
@@ -647,7 +648,11 @@ where
         return Err(ServerError::NotFound(format!("drawer {id} not found")));
     }
 
-    Ok(Json(drawer_record_to_json_no_embedding(&drawer)))
+    // Resolve locator-backed rows before building the response.
+    let stale_flags = resolve_records(std::slice::from_mut(&mut drawer));
+    let stale = stale_flags.first().copied().unwrap_or(false);
+
+    Ok(Json(drawer_record_to_json_with_stale(&drawer, stale)))
 }
 
 // ─── Drawers: delete ──────────────────────────────────────────────────────────
@@ -712,11 +717,19 @@ where
         .list_drawers(&DrawerFilter { wing, room, ..DrawerFilter::default() })
         .await?;
 
-    let items: Vec<Value> = drawers
+    let mut drawers_filtered: Vec<DrawerRecord> = drawers
         .into_iter()
         .filter(|d| !is_diary_wing_or_room(d.wing.as_str(), d.room.as_str()))
         .take(limit)
-        .map(|d| drawer_record_to_json_no_embedding(&d))
+        .collect();
+
+    // Resolve locator-backed rows before building the response.
+    let stale_flags = resolve_records(&mut drawers_filtered);
+
+    let items: Vec<Value> = drawers_filtered
+        .iter()
+        .zip(stale_flags)
+        .map(|(d, stale)| drawer_record_to_json_with_stale(d, stale))
         .collect();
 
     // Note: the underlying store lacks cursor-based list pagination.
@@ -1065,7 +1078,11 @@ fn decode_cursor(s: &str) -> Result<ChangeCursor, ServerError> {
 
 /// Serialises `DrawerRecord` to JSON, stripping the embedding vector.
 fn drawer_record_to_json_no_embedding(drawer: &DrawerRecord) -> Value {
-    json!({
+    drawer_record_to_json_with_stale(drawer, false)
+}
+
+fn drawer_record_to_json_with_stale(drawer: &DrawerRecord, stale: bool) -> Value {
+    let mut v = json!({
         "id": drawer.id.as_str(),
         "wing": drawer.wing.as_str(),
         "room": drawer.room.as_str(),
@@ -1078,7 +1095,11 @@ fn drawer_record_to_json_no_embedding(drawer: &DrawerRecord) -> Value {
         "filed_at": format_rfc3339(drawer.filed_at).ok(),
         "content": drawer.content,
         "content_hash": drawer.content_hash,
-    })
+    });
+    if stale {
+        v["stale"] = json!(true);
+    }
+    v
 }
 
 /// Performs a semantic duplicate search and returns a JSON array of matches.

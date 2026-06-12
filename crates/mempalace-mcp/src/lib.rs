@@ -358,7 +358,7 @@ impl ToolName {
             },
             Self::Search => ToolDefinition {
                 name: self.as_str(),
-                description: "Semantic search. Returns verbatim drawer content with similarity scores.",
+                description: "Semantic search. Returns verbatim drawer content with similarity scores. Results from mined files include `stale: true` when the source file changed since mining.",
                 input_schema: json!({
                     "type":"object",
                     "properties":{
@@ -1021,7 +1021,7 @@ where
                         .map_tool()?
                         .into_iter()
                         .map(|result| {
-                            json!({
+                            let mut obj = json!({
                                 "wing": result.wing,
                                 "room": result.room,
                                 "similarity": round_similarity(result.score),
@@ -1029,7 +1029,11 @@ where
                                 "source_file": result.source_file,
                                 "content_hash": hash_text(&result.content),
                                 "origin": "local",
-                            })
+                            });
+                            if result.stale {
+                                obj["stale"] = json!(true);
+                            }
+                            obj
                         })
                         .collect()
                 } else {
@@ -1062,13 +1066,19 @@ where
                 "wing": wing.map(|value| value.to_string()),
                 "room": room.map(|value| value.to_string()),
             },
-            "results": results.into_iter().map(|result| json!({
-                "wing": result.wing,
-                "room": result.room,
-                "similarity": round_similarity(result.score),
-                "text": result.content,
-                "source_file": result.source_file,
-            })).collect::<Vec<_>>()
+            "results": results.into_iter().map(|result| {
+                let mut obj = json!({
+                    "wing": result.wing,
+                    "room": result.room,
+                    "similarity": round_similarity(result.score),
+                    "text": result.content,
+                    "source_file": result.source_file,
+                });
+                if result.stale {
+                    obj["stale"] = json!(true);
+                }
+                obj
+            }).collect::<Vec<_>>()
         });
         Ok(payload)
     }
@@ -2556,6 +2566,86 @@ mod tests {
                 .iter()
                 .all(|result| result.get("similarity").is_some())
         );
+    }
+
+    #[tokio::test]
+    async fn search_tool_resolves_locator_rows_and_marks_stale_only_when_changed() {
+        let harness = test_harness().await;
+
+        // A real mined file on disk; one fresh locator row and one with a
+        // mismatched file hash (simulating a file changed since mining).
+        let mined_dir = TempDir::new().unwrap();
+        let file_path = mined_dir.path().join("mined.rs");
+        let file_body = b"auth migration parity chunk lives right here in the mined file";
+        std::fs::write(&file_path, file_body).unwrap();
+        let resolve_root = mined_dir.path().to_string_lossy().into_owned();
+
+        let make_row = |id: &str, room: &str, file_hash: String| DrawerRecord {
+            id: DrawerId::new(id).unwrap(),
+            wing: WingId::new("wing_mined").unwrap(),
+            room: RoomId::new(room).unwrap(),
+            hall: None,
+            date: None,
+            source_file: "mined.rs".to_owned(),
+            chunk_index: 0,
+            ingest_mode: "projects".to_owned(),
+            extract_mode: None,
+            added_by: "tests".to_owned(),
+            filed_at: datetime!(2026-04-11 09:00:00 UTC),
+            importance: None,
+            emotional_weight: None,
+            weight: None,
+            content: String::new(),
+            content_hash: hash_text("auth migration parity"),
+            embedding: vec![1.0; EmbeddingProfile::Balanced.metadata().dimensions],
+            locator: Some(mempalace_core::SourceLocator {
+                byte_start: 0,
+                byte_end: 21, // "auth migration parity"
+                line_start: 1,
+                line_end: 1,
+                file_hash,
+                resolve_root: resolve_root.clone(),
+                commit_hash: None,
+            }),
+        };
+
+        let fresh =
+            make_row("wing_mined/fresh/0001", "fresh", mempalace_core::hash_bytes(file_body));
+        let stale = make_row("wing_mined/stale/0001", "stale", "not-the-right-hash".to_owned());
+        {
+            let runtime = harness.server.runtime.lock().await;
+            runtime
+                .storage
+                .drawer_store()
+                .put_drawers(&[fresh, stale], DuplicateStrategy::Error)
+                .await
+                .unwrap();
+        }
+
+        let response = harness
+            .server
+            .handle_request(tool_call(
+                7,
+                "mempalace_search",
+                json!({"query":"auth migration parity","limit":10}),
+            ))
+            .await;
+        let payload = decode_tool_payload(&response).unwrap();
+        let results = payload["results"].as_array().unwrap();
+
+        let fresh_result =
+            results.iter().find(|r| r["room"] == "fresh").expect("fresh locator row in results");
+        assert_eq!(fresh_result["text"], "auth migration parity");
+        assert!(
+            fresh_result.get("stale").is_none(),
+            "fresh row must not carry a stale key: {fresh_result}"
+        );
+
+        let stale_result =
+            results.iter().find(|r| r["room"] == "stale").expect("stale locator row in results");
+        assert_eq!(stale_result["stale"], json!(true));
+        // Best-effort text still resolves from the current (in-bounds) file bytes.
+        assert_eq!(stale_result["text"], "auth migration parity");
     }
 
     #[tokio::test]

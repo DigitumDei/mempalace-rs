@@ -1134,6 +1134,9 @@ fn drawer_result_to_value(result: RemoteDrawerResult, origin: &str) -> Value {
     if let Some(c) = &result.content_hash {
         v["content_hash"] = json!(c);
     }
+    if result.stale {
+        v["stale"] = json!(true);
+    }
     v
 }
 
@@ -1606,6 +1609,7 @@ mod tests {
                     content_hash: v["content_hash"].as_str().map(|s| s.to_owned()),
                     filed_at: None,
                     added_by: None,
+                    stale: false,
                 })
                 .collect();
             Ok(DrawerSearchResponse { results })

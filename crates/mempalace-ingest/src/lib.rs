@@ -11,10 +11,7 @@ use mempalace_config::{ConfigLoader, ProjectRoomConfig};
 use mempalace_core::{DrawerId, DrawerRecord, RoomId, SourceLocator, WingId};
 use mempalace_embeddings::{EmbeddingProvider, EmbeddingRequest};
 use mempalace_storage::core::MempalaceError;
-use mempalace_storage::{
-    DrawerFilter, DrawerStore, DuplicateStrategy, IngestCommitRequest, IngestManifestStore,
-    StorageEngine,
-};
+use mempalace_storage::{IngestManifestStore, StorageEngine};
 use serde_json::Value;
 use thiserror::Error;
 use time::{Date, OffsetDateTime};
@@ -882,25 +879,10 @@ async fn replace_source_drawers(
     content_hash: String,
     drawers: Vec<DrawerRecord>,
 ) -> Result<()> {
-    let existing = engine.operational_store().committed_drawer_ids_for_source_key(source_key)?;
-    let new_ids = drawers.iter().map(|drawer| drawer.id.clone()).collect::<BTreeSet<_>>();
-
     engine
-        .commit_ingest(IngestCommitRequest {
-            ingest_kind: ingest_kind.to_owned(),
-            source_key: source_key.to_owned(),
-            source_file: source_file.to_owned(),
-            content_hash,
-            drawers,
-            duplicate_strategy: DuplicateStrategy::Overwrite,
-        })
-        .await?;
-
-    let stale = existing.into_iter().filter(|id| !new_ids.contains(id)).collect::<Vec<_>>();
-    if !stale.is_empty() {
-        engine.drawer_store().delete_drawers(&stale).await?;
-    }
-    Ok(())
+        .replace_source_drawers(ingest_kind, source_key, source_file, content_hash, drawers)
+        .await
+        .map_err(IngestError::Storage)
 }
 
 /// Returns `true` if `file_name` should be skipped for secrets / lockfile hygiene.
@@ -2133,8 +2115,7 @@ fn room_id(value: &str) -> Result<RoomId> {
 }
 
 fn drawer_id(wing: &WingId, room: &RoomId, source_key: &str, chunk_index: u32) -> Result<DrawerId> {
-    let source_hash = &hash_text(source_key)[..12];
-    DrawerId::new(format!("{}/{}/{}-{:04}", wing.as_str(), room.as_str(), source_hash, chunk_index))
+    mempalace_core::mined_drawer_id(wing, room, source_key, chunk_index)
         .map_err(|err| IngestError::Core(err.into()))
 }
 
@@ -2184,6 +2165,7 @@ mod tests {
         EmbeddingProvider, EmbeddingRequest, EmbeddingResponse, StartupValidation,
         StartupValidationStatus,
     };
+    use mempalace_storage::{DrawerFilter, DrawerStore};
     use serde_json::json;
     use tempfile::tempdir;
 

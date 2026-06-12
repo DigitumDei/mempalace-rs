@@ -50,6 +50,7 @@ fn test_config(tempdir: &TempDir) -> MempalaceConfig {
         server: ServerRuntimeConfig {
             bind: "127.0.0.1:0".parse().unwrap(),
             token_file: tempdir.path().join("tokens.json"),
+            checkouts: std::collections::BTreeMap::new(),
         },
         federation: FederationRuntimeConfig::default(),
     }

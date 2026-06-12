@@ -166,6 +166,7 @@ pub trait IngestManifestStore {
     fn committed_drawer_ids(&self) -> Result<Vec<DrawerId>>;
     fn committed_drawer_ids_for_source_key(&self, source_key: &str) -> Result<Vec<DrawerId>>;
     fn get_ingested_file(&self, source_key: &str) -> Result<Option<IngestFileRecord>>;
+    fn ingested_source_keys_with_prefix(&self, prefix: &str) -> Result<Vec<String>>;
 }
 
 pub trait EntityRegistryStore {
@@ -587,6 +588,32 @@ impl IngestManifestStore for SqliteOperationalStore {
         }
 
         Ok(None)
+    }
+
+    fn ingested_source_keys_with_prefix(&self, prefix: &str) -> Result<Vec<String>> {
+        // Escape LIKE special characters in the caller-supplied prefix so that
+        // a prefix such as "projects:%foo" does not wildcard-match unintended
+        // rows.  The root_key component is hex so escaping is belt-and-braces,
+        // but we do it unconditionally per the plan.
+        let escaped: String = prefix
+            .chars()
+            .flat_map(|ch| match ch {
+                '%' => vec!['\\', '%'],
+                '_' => vec!['\\', '_'],
+                '\\' => vec!['\\', '\\'],
+                other => vec![other],
+            })
+            .collect();
+        let pattern = format!("{escaped}%");
+
+        let connection = self.open_connection()?;
+        let mut statement = connection.prepare(
+            "SELECT source_key FROM ingest_files WHERE source_key LIKE ?1 ESCAPE '\\' ORDER BY source_key ASC",
+        )?;
+        statement
+            .query_map([pattern], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
     }
 }
 

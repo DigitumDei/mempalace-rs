@@ -4,9 +4,10 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::process::Command;
 
 use mempalace_config::{ConfigLoader, ProjectRoomConfig};
-use mempalace_core::{DrawerId, DrawerRecord, RoomId, WingId};
+use mempalace_core::{DrawerId, DrawerRecord, RoomId, SourceLocator, WingId};
 use mempalace_embeddings::{EmbeddingProvider, EmbeddingRequest};
 use mempalace_storage::core::MempalaceError;
 use mempalace_storage::{
@@ -324,6 +325,7 @@ pub struct ProjectIngestRequest {
     pub agent: String,
     pub limit: Option<usize>,
     pub dry_run: bool,
+    pub reindex: bool,
     pub max_embed_batch_size: Option<usize>,
 }
 
@@ -335,6 +337,7 @@ impl ProjectIngestRequest {
             agent: "mempalace-rs".to_owned(),
             limit: None,
             dry_run: false,
+            reindex: false,
             max_embed_batch_size: None,
         }
     }
@@ -348,6 +351,7 @@ pub struct ConversationIngestRequest {
     pub extract_mode: ConversationExtractMode,
     pub limit: Option<usize>,
     pub dry_run: bool,
+    pub reindex: bool,
     pub max_embed_batch_size: Option<usize>,
 }
 
@@ -360,6 +364,7 @@ impl ConversationIngestRequest {
             extract_mode: ConversationExtractMode::Exchange,
             limit: None,
             dry_run: false,
+            reindex: false,
             max_embed_batch_size: None,
         }
     }
@@ -371,6 +376,9 @@ pub struct Chunk {
     pub chunk_index: u32,
     pub room_hint: Option<String>,
     pub date_hint: Option<Date>,
+    /// Byte range within the original file bytes (start inclusive, end exclusive).
+    /// Only set for project chunks from valid-UTF-8 files.
+    pub byte_range: Option<(u64, u64)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -439,6 +447,12 @@ pub async fn ingest_project<P: EmbeddingProvider>(
     let discovered = discover_project_files(&root)?;
     let routing_fingerprint = project_routing_fingerprint(&config.rooms);
 
+    // Resolve the git commit hash once per mine run (None if not in a repo).
+    let commit_hash = resolve_commit_hash(&root);
+
+    // Resolve root as a string for locators (use to_string_lossy for Windows verbatim paths).
+    let resolve_root = root.to_string_lossy().into_owned();
+
     let mut summary = IngestSummary::default();
     summary.discovered_files = discovered.files.len();
     summary.ignored_files = discovered.ignored_files;
@@ -452,10 +466,14 @@ pub async fn ingest_project<P: EmbeddingProvider>(
                     source_key("projects", &root, &wing_name, None, &file.relative_path);
                 let content_hash =
                     project_ingest_content_hash(&document.content_hash, &routing_fingerprint);
-                if let Some(existing) = engine.operational_store().get_ingested_file(&source_key)? {
-                    if existing.content_hash == content_hash {
-                        summary.skipped_unchanged += 1;
-                        continue;
+                if !request.reindex {
+                    if let Some(existing) =
+                        engine.operational_store().get_ingested_file(&source_key)?
+                    {
+                        if existing.content_hash == content_hash {
+                            summary.skipped_unchanged += 1;
+                            continue;
+                        }
                     }
                 }
 
@@ -481,7 +499,10 @@ pub async fn ingest_project<P: EmbeddingProvider>(
                     &document.content,
                     &config.rooms,
                 );
-                let chunks = chunk_project_text(&document.content);
+
+                // Use offset-tracked chunking when the document has a locator basis.
+                let chunks = chunk_project_text(&document.content, document.valid_utf8);
+
                 if chunks.is_empty() {
                     if !request.dry_run {
                         replace_source_drawers(
@@ -499,6 +520,64 @@ pub async fn ingest_project<P: EmbeddingProvider>(
                     continue;
                 }
 
+                // Build locator context when we have a valid UTF-8 basis.
+                let locator_ctx = if document.valid_utf8 {
+                    // Read original file bytes once for line-number computation.
+                    let file_bytes = fs::read(&file.absolute_path)
+                        .map_err(|source| IngestError::Io { path: file.absolute_path.clone(), source })?;
+
+                    // Adjust chunk byte ranges from trimmed-string offsets to file offsets.
+                    let file_byte_ranges: Vec<(u64, u64)> = chunks
+                        .iter()
+                        .filter_map(|c| c.byte_range)
+                        .map(|(s, e)| {
+                            let off = document.trim_offset as u64;
+                            (s + off, e + off)
+                        })
+                        .collect();
+
+                    let line_numbers = compute_line_numbers(&file_bytes, &file_byte_ranges);
+                    Some((file_byte_ranges, line_numbers))
+                } else {
+                    None
+                };
+
+                // Assign room hints and final file-relative byte ranges to chunks.
+                let (chunks_with_room, maybe_ctx): (Vec<Chunk>, Option<ProjectLocatorContext<'_>>) =
+                    match locator_ctx {
+                        Some((ref file_byte_ranges, ref line_numbers)) => {
+                            // Re-map byte ranges from trimmed-string relative to file-relative.
+                            let chunks_out: Vec<Chunk> = chunks
+                                .into_iter()
+                                .zip(file_byte_ranges.iter())
+                                .map(|(mut c, &(s, e))| {
+                                    c.room_hint = Some(room.clone());
+                                    c.date_hint = None;
+                                    c.byte_range = Some((s, e));
+                                    c
+                                })
+                                .collect();
+                            let ctx = ProjectLocatorContext {
+                                file_hash: &document.content_hash,
+                                resolve_root: &resolve_root,
+                                commit_hash: commit_hash.as_deref(),
+                                line_numbers,
+                            };
+                            (chunks_out, Some(ctx))
+                        }
+                        None => {
+                            let chunks_out: Vec<Chunk> = chunks
+                                .into_iter()
+                                .map(|mut c| {
+                                    c.room_hint = Some(room.clone());
+                                    c.date_hint = None;
+                                    c
+                                })
+                                .collect();
+                            (chunks_out, None)
+                        }
+                    };
+
                 let source_drawers = build_drawers(
                     provider,
                     &wing_id,
@@ -508,15 +587,8 @@ pub async fn ingest_project<P: EmbeddingProvider>(
                     None,
                     &request.agent,
                     request.max_embed_batch_size,
-                    chunks
-                        .into_iter()
-                        .map(|chunk| Chunk {
-                            content: chunk.content,
-                            chunk_index: chunk.chunk_index,
-                            room_hint: Some(room.clone()),
-                            date_hint: None,
-                        })
-                        .collect::<Vec<_>>(),
+                    chunks_with_room,
+                    maybe_ctx.as_ref(),
                 )?;
                 let drawer_count = source_drawers.len();
 
@@ -584,10 +656,12 @@ pub async fn ingest_conversations<P: EmbeddingProvider>(
             Some(request.extract_mode.as_str()),
             &file.relative_path,
         );
-        if let Some(existing) = engine.operational_store().get_ingested_file(&source_key)? {
-            if existing.content_hash == content_hash {
-                summary.skipped_unchanged += 1;
-                continue;
+        if !request.reindex {
+            if let Some(existing) = engine.operational_store().get_ingested_file(&source_key)? {
+                if existing.content_hash == content_hash {
+                    summary.skipped_unchanged += 1;
+                    continue;
+                }
             }
         }
 
@@ -641,6 +715,7 @@ pub async fn ingest_conversations<P: EmbeddingProvider>(
                     chunk
                 })
                 .collect::<Vec<_>>(),
+            None,
         )?;
         let drawer_count = drawers.len();
 
@@ -662,6 +737,15 @@ pub async fn ingest_conversations<P: EmbeddingProvider>(
     Ok(summary)
 }
 
+/// Context needed to populate `DrawerRecord.locator` for project-mined chunks.
+struct ProjectLocatorContext<'a> {
+    file_hash: &'a str,
+    resolve_root: &'a str,
+    commit_hash: Option<&'a str>,
+    /// Parallel to the chunk list: (line_start, line_end).
+    line_numbers: &'a [(u32, u32)],
+}
+
 fn build_drawers<P: EmbeddingProvider>(
     provider: &mut P,
     wing: &WingId,
@@ -672,18 +756,42 @@ fn build_drawers<P: EmbeddingProvider>(
     agent: &str,
     max_embed_batch_size: Option<usize>,
     chunks: Vec<Chunk>,
+    locator_ctx: Option<&ProjectLocatorContext<'_>>,
 ) -> Result<Vec<DrawerRecord>> {
     if chunks.is_empty() {
         return Ok(Vec::new());
     }
 
+    // Embed using the real chunk text.
     let embeddings = embed_chunks(provider, &chunks, max_embed_batch_size)?;
 
     let mut drawers = Vec::with_capacity(chunks.len());
-    for (chunk, embedding) in chunks.into_iter().zip(embeddings.into_iter()) {
+    for (i, (chunk, embedding)) in chunks.into_iter().zip(embeddings.into_iter()).enumerate() {
         let room_name = chunk.room_hint.unwrap_or_else(|| "general".to_owned());
         let room_id = room_id(&room_name)?;
         let drawer_id = drawer_id(wing, &room_id, source_key, chunk.chunk_index)?;
+        let chunk_text = chunk.content;
+        let content_hash = hash_text(&chunk_text);
+
+        let locator = match (locator_ctx, chunk.byte_range) {
+            (Some(ctx), Some((byte_start, byte_end))) => {
+                let (line_start, line_end) = ctx.line_numbers.get(i).copied().unwrap_or((1, 1));
+                Some(SourceLocator {
+                    byte_start,
+                    byte_end,
+                    line_start,
+                    line_end,
+                    file_hash: ctx.file_hash.to_owned(),
+                    resolve_root: ctx.resolve_root.to_owned(),
+                    commit_hash: ctx.commit_hash.map(str::to_owned),
+                })
+            }
+            _ => None,
+        };
+
+        // When a locator is present, store empty content (resolved lazily).
+        let stored_content = if locator.is_some() { String::new() } else { chunk_text };
+
         drawers.push(DrawerRecord {
             id: drawer_id,
             wing: wing.clone(),
@@ -699,10 +807,10 @@ fn build_drawers<P: EmbeddingProvider>(
             importance: None,
             emotional_weight: None,
             weight: None,
-            content_hash: hash_text(&chunk.content),
-            content: chunk.content,
+            content_hash,
+            content: stored_content,
             embedding,
-            locator: None,
+            locator,
         });
     }
 
@@ -907,6 +1015,12 @@ struct TextDocument {
     content: String,
     content_hash: String,
     truncated: bool,
+    /// Byte offset of the start of the trimmed content within the file bytes.
+    /// Zero when the file starts with non-whitespace (or when `valid_utf8` is false).
+    trim_offset: usize,
+    /// True when the effective (possibly truncated) bytes are valid UTF-8.
+    /// When false, `trim_offset` is meaningless and no locator should be produced.
+    valid_utf8: bool,
 }
 
 fn read_text_document(path: &Path) -> Result<TextDocument> {
@@ -916,8 +1030,21 @@ fn read_text_document(path: &Path) -> Result<TextDocument> {
     let truncated = bytes.len() > LARGE_FILE_TRUNCATION_BYTES;
     let effective =
         if truncated { &bytes[..LARGE_FILE_TRUNCATION_BYTES] } else { bytes.as_slice() };
-    let content = String::from_utf8_lossy(effective).trim().to_owned();
-    Ok(TextDocument { content, content_hash, truncated })
+
+    match std::str::from_utf8(effective) {
+        Ok(s) => {
+            // Compute how many bytes are trimmed from the start (valid char boundary).
+            let trimmed = s.trim_start();
+            let trim_offset = s.len() - trimmed.len();
+            let content = trimmed.trim_end().to_owned();
+            Ok(TextDocument { content, content_hash, truncated, trim_offset, valid_utf8: true })
+        }
+        Err(_) => {
+            // Non-UTF-8: fall back to lossy conversion, no locator basis.
+            let content = String::from_utf8_lossy(effective).trim().to_owned();
+            Ok(TextDocument { content, content_hash, truncated, trim_offset: 0, valid_utf8: false })
+        }
+    }
 }
 
 fn detect_project_room(relative_path: &Path, content: &str, rooms: &[ProjectRoomConfig]) -> String {
@@ -965,8 +1092,12 @@ fn detect_project_room(relative_path: &Path, content: &str, rooms: &[ProjectRoom
         .unwrap_or_else(|| "general".to_owned())
 }
 
-fn chunk_project_text(content: &str) -> Vec<Chunk> {
-    let content = content.trim();
+/// Chunk the project text and track byte ranges within `content` (the already-trimmed string).
+///
+/// `track_offsets` — when true, `Chunk.byte_range` is set to `(start, end)` within `content`.
+/// The caller is responsible for adding `trim_offset` to map these into file bytes.
+fn chunk_project_text(content: &str, track_offsets: bool) -> Vec<Chunk> {
+    // content is already trimmed by the caller (read_text_document returns trimmed string).
     if content.is_empty() {
         return Vec::new();
     }
@@ -989,13 +1120,24 @@ fn chunk_project_text(content: &str) -> Vec<Chunk> {
             }
         }
 
-        let chunk = content[start..end].trim();
-        if chunk.len() >= PROJECT_MIN_CHUNK_SIZE {
+        let raw_slice = &content[start..end];
+        // Compute trim offsets within the raw slice for accurate byte ranges.
+        let leading = raw_slice.len() - raw_slice.trim_start().len();
+        let chunk_str = raw_slice.trim();
+        if chunk_str.len() >= PROJECT_MIN_CHUNK_SIZE {
+            let byte_range = if track_offsets {
+                let chunk_start = start + leading;
+                let chunk_end = chunk_start + chunk_str.len();
+                Some((chunk_start as u64, chunk_end as u64))
+            } else {
+                None
+            };
             chunks.push(Chunk {
-                content: chunk.to_owned(),
+                content: chunk_str.to_owned(),
                 chunk_index: u32::try_from(chunks.len()).unwrap_or(u32::MAX),
                 room_hint: None,
                 date_hint: None,
+                byte_range,
             });
         }
 
@@ -1018,6 +1160,73 @@ fn align_to_char_boundary(content: &str, index: usize) -> usize {
 
 fn find_boundary(content: &str, start: usize, end: usize, delimiter: &str) -> Option<usize> {
     content[start..end].rfind(delimiter).map(|index| start + index)
+}
+
+/// Compute 1-based line numbers for a sorted list of `(byte_start, byte_end)` pairs
+/// within `file_bytes`.  Returns a parallel `Vec<(line_start, line_end)>`.
+///
+/// Offsets in `chunks` must be valid byte offsets into `file_bytes` and must be
+/// sorted by `byte_start` for the incremental counting to work.
+fn compute_line_numbers(file_bytes: &[u8], chunks: &[(u64, u64)]) -> Vec<(u32, u32)> {
+    if chunks.is_empty() {
+        return Vec::new();
+    }
+
+    // Walk through the bytes once in order, counting newlines.
+    let mut results = Vec::with_capacity(chunks.len());
+    // current_line is 1-based; newlines_before_offset[i] gives how many \n
+    // appear before offset i (0-based).
+    let mut newline_count = 0u32; // newlines seen so far
+    let mut byte_pos = 0usize;
+
+    // For each chunk we need the newline count just before byte_start and just
+    // before byte_end.  We collect the sorted query offsets then process them.
+    let mut queries: Vec<(u64, usize, bool)> = Vec::new(); // (offset, chunk_index, is_end)
+    for (i, &(start, end)) in chunks.iter().enumerate() {
+        queries.push((start, i, false));
+        // line_end counts up to (but not including) the last byte; use saturating_sub.
+        queries.push((end.saturating_sub(1), i, true));
+    }
+    queries.sort_unstable_by_key(|&(off, idx, is_end)| (off, idx, !is_end));
+
+    let mut line_starts = vec![0u32; chunks.len()];
+    let mut line_ends = vec![0u32; chunks.len()];
+
+    for (target_offset, chunk_idx, is_end) in queries {
+        let target = target_offset as usize;
+        // Advance byte_pos to target, counting newlines.
+        while byte_pos < target && byte_pos < file_bytes.len() {
+            if file_bytes[byte_pos] == b'\n' {
+                newline_count += 1;
+            }
+            byte_pos += 1;
+        }
+        let line = newline_count + 1; // 1-based
+        if is_end {
+            line_ends[chunk_idx] = line;
+        } else {
+            line_starts[chunk_idx] = line;
+        }
+    }
+
+    for i in 0..chunks.len() {
+        results.push((line_starts[i], line_ends[i]));
+    }
+    results
+}
+
+/// Run `git -C <root> rev-parse HEAD` and return the trimmed stdout, or `None`
+/// if git is unavailable, the directory is not a repo, or any error occurs.
+fn resolve_commit_hash(root: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .args(["-C", &root.to_string_lossy(), "rev-parse", "HEAD"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let s = std::str::from_utf8(&output.stdout).ok()?.trim().to_owned();
+    if s.is_empty() { None } else { Some(s) }
 }
 
 fn normalize_conversation(
@@ -1471,6 +1680,7 @@ fn chunk_by_exchange(lines: &[&str]) -> Vec<Chunk> {
                 chunk_index: u32::try_from(chunks.len()).unwrap_or(u32::MAX),
                 room_hint: None,
                 date_hint: None,
+                byte_range: None,
             });
         }
     }
@@ -1496,6 +1706,7 @@ fn chunk_by_paragraph(content: &str) -> Vec<Chunk> {
                         chunk_index: 0,
                         room_hint: None,
                         date_hint: None,
+                        byte_range: None,
                     })
                 } else {
                     None
@@ -1518,6 +1729,7 @@ fn chunk_by_paragraph(content: &str) -> Vec<Chunk> {
             chunk_index: u32::try_from(index).unwrap_or(u32::MAX),
             room_hint: None,
             date_hint: None,
+            byte_range: None,
         })
         .collect::<Vec<_>>()
 }
@@ -1583,6 +1795,7 @@ fn extract_memories(text: &str) -> Vec<Chunk> {
             chunk_index: u32::try_from(memories.len()).unwrap_or(u32::MAX),
             room_hint: Some(chosen),
             date_hint: None,
+            byte_range: None,
         });
     }
 
@@ -1979,32 +2192,38 @@ mod tests {
                     chunk_index: 0,
                     room_hint: Some("general".to_owned()),
                     date_hint: None,
+                    byte_range: None,
                 },
                 Chunk {
                     content: "beta".to_owned(),
                     chunk_index: 1,
                     room_hint: Some("general".to_owned()),
                     date_hint: None,
+                    byte_range: None,
                 },
                 Chunk {
                     content: "gamma".to_owned(),
                     chunk_index: 2,
                     room_hint: Some("general".to_owned()),
                     date_hint: None,
+                    byte_range: None,
                 },
                 Chunk {
                     content: "delta".to_owned(),
                     chunk_index: 3,
                     room_hint: Some("general".to_owned()),
                     date_hint: None,
+                    byte_range: None,
                 },
                 Chunk {
                     content: "epsilon".to_owned(),
                     chunk_index: 4,
                     room_hint: Some("general".to_owned()),
                     date_hint: None,
+                    byte_range: None,
                 },
             ],
+            None,
         )
         .unwrap();
 
@@ -2127,6 +2346,7 @@ mod tests {
                 agent: "tester".to_owned(),
                 limit: None,
                 dry_run: false,
+                reindex: false,
                 max_embed_batch_size: None,
             },
         )
@@ -2173,6 +2393,7 @@ mod tests {
                 extract_mode: ConversationExtractMode::Exchange,
                 limit: None,
                 dry_run: false,
+                reindex: false,
                 max_embed_batch_size: None,
             },
         )
@@ -2190,6 +2411,7 @@ mod tests {
                 extract_mode: ConversationExtractMode::General,
                 limit: None,
                 dry_run: false,
+                reindex: false,
                 max_embed_batch_size: None,
             },
         )
@@ -2244,6 +2466,7 @@ mod tests {
                 extract_mode: ConversationExtractMode::Exchange,
                 limit: None,
                 dry_run: false,
+                reindex: false,
                 max_embed_batch_size: None,
             },
         )
@@ -2259,6 +2482,7 @@ mod tests {
                 extract_mode: ConversationExtractMode::Exchange,
                 limit: None,
                 dry_run: false,
+                reindex: false,
                 max_embed_batch_size: None,
             },
         )
@@ -2280,6 +2504,7 @@ mod tests {
                 extract_mode: ConversationExtractMode::Exchange,
                 limit: None,
                 dry_run: false,
+                reindex: false,
                 max_embed_batch_size: None,
             },
         )
@@ -2327,6 +2552,7 @@ mod tests {
                 agent: "tester".to_owned(),
                 limit: None,
                 dry_run: false,
+                reindex: false,
                 max_embed_batch_size: None,
             },
         )
@@ -2341,6 +2567,7 @@ mod tests {
                 agent: "tester".to_owned(),
                 limit: None,
                 dry_run: false,
+                reindex: false,
                 max_embed_batch_size: None,
             },
         )
@@ -2363,6 +2590,7 @@ mod tests {
                 agent: "tester".to_owned(),
                 limit: None,
                 dry_run: false,
+                reindex: false,
                 max_embed_batch_size: None,
             },
         )
@@ -2378,7 +2606,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(drawers.len(), 1);
-        assert!(drawers[0].content.contains("changed auth"));
+        // Locator-backed rows store empty content; text is resolved lazily.
+        let d = &drawers[0];
+        assert!(d.locator.is_some(), "expected locator on mined project drawer");
+        assert!(d.content.is_empty(), "expected empty stored content for locator-backed row");
+        let snippet = mempalace_core::resolve_locator(d.locator.as_ref().unwrap(), &d.source_file);
+        assert!(!snippet.stale);
+        assert!(snippet.text.contains("changed auth"), "resolved text: {:?}", snippet.text);
     }
 
     #[tokio::test]
@@ -2410,6 +2644,7 @@ mod tests {
                 agent: "tester".to_owned(),
                 limit: None,
                 dry_run: false,
+                reindex: false,
                 max_embed_batch_size: None,
             },
         )
@@ -2456,6 +2691,7 @@ mod tests {
                 agent: "tester".to_owned(),
                 limit: None,
                 dry_run: false,
+                reindex: false,
                 max_embed_batch_size: None,
             },
         )
@@ -2473,6 +2709,7 @@ mod tests {
                 agent: "tester".to_owned(),
                 limit: None,
                 dry_run: false,
+                reindex: false,
                 max_embed_batch_size: None,
             },
         )
@@ -2520,6 +2757,7 @@ mod tests {
                 agent: "tester".to_owned(),
                 limit: None,
                 dry_run: false,
+                reindex: false,
                 max_embed_batch_size: None,
             },
         )
@@ -2540,6 +2778,7 @@ mod tests {
                 agent: "tester".to_owned(),
                 limit: None,
                 dry_run: false,
+                reindex: false,
                 max_embed_batch_size: None,
             },
         )
@@ -2582,6 +2821,7 @@ mod tests {
                 extract_mode: ConversationExtractMode::Exchange,
                 limit: None,
                 dry_run: false,
+                reindex: false,
                 max_embed_batch_size: None,
             },
         )
@@ -2590,5 +2830,391 @@ mod tests {
 
         assert_eq!(summary.malformed_files, 1);
         assert_eq!(summary.ingested_files, 1);
+    }
+
+    // ── Stage-2 locator tests ──────────────────────────────────────────────
+
+    /// Mine a temp project with a multi-chunk UTF-8 file.  For every drawer
+    /// assert: locator present, content empty, hash matches resolved text.
+    #[tokio::test]
+    async fn locator_round_trip_for_utf8_file() {
+        let tempdir = tempdir().unwrap();
+        let project_dir = tempdir.path().join("project");
+        fs::create_dir_all(project_dir.join("src")).unwrap();
+        fs::write(
+            project_dir.join("mempalace.yaml"),
+            "wing: loctest\nrooms:\n  - name: general\n",
+        )
+        .unwrap();
+
+        // Build a file large enough to produce at least two chunks (> 1600 chars).
+        let line = "The quick brown fox jumps over the lazy dog. ";
+        let body: String = line.repeat(40); // ~1800 chars, two chunks
+        let file_path = project_dir.join("src/code.txt");
+        fs::write(&file_path, &body).unwrap();
+        let file_bytes = fs::read(&file_path).unwrap();
+
+        let engine = open_engine(&tempdir.path().join("palace")).await;
+        let mut provider =
+            FakeEmbeddingProvider::new(EmbeddingProfile::Balanced.metadata().dimensions);
+
+        let summary = ingest_project(
+            &engine,
+            &mut provider,
+            &ProjectIngestRequest {
+                project_dir: project_dir.clone(),
+                wing: None,
+                agent: "tester".to_owned(),
+                limit: None,
+                dry_run: false,
+                reindex: false,
+                max_embed_batch_size: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(summary.drawers_written >= 2, "expected >=2 chunks, got {}", summary.drawers_written);
+
+        let drawers = engine
+            .drawer_store()
+            .list_drawers(&DrawerFilter {
+                source_file: Some("src/code.txt".to_owned()),
+                ..DrawerFilter::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(drawers.len() as usize, summary.drawers_written);
+        for drawer in &drawers {
+            let loc = drawer.locator.as_ref().expect("locator must be set for UTF-8 project file");
+            // Stored content must be empty.
+            assert!(drawer.content.is_empty(), "stored content must be empty for locator row");
+            // file_hash must equal hash of full file bytes.
+            assert_eq!(loc.file_hash, hash_bytes(&file_bytes));
+            // Line numbers must be sane.
+            assert!(loc.line_start >= 1);
+            assert!(loc.line_end >= loc.line_start);
+            // Byte range sliced from file must equal the embedded chunk text.
+            let start = loc.byte_start as usize;
+            let end = loc.byte_end as usize;
+            let slice = std::str::from_utf8(&file_bytes[start..end])
+                .expect("locator slice must be valid UTF-8");
+            // content_hash is hash of the real chunk text.
+            assert_eq!(drawer.content_hash, hash_text(slice));
+            // resolve_locator must return non-stale text.
+            let snippet = mempalace_core::resolve_locator(loc, &drawer.source_file);
+            assert!(!snippet.stale, "locator must not be stale for unmodified file");
+            assert_eq!(snippet.text, slice);
+            assert_eq!(hash_text(&snippet.text), drawer.content_hash);
+        }
+    }
+
+    /// A file starting with leading whitespace/newlines: locator offsets must
+    /// still slice correctly (regression for trim_offset arithmetic).
+    #[tokio::test]
+    async fn locator_leading_whitespace_file() {
+        let tempdir = tempdir().unwrap();
+        let project_dir = tempdir.path().join("project");
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::write(
+            project_dir.join("mempalace.yaml"),
+            "wing: lwtest\nrooms:\n  - name: general\n",
+        )
+        .unwrap();
+
+        let line = "Content line with enough text to fill the chunk buffer here. ";
+        let body = format!("\n\n\n{}", line.repeat(20)); // leading newlines
+        let file_path = project_dir.join("notes.txt");
+        fs::write(&file_path, &body).unwrap();
+        let file_bytes = fs::read(&file_path).unwrap();
+
+        let engine = open_engine(&tempdir.path().join("palace")).await;
+        let mut provider =
+            FakeEmbeddingProvider::new(EmbeddingProfile::Balanced.metadata().dimensions);
+
+        ingest_project(
+            &engine,
+            &mut provider,
+            &ProjectIngestRequest {
+                project_dir: project_dir.clone(),
+                wing: None,
+                agent: "tester".to_owned(),
+                limit: None,
+                dry_run: false,
+                reindex: false,
+                max_embed_batch_size: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let drawers = engine
+            .drawer_store()
+            .list_drawers(&DrawerFilter {
+                source_file: Some("notes.txt".to_owned()),
+                ..DrawerFilter::default()
+            })
+            .await
+            .unwrap();
+
+        assert!(!drawers.is_empty());
+        for drawer in &drawers {
+            let loc = drawer.locator.as_ref().expect("locator must be present");
+            let start = loc.byte_start as usize;
+            let end = loc.byte_end as usize;
+            assert!(start >= 3, "trim_offset must skip the 3 leading newlines; start={start}");
+            let slice = std::str::from_utf8(&file_bytes[start..end]).unwrap();
+            assert_eq!(hash_text(slice), drawer.content_hash);
+        }
+    }
+
+    /// A non-UTF-8 file should store content verbatim (lossy) with locator None.
+    #[tokio::test]
+    async fn non_utf8_file_stores_content_no_locator() {
+        let tempdir = tempdir().unwrap();
+        let project_dir = tempdir.path().join("project");
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::write(
+            project_dir.join("mempalace.yaml"),
+            "wing: bintest\nrooms:\n  - name: general\n",
+        )
+        .unwrap();
+
+        // Latin-1 bytes that are not valid UTF-8, long enough to meet min chunk size.
+        let mut raw: Vec<u8> = b"Hello world invalid ".to_vec();
+        raw.extend(b"\xFF\xFE text content that is long enough to exceed the minimum ".to_vec());
+        raw.extend(b"chunk size threshold so it actually gets stored in the palace.".to_vec());
+        let file_path = project_dir.join("latin1.txt");
+        fs::write(&file_path, &raw).unwrap();
+
+        let engine = open_engine(&tempdir.path().join("palace")).await;
+        let mut provider =
+            FakeEmbeddingProvider::new(EmbeddingProfile::Balanced.metadata().dimensions);
+
+        ingest_project(
+            &engine,
+            &mut provider,
+            &ProjectIngestRequest {
+                project_dir: project_dir.clone(),
+                wing: None,
+                agent: "tester".to_owned(),
+                limit: None,
+                dry_run: false,
+                reindex: false,
+                max_embed_batch_size: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let drawers = engine
+            .drawer_store()
+            .list_drawers(&DrawerFilter {
+                source_file: Some("latin1.txt".to_owned()),
+                ..DrawerFilter::default()
+            })
+            .await
+            .unwrap();
+
+        assert!(!drawers.is_empty(), "non-UTF-8 file should still be chunked and stored");
+        for drawer in &drawers {
+            assert!(drawer.locator.is_none(), "non-UTF-8 file must have no locator");
+            assert!(!drawer.content.is_empty(), "non-UTF-8 file must store content verbatim");
+        }
+    }
+
+    /// A file larger than 200 000 bytes: chunks only cover the first 200 000 bytes;
+    /// file_hash is hash of the FULL bytes.
+    #[tokio::test]
+    async fn truncated_file_locators_cover_only_first_200k() {
+        let tempdir = tempdir().unwrap();
+        let project_dir = tempdir.path().join("project");
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::write(
+            project_dir.join("mempalace.yaml"),
+            "wing: trunctest\nrooms:\n  - name: general\n",
+        )
+        .unwrap();
+
+        // Build a file larger than LARGE_FILE_TRUNCATION_BYTES (200_000 bytes).
+        let line = "Truncation boundary test line of content. ";
+        let body: String = line.repeat(6_000); // ~252 000 bytes
+        assert!(body.len() > LARGE_FILE_TRUNCATION_BYTES);
+        let file_path = project_dir.join("large.txt");
+        fs::write(&file_path, &body).unwrap();
+        let file_bytes = fs::read(&file_path).unwrap();
+
+        let engine = open_engine(&tempdir.path().join("palace")).await;
+        let mut provider =
+            FakeEmbeddingProvider::new(EmbeddingProfile::Balanced.metadata().dimensions);
+
+        ingest_project(
+            &engine,
+            &mut provider,
+            &ProjectIngestRequest {
+                project_dir: project_dir.clone(),
+                wing: None,
+                agent: "tester".to_owned(),
+                limit: None,
+                dry_run: false,
+                reindex: false,
+                max_embed_batch_size: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let drawers = engine
+            .drawer_store()
+            .list_drawers(&DrawerFilter {
+                source_file: Some("large.txt".to_owned()),
+                ..DrawerFilter::default()
+            })
+            .await
+            .unwrap();
+
+        assert!(!drawers.is_empty());
+        let expected_file_hash = hash_bytes(&file_bytes);
+        for drawer in &drawers {
+            let loc = drawer.locator.as_ref().expect("truncated UTF-8 file must have locator");
+            // file_hash must be hash of FULL bytes.
+            assert_eq!(loc.file_hash, expected_file_hash);
+            // Byte ranges must lie within the first 200 000 bytes.
+            assert!(loc.byte_end <= LARGE_FILE_TRUNCATION_BYTES as u64,
+                "byte_end {} exceeds truncation boundary", loc.byte_end);
+            // Slice must be valid.
+            let start = loc.byte_start as usize;
+            let end = loc.byte_end as usize;
+            let slice = std::str::from_utf8(&file_bytes[start..end]).unwrap();
+            assert_eq!(hash_text(slice), drawer.content_hash);
+        }
+    }
+
+    /// A non-git directory should yield commit_hash = None on the locator.
+    #[tokio::test]
+    async fn commit_hash_none_when_not_a_git_repo() {
+        let tempdir = tempdir().unwrap();
+        let project_dir = tempdir.path().join("project");
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::write(
+            project_dir.join("mempalace.yaml"),
+            "wing: gitless\nrooms:\n  - name: general\n",
+        )
+        .unwrap();
+        let line = "Some content for the locator test. ";
+        fs::write(project_dir.join("notes.txt"), line.repeat(30)).unwrap();
+
+        let engine = open_engine(&tempdir.path().join("palace")).await;
+        let mut provider =
+            FakeEmbeddingProvider::new(EmbeddingProfile::Balanced.metadata().dimensions);
+
+        ingest_project(
+            &engine,
+            &mut provider,
+            &ProjectIngestRequest {
+                project_dir: project_dir.clone(),
+                wing: None,
+                agent: "tester".to_owned(),
+                limit: None,
+                dry_run: false,
+                reindex: false,
+                max_embed_batch_size: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let drawers = engine
+            .drawer_store()
+            .list_drawers(&DrawerFilter {
+                source_file: Some("notes.txt".to_owned()),
+                ..DrawerFilter::default()
+            })
+            .await
+            .unwrap();
+
+        assert!(!drawers.is_empty());
+        for drawer in &drawers {
+            let loc = drawer.locator.as_ref().expect("locator must be present");
+            assert!(loc.commit_hash.is_none(), "commit_hash must be None outside a git repo");
+        }
+    }
+
+    /// Mine twice unchanged → second run skipped_unchanged == discovered.
+    /// Mine with reindex: true → files re-ingested (ingested_files > 0, skipped_unchanged == 0).
+    #[tokio::test]
+    async fn reindex_forces_reingest_even_when_unchanged() {
+        let tempdir = tempdir().unwrap();
+        let project_dir = tempdir.path().join("project");
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::write(
+            project_dir.join("mempalace.yaml"),
+            "wing: ridx\nrooms:\n  - name: general\n",
+        )
+        .unwrap();
+        let body = "Stable content for reindex test.\n".repeat(30);
+        fs::write(project_dir.join("stable.txt"), &body).unwrap();
+
+        let engine = open_engine(&tempdir.path().join("palace")).await;
+        let mut provider =
+            FakeEmbeddingProvider::new(EmbeddingProfile::Balanced.metadata().dimensions);
+
+        // First run: ingest.
+        let first = ingest_project(
+            &engine,
+            &mut provider,
+            &ProjectIngestRequest {
+                project_dir: project_dir.clone(),
+                wing: None,
+                agent: "tester".to_owned(),
+                limit: None,
+                dry_run: false,
+                reindex: false,
+                max_embed_batch_size: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(first.ingested_files >= 1);
+
+        // Second run without changes: should skip.
+        let second = ingest_project(
+            &engine,
+            &mut provider,
+            &ProjectIngestRequest {
+                project_dir: project_dir.clone(),
+                wing: None,
+                agent: "tester".to_owned(),
+                limit: None,
+                dry_run: false,
+                reindex: false,
+                max_embed_batch_size: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.skipped_unchanged, second.discovered_files,
+            "unchanged run: all files should be skipped");
+        assert_eq!(second.ingested_files, 0);
+
+        // Third run with reindex=true: must re-ingest all.
+        let third = ingest_project(
+            &engine,
+            &mut provider,
+            &ProjectIngestRequest {
+                project_dir: project_dir.clone(),
+                wing: None,
+                agent: "tester".to_owned(),
+                limit: None,
+                dry_run: false,
+                reindex: true,
+                max_embed_batch_size: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(third.skipped_unchanged, 0, "reindex=true: nothing should be skipped");
+        assert!(third.ingested_files >= 1, "reindex=true: files must be re-ingested");
     }
 }

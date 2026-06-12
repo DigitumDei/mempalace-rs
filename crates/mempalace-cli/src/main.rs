@@ -199,6 +199,8 @@ enum Commands {
         limit: usize,
         #[arg(long = "dry-run")]
         dry_run: bool,
+        #[arg(long = "reindex", help = "Re-process all discovered files even if their content hash is unchanged (migration path from content rows to locator rows)")]
+        reindex: bool,
         #[arg(long, value_enum, default_value_t = CliExtractMode::Exchange)]
         extract: CliExtractMode,
     },
@@ -370,18 +372,21 @@ where
         Commands::Init { dir, yes } => {
             execute_init(&dir, yes, cli.palace.as_deref(), context, validation_provider_factory)
         }
-        Commands::Mine { dir, mode, wing, agent, limit, dry_run, extract } => execute_mine(
-            &dir,
-            mode,
-            wing,
-            agent,
-            limit,
-            dry_run,
-            extract,
-            cli.palace.as_deref(),
-            context,
-            provider_factory,
-        ),
+        Commands::Mine { dir, mode, wing, agent, limit, dry_run, reindex, extract } => {
+            execute_mine(
+                &dir,
+                mode,
+                wing,
+                agent,
+                limit,
+                dry_run,
+                reindex,
+                extract,
+                cli.palace.as_deref(),
+                context,
+                provider_factory,
+            )
+        }
         Commands::Search { query, wing, room, results } => execute_search(
             &query,
             wing,
@@ -487,6 +492,7 @@ fn execute_mine<F, P>(
     agent: String,
     limit: usize,
     dry_run: bool,
+    reindex: bool,
     extract: CliExtractMode,
     palace_override: Option<&Path>,
     context: &CliContext,
@@ -527,6 +533,7 @@ where
                     agent,
                     limit: if limit == 0 { None } else { Some(limit) },
                     dry_run,
+                    reindex,
                     max_embed_batch_size: config
                         .low_cpu
                         .enabled
@@ -548,6 +555,7 @@ where
                     },
                     limit: if limit == 0 { None } else { Some(limit) },
                     dry_run,
+                    reindex,
                     max_embed_batch_size: config
                         .low_cpu
                         .enabled
@@ -1757,5 +1765,46 @@ mod tests {
         let result =
             fastembed_provider(EmbeddingProfile::Balanced, cache_root.path().to_path_buf());
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn mine_reindex_flag_accepted_and_plumbed() {
+        let workspace = tempdir().unwrap();
+        let project_dir = setup_project_fixture(workspace.path());
+        let config_root = temp_config_root("reindex-flag");
+        let context = CliContext::for_tests(config_root.clone());
+
+        run_cli(["init", project_dir.to_str().unwrap(), "--yes"], &context, stub_provider).unwrap();
+
+        // First mine populates the palace.
+        let first = run_cli(["mine", project_dir.to_str().unwrap()], &context, stub_provider).unwrap();
+        assert_eq!(first.exit_code, 0);
+
+        // Second mine without --reindex skips all three unchanged fixture files.
+        let second = run_cli(["mine", project_dir.to_str().unwrap()], &context, stub_provider).unwrap();
+        assert_eq!(second.exit_code, 0);
+        assert!(
+            second.stdout.contains("Files skipped unchanged: 3"),
+            "expected all files skipped: {:?}",
+            second.stdout
+        );
+        assert!(second.stdout.contains("Files ingested: 0"), "second run: {:?}", second.stdout);
+
+        // --reindex forces re-ingestion of all three files despite unchanged hashes.
+        let reindex = run_cli(
+            ["mine", project_dir.to_str().unwrap(), "--reindex"],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+        assert_eq!(reindex.exit_code, 0);
+        assert!(
+            reindex.stdout.contains("Files skipped unchanged: 0"),
+            "reindex run must skip nothing: {:?}",
+            reindex.stdout
+        );
+        assert!(reindex.stdout.contains("Files ingested: 3"), "reindex output: {:?}", reindex.stdout);
+
+        remove_dir_all_if_exists(&config_root);
     }
 }

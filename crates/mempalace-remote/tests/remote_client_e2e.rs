@@ -14,8 +14,8 @@ use mempalace_config::{FederationRuntimeConfig, LowCpuRuntimeConfig, MempalaceCo
 use mempalace_core::EmbeddingProfile;
 use mempalace_embeddings::DeterministicStubProvider;
 use mempalace_federation::{
-    AddDrawerRequest, ChangesQuery, KgAddFactRequest, KgInvalidateRequest, KgQueryRequest,
-    ListDrawersQuery,
+    AddDrawerRequest, ChangesQuery, IngestBatchRequest, IngestChunkDto, IngestFileDto,
+    KgAddFactRequest, KgInvalidateRequest, KgQueryRequest, ListDrawersQuery,
 };
 use mempalace_remote::{RemoteApi, RemoteClient, RemoteEndpoint, RemoteError};
 use mempalace_server::{TokenRegistry, build_router};
@@ -403,5 +403,206 @@ async fn unreachable_remote_is_degradable() {
             assert!(err.is_degradable(), "Unreachable must be degradable");
         }
         other => panic!("expected Unreachable for dropped listener, got: {other:?}"),
+    }
+}
+
+// ─── Test 9: ingest_batch_round_trip ─────────────────────────────────────────
+
+#[tokio::test]
+async fn ingest_batch_round_trip() {
+    let tempdir = TempDir::new().unwrap();
+    let token_file = write_token_file(&tempdir);
+    let config = test_config(&tempdir);
+    let addr = spawn_server(config, token_file).await;
+    let client = client_for(addr, Some(TEST_TOKEN));
+
+    // Two files:
+    //   file 0 — no file_hash → content row (non-UTF-8 fallback path)
+    //   file 1 — file_hash present → locator row
+    //
+    // Use keyword clusters that are textually far apart so the
+    // DeterministicStubProvider assigns distinct embeddings.
+    let req = IngestBatchRequest {
+        wing: "wing_ingest".to_owned(),
+        repo_id: "github.com/test/myrepo".to_owned(),
+        agent: Some("e2e-agent".to_owned()),
+        commit_hash: Some("deadbeef1234".to_owned()),
+        files: vec![
+            // Content-row file (no file_hash)
+            IngestFileDto {
+                relative_path: "src/alpha.rs".to_owned(),
+                content_hash: "contenthash_alpha_001".to_owned(),
+                file_hash: None,
+                chunks: vec![IngestChunkDto {
+                    chunk_index: 0,
+                    room: "code".to_owned(),
+                    text: "alpha module implements the frombulation subsystem for quxzort"
+                        .to_owned(),
+                    byte_start: None,
+                    byte_end: None,
+                    line_start: None,
+                    line_end: None,
+                }],
+            },
+            // Locator-row file (file_hash present, ranges provided)
+            IngestFileDto {
+                relative_path: "src/beta.rs".to_owned(),
+                content_hash: "contenthash_beta_002".to_owned(),
+                file_hash: Some(
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        .to_owned(),
+                ),
+                chunks: vec![IngestChunkDto {
+                    chunk_index: 0,
+                    room: "code".to_owned(),
+                    text: "beta module handles the wibbleplonk dispatcher initialization"
+                        .to_owned(),
+                    byte_start: Some(0),
+                    byte_end: Some(62),
+                    line_start: Some(1),
+                    line_end: Some(1),
+                }],
+            },
+        ],
+    };
+
+    let resp = client.ingest_batch(req).await.unwrap();
+
+    // Both files must be present in the response in request order.
+    assert_eq!(resp.files.len(), 2, "response must contain one result per file");
+
+    let alpha = &resp.files[0];
+    assert_eq!(alpha.relative_path, "src/alpha.rs");
+    assert_eq!(alpha.status, "ingested", "alpha file must be ingested");
+    assert_eq!(alpha.drawers_written, 1, "alpha: one chunk → one drawer");
+    assert!(alpha.error.is_none(), "alpha must not have an error");
+
+    let beta = &resp.files[1];
+    assert_eq!(beta.relative_path, "src/beta.rs");
+    assert_eq!(beta.status, "ingested", "beta file must be ingested");
+    assert_eq!(beta.drawers_written, 1, "beta: one chunk → one drawer");
+    assert!(beta.error.is_none(), "beta must not have an error");
+
+    // search_drawers must find the alpha chunk by a keyword from its text.
+    let search_resp = client
+        .search_drawers(mempalace_federation::DrawerSearchRequest {
+            query: "frombulation subsystem quxzort".to_owned(),
+            wing: Some("wing_ingest".to_owned()),
+            room: None,
+            limit: Some(5),
+        })
+        .await
+        .unwrap();
+    assert!(
+        !search_resp.results.is_empty(),
+        "search must find the alpha chunk after ingest_batch"
+    );
+    let top = &search_resp.results[0];
+    assert!(
+        top.content.contains("frombulation"),
+        "top search result content must mention 'frombulation'; got: {}",
+        top.content
+    );
+}
+
+// ─── Test 10: ingest_batch_diary_wing_rejected_422 ────────────────────────────
+
+#[tokio::test]
+async fn ingest_batch_diary_wing_rejected_422() {
+    let tempdir = TempDir::new().unwrap();
+    let token_file = write_token_file(&tempdir);
+    let config = test_config(&tempdir);
+    let addr = spawn_server(config, token_file).await;
+    let client = client_for(addr, Some(TEST_TOKEN));
+
+    // Sending to the diary room inside wing_agents must be rejected with 422.
+    let req = IngestBatchRequest {
+        wing: "wing_agents".to_owned(),
+        repo_id: "github.com/test/repo".to_owned(),
+        agent: None,
+        commit_hash: None,
+        files: vec![IngestFileDto {
+            relative_path: "diary/entry.md".to_owned(),
+            content_hash: "ch_diary_001".to_owned(),
+            file_hash: None,
+            chunks: vec![IngestChunkDto {
+                chunk_index: 0,
+                room: "diary".to_owned(),
+                text: "diary entry attempt via ingest_batch".to_owned(),
+                byte_start: None,
+                byte_end: None,
+                line_start: None,
+                line_end: None,
+            }],
+        }],
+    };
+
+    let result = client.ingest_batch(req).await;
+    match result {
+        Err(RemoteError::RemoteRejected { status: 422, .. }) => {}
+        other => {
+            panic!("expected RemoteRejected(422) for diary ingest_batch, got: {other:?}")
+        }
+    }
+}
+
+// ─── Test 11: ingest_batch_route_missing_returns_404 ─────────────────────────
+
+#[tokio::test]
+async fn ingest_batch_route_missing_returns_404() {
+    // Stub server: answers /v1/info correctly but 404s /v1/ingest/batch.
+    // This mirrors an old server that doesn't yet implement the bulk-ingest
+    // endpoint (the plan notes: "old servers 404 → RemoteRejected").
+    let app = axum::Router::new()
+        .route(
+            "/v1/info",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({
+                    "server_version": "1.0.0-stub",
+                    "federation_api_version": 1u32,
+                    "embedding_profile": "balanced",
+                    "capabilities": ["drawers", "kg"]
+                }))
+            }),
+        );
+    // All other routes fall through to the default 404 handler.
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    // No token needed — the stub doesn't check auth.
+    let client = client_for(addr, None);
+
+    let req = IngestBatchRequest {
+        wing: "wing_code".to_owned(),
+        repo_id: "github.com/test/repo".to_owned(),
+        agent: None,
+        commit_hash: None,
+        files: vec![IngestFileDto {
+            relative_path: "src/main.rs".to_owned(),
+            content_hash: "ch_main_001".to_owned(),
+            file_hash: None,
+            chunks: vec![IngestChunkDto {
+                chunk_index: 0,
+                room: "code".to_owned(),
+                text: "fn main() {}".to_owned(),
+                byte_start: None,
+                byte_end: None,
+                line_start: None,
+                line_end: None,
+            }],
+        }],
+    };
+
+    let result = client.ingest_batch(req).await;
+    match result {
+        Err(RemoteError::RemoteRejected { status: 404, .. }) => {}
+        other => {
+            panic!("expected RemoteRejected(404) for missing route, got: {other:?}")
+        }
     }
 }

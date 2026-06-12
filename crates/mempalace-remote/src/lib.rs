@@ -35,8 +35,9 @@ pub use error::{RemoteError, Result};
 
 use mempalace_federation::{
     AddDrawerRequest, AddDrawerResponse, ChangesQuery, ChangesResponse, CheckDuplicateRequest,
-    CheckDuplicateResponse, DrawerSearchRequest, DrawerSearchResponse, InfoResponse,
-    KgAddFactRequest, KgInvalidateRequest, KgQueryRequest, ListDrawersQuery, ListDrawersResponse,
+    CheckDuplicateResponse, DrawerSearchRequest, DrawerSearchResponse, IngestBatchRequest,
+    IngestBatchResponse, InfoResponse, KgAddFactRequest, KgInvalidateRequest, KgQueryRequest,
+    ListDrawersQuery, ListDrawersResponse,
 };
 
 /// Default per-request timeout for remote calls.
@@ -119,4 +120,12 @@ pub trait RemoteApi: Send + Sync {
 
     /// Retrieve paginated change events (`GET /v1/changes`).
     async fn changes(&self, query: ChangesQuery) -> Result<ChangesResponse>;
+
+    /// Bulk-ingest pre-chunked file content into the remote palace
+    /// (`POST /v1/ingest/batch`).
+    ///
+    /// The server embeds each chunk and writes drawers using a deterministic
+    /// source-key derived from `wing`, `repo_id`, and `relative_path`, so that
+    /// two clients pushing the same repository converge on identical drawer ids.
+    async fn ingest_batch(&self, req: IngestBatchRequest) -> Result<IngestBatchResponse>;
 }

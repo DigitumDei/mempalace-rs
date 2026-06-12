@@ -4506,6 +4506,15 @@ mod tests {
                 next_cursor: self.changes_next_cursor.clone(),
             })
         }
+        async fn ingest_batch(
+            &self,
+            _req: mempalace_federation::IngestBatchRequest,
+        ) -> mempalace_remote::Result<mempalace_federation::IngestBatchResponse> {
+            Err(mempalace_remote::RemoteError::Unreachable {
+                remote: "mock".to_owned(),
+                message: "not used".to_owned(),
+            })
+        }
     }
 
     fn make_lib_router(

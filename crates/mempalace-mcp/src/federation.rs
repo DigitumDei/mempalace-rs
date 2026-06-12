@@ -8,7 +8,7 @@ use mempalace_config::{
 };
 use mempalace_core::{DIARY_ROOM, SHARED_AGENT_DIARY_WING};
 use mempalace_federation::{
-    AddDrawerRequest, DrawerSearchRequest, RemoteDrawerResult,
+    AddDrawerRequest, ChangesQuery, DrawerSearchRequest, RemoteDrawerResult,
 };
 use mempalace_remote::{
     RemoteApi, RemoteClient, RemoteEndpoint, RemoteError,
@@ -701,6 +701,85 @@ impl FederationRouter {
             obj.insert("federation".to_owned(), json!({ "remotes": federation_info }));
         }
         Ok(local_status)
+    }
+
+    // ─── Changes feed ────────────────────────────────────────────────────────────
+
+    /// Fan out a changes query to ALL configured remotes concurrently.
+    ///
+    /// Returns a map of `remote_name → per-remote result`. On success the value
+    /// is `{ "events": [...], "next_cursor": <string|null> }` where each event
+    /// object carries an added `"origin"` field (`"remote:<name>"`). On any
+    /// transport or application error (including join panics) the value is
+    /// `{ "unreachable": true, "error": "<message>" }`.
+    ///
+    /// A down remote NEVER poisons healthy remotes.
+    pub async fn changes_fanout(
+        &self,
+        since: Option<String>,
+        limit: Option<usize>,
+        cursors: &BTreeMap<String, String>,
+    ) -> BTreeMap<String, Value> {
+        let mut set: JoinSet<(String, Result<Value, String>)> = JoinSet::new();
+
+        for (name, api) in &self.remotes {
+            let name = name.clone();
+            let api = Arc::clone(api);
+            let query = ChangesQuery {
+                since: since.clone(),
+                limit,
+                cursor: cursors.get(&name).cloned(),
+            };
+            set.spawn(async move {
+                match api.changes(query).await {
+                    Ok(resp) => {
+                        let origin = format_remote_origin(&name);
+                        let events: Vec<Value> = resp
+                            .events
+                            .into_iter()
+                            .map(|evt| {
+                                let mut v = serde_json::to_value(&evt)
+                                    .unwrap_or_else(|_| json!({}));
+                                if let Some(obj) = v.as_object_mut() {
+                                    obj.insert("origin".to_owned(), json!(origin));
+                                }
+                                v
+                            })
+                            .collect();
+                        let payload = json!({
+                            "events": events,
+                            "next_cursor": resp.next_cursor,
+                        });
+                        (name, Ok(payload))
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        (name, Err(msg))
+                    }
+                }
+            });
+        }
+
+        let mut results: BTreeMap<String, Value> = BTreeMap::new();
+        while let Some(res) = set.join_next().await {
+            match res {
+                Ok((name, Ok(payload))) => {
+                    results.insert(name, payload);
+                }
+                Ok((name, Err(msg))) => {
+                    tracing::warn!(remote = %name, "changes fan-out failed: {msg}");
+                    results.insert(
+                        name,
+                        json!({ "unreachable": true, "error": msg }),
+                    );
+                }
+                Err(join_err) => {
+                    tracing::warn!("changes fan-out task panicked: {join_err}");
+                }
+            }
+        }
+
+        results
     }
 
     // ─── KG ──────────────────────────────────────────────────────────────────────
@@ -1464,6 +1543,10 @@ mod tests {
         kg_invalidate_response: Value,
         delete_succeeds: bool,
         fail_on: Option<String>,
+        changes_events: Vec<mempalace_federation::ChangeEventDto>,
+        changes_next_cursor: Option<String>,
+        /// When set, the `changes` call records the incoming cursor here.
+        received_cursor: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     }
 
     impl Default for MockRemote {
@@ -1489,6 +1572,9 @@ mod tests {
                 kg_invalidate_response: json!({"success": true}),
                 delete_succeeds: true,
                 fail_on: None,
+                changes_events: vec![],
+                changes_next_cursor: None,
+                received_cursor: std::sync::Arc::new(std::sync::Mutex::new(None)),
             }
         }
     }
@@ -1624,9 +1710,15 @@ mod tests {
 
         async fn changes(
             &self,
-            _query: ChangesQuery,
+            query: ChangesQuery,
         ) -> mempalace_remote::Result<ChangesResponse> {
-            Ok(ChangesResponse { events: vec![], next_cursor: None })
+            self.check_fail("changes")?;
+            // Record the cursor we received so tests can assert passthrough.
+            *self.received_cursor.lock().unwrap() = query.cursor;
+            Ok(ChangesResponse {
+                events: self.changes_events.clone(),
+                next_cursor: self.changes_next_cursor.clone(),
+            })
         }
     }
 
@@ -2388,5 +2480,121 @@ mod tests {
         assert_eq!(merged.len(), 1, "cross-side duplicate should be deduped to 1");
         // Local item is preferred (it was inserted first).
         assert!(merged[0].get("content_hash").is_none());
+    }
+
+    // ─── changes_fanout unit tests ────────────────────────────────────────────
+
+    fn make_change_event(
+        event_type: &str,
+        occurred_at: &str,
+        entity_id: &str,
+    ) -> mempalace_federation::ChangeEventDto {
+        mempalace_federation::ChangeEventDto {
+            event_type: event_type.to_owned(),
+            occurred_at: occurred_at.to_owned(),
+            entity_id: entity_id.to_owned(),
+            actor: None,
+            details: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn changes_fanout_annotates_origin() {
+        let mut mock = MockRemote::default();
+        mock.changes_events = vec![
+            make_change_event("drawer_added", "2026-06-10T10:00:00Z", "entity-1"),
+        ];
+        let mut remotes = BTreeMap::new();
+        remotes.insert("hub".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+
+        let cursors = BTreeMap::new();
+        let results = router.changes_fanout(None, None, &cursors).await;
+
+        assert!(results.contains_key("hub"), "expected hub in results");
+        let hub = &results["hub"];
+        let events = hub["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["origin"], "remote:hub");
+        assert_eq!(events[0]["event_type"], "drawer_added");
+        assert_eq!(hub["next_cursor"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn changes_fanout_passes_cursor_to_correct_remote() {
+        let cursor_store = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let mut mock = MockRemote::default();
+        mock.received_cursor = std::sync::Arc::clone(&cursor_store);
+
+        let mut remotes = BTreeMap::new();
+        remotes.insert("hub".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+
+        let mut cursors = BTreeMap::new();
+        cursors.insert("hub".to_owned(), "tok-abc123".to_owned());
+
+        let _ = router.changes_fanout(None, None, &cursors).await;
+
+        let received = cursor_store.lock().unwrap().clone();
+        assert_eq!(received.as_deref(), Some("tok-abc123"));
+    }
+
+    #[tokio::test]
+    async fn changes_fanout_unreachable_remote_is_marked_and_does_not_poison_healthy() {
+        let mut failing = MockRemote::default();
+        failing.fail_on = Some("changes".to_owned());
+
+        let mut healthy = MockRemote::default();
+        healthy.changes_events = vec![
+            make_change_event("drawer_added", "2026-06-10T11:00:00Z", "entity-ok"),
+        ];
+
+        let mut remotes = BTreeMap::new();
+        remotes.insert("down".to_owned(), Arc::new(failing) as Arc<dyn RemoteApi>);
+        remotes.insert("ok".to_owned(), Arc::new(healthy) as Arc<dyn RemoteApi>);
+
+        let rules_remotes = {
+            let mut m = BTreeMap::new();
+            m.insert("down".to_owned(), make_resolved_remote("down"));
+            m.insert("ok".to_owned(), make_resolved_remote("ok"));
+            m
+        };
+        let rules = FederationRuntimeConfig {
+            remotes: rules_remotes,
+            default_mode: RouteMode::Combined,
+            default_remote: Some("ok".to_owned()),
+            wings: BTreeMap::new(),
+            kg: None,
+        };
+        let router = FederationRouter::with_remotes(rules, remotes);
+
+        let cursors = BTreeMap::new();
+        let results = router.changes_fanout(None, None, &cursors).await;
+
+        // "down" → unreachable marker
+        let down = &results["down"];
+        assert_eq!(down["unreachable"], true, "down should be unreachable");
+        assert!(down["error"].as_str().map_or(false, |e| !e.is_empty()));
+
+        // "ok" → healthy events with origin annotation
+        let ok = &results["ok"];
+        let events = ok["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["origin"], "remote:ok");
+    }
+
+    #[tokio::test]
+    async fn changes_fanout_surfaces_next_cursor() {
+        let mut mock = MockRemote::default();
+        mock.changes_next_cursor = Some("cursor-next-42".to_owned());
+
+        let mut remotes = BTreeMap::new();
+        remotes.insert("hub".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+
+        let cursors = BTreeMap::new();
+        let results = router.changes_fanout(None, None, &cursors).await;
+
+        assert_eq!(results["hub"]["next_cursor"], "cursor-next-42");
     }
 }

@@ -232,7 +232,7 @@ impl ToolName {
         match self {
             Self::WakeUp => ToolDefinition {
                 name: self.as_str(),
-                description: "Wake up into the palace. Returns identity.txt, palace status, recent palace changes, current project history when provided, and recent diary entries across all agents. Local palace only; federated change feeds are future work.",
+                description: "Wake up into the palace. Returns identity.txt, palace status, recent palace changes, current project history when provided, and recent diary entries across all agents. When federation is active the response also includes `remote_changes`: a per-remote map of change events from the last 24 hours (each event carries `origin: \"remote:<name>\"`), unreachable remotes appear as `{ \"unreachable\": true, \"error\": \"...\" }`, and a `next_cursor` is provided per remote for continuation via mempalace_get_changes_since.",
                 input_schema: json!({
                     "type":"object",
                     "properties":{
@@ -437,12 +437,13 @@ impl ToolName {
             },
             Self::GetChangesSince => ToolDefinition {
                 name: self.as_str(),
-                description: "Get all palace changes since a given timestamp. Call this at session start (or when coordinating with teammates) to catch up on what other agents have written. Returns events in chronological order with operation type, affected entity, actor, and timestamp. Local palace only; federated change feeds are future work.",
+                description: "Get all palace changes since a given timestamp. Call this at session start (or when coordinating with teammates) to catch up on what other agents have written. Returns events in chronological order with operation type, affected entity, actor, and timestamp. When federation is active, remote changes are merged in: each event carries an `origin` field (`\"local\"` or `\"remote:<name>\"`), and a top-level `remotes` object reports per-remote `{ next_cursor, count }` or `{ unreachable: true, error }`. CLOCK-SKEW CAVEAT: timestamps across machines are not directly comparable. Persist the per-origin `next_cursor` values from `remotes` and pass them back via `cursors` rather than reusing a single max-timestamp across origins. `limit` applies per origin (local and each remote each receive `limit` events independently).",
                 input_schema: json!({
                     "type":"object",
                     "properties":{
                         "since":{"type":"string","description":"ISO 8601 timestamp — return only events after this point (optional, default: epoch)"},
-                        "limit":{"type":"integer","description":"Max events to return (default 50)"}
+                        "limit":{"type":"integer","description":"Max events to return per origin (default 50)"},
+                        "cursors":{"type":"object","description":"Per-remote opaque cursor strings from a previous response's `remotes.<name>.next_cursor`. Pass back to continue pagination for specific remotes without re-fetching already-seen events.","additionalProperties":{"type":"string"}}
                     }
                 }),
             },
@@ -775,7 +776,7 @@ where
         let diary =
             self.wake_up_diary_payload(agent_name.as_deref(), diary_since, diary_limit).await?;
 
-        Ok(json!({
+        let mut payload = json!({
             "identity_path": self.identity_path(),
             "identity": identity,
             "status": status,
@@ -790,7 +791,20 @@ where
                 },
             },
             "diary": diary,
-        }))
+        });
+
+        if let Some(router) = &self.federation {
+            if router.has_remotes() {
+                let fan_since = format_rfc3339(OffsetDateTime::now_utc() - Duration::days(1))?;
+                let cursors = BTreeMap::new();
+                let remote_changes = router
+                    .changes_fanout(Some(fan_since), Some(latest_limit), &cursors)
+                    .await;
+                payload["remote_changes"] = json!(remote_changes);
+            }
+        }
+
+        Ok(payload)
     }
 
     async fn tool_status(&mut self) -> ToolResult<Value> {
@@ -1714,17 +1728,109 @@ where
             .unwrap_or(OffsetDateTime::UNIX_EPOCH);
         let limit = optional_usize(arguments, "limit")?.unwrap_or(50);
 
+        // Parse optional `cursors` object: maps remote name → opaque cursor string.
+        // When federation is None the field is silently ignored (consistent with
+        // other federation-only args across the tool suite).
+        let cursors: BTreeMap<String, String> = match arguments.get("cursors") {
+            None | Some(Value::Null) => BTreeMap::new(),
+            Some(Value::Object(map)) => {
+                let mut out = BTreeMap::new();
+                for (k, v) in map {
+                    match v.as_str() {
+                        Some(s) => { out.insert(k.clone(), s.to_owned()); }
+                        None => {
+                            return Err(ToolError::InvalidParams(
+                                "field `cursors` must be an object of string values".to_owned(),
+                            ));
+                        }
+                    }
+                }
+                out
+            }
+            Some(_) => {
+                return Err(ToolError::InvalidParams(
+                    "field `cursors` must be an object of string values".to_owned(),
+                ));
+            }
+        };
+
         let events =
             self.storage.operational_store().get_changes_since(since, limit).map_tool_internal()?;
 
-        let count = events.len();
-        let event_list = render_change_events(events)?;
+        if let Some(router) = self.federation.as_ref().filter(|r| r.has_remotes()) {
+            // Annotate local events with origin.
+            let local_event_list: Vec<Value> = render_change_events(events)?
+                .into_iter()
+                .map(|mut v| {
+                    if let Some(obj) = v.as_object_mut() {
+                        obj.insert("origin".to_owned(), json!("local"));
+                    }
+                    v
+                })
+                .collect();
 
-        Ok(json!({
-            "since": since_str.unwrap_or_else(|| "epoch".to_owned()),
-            "count": count,
-            "events": event_list,
-        }))
+            let remote_results = router
+                .changes_fanout(since_str.clone(), Some(limit), &cursors)
+                .await;
+
+            // Merge all events and collect per-remote metadata.
+            let mut all_events: Vec<Value> = local_event_list;
+            let mut remotes_meta = serde_json::Map::new();
+
+            for (name, result) in &remote_results {
+                if result.get("unreachable") == Some(&json!(true)) {
+                    remotes_meta.insert(name.clone(), result.clone());
+                } else {
+                    let remote_events = result["events"].as_array().cloned().unwrap_or_default();
+                    let event_count = remote_events.len();
+                    all_events.extend(remote_events);
+                    remotes_meta.insert(
+                        name.clone(),
+                        json!({
+                            "next_cursor": result["next_cursor"],
+                            "count": event_count,
+                        }),
+                    );
+                }
+            }
+
+            // Sort combined events by occurred_at ascending (best-effort
+            // display order only — cross-machine clocks may skew). Parse the
+            // timestamps so differing UTC offsets or subsecond precision
+            // across remotes still compare chronologically; unparseable
+            // timestamps sort last, by raw string among themselves.
+            let parse_occurred_at = |event: &Value| {
+                event["occurred_at"]
+                    .as_str()
+                    .and_then(|s| OffsetDateTime::parse(s, &Rfc3339).ok())
+            };
+            all_events.sort_by(|a, b| match (parse_occurred_at(a), parse_occurred_at(b)) {
+                (Some(ta), Some(tb)) => ta.cmp(&tb),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => {
+                    let sa = a["occurred_at"].as_str().unwrap_or("");
+                    let sb = b["occurred_at"].as_str().unwrap_or("");
+                    sa.cmp(sb)
+                }
+            });
+
+            let count = all_events.len();
+            Ok(json!({
+                "since": since_str.unwrap_or_else(|| "epoch".to_owned()),
+                "count": count,
+                "events": all_events,
+                "remotes": Value::Object(remotes_meta),
+            }))
+        } else {
+            let count = events.len();
+            let event_list = render_change_events(events)?;
+            Ok(json!({
+                "since": since_str.unwrap_or_else(|| "epoch".to_owned()),
+                "count": count,
+                "events": event_list,
+            }))
+        }
     }
 }
 
@@ -2205,7 +2311,7 @@ mod tests {
     use std::sync::mpsc;
 
     use mempalace_config::{
-        FederationRuntimeConfig, LowCpuRuntimeConfig, ResolvedRouteRule, RouteMode,
+        FederationRuntimeConfig, LowCpuRuntimeConfig, ResolvedRemote, ResolvedRouteRule, RouteMode,
         ServerRuntimeConfig, WriteTarget,
     };
     use mempalace_embeddings::{StartupValidation, StartupValidationStatus};
@@ -4173,6 +4279,435 @@ mod tests {
         assert_eq!(
             default_keys, none_fed_keys,
             "mempalace_add_drawer top-level keys differ between federation:none and no federation"
+        );
+    }
+
+    // ─── Federation changes integration tests ─────────────────────────────────
+
+    /// A minimal MockRemote for use in lib.rs integration tests.  We re-use the
+    /// same shape as the federation.rs tests so we can import via `use super::*`.
+    struct LibMockRemote {
+        changes_events: Vec<mempalace_federation::ChangeEventDto>,
+        changes_next_cursor: Option<String>,
+        fail: bool,
+    }
+
+    impl Default for LibMockRemote {
+        fn default() -> Self {
+            Self { changes_events: vec![], changes_next_cursor: None, fail: false }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl mempalace_remote::RemoteApi for LibMockRemote {
+        async fn info(&self) -> mempalace_remote::Result<mempalace_federation::InfoResponse> {
+            Err(mempalace_remote::RemoteError::Unreachable {
+                remote: "mock".to_owned(),
+                message: "not used".to_owned(),
+            })
+        }
+        async fn search_drawers(
+            &self,
+            _req: mempalace_federation::DrawerSearchRequest,
+        ) -> mempalace_remote::Result<mempalace_federation::DrawerSearchResponse> {
+            Ok(mempalace_federation::DrawerSearchResponse { results: vec![] })
+        }
+        async fn check_duplicate(
+            &self,
+            _req: mempalace_federation::CheckDuplicateRequest,
+        ) -> mempalace_remote::Result<mempalace_federation::CheckDuplicateResponse> {
+            Ok(mempalace_federation::CheckDuplicateResponse {
+                is_duplicate: false,
+                matches: json!([]),
+            })
+        }
+        async fn add_drawer(
+            &self,
+            _req: mempalace_federation::AddDrawerRequest,
+        ) -> mempalace_remote::Result<mempalace_federation::AddDrawerResponse> {
+            Err(mempalace_remote::RemoteError::Unreachable {
+                remote: "mock".to_owned(),
+                message: "not used".to_owned(),
+            })
+        }
+        async fn list_drawers(
+            &self,
+            _query: mempalace_federation::ListDrawersQuery,
+        ) -> mempalace_remote::Result<mempalace_federation::ListDrawersResponse> {
+            Ok(mempalace_federation::ListDrawersResponse {
+                drawers: json!([]),
+                next_cursor: None,
+            })
+        }
+        async fn get_drawer(&self, _drawer_id: &str) -> mempalace_remote::Result<Value> {
+            Ok(json!({}))
+        }
+        async fn delete_drawer(&self, _drawer_id: &str) -> mempalace_remote::Result<()> {
+            Ok(())
+        }
+        async fn kg_query(
+            &self,
+            _req: mempalace_federation::KgQueryRequest,
+        ) -> mempalace_remote::Result<Value> {
+            Ok(json!({"entity":"","facts":[],"count":0}))
+        }
+        async fn kg_add_fact(
+            &self,
+            _req: mempalace_federation::KgAddFactRequest,
+        ) -> mempalace_remote::Result<Value> {
+            Ok(json!({"success":true}))
+        }
+        async fn kg_invalidate(
+            &self,
+            _req: mempalace_federation::KgInvalidateRequest,
+        ) -> mempalace_remote::Result<Value> {
+            Ok(json!({"success":true}))
+        }
+        async fn kg_timeline(
+            &self,
+            _entity: Option<&str>,
+        ) -> mempalace_remote::Result<Value> {
+            Ok(json!({"entity":"all","timeline":[],"count":0}))
+        }
+        async fn kg_stats(&self) -> mempalace_remote::Result<Value> {
+            Ok(json!({"entities":0,"triples":0,"current_facts":0,"expired_facts":0,"relationship_types":[]}))
+        }
+        async fn taxonomy(&self) -> mempalace_remote::Result<Value> {
+            Ok(json!({"taxonomy":{}}))
+        }
+        async fn wings(&self) -> mempalace_remote::Result<Value> {
+            Ok(json!({"wings":{}}))
+        }
+        async fn rooms(
+            &self,
+            _wing: Option<&str>,
+        ) -> mempalace_remote::Result<Value> {
+            Ok(json!({"rooms":{}}))
+        }
+        async fn changes(
+            &self,
+            _query: mempalace_federation::ChangesQuery,
+        ) -> mempalace_remote::Result<mempalace_federation::ChangesResponse> {
+            if self.fail {
+                return Err(mempalace_remote::RemoteError::Unreachable {
+                    remote: "mock".to_owned(),
+                    message: "mock remote is down".to_owned(),
+                });
+            }
+            Ok(mempalace_federation::ChangesResponse {
+                events: self.changes_events.clone(),
+                next_cursor: self.changes_next_cursor.clone(),
+            })
+        }
+    }
+
+    fn make_lib_router(
+        remotes: BTreeMap<String, Arc<dyn mempalace_remote::RemoteApi>>,
+    ) -> FederationRouter {
+        let mut rules_remotes = BTreeMap::new();
+        for name in remotes.keys() {
+            rules_remotes.insert(
+                name.clone(),
+                ResolvedRemote {
+                    name: name.clone(),
+                    url: "https://test.example".to_owned(),
+                    token: None,
+                    timeout: std::time::Duration::from_secs(5),
+                },
+            );
+        }
+        let rules = FederationRuntimeConfig {
+            remotes: rules_remotes,
+            default_mode: RouteMode::Combined,
+            default_remote: remotes.keys().next().cloned(),
+            wings: BTreeMap::new(),
+            kg: Some(ResolvedRouteRule {
+                mode: RouteMode::Combined,
+                remote: remotes.keys().next().cloned(),
+                write: WriteTarget::Remote,
+            }),
+        };
+        FederationRouter::with_remotes(rules, remotes)
+    }
+
+    async fn test_harness_with_mock_router(router: FederationRouter) -> TestHarness {
+        let tempdir = TempDir::new().unwrap();
+        let palace_path = tempdir.path().join("palace");
+        let config = make_base_config(&palace_path, &tempdir);
+        let mut runtime =
+            McpRuntime::new(config, DeterministicStubProvider::new(EmbeddingProfile::Balanced))
+                .await
+                .unwrap();
+        // Replace federation with the mock router (only if it has remotes).
+        runtime.federation = if router.has_remotes() { Some(router) } else { None };
+        let server = McpServer {
+            runtime: Arc::new(Mutex::new(runtime)),
+            queue_limit: Arc::new(Semaphore::new(8)),
+        };
+        seed_drawers(&server).await;
+        TestHarness { _tempdir: tempdir, server }
+    }
+
+    fn make_dto_event(event_type: &str, occurred_at: &str, entity_id: &str)
+        -> mempalace_federation::ChangeEventDto
+    {
+        mempalace_federation::ChangeEventDto {
+            event_type: event_type.to_owned(),
+            occurred_at: occurred_at.to_owned(),
+            entity_id: entity_id.to_owned(),
+            actor: None,
+            details: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_get_changes_since_with_federation_merges_events_and_annotates_origin() {
+        let mut mock_hub = LibMockRemote::default();
+        mock_hub.changes_events = vec![
+            make_dto_event("drawer_added", "2026-06-10T12:00:00Z", "remote-entity-1"),
+        ];
+        mock_hub.changes_next_cursor = Some("cursor-hub-1".to_owned());
+
+        let mut remotes: BTreeMap<String, Arc<dyn mempalace_remote::RemoteApi>> = BTreeMap::new();
+        remotes.insert("hub".to_owned(), Arc::new(mock_hub));
+        let router = make_lib_router(remotes);
+
+        let harness = test_harness_with_mock_router(router).await;
+
+        // First, write a local change so there is at least one local event.
+        harness
+            .server
+            .handle_request(tool_call(
+                9000,
+                "mempalace_add_drawer",
+                json!({"wing":"wing_fed_changes","room":"test","content":"federation changes test"}),
+            ))
+            .await;
+
+        let response = harness
+            .server
+            .handle_request(tool_call(
+                9001,
+                "mempalace_get_changes_since",
+                json!({"since": "2000-01-01T00:00:00Z", "limit": 10}),
+            ))
+            .await;
+
+        let payload = decode_tool_payload(&response).unwrap();
+
+        // All events should have an `origin` field.
+        let events = payload["events"].as_array().unwrap();
+        assert!(
+            events.iter().all(|e| e.get("origin").is_some()),
+            "all events must have origin when federation is active: {payload}"
+        );
+
+        // At least one local event and at least one remote:hub event.
+        assert!(
+            events.iter().any(|e| e["origin"] == "local"),
+            "expected at least one local event: {payload}"
+        );
+        assert!(
+            events.iter().any(|e| e["origin"] == "remote:hub"),
+            "expected at least one hub event: {payload}"
+        );
+
+        // remotes.hub should have next_cursor and the stub's event count.
+        assert_eq!(payload["remotes"]["hub"]["next_cursor"], "cursor-hub-1");
+        assert_eq!(payload["remotes"]["hub"]["count"], 1);
+    }
+
+    #[tokio::test]
+    async fn tool_get_changes_since_events_sorted_by_occurred_at() {
+        // Hub returns an event with an earlier timestamp; local event will be later.
+        let mut mock_hub = LibMockRemote::default();
+        mock_hub.changes_events = vec![
+            make_dto_event("drawer_added", "2026-01-01T00:00:00Z", "early-remote"),
+        ];
+
+        let mut remotes: BTreeMap<String, Arc<dyn mempalace_remote::RemoteApi>> = BTreeMap::new();
+        remotes.insert("hub".to_owned(), Arc::new(mock_hub));
+        let router = make_lib_router(remotes);
+
+        let harness = test_harness_with_mock_router(router).await;
+
+        // Add a local drawer (timestamp will be recent, so later than 2026-01-01).
+        harness
+            .server
+            .handle_request(tool_call(
+                9010,
+                "mempalace_add_drawer",
+                json!({"wing":"wing_sort_test","room":"test","content":"sort test local"}),
+            ))
+            .await;
+
+        let payload = decode_tool_payload(
+            &harness
+                .server
+                .handle_request(tool_call(
+                    9011,
+                    "mempalace_get_changes_since",
+                    json!({"since":"2000-01-01T00:00:00Z","limit":20}),
+                ))
+                .await,
+        )
+        .unwrap();
+
+        let events = payload["events"].as_array().unwrap();
+        // Events must be sorted ascending by occurred_at.
+        let timestamps: Vec<&str> = events
+            .iter()
+            .filter_map(|e| e["occurred_at"].as_str())
+            .collect();
+        let mut sorted = timestamps.clone();
+        sorted.sort();
+        assert_eq!(timestamps, sorted, "events must be sorted ascending by occurred_at");
+    }
+
+    #[tokio::test]
+    async fn tool_get_changes_since_unreachable_remote_yields_marker() {
+        let mut mock_hub = LibMockRemote::default();
+        mock_hub.fail = true;
+
+        let mut remotes: BTreeMap<String, Arc<dyn mempalace_remote::RemoteApi>> = BTreeMap::new();
+        remotes.insert("hub".to_owned(), Arc::new(mock_hub));
+        let router = make_lib_router(remotes);
+
+        let harness = test_harness_with_mock_router(router).await;
+
+        let payload = decode_tool_payload(
+            &harness
+                .server
+                .handle_request(tool_call(
+                    9020,
+                    "mempalace_get_changes_since",
+                    json!({"since":"2000-01-01T00:00:00Z","limit":10}),
+                ))
+                .await,
+        )
+        .unwrap();
+
+        assert_eq!(payload["remotes"]["hub"]["unreachable"], true);
+        assert!(
+            payload["remotes"]["hub"]["error"].as_str().map_or(false, |e| !e.is_empty()),
+            "error message must be non-empty"
+        );
+        // The tool must still succeed — local events are returned, no top-level error.
+        assert!(payload.get("events").is_some());
+    }
+
+    #[tokio::test]
+    async fn tool_wake_up_with_federation_includes_remote_changes() {
+        let mut mock_hub = LibMockRemote::default();
+        mock_hub.changes_events = vec![
+            make_dto_event("drawer_added", "2026-06-10T10:00:00Z", "hub-entity-1"),
+        ];
+
+        let mut remotes: BTreeMap<String, Arc<dyn mempalace_remote::RemoteApi>> = BTreeMap::new();
+        remotes.insert("hub".to_owned(), Arc::new(mock_hub));
+        let router = make_lib_router(remotes);
+
+        let harness = test_harness_with_mock_router(router).await;
+
+        let payload = decode_tool_payload(
+            &harness
+                .server
+                .handle_request(tool_call(9030, "mempalace_wake_up", json!({})))
+                .await,
+        )
+        .unwrap();
+
+        assert!(
+            payload.get("remote_changes").is_some(),
+            "remote_changes must be present when federation is active: {payload}"
+        );
+        let rc = &payload["remote_changes"]["hub"];
+        let events = rc["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["origin"], "remote:hub");
+    }
+
+    #[tokio::test]
+    async fn tool_wake_up_with_unreachable_remote_still_succeeds() {
+        let mut mock_hub = LibMockRemote::default();
+        mock_hub.fail = true;
+
+        let mut remotes: BTreeMap<String, Arc<dyn mempalace_remote::RemoteApi>> = BTreeMap::new();
+        remotes.insert("hub".to_owned(), Arc::new(mock_hub));
+        let router = make_lib_router(remotes);
+
+        let harness = test_harness_with_mock_router(router).await;
+
+        let payload = decode_tool_payload(
+            &harness
+                .server
+                .handle_request(tool_call(9040, "mempalace_wake_up", json!({})))
+                .await,
+        )
+        .unwrap();
+
+        // wake_up must succeed even when the remote is down.
+        assert!(payload.get("identity").is_some());
+        // remote_changes for the down hub should be the unreachable marker.
+        let rc = &payload["remote_changes"]["hub"];
+        assert_eq!(rc["unreachable"], true);
+        assert!(rc["error"].as_str().map_or(false, |e| !e.is_empty()));
+    }
+
+    // ─── Byte-parity: federation-off must not add remote_changes / remotes / origin ─
+
+    #[tokio::test]
+    async fn federation_none_wake_up_has_no_remote_changes_key() {
+        let harness = test_harness().await;
+        let payload = decode_tool_payload(
+            &harness
+                .server
+                .handle_request(tool_call(9100, "mempalace_wake_up", json!({})))
+                .await,
+        )
+        .unwrap();
+        assert!(
+            payload.get("remote_changes").is_none(),
+            "remote_changes must NOT appear when federation is off: {payload}"
+        );
+    }
+
+    #[tokio::test]
+    async fn federation_none_get_changes_since_has_no_remotes_key_and_no_origin() {
+        let harness = test_harness().await;
+
+        // Add a drawer so there is at least one event in the log.
+        harness
+            .server
+            .handle_request(tool_call(
+                9110,
+                "mempalace_add_drawer",
+                json!({"wing":"wing_parity_test","room":"r","content":"parity test content"}),
+            ))
+            .await;
+
+        let payload = decode_tool_payload(
+            &harness
+                .server
+                .handle_request(tool_call(
+                    9111,
+                    "mempalace_get_changes_since",
+                    json!({"since":"2000-01-01T00:00:00Z","limit":10}),
+                ))
+                .await,
+        )
+        .unwrap();
+
+        assert!(
+            payload.get("remotes").is_none(),
+            "`remotes` key must NOT appear when federation is off: {payload}"
+        );
+
+        // No event should have an `origin` field.
+        let events = payload["events"].as_array().unwrap();
+        assert!(
+            events.iter().all(|e| e.get("origin").is_none()),
+            "events must NOT have `origin` when federation is off: {payload}"
         );
     }
 

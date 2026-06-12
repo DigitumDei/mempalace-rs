@@ -72,8 +72,10 @@ fn resolve_from_bytes(
         };
     };
 
-    let start = locator.byte_start as usize;
-    let end = locator.byte_end as usize;
+    // try_from instead of `as`: on 32-bit targets an offset beyond usize::MAX
+    // must fall through to the stale path, not silently truncate.
+    let start = usize::try_from(locator.byte_start).unwrap_or(usize::MAX);
+    let end = usize::try_from(locator.byte_end).unwrap_or(usize::MAX);
     let slice_text =
         bytes.get(start..end).and_then(|slice| std::str::from_utf8(slice).ok()).map(str::to_owned);
 

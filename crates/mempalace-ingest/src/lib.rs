@@ -562,10 +562,6 @@ pub async fn ingest_project<P: EmbeddingProvider>(
 
                 // Build locator context when we have a valid UTF-8 basis.
                 let locator_ctx = if document.valid_utf8 {
-                    // Read original file bytes once for line-number computation.
-                    let file_bytes = fs::read(&file.absolute_path)
-                        .map_err(|source| IngestError::Io { path: file.absolute_path.clone(), source })?;
-
                     // Adjust chunk byte ranges from trimmed-string offsets to file offsets.
                     let file_byte_ranges: Vec<(u64, u64)> = chunks
                         .iter()
@@ -576,7 +572,9 @@ pub async fn ingest_project<P: EmbeddingProvider>(
                         })
                         .collect();
 
-                    let line_numbers = compute_line_numbers(&file_bytes, &file_byte_ranges);
+                    // Reuse the bytes read by read_text_document — both the hash and
+                    // the line numbers must describe the same file snapshot.
+                    let line_numbers = compute_line_numbers(&document.raw_bytes, &file_byte_ranges);
                     Some((file_byte_ranges, line_numbers))
                 } else {
                     None
@@ -922,10 +920,11 @@ fn project_file_skip_by_name(file_name: &str) -> bool {
 
 /// Read up to `limit` bytes from `path`.  Returns `None` on any I/O error.
 fn read_prefix(path: &Path, limit: usize) -> Option<Vec<u8>> {
-    let mut file = std::fs::File::open(path).ok()?;
-    let mut buf = vec![0u8; limit];
-    let n = file.read(&mut buf).ok()?;
-    buf.truncate(n);
+    let file = std::fs::File::open(path).ok()?;
+    let mut buf = Vec::with_capacity(limit);
+    // take + read_to_end reads reliably up to `limit` bytes; a single read()
+    // call may legally return fewer bytes than the buffer holds.
+    file.take(limit as u64).read_to_end(&mut buf).ok()?;
     Some(buf)
 }
 
@@ -1118,6 +1117,9 @@ struct TextDocument {
     /// True when the effective (possibly truncated) bytes are valid UTF-8.
     /// When false, `trim_offset` is meaningless and no locator should be produced.
     valid_utf8: bool,
+    /// The raw file bytes, kept so locator line numbers can be computed without
+    /// a second disk read (which could also race with concurrent file edits).
+    raw_bytes: Vec<u8>,
 }
 
 fn read_text_document(path: &Path) -> Result<TextDocument> {
@@ -1134,12 +1136,26 @@ fn read_text_document(path: &Path) -> Result<TextDocument> {
             let trimmed = s.trim_start();
             let trim_offset = s.len() - trimmed.len();
             let content = trimmed.trim_end().to_owned();
-            Ok(TextDocument { content, content_hash, truncated, trim_offset, valid_utf8: true })
+            Ok(TextDocument {
+                content,
+                content_hash,
+                truncated,
+                trim_offset,
+                valid_utf8: true,
+                raw_bytes: bytes,
+            })
         }
         Err(_) => {
             // Non-UTF-8: fall back to lossy conversion, no locator basis.
             let content = String::from_utf8_lossy(effective).trim().to_owned();
-            Ok(TextDocument { content, content_hash, truncated, trim_offset: 0, valid_utf8: false })
+            Ok(TextDocument {
+                content,
+                content_hash,
+                truncated,
+                trim_offset: 0,
+                valid_utf8: false,
+                raw_bytes: bytes,
+            })
         }
     }
 }
@@ -1290,7 +1306,9 @@ fn compute_line_numbers(file_bytes: &[u8], chunks: &[(u64, u64)]) -> Vec<(u32, u
     let mut line_ends = vec![0u32; chunks.len()];
 
     for (target_offset, chunk_idx, is_end) in queries {
-        let target = target_offset as usize;
+        // try_from instead of `as`: clamp instead of silently truncating on
+        // 32-bit targets (the walk below stops at file_bytes.len() anyway).
+        let target = usize::try_from(target_offset).unwrap_or(usize::MAX);
         // Advance byte_pos to target, counting newlines.
         while byte_pos < target && byte_pos < file_bytes.len() {
             if file_bytes[byte_pos] == b'\n' {

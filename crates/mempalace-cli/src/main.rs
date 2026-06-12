@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use mempalace_config::{
-    ConfigFileV1, ConfigLoader, MempalaceConfig, ProjectRoomConfig, ResolvedPaths, build_runtime,
+    ConfigFileV1, ConfigLoader, MempalaceConfig, ProjectRoomConfig, ResolvedPaths, RouteMode,
+    RouteQuery, WriteTarget, build_runtime, resolve_route,
 };
 use mempalace_core::{EmbeddingProfile, RoomId, SearchQuery, WingId};
 use mempalace_embeddings::{
@@ -16,10 +17,12 @@ use mempalace_embeddings::{
     env_flag, log_startup_validation,
 };
 use mempalace_server::{TokenRegistry, build_router};
+use mempalace_federation::{IngestBatchRequest, IngestBatchResponse};
 use mempalace_ingest::{
-    ConversationExtractMode, ConversationIngestRequest, IngestSummary, ProjectIngestRequest,
-    ingest_conversations, ingest_project,
+    ConversationExtractMode, ConversationIngestRequest, IngestError, IngestSummary,
+    ProjectIngestRequest, ingest_conversations, ingest_project, prepare_project_batch,
 };
+use mempalace_remote::{RemoteApi, RemoteClient, RemoteEndpoint, RemoteError};
 use mempalace_search::{Layer1Config, SearchRuntime, SearchRuntimePolicy, WakeUpRequest};
 use mempalace_storage::{DrawerFilter, DrawerStore, StorageEngine, StorageLayout};
 use serde_yaml::Mapping;
@@ -203,6 +206,8 @@ enum Commands {
         reindex: bool,
         #[arg(long, value_enum, default_value_t = CliExtractMode::Exchange)]
         extract: CliExtractMode,
+        #[arg(long, help = "Mine only files changed vs the merge-base with the default branch (local branch-delta mining)")]
+        branch: bool,
     },
     /// Find anything, exact words.
     Search {
@@ -372,7 +377,7 @@ where
         Commands::Init { dir, yes } => {
             execute_init(&dir, yes, cli.palace.as_deref(), context, validation_provider_factory)
         }
-        Commands::Mine { dir, mode, wing, agent, limit, dry_run, reindex, extract } => {
+        Commands::Mine { dir, mode, wing, agent, limit, dry_run, reindex, extract, branch } => {
             execute_mine(
                 &dir,
                 mode,
@@ -382,6 +387,7 @@ where
                 dry_run,
                 reindex,
                 extract,
+                branch,
                 cli.palace.as_deref(),
                 context,
                 provider_factory,
@@ -494,6 +500,7 @@ fn execute_mine<F, P>(
     dry_run: bool,
     reindex: bool,
     extract: CliExtractMode,
+    branch: bool,
     palace_override: Option<&Path>,
     context: &CliContext,
     provider_factory: F,
@@ -510,8 +517,54 @@ where
     })?;
 
     let config = load_runtime_config(palace_override, context).map_err(config_error)?;
-    let use_temp_storage = dry_run && !palace_exists(&config.palace_path);
     let runtime = build_runtime(&config).map_err(runtime_error)?;
+
+    // ── Routing decision (projects mode only) ────────────────────────────────
+    if mode == CliMode::Projects {
+        // Load the project config to get the wing name and routing.
+        let project_config =
+            ConfigLoader::load_project_config(&source_dir).map_err(config_error)?;
+        let wing_name = wing
+            .clone()
+            .unwrap_or_else(|| project_config.wing.clone());
+
+        let rule = resolve_route(
+            &config.federation,
+            project_config.routing.as_ref(),
+            RouteQuery { wing: Some(&wing_name), room: None, source_file: None },
+        );
+
+        let use_remote = !branch
+            && (rule.mode == RouteMode::Remote
+                || (rule.mode == RouteMode::Combined
+                    && rule.write == WriteTarget::Remote));
+
+        if use_remote {
+            return execute_remote_mine(
+                &source_dir,
+                wing,
+                &agent,
+                limit,
+                dry_run,
+                &config,
+                &runtime,
+                &rule,
+            );
+        }
+    } else {
+        // Convos mode: --branch is not supported; remote routing is not supported.
+        if branch {
+            return Ok(CliOutput::failure(
+                1,
+                "--branch requires --mode projects; branch-delta mining is not supported for conversations\n",
+            ));
+        }
+        // Conversation mining is always local: routing rules are wing-based and
+        // convo directories carry no project wing config to resolve against.
+    }
+
+    // ── Local mine path (unchanged from before for federation-absent/local-route) ─
+    let use_temp_storage = dry_run && !palace_exists(&config.palace_path);
     let dry_run_storage =
         if use_temp_storage { Some(tempfile::tempdir().map_err(io_error)?) } else { None };
     let storage_root =
@@ -538,10 +591,10 @@ where
                         .low_cpu
                         .enabled
                         .then_some(config.low_cpu.effective_ingest_batch_size()),
-                    branch: false,
+                    branch,
                 },
             ))
-            .map_err(ingest_error)?,
+            .map_err(|e| branch_delta_error(e, ingest_error))?,
         CliMode::Convos => runtime
             .block_on(ingest_conversations(
                 &engine,
@@ -575,6 +628,326 @@ where
     )))
 }
 
+/// Map an [`IngestError`] to a clap error, giving a friendly message for
+/// [`IngestError::BranchDeltaUnavailable`].
+fn branch_delta_error(
+    error: IngestError,
+    fallback: impl Fn(IngestError) -> clap::Error,
+) -> clap::Error {
+    match error {
+        IngestError::BranchDeltaUnavailable { ref reason } => clap::Error::raw(
+            clap::error::ErrorKind::Io,
+            format!(
+                "--branch mining requires a git repository with a detectable default branch \
+                 (main or master): {reason}\n\
+                 Hint: run `git init` and commit at least once, or omit --branch for a full mine.\n"
+            ),
+        ),
+        other => fallback(other),
+    }
+}
+
+/// Maximum accumulated chunk-text bytes before flushing a remote batch (~4 MiB).
+const REMOTE_BATCH_MAX_BYTES: usize = 4 * 1024 * 1024;
+/// Maximum number of files per remote batch.
+const REMOTE_BATCH_MAX_FILES: usize = 64;
+
+#[allow(clippy::too_many_arguments)]
+fn execute_remote_mine(
+    source_dir: &Path,
+    wing_override: Option<String>,
+    agent: &str,
+    limit: usize,
+    dry_run: bool,
+    config: &MempalaceConfig,
+    runtime: &tokio::runtime::Runtime,
+    rule: &mempalace_config::ResolvedRouteRule,
+) -> Result<CliOutput, clap::Error> {
+    // ── 1. Prepare the batch (no embedding, no storage) ─────────────────────
+    let prepared = prepare_project_batch(&ProjectIngestRequest {
+        project_dir: source_dir.to_path_buf(),
+        wing: wing_override.clone(),
+        agent: agent.to_owned(),
+        limit: if limit == 0 { None } else { Some(limit) },
+        dry_run: false,
+        reindex: false,
+        max_embed_batch_size: None,
+        branch: false,
+    })
+    .map_err(|e| branch_delta_error(e, ingest_error))?;
+
+    // ── 2. Resolve the remote config entry ──────────────────────────────────
+    let remote_name = rule.remote.as_deref().unwrap_or("remote");
+    let resolved_remote =
+        config.federation.remotes.get(remote_name).ok_or_else(|| {
+            clap::Error::raw(
+                clap::error::ErrorKind::Io,
+                format!(
+                    "federation config error: route for wing '{}' refers to remote '{}', \
+                     but no such remote is defined in config.federation.remotes\n",
+                    prepared.wing, remote_name
+                ),
+            )
+        })?;
+    let remote_url = resolved_remote.url.clone();
+
+    // ── 3. Non-default-branch warning text (computed early for dry-run) ─────
+    let branch_warning = match (&prepared.current_branch, &prepared.default_branch) {
+        (Some(cur), Some(def)) if cur != def => Some(format!(
+            "warning: mining branch '{}' into the shared remote wing '{}' \
+             (expected '{}')\n",
+            cur, prepared.wing, def
+        )),
+        _ => None,
+    };
+
+    // Count total chunks for dry-run display.
+    let total_chunks: usize = prepared.files.iter().map(|f| f.chunks.len()).sum();
+
+    // ── 4. Dry-run: print plan and return ────────────────────────────────────
+    if dry_run {
+        let mut lines = vec![
+            format!("\n{}", "=".repeat(SEARCH_HEADER_WIDTH)),
+            "  Mine plan (dry run)".to_owned(),
+            "=".repeat(SEARCH_HEADER_WIDTH),
+            "  Mode: projects (remote)".to_owned(),
+            format!("  Source: {}", source_dir.display()),
+            format!("  Remote: {} ({})", remote_name, remote_url),
+            format!("  Wing: {}", prepared.wing),
+            format!("  Repo ID: {}", prepared.repo_id),
+            format!(
+                "  Commit: {}",
+                prepared.commit_hash.as_deref().unwrap_or("<none>")
+            ),
+            format!("  Files to send: {}", prepared.files.len()),
+            format!("  Total chunks: {total_chunks}"),
+        ];
+        if let Some(ref warning) = branch_warning {
+            lines.push(format!("  {}", warning.trim()));
+        }
+        lines.push(format!("{}\n", "=".repeat(SEARCH_HEADER_WIDTH)));
+        return Ok(CliOutput::success(lines.join("\n")));
+    }
+
+    // ── 5. Build the remote client ───────────────────────────────────────────
+    let endpoint = RemoteEndpoint {
+        name: remote_name.to_owned(),
+        base_url: remote_url.clone(),
+        token: resolved_remote.token.clone(),
+        timeout: resolved_remote.timeout,
+    };
+    let client = RemoteClient::new(endpoint).map_err(|e| {
+        clap::Error::raw(
+            clap::error::ErrorKind::Io,
+            format!("failed to build remote client for '{}': {e}\n", remote_name),
+        )
+    })?;
+
+    // ── 6. Capabilities check ────────────────────────────────────────────────
+    // Call through the trait to avoid shadowing by the `info` field on RemoteClient.
+    let api: &dyn RemoteApi = &client;
+    let info_resp = runtime.block_on(api.info()).map_err(|e| {
+        let msg = match e {
+            RemoteError::Unreachable { ref message, .. } => format!(
+                "remote '{}' is unreachable at {}: {}\n\
+                 Note: writes do not fall back to local.\n",
+                remote_name, remote_url, message
+            ),
+            other => format!("remote '{}' info() failed: {other}\n", remote_name),
+        };
+        clap::Error::raw(clap::error::ErrorKind::Io, msg)
+    })?;
+
+    if !info_resp.capabilities.iter().any(|c| c == "ingest") {
+        return Ok(CliOutput::failure(
+            1,
+            format!(
+                "remote '{}' does not support the ingest capability; \
+                 please upgrade the remote server.\n\
+                 Server capabilities: {}\n",
+                remote_name,
+                info_resp.capabilities.join(", ")
+            ),
+        ));
+    }
+
+    // ── 7. Batch and send ────────────────────────────────────────────────────
+    let wing = prepared.wing.clone();
+    let repo_id = prepared.repo_id.clone();
+    let commit_hash = prepared.commit_hash.clone();
+    let agent_owned = agent.to_owned();
+
+    // Split files into batches.
+    let batches = build_remote_batches(prepared.files);
+
+    let mut ingested_count: usize = 0;
+    let mut skipped_count: usize = 0;
+    let mut failed_count: usize = 0;
+    let mut total_drawers_written: usize = 0;
+    let mut all_warnings: Vec<String> = Vec::new();
+    let mut failed_files: Vec<(String, String)> = Vec::new();
+    let mut batches_sent: usize = 0;
+
+    for batch_files in batches {
+        let req = IngestBatchRequest {
+            wing: wing.clone(),
+            repo_id: repo_id.clone(),
+            agent: Some(agent_owned.clone()),
+            commit_hash: commit_hash.clone(),
+            files: batch_files,
+        };
+
+        let resp: IngestBatchResponse =
+            runtime.block_on(api.ingest_batch(req)).map_err(|e| {
+                clap::Error::raw(
+                    clap::error::ErrorKind::Io,
+                    format!(
+                        "remote '{}' transport error after {} batch(es): {e}\n\
+                         Note: writes do not fall back to local.\n",
+                        remote_name, batches_sent
+                    ),
+                )
+            })?;
+
+        batches_sent += 1;
+
+        for file_result in resp.files {
+            match file_result.status.as_str() {
+                "ingested" => {
+                    ingested_count += 1;
+                    total_drawers_written += file_result.drawers_written;
+                }
+                "skipped_unchanged" => {
+                    skipped_count += 1;
+                }
+                _ => {
+                    failed_count += 1;
+                    failed_files.push((
+                        file_result.relative_path,
+                        file_result.error.unwrap_or_default(),
+                    ));
+                }
+            }
+        }
+
+        // Dedupe warnings.
+        for w in resp.warnings {
+            if !all_warnings.contains(&w) {
+                all_warnings.push(w);
+            }
+        }
+    }
+
+    // ── 8. Render summary ────────────────────────────────────────────────────
+    let output = render_remote_mine_summary(
+        source_dir,
+        remote_name,
+        &remote_url,
+        &wing,
+        &repo_id,
+        ingested_count,
+        skipped_count,
+        failed_count,
+        total_drawers_written,
+        &all_warnings,
+        &failed_files,
+        branch_warning.as_deref(),
+    );
+
+    Ok(CliOutput::success(output))
+}
+
+/// Split a flat list of [`IngestFileDto`] into batches bounded by
+/// [`REMOTE_BATCH_MAX_FILES`] files and [`REMOTE_BATCH_MAX_BYTES`] chunk text.
+fn build_remote_batches(
+    files: Vec<mempalace_federation::IngestFileDto>,
+) -> Vec<Vec<mempalace_federation::IngestFileDto>> {
+    let mut batches: Vec<Vec<mempalace_federation::IngestFileDto>> = Vec::new();
+    let mut current: Vec<mempalace_federation::IngestFileDto> = Vec::new();
+    let mut current_bytes: usize = 0;
+
+    for file in files {
+        let file_bytes: usize = file.chunks.iter().map(|c| c.text.len()).sum();
+
+        // An oversized single file goes alone in its own batch.
+        let would_overflow_bytes =
+            current_bytes + file_bytes > REMOTE_BATCH_MAX_BYTES && !current.is_empty();
+        let would_overflow_files = current.len() >= REMOTE_BATCH_MAX_FILES;
+
+        if would_overflow_bytes || would_overflow_files {
+            batches.push(std::mem::take(&mut current));
+            current_bytes = 0;
+        }
+
+        current_bytes += file_bytes;
+        current.push(file);
+    }
+
+    if !current.is_empty() {
+        batches.push(current);
+    }
+
+    batches
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_remote_mine_summary(
+    source_dir: &Path,
+    remote_name: &str,
+    remote_url: &str,
+    wing: &str,
+    repo_id: &str,
+    ingested_count: usize,
+    skipped_count: usize,
+    failed_count: usize,
+    drawers_written: usize,
+    warnings: &[String],
+    failed_files: &[(String, String)],
+    branch_warning: Option<&str>,
+) -> String {
+    let mut lines = vec![
+        format!("\n{}", "=".repeat(SEARCH_HEADER_WIDTH)),
+        "  Mine complete".to_owned(),
+        "=".repeat(SEARCH_HEADER_WIDTH),
+        "  Mode: projects (remote)".to_owned(),
+        format!("  Source: {}", source_dir.display()),
+        format!("  Remote: {remote_name} ({remote_url})"),
+        format!("  Wing: {wing}"),
+        format!("  Repo ID: {repo_id}"),
+        format!("  Files ingested: {ingested_count}"),
+        format!("  Files skipped unchanged: {skipped_count}"),
+        format!("  Files failed: {failed_count}"),
+        format!("  Drawers written: {drawers_written}"),
+    ];
+
+    if !warnings.is_empty() {
+        lines.push(String::new());
+        lines.push("  Warnings:".to_owned());
+        for w in warnings {
+            lines.push(format!("    - {w}"));
+        }
+    }
+
+    if let Some(bw) = branch_warning {
+        lines.push(format!("  {}", bw.trim()));
+    }
+
+    if !failed_files.is_empty() {
+        lines.push(String::new());
+        lines.push("  Failed files:".to_owned());
+        let cap = failed_files.len().min(10);
+        for (path, err) in failed_files.iter().take(cap) {
+            lines.push(format!("    {path}: {err}"));
+        }
+        if failed_files.len() > 10 {
+            lines.push(format!("    ... and {} more", failed_files.len() - 10));
+        }
+    }
+
+    lines.push(format!("{}\n", "=".repeat(SEARCH_HEADER_WIDTH)));
+    lines.join("\n")
+}
+
 fn execute_search<F, P>(
     query: &str,
     wing: Option<String>,
@@ -597,7 +970,7 @@ where
     let engine = runtime
         .block_on(StorageEngine::open(&config.palace_path, config.embedding_profile))
         .map_err(storage_error)?;
-    let mut provider = provider_factory(config.embedding_profile, default_embedding_cache_dir())
+    let provider = provider_factory(config.embedding_profile, default_embedding_cache_dir())
         .map_err(provider_error)?;
     let mut search = SearchRuntime::with_policy(
         provider,
@@ -832,7 +1205,7 @@ fn render_mine_summary(
         CliMode::Convos => "convos",
     };
 
-    [
+    let mut lines = vec![
         format!("\n{}", "=".repeat(SEARCH_HEADER_WIDTH)),
         "  Mine complete".to_owned(),
         "=".repeat(SEARCH_HEADER_WIDTH),
@@ -848,9 +1221,15 @@ fn render_mine_summary(
         format!("  Files ingested: {}", summary.ingested_files),
         format!("  Drawers written: {}", summary.drawers_written),
         format!("  Files truncated: {}", summary.truncated_files),
-        format!("{}\n", "=".repeat(SEARCH_HEADER_WIDTH)),
-    ]
-    .join("\n")
+    ];
+
+    // Only print when non-zero to preserve byte-parity with existing test output.
+    if summary.removed_sources > 0 {
+        lines.push(format!("  Sources removed: {}", summary.removed_sources));
+    }
+
+    lines.push(format!("{}\n", "=".repeat(SEARCH_HEADER_WIDTH)));
+    lines.join("\n")
 }
 
 fn deferred_command(command: &str) -> CliOutput {
@@ -1766,6 +2145,454 @@ mod tests {
         let result =
             fastembed_provider(EmbeddingProfile::Balanced, cache_root.path().to_path_buf());
         assert!(result.is_err());
+    }
+
+    // ─── --branch tests ──────────────────────────────────────────────────────
+
+    /// Initialize a bare git repo at `dir` with an initial commit on `main`.
+    fn git_init_repo(dir: &Path, files: &[(&str, &str)]) {
+        let run = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed in {}", dir.display());
+        };
+        run(&["init", "-b", "main"]);
+        run(&["config", "user.email", "test@test.com"]);
+        run(&["config", "user.name", "Test"]);
+        for (path, content) in files {
+            let full = dir.join(path);
+            if let Some(parent) = full.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(&full, content).unwrap();
+            run(&["add", path]);
+        }
+        run(&[
+            "-c", "user.email=test@test.com",
+            "-c", "user.name=Test",
+            "commit", "-m", "initial",
+        ]);
+    }
+
+    #[test]
+    fn mine_branch_e2e_ingests_delta_file() {
+        let workspace = tempdir().unwrap();
+        let repo_dir = workspace.path().join("repo");
+        fs::create_dir_all(&repo_dir).unwrap();
+
+        let base_content = "fn base() -> i32 { 42 }\n".repeat(20);
+        git_init_repo(
+            &repo_dir,
+            &[
+                ("mempalace.yaml", "wing: branchtest\nrooms:\n  - name: general\n"),
+                ("base.rs", &base_content),
+                ("stable.rs", "fn stable() -> &str { \"hello\" }\n"),
+            ],
+        );
+
+        // Create feature branch, modify one file.
+        let run_git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo_dir)
+                .status()
+                .unwrap();
+        };
+        run_git(&["checkout", "-b", "feature"]);
+        let changed = "fn base() -> i32 { 99 }\n".repeat(20);
+        fs::write(repo_dir.join("base.rs"), &changed).unwrap();
+
+        let config_root = temp_config_root("mine-branch-e2e");
+        let context = CliContext::for_tests(config_root.clone());
+
+        let output = run_cli(
+            ["mine", repo_dir.to_str().unwrap(), "--branch"],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+
+        assert_eq!(output.exit_code, 0, "branch mine failed: {:?}", output.stderr);
+        // The modified file (base.rs) must be counted as ingested.
+        assert!(
+            output.stdout.contains("Files ingested: 1"),
+            "expected 1 ingested file: {}",
+            output.stdout
+        );
+
+        // Second run after reverting to original should show Sources removed: 1.
+        fs::write(repo_dir.join("base.rs"), &base_content).unwrap();
+        let second = run_cli(
+            ["mine", repo_dir.to_str().unwrap(), "--branch"],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+        assert_eq!(second.exit_code, 0, "second branch mine failed: {:?}", second.stderr);
+        assert!(
+            second.stdout.contains("Sources removed: 1"),
+            "expected 'Sources removed: 1' after revert: {}",
+            second.stdout
+        );
+
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn mine_branch_outside_git_repo_fails_cleanly() {
+        let workspace = tempdir().unwrap();
+        // Non-git directory (no .git).
+        let project_dir = workspace.path().join("plain_project");
+        fs::create_dir_all(&project_dir).unwrap();
+        write_file(
+            &project_dir.join("mempalace.yaml"),
+            "wing: testproject\nrooms:\n  - name: general\n",
+        );
+        write_file(&project_dir.join("code.rs"), &"fn x() {}\n".repeat(20));
+
+        let config_root = temp_config_root("branch-no-git");
+        let context = CliContext::for_tests(config_root.clone());
+
+        let result = run_cli(
+            ["mine", project_dir.to_str().unwrap(), "--branch"],
+            &context,
+            stub_provider,
+        );
+
+        // Either a clap Err or an Ok with non-zero exit code — both count as failure.
+        match result {
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("git") || msg.contains("branch"),
+                    "error message should mention git: {msg}"
+                );
+            }
+            Ok(output) => {
+                assert_ne!(output.exit_code, 0, "should fail outside git repo");
+                assert!(
+                    output.stderr.contains("git") || output.stderr.contains("branch"),
+                    "error message should mention git: {}",
+                    output.stderr
+                );
+            }
+        }
+
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn mine_branch_with_convos_mode_fails() {
+        let workspace = tempdir().unwrap();
+        let convo_dir = setup_convo_fixture(workspace.path());
+        let config_root = temp_config_root("branch-convos");
+        let context = CliContext::for_tests(config_root.clone());
+
+        let output = run_cli(
+            [
+                "mine",
+                convo_dir.to_str().unwrap(),
+                "--mode",
+                "convos",
+                "--wing",
+                "talks",
+                "--branch",
+            ],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+
+        assert_ne!(output.exit_code, 0, "--branch + --mode convos should fail");
+        assert!(
+            output.stderr.contains("convos") || output.stderr.contains("projects"),
+            "error should mention mode restriction: {}",
+            output.stderr
+        );
+
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    // ─── Remote mine e2e tests ───────────────────────────────────────────────
+
+    /// Write a minimal token file into `dir` and return the path.
+    fn write_test_token_file(dir: &Path, token: &str) -> PathBuf {
+        let path = dir.join("tokens.json");
+        fs::write(
+            &path,
+            serde_json::to_string(&serde_json::json!([
+                {"token": token, "name": "test-user", "enabled": true}
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        path
+    }
+
+    /// Build a `MempalaceConfig` pointing at the given palace dir with stub embeddings.
+    fn remote_test_config(palace_dir: PathBuf, token_file: PathBuf) -> mempalace_config::MempalaceConfig {
+        use mempalace_config::{FederationRuntimeConfig, LowCpuRuntimeConfig, ServerRuntimeConfig};
+        mempalace_config::MempalaceConfig {
+            schema_version: 1,
+            collection_name: "mempalace_drawers".to_owned(),
+            palace_path: palace_dir,
+            embedding_profile: EmbeddingProfile::Balanced,
+            low_cpu: LowCpuRuntimeConfig::defaults_for_profile(EmbeddingProfile::Balanced),
+            server: ServerRuntimeConfig {
+                bind: "127.0.0.1:0".parse().unwrap(),
+                token_file,
+                checkouts: std::collections::BTreeMap::new(),
+            },
+            federation: FederationRuntimeConfig::default(),
+        }
+    }
+
+    /// Spawn a federation server in-process on an ephemeral port.
+    /// Returns the bound address.
+    fn spawn_test_server(palace_dir: PathBuf, token: &str) -> std::net::SocketAddr {
+        use mempalace_embeddings::DeterministicStubProvider;
+        use mempalace_server::{TokenRegistry, build_router};
+
+        let token_dir = tempfile::tempdir().unwrap();
+        let token_file = write_test_token_file(token_dir.path(), token);
+        let config = remote_test_config(palace_dir, token_file.clone());
+
+        // Build a dedicated tokio runtime to host the server.
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let tokens = rt.block_on(async { TokenRegistry::load(token_file).unwrap() });
+        let provider = DeterministicStubProvider::new(EmbeddingProfile::Balanced);
+        let router = rt.block_on(build_router(config, provider, tokens)).unwrap();
+
+        let listener =
+            rt.block_on(tokio::net::TcpListener::bind("127.0.0.1:0")).unwrap();
+        let addr = rt.block_on(async { listener.local_addr().unwrap() });
+
+        rt.spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        // Keep the runtime alive by leaking it — the test process owns it for its lifetime.
+        std::mem::forget(rt);
+        // Keep token_dir alive too.
+        std::mem::forget(token_dir);
+
+        addr
+    }
+
+    /// Write a CLI config.json with federation remotes pointing at `server_url`,
+    /// with an inline `token`. Also writes a per-project mempalace.yaml.
+    fn write_remote_cli_config(
+        config_dir: &Path,
+        remote_name: &str,
+        server_url: &str,
+        inline_token: &str,
+        wing_name: &str,
+        project_dir: &Path,
+    ) {
+        fs::create_dir_all(config_dir).unwrap();
+        // Use inline token (not token_env) to avoid unsafe set_var in Rust 2024.
+        let config_json = serde_json::json!({
+            "version": 1,
+            "federation": {
+                "remotes": [{"name": remote_name, "url": server_url, "token": inline_token}],
+                "wings": {
+                    wing_name: {"mode": "remote", "remote": remote_name}
+                }
+            }
+        });
+        fs::write(
+            config_dir.join("config.json"),
+            serde_json::to_string_pretty(&config_json).unwrap(),
+        )
+        .unwrap();
+
+        // Write the project config.
+        let yaml = format!(
+            "wing: {wing_name}\nrooms:\n  - name: general\n    description: General files\n"
+        );
+        fs::write(project_dir.join("mempalace.yaml"), yaml).unwrap();
+    }
+
+    #[test]
+    fn mine_remote_routed_e2e_ingests_to_server() {
+        const TOKEN: &str = "remote-mine-e2e-tok-001";
+        let workspace = tempdir().unwrap();
+
+        // Server palace dir.
+        let server_palace = workspace.path().join("server-palace");
+        fs::create_dir_all(&server_palace).unwrap();
+
+        let addr = spawn_test_server(server_palace.clone(), TOKEN);
+        let server_url = format!("http://{addr}");
+
+        // Project dir.
+        let project_dir = workspace.path().join("myproject");
+        fs::create_dir_all(&project_dir).unwrap();
+        write_file(
+            &project_dir.join("backend/auth.rs"),
+            "Auth login flow keeps auth checks in the backend service.\n"
+                .repeat(5)
+                .as_str(),
+        );
+        write_file(
+            &project_dir.join("docs/roadmap.md"),
+            "Roadmap plan tracks the migration milestones.\n".repeat(5).as_str(),
+        );
+
+        // CLI config dir.
+        let config_root = temp_config_root("remote-mine-e2e");
+        let wing_name = "wing_myproject";
+        let remote_name = "hub";
+        write_remote_cli_config(
+            &config_root,
+            remote_name,
+            &server_url,
+            TOKEN,
+            wing_name,
+            &project_dir,
+        );
+
+        let context = CliContext::for_tests(config_root.clone());
+        let output = run_cli(
+            ["mine", project_dir.to_str().unwrap()],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+
+        assert_eq!(output.exit_code, 0, "remote mine failed: stderr={:?}", output.stderr);
+        assert!(
+            output.stdout.contains("Remote:"),
+            "summary must show 'Remote:': {}",
+            output.stdout
+        );
+        assert!(
+            output.stdout.contains("Files ingested:"),
+            "summary must show ingested count: {}",
+            output.stdout
+        );
+        // Files ingested must be > 0.
+        let ingested_line =
+            output.stdout.lines().find(|l| l.contains("Files ingested:")).unwrap_or("");
+        let ingested_n: usize =
+            ingested_line.split(':').last().unwrap_or("0").trim().parse().unwrap_or(0);
+        assert!(ingested_n > 0, "should have ingested at least 1 file: {}", output.stdout);
+
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn mine_remote_dry_run_prints_plan_without_server() {
+        // No server running; dry-run should succeed without network.
+        let workspace = tempdir().unwrap();
+        let project_dir = workspace.path().join("dryrunproject");
+        fs::create_dir_all(&project_dir).unwrap();
+        write_file(
+            &project_dir.join("code.rs"),
+            "fn example() -> bool { true }\n".repeat(10).as_str(),
+        );
+
+        let config_root = temp_config_root("remote-dry-run");
+        let wing_name = "wing_dryrunproject";
+        let remote_name = "hub";
+        // Port 1 is not bindable, so any real connection would fail — but we're dry-run.
+        let server_url = "http://127.0.0.1:1";
+        write_remote_cli_config(
+            &config_root,
+            remote_name,
+            server_url,
+            "dryrun-tok",
+            wing_name,
+            &project_dir,
+        );
+
+        let context = CliContext::for_tests(config_root.clone());
+        let output = run_cli(
+            ["mine", project_dir.to_str().unwrap(), "--dry-run"],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+
+        assert_eq!(output.exit_code, 0, "dry-run should succeed without server: {:?}", output);
+        assert!(
+            output.stdout.contains("dry run"),
+            "dry-run output should say 'dry run': {}",
+            output.stdout
+        );
+        assert!(
+            output.stdout.contains("Remote:") || output.stdout.contains("remote"),
+            "dry-run output should mention remote: {}",
+            output.stdout
+        );
+        assert!(
+            output.stdout.contains("Files to send:"),
+            "dry-run output should mention file count: {}",
+            output.stdout
+        );
+
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn mine_remote_unreachable_fails_with_no_fallback_message() {
+        let workspace = tempdir().unwrap();
+        let project_dir = workspace.path().join("unreachableproject");
+        fs::create_dir_all(&project_dir).unwrap();
+        write_file(
+            &project_dir.join("code.rs"),
+            "fn example() -> bool { true }\n".repeat(10).as_str(),
+        );
+
+        let config_root = temp_config_root("remote-unreachable");
+        let wing_name = "wing_unreachableproject";
+        let remote_name = "hub";
+        // Port 1 is not bindable — any connection will fail immediately.
+        let server_url = "http://127.0.0.1:1";
+        write_remote_cli_config(
+            &config_root,
+            remote_name,
+            server_url,
+            "unreachable-tok",
+            wing_name,
+            &project_dir,
+        );
+
+        let context = CliContext::for_tests(config_root.clone());
+        let result = run_cli(
+            ["mine", project_dir.to_str().unwrap()],
+            &context,
+            stub_provider,
+        );
+
+        // Should fail (either Err or exit_code != 0) and the message must say
+        // the remote is unreachable with no local fallback.
+        match result {
+            Err(error) => {
+                let msg = error.to_string();
+                assert!(
+                    msg.contains("unreachable") && msg.contains("local"),
+                    "error should mention unreachable and no local fallback: {msg}"
+                );
+            }
+            Ok(output) => {
+                assert_ne!(output.exit_code, 0, "should fail when remote unreachable");
+                assert!(
+                    output.stderr.contains("unreachable") && output.stderr.contains("local"),
+                    "error should mention unreachable and no local fallback: {}",
+                    output.stderr
+                );
+            }
+        }
+
+        remove_dir_all_if_exists(&config_root);
     }
 
     #[test]

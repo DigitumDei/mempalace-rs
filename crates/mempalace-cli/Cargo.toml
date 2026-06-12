@@ -14,6 +14,7 @@ mempalace-core = { path = "../mempalace-core" }
 mempalace-ingest = { path = "../mempalace-ingest" }
 mempalace-embeddings = { path = "../mempalace-embeddings" }
 mempalace-federation = { path = "../mempalace-federation" }
+mempalace-remote = { path = "../mempalace-remote" }
 mempalace-search = { path = "../mempalace-search" }
 mempalace-server = { path = "../mempalace-server" }
 mempalace-storage = { path = "../mempalace-storage" }

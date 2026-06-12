@@ -3899,8 +3899,10 @@ dependencies = [
 name = "mempalace-core"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "time",
 ]
@@ -3962,7 +3964,6 @@ dependencies = [
 name = "mempalace-ingest"
 version = "0.1.0"
 dependencies = [
- "blake3",
  "mempalace-config",
  "mempalace-core",
  "mempalace-embeddings",
@@ -4029,6 +4030,8 @@ dependencies = [
  "mempalace-dialect",
  "mempalace-embeddings",
  "mempalace-storage",
+ "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "time",
  "tokio",

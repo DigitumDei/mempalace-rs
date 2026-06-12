@@ -16,7 +16,7 @@ mempalace-storage = { path = "../mempalace-storage" }
 mempalace-federation = { path = "../mempalace-federation" }
 
 axum = { version = "0.8", default-features = true }
-blake3 = "1.8.2"
+blake3.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 subtle = "2.6"

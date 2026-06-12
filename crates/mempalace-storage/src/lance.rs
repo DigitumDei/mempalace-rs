@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use arrow_array::{
     Array, ArrayRef, Date32Array, FixedSizeListArray, Float32Array, RecordBatch,
-    RecordBatchIterator, StringArray, TimestampMicrosecondArray, UInt32Array, cast::AsArray,
-    types::Float32Type,
+    RecordBatchIterator, StringArray, TimestampMicrosecondArray, UInt32Array, UInt64Array,
+    cast::AsArray, types::Float32Type,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use async_trait::async_trait;
@@ -14,6 +14,7 @@ use lancedb::connection::Connection;
 use lancedb::database::CreateTableMode;
 use lancedb::index::Index;
 use lancedb::query::{ExecutableQuery, QueryBase};
+use lancedb::table::NewColumnTransform;
 use time::{Date, OffsetDateTime};
 
 use crate::error::{Result, StorageError};
@@ -72,6 +73,16 @@ impl LanceDrawerStore {
             Field::new("weight", DataType::Float32, true),
             Field::new("content", DataType::Utf8, false),
             Field::new("content_hash", DataType::Utf8, false),
+            // Locator columns (nullable; absent in old tables — migrated by ensure_schema).
+            // UInt64 is stored as arrow UInt64 (BIGINT UNSIGNED in DataFusion SQL).
+            // UInt32 is stored as arrow UInt32 (INT UNSIGNED in DataFusion SQL).
+            Field::new("locator_byte_start", DataType::UInt64, true),
+            Field::new("locator_byte_end", DataType::UInt64, true),
+            Field::new("locator_line_start", DataType::UInt32, true),
+            Field::new("locator_line_end", DataType::UInt32, true),
+            Field::new("locator_file_hash", DataType::Utf8, true),
+            Field::new("locator_resolve_root", DataType::Utf8, true),
+            Field::new("locator_commit", DataType::Utf8, true),
             Field::new(
                 "embedding",
                 DataType::FixedSizeList(
@@ -187,11 +198,61 @@ impl DrawerStore for LanceDrawerStore {
     async fn ensure_schema(&self) -> Result<()> {
         let connection = self.connect().await?;
         let schema = self.schema();
-        let table = connection
-            .create_empty_table(DRAWERS_TABLE, schema)
-            .mode(CreateTableMode::exist_ok(|request| request))
-            .execute()
-            .await?;
+
+        // Open the existing table or create a new empty one. We open first instead of
+        // creating with ExistOk directly because lancedb 0.23.1 validates schema
+        // equality in ExistOk mode, which would fail for old tables that predate the
+        // locator columns. On the create path ExistOk is safe: a concurrent creator
+        // uses this same (new) schema, so the equality check passes.
+        let table = match connection.open_table(DRAWERS_TABLE).execute().await {
+            Ok(existing) => existing,
+            Err(lancedb::error::Error::TableNotFound { .. }) => {
+                connection
+                    .create_empty_table(DRAWERS_TABLE, schema.clone())
+                    .mode(CreateTableMode::exist_ok(|request| request))
+                    .execute()
+                    .await?
+            }
+            Err(err) => return Err(err.into()),
+        };
+
+        // Migrate: compute columns present in expected schema but missing from the table.
+        // This is idempotent and handles old tables that predate the locator columns.
+        // SQL type expressions are picked below based on the Arrow DataType.
+        let existing_fields: std::collections::HashSet<String> = table
+            .schema()
+            .await?
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+
+        // Lance/DataFusion SQL type names (verified against lance-datafusion-1.0.1/src/planner.rs):
+        //   UInt64 → "BIGINT UNSIGNED"
+        //   UInt32 → "INT UNSIGNED"
+        //   Utf8   → "STRING"  (VARCHAR(None) is NOT accepted; "string" is listed as supported)
+        let missing_columns: Vec<(String, String)> = schema
+            .fields()
+            .iter()
+            .filter(|f| !existing_fields.contains(f.name()))
+            .map(|f| {
+                let sql_expr = match f.data_type() {
+                    DataType::UInt64 => "CAST(NULL AS BIGINT UNSIGNED)".to_owned(),
+                    DataType::UInt32 => "CAST(NULL AS INT UNSIGNED)".to_owned(),
+                    DataType::Utf8 => "CAST(NULL AS STRING)".to_owned(),
+                    _ => "NULL".to_owned(),
+                };
+                (f.name().clone(), sql_expr)
+            })
+            .collect();
+
+        if !missing_columns.is_empty() {
+            table
+                .add_columns(NewColumnTransform::SqlExpressions(missing_columns), None)
+                .await
+                .map_err(|err| StorageError::Invariant(format!("schema migration failed: {err}")))?;
+        }
+
         self.ensure_indices(&table).await?;
         Ok(())
     }
@@ -376,6 +437,54 @@ fn drawers_to_reader(
             Arc::new(StringArray::from(
                 drawers.iter().map(|drawer| Some(drawer.content_hash.as_str())).collect::<Vec<_>>(),
             )),
+            // Locator columns — None for non-locator rows.
+            Arc::new(UInt64Array::from(
+                drawers
+                    .iter()
+                    .map(|drawer| drawer.locator.as_ref().map(|loc| loc.byte_start))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt64Array::from(
+                drawers
+                    .iter()
+                    .map(|drawer| drawer.locator.as_ref().map(|loc| loc.byte_end))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt32Array::from(
+                drawers
+                    .iter()
+                    .map(|drawer| drawer.locator.as_ref().map(|loc| loc.line_start))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt32Array::from(
+                drawers
+                    .iter()
+                    .map(|drawer| drawer.locator.as_ref().map(|loc| loc.line_end))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                drawers
+                    .iter()
+                    .map(|drawer| drawer.locator.as_ref().map(|loc| loc.file_hash.as_str()))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                drawers
+                    .iter()
+                    .map(|drawer| drawer.locator.as_ref().map(|loc| loc.resolve_root.as_str()))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                drawers
+                    .iter()
+                    .map(|drawer| {
+                        drawer
+                            .locator
+                            .as_ref()
+                            .and_then(|loc| loc.commit_hash.as_deref())
+                    })
+                    .collect::<Vec<_>>(),
+            )),
             Arc::new(FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
                 drawers.iter().map(|drawer| {
                     Some(drawer.embedding.iter().copied().map(Some).collect::<Vec<_>>())
@@ -485,6 +594,30 @@ fn records_from_batches(batches: &[RecordBatch]) -> Result<Vec<DrawerRecord>> {
             .column_by_name("content_hash")
             .ok_or_else(|| StorageError::Invariant("missing `content_hash` column".to_owned()))?
             .as_string::<i32>();
+        // Locator columns are optional (absent from tables created before schema migration).
+        // Treat the whole group as absent (locator = None) when any required column is missing.
+        let locator_byte_start =
+            batch.column_by_name("locator_byte_start").map(|col| {
+                col.as_primitive::<arrow_array::types::UInt64Type>()
+            });
+        let locator_byte_end =
+            batch.column_by_name("locator_byte_end").map(|col| {
+                col.as_primitive::<arrow_array::types::UInt64Type>()
+            });
+        let locator_line_start =
+            batch.column_by_name("locator_line_start").map(|col| {
+                col.as_primitive::<arrow_array::types::UInt32Type>()
+            });
+        let locator_line_end =
+            batch.column_by_name("locator_line_end").map(|col| {
+                col.as_primitive::<arrow_array::types::UInt32Type>()
+            });
+        let locator_file_hash =
+            batch.column_by_name("locator_file_hash").map(|col| col.as_string::<i32>());
+        let locator_resolve_root =
+            batch.column_by_name("locator_resolve_root").map(|col| col.as_string::<i32>());
+        let locator_commit =
+            batch.column_by_name("locator_commit").map(|col| col.as_string::<i32>());
         let embedding = batch
             .column_by_name("embedding")
             .ok_or_else(|| StorageError::Invariant("missing `embedding` column".to_owned()))?
@@ -517,10 +650,60 @@ fn records_from_batches(batches: &[RecordBatch]) -> Result<Vec<DrawerRecord>> {
                 content: content.value(row).to_owned(),
                 content_hash: content_hash.value(row).to_owned(),
                 embedding: vector.into_iter().flatten().collect(),
+                locator: build_locator(
+                    row,
+                    locator_byte_start,
+                    locator_byte_end,
+                    locator_line_start,
+                    locator_line_end,
+                    locator_file_hash,
+                    locator_resolve_root,
+                    locator_commit,
+                ),
             });
         }
     }
     Ok(records)
+}
+
+/// Reconstruct a [`SourceLocator`] from optional column arrays at the given row index.
+///
+/// Returns `Some` only when all four required fields (byte_start, byte_end, line_start,
+/// line_end, file_hash, resolve_root) are non-null. commit_hash is always optional.
+/// When any required column is entirely absent (old table, pre-migration) the callers
+/// pass `None` slices and we return `None`.
+fn build_locator(
+    row: usize,
+    byte_start: Option<&arrow_array::PrimitiveArray<arrow_array::types::UInt64Type>>,
+    byte_end: Option<&arrow_array::PrimitiveArray<arrow_array::types::UInt64Type>>,
+    line_start: Option<&arrow_array::PrimitiveArray<arrow_array::types::UInt32Type>>,
+    line_end: Option<&arrow_array::PrimitiveArray<arrow_array::types::UInt32Type>>,
+    file_hash: Option<&arrow_array::StringArray>,
+    resolve_root: Option<&arrow_array::StringArray>,
+    commit: Option<&arrow_array::StringArray>,
+) -> Option<mempalace_core::SourceLocator> {
+    let bs = byte_start.filter(|col| !col.is_null(row)).map(|col| col.value(row))?;
+    let be = byte_end.filter(|col| !col.is_null(row)).map(|col| col.value(row))?;
+    let ls = line_start.filter(|col| !col.is_null(row)).map(|col| col.value(row))?;
+    let le = line_end.filter(|col| !col.is_null(row)).map(|col| col.value(row))?;
+    let fh = file_hash
+        .filter(|col| !col.is_null(row))
+        .map(|col| col.value(row).to_owned())?;
+    let rr = resolve_root
+        .filter(|col| !col.is_null(row))
+        .map(|col| col.value(row).to_owned())?;
+    let ch = commit
+        .filter(|col| !col.is_null(row))
+        .map(|col| col.value(row).to_owned());
+    Some(mempalace_core::SourceLocator {
+        byte_start: bs,
+        byte_end: be,
+        line_start: ls,
+        line_end: le,
+        file_hash: fh,
+        resolve_root: rr,
+        commit_hash: ch,
+    })
 }
 
 fn matches_from_batches(batches: &[RecordBatch]) -> Result<Vec<DrawerMatch>> {
@@ -607,6 +790,7 @@ mod tests {
             content: format!("payload-{id}"),
             content_hash: format!("hash-{id}"),
             embedding: embedding(seed),
+            locator: None,
         }
     }
 
@@ -821,5 +1005,209 @@ mod tests {
 
         let reopened = LanceDrawerStore::new(&root, EmbeddingProfile::Balanced);
         reopened.ensure_schema().await.unwrap();
+    }
+
+    /// Back-compat: an old table (schema without locator columns) must be migrated
+    /// transparently by `ensure_schema`. Old rows read back with `locator: None`
+    /// and intact content; new locator rows write and read back fully.
+    #[tokio::test]
+    async fn schema_migration_adds_locator_columns_to_old_table() {
+        use std::sync::Arc as StdArc;
+
+        use arrow_array::{
+            Date32Array, FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator,
+            StringArray, TimestampMicrosecondArray, UInt32Array,
+        };
+        use arrow_schema::{DataType, Field, Schema, TimeUnit};
+        use lancedb::database::CreateTableMode;
+        use mempalace_core::SourceLocator;
+
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path().join("lance_legacy");
+        let dim = EmbeddingProfile::Balanced.metadata().dimensions as i32;
+
+        // Build the OLD schema (no locator columns).
+        let old_schema = StdArc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("wing", DataType::Utf8, false),
+            Field::new("room", DataType::Utf8, false),
+            Field::new("hall", DataType::Utf8, true),
+            Field::new("date", DataType::Date32, true),
+            Field::new("source_file", DataType::Utf8, false),
+            Field::new("chunk_index", DataType::UInt32, false),
+            Field::new("ingest_mode", DataType::Utf8, false),
+            Field::new("extract_mode", DataType::Utf8, true),
+            Field::new("added_by", DataType::Utf8, false),
+            Field::new(
+                "filed_at",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                false,
+            ),
+            Field::new("importance", DataType::Float32, true),
+            Field::new("emotional_weight", DataType::Float32, true),
+            Field::new("weight", DataType::Float32, true),
+            Field::new("content", DataType::Utf8, false),
+            Field::new("content_hash", DataType::Utf8, false),
+            Field::new(
+                "embedding",
+                DataType::FixedSizeList(
+                    StdArc::new(Field::new("item", DataType::Float32, true)),
+                    dim,
+                ),
+                true,
+            ),
+        ]));
+
+        // Create an old-format table and insert one row directly via lancedb.
+        std::fs::create_dir_all(&root).unwrap();
+        let conn = lancedb::connect(root.to_string_lossy().as_ref()).execute().await.unwrap();
+        let old_table = conn
+            .create_empty_table("drawers", old_schema.clone())
+            .mode(CreateTableMode::exist_ok(|r| r))
+            .execute()
+            .await
+            .unwrap();
+
+        let legacy_content = "legacy chunk text";
+        let filed_at_us: i64 = 1_744_365_600_000_000; // some fixed µs timestamp
+        let embed_vals: Vec<Option<f32>> =
+            (0..dim as usize).map(|i| Some((i as f32) * 0.001)).collect();
+        let old_batch = RecordBatch::try_new(
+            old_schema.clone(),
+            vec![
+                StdArc::new(StringArray::from(vec![Some("leg/room/0001")])),
+                StdArc::new(StringArray::from(vec![Some("leg")])),
+                StdArc::new(StringArray::from(vec![Some("room")])),
+                StdArc::new(StringArray::from(vec![None::<&str>])),
+                StdArc::new(Date32Array::from(vec![None::<i32>])),
+                StdArc::new(StringArray::from(vec![Some("legacy.txt")])),
+                StdArc::new(UInt32Array::from(vec![0_u32])),
+                StdArc::new(StringArray::from(vec![Some("legacy_ingest")])),
+                StdArc::new(StringArray::from(vec![None::<&str>])),
+                StdArc::new(StringArray::from(vec![Some("tester")])),
+                StdArc::new(
+                    TimestampMicrosecondArray::from(vec![filed_at_us]).with_timezone("UTC"),
+                ),
+                StdArc::new(Float32Array::from(vec![None::<f32>])),
+                StdArc::new(Float32Array::from(vec![None::<f32>])),
+                StdArc::new(Float32Array::from(vec![None::<f32>])),
+                StdArc::new(StringArray::from(vec![Some(legacy_content)])),
+                StdArc::new(StringArray::from(vec![Some("legacy-hash")])),
+                StdArc::new(FixedSizeListArray::from_iter_primitive::<
+                    arrow_array::types::Float32Type,
+                    _,
+                    _,
+                >(std::iter::once(Some(embed_vals)), dim)),
+            ],
+        )
+        .unwrap();
+        old_table
+            .add(RecordBatchIterator::new(
+                vec![Ok(old_batch)].into_iter(),
+                old_schema,
+            ))
+            .execute()
+            .await
+            .unwrap();
+
+        // Now open via the new store — ensure_schema must migrate the table.
+        let store = LanceDrawerStore::new(&root, EmbeddingProfile::Balanced);
+        store.ensure_schema().await.unwrap();
+
+        // Old row must read back with locator: None and intact content.
+        let rows = store
+            .list_drawers(&DrawerFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].content, legacy_content);
+        assert!(rows[0].locator.is_none(), "legacy row must have locator: None");
+
+        // Write a new row with a locator (commit_hash Some).
+        let locator_with_commit = SourceLocator {
+            byte_start: 10,
+            byte_end: 20,
+            line_start: 1,
+            line_end: 2,
+            file_hash: "abc123".to_owned(),
+            resolve_root: "/checkout".to_owned(),
+            commit_hash: Some("deadbeef".to_owned()),
+        };
+        let new_row = DrawerRecord {
+            id: DrawerId::new("loc/room/0002").unwrap(),
+            wing: WingId::new("loc").unwrap(),
+            room: RoomId::new("room").unwrap(),
+            hall: None,
+            date: None,
+            source_file: "new.rs".to_owned(),
+            chunk_index: 0,
+            ingest_mode: "mine".to_owned(),
+            extract_mode: None,
+            added_by: "tester".to_owned(),
+            filed_at: time::macros::datetime!(2026-06-01 00:00:00 UTC),
+            importance: None,
+            emotional_weight: None,
+            weight: None,
+            content: String::new(),
+            content_hash: "newhash".to_owned(),
+            embedding: embedding([0.1, 0.2, 0.3, 0.4]),
+            locator: Some(locator_with_commit.clone()),
+        };
+        store.put_drawers(&[new_row], DuplicateStrategy::Error).await.unwrap();
+
+        let fetched = store
+            .get_drawer(&DrawerId::new("loc/room/0002").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let loc = fetched.locator.as_ref().unwrap();
+        assert_eq!(loc.byte_start, 10);
+        assert_eq!(loc.byte_end, 20);
+        assert_eq!(loc.line_start, 1);
+        assert_eq!(loc.line_end, 2);
+        assert_eq!(loc.file_hash, "abc123");
+        assert_eq!(loc.resolve_root, "/checkout");
+        assert_eq!(loc.commit_hash.as_deref(), Some("deadbeef"));
+
+        // Write another new row with locator but commit_hash None.
+        let locator_no_commit = SourceLocator {
+            byte_start: 0,
+            byte_end: 5,
+            line_start: 1,
+            line_end: 1,
+            file_hash: "fff".to_owned(),
+            resolve_root: "/root2".to_owned(),
+            commit_hash: None,
+        };
+        let row_no_commit = DrawerRecord {
+            id: DrawerId::new("loc/room/0003").unwrap(),
+            wing: WingId::new("loc").unwrap(),
+            room: RoomId::new("room").unwrap(),
+            hall: None,
+            date: None,
+            source_file: "other.rs".to_owned(),
+            chunk_index: 0,
+            ingest_mode: "mine".to_owned(),
+            extract_mode: None,
+            added_by: "tester".to_owned(),
+            filed_at: time::macros::datetime!(2026-06-01 01:00:00 UTC),
+            importance: None,
+            emotional_weight: None,
+            weight: None,
+            content: String::new(),
+            content_hash: "otherhash".to_owned(),
+            embedding: embedding([0.2, 0.3, 0.4, 0.5]),
+            locator: Some(locator_no_commit),
+        };
+        store.put_drawers(&[row_no_commit], DuplicateStrategy::Error).await.unwrap();
+
+        let fetched2 = store
+            .get_drawer(&DrawerId::new("loc/room/0003").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let loc2 = fetched2.locator.as_ref().unwrap();
+        assert_eq!(loc2.commit_hash, None, "commit_hash should round-trip as None");
+        assert_eq!(loc2.file_hash, "fff");
     }
 }

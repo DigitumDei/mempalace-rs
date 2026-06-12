@@ -6,12 +6,14 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+blake3.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 time.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
+tempfile = "3.23.0"
 
 [lints]
 workspace = true

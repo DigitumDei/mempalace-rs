@@ -79,6 +79,11 @@ pub struct RemoteDrawerResult {
     /// Agent name recorded at ingest time.
     #[serde(default)]
     pub added_by: Option<String>,
+    /// True when the drawer's mined source file changed since mining
+    /// (locator-backed rows).  Absent unless true; `serde(default)` keeps old
+    /// servers/clients wire-compatible.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stale: bool,
 }
 
 // ─── Add drawer ───────────────────────────────────────────────────────────────
@@ -316,6 +321,7 @@ mod tests {
                 content_hash: None,
                 filed_at: None,
                 added_by: None,
+                stale: false,
             }],
         };
         let json = serde_json::to_string(&original).unwrap();

@@ -345,7 +345,7 @@
     }
   },
   "mempalace_search": {
-    "description": "Semantic search. Returns verbatim drawer content with similarity scores.",
+    "description": "Semantic search. Returns verbatim drawer content with similarity scores. Results from mined files include `stale: true` when the source file changed since mining.",
     "input_schema": {
       "properties": {
         "limit": {

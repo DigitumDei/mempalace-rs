@@ -735,6 +735,7 @@ mod tests {
             content: content.to_owned(),
             content_hash: format!("hash-{id}"),
             embedding: vec![0.0; 384],
+            locator: None,
         }
     }
 

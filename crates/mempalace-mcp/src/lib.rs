@@ -358,7 +358,7 @@ impl ToolName {
             },
             Self::Search => ToolDefinition {
                 name: self.as_str(),
-                description: "Semantic search. Returns verbatim drawer content with similarity scores.",
+                description: "Semantic search. Returns verbatim drawer content with similarity scores. Results from mined files include `stale: true` when the source file changed since mining.",
                 input_schema: json!({
                     "type":"object",
                     "properties":{
@@ -1021,7 +1021,7 @@ where
                         .map_tool()?
                         .into_iter()
                         .map(|result| {
-                            json!({
+                            let mut obj = json!({
                                 "wing": result.wing,
                                 "room": result.room,
                                 "similarity": round_similarity(result.score),
@@ -1029,7 +1029,11 @@ where
                                 "source_file": result.source_file,
                                 "content_hash": hash_text(&result.content),
                                 "origin": "local",
-                            })
+                            });
+                            if result.stale {
+                                obj["stale"] = json!(true);
+                            }
+                            obj
                         })
                         .collect()
                 } else {
@@ -1062,13 +1066,19 @@ where
                 "wing": wing.map(|value| value.to_string()),
                 "room": room.map(|value| value.to_string()),
             },
-            "results": results.into_iter().map(|result| json!({
-                "wing": result.wing,
-                "room": result.room,
-                "similarity": round_similarity(result.score),
-                "text": result.content,
-                "source_file": result.source_file,
-            })).collect::<Vec<_>>()
+            "results": results.into_iter().map(|result| {
+                let mut obj = json!({
+                    "wing": result.wing,
+                    "room": result.room,
+                    "similarity": round_similarity(result.score),
+                    "text": result.content,
+                    "source_file": result.source_file,
+                });
+                if result.stale {
+                    obj["stale"] = json!(true);
+                }
+                obj
+            }).collect::<Vec<_>>()
         });
         Ok(payload)
     }
@@ -1687,6 +1697,7 @@ where
             content: content.clone(),
             content_hash: hash_text(&content),
             embedding,
+            locator: None,
         })
     }
 
@@ -2169,7 +2180,7 @@ fn generated_drawer_id(
 }
 
 fn hash_text(content: &str) -> String {
-    blake3::hash(content.as_bytes()).to_hex().to_string()
+    mempalace_core::hash_text(content)
 }
 
 fn infer_entity_kind(name: &str) -> EntityKind {
@@ -2372,6 +2383,7 @@ mod tests {
             content: content.to_owned(),
             content_hash: hash_text(content),
             embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
+            locator: None,
         }
     }
 
@@ -2436,6 +2448,7 @@ mod tests {
                     "Code notes: auth-migration keeps search filter semantics exact while storage changes underneath.",
                 ),
                 embedding: vec![1.0; EmbeddingProfile::Balanced.metadata().dimensions],
+                locator: None,
             },
             DrawerRecord {
                 id: DrawerId::new("wing_team/auth-migration/0001").unwrap(),
@@ -2457,6 +2470,7 @@ mod tests {
                     "The team decided the auth-migration must preserve CLI and MCP parity.",
                 ),
                 embedding: vec![1.0; EmbeddingProfile::Balanced.metadata().dimensions],
+                locator: None,
             },
         ];
         runtime
@@ -2555,6 +2569,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_tool_resolves_locator_rows_and_marks_stale_only_when_changed() {
+        let harness = test_harness().await;
+
+        // A real mined file on disk; one fresh locator row and one with a
+        // mismatched file hash (simulating a file changed since mining).
+        let mined_dir = TempDir::new().unwrap();
+        let file_path = mined_dir.path().join("mined.rs");
+        let file_body = b"auth migration parity chunk lives right here in the mined file";
+        std::fs::write(&file_path, file_body).unwrap();
+        let resolve_root = mined_dir.path().to_string_lossy().into_owned();
+
+        let make_row = |id: &str, room: &str, file_hash: String| DrawerRecord {
+            id: DrawerId::new(id).unwrap(),
+            wing: WingId::new("wing_mined").unwrap(),
+            room: RoomId::new(room).unwrap(),
+            hall: None,
+            date: None,
+            source_file: "mined.rs".to_owned(),
+            chunk_index: 0,
+            ingest_mode: "projects".to_owned(),
+            extract_mode: None,
+            added_by: "tests".to_owned(),
+            filed_at: datetime!(2026-04-11 09:00:00 UTC),
+            importance: None,
+            emotional_weight: None,
+            weight: None,
+            content: String::new(),
+            content_hash: hash_text("auth migration parity"),
+            embedding: vec![1.0; EmbeddingProfile::Balanced.metadata().dimensions],
+            locator: Some(mempalace_core::SourceLocator {
+                byte_start: 0,
+                byte_end: 21, // "auth migration parity"
+                line_start: 1,
+                line_end: 1,
+                file_hash,
+                resolve_root: resolve_root.clone(),
+                commit_hash: None,
+            }),
+        };
+
+        let fresh =
+            make_row("wing_mined/fresh/0001", "fresh", mempalace_core::hash_bytes(file_body));
+        let stale = make_row("wing_mined/stale/0001", "stale", "not-the-right-hash".to_owned());
+        {
+            let runtime = harness.server.runtime.lock().await;
+            runtime
+                .storage
+                .drawer_store()
+                .put_drawers(&[fresh, stale], DuplicateStrategy::Error)
+                .await
+                .unwrap();
+        }
+
+        let response = harness
+            .server
+            .handle_request(tool_call(
+                7,
+                "mempalace_search",
+                json!({"query":"auth migration parity","limit":10}),
+            ))
+            .await;
+        let payload = decode_tool_payload(&response).unwrap();
+        let results = payload["results"].as_array().unwrap();
+
+        let fresh_result =
+            results.iter().find(|r| r["room"] == "fresh").expect("fresh locator row in results");
+        assert_eq!(fresh_result["text"], "auth migration parity");
+        assert!(
+            fresh_result.get("stale").is_none(),
+            "fresh row must not carry a stale key: {fresh_result}"
+        );
+
+        let stale_result =
+            results.iter().find(|r| r["room"] == "stale").expect("stale locator row in results");
+        assert_eq!(stale_result["stale"], json!(true));
+        // Best-effort text still resolves from the current (in-bounds) file bytes.
+        assert_eq!(stale_result["text"], "auth migration parity");
+    }
+
+    #[tokio::test]
     async fn search_tool_clamps_results_under_low_cpu_config() {
         let harness = test_harness_with_config(
             LowCpuRuntimeConfig {
@@ -2627,6 +2721,7 @@ mod tests {
                     content: content.to_owned(),
                     content_hash: hash_text(content),
                     embedding,
+                    locator: None,
                 }],
                 DuplicateStrategy::Error,
             )
@@ -3163,6 +3258,7 @@ mod tests {
             content: "SESSION:legacy-collapsed".to_owned(),
             content_hash: hash_text("SESSION:legacy-collapsed"),
             embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
+            locator: None,
         };
         let runtime = harness.server.runtime.lock().await;
         runtime
@@ -3554,6 +3650,7 @@ mod tests {
             content: "SESSION:legacy".to_owned(),
             content_hash: hash_text("SESSION:legacy"),
             embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
+            locator: None,
         };
         let colliding_other_agent_drawer = DrawerRecord {
             id: DrawerId::new("diary_worker_one_colliding_agent").unwrap(),
@@ -3573,6 +3670,7 @@ mod tests {
             content: "SESSION:other-agent".to_owned(),
             content_hash: hash_text("SESSION:other-agent"),
             embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
+            locator: None,
         };
         let runtime = harness.server.runtime.lock().await;
         runtime
@@ -3622,6 +3720,7 @@ mod tests {
             content: "Primary wing has non-diary content only.".to_owned(),
             content_hash: hash_text("Primary wing has non-diary content only."),
             embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
+            locator: None,
         };
         let legacy_diary_drawer = DrawerRecord {
             id: DrawerId::new("diary_legacy_worker_one_0002").unwrap(),
@@ -3641,6 +3740,7 @@ mod tests {
             content: "SESSION:legacy-only".to_owned(),
             content_hash: hash_text("SESSION:legacy-only"),
             embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
+            locator: None,
         };
 
         let runtime = harness.server.runtime.lock().await;
@@ -3692,6 +3792,7 @@ mod tests {
             content: "SESSION:space-agent".to_owned(),
             content_hash: hash_text("SESSION:space-agent"),
             embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
+            locator: None,
         };
         let worker_underscore = DrawerRecord {
             id: DrawerId::new("diary_worker_one_primary_0002").unwrap(),
@@ -3711,6 +3812,7 @@ mod tests {
             content: "SESSION:underscore-agent".to_owned(),
             content_hash: hash_text("SESSION:underscore-agent"),
             embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
+            locator: None,
         };
 
         let runtime = harness.server.runtime.lock().await;
@@ -3760,6 +3862,7 @@ mod tests {
             content: "SESSION:matching".to_owned(),
             content_hash: hash_text("SESSION:matching"),
             embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
+            locator: None,
         };
         let old = DrawerRecord {
             id: DrawerId::new("diary_filter_old").unwrap(),
@@ -3779,6 +3882,7 @@ mod tests {
             content: "SESSION:old".to_owned(),
             content_hash: hash_text("SESSION:old"),
             embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
+            locator: None,
         };
         let wrong_topic = DrawerRecord {
             id: DrawerId::new("diary_filter_wrong_topic").unwrap(),
@@ -3798,6 +3902,7 @@ mod tests {
             content: "SESSION:wrong-topic".to_owned(),
             content_hash: hash_text("SESSION:wrong-topic"),
             embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
+            locator: None,
         };
         let wrong_agent = DrawerRecord {
             id: DrawerId::new("diary_filter_wrong_agent").unwrap(),
@@ -3817,6 +3922,7 @@ mod tests {
             content: "SESSION:wrong-agent".to_owned(),
             content_hash: hash_text("SESSION:wrong-agent"),
             embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
+            locator: None,
         };
 
         let runtime = harness.server.runtime.lock().await;

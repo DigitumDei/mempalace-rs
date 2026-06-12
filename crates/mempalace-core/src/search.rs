@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use time::{Date, OffsetDateTime};
 
+use crate::locator::SourceLocator;
 use crate::{DrawerId, EmbeddingProfile, RoomId, WingId};
 
 time::serde::format_description!(date_only, Date, "[year]-[month]-[day]");
@@ -28,6 +29,8 @@ pub struct DrawerRecord {
     pub content_hash: String,
     #[serde(default)]
     pub embedding: Vec<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locator: Option<SourceLocator>,
 }
 
 /// Search request contract shared by CLI, MCP, and library APIs.
@@ -52,6 +55,11 @@ pub struct SearchResult {
     #[serde(rename = "text")]
     pub content: String,
     pub source_file: String,
+    /// `true` when the result comes from a locator-backed row whose source file
+    /// changed since mining.  Absent (serialised) unless true, so existing JSON
+    /// shapes remain byte-identical for non-stale results.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stale: bool,
 }
 
 #[cfg(test)]
@@ -72,6 +80,7 @@ mod tests {
             score: 0.49,
             content: "auth migration parity".to_owned(),
             source_file: "team.txt".to_owned(),
+            stale: false,
         };
 
         let value = serde_json::to_value(&result).unwrap();
@@ -84,6 +93,26 @@ mod tests {
         assert!(object.get("drawer_id").is_none());
         let similarity = object.get("similarity").and_then(|value| value.as_f64()).unwrap();
         assert!((similarity - 0.49).abs() < 1e-6, "unexpected similarity: {similarity}");
+        // `stale` must be absent when false so byte-parity is preserved.
+        assert!(object.get("stale").is_none(), "stale should be absent when false");
+    }
+
+    #[test]
+    fn search_result_stale_present_only_when_true() {
+        let non_stale = SearchResult {
+            drawer_id: None,
+            wing: WingId::new("w").unwrap(),
+            room: RoomId::new("r").unwrap(),
+            score: 0.5,
+            content: "text".to_owned(),
+            source_file: "f.txt".to_owned(),
+            stale: false,
+        };
+        let stale = SearchResult { stale: true, ..non_stale.clone() };
+        let non_stale_json = serde_json::to_value(&non_stale).unwrap();
+        let stale_json = serde_json::to_value(&stale).unwrap();
+        assert!(non_stale_json.as_object().unwrap().get("stale").is_none());
+        assert_eq!(stale_json.as_object().unwrap().get("stale"), Some(&json!(true)));
     }
 
     #[test]
@@ -106,6 +135,7 @@ mod tests {
             content: "payload".to_owned(),
             content_hash: "hash".to_owned(),
             embedding: vec![0.1, 0.2],
+            locator: None,
         };
 
         let value = serde_json::to_value(&record).unwrap();

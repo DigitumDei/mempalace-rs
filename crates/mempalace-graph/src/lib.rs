@@ -2038,6 +2038,7 @@ mod tests {
             content: "payload".to_owned(),
             content_hash: "hash".to_owned(),
             embedding: Vec::new(),
+            locator: None,
         }
     }
 }

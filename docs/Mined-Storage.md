@@ -155,13 +155,276 @@ The following files are never discovered regardless of extension:
   peer. Clients and federated palaces receive plain text; they do not need access
   to the source checkout.
 - **`resolve_root` is re-rootable.** Byte/line ranges and `source_file` are
-  relative to the checkout root; the absolute path is stored separately. A future
-  bulk-ingest endpoint (#20) can ship locators without `resolve_root` and let the
-  receiving palace fill in its own checkout path.
+  relative to the checkout root; the absolute path is stored separately. The
+  bulk-ingest endpoint lets the receiving palace fill in its own checkout path
+  via `server.checkouts`.
 - **`content_hash` is the dedupe key.** The row's `content_hash` is computed
   from the real chunk text even though that text is not persisted.
-  Branch-overlay mining (#20) identifies identical chunks across branches by
-  this hash.
-- **`commit_hash` anchors future invalidation.** Recording the git SHA at mine
-  time provides the reference point for merge-base invalidation of branch deltas
-  in #20.
+  Branch-delta mining identifies identical chunks across branches by this hash.
+- **`commit_hash` anchors invalidation.** Recording the git SHA at mine time
+  provides the reference point for merge-base invalidation of branch deltas.
+
+## Federated mining
+
+When a wing's federation route resolves to `mode: remote` (or `mode: combined`
+with `write: remote`), running `mine <dir>` routes to the remote palace instead
+of writing locally.
+
+### Flow
+
+1. The CLI runs full project discovery, chunking, byte/line-offset calculation,
+   and room detection locally — the same pipeline as a local mine — but skips
+   embedding and storage (`prepare_project_batch`).
+2. It calls `GET /v1/info` on the remote server and requires `"ingest"` in the
+   capabilities list. If the capability is absent the run fails with a clear
+   message asking the operator to upgrade the remote server (old servers return
+   404 for the new route, which produces a `RemoteRejected` error).
+3. The prepared files are split into request batches (see [Batching](#batching)
+   below) and sent to `POST /v1/ingest/batch`.
+4. The server embeds each chunk with its own embedding model and commits the
+   drawers using the same pending-run / replace-source machinery as a local mine.
+5. Per-file results (`ingested`, `skipped_unchanged`, `failed`) are aggregated
+   and printed in the same mine-summary format as a local run.
+
+If the remote is unreachable, the run fails with an explicit error. There is no
+silent fallback to local storage (matching the write semantics of other
+federated operations).
+
+If the current git branch differs from the repository's default branch, `mine`
+prints a warning line before sending. The run is not blocked.
+
+Dry-run mode (`--dry-run`) prepares the batch and prints the plan without
+sending any network requests.
+
+### Wire format
+
+Request body for `POST /v1/ingest/batch`:
+
+```
+IngestBatchRequest {
+    wing:        String,           // target wing name
+    repo_id:     String,           // machine-independent repo identity
+    agent:       Option<String>,   // client-declared agent name
+    commit_hash: Option<String>,   // git SHA at mine time
+    files:       Vec<IngestFileDto>,
+}
+```
+
+Each `IngestFileDto`:
+
+```
+IngestFileDto {
+    relative_path: String,         // project-root-relative, forward slashes
+                                   // (= repo-root-relative when mining a whole
+                                   //  repo; server.checkouts must use that root)
+    content_hash:  String,         // skip-unchanged key
+    file_hash:     Option<String>, // BLAKE3 of full file bytes; None => content rows
+    chunks:        Vec<IngestChunkDto>,
+}
+```
+
+Each `IngestChunkDto`:
+
+```
+IngestChunkDto {
+    chunk_index: u32,
+    room:        String,
+    text:        String,           // server embeds this
+    // present together iff file_hash is Some:
+    byte_start:  Option<u64>,
+    byte_end:    Option<u64>,
+    line_start:  Option<u32>,
+    line_end:    Option<u32>,
+}
+```
+
+Response body `IngestBatchResponse`:
+
+```
+IngestBatchResponse {
+    files:    Vec<IngestFileResult>,
+    warnings: Vec<String>,         // non-fatal; e.g. missing checkout mapping
+}
+```
+
+Each `IngestFileResult`:
+
+```
+IngestFileResult {
+    relative_path:   String,
+    status:          String,   // "ingested" | "skipped_unchanged" | "failed"
+    drawers_written: usize,    // 0 for skipped or failed
+    error:           Option<String>,
+}
+```
+
+### Repo identity and source keys
+
+`repo_id` is derived from the git remote URL of `origin` and normalized to a
+machine-independent form by `derive_repo_id` / `normalize_git_remote_url`:
+
+- Trailing `.git` and trailing `/` are stripped.
+- SCP-style `git@host:path` becomes `host/path`.
+- URL-style `scheme://[user@]host[:port]/path` becomes `host/path` (port
+  dropped; host lowercased; path case preserved).
+
+Examples from the test suite:
+
+| Remote URL | Normalized `repo_id` |
+|---|---|
+| `git@github.com:Acme/Repo.git` | `github.com/Acme/Repo` |
+| `https://github.com/acme/repo.git/` | `github.com/acme/repo` |
+| `ssh://git@Host.Example:2222/team/repo` | `host.example/team/repo` |
+| `https://user@gitlab.com/a/b` | `gitlab.com/a/b` |
+
+When no `origin` remote is configured, `repo_id` falls back to
+`wing:<wing_name>`.
+
+The server computes the source key for each file as:
+
+```
+projects:{wing}:{blake3_hex(repo_id)}:{relative_path}
+```
+
+This is the same shape as the local `projects:{wing}:{blake3_hex(root_path)}:{relative_path}` key, with the machine-local checkout path hash replaced
+by the repo-identity hash. Two clients pushing the same repository to the same
+remote wing converge on identical source keys and identical drawer ids.
+
+Drawer ids follow the same formula as local mining:
+
+```
+{wing}/{room}/{first-12-of-blake3_hex(source_key)}-{chunk_index:04}
+```
+
+### Hub-side stale semantics
+
+The receiving server stores **locator rows** (not chunk text) for files where
+`file_hash` is present. The `resolve_root` field of every locator row is filled
+from `server.checkouts[wing]` (see [Config-Schema.md](Config-Schema.md)).
+
+- **Checkout mapped:** locators resolve fresh text from the server's local
+  checkout.
+- **Checkout not mapped:** `resolve_root` is stored as an empty string. Every
+  search result for those rows resolves as a stale placeholder until
+  `server.checkouts` is configured. The response `warnings` array contains:
+  `"no checkout configured for wing '<w>'; locator results will resolve as stale placeholders until server.checkouts is set"`.
+
+Files whose `file_hash` is `None` (non-UTF-8 fallback) are stored as legacy
+content rows — chunk text is persisted verbatim with no locator.
+
+### Skip and replace semantics
+
+Processing is per-file:
+
+- If `get_ingested_file(source_key)` returns a record whose `content_hash`
+  matches the request file's `content_hash`, the file is reported
+  `skipped_unchanged` (no embedding, no storage write).
+- Otherwise the server embeds all chunks, then calls `replace_source_drawers`,
+  which commits the new drawers and deletes any stale drawer ids for the same
+  source key (handles files that shrank between mines).
+
+One `mine_batch` change event is appended per request when at least one file
+was ingested. The event carries `repo_id`, `files_ingested`, `files_skipped`,
+`files_failed`, `drawers_written`, and `commit_hash` in its details.
+
+### Batching
+
+To stay within the server's body limit, the client flushes a new request batch
+when either limit is reached:
+
+| Limit | Value |
+|---|---|
+| Files per batch | 64 |
+| Chunk text per batch | ~4 MiB (4 × 1 024 × 1 024 bytes) |
+
+The server applies a 16 MiB body size limit to `POST /v1/ingest/batch` (axum's
+default is 2 MiB; all other routes keep the default).
+
+### `relative_path` sanitization
+
+The server validates `relative_path` on every file before processing:
+
+- Must not be empty.
+- Must not start with `/` (absolute path).
+- Must not contain `\` (backslash).
+- Must not contain `:` (Windows drive letter or scheme).
+- Must not contain `..` path segments (directory traversal).
+
+Files that fail validation are reported as `"failed"` with a descriptive error;
+the rest of the batch continues processing.
+
+### Diary guard
+
+The server rejects any request targeting the diary wing (`wing_agents`) or any
+chunk whose room is the diary room (`diary`) with HTTP 422 and error code
+`diary_not_federated`. Diary entries are always palace-local.
+
+## Branch-delta mining
+
+`mine --branch` mines only the files that differ from the repository's default
+branch, making it efficient for ongoing branch work.
+
+### Delta computation
+
+1. The default branch reference is resolved by trying, in order:
+   - `git symbolic-ref --short refs/remotes/origin/HEAD`
+   - literal `main`
+   - literal `master`
+   The first reference that `git rev-parse --verify` accepts is used.
+   If none resolves, `mine --branch` exits with an error.
+
+2. The merge-base commit between the default branch reference and `HEAD` is
+   computed with `git merge-base`.
+
+3. The delta set is the union of:
+   - Files changed or added in the working tree relative to the merge-base
+     (`git diff --name-only --diff-filter=d <merge-base>`).
+   - Untracked files (`git ls-files --others --exclude-standard`).
+
+   Uncommitted edits are intentionally included — the purpose is to embed
+   exactly what you are working on, not just what is committed.
+
+4. Paths reported by git are repo-root-relative. When the project root is a
+   subdirectory of the repo, paths are re-relativized to the project root;
+   paths outside the project root are dropped.
+
+### Source-key namespace
+
+Branch runs use the namespace `projects-branch` instead of `projects`:
+
+```
+projects-branch:{wing}:{blake3_hex(root_path)}:{relative_path}
+```
+
+This ensures branch rows never collide with a full local mine of the same wing,
+allowing both to coexist in the same palace and be merged at search time via the
+combined-wing overlay.
+
+### Cleanup pass
+
+On every `mine --branch` run, after ingesting the delta, the CLI lists all
+source keys under `projects-branch:{wing}:{root_key}:` and replaces drawers for
+any file whose key is **not** in the current delta (file reverted to base or
+deleted from the branch). The replacement is an empty commit — it removes stale
+drawers without leaving orphaned rows. The count of removed sources is reported
+as "Sources removed: N" in the mine summary.
+
+This means the branch store is always consistent with the current delta: rebase,
+merge, or reverting a file immediately cleans up the previously mined drawers on
+the next run.
+
+### Branch-delta is always local
+
+`--branch` overrides the wing's federation route. Even if the wing is configured
+as `mode: remote` or `mode: combined` with `write: remote`, a branch mine always
+writes to the local palace. The intended workflow is:
+
+- Team or CI mines the full repository into the **remote** shared palace via
+  the normal `mine` command (remote route).
+- Each developer mines their local branch delta into their **local** palace.
+- When search runs over a combined wing, both sides are merged. The
+  `content_hash` deduplication ensures chunks that appear in both the remote
+  full mine and the local branch delta are not double-counted.
+
+`--branch` is not supported for conversation (`--mode convos`) mining; using
+both together exits with an error.

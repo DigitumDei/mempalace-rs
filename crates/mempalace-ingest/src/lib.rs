@@ -5,7 +5,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-use blake3::Hasher;
 use mempalace_config::{ConfigLoader, ProjectRoomConfig};
 use mempalace_core::{DrawerId, DrawerRecord, RoomId, WingId};
 use mempalace_embeddings::{EmbeddingProvider, EmbeddingRequest};
@@ -703,6 +702,7 @@ fn build_drawers<P: EmbeddingProvider>(
             content_hash: hash_text(&chunk.content),
             content: chunk.content,
             embedding,
+            locator: None,
         });
     }
 
@@ -1735,13 +1735,11 @@ fn relative_path(root: &Path, path: &Path) -> Result<String> {
 }
 
 fn hash_bytes(bytes: &[u8]) -> String {
-    let mut hasher = Hasher::new();
-    hasher.update(bytes);
-    hasher.finalize().to_hex().to_string()
+    mempalace_core::hash_bytes(bytes)
 }
 
 fn hash_text(text: &str) -> String {
-    hash_bytes(text.as_bytes())
+    mempalace_core::hash_text(text)
 }
 
 fn source_key(

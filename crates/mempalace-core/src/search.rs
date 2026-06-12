@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use time::{Date, OffsetDateTime};
 
+use crate::locator::SourceLocator;
 use crate::{DrawerId, EmbeddingProfile, RoomId, WingId};
 
 time::serde::format_description!(date_only, Date, "[year]-[month]-[day]");
@@ -28,6 +29,8 @@ pub struct DrawerRecord {
     pub content_hash: String,
     #[serde(default)]
     pub embedding: Vec<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locator: Option<SourceLocator>,
 }
 
 /// Search request contract shared by CLI, MCP, and library APIs.
@@ -106,6 +109,7 @@ mod tests {
             content: "payload".to_owned(),
             content_hash: "hash".to_owned(),
             embedding: vec![0.1, 0.2],
+            locator: None,
         };
 
         let value = serde_json::to_value(&record).unwrap();

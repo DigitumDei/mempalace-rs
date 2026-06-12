@@ -174,6 +174,7 @@ mod tests {
             content: format!("payload-{id}"),
             content_hash: format!("hash-{id}"),
             embedding: embedding(seed),
+            locator: None,
         }
     }
 

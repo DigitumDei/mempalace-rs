@@ -1165,6 +1165,7 @@ where
         content: content.clone(),
         content_hash: hash_text(&content),
         embedding,
+        locator: None,
     })
 }
 
@@ -1185,7 +1186,7 @@ fn generated_drawer_id(
 
 /// Computes the BLAKE3 hex hash of a text string.
 fn hash_text(content: &str) -> String {
-    blake3::hash(content.as_bytes()).to_hex().to_string()
+    mempalace_core::hash_text(content)
 }
 
 /// Formats an `OffsetDateTime` as RFC 3339.

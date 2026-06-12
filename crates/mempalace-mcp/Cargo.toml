@@ -14,7 +14,7 @@ mempalace-graph = { path = "../mempalace-graph" }
 mempalace-remote = { path = "../mempalace-remote" }
 mempalace-search = { path = "../mempalace-search" }
 mempalace-storage = { path = "../mempalace-storage" }
-blake3 = "1.8.2"
+blake3.workspace = true
 dirs.workspace = true
 serde.workspace = true
 serde_json.workspace = true

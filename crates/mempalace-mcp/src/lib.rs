@@ -1687,6 +1687,7 @@ where
             content: content.clone(),
             content_hash: hash_text(&content),
             embedding,
+            locator: None,
         })
     }
 
@@ -2169,7 +2170,7 @@ fn generated_drawer_id(
 }
 
 fn hash_text(content: &str) -> String {
-    blake3::hash(content.as_bytes()).to_hex().to_string()
+    mempalace_core::hash_text(content)
 }
 
 fn infer_entity_kind(name: &str) -> EntityKind {
@@ -2372,6 +2373,7 @@ mod tests {
             content: content.to_owned(),
             content_hash: hash_text(content),
             embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
+            locator: None,
         }
     }
 
@@ -2436,6 +2438,7 @@ mod tests {
                     "Code notes: auth-migration keeps search filter semantics exact while storage changes underneath.",
                 ),
                 embedding: vec![1.0; EmbeddingProfile::Balanced.metadata().dimensions],
+                locator: None,
             },
             DrawerRecord {
                 id: DrawerId::new("wing_team/auth-migration/0001").unwrap(),
@@ -2457,6 +2460,7 @@ mod tests {
                     "The team decided the auth-migration must preserve CLI and MCP parity.",
                 ),
                 embedding: vec![1.0; EmbeddingProfile::Balanced.metadata().dimensions],
+                locator: None,
             },
         ];
         runtime
@@ -2627,6 +2631,7 @@ mod tests {
                     content: content.to_owned(),
                     content_hash: hash_text(content),
                     embedding,
+                    locator: None,
                 }],
                 DuplicateStrategy::Error,
             )
@@ -3163,6 +3168,7 @@ mod tests {
             content: "SESSION:legacy-collapsed".to_owned(),
             content_hash: hash_text("SESSION:legacy-collapsed"),
             embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
+            locator: None,
         };
         let runtime = harness.server.runtime.lock().await;
         runtime
@@ -3554,6 +3560,7 @@ mod tests {
             content: "SESSION:legacy".to_owned(),
             content_hash: hash_text("SESSION:legacy"),
             embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
+            locator: None,
         };
         let colliding_other_agent_drawer = DrawerRecord {
             id: DrawerId::new("diary_worker_one_colliding_agent").unwrap(),
@@ -3573,6 +3580,7 @@ mod tests {
             content: "SESSION:other-agent".to_owned(),
             content_hash: hash_text("SESSION:other-agent"),
             embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
+            locator: None,
         };
         let runtime = harness.server.runtime.lock().await;
         runtime
@@ -3622,6 +3630,7 @@ mod tests {
             content: "Primary wing has non-diary content only.".to_owned(),
             content_hash: hash_text("Primary wing has non-diary content only."),
             embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
+            locator: None,
         };
         let legacy_diary_drawer = DrawerRecord {
             id: DrawerId::new("diary_legacy_worker_one_0002").unwrap(),
@@ -3641,6 +3650,7 @@ mod tests {
             content: "SESSION:legacy-only".to_owned(),
             content_hash: hash_text("SESSION:legacy-only"),
             embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
+            locator: None,
         };
 
         let runtime = harness.server.runtime.lock().await;
@@ -3692,6 +3702,7 @@ mod tests {
             content: "SESSION:space-agent".to_owned(),
             content_hash: hash_text("SESSION:space-agent"),
             embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
+            locator: None,
         };
         let worker_underscore = DrawerRecord {
             id: DrawerId::new("diary_worker_one_primary_0002").unwrap(),
@@ -3711,6 +3722,7 @@ mod tests {
             content: "SESSION:underscore-agent".to_owned(),
             content_hash: hash_text("SESSION:underscore-agent"),
             embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
+            locator: None,
         };
 
         let runtime = harness.server.runtime.lock().await;
@@ -3760,6 +3772,7 @@ mod tests {
             content: "SESSION:matching".to_owned(),
             content_hash: hash_text("SESSION:matching"),
             embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
+            locator: None,
         };
         let old = DrawerRecord {
             id: DrawerId::new("diary_filter_old").unwrap(),
@@ -3779,6 +3792,7 @@ mod tests {
             content: "SESSION:old".to_owned(),
             content_hash: hash_text("SESSION:old"),
             embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
+            locator: None,
         };
         let wrong_topic = DrawerRecord {
             id: DrawerId::new("diary_filter_wrong_topic").unwrap(),
@@ -3798,6 +3812,7 @@ mod tests {
             content: "SESSION:wrong-topic".to_owned(),
             content_hash: hash_text("SESSION:wrong-topic"),
             embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
+            locator: None,
         };
         let wrong_agent = DrawerRecord {
             id: DrawerId::new("diary_filter_wrong_agent").unwrap(),
@@ -3817,6 +3832,7 @@ mod tests {
             content: "SESSION:wrong-agent".to_owned(),
             content_hash: hash_text("SESSION:wrong-agent"),
             embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
+            locator: None,
         };
 
         let runtime = harness.server.runtime.lock().await;

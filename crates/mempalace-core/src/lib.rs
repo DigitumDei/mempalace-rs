@@ -3,12 +3,16 @@
 
 mod diary;
 mod error;
+pub mod hash;
 mod ids;
+pub mod locator;
 mod profiles;
 mod search;
 
 pub use diary::{DIARY_HALL, DIARY_ROOM, DIARY_TOPIC_PREFIX, SHARED_AGENT_DIARY_WING};
 pub use error::{MempalaceError, Result};
+pub use hash::{hash_bytes, hash_text};
 pub use ids::{DrawerId, IdError, RoomId, WingId};
+pub use locator::{ResolvedSnippet, SourceLocator, resolve_locator, resolve_records};
 pub use profiles::{BALANCED_PROFILE, EmbeddingProfile, EmbeddingProfileMetadata, LOW_CPU_PROFILE};
 pub use search::{DrawerRecord, SearchQuery, SearchResult};

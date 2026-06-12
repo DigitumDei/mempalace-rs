@@ -683,6 +683,7 @@ mod tests {
             content: content.to_owned(),
             content_hash: format!("hash-{id}"),
             embedding: embedding(score.unwrap_or(0.0)),
+            locator: None,
         }
     }
 

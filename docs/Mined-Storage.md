@@ -349,6 +349,8 @@ The server validates `relative_path` on every file before processing:
 - Must not contain `\` (backslash).
 - Must not contain `:` (Windows drive letter or scheme).
 - Must not contain `..` path segments (directory traversal).
+- Must not contain a `.git` path segment (prevents reading `.git/config` or
+  credentials back through locator resolution).
 
 Files that fail validation are reported as `"failed"` with a descriptive error;
 the rest of the batch continues processing.

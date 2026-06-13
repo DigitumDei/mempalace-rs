@@ -1138,7 +1138,9 @@ fn compute_merge_base(root: &Path, default_ref: &str) -> Option<String> {
 fn git_delta_paths(root: &Path, merge_base: &str) -> Option<Vec<String>> {
     let root_str = root.to_string_lossy();
 
-    // Changed/added files (working tree vs merge-base).
+    // Changed/added files (working tree vs merge-base).  `-z` yields
+    // NUL-separated, unquoted paths so filenames with spaces or non-ASCII
+    // bytes survive regardless of the user's core.quotePath setting.
     let diff_out = Command::new("git")
         .args([
             "-C",
@@ -1146,6 +1148,7 @@ fn git_delta_paths(root: &Path, merge_base: &str) -> Option<Vec<String>> {
             "diff",
             "--name-only",
             "--diff-filter=d",
+            "-z",
             merge_base,
         ])
         .output()
@@ -1156,7 +1159,7 @@ fn git_delta_paths(root: &Path, merge_base: &str) -> Option<Vec<String>> {
 
     // Untracked files.
     let untracked_out = Command::new("git")
-        .args(["-C", &root_str, "ls-files", "--others", "--exclude-standard"])
+        .args(["-C", &root_str, "ls-files", "--others", "--exclude-standard", "-z"])
         .output()
         .ok()?;
     if !untracked_out.status.success() {
@@ -1165,11 +1168,14 @@ fn git_delta_paths(root: &Path, merge_base: &str) -> Option<Vec<String>> {
 
     let mut paths = Vec::new();
     for bytes in [diff_out.stdout.as_slice(), untracked_out.stdout.as_slice()] {
-        let text = std::str::from_utf8(bytes).ok()?;
-        for line in text.lines() {
-            let trimmed = line.trim();
-            if !trimmed.is_empty() {
-                paths.push(trimmed.to_owned());
+        for path_bytes in bytes.split(|&b| b == 0) {
+            if path_bytes.is_empty() {
+                continue;
+            }
+            // Non-UTF-8 paths can't match our String-based relative paths;
+            // skip them rather than failing the whole delta.
+            if let Ok(path) = std::str::from_utf8(path_bytes) {
+                paths.push(path.to_owned());
             }
         }
     }

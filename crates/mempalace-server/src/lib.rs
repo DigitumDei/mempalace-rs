@@ -1120,11 +1120,18 @@ where
             let mut range_error: Option<String> = None;
             for chunk in &file.chunks {
                 match (chunk.byte_start, chunk.byte_end, chunk.line_start, chunk.line_end) {
-                    (Some(bs), Some(be), Some(_), Some(_)) => {
+                    (Some(bs), Some(be), Some(ls), Some(le)) => {
                         if be < bs {
                             range_error = Some(format!(
                                 "chunk {}: byte_end ({}) < byte_start ({})",
                                 chunk.chunk_index, be, bs
+                            ));
+                            break;
+                        }
+                        if le < ls {
+                            range_error = Some(format!(
+                                "chunk {}: line_end ({}) < line_start ({})",
+                                chunk.chunk_index, le, ls
                             ));
                             break;
                         }
@@ -1426,7 +1433,9 @@ fn is_diary_wing_or_room(wing: &str, room: &str) -> bool {
 /// Returns `Some(error)` when `relative_path` is not a safe repo-relative path
 /// for batch ingest. The path is later joined onto the server's checkout root
 /// during locator resolution, so absolute paths, drive letters, backslashes,
-/// and `..` traversal must all be rejected.
+/// `..` traversal, and `.git` access must all be rejected. The `.git` guard
+/// matters because a client could otherwise ingest `.git/config` (or a
+/// credentials file) and read it back through locator resolution.
 fn invalid_ingest_relative_path(path: &str) -> Option<String> {
     if path.is_empty() {
         return Some("relative_path must not be empty".to_owned());
@@ -1436,8 +1445,10 @@ fn invalid_ingest_relative_path(path: &str) -> Option<String> {
             "relative_path `{path}` must be a forward-slash repo-relative path"
         ));
     }
-    if path.split('/').any(|segment| segment == "..") {
-        return Some(format!("relative_path `{path}` must not contain `..` segments"));
+    if path.split('/').any(|segment| segment == ".." || segment == ".git") {
+        return Some(format!(
+            "relative_path `{path}` must not contain `..` or `.git` segments"
+        ));
     }
     None
 }
@@ -2593,6 +2604,46 @@ mod tests {
         assert!(files[0]["error"].as_str().unwrap().contains("byte_end"));
     }
 
+    /// line_end < line_start → file result "failed" (200 with per-file error).
+    #[tokio::test]
+    async fn ingest_batch_invalid_line_range_fails_file() {
+        let harness = make_harness().await;
+        let resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/ingest/batch",
+                ALICE_TOKEN,
+                json!({
+                    "wing": "wing_lines",
+                    "repo_id": "github.com/acme/repo",
+                    "files": [
+                        {
+                            "relative_path": "src/bad.rs",
+                            "content_hash": "ch-bad",
+                            "file_hash": "fh-bad",
+                            "chunks": [
+                                {
+                                    "chunk_index": 0, "room": "backend",
+                                    "text": "some code here",
+                                    "byte_start": 0, "byte_end": 14,
+                                    "line_start": 9, "line_end": 3  // invalid: end < start
+                                }
+                            ]
+                        }
+                    ]
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "overall request should be 200");
+        let body = body_json(resp).await;
+        let files = body["files"].as_array().unwrap();
+        assert_eq!(files[0]["status"], "failed");
+        assert!(files[0]["error"].as_str().unwrap().contains("line_end"));
+    }
+
     /// Checkout-mapped wing: file_hash matches the file's bytes → search result is non-stale.
     #[tokio::test]
     async fn ingest_batch_checkout_mapped_resolves_non_stale() {
@@ -2762,6 +2813,8 @@ mod tests {
                          "chunks": [{"chunk_index": 0, "room": "general", "text": "x y z"}]},
                         {"relative_path": "src\\win.rs", "content_hash": "c3",
                          "chunks": [{"chunk_index": 0, "room": "general", "text": "x y z"}]},
+                        {"relative_path": ".git/config", "content_hash": "c5",
+                         "chunks": [{"chunk_index": 0, "room": "general", "text": "x y z"}]},
                         {"relative_path": "src/ok.rs", "content_hash": "c4",
                          "chunks": [{"chunk_index": 0, "room": "general",
                                      "text": "perfectly safe path content"}]}
@@ -2776,7 +2829,8 @@ mod tests {
         assert_eq!(files[0]["status"], "failed");
         assert_eq!(files[1]["status"], "failed");
         assert_eq!(files[2]["status"], "failed");
-        assert_eq!(files[3]["status"], "ingested", "safe path must still ingest");
+        assert_eq!(files[3]["status"], "failed", ".git path must be rejected");
+        assert_eq!(files[4]["status"], "ingested", "safe path must still ingest");
     }
 
     /// Duplicate chunk_index within one file → per-file "failed".

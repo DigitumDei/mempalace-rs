@@ -100,8 +100,9 @@ Flags:
   `config.json`, falling back to `~/.mempalace/server_tokens.json`.
 
 Behavior:
-- The token file is a JSON array of `{ "token", "name", "enabled" }` entries; it is
-  hot-reloaded on each request, and tokens are hashed in memory.
+- The token file is a JSON array of objects, each with `token`, `name`, and
+  `enabled` keys; it is hot-reloaded on each request, and tokens are hashed in
+  memory.
 - `GET /v1/health` is unauthenticated; all other `/v1` routes require
   `Authorization: Bearer <token>`.
 - The server speaks plain HTTP and prints a warning to that effect — front it with

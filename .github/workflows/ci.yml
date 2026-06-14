@@ -275,8 +275,8 @@ jobs:
       - name: Run mempalace-cli tests
         run: cargo test -p mempalace-cli --locked -- --nocapture
 
-  build-and-package:
-    name: Build And Package
+  release-gate:
+    name: Release Gate
     runs-on: ubuntu-latest
     needs:
       - workspace-build
@@ -288,43 +288,163 @@ jobs:
       - graph-tests
       - mcp-tests
       - cli-tests
+    steps:
+      - name: Tests green
+        run: echo "All workspace tests passed; proceeding to release builds."
+
+  release-host:
+    name: Release ${{ matrix.asset }}
+    needs: release-gate
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - asset: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - asset: macos-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+          - asset: macos-x86_64
+            os: macos-latest
+            target: x86_64-apple-darwin
+            cross: true
+          - asset: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
 
     steps:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Install packaging dependencies
+      - name: Install protobuf compiler (Linux)
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
 
+      - name: Install protobuf compiler (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
+      - name: Install protobuf compiler (Windows)
+        if: runner.os == 'Windows'
+        run: choco install protoc --no-progress -y
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.asset }}
 
       - name: Build release artifacts
-        run: cargo build --release --locked -p mempalace-cli -p mempalace-mcp
+        run: cargo build --release --locked -p mempalace-cli -p mempalace-mcp --target ${{ matrix.target }}
+
+      - name: Stage binaries
+        shell: bash
+        run: |
+          ext=""
+          [ "${{ runner.os }}" = "Windows" ] && ext=".exe"
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/mempalace-cli${ext}" "dist/mempalace-cli-${{ matrix.asset }}${ext}"
+          cp "target/${{ matrix.target }}/release/mempalace-mcp${ext}" "dist/mempalace-mcp-${{ matrix.asset }}${ext}"
 
       - name: Smoke packaged binaries
+        # The macOS x86_64 binary is cross-compiled on an arm64 runner, so it cannot run here.
+        if: ${{ !matrix.cross }}
+        shell: bash
         run: |
-          ./target/release/mempalace-cli --help
-          ./target/release/mempalace-mcp --help
+          ext=""
+          [ "${{ runner.os }}" = "Windows" ] && ext=".exe"
+          "dist/mempalace-cli-${{ matrix.asset }}${ext}" --help
+          "dist/mempalace-mcp-${{ matrix.asset }}${ext}" --help
 
       - name: Upload release artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: mempalace-release-binaries
+          name: release-${{ matrix.asset }}
+          path: dist/*
+          if-no-files-found: error
+
+  release-manylinux:
+    name: Release linux-x86_64-manylinux
+    needs: release-gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      # Cache the container build's CARGO_HOME / RUSTUP_HOME / target on the host
+      # (the build runs as root inside the container against these mounted paths).
+      - name: Cache cargo artifacts
+        uses: actions/cache@v4
+        with:
           path: |
-            target/release/mempalace-cli
-            target/release/mempalace-mcp
+            .cargo-home/registry
+            .cargo-home/git
+            .rustup-home
+            target
+          key: manylinux-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            manylinux-
+
+      # Compile inside manylinux_2_28 (glibc 2.28 baseline) so the binary runs in
+      # older containers. checkout/upload stay on the host to avoid the
+      # node-in-container requirement of JS actions. ort ships glibc prebuilts, so
+      # no musl is involved (see issue #14 / PR #12).
+      - name: Build in manylinux_2_28 container
+        run: |
+          docker run --rm \
+            -v "$PWD":/io -w /io \
+            -e CARGO_HOME=/io/.cargo-home \
+            -e RUSTUP_HOME=/io/.rustup-home \
+            -e CARGO_TERM_COLOR=always \
+            quay.io/pypa/manylinux_2_28_x86_64 \
+            bash -euxo pipefail -c '
+              yum -y install unzip >/dev/null
+              protoc_version=25.1
+              curl -sSL -o /tmp/protoc.zip \
+                "https://github.com/protocolbuffers/protobuf/releases/download/v${protoc_version}/protoc-${protoc_version}-linux-x86_64.zip"
+              unzip -o /tmp/protoc.zip -d /usr/local
+              export PATH="/usr/local/bin:$PATH"
+              protoc --version
+              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | \
+                sh -s -- -y --profile minimal --default-toolchain stable
+              export PATH="$CARGO_HOME/bin:$PATH"
+              rustc --version
+              cargo build --release --locked -p mempalace-cli -p mempalace-mcp
+            '
+
+      - name: Stage binaries
+        run: |
+          mkdir -p dist
+          cp target/release/mempalace-cli dist/mempalace-cli-linux-x86_64-manylinux
+          cp target/release/mempalace-mcp dist/mempalace-mcp-linux-x86_64-manylinux
+          chmod +x dist/*
+
+      - name: Smoke packaged binaries
+        run: |
+          dist/mempalace-cli-linux-x86_64-manylinux --help
+          dist/mempalace-mcp-linux-x86_64-manylinux --help
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-linux-x86_64-manylinux
+          path: dist/*
           if-no-files-found: error
 
   publish-nightly:
     name: Publish Nightly Release
     runs-on: ubuntu-latest
-    needs: build-and-package
+    needs:
+      - release-host
+      - release-manylinux
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     permissions:
       contents: write
@@ -336,16 +456,14 @@ jobs:
       - name: Download release artifacts
         uses: actions/download-artifact@v4
         with:
-          name: mempalace-release-binaries
-          path: artifacts
+          pattern: release-*
+          merge-multiple: true
+          path: nightly
 
       - name: Stage nightly assets
         run: |
-          mkdir -p nightly
           short_sha="${GITHUB_SHA::7}"
-          cp artifacts/mempalace-cli "nightly/mempalace-cli-linux-x86_64"
-          cp artifacts/mempalace-mcp "nightly/mempalace-mcp-linux-x86_64"
-          chmod +x nightly/*
+          chmod +x nightly/mempalace-* || true
           (cd nightly && sha256sum * > SHA256SUMS)
           echo "SHORT_SHA=$short_sha" >> "$GITHUB_ENV"
 
@@ -357,6 +475,13 @@ jobs:
           body: |
             Rolling nightly build from `main` @ ${{ github.sha }}.
 
+            Binaries (each as `mempalace-cli-*` and `mempalace-mcp-*`):
+            - `linux-x86_64` — glibc, built on ubuntu-latest (needs a recent glibc)
+            - `linux-x86_64-manylinux` — glibc 2.28+ baseline, runs in older containers
+            - `macos-arm64`, `macos-x86_64`
+            - `windows-x86_64.exe`
+
+            `SHA256SUMS` lists checksums for every asset.
             Overwritten on every push to `main`. Not a stable release.
           prerelease: true
           make_latest: false

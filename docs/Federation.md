@@ -1,0 +1,387 @@
+# Federation Guide
+
+Federation lets several MemPalace clients share one or more **remote palaces** over
+an HTTP REST API. An agent talking to its local MCP server sees a single seamless
+palace: reads for selected wings are transparently merged across local and remote,
+and writes are routed per the wing's rule. (The `mempalace-cli` is federation-aware
+for mining/writes; its `search`/`status`/`wake-up` read the local palace only —
+see [Part 5](#part-5--federated-reads-wake-up-and-changes).)
+
+This guide covers the whole feature end-to-end: running a server, configuring a
+client, the routing model, federated and branch-aware mining, and how to exercise
+it all locally for dev testing.
+
+- For the exact config field reference, see [Config Schema](Config-Schema.md).
+- For the locator storage model that federated mining relies on, see
+  [Mined Storage](Mined-Storage.md).
+- For every CLI flag, see [CLI Surface](CLI-Surface.md).
+
+## Concepts
+
+- **Remote** — a named MemPalace server reachable over HTTP, defined in
+  `federation.remotes`. Each remote has a `name`, `url`, optional bearer token,
+  and timeout.
+- **Route** — per wing (and for the knowledge graph), one of three modes:
+  - `local` — served only from the local palace (the default).
+  - `remote` — served only from the named remote.
+  - `combined` — local and remote are merged on read; `write` selects which side
+    new writes go to.
+- **Wing name is the join key.** The same wing name on both sides is treated as
+  one combined wing. There is no separate handshake to "link" wings — naming them
+  identically is the link.
+- **Rank-merge, not score-merge.** Combined search interleaves results by rank
+  across origins (round-robin), because similarity scores are not comparable
+  across embedding profiles. Every result is annotated with its `origin`
+  (`local` or `remote:<name>`).
+- **Reads degrade, writes do not.** A remote that is unreachable during a read is
+  reported as a warning and skipped — the local side still returns. A write to a
+  down remote is an explicit error with **no silent local fallback**.
+- **Diary is always local.** `wing_agents`, the `diary` room, and `diary:`-prefixed
+  sources are hard-pinned to local storage. Any config that tries to route them
+  remote is warned about and ignored, and the server rejects diary-shaped writes
+  with HTTP 422.
+
+## Part 1 — Running a server (the hub)
+
+The server is the same `mempalace-cli` binary, started with `serve`. It exposes
+the local palace at `<palace_path>` over HTTP.
+
+### 1.1 Create a token file
+
+Authentication is bearer-token based. The token file is a JSON array of entries:
+
+```json
+[
+  { "token": "alice-secret-token", "name": "alice", "enabled": true },
+  { "token": "bob-secret-token",   "name": "bob",   "enabled": false }
+]
+```
+
+- `token` — the bearer secret a client must present.
+- `name` — the identity recorded as `added_by` on writes from that token.
+- `enabled` — `false` treats the entry as if it did not exist (instant revoke).
+
+Tokens are hashed in memory; the raw secret is not retained after load. The file
+is hot-reloaded — editing it (e.g. flipping `enabled`) takes effect on the next
+request without restarting the server. The default path is
+`~/.mempalace/server_tokens.json`.
+
+### 1.2 Configure the server section (optional but recommended)
+
+In `~/.mempalace/config.json`:
+
+```jsonc
+{
+  "server": {
+    "bind": "127.0.0.1:8765",
+    "token_file": "~/.mempalace/server_tokens.json",
+    "checkouts": {
+      "wing_myproject": "/srv/repos/myproject",
+      "wing_teamdocs":  "/srv/repos/teamdocs"
+    }
+  }
+}
+```
+
+`server.checkouts` maps a wing name to a local checkout path on the **server**.
+It is how the hub resolves locator-backed mined drawers (see
+[Federated mining](#part-3--federated-mining) and [Mined Storage](Mined-Storage.md)):
+
+- **Mapped** — the server reads snippet text from that checkout at search time, so
+  results are fresh and non-stale.
+- **Unmapped** — the server stores locator rows with an empty root; every result
+  for that wing resolves as a *stale placeholder* until you add the mapping, and
+  the bulk-ingest response carries a warning. This is safe (no wrong text), just
+  degraded.
+
+See [Config Schema → Server Config](Config-Schema.md#server-config) for the full
+field reference.
+
+### 1.3 Start the server
+
+```bash
+mempalace-cli serve
+# or override config:
+mempalace-cli serve --bind 0.0.0.0:8765 --token-file /etc/mempalace/tokens.json
+```
+
+On start it prints the palace path, bind address, and token file, then logs
+`Listening on http://<addr>`. It shuts down gracefully on Ctrl-C.
+
+> **The server speaks plain HTTP.** Bearer tokens cross the wire unencrypted.
+> Run it only on a trusted network or behind a TLS-terminating reverse proxy
+> (nginx, Caddy, etc.). The server prints this warning on every start.
+
+### 1.4 REST surface
+
+All routes are under `/v1`. `GET /v1/health` is unauthenticated; everything else
+requires `Authorization: Bearer <token>`.
+
+| Method & path | Purpose |
+|---|---|
+| `GET /v1/health` | Liveness probe (no auth) |
+| `GET /v1/info` | Server version, `federation_api_version`, embedding profile, capabilities |
+| `POST /v1/drawers/search` | Semantic search (server embeds the query text) |
+| `POST /v1/drawers/check_duplicate` | Near-duplicate check |
+| `POST /v1/drawers` | Add a drawer |
+| `GET /v1/drawers` | List drawers (paginated) |
+| `GET /v1/drawers/{id}` | Get one drawer |
+| `DELETE /v1/drawers/{id}` | Delete a drawer |
+| `POST /v1/kg/query` | Knowledge-graph query |
+| `POST /v1/kg/facts` | Add a KG fact |
+| `POST /v1/kg/facts/invalidate` | Invalidate a KG fact |
+| `GET /v1/kg/timeline` | KG timeline |
+| `GET /v1/kg/stats` | KG statistics |
+| `GET /v1/taxonomy` | Wing/room taxonomy |
+| `GET /v1/wings` | List wings |
+| `GET /v1/rooms` | List rooms |
+| `GET /v1/changes` | Change-event feed (cursor-paginated) |
+| `POST /v1/ingest/batch` | Bulk mined-chunk ingest (16 MiB body limit) |
+
+`GET /v1/info` advertises a `capabilities` list; the `"ingest"` capability is what
+a client checks before attempting federated mining. The wire DTOs live in the
+`mempalace-federation` crate and are shared verbatim by server and client.
+
+## Part 2 — Configuring a client
+
+Clients (the CLI and the MCP server) read `federation` from
+`~/.mempalace/config.json`:
+
+```jsonc
+{
+  "federation": {
+    "remotes": [
+      {
+        "name": "work",
+        "url": "https://palace.intra.example",
+        "token_env": "MEMPALACE_WORK_TOKEN",
+        "timeout_ms": 5000
+      }
+    ],
+    "default_mode": "local",
+    "wings": {
+      "wing_teamdocs": { "mode": "remote",   "remote": "work" },
+      "wing_bigrepo":  { "mode": "combined", "remote": "work", "write": "local" }
+    },
+    "kg": { "mode": "combined", "remote": "work", "write": "remote" }
+  }
+}
+```
+
+- Prefer `token_env` over an inline `token` so the secret stays out of the config
+  file. If the named variable is absent at startup the loader **warns** and
+  continues (falling back to inline `token`, or unauthenticated if neither is set)
+  — local-only operation never breaks because of a missing remote token.
+- `url` must be `http://` or `https://`; any other scheme fails config load.
+- A wing whose name matches `server.checkouts` on the hub gets fresh locator
+  resolution; otherwise its remote results surface as stale.
+
+### Route resolution precedence
+
+First match wins:
+
+1. Explicit per-wing rule in `federation.wings`
+2. The `routing` block in that wing's project `mempalace.yaml`
+3. `federation.default_mode`
+4. `local` (hard default when no federation config exists)
+
+Then the diary hard-override is applied unconditionally (always local).
+
+The knowledge graph has its own rule (`federation.kg`) because KG facts are
+entity-scoped, not wing-scoped — this is what enables the "main facts remote,
+branch facts local" pattern.
+
+### Per-project routing
+
+A repo can declare its own route without editing the global config, via
+`mempalace.yaml`:
+
+```yaml
+wing: wing_myproject
+routing:
+  mode: combined
+  remote: work
+  write: local
+```
+
+This sits at precedence step 2 — a global `federation.wings` rule for the same
+wing still overrides it.
+
+## Part 3 — Federated mining
+
+Mining a project whose wing routes to a remote (`mode: remote`, or `mode: combined`
+with `write: remote`) pushes the work to the hub instead of writing locally.
+
+### How it works
+
+1. The CLI runs the full local pipeline — discovery, chunking, byte/line offset
+   computation, room detection — but **skips embedding and storage**.
+2. It calls `GET /v1/info` and requires the `"ingest"` capability. An older server
+   without the endpoint returns 404, surfaced as a clear "upgrade the remote"
+   error.
+3. Prepared files are sent to `POST /v1/ingest/batch` in batches capped at **64
+   files or ~4 MiB of chunk text**, whichever comes first.
+4. The **server** embeds each chunk with its own model and commits locator-backed
+   drawers, filling `resolve_root` from `server.checkouts[wing]`.
+5. Per-file results (`ingested` / `skipped_unchanged` / `failed`) and any warnings
+   are aggregated into the mine summary.
+
+```bash
+# wing routes to a remote → this pushes to the hub
+mempalace-cli mine /path/to/project
+
+# preview what would be sent, no network calls
+mempalace-cli mine /path/to/project --dry-run
+```
+
+### Machine-independent identity
+
+The hub keys each file by `projects:{wing}:{blake3(repo_id)}:{relative_path}`,
+where `repo_id` is the normalized `origin` remote URL (e.g.
+`git@github.com:Acme/Repo.git` → `github.com/Acme/Repo`), or `wing:<name>` when no
+remote is configured. Because the key is derived from repo identity rather than a
+local checkout path, **two clients mining the same repo converge on identical
+source keys and drawer ids** — no disjoint histories, and re-pushes dedupe cleanly.
+
+### Failure behavior
+
+- Remote unreachable → explicit error, no local fallback.
+- A bad single file → reported `failed` in the 200 response body; the rest of the
+  batch still commits.
+- Diary-shaped wing/room → rejected with HTTP 422.
+
+## Part 4 — Branch-aware mining
+
+`mine --branch` mines only the files that differ from the default branch, keeping
+the local palace in sync with ongoing branch work without re-ingesting the repo.
+
+```bash
+mempalace-cli mine /path/to/project --branch
+```
+
+- **Delta** = files changed vs the merge-base with the default branch
+  (`origin/HEAD` → `main` → `master`, first that resolves) **plus** untracked
+  files. Uncommitted edits are included by design.
+- Subdirectory project roots are re-relativized; files outside the project root
+  are dropped.
+- Branch rows use the `projects-branch` source-key namespace so they never collide
+  with a full mine of the same wing.
+- Every run reconciles: drawers for files that have left the delta (reverted,
+  merged, rebased away) are removed and reported as `Sources removed: N`.
+- **`--branch` is always local**, even for a `remote`/`combined` wing. That is the
+  point: it is the local side of a combined wing.
+
+### The combined-wing team workflow
+
+This is the intended end state of federation + locator storage + branch mining:
+
+1. The team/CI mines the repository's **main** branch into the **remote** shared
+   palace (a normal remote-routed `mine`). Done once for the whole team.
+2. Each developer mines their **branch delta** into their **local** palace
+   (`mine --branch`).
+3. The wing is configured `combined`. Search merges both sides; `content_hash`
+   deduplication means chunks identical between remote-main and local-branch are
+   not double-counted, while branch-local changes overlay the shared main index.
+
+The result: every agent searches one wing and transparently sees shared main
+knowledge overlaid with the local branch's in-progress changes.
+
+## Part 5 — Federated reads, wake-up, and changes
+
+> **Federated reads are an MCP-server capability.** The fan-out and merge below
+> happen inside `mempalace-mcp` (the tools your agent calls). The `mempalace-cli`
+> `search`, `status`, and `wake-up` commands always operate on the **local**
+> palace only — the CLI is federation-aware for **mining (writes)**, not for
+> reads. To exercise federated reads, point an MCP client at `mempalace-mcp` with
+> the federation config, or call the hub's REST endpoints directly.
+
+Through the MCP server, federated wings fan out across reads:
+
+- **Search / taxonomy / wings / rooms / status** — combined wings merge local and
+  remote; results and wings are annotated with origin/availability; a down remote
+  becomes a warning, not a failure.
+- **`mempalace_wake_up`** — when federation is active, the response gains
+  `remote_changes`: a per-remote map of the last 24 h of change events (each event
+  carries `origin: "remote:<name>"`), with unreachable remotes shown as
+  `{ "unreachable": true, "error": "..." }` and a `next_cursor` per remote.
+- **`mempalace_get_changes_since`** — merges local and remote change feeds,
+  annotates origin, and accepts per-remote `cursors` for continuation.
+
+> **Clock-skew caveat:** persist and pass back the per-origin cursors rather than
+> comparing timestamps across machines. Cross-machine `occurred_at` ordering is
+> best-effort display only.
+
+## Part 6 — Dev testing locally
+
+You can exercise the whole feature on one machine with two palace directories. The
+hub does the embedding, so set `MEMPALACE_STUB_EMBEDDINGS` (deterministic vectors,
+no model download) on the **hub** process — the client never embeds during a
+remote mine.
+
+```bash
+# 1. Hub palace + token file
+mkdir -p /tmp/hub
+echo '[{"token":"dev-token","name":"dev","enabled":true}]' > /tmp/hub/tokens.json
+
+# 2. Start the hub against the hub palace (stub embeddings for a fast offline run)
+MEMPALACE_STUB_EMBEDDINGS=1 mempalace-cli --palace /tmp/hub/palace serve \
+  --bind 127.0.0.1:8765 --token-file /tmp/hub/tokens.json &
+
+# 3. Point a client config at the hub (client uses a different, default palace)
+#    ~/.mempalace/config.json:
+#    { "federation": {
+#        "remotes": [{ "name": "hub", "url": "http://127.0.0.1:8765", "token": "dev-token" }],
+#        "wings": { "wing_demo": { "mode": "remote", "remote": "hub" } } } }
+
+# 4. Mine a project whose mempalace.yaml declares wing: wing_demo → pushes to the hub.
+#    The client does NOT embed here; the hub does.
+mempalace-cli mine /path/to/demo-project
+
+# 5. Verify the hub received it. The CLI's own `search` only reads the LOCAL
+#    palace, so query the hub directly over REST instead:
+curl -s -X POST http://127.0.0.1:8765/v1/drawers/search \
+  -H "Authorization: Bearer dev-token" -H "Content-Type: application/json" \
+  -d '{"query":"something from the project","wing":"wing_demo","limit":5}'
+```
+
+To exercise federated **reads** (combined search, wake-up fan-out), point an MCP
+client at `mempalace-mcp` running with the same client config from step 3 — the
+fan-out lives in the MCP server, not the CLI.
+
+For non-stale snippet resolution on the hub, add the project path to
+`server.checkouts.wing_demo` in the hub's config and restart `serve`.
+
+Notes:
+- `MEMPALACE_STUB_EMBEDDINGS` is honored by the `mempalace-mcp` binary and the CLI
+  `serve` command. The CLI `mine`/`search` commands always use the real embedding
+  provider — but a *remote-routed* `mine` does no client-side embedding at all, so
+  the stub setting only matters on the hub. For a fully stubbed read path, run the
+  MCP server with the env var set.
+- The stub maps keyword-less text to a single vector, so give demo files distinct
+  keyword clusters if you want them to rank apart.
+
+## Troubleshooting
+
+### `remote '<name>' is unreachable ... writes do not fall back to local`
+The hub is down or the URL/port is wrong. Federated writes intentionally do not
+fall back — fix connectivity or switch the wing to `local`.
+
+### `remote '<name>' does not support the ingest capability`
+The hub is an older build without `POST /v1/ingest/batch`. Upgrade the server.
+
+### Search results from a remote wing are all stale placeholders
+The hub has no `server.checkouts` entry for that wing. Add the mapping and restart
+`serve`; existing rows resolve fresh on the next search (no re-mine needed).
+
+### Config load warns about a missing token env var
+`token_env` names a variable that is not set. Export it, or the client proceeds
+unauthenticated (fine against a server with an unauthenticated entry, otherwise
+401s on protected routes).
+
+### A remote-routed write returns 422
+The target is diary-shaped (`wing_agents` / `diary` room / `diary:` source). Diary
+is local-only by design; no config can federate it.
+
+### `version != 1` on the server
+The server only accepts config schema version `1`. See
+[Config Schema](Config-Schema.md).

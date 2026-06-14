@@ -12,10 +12,11 @@ This document defines the first Rust release surface for `mempalace-rs`.
 ### CLI commands frozen for v1
 
 - `init`
-- `mine`
+- `mine` (including `--branch` branch-delta mining and remote-routed mining; see Federation)
 - `search`
 - `status`
 - `wake-up`
+- `serve` (federation HTTP server; see Federation below)
 
 ### Storage shape frozen for v1
 
@@ -27,8 +28,9 @@ This document defines the first Rust release surface for `mempalace-rs`.
 - `balanced`
 - `low_cpu`
 
-### MCP tool surface frozen for v1
+### MCP tool surface (23 tools)
 
+- `mempalace_wake_up`
 - `mempalace_status`
 - `mempalace_list_wings`
 - `mempalace_list_rooms`
@@ -48,6 +50,27 @@ This document defines the first Rust release surface for `mempalace-rs`.
 - `mempalace_delete_drawer`
 - `mempalace_diary_write`
 - `mempalace_diary_read`
+- `mempalace_get_changes_since`
+- `mempalace_identity_read`
+- `mempalace_identity_update`
+
+### Federation
+
+Added after the initial v1 freeze; now part of the shipped surface.
+
+- `mempalace-server` — Axum REST server exposing a palace, started via
+  `mempalace-cli serve`. Bearer-token auth; `GET /v1/health` is public.
+- `mempalace-remote` — HTTP client (`RemoteApi` trait + `RemoteClient`).
+- `mempalace-federation` — shared wire DTOs.
+- REST surface under `/v1`: `info`, `drawers` (search, check_duplicate, add, list,
+  get, delete), `kg` (query, facts, facts/invalidate, timeline, stats), `taxonomy`,
+  `wings`, `rooms`, `changes`, and `ingest/batch` (bulk mined-chunk ingest).
+- Client routing (`federation` config section): per-wing and KG `local` / `remote`
+  / `combined` modes; federated mining and `mine --branch` branch-delta mining.
+- MCP read fan-out: combined search/taxonomy/status, plus `remote_changes` in
+  `mempalace_wake_up` and remote merge in `mempalace_get_changes_since`.
+
+See [Federation](Federation.md) for the full guide.
 
 ## Explicitly Deferred Or Out Of Scope
 

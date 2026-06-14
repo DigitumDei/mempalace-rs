@@ -27,17 +27,18 @@ MemPalace provides a palace-style memory store with:
 - Semantic search via local embeddings (no external API calls)
 - A knowledge graph for structured facts, relationships, and timelines
 - An AAAK dialect for compact, human-readable memory storage
-- An MCP server (`mempalace-mcp`) for agent integration (19 tools)
+- An MCP server (`mempalace-mcp`) for agent integration (23 tools)
 - A CLI (`mempalace-cli`) for direct palace management
 - Locator-based mined storage: project file chunks store byte/line ranges instead of duplicated text; snippets are resolved lazily from the checkout at read time with stale detection
 - Branch-delta mining (`mine --branch`): mines only files changed vs the merge-base with the default branch, plus untracked files — keeps the local palace in sync with ongoing branch work without re-ingesting the whole repo
 - Federated project mining: when a wing's route targets a remote palace, `mine` prepares chunks locally and pushes them to the remote server via `POST /v1/ingest/batch`; the server embeds and stores them, so teams can share a single mined index without distributing embedding workload to every client
+- Federation: an HTTP server (`mempalace-cli serve`) shares a palace with other clients; per-wing `local`/`remote`/`combined` routing merges remote and local results, with bearer-token auth — see the [Federation guide](docs/Federation.md)
 
 ## Crates
 
 | Crate | Purpose |
 |---|---|
-| `mempalace-cli` | Command-line interface (`init`, `mine`, `search`, `status`, `wake-up`) |
+| `mempalace-cli` | Command-line interface (`init`, `mine`, `search`, `status`, `wake-up`, `serve`) |
 | `mempalace-mcp` | MCP server for agent tool integration |
 | `mempalace-core` | Core types and traits |
 | `mempalace-storage` | Palace persistence layer |
@@ -65,6 +66,7 @@ MemPalace provides a palace-style memory store with:
 - [Config schema](docs/Config-Schema.md) — `~/.mempalace/config.json`
 - [Low-CPU mode](docs/Operator-Low-CPU.md) — constrained environments
 - [Mined storage](docs/Mined-Storage.md) — locator model, stale semantics, discovery rules
+- [Federation](docs/Federation.md) — running a server, client routing, federated & branch-aware mining
 - [Hook setup](hooks/README.md) — auto-save for Claude Code
 
 ## License

@@ -10,6 +10,7 @@ Artifacts in this set:
 - [Standard Operator Guide](Operator-Standard.md)
 - [Low-CPU Operator Guide](Operator-Low-CPU.md)
 - [Mined Storage](Mined-Storage.md)
+- [Federation](Federation.md)
 - [Packaging And Validation](Packaging-And-Validation.md)
 - [Validation Evidence](Validation-Evidence.md)
 

@@ -68,7 +68,7 @@ claude mcp add mempalace -- /absolute/path/to/target/release/mempalace-mcp
 
 ### Cline / Cursor / Any MCP host
 
-Point your MCP client at the `mempalace-mcp` binary. No arguments needed — the server speaks stdio MCP and exposes all 19 tools on `initialize`.
+Point your MCP client at the `mempalace-mcp` binary. No arguments needed — the server speaks stdio MCP and exposes all 23 tools on `initialize`.
 
 Your AI now has access to `mempalace_search`, `mempalace_add_drawer`, `mempalace_kg_query`, and 16 more tools. Ask it anything about your project — it can search your palace on demand.
 
@@ -78,4 +78,5 @@ Your AI now has access to `mempalace_search`, `mempalace_add_drawer`, `mempalace
 - [CLI reference](CLI-Surface.md) — all commands and flags
 - [Config schema](Config-Schema.md) — `~/.mempalace/config.json` and `mempalace.yaml`
 - [Low-CPU mode](Operator-Low-CPU.md) — constrained environments
+- [Federation](Federation.md) — share a palace across machines: server setup, routing, federated & branch-aware mining
 - [Hook installation](../hooks/README.md) — auto-save for Claude Code

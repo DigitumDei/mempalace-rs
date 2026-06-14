@@ -107,6 +107,33 @@ If the MCP host needs to bootstrap a cold cache on first start, launch it with:
 MEMPALACE_EMBED_ALLOW_DOWNLOADS=1 target/release/mempalace-mcp
 ```
 
+## Federation Server Deployment
+
+To share a palace with other clients, run the federation HTTP server:
+
+```bash
+target/release/mempalace-cli serve --bind 127.0.0.1:8765 \
+  --token-file ~/.mempalace/server_tokens.json
+```
+
+Operational notes:
+
+- Create the token file first — a JSON array of objects, each with `token`,
+  `name`, and `enabled` keys. It is hot-reloaded, so revoking a token (set
+  `enabled: false`) takes effect on the next request without a restart.
+- The server speaks **plain HTTP**. On any untrusted network, run it behind a
+  TLS-terminating reverse proxy; never expose raw bearer tokens over the wire.
+- `GET /v1/health` is unauthenticated and suitable as a liveness probe; all other
+  routes require `Authorization: Bearer <token>`.
+- To resolve mined locator snippets server-side, map wings to local checkout paths
+  via `server.checkouts` in `config.json`.
+- Cold cache bootstrap uses the same `MEMPALACE_EMBED_ALLOW_DOWNLOADS` rule as the
+  other binaries; `MEMPALACE_STUB_EMBEDDINGS` runs the server with deterministic
+  stub vectors for offline testing.
+
+Full setup, client configuration, and the team mining workflow are in the
+[Federation guide](Federation.md).
+
 ## Storage Recovery
 
 If the palace is damaged or inconsistent:

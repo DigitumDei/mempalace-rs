@@ -84,6 +84,33 @@ Behavior:
 - Default L1 assembly uses the search crate default and is then clamped by low-CPU limits when enabled.
 - If no palace exists, the command returns a non-zero result with the expected bootstrap guidance.
 
+### `serve`
+
+Purpose:
+- Run the federation HTTP server over the current palace, exposing it to remote
+  clients via the REST API. See the [Federation guide](Federation.md) for the full
+  setup.
+
+Flags:
+- `--bind <ADDR>`
+  Socket address to listen on, e.g. `127.0.0.1:8765`. Default: `server.bind` from
+  `config.json`, falling back to `127.0.0.1:8765`.
+- `--token-file <PATH>`
+  Path to the bearer-token JSON file. Default: `server.token_file` from
+  `config.json`, falling back to `~/.mempalace/server_tokens.json`.
+
+Behavior:
+- The token file is a JSON array of objects, each with `token`, `name`, and
+  `enabled` keys; it is hot-reloaded on each request, and tokens are hashed in
+  memory.
+- `GET /v1/health` is unauthenticated; all other `/v1` routes require
+  `Authorization: Bearer <token>`.
+- The server speaks plain HTTP and prints a warning to that effect — front it with
+  TLS termination on untrusted networks.
+- Honors `MEMPALACE_STUB_EMBEDDINGS` (deterministic stub provider) for offline dev
+  testing.
+- Runs until interrupted; shuts down gracefully on Ctrl-C.
+
 ### Deferred Commands
 
 These commands are intentionally visible but not shipped as working Rust v1 functionality:

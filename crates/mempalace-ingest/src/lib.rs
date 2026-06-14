@@ -1099,19 +1099,15 @@ fn detect_default_branch(root: &Path) -> Option<String> {
         }
     }
 
-    // Fallback: check if main / master exist as local refs.
+    // Fallback: check if main / master exist as local refs. Use `output()` (not
+    // `status()`) so git's stdout (the resolved SHA) and stderr ("fatal: not a
+    // git repository" for non-repos) are captured rather than leaking to the
+    // CLI's own stdout/stderr.
     for candidate in &["main", "master"] {
         let ok = Command::new("git")
-            .args([
-                "-C",
-                &root_str,
-                "rev-parse",
-                "--verify",
-                "--quiet",
-                candidate,
-            ])
-            .status()
-            .map(|s| s.success())
+            .args(["-C", &root_str, "rev-parse", "--verify", "--quiet", candidate])
+            .output()
+            .map(|out| out.status.success())
             .unwrap_or(false);
         if ok {
             return Some((*candidate).to_owned());

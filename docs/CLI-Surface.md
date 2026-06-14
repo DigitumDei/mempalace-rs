@@ -39,12 +39,16 @@ Flags:
 - `--extract <exchange|general>` default: `exchange`
 - `--reindex`
   Re-process files that were previously ingested and are unchanged on disk by bypassing the unchanged-content skip. In `projects` mode this converts existing content rows to locator rows — use it as the one-time migration step after upgrading a palace from pre-locator storage.
+- `--branch`
+  Mine only files changed vs the merge-base with the default branch (plus untracked files). Always writes to the local palace regardless of federation routing. Uses the `projects-branch` source-key namespace so branch rows never collide with a full mine. Unsupported for `--mode convos`.
 
 Behavior:
 - `projects` uses the project ingest path.
 - `convos` uses the conversation ingest path.
 - In low-CPU mode, ingest batching is clamped by the resolved low-CPU runtime config.
 - `--reindex` bypasses the unchanged-content skip in both `projects` and `convos` modes.
+- When the wing's federation route targets a remote palace (mode `remote`, or mode `combined` with `write: remote`) and `--branch` is not set, the CLI prepares chunks locally and pushes them to `POST /v1/ingest/batch` on the remote server. The remote must advertise the `"ingest"` capability in `GET /v1/info`; older servers that lack this endpoint return a 404, which surfaces as a `RemoteRejected` error with a prompt to upgrade.
+- `--branch` overrides any remote route for the wing — branch-delta mining is always local.
 
 ### `search <query>`
 

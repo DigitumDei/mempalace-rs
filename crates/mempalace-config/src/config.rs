@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::net::SocketAddr;
@@ -46,6 +47,11 @@ pub struct ServerConfigFileV1 {
     /// Path to the bearer-token JSON file.  `~/`-prefixed strings are expanded.
     #[serde(default)]
     pub token_file: Option<String>,
+    /// Map of wing name → local checkout path.  The server uses this to
+    /// resolve locator rows for mined drawers pushed via the batch-ingest
+    /// endpoint; absent entries produce stale-placeholder locators.
+    #[serde(default)]
+    pub checkouts: BTreeMap<String, PathBuf>,
 }
 
 /// Resolved runtime configuration for the federation HTTP server.
@@ -55,6 +61,8 @@ pub struct ServerRuntimeConfig {
     pub bind: SocketAddr,
     /// Resolved path to the bearer-token JSON file.
     pub token_file: PathBuf,
+    /// Map of wing name → local checkout path (default: empty).
+    pub checkouts: BTreeMap<String, PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -459,7 +467,11 @@ fn resolve_server_config(
     let default_token_file = base_dir.join(DEFAULT_SERVER_TOKEN_FILE);
 
     let Some(section) = file_section else {
-        return Ok(ServerRuntimeConfig { bind: default_bind, token_file: default_token_file });
+        return Ok(ServerRuntimeConfig {
+            bind: default_bind,
+            token_file: default_token_file,
+            checkouts: BTreeMap::new(),
+        });
     };
 
     let bind = match section.bind {
@@ -477,7 +489,7 @@ fn resolve_server_config(
         Some(ref s) => expand_path(s)?,
     };
 
-    Ok(ServerRuntimeConfig { bind, token_file })
+    Ok(ServerRuntimeConfig { bind, token_file, checkouts: section.checkouts })
 }
 
 fn default_collection_name() -> String {
@@ -806,6 +818,69 @@ mod tests {
     }
 
     // ─── Server config tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn server_checkouts_populated_from_config() {
+        let base = temp_dir();
+        fs::create_dir_all(&base).unwrap();
+        fs::write(
+            base.join("config.json"),
+            r#"{
+  "version": 1,
+  "server": {
+    "bind": "127.0.0.1:8765",
+    "checkouts": {
+      "wing_proj": "/repos/myproject",
+      "wing_docs": "/repos/docs"
+    }
+  }
+}"#,
+        )
+        .unwrap();
+
+        let config = ConfigLoader::load_with_env(Some(&base)).unwrap();
+
+        assert_eq!(config.server.checkouts.len(), 2);
+        assert_eq!(
+            config.server.checkouts.get("wing_proj"),
+            Some(&PathBuf::from("/repos/myproject"))
+        );
+        assert_eq!(
+            config.server.checkouts.get("wing_docs"),
+            Some(&PathBuf::from("/repos/docs"))
+        );
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn server_checkouts_defaults_to_empty_when_absent() {
+        let base = temp_dir();
+        fs::create_dir_all(&base).unwrap();
+        // server section present but no checkouts field
+        fs::write(
+            base.join("config.json"),
+            r#"{"version":1,"server":{"bind":"127.0.0.1:8765"}}"#,
+        )
+        .unwrap();
+
+        let config = ConfigLoader::load_with_env(Some(&base)).unwrap();
+        assert!(config.server.checkouts.is_empty());
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn server_checkouts_defaults_to_empty_when_section_absent() {
+        let base = temp_dir();
+        fs::create_dir_all(&base).unwrap();
+        fs::write(base.join("config.json"), r#"{"version":1}"#).unwrap();
+
+        let config = ConfigLoader::load_with_env(Some(&base)).unwrap();
+        assert!(config.server.checkouts.is_empty());
+
+        fs::remove_dir_all(base).unwrap();
+    }
 
     #[test]
     fn server_defaults_when_section_absent() {

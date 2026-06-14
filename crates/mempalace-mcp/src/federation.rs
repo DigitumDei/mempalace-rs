@@ -1724,6 +1724,14 @@ mod tests {
                 next_cursor: self.changes_next_cursor.clone(),
             })
         }
+
+        async fn ingest_batch(
+            &self,
+            _req: mempalace_federation::IngestBatchRequest,
+        ) -> mempalace_remote::Result<mempalace_federation::IngestBatchResponse> {
+            self.check_fail("ingest_batch")?;
+            Ok(mempalace_federation::IngestBatchResponse { files: vec![], warnings: vec![] })
+        }
     }
 
     impl MockRemote {

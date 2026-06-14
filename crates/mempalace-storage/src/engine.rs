@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
 
 use tracing::warn;
@@ -10,7 +10,7 @@ use crate::types::{
     DrawerFilter, DrawerStore, DuplicateStrategy, IngestCommitRequest, IngestManifestEntry,
     RetryableRun, StorageLayout,
 };
-use mempalace_core::{DrawerId, EmbeddingProfile};
+use mempalace_core::{DrawerId, DrawerRecord, EmbeddingProfile};
 use time::{Duration, OffsetDateTime};
 
 #[derive(Debug, Clone)]
@@ -113,6 +113,48 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Replace all drawers for a mined source key.
+    ///
+    /// 1. Captures the currently-committed drawer ids for `source_key`.
+    /// 2. Commits the new `drawers` via [`DuplicateStrategy::Overwrite`].
+    /// 3. Deletes the previously-committed ids that are NOT present in the new
+    ///    set (stale rows from a previous mine of the same file).
+    ///
+    /// Passing an empty `drawers` vec effectively wipes all drawers for the
+    /// source key (used for branch-delta cleanup when a file is no longer in
+    /// the delta).
+    pub async fn replace_source_drawers(
+        &self,
+        ingest_kind: &str,
+        source_key: &str,
+        source_file: &str,
+        content_hash: String,
+        drawers: Vec<DrawerRecord>,
+    ) -> Result<()> {
+        let existing =
+            self.operational_store.committed_drawer_ids_for_source_key(source_key)?;
+        let new_ids = drawers.iter().map(|d| d.id.clone()).collect::<BTreeSet<_>>();
+
+        self.commit_ingest(IngestCommitRequest {
+            ingest_kind: ingest_kind.to_owned(),
+            source_key: source_key.to_owned(),
+            source_file: source_file.to_owned(),
+            content_hash,
+            drawers,
+            duplicate_strategy: DuplicateStrategy::Overwrite,
+        })
+        .await?;
+
+        let stale = existing
+            .into_iter()
+            .filter(|id| !new_ids.contains(id))
+            .collect::<Vec<_>>();
+        if !stale.is_empty() {
+            self.drawer_store.delete_drawers(&stale).await?;
+        }
+        Ok(())
+    }
+
     async fn prune_orphaned_rows(&self, stale_runs: &[RetryableRun]) -> Result<()> {
         let committed_ids =
             self.operational_store.committed_drawer_ids()?.into_iter().collect::<HashSet<_>>();
@@ -137,6 +179,7 @@ impl StorageEngine {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use tempfile::tempdir;
     use time::macros::{date, datetime};
@@ -240,5 +283,169 @@ mod tests {
             .stale_pending_runs(datetime!(2026-04-20 00:00:00 UTC))
             .unwrap();
         assert!(stale_runs.iter().all(|run| run.run.id != created_run.id));
+    }
+
+    // ─── replace_source_drawers tests ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn replace_source_drawers_removes_stale_ids_and_keeps_new() {
+        let tempdir = tempdir().unwrap();
+        let engine = StorageEngine::open(tempdir.path(), EmbeddingProfile::Balanced).await.unwrap();
+        let source_key = "projects:wing_p:abc123def456:src/auth.rs";
+
+        // Initial commit: 2 drawers.
+        let drawer_a = record("wing_p/backend/aaa-0000", "src/auth.rs", [1.0, 0.0, 0.0, 0.0]);
+        let drawer_b = record("wing_p/backend/aaa-0001", "src/auth.rs", [0.0, 1.0, 0.0, 0.0]);
+        engine
+            .replace_source_drawers(
+                "projects",
+                source_key,
+                "src/auth.rs",
+                "hash-v1".to_owned(),
+                vec![drawer_a.clone(), drawer_b.clone()],
+            )
+            .await
+            .unwrap();
+
+        let all = engine.drawer_store().list_drawers(&DrawerFilter::default()).await.unwrap();
+        assert_eq!(all.len(), 2, "should have 2 drawers after first commit");
+
+        // Replace with 1 new drawer; drawer_a is gone, drawer_c is new.
+        let drawer_c = record("wing_p/backend/aaa-0002", "src/auth.rs", [0.0, 0.0, 1.0, 0.0]);
+        engine
+            .replace_source_drawers(
+                "projects",
+                source_key,
+                "src/auth.rs",
+                "hash-v2".to_owned(),
+                vec![drawer_c.clone()],
+            )
+            .await
+            .unwrap();
+
+        let ids_after: Vec<_> =
+            engine.drawer_store().list_drawers(&DrawerFilter::default()).await.unwrap()
+                .into_iter()
+                .map(|d| d.id)
+                .collect();
+        assert_eq!(ids_after.len(), 1, "stale drawers should be deleted");
+        assert_eq!(ids_after[0], drawer_c.id, "the new drawer should remain");
+    }
+
+    #[tokio::test]
+    async fn replace_source_drawers_with_empty_vec_wipes_all_drawers_for_key() {
+        let tempdir = tempdir().unwrap();
+        let engine = StorageEngine::open(tempdir.path(), EmbeddingProfile::Balanced).await.unwrap();
+        let source_key = "projects:wing_p:abc123def456:src/utils.rs";
+
+        let drawer_a = record("wing_p/utils/bbb-0000", "src/utils.rs", [1.0, 0.0, 0.0, 0.0]);
+        let drawer_b = record("wing_p/utils/bbb-0001", "src/utils.rs", [0.0, 1.0, 0.0, 0.0]);
+        engine
+            .replace_source_drawers(
+                "projects",
+                source_key,
+                "src/utils.rs",
+                "hash-orig".to_owned(),
+                vec![drawer_a, drawer_b],
+            )
+            .await
+            .unwrap();
+
+        // Replace with empty vec → all drawers for this source key removed.
+        engine
+            .replace_source_drawers(
+                "projects",
+                source_key,
+                "src/utils.rs",
+                "hash-empty".to_owned(),
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let all = engine.drawer_store().list_drawers(&DrawerFilter::default()).await.unwrap();
+        assert!(all.is_empty(), "all drawers should be deleted after empty replace");
+    }
+}
+
+// ─── ingested_source_keys_with_prefix tests (on SqliteOperationalStore) ───────
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod prefix_tests {
+    use crate::sqlite::{IngestManifestStore, SqliteOperationalStore};
+    use crate::types::{IngestManifestEntry, IngestRunStatus};
+    use mempalace_core::DrawerId;
+    use tempfile::tempdir;
+    use time::macros::datetime;
+
+    fn commit_source(store: &SqliteOperationalStore, source_key: &str, drawer_id_str: &str) {
+        let run = store
+            .create_pending_run(
+                "projects",
+                source_key,
+                &[IngestManifestEntry {
+                    run_id: 0,
+                    drawer_id: DrawerId::new(drawer_id_str).unwrap(),
+                    source_file: "f.rs".to_owned(),
+                    content_hash: "ch".to_owned(),
+                    status: IngestRunStatus::Pending,
+                }],
+                datetime!(2026-01-01 00:00:00 UTC),
+            )
+            .unwrap();
+        store
+            .mark_run_committed(
+                run.id,
+                source_key,
+                "f.rs",
+                "ch",
+                1,
+                datetime!(2026-01-01 00:01:00 UTC),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn prefix_listing_returns_only_matching_keys() {
+        let tempdir = tempdir().unwrap();
+        let store = SqliteOperationalStore::new(tempdir.path().join("storage.sqlite3"));
+        store.ensure_schema().unwrap();
+
+        commit_source(&store, "projects:wing_a:abc:src/main.rs", "wing_a/code/abc-0000");
+        commit_source(&store, "projects:wing_a:abc:src/lib.rs", "wing_a/code/abc-0001");
+        commit_source(&store, "projects:wing_b:def:README.md", "wing_b/docs/def-0000");
+
+        let wing_a_keys = store.ingested_source_keys_with_prefix("projects:wing_a:").unwrap();
+        assert_eq!(wing_a_keys.len(), 2);
+        assert!(wing_a_keys.iter().all(|k| k.starts_with("projects:wing_a:")));
+
+        let wing_b_keys = store.ingested_source_keys_with_prefix("projects:wing_b:").unwrap();
+        assert_eq!(wing_b_keys.len(), 1);
+        assert_eq!(wing_b_keys[0], "projects:wing_b:def:README.md");
+
+        let all_projects = store.ingested_source_keys_with_prefix("projects:").unwrap();
+        assert_eq!(all_projects.len(), 3);
+    }
+
+    #[test]
+    fn prefix_with_percent_does_not_wildcard_match() {
+        let tempdir = tempdir().unwrap();
+        let store = SqliteOperationalStore::new(tempdir.path().join("storage.sqlite3"));
+        store.ensure_schema().unwrap();
+
+        // Insert a key that would be matched by '%' if not escaped.
+        commit_source(
+            &store,
+            "projects:wing_x:abc123:src/real.rs",
+            "wing_x/code/real-0000",
+        );
+
+        // A prefix containing '%' must NOT wildcard-match; expect zero results.
+        let results = store.ingested_source_keys_with_prefix("projects:wing_x%").unwrap();
+        assert!(
+            results.is_empty(),
+            "percent in prefix must not act as a wildcard; got: {results:?}"
+        );
     }
 }

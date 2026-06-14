@@ -181,6 +181,55 @@ routing:
 - `remote`: name of a remote defined in `~/.mempalace/config.json` federation.remotes. May be omitted when exactly one remote is configured.
 - `write`: `local` or `remote`. Only meaningful for `combined` mode. Default: `local`.
 
+## Server Config
+
+The optional `server` section of `~/.mempalace/config.json` configures the
+federation HTTP server started by `mempalace serve`.
+
+### Shape
+
+```jsonc
+{
+  "server": {
+    "bind": "127.0.0.1:8765",
+    "token_file": "~/.mempalace/server_tokens.json",
+    "checkouts": {
+      "wing_myproject": "/home/user/repos/myproject",
+      "wing_teamdocs":  "/home/user/repos/teamdocs"
+    }
+  }
+}
+```
+
+### Field Definitions
+
+#### `server.bind`
+
+- Type: string (`host:port` socket address)
+- Optional. Default: `"127.0.0.1:8765"`
+- Invalid socket-address strings fail config load with a precise error.
+
+#### `server.token_file`
+
+- Type: string (path, `~/`-prefixed strings are expanded)
+- Optional. Default: `~/.mempalace/server_tokens.json`
+
+#### `server.checkouts`
+
+- Type: object mapping wing name → absolute checkout path
+- Optional. Default: empty
+- Used by `POST /v1/ingest/batch` to fill the `resolve_root` field of locator
+  rows for mined files pushed from remote clients.
+- When a wing is present in the map, snippet text is resolved from the
+  configured path at search time, giving fresh locator results.
+- When a wing is **absent** from the map (or the `checkouts` field is omitted
+  entirely), the server stores locator rows with an empty `resolve_root`. Every
+  search result for that wing resolves as a stale placeholder, and the batch
+  response `warnings` array contains:
+  `"no checkout configured for wing '<w>'; locator results will resolve as stale placeholders until server.checkouts is set"`
+- Only the server that receives `POST /v1/ingest/batch` reads this field;
+  clients that push batches do not need it.
+
 ## Federation Config
 
 The optional `federation` section of `~/.mempalace/config.json` controls routing of wing reads and writes to remote palace servers.

@@ -10,11 +10,10 @@ use std::process::Command;
 use mempalace_config::{ConfigLoader, ProjectRoomConfig};
 use mempalace_core::{DrawerId, DrawerRecord, RoomId, SourceLocator, WingId};
 use mempalace_embeddings::{EmbeddingProvider, EmbeddingRequest};
+pub use mempalace_federation;
+use mempalace_federation::{IngestChunkDto, IngestFileDto};
 use mempalace_storage::core::MempalaceError;
-use mempalace_storage::{
-    DrawerFilter, DrawerStore, DuplicateStrategy, IngestCommitRequest, IngestManifestStore,
-    StorageEngine,
-};
+use mempalace_storage::{IngestManifestStore, StorageEngine};
 use serde_json::Value;
 use thiserror::Error;
 use time::{Date, OffsetDateTime};
@@ -327,6 +326,10 @@ pub enum IngestError {
     },
     #[error("invalid relative path for `{path}`")]
     InvalidRelativePath { path: PathBuf },
+    #[error(
+        "branch-delta mining requires a git repository with a detectable default branch: {reason}"
+    )]
+    BranchDeltaUnavailable { reason: String },
 }
 
 pub type Result<T> = std::result::Result<T, IngestError>;
@@ -356,6 +359,9 @@ pub struct IngestSummary {
     pub ingested_files: usize,
     pub drawers_written: usize,
     pub truncated_files: usize,
+    /// Number of previously-mined source keys removed during a branch cleanup
+    /// pass.  Always 0 for non-branch runs.
+    pub removed_sources: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -367,6 +373,11 @@ pub struct ProjectIngestRequest {
     pub dry_run: bool,
     pub reindex: bool,
     pub max_embed_batch_size: Option<usize>,
+    /// When `true`, only files in the git delta (changed vs merge-base with the
+    /// default branch, plus untracked) are mined.  Uses the `projects-branch`
+    /// source-key namespace.  Returns [`IngestError::BranchDeltaUnavailable`]
+    /// when no git repo or default branch is found.
+    pub branch: bool,
 }
 
 impl ProjectIngestRequest {
@@ -379,6 +390,7 @@ impl ProjectIngestRequest {
             dry_run: false,
             reindex: false,
             max_embed_batch_size: None,
+            branch: false,
         }
     }
 }
@@ -460,6 +472,33 @@ struct DiscoveredSource {
     relative_path: String,
 }
 
+/// A single chunk produced by [`prepare_file_chunks`], with all byte/line
+/// offsets already adjusted to be file-absolute (not trimmed-string-relative).
+#[derive(Debug, Clone)]
+struct PreparedChunk {
+    text: String,
+    chunk_index: u32,
+    room: String,
+    /// Present iff the file is valid UTF-8.
+    byte_start: Option<u64>,
+    byte_end: Option<u64>,
+    line_start: Option<u32>,
+    line_end: Option<u32>,
+}
+
+/// Output of the pure per-file preparation step (no embedding, no I/O beyond
+/// reading the file).
+#[derive(Debug, Clone)]
+struct PreparedFileChunks {
+    relative_path: String,
+    /// `project_ingest_content_hash` of the file (document hash × routing fingerprint).
+    content_hash: String,
+    /// `Some(document.content_hash)` when the file is valid UTF-8 (locator basis).
+    file_hash: Option<String>,
+    chunks: Vec<PreparedChunk>,
+    truncated: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ConversationNormalizeError {
     Malformed,
@@ -497,146 +536,90 @@ pub async fn ingest_project<P: EmbeddingProvider>(
     summary.discovered_files = discovered.files.len();
     summary.ignored_files = discovered.ignored_files;
 
-    let files = apply_limit(discovered.files, request.limit);
+    // For branch mode: compute the delta set and filter files.
+    let (ingest_kind, delta_set) = if request.branch {
+        let delta = compute_branch_delta(&root)?;
+        let set: BTreeSet<String> = delta.into_iter().collect();
+        ("projects-branch", Some(set))
+    } else {
+        ("projects", None)
+    };
 
-    for file in files {
-        match read_text_document(&file.absolute_path) {
-            Ok(document) => {
-                let source_key =
-                    source_key("projects", &root, &wing_name, None, &file.relative_path);
-                let content_hash =
-                    project_ingest_content_hash(&document.content_hash, &routing_fingerprint);
+    let discovered_files = if let Some(ref delta) = delta_set {
+        discovered
+            .files
+            .into_iter()
+            .filter(|f| delta.contains(&f.relative_path))
+            .collect::<Vec<_>>()
+    } else {
+        discovered.files
+    };
+
+    let files: Vec<DiscoveredSource> = apply_limit(discovered_files, request.limit).collect();
+
+    for file in &files {
+        match prepare_file_chunks(file, &routing_fingerprint, &config.rooms) {
+            Ok(prepared) => {
+                let sk =
+                    source_key(ingest_kind, &root, &wing_name, None, &file.relative_path);
                 if !request.reindex {
                     if let Some(existing) =
-                        engine.operational_store().get_ingested_file(&source_key)?
+                        engine.operational_store().get_ingested_file(&sk)?
                     {
-                        if existing.content_hash == content_hash {
+                        if existing.content_hash == prepared.content_hash {
                             summary.skipped_unchanged += 1;
                             continue;
                         }
                     }
                 }
 
-                if document.content.trim().len() < PROJECT_MIN_CHUNK_SIZE {
+                if prepared.chunks.is_empty() {
                     if !request.dry_run {
                         replace_source_drawers(
                             engine,
-                            &source_key,
+                            &sk,
                             &file.relative_path,
-                            "projects",
-                            content_hash,
+                            ingest_kind,
+                            prepared.content_hash,
                             Vec::new(),
                         )
                         .await?;
                     }
                     summary.ingested_files += 1;
-                    summary.truncated_files += usize::from(document.truncated);
+                    summary.truncated_files += usize::from(prepared.truncated);
                     continue;
                 }
 
-                let room = detect_project_room(
-                    Path::new(&file.relative_path),
-                    &document.content,
-                    &config.rooms,
+                // Convert PreparedChunk → Chunk and build the locator context.
+                let (chunks_with_room, maybe_ctx_storage) = prepared_chunks_to_ingest(
+                    &prepared,
+                    &resolve_root,
+                    commit_hash.as_deref(),
                 );
-
-                // Use offset-tracked chunking when the document has a locator basis.
-                let chunks = chunk_project_text(&document.content, document.valid_utf8);
-
-                if chunks.is_empty() {
-                    if !request.dry_run {
-                        replace_source_drawers(
-                            engine,
-                            &source_key,
-                            &file.relative_path,
-                            "projects",
-                            content_hash,
-                            Vec::new(),
-                        )
-                        .await?;
-                    }
-                    summary.ingested_files += 1;
-                    summary.truncated_files += usize::from(document.truncated);
-                    continue;
-                }
-
-                // Build locator context when we have a valid UTF-8 basis.
-                let locator_ctx = if document.valid_utf8 {
-                    // Adjust chunk byte ranges from trimmed-string offsets to file offsets.
-                    let file_byte_ranges: Vec<(u64, u64)> = chunks
-                        .iter()
-                        .filter_map(|c| c.byte_range)
-                        .map(|(s, e)| {
-                            let off = document.trim_offset as u64;
-                            (s + off, e + off)
-                        })
-                        .collect();
-
-                    // Reuse the bytes read by read_text_document — both the hash and
-                    // the line numbers must describe the same file snapshot.
-                    let line_numbers = compute_line_numbers(&document.raw_bytes, &file_byte_ranges);
-                    Some((file_byte_ranges, line_numbers))
-                } else {
-                    None
-                };
-
-                // Assign room hints and final file-relative byte ranges to chunks.
-                let (chunks_with_room, maybe_ctx): (Vec<Chunk>, Option<ProjectLocatorContext<'_>>) =
-                    match locator_ctx {
-                        Some((ref file_byte_ranges, ref line_numbers)) => {
-                            // Re-map byte ranges from trimmed-string relative to file-relative.
-                            let chunks_out: Vec<Chunk> = chunks
-                                .into_iter()
-                                .zip(file_byte_ranges.iter())
-                                .map(|(mut c, &(s, e))| {
-                                    c.room_hint = Some(room.clone());
-                                    c.date_hint = None;
-                                    c.byte_range = Some((s, e));
-                                    c
-                                })
-                                .collect();
-                            let ctx = ProjectLocatorContext {
-                                file_hash: &document.content_hash,
-                                resolve_root: &resolve_root,
-                                commit_hash: commit_hash.as_deref(),
-                                line_numbers,
-                            };
-                            (chunks_out, Some(ctx))
-                        }
-                        None => {
-                            let chunks_out: Vec<Chunk> = chunks
-                                .into_iter()
-                                .map(|mut c| {
-                                    c.room_hint = Some(room.clone());
-                                    c.date_hint = None;
-                                    c
-                                })
-                                .collect();
-                            (chunks_out, None)
-                        }
-                    };
+                let ctx_borrow =
+                    maybe_ctx_storage.as_ref().map(PreparedLocatorStorage::as_ctx);
 
                 let source_drawers = build_drawers(
                     provider,
                     &wing_id,
-                    &source_key,
+                    &sk,
                     &file.relative_path,
-                    "projects",
+                    ingest_kind,
                     None,
                     &request.agent,
                     request.max_embed_batch_size,
                     chunks_with_room,
-                    maybe_ctx.as_ref(),
+                    ctx_borrow.as_ref(),
                 )?;
                 let drawer_count = source_drawers.len();
 
                 if !request.dry_run {
                     replace_source_drawers(
                         engine,
-                        &source_key,
+                        &sk,
                         &file.relative_path,
-                        "projects",
-                        content_hash,
+                        ingest_kind,
+                        prepared.content_hash,
                         source_drawers,
                     )
                     .await?;
@@ -644,12 +627,47 @@ pub async fn ingest_project<P: EmbeddingProvider>(
 
                 summary.ingested_files += 1;
                 summary.drawers_written += drawer_count;
-                summary.truncated_files += usize::from(document.truncated);
+                summary.truncated_files += usize::from(prepared.truncated);
             }
             Err(IngestError::Io { .. }) => {
                 summary.unreadable_files += 1;
             }
             Err(error) => return Err(error),
+        }
+    }
+
+    // Branch cleanup pass: remove source keys whose relative paths are no longer
+    // in the current delta (files reverted to base or deleted from the branch).
+    if request.branch && !request.dry_run {
+        let current_rel_paths: BTreeSet<&str> =
+            files.iter().map(|f| f.relative_path.as_str()).collect();
+        let root_key = hash_text(&root.to_string_lossy());
+        let prefix = format!("{ingest_kind}:{wing_name}:{root_key}:");
+        let stale_keys =
+            engine.operational_store().ingested_source_keys_with_prefix(&prefix)?;
+        for key in stale_keys {
+            // Key format: projects-branch:{wing}:{root_key}:{rel_path}
+            // Split off the first 3 ':'-delimited segments to get rel_path.
+            let rel = key.splitn(4, ':').nth(3).unwrap_or("");
+            if !current_rel_paths.contains(rel) {
+                // Only replace if there are committed drawers for this key.
+                if let Some(existing) =
+                    engine.operational_store().get_ingested_file(&key)?
+                {
+                    if existing.content_hash != hash_text("removed") {
+                        replace_source_drawers(
+                            engine,
+                            &key,
+                            rel,
+                            ingest_kind,
+                            hash_text("removed"),
+                            Vec::new(),
+                        )
+                        .await?;
+                        summary.removed_sources += 1;
+                    }
+                }
+            }
         }
     }
 
@@ -882,25 +900,600 @@ async fn replace_source_drawers(
     content_hash: String,
     drawers: Vec<DrawerRecord>,
 ) -> Result<()> {
-    let existing = engine.operational_store().committed_drawer_ids_for_source_key(source_key)?;
-    let new_ids = drawers.iter().map(|drawer| drawer.id.clone()).collect::<BTreeSet<_>>();
-
     engine
-        .commit_ingest(IngestCommitRequest {
-            ingest_kind: ingest_kind.to_owned(),
-            source_key: source_key.to_owned(),
-            source_file: source_file.to_owned(),
-            content_hash,
-            drawers,
-            duplicate_strategy: DuplicateStrategy::Overwrite,
-        })
-        .await?;
+        .replace_source_drawers(ingest_kind, source_key, source_file, content_hash, drawers)
+        .await
+        .map_err(IngestError::Storage)
+}
 
-    let stale = existing.into_iter().filter(|id| !new_ids.contains(id)).collect::<Vec<_>>();
-    if !stale.is_empty() {
-        engine.drawer_store().delete_drawers(&stale).await?;
+// ─── Per-file chunk preparation helper ─────────────────────────────────────
+
+/// Pure per-file preparation: read the file, chunk it, compute byte/line offsets.
+/// No embedding, no storage.  Returns an error only on I/O or path problems.
+///
+/// Files below [`PROJECT_MIN_CHUNK_SIZE`] or that produce zero chunks after
+/// chunking will have an empty `chunks` vec — the caller handles the
+/// replace-with-empty semantics.
+fn prepare_file_chunks(
+    file: &DiscoveredSource,
+    routing_fingerprint: &str,
+    rooms: &[ProjectRoomConfig],
+) -> Result<PreparedFileChunks> {
+    let document = read_text_document(&file.absolute_path)?;
+    let content_hash =
+        project_ingest_content_hash(&document.content_hash, routing_fingerprint);
+
+    // Below the minimum size gate → return with empty chunks.
+    if document.content.trim().len() < PROJECT_MIN_CHUNK_SIZE {
+        return Ok(PreparedFileChunks {
+            relative_path: file.relative_path.clone(),
+            content_hash,
+            file_hash: None,
+            chunks: Vec::new(),
+            truncated: document.truncated,
+        });
     }
-    Ok(())
+
+    let room = detect_project_room(
+        Path::new(&file.relative_path),
+        &document.content,
+        rooms,
+    );
+
+    let raw_chunks = chunk_project_text(&document.content, document.valid_utf8);
+
+    // After chunking, if we got nothing → return with empty chunks.
+    if raw_chunks.is_empty() {
+        return Ok(PreparedFileChunks {
+            relative_path: file.relative_path.clone(),
+            content_hash,
+            file_hash: None,
+            chunks: Vec::new(),
+            truncated: document.truncated,
+        });
+    }
+
+    let (file_hash, prepared_chunks) = if document.valid_utf8 {
+        // Adjust chunk byte ranges from trimmed-string offsets to file offsets.
+        let file_byte_ranges: Vec<(u64, u64)> = raw_chunks
+            .iter()
+            .filter_map(|c| c.byte_range)
+            .map(|(s, e)| {
+                let off = document.trim_offset as u64;
+                (s + off, e + off)
+            })
+            .collect();
+
+        // Reuse the bytes read by read_text_document — both the hash and
+        // the line numbers must describe the same file snapshot.
+        let line_numbers = compute_line_numbers(&document.raw_bytes, &file_byte_ranges);
+
+        let chunks: Vec<PreparedChunk> = raw_chunks
+            .into_iter()
+            .zip(file_byte_ranges.iter())
+            .zip(line_numbers.iter())
+            .map(|((c, &(bs, be)), &(ls, le))| PreparedChunk {
+                text: c.content,
+                chunk_index: c.chunk_index,
+                room: room.clone(),
+                byte_start: Some(bs),
+                byte_end: Some(be),
+                line_start: Some(ls),
+                line_end: Some(le),
+            })
+            .collect();
+
+        (Some(document.content_hash), chunks)
+    } else {
+        let chunks: Vec<PreparedChunk> = raw_chunks
+            .into_iter()
+            .map(|c| PreparedChunk {
+                text: c.content,
+                chunk_index: c.chunk_index,
+                room: room.clone(),
+                byte_start: None,
+                byte_end: None,
+                line_start: None,
+                line_end: None,
+            })
+            .collect();
+        (None, chunks)
+    };
+
+    Ok(PreparedFileChunks {
+        relative_path: file.relative_path.clone(),
+        content_hash,
+        file_hash,
+        chunks: prepared_chunks,
+        truncated: document.truncated,
+    })
+}
+
+/// Convert [`PreparedFileChunks`] into a [`Chunk`] vec plus optional owned
+/// locator storage that the caller can then borrow as [`ProjectLocatorContext`].
+fn prepared_chunks_to_ingest(
+    prepared: &PreparedFileChunks,
+    resolve_root: &str,
+    commit_hash: Option<&str>,
+) -> (Vec<Chunk>, Option<PreparedLocatorStorage>) {
+    match prepared.file_hash {
+        Some(ref fh) => {
+            let line_numbers: Vec<(u32, u32)> = prepared
+                .chunks
+                .iter()
+                .map(|c| (c.line_start.unwrap_or(1), c.line_end.unwrap_or(1)))
+                .collect();
+
+            let chunks_out: Vec<Chunk> = prepared
+                .chunks
+                .iter()
+                .map(|c| Chunk {
+                    content: c.text.clone(),
+                    chunk_index: c.chunk_index,
+                    room_hint: Some(c.room.clone()),
+                    date_hint: None,
+                    byte_range: c.byte_start.zip(c.byte_end),
+                })
+                .collect();
+            let storage = PreparedLocatorStorage {
+                file_hash: fh.clone(),
+                resolve_root: resolve_root.to_owned(),
+                commit_hash: commit_hash.map(str::to_owned),
+                line_numbers,
+            };
+            (chunks_out, Some(storage))
+        }
+        None => {
+            let chunks_out: Vec<Chunk> = prepared
+                .chunks
+                .iter()
+                .map(|c| Chunk {
+                    content: c.text.clone(),
+                    chunk_index: c.chunk_index,
+                    room_hint: Some(c.room.clone()),
+                    date_hint: None,
+                    byte_range: None,
+                })
+                .collect();
+            (chunks_out, None)
+        }
+    }
+}
+
+/// Owned storage for the locator context produced by [`prepared_chunks_to_ingest`].
+/// Implements `AsRef<ProjectLocatorContext<'_>>` so it can be passed to `build_drawers`.
+struct PreparedLocatorStorage {
+    file_hash: String,
+    resolve_root: String,
+    commit_hash: Option<String>,
+    line_numbers: Vec<(u32, u32)>,
+}
+
+impl PreparedLocatorStorage {
+    fn as_ctx(&self) -> ProjectLocatorContext<'_> {
+        ProjectLocatorContext {
+            file_hash: &self.file_hash,
+            resolve_root: &self.resolve_root,
+            commit_hash: self.commit_hash.as_deref(),
+            line_numbers: &self.line_numbers,
+        }
+    }
+}
+
+// ─── Branch-delta helpers ────────────────────────────────────────────────────
+
+/// Detect the default branch ref: tries `origin/HEAD` symbolic-ref, then
+/// literal `main` / `master`.  Returns `None` when neither is found.
+fn detect_default_branch(root: &Path) -> Option<String> {
+    let root_str = root.to_string_lossy();
+
+    // Try the symbolic ref (e.g. "origin/main").
+    let out = Command::new("git")
+        .args(["-C", &root_str, "symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
+        .output()
+        .ok()?;
+    if out.status.success() {
+        let s = std::str::from_utf8(&out.stdout).ok()?.trim().to_owned();
+        if !s.is_empty() {
+            return Some(s);
+        }
+    }
+
+    // Fallback: check if main / master exist as local refs.
+    for candidate in &["main", "master"] {
+        let ok = Command::new("git")
+            .args([
+                "-C",
+                &root_str,
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                candidate,
+            ])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ok {
+            return Some((*candidate).to_owned());
+        }
+    }
+    None
+}
+
+/// Compute the merge-base commit between `default_ref` and HEAD.
+fn compute_merge_base(root: &Path, default_ref: &str) -> Option<String> {
+    let out = Command::new("git")
+        .args(["-C", &root.to_string_lossy().as_ref(), "merge-base", default_ref, "HEAD"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = std::str::from_utf8(&out.stdout).ok()?.trim().to_owned();
+    if s.is_empty() { None } else { Some(s) }
+}
+
+/// Return repo-toplevel-relative forward-slash paths of all files changed
+/// between `merge_base` and the working tree (including untracked files).
+fn git_delta_paths(root: &Path, merge_base: &str) -> Option<Vec<String>> {
+    let root_str = root.to_string_lossy();
+
+    // Changed/added files (working tree vs merge-base).  `-z` yields
+    // NUL-separated, unquoted paths so filenames with spaces or non-ASCII
+    // bytes survive regardless of the user's core.quotePath setting.
+    let diff_out = Command::new("git")
+        .args([
+            "-C",
+            &root_str,
+            "diff",
+            "--name-only",
+            "--diff-filter=d",
+            "-z",
+            merge_base,
+        ])
+        .output()
+        .ok()?;
+    if !diff_out.status.success() {
+        return None;
+    }
+
+    // Untracked files.
+    let untracked_out = Command::new("git")
+        .args(["-C", &root_str, "ls-files", "--others", "--exclude-standard", "-z"])
+        .output()
+        .ok()?;
+    if !untracked_out.status.success() {
+        return None;
+    }
+
+    let mut paths = Vec::new();
+    for bytes in [diff_out.stdout.as_slice(), untracked_out.stdout.as_slice()] {
+        for path_bytes in bytes.split(|&b| b == 0) {
+            if path_bytes.is_empty() {
+                continue;
+            }
+            // Non-UTF-8 paths can't match our String-based relative paths;
+            // skip them rather than failing the whole delta.
+            if let Ok(path) = std::str::from_utf8(path_bytes) {
+                paths.push(path.to_owned());
+            }
+        }
+    }
+    Some(paths)
+}
+
+/// Get the absolute repo root (via `git rev-parse --show-toplevel`).
+fn git_repo_toplevel(root: &Path) -> Option<PathBuf> {
+    let out = Command::new("git")
+        .args(["-C", &root.to_string_lossy().as_ref(), "rev-parse", "--show-toplevel"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = std::str::from_utf8(&out.stdout).ok()?.trim();
+    if s.is_empty() { None } else { Some(PathBuf::from(s)) }
+}
+
+/// Compute the branch delta: returns project-root-relative forward-slash paths
+/// of files that differ from the merge-base with the default branch (including
+/// untracked files).  Paths outside the project root are dropped.
+fn compute_branch_delta(root: &Path) -> Result<Vec<String>> {
+    let default_ref = detect_default_branch(root).ok_or_else(|| {
+        IngestError::BranchDeltaUnavailable {
+            reason: "not a git repository or no default branch (origin/HEAD, main, master) found"
+                .to_owned(),
+        }
+    })?;
+
+    let merge_base = compute_merge_base(root, &default_ref).ok_or_else(|| {
+        IngestError::BranchDeltaUnavailable {
+            reason: format!(
+                "could not compute merge-base between '{default_ref}' and HEAD"
+            ),
+        }
+    })?;
+
+    let repo_paths = git_delta_paths(root, &merge_base).ok_or_else(|| {
+        IngestError::BranchDeltaUnavailable {
+            reason: "git diff / ls-files failed".to_owned(),
+        }
+    })?;
+
+    // Re-relativize paths from repo-root to project-root.
+    let repo_root = git_repo_toplevel(root).ok_or_else(|| {
+        IngestError::BranchDeltaUnavailable {
+            reason: "git rev-parse --show-toplevel failed".to_owned(),
+        }
+    })?;
+
+    // repo_root from git uses forward slashes on all platforms for the purpose
+    // of path computation below; canonicalize both for comparison.
+    let repo_root_canon = repo_root
+        .canonicalize()
+        .unwrap_or_else(|_| repo_root.clone());
+    let project_root_canon = root.to_path_buf();
+
+    let mut result = Vec::new();
+    for repo_rel in repo_paths {
+        // Build absolute path from repo root + repo-relative path (forward slashes).
+        let abs = repo_root_canon.join(repo_rel.replace('/', std::path::MAIN_SEPARATOR_STR));
+        // Now compute relative to project root.
+        match abs.strip_prefix(&project_root_canon) {
+            Ok(rel) => {
+                // Convert back to forward slashes.
+                let fwd: String = rel
+                    .components()
+                    .filter_map(|c| {
+                        if let Component::Normal(s) = c {
+                            s.to_str().map(str::to_owned)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("/");
+                if !fwd.is_empty() {
+                    result.push(fwd);
+                }
+            }
+            Err(_) => {
+                // Path is outside the project root — drop it.
+            }
+        }
+    }
+    Ok(result)
+}
+
+// ─── prepare_project_batch ───────────────────────────────────────────────────
+
+/// Summary produced by [`prepare_project_batch`].
+#[derive(Debug, Clone)]
+pub struct PreparedProjectMine {
+    /// Resolved wing name.
+    pub wing: String,
+    /// Machine-independent repository identity (see [`derive_repo_id`]).
+    pub repo_id: String,
+    /// Git commit hash at the time of preparation, if available.
+    pub commit_hash: Option<String>,
+    /// Current git branch name, for non-default-branch warnings on the caller side.
+    pub current_branch: Option<String>,
+    /// Default branch name (as resolved from origin/HEAD or main/master).
+    pub default_branch: Option<String>,
+    /// Files ready to send; zero-chunk files are excluded (not representable over
+    /// the wire in v1 — the replace-with-empty case is local-only).
+    pub files: Vec<IngestFileDto>,
+    /// Discovery/preparation counts (ingested_files = files included in `files`).
+    pub summary: IngestSummary,
+}
+
+/// Prepare a project mine for federation transmission.
+///
+/// Performs discovery + per-file chunk preparation (including byte/line offset
+/// computation) but no embedding and no storage writes.  The returned
+/// [`PreparedProjectMine`] contains [`IngestFileDto`] values ready for
+/// [`mempalace_federation::IngestBatchRequest`].
+///
+/// Files with zero chunks (below the minimum size gate or producing no chunks
+/// after splitting) are **excluded** from `files` — the replace-with-empty
+/// semantics are not supported over the wire in v1.  They are not counted in
+/// `summary.ingested_files` (only files actually included are counted).
+///
+/// `request.dry_run` and `request.branch` are ignored; the caller controls
+/// whether to send the batch.
+pub fn prepare_project_batch(request: &ProjectIngestRequest) -> Result<PreparedProjectMine> {
+    let root = request
+        .project_dir
+        .canonicalize()
+        .map_err(|source| IngestError::Io { path: request.project_dir.clone(), source })?;
+    let config = ConfigLoader::load_project_config(&root)?;
+    let wing_name = request.wing.clone().unwrap_or_else(|| config.wing.clone());
+    let discovered = discover_project_files(&root)?;
+    let routing_fingerprint = project_routing_fingerprint(&config.rooms);
+    let commit_hash = resolve_commit_hash(&root);
+
+    let repo_id = derive_repo_id(&root, &wing_name);
+    let default_branch = detect_default_branch(&root);
+    let current_branch = resolve_current_branch(&root);
+
+    let mut summary = IngestSummary::default();
+    summary.discovered_files = discovered.files.len();
+    summary.ignored_files = discovered.ignored_files;
+
+    let files_to_process: Vec<DiscoveredSource> =
+        apply_limit(discovered.files, request.limit).collect();
+    let mut file_dtos: Vec<IngestFileDto> = Vec::new();
+
+    for file in &files_to_process {
+        match prepare_file_chunks(file, &routing_fingerprint, &config.rooms) {
+            Ok(prepared) => {
+                // Skip zero-chunk files — replace-with-empty is not supported over
+                // the wire in v1.
+                if prepared.chunks.is_empty() {
+                    continue;
+                }
+
+                let chunks: Vec<IngestChunkDto> = prepared
+                    .chunks
+                    .iter()
+                    .map(|c| IngestChunkDto {
+                        chunk_index: c.chunk_index,
+                        room: c.room.clone(),
+                        text: c.text.clone(),
+                        byte_start: c.byte_start,
+                        byte_end: c.byte_end,
+                        line_start: c.line_start,
+                        line_end: c.line_end,
+                    })
+                    .collect();
+
+                file_dtos.push(IngestFileDto {
+                    relative_path: prepared.relative_path,
+                    content_hash: prepared.content_hash,
+                    file_hash: prepared.file_hash,
+                    chunks,
+                });
+
+                summary.ingested_files += 1;
+                summary.truncated_files += usize::from(prepared.truncated);
+            }
+            Err(IngestError::Io { .. }) => {
+                summary.unreadable_files += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    Ok(PreparedProjectMine {
+        wing: wing_name,
+        repo_id,
+        commit_hash,
+        current_branch,
+        default_branch,
+        files: file_dtos,
+        summary,
+    })
+}
+
+// ─── Repo identity ───────────────────────────────────────────────────────────
+
+/// Derive a machine-independent repository identity string from the git remote
+/// URL of `origin`.  Falls back to `format!("wing:{wing}")` when no remote is
+/// configured or the directory is not a git repository.
+pub fn derive_repo_id(root: &Path, wing: &str) -> String {
+    let url = Command::new("git")
+        .args(["-C", &root.to_string_lossy(), "remote", "get-url", "origin"])
+        .output()
+        .ok()
+        .and_then(|out| {
+            if out.status.success() {
+                std::str::from_utf8(&out.stdout).ok().map(|s| s.trim().to_owned())
+            } else {
+                None
+            }
+        });
+
+    match url.as_deref().filter(|s| !s.is_empty()) {
+        Some(u) => normalize_git_remote_url(u)
+            .unwrap_or_else(|| format!("wing:{wing}")),
+        None => format!("wing:{wing}"),
+    }
+}
+
+/// Normalize a git remote URL to the form `host/path` for use as a
+/// machine-independent repository identity.
+///
+/// Rules:
+/// - Strip one trailing `/` and one trailing `.git`.
+/// - `git@host:path` (SCP) → `host/path`.
+/// - `scheme://[user@]host[:port]/path` → `host/path` (port dropped).
+/// - Host is lowercased; path case is preserved.
+///
+/// Returns `None` for unrecognisable or empty input.
+pub fn normalize_git_remote_url(url: &str) -> Option<String> {
+    let url = url.trim();
+    if url.is_empty() {
+        return None;
+    }
+
+    // Strip one trailing '/' then one trailing '.git'.
+    let url = url.trim_end_matches('/');
+    let url = url.strip_suffix(".git").unwrap_or(url);
+    // Another trailing '/' after stripping .git (e.g. "…repo.git/").
+    let url = url.trim_end_matches('/');
+
+    if url.is_empty() {
+        return None;
+    }
+
+    // SCP style: git@github.com:owner/repo
+    if let Some(at_pos) = url.find('@') {
+        if !url[..at_pos].contains("://") {
+            // No scheme before '@' → SCP format.
+            let after_at = &url[at_pos + 1..];
+            if let Some(colon_pos) = after_at.find(':') {
+                let host = after_at[..colon_pos].to_ascii_lowercase();
+                let path = &after_at[colon_pos + 1..];
+                let path = path.trim_start_matches('/');
+                if path.is_empty() || host.is_empty() {
+                    return None;
+                }
+                return Some(format!("{host}/{path}"));
+            }
+            return None;
+        }
+    }
+
+    // URL style: scheme://[user@]host[:port]/path
+    if let Some(after_scheme) = url.find("://").map(|i| &url[i + 3..]) {
+        // Strip optional user@ prefix.
+        let host_and_rest = if let Some(at_pos) = after_scheme.find('@') {
+            &after_scheme[at_pos + 1..]
+        } else {
+            after_scheme
+        };
+
+        // Split host (and optional :port) from path.
+        let (host_port, path) = if let Some(slash_pos) = host_and_rest.find('/') {
+            (&host_and_rest[..slash_pos], &host_and_rest[slash_pos + 1..])
+        } else {
+            (host_and_rest, "")
+        };
+
+        // Drop the port from host:port.
+        let host = if let Some(colon_pos) = host_port.find(':') {
+            &host_port[..colon_pos]
+        } else {
+            host_port
+        }
+        .to_ascii_lowercase();
+
+        let path = path.trim_start_matches('/');
+
+        if host.is_empty() {
+            return None;
+        }
+        if path.is_empty() {
+            return Some(host);
+        }
+        return Some(format!("{host}/{path}"));
+    }
+
+    None
+}
+
+/// Resolve the current git branch name (`git rev-parse --abbrev-ref HEAD`).
+/// Returns `None` when not in a repo or in detached HEAD state.
+fn resolve_current_branch(root: &Path) -> Option<String> {
+    let out = Command::new("git")
+        .args(["-C", &root.to_string_lossy(), "rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = std::str::from_utf8(&out.stdout).ok()?.trim().to_owned();
+    if s.is_empty() || s == "HEAD" { None } else { Some(s) }
 }
 
 /// Returns `true` if `file_name` should be skipped for secrets / lockfile hygiene.
@@ -2133,8 +2726,7 @@ fn room_id(value: &str) -> Result<RoomId> {
 }
 
 fn drawer_id(wing: &WingId, room: &RoomId, source_key: &str, chunk_index: u32) -> Result<DrawerId> {
-    let source_hash = &hash_text(source_key)[..12];
-    DrawerId::new(format!("{}/{}/{}-{:04}", wing.as_str(), room.as_str(), source_hash, chunk_index))
+    mempalace_core::mined_drawer_id(wing, room, source_key, chunk_index)
         .map_err(|err| IngestError::Core(err.into()))
 }
 
@@ -2184,6 +2776,7 @@ mod tests {
         EmbeddingProvider, EmbeddingRequest, EmbeddingResponse, StartupValidation,
         StartupValidationStatus,
     };
+    use mempalace_storage::{DrawerFilter, DrawerStore};
     use serde_json::json;
     use tempfile::tempdir;
 
@@ -2463,6 +3056,7 @@ mod tests {
                 dry_run: false,
                 reindex: false,
                 max_embed_batch_size: None,
+                branch: false,
             },
         )
         .await
@@ -2669,6 +3263,7 @@ mod tests {
                 dry_run: false,
                 reindex: false,
                 max_embed_batch_size: None,
+                branch: false,
             },
         )
         .await
@@ -2684,6 +3279,7 @@ mod tests {
                 dry_run: false,
                 reindex: false,
                 max_embed_batch_size: None,
+                branch: false,
             },
         )
         .await
@@ -2707,6 +3303,7 @@ mod tests {
                 dry_run: false,
                 reindex: false,
                 max_embed_batch_size: None,
+                branch: false,
             },
         )
         .await
@@ -2761,6 +3358,7 @@ mod tests {
                 dry_run: false,
                 reindex: false,
                 max_embed_batch_size: None,
+                branch: false,
             },
         )
         .await
@@ -2808,6 +3406,7 @@ mod tests {
                 dry_run: false,
                 reindex: false,
                 max_embed_batch_size: None,
+                branch: false,
             },
         )
         .await
@@ -2826,6 +3425,7 @@ mod tests {
                 dry_run: false,
                 reindex: false,
                 max_embed_batch_size: None,
+                branch: false,
             },
         )
         .await
@@ -2874,6 +3474,7 @@ mod tests {
                 dry_run: false,
                 reindex: false,
                 max_embed_batch_size: None,
+                branch: false,
             },
         )
         .await
@@ -2895,6 +3496,7 @@ mod tests {
                 dry_run: false,
                 reindex: false,
                 max_embed_batch_size: None,
+                branch: false,
             },
         )
         .await
@@ -2984,6 +3586,7 @@ mod tests {
                 dry_run: false,
                 reindex: false,
                 max_embed_batch_size: None,
+                branch: false,
             },
         )
         .await
@@ -3059,6 +3662,7 @@ mod tests {
                 dry_run: false,
                 reindex: false,
                 max_embed_batch_size: None,
+                branch: false,
             },
         )
         .await
@@ -3118,6 +3722,7 @@ mod tests {
                 dry_run: false,
                 reindex: false,
                 max_embed_batch_size: None,
+                branch: false,
             },
         )
         .await
@@ -3175,6 +3780,7 @@ mod tests {
                 dry_run: false,
                 reindex: false,
                 max_embed_batch_size: None,
+                branch: false,
             },
         )
         .await
@@ -3235,6 +3841,7 @@ mod tests {
                 dry_run: false,
                 reindex: false,
                 max_embed_batch_size: None,
+                branch: false,
             },
         )
         .await
@@ -3287,6 +3894,7 @@ mod tests {
                 dry_run: false,
                 reindex: false,
                 max_embed_batch_size: None,
+                branch: false,
             },
         )
         .await
@@ -3305,6 +3913,7 @@ mod tests {
                 dry_run: false,
                 reindex: false,
                 max_embed_batch_size: None,
+                branch: false,
             },
         )
         .await
@@ -3325,6 +3934,7 @@ mod tests {
                 dry_run: false,
                 reindex: true,
                 max_embed_batch_size: None,
+                branch: false,
             },
         )
         .await
@@ -3444,5 +4054,497 @@ mod tests {
         assert!(!names.contains(&"composer.lock"), "composer.lock must be skipped");
         assert!(!names.contains(&"Gemfile.lock"), "Gemfile.lock must be skipped");
         assert!(names.contains(&"main.rs"), "main.rs must be discovered: {names:?}");
+    }
+
+    // ─── normalize_git_remote_url table tests ────────────────────────────────
+
+    #[test]
+    fn normalize_git_remote_url_ssh_style() {
+        assert_eq!(
+            normalize_git_remote_url("git@github.com:Acme/Repo.git"),
+            Some("github.com/Acme/Repo".to_owned())
+        );
+    }
+
+    #[test]
+    fn normalize_git_remote_url_https_with_trailing_slash_and_git() {
+        assert_eq!(
+            normalize_git_remote_url("https://github.com/acme/repo.git/"),
+            Some("github.com/acme/repo".to_owned())
+        );
+    }
+
+    #[test]
+    fn normalize_git_remote_url_ssh_with_port() {
+        assert_eq!(
+            normalize_git_remote_url("ssh://git@Host.Example:2222/team/repo"),
+            Some("host.example/team/repo".to_owned())
+        );
+    }
+
+    #[test]
+    fn normalize_git_remote_url_https_with_user() {
+        assert_eq!(
+            normalize_git_remote_url("https://user@gitlab.com/a/b"),
+            Some("gitlab.com/a/b".to_owned())
+        );
+    }
+
+    #[test]
+    fn normalize_git_remote_url_garbage_returns_none() {
+        assert_eq!(normalize_git_remote_url("not-a-url"), None);
+        assert_eq!(normalize_git_remote_url(""), None);
+        assert_eq!(normalize_git_remote_url("   "), None);
+    }
+
+    #[test]
+    fn normalize_git_remote_url_host_lowercased_path_preserved() {
+        assert_eq!(
+            normalize_git_remote_url("https://GITHUB.COM/Owner/MixedCase"),
+            Some("github.com/Owner/MixedCase".to_owned())
+        );
+    }
+
+    // ─── prepare_project_batch tests ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn prepare_batch_content_hash_matches_ingest_and_byte_ranges_correct() {
+        let tempdir = tempdir().unwrap();
+        let project_dir = tempdir.path().join("project");
+        fs::create_dir_all(project_dir.join("src")).unwrap();
+        fs::write(
+            project_dir.join("mempalace.yaml"),
+            "wing: testbatch\nrooms:\n  - name: general\n",
+        )
+        .unwrap();
+
+        // Write a multi-chunk UTF-8 file.
+        let file_content = "fn main() {\n    println!(\"hello\");\n}\n".repeat(30);
+        fs::write(project_dir.join("src/main.rs"), &file_content).unwrap();
+
+        // Write a non-UTF-8 file.
+        let mut non_utf8 = vec![0xFF, 0xFE];
+        non_utf8.extend_from_slice(b" binary content here  binary content here  binary content here  extra");
+        fs::write(project_dir.join("src/binary.rs"), &non_utf8).unwrap();
+
+        let request = ProjectIngestRequest::new(&project_dir);
+
+        // Run prepare_project_batch.
+        let prepared = prepare_project_batch(&request).unwrap();
+        assert_eq!(prepared.wing, "testbatch");
+
+        // Find the UTF-8 file DTO.
+        let utf8_dto = prepared
+            .files
+            .iter()
+            .find(|f| f.relative_path == "src/main.rs")
+            .expect("src/main.rs must be in prepared files");
+
+        assert!(utf8_dto.file_hash.is_some(), "UTF-8 file must have file_hash");
+        assert!(!utf8_dto.chunks.is_empty(), "UTF-8 file must have chunks");
+
+        // Verify byte ranges slice the file bytes correctly.
+        let file_bytes = file_content.as_bytes();
+        for chunk in &utf8_dto.chunks {
+            let bs = chunk.byte_start.expect("UTF-8 chunk must have byte_start") as usize;
+            let be = chunk.byte_end.expect("UTF-8 chunk must have byte_end") as usize;
+            let sliced = std::str::from_utf8(&file_bytes[bs..be]).unwrap();
+            assert_eq!(
+                sliced, chunk.text,
+                "file_bytes[byte_start..byte_end] must equal chunk text"
+            );
+        }
+
+        // Now also run ingest_project into a temp engine and compare content_hash.
+        let engine_dir = tempdir.path().join("engine");
+        let engine = open_engine(&engine_dir).await;
+        let mut provider =
+            FakeEmbeddingProvider::new(EmbeddingProfile::Balanced.metadata().dimensions);
+        ingest_project(
+            &engine,
+            &mut provider,
+            &ProjectIngestRequest {
+                project_dir: project_dir.clone(),
+                wing: None,
+                agent: "tester".to_owned(),
+                limit: None,
+                dry_run: false,
+                reindex: false,
+                max_embed_batch_size: None,
+                branch: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Resolve the stored source key for src/main.rs.
+        let root = project_dir.canonicalize().unwrap();
+        let wing_name = "testbatch";
+        let sk = source_key("projects", &root, wing_name, None, "src/main.rs");
+        let stored =
+            engine.operational_store().get_ingested_file(&sk).unwrap().expect("must be stored");
+        assert_eq!(
+            utf8_dto.content_hash, stored.content_hash,
+            "prepare_project_batch content_hash must match stored content_hash"
+        );
+    }
+
+    #[test]
+    fn prepare_batch_non_utf8_file_has_no_file_hash_and_no_ranges() {
+        let tempdir = tempdir().unwrap();
+        let project_dir = tempdir.path().join("project");
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::write(
+            project_dir.join("mempalace.yaml"),
+            "wing: testbatch\nrooms:\n  - name: general\n",
+        )
+        .unwrap();
+
+        // Non-UTF-8 content long enough to produce chunks.
+        let mut non_utf8 = vec![0xFF, 0xFE];
+        let fill: Vec<u8> = b" non utf8 filler content here  non utf8 filler content here  ".repeat(15).to_vec();
+        non_utf8.extend(fill);
+        fs::write(project_dir.join("data.rs"), &non_utf8).unwrap();
+
+        let request = ProjectIngestRequest::new(&project_dir);
+        let prepared = prepare_project_batch(&request).unwrap();
+
+        // Non-UTF-8 files that produce chunks: file_hash must be None, no ranges.
+        for file_dto in &prepared.files {
+            if file_dto.relative_path == "data.rs" {
+                assert!(file_dto.file_hash.is_none(), "non-UTF-8 file must have no file_hash");
+                for chunk in &file_dto.chunks {
+                    assert!(chunk.byte_start.is_none(), "non-UTF-8 chunk must have no byte_start");
+                    assert!(chunk.byte_end.is_none(), "non-UTF-8 chunk must have no byte_end");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn prepare_batch_zero_chunk_files_excluded() {
+        let tempdir = tempdir().unwrap();
+        let project_dir = tempdir.path().join("project");
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::write(
+            project_dir.join("mempalace.yaml"),
+            "wing: testbatch\nrooms:\n  - name: general\n",
+        )
+        .unwrap();
+        // Tiny file below the minimum chunk size gate.
+        fs::write(project_dir.join("tiny.rs"), "fn x() {}").unwrap();
+
+        let request = ProjectIngestRequest::new(&project_dir);
+        let prepared = prepare_project_batch(&request).unwrap();
+
+        // The tiny file must not appear in files (zero chunks → excluded in v1).
+        let found = prepared.files.iter().any(|f| f.relative_path == "tiny.rs");
+        assert!(!found, "zero-chunk file must be excluded from prepare_project_batch files");
+    }
+
+    // ─── Branch delta tests ───────────────────────────────────────────────────
+
+    /// Initialize a git repo at `dir` with a single commit on branch `main`.
+    fn git_init_with_commit(dir: &Path, branch: &str, files: &[(&str, &str)]) {
+        let run = |args: &[&str]| {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run(&["init", "-b", branch]);
+        run(&["-c", "user.email=test@test.com", "-c", "user.name=Test", "config", "user.email", "test@test.com"]);
+        run(&["-c", "user.email=test@test.com", "-c", "user.name=Test", "config", "user.name", "Test"]);
+        for (path, content) in files {
+            let full = dir.join(path);
+            if let Some(parent) = full.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(&full, content).unwrap();
+            run(&["add", path]);
+        }
+        run(&[
+            "-c", "user.email=test@test.com",
+            "-c", "user.name=Test",
+            "commit", "-m", "initial",
+        ]);
+    }
+
+    #[tokio::test]
+    async fn branch_mine_only_delta_files() {
+        let tempdir = tempdir().unwrap();
+        let repo_dir = tempdir.path().join("repo");
+        fs::create_dir_all(&repo_dir).unwrap();
+
+        let base_content = "fn base() -> i32 { 42 }\n".repeat(5);
+        let stable_content = "fn stable() -> &str { \"hello\" }\n".repeat(5);
+
+        git_init_with_commit(
+            &repo_dir,
+            "main",
+            &[
+                ("mempalace.yaml", "wing: branchtest\nrooms:\n  - name: general\n"),
+                ("base.rs", &base_content),
+                ("stable.rs", &stable_content),
+            ],
+        );
+
+        // Create and switch to feature branch.
+        let run_git = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(&repo_dir)
+                .status()
+                .unwrap();
+        };
+        run_git(&["checkout", "-b", "feature"]);
+
+        // Modify one file and add one untracked file.
+        let changed_content = "fn base() -> i32 { 99 }\n".repeat(5);
+        fs::write(repo_dir.join("base.rs"), &changed_content).unwrap();
+        let new_content = "fn new_func() -> bool { true }\n".repeat(5);
+        fs::write(repo_dir.join("new_file.rs"), &new_content).unwrap();
+
+        let engine = open_engine(&tempdir.path().join("palace")).await;
+        let mut provider =
+            FakeEmbeddingProvider::new(EmbeddingProfile::Balanced.metadata().dimensions);
+
+        let summary = ingest_project(
+            &engine,
+            &mut provider,
+            &ProjectIngestRequest {
+                project_dir: repo_dir.clone(),
+                wing: None,
+                agent: "tester".to_owned(),
+                limit: None,
+                dry_run: false,
+                reindex: false,
+                max_embed_batch_size: None,
+                branch: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Only the 2 delta files (base.rs modified + new_file.rs untracked) are mined.
+        assert_eq!(summary.ingested_files, 2, "branch mine must ingest only delta files");
+        assert_eq!(summary.removed_sources, 0);
+
+        // Source keys must use the projects-branch prefix.
+        let root = repo_dir.canonicalize().unwrap();
+        let wing_name = "branchtest";
+        let sk_base =
+            source_key("projects-branch", &root, wing_name, None, "base.rs");
+        let stored_base =
+            engine.operational_store().get_ingested_file(&sk_base).unwrap();
+        assert!(stored_base.is_some(), "base.rs must be stored under projects-branch key");
+
+        let sk_stable =
+            source_key("projects-branch", &root, wing_name, None, "stable.rs");
+        let stored_stable =
+            engine.operational_store().get_ingested_file(&sk_stable).unwrap();
+        assert!(stored_stable.is_none(), "stable.rs must NOT be stored (not in delta)");
+    }
+
+    #[tokio::test]
+    async fn branch_cleanup_removes_departed_files() {
+        let tempdir = tempdir().unwrap();
+        let repo_dir = tempdir.path().join("repo");
+        fs::create_dir_all(&repo_dir).unwrap();
+
+        let base_content = "fn base() -> i32 { 42 }\n".repeat(5);
+        let stable_content = "fn stable() -> &str { \"hello\" }\n".repeat(5);
+
+        git_init_with_commit(
+            &repo_dir,
+            "main",
+            &[
+                ("mempalace.yaml", "wing: cleanuptest\nrooms:\n  - name: general\n"),
+                ("base.rs", &base_content),
+                ("stable.rs", &stable_content),
+            ],
+        );
+
+        let run_git = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(&repo_dir)
+                .status()
+                .unwrap();
+        };
+        run_git(&["checkout", "-b", "feature"]);
+
+        // First mine: modify base.rs + add untracked.rs
+        let changed_content = "fn base() -> i32 { 99 }\n".repeat(5);
+        fs::write(repo_dir.join("base.rs"), &changed_content).unwrap();
+        let new_content = "fn new_func() -> bool { true }\n".repeat(5);
+        fs::write(repo_dir.join("untracked.rs"), &new_content).unwrap();
+
+        let engine = open_engine(&tempdir.path().join("palace")).await;
+        let mut provider =
+            FakeEmbeddingProvider::new(EmbeddingProfile::Balanced.metadata().dimensions);
+
+        let first = ingest_project(
+            &engine,
+            &mut provider,
+            &ProjectIngestRequest {
+                project_dir: repo_dir.clone(),
+                wing: None,
+                agent: "tester".to_owned(),
+                limit: None,
+                dry_run: false,
+                reindex: false,
+                max_embed_batch_size: None,
+                branch: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.ingested_files, 2);
+        assert_eq!(first.removed_sources, 0);
+
+        // Revert base.rs to original content (it is no longer in the delta).
+        fs::write(repo_dir.join("base.rs"), &base_content).unwrap();
+
+        let second = ingest_project(
+            &engine,
+            &mut provider,
+            &ProjectIngestRequest {
+                project_dir: repo_dir.clone(),
+                wing: None,
+                agent: "tester".to_owned(),
+                limit: None,
+                dry_run: false,
+                reindex: false,
+                max_embed_batch_size: None,
+                branch: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        // base.rs is no longer in the delta (reverted); untracked.rs still is.
+        assert_eq!(second.removed_sources, 1, "reverted file must be counted as removed");
+
+        // base.rs drawers must be cleared.
+        let root = repo_dir.canonicalize().unwrap();
+        let wing_name = "cleanuptest";
+        let sk_base =
+            source_key("projects-branch", &root, wing_name, None, "base.rs");
+        let stored = engine.operational_store().get_ingested_file(&sk_base).unwrap();
+        // After cleanup the key exists but with zero drawers (replace-with-empty).
+        // The content_hash is now hash_text("removed").
+        assert!(
+            stored.map(|s| s.content_hash == hash_text("removed")).unwrap_or(false),
+            "reverted file's stored content_hash must be hash_text(\"removed\")"
+        );
+    }
+
+    #[tokio::test]
+    async fn branch_mine_subdir_project_re_relativizes_correctly() {
+        let tempdir = tempdir().unwrap();
+        let repo_dir = tempdir.path().join("repo");
+        let project_dir = repo_dir.join("crates").join("mylib");
+        fs::create_dir_all(project_dir.join("src")).unwrap();
+
+        // Also put a file outside the project dir.
+        fs::create_dir_all(repo_dir.join("other")).unwrap();
+
+        git_init_with_commit(
+            &repo_dir,
+            "main",
+            &[
+                ("README.md", "# repo\n"),
+                ("crates/mylib/mempalace.yaml", "wing: mylib\nrooms:\n  - name: general\n"),
+                ("crates/mylib/src/lib.rs", "pub fn stable() {}\n".repeat(5).as_str()),
+                ("other/outside.rs", "fn outside() {}\n".repeat(5).as_str()),
+            ],
+        );
+
+        let run_git = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(&repo_dir)
+                .status()
+                .unwrap();
+        };
+        run_git(&["checkout", "-b", "feature"]);
+
+        // Modify a file inside the project subdir and a file outside it.
+        let changed = "pub fn changed() {}\n".repeat(5);
+        fs::write(project_dir.join("src/lib.rs"), &changed).unwrap();
+        let outside_changed = "fn outside_changed() {}\n".repeat(5);
+        fs::write(repo_dir.join("other/outside.rs"), &outside_changed).unwrap();
+
+        let engine = open_engine(&tempdir.path().join("palace")).await;
+        let mut provider =
+            FakeEmbeddingProvider::new(EmbeddingProfile::Balanced.metadata().dimensions);
+
+        let summary = ingest_project(
+            &engine,
+            &mut provider,
+            &ProjectIngestRequest {
+                project_dir: project_dir.clone(),
+                wing: None,
+                agent: "tester".to_owned(),
+                limit: None,
+                dry_run: false,
+                reindex: false,
+                max_embed_batch_size: None,
+                branch: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Only src/lib.rs (inside the project) should be mined; outside.rs should be ignored.
+        assert_eq!(
+            summary.ingested_files, 1,
+            "only the file inside the project subdir must be mined"
+        );
+    }
+
+    #[tokio::test]
+    async fn branch_mine_not_a_git_repo_returns_error() {
+        let tempdir = tempdir().unwrap();
+        let project_dir = tempdir.path().join("notgit");
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::write(
+            project_dir.join("mempalace.yaml"),
+            "wing: test\nrooms:\n  - name: general\n",
+        )
+        .unwrap();
+        fs::write(
+            project_dir.join("main.rs"),
+            "fn main() {}\n".repeat(10),
+        )
+        .unwrap();
+
+        let engine = open_engine(tempdir.path()).await;
+        let mut provider =
+            FakeEmbeddingProvider::new(EmbeddingProfile::Balanced.metadata().dimensions);
+
+        let result = ingest_project(
+            &engine,
+            &mut provider,
+            &ProjectIngestRequest {
+                project_dir: project_dir.clone(),
+                wing: None,
+                agent: "tester".to_owned(),
+                limit: None,
+                dry_run: false,
+                reindex: false,
+                max_embed_batch_size: None,
+                branch: true,
+            },
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(IngestError::BranchDeltaUnavailable { .. })),
+            "expected BranchDeltaUnavailable, got: {result:?}"
+        );
     }
 }

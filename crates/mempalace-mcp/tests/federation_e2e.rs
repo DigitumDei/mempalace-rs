@@ -56,6 +56,7 @@ fn server_config(dir: &TempDir) -> MempalaceConfig {
         server: ServerRuntimeConfig {
             bind: "127.0.0.1:0".parse().unwrap(),
             token_file: dir.path().join("tokens.json"),
+            checkouts: std::collections::BTreeMap::new(),
         },
         federation: FederationRuntimeConfig::default(),
     }
@@ -122,6 +123,7 @@ async fn mcp_server_with_hub(
         server: ServerRuntimeConfig {
             bind: "127.0.0.1:0".parse().unwrap(),
             token_file: local_dir.path().join("server_tokens.json"),
+            checkouts: std::collections::BTreeMap::new(),
         },
         federation,
     };
@@ -449,6 +451,7 @@ async fn different_embedding_profiles_per_side() {
         server: ServerRuntimeConfig {
             bind: "127.0.0.1:0".parse().unwrap(),
             token_file: local_dir.path().join("server_tokens.json"),
+            checkouts: std::collections::BTreeMap::new(),
         },
         federation,
     };
@@ -591,6 +594,7 @@ async fn remote_down_degrades_reads() {
         server: ServerRuntimeConfig {
             bind: "127.0.0.1:0".parse().unwrap(),
             token_file: local_dir.path().join("server_tokens.json"),
+            checkouts: std::collections::BTreeMap::new(),
         },
         federation,
     };
@@ -1026,6 +1030,7 @@ async fn wake_up_with_down_remote_marks_unreachable_and_succeeds() {
         server: ServerRuntimeConfig {
             bind: "127.0.0.1:0".parse().unwrap(),
             token_file: local_dir.path().join("server_tokens.json"),
+            checkouts: std::collections::BTreeMap::new(),
         },
         federation,
     };
@@ -1251,6 +1256,7 @@ async fn diary_events_never_appear_in_remote_changes() {
                 server: ServerRuntimeConfig {
                     bind: "127.0.0.1:0".parse().unwrap(),
                     token_file: hub_dir.path().join("server_tokens.json"),
+                    checkouts: std::collections::BTreeMap::new(),
                 },
                 federation: FederationRuntimeConfig::default(),
             },

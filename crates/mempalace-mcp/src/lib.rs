@@ -2767,6 +2767,7 @@ mod tests {
             server: ServerRuntimeConfig {
                 bind: "127.0.0.1:8765".parse().unwrap(),
                 token_file: tempdir.path().join("server_tokens.json"),
+                checkouts: std::collections::BTreeMap::new(),
             },
             federation: FederationRuntimeConfig::default(),
         };
@@ -4505,6 +4506,15 @@ mod tests {
                 next_cursor: self.changes_next_cursor.clone(),
             })
         }
+        async fn ingest_batch(
+            &self,
+            _req: mempalace_federation::IngestBatchRequest,
+        ) -> mempalace_remote::Result<mempalace_federation::IngestBatchResponse> {
+            Err(mempalace_remote::RemoteError::Unreachable {
+                remote: "mock".to_owned(),
+                message: "not used".to_owned(),
+            })
+        }
     }
 
     fn make_lib_router(
@@ -4843,6 +4853,7 @@ mod tests {
             server: ServerRuntimeConfig {
                 bind: "127.0.0.1:8765".parse().unwrap(),
                 token_file: tempdir.path().join("server_tokens.json"),
+                checkouts: std::collections::BTreeMap::new(),
             },
             federation: FederationRuntimeConfig::default(),
         }

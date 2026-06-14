@@ -17,6 +17,7 @@ async fn test_server(tempdir: &TempDir) -> McpServer<DeterministicStubProvider> 
         server: ServerRuntimeConfig {
             bind: "127.0.0.1:8765".parse().unwrap(),
             token_file: tempdir.path().join("server_tokens.json"),
+            checkouts: std::collections::BTreeMap::new(),
         },
         federation: FederationRuntimeConfig::default(),
     };

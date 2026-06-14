@@ -263,6 +263,100 @@ pub struct ChangeEventDto {
     pub details: Option<Value>,
 }
 
+// ─── Bulk ingest ──────────────────────────────────────────────────────────────
+
+/// Request body for `POST /v1/ingest/batch`.
+///
+/// The client sends one or more pre-chunked files; the server embeds them and
+/// writes drawers on its side.  `wing` and `repo_id` together determine the
+/// source-key namespace so that two clients pushing the same repository
+/// converge on identical drawer ids.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IngestBatchRequest {
+    /// Target wing name (will be normalized server-side).
+    pub wing: String,
+    /// Machine-independent repository identity (normalized remote-URL or fallback).
+    pub repo_id: String,
+    /// Client-declared agent name; server may augment from auth token.
+    #[serde(default)]
+    pub agent: Option<String>,
+    /// Git commit hash at the time of mining, for audit / change-event details.
+    #[serde(default)]
+    pub commit_hash: Option<String>,
+    /// Files included in this batch.
+    pub files: Vec<IngestFileDto>,
+}
+
+/// A single file's chunks within an [`IngestBatchRequest`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IngestFileDto {
+    /// Repository-root-relative path with forward slashes.
+    pub relative_path: String,
+    /// `project_ingest_content_hash` of this file; used for skip-unchanged detection.
+    pub content_hash: String,
+    /// BLAKE3 hex hash of the full file bytes.  When `Some`, all chunks carry
+    /// byte ranges so the server can build locator rows.  When `None`, the
+    /// file could not be read as UTF-8 and chunks are stored as legacy content
+    /// rows (text persisted, no locator).
+    #[serde(default)]
+    pub file_hash: Option<String>,
+    /// Ordered list of chunks derived from this file.
+    pub chunks: Vec<IngestChunkDto>,
+}
+
+/// A single text chunk within an [`IngestFileDto`].
+///
+/// When `file_hash` is `Some` on the parent [`IngestFileDto`], all four byte/
+/// line range fields must also be `Some` so the server can store a locator row.
+/// When `file_hash` is `None`, the ranges are absent and the server stores
+/// `text` directly as a legacy content row.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IngestChunkDto {
+    /// 0-based chunk index within the file; determines the drawer-id suffix.
+    pub chunk_index: u32,
+    /// Room name for this chunk (derived from file path / heuristics on the client).
+    pub room: String,
+    /// Chunk text; the server uses this for embedding.
+    pub text: String,
+    /// Inclusive byte offset of the first byte of this chunk in the file.
+    #[serde(default)]
+    pub byte_start: Option<u64>,
+    /// Byte offset one past the last byte of this chunk (exclusive).
+    #[serde(default)]
+    pub byte_end: Option<u64>,
+    /// 1-based line number of the first line of this chunk.
+    #[serde(default)]
+    pub line_start: Option<u32>,
+    /// 1-based line number of the last line of this chunk.
+    #[serde(default)]
+    pub line_end: Option<u32>,
+}
+
+/// Response body for `POST /v1/ingest/batch`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IngestBatchResponse {
+    /// Per-file outcomes, in the same order as the request's `files` array.
+    pub files: Vec<IngestFileResult>,
+    /// Non-fatal warnings (e.g. missing checkout mapping → stale placeholders).
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+/// Outcome for a single file within an [`IngestBatchResponse`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IngestFileResult {
+    /// Repository-root-relative path, echoed from the request.
+    pub relative_path: String,
+    /// `"ingested"` | `"skipped_unchanged"` | `"failed"`.
+    pub status: String,
+    /// Number of drawers written (0 for skipped or failed files).
+    #[serde(default)]
+    pub drawers_written: usize,
+    /// Error message when `status == "failed"`.
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
 // ─── Error ────────────────────────────────────────────────────────────────────
 
 /// Standard error response body returned by all federation endpoints on failure.
@@ -401,5 +495,108 @@ mod tests {
         let json = serde_json::to_string(&err).unwrap();
         let decoded: ErrorBody = serde_json::from_str(&json).unwrap();
         assert_eq!(err, decoded);
+    }
+
+    #[test]
+    fn ingest_batch_request_round_trips() {
+        let original = IngestBatchRequest {
+            wing: "wing_myproject".to_owned(),
+            repo_id: "github.com/acme/myrepo".to_owned(),
+            agent: Some("claude".to_owned()),
+            commit_hash: Some("abc123def456".to_owned()),
+            files: vec![IngestFileDto {
+                relative_path: "src/main.rs".to_owned(),
+                content_hash: "contenthash1".to_owned(),
+                file_hash: Some("filehash1".to_owned()),
+                chunks: vec![IngestChunkDto {
+                    chunk_index: 0,
+                    room: "backend".to_owned(),
+                    text: "fn main() {}".to_owned(),
+                    byte_start: Some(0),
+                    byte_end: Some(12),
+                    line_start: Some(1),
+                    line_end: Some(1),
+                }],
+            }],
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let decoded: IngestBatchRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn ingest_batch_response_round_trips() {
+        let original = IngestBatchResponse {
+            files: vec![
+                IngestFileResult {
+                    relative_path: "src/main.rs".to_owned(),
+                    status: "ingested".to_owned(),
+                    drawers_written: 3,
+                    error: None,
+                },
+                IngestFileResult {
+                    relative_path: "src/lib.rs".to_owned(),
+                    status: "skipped_unchanged".to_owned(),
+                    drawers_written: 0,
+                    error: None,
+                },
+                IngestFileResult {
+                    relative_path: "src/broken.rs".to_owned(),
+                    status: "failed".to_owned(),
+                    drawers_written: 0,
+                    error: Some("embedding failed".to_owned()),
+                },
+            ],
+            warnings: vec!["no checkout configured for wing 'wing_x'".to_owned()],
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let decoded: IngestBatchResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn ingest_batch_request_sparse_json_deserialises() {
+        // Only required fields present; optional fields default to None / empty.
+        let raw = r#"{
+            "wing": "wing_proj",
+            "repo_id": "github.com/org/repo",
+            "files": [
+                {
+                    "relative_path": "README.md",
+                    "content_hash": "ch1",
+                    "chunks": [
+                        {"chunk_index": 0, "room": "docs", "text": "hello"}
+                    ]
+                }
+            ]
+        }"#;
+        let req: IngestBatchRequest = serde_json::from_str(raw).unwrap();
+        assert_eq!(req.wing, "wing_proj");
+        assert_eq!(req.repo_id, "github.com/org/repo");
+        assert!(req.agent.is_none());
+        assert!(req.commit_hash.is_none());
+        assert_eq!(req.files.len(), 1);
+        assert!(req.files[0].file_hash.is_none());
+        let chunk = &req.files[0].chunks[0];
+        assert_eq!(chunk.chunk_index, 0);
+        assert!(chunk.byte_start.is_none());
+        assert!(chunk.byte_end.is_none());
+        assert!(chunk.line_start.is_none());
+        assert!(chunk.line_end.is_none());
+    }
+
+    #[test]
+    fn ingest_batch_response_sparse_json_deserialises() {
+        // Only required fields; drawers_written defaults to 0, warnings to empty vec.
+        let raw = r#"{
+            "files": [
+                {"relative_path": "src/main.rs", "status": "ingested"}
+            ]
+        }"#;
+        let resp: IngestBatchResponse = serde_json::from_str(raw).unwrap();
+        assert_eq!(resp.files.len(), 1);
+        assert_eq!(resp.files[0].drawers_written, 0);
+        assert!(resp.files[0].error.is_none());
+        assert!(resp.warnings.is_empty());
     }
 }

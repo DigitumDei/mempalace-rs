@@ -3,8 +3,8 @@
 use mempalace_federation::{
     AddDrawerRequest, AddDrawerResponse, ChangesQuery, ChangesResponse, CheckDuplicateRequest,
     CheckDuplicateResponse, DrawerSearchRequest, DrawerSearchResponse, ErrorBody,
-    FEDERATION_API_VERSION, InfoResponse, KgAddFactRequest, KgInvalidateRequest, KgQueryRequest,
-    ListDrawersQuery, ListDrawersResponse,
+    FEDERATION_API_VERSION, IngestBatchRequest, IngestBatchResponse, InfoResponse,
+    KgAddFactRequest, KgInvalidateRequest, KgQueryRequest, ListDrawersQuery, ListDrawersResponse,
 };
 
 use crate::{
@@ -323,6 +323,19 @@ impl RemoteApi for RemoteClient {
         self.ensure_handshake().await?;
         let url = self.url("v1/changes")?;
         let rb = self.http.get(url).query(&query);
+        self.execute(rb).await
+    }
+
+    /// Bulk-ingest pre-chunked file content into the remote palace
+    /// (`POST /v1/ingest/batch`).
+    ///
+    /// A 413 response (body too large) surfaces as
+    /// [`RemoteError::RemoteRejected`] with `status: 413`; no client-side
+    /// splitting is attempted.
+    async fn ingest_batch(&self, req: IngestBatchRequest) -> Result<IngestBatchResponse> {
+        self.ensure_handshake().await?;
+        let url = self.url("v1/ingest/batch")?;
+        let rb = self.http.post(url).json(&req);
         self.execute(rb).await
     }
 }

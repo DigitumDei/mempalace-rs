@@ -38,7 +38,7 @@ MemPalace provides a palace-style memory store with:
 
 | Crate | Purpose |
 |---|---|
-| `mempalace-cli` | Command-line interface (`init`, `mine`, `search`, `status`, `wake-up`, `serve`) |
+| `mempalace-cli` | Command-line interface (`init`, `mine`, `search`, `status`, `wake-up`, `setup`, `serve`) |
 | `mempalace-mcp` | MCP server for agent tool integration |
 | `mempalace-core` | Core types and traits |
 | `mempalace-storage` | Palace persistence layer |

@@ -84,6 +84,29 @@ Behavior:
 - Default L1 assembly uses the search crate default and is then clamped by low-CPU limits when enabled.
 - If no palace exists, the command returns a non-zero result with the expected bootstrap guidance.
 
+### `setup`
+
+Purpose:
+- Detect which supported AI coding tools are installed and register the mempalace MCP server (`mempalace-mcp`) with each, idempotently.
+
+Flags:
+- `--dry-run`
+  Preview what would change — print the command that would run / file that would be written for each detected tool — without running anything or writing any file.
+- `--mcp-path <PATH>` default: `~/.mempalace/bin/mempalace-mcp` (`.exe` on Windows)
+  Absolute path to the `mempalace-mcp` binary that tools are pointed at. A warning is printed if the binary is not present there yet (tools are still configured to launch it once installed).
+- `--tools <LIST>` default: all
+  Comma-separated subset of tool keys to limit setup to: `claude,codex,gemini,opencode,copilot,antigravity,jules`.
+
+Behavior:
+- Per-tool mechanism (verified against each tool's official docs):
+  - **claude / codex / gemini** — registered via the tool's own CLI (`claude mcp add --scope user`, `codex mcp add`, `gemini mcp add -s user`), at user/global scope. Requires the tool's binary on `PATH`. Idempotent: an existing `mempalace` server is detected and left as-is. The binary is invoked by its resolved path (including the npm `.cmd` shim on Windows), so arguments — including the MCP path — are passed as real argv entries rather than re-parsed by `cmd.exe`.
+  - **opencode** — merges a `mcp.mempalace` entry (`type: "local"`, command as a single-element array) into `~/.config/opencode/opencode.json` (XDG path, the same on Windows).
+  - **copilot** — merges a `mcpServers.mempalace` entry into `~/.copilot/mcp-config.json`.
+  - **antigravity** — merges a `mcpServers.mempalace` entry into both `~/.gemini/config/mcp_config.json` and `~/.gemini/antigravity-cli/mcp_config.json` (the config location differs across Antigravity versions; writing both is harmless). Detection keys off the antigravity-owned `~/.gemini/antigravity-cli/` directory (not the bare `~/.gemini/config/`, which is shared with the Gemini CLI).
+  - **jules** — reported as unsupported and skipped: it is a cloud agent that only allows a curated set of remote MCP integrations configured in its web UI, so it cannot run a local stdio server.
+- JSON merges preserve all other keys and are idempotent (re-running reports "already configured"). If an existing config file is not valid JSON, setup refuses to clobber it and reports a failure for that tool.
+- Tools that are not installed are skipped with a note. The command always exits 0 (best-effort across tools); per-tool status is shown in the summary.
+
 ### `serve`
 
 Purpose:

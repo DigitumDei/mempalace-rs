@@ -401,11 +401,14 @@ enum ReadError {
 }
 
 /// Read a JSON file into a `Value`, or `None` when the file does not exist.
+/// Attempts the read directly and treats `NotFound` as absent, rather than a
+/// separate `exists()` check (which would be a TOCTOU race).
 fn read_json(path: &Path) -> Result<Option<Value>, ReadError> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    let text = fs::read_to_string(path).map_err(ReadError::Io)?;
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(ReadError::Io(e)),
+    };
     if text.trim().is_empty() {
         return Ok(None);
     }
@@ -419,7 +422,12 @@ fn write_json(path: &Path, value: &Value) -> io::Result<()> {
     let mut text = serde_json::to_string_pretty(value)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     text.push('\n');
-    fs::write(path, text)
+    // Write to a sibling temp file then rename into place, so an interrupted
+    // write (crash, power loss, disk full) can't leave a tool's config
+    // truncated/corrupt. rename is atomic within the same directory/filesystem.
+    let tmp = path.with_extension("mempalace-tmp");
+    fs::write(&tmp, text)?;
+    fs::rename(&tmp, path)
 }
 
 /// Upsert `top_key -> name -> entry` into a JSON object, preserving every other

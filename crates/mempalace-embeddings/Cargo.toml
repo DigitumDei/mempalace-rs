@@ -6,11 +6,30 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-fastembed = { version = "5.13.2", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"] }
+# Both features route fastembed's build- and run-time downloads through the OS
+# native TLS stack (Windows Schannel → system cert store) instead of rustls's
+# bundled WebPKI roots, so they trust an SSL-inspecting proxy's CA (Netskope,
+# Zscaler, etc.):
+#   * `hf-hub-native-tls`            — HuggingFace model downloads (runtime).
+#   * `ort-download-binaries-native-tls` — the `ort-sys` build script that
+#     downloads the prebuilt ONNX Runtime. The default `*-rustls-tls` variant
+#     ignores the system cert store and fails behind such a proxy.
+# Auto-download is kept (not replaced by a manual ORT_LIB_LOCATION) so CI and
+# unproxied builds keep working with zero setup. See README "Building behind
+# corporate SSL inspection".
+fastembed = { version = "5.13.2", default-features = false, features = ["hf-hub-native-tls", "ort-download-binaries-native-tls"] }
 mempalace-core = { path = "../mempalace-core" }
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+# load-bearing: do not remove. `ureq` is never referenced in this crate's code,
+# but hf-hub uses two ureq clients and the default rustls one handles the initial
+# metadata request on every download. Declaring ureq here with `native-certs`
+# flips on rustls-native-certs for every ureq in the build (Cargo feature
+# unification), so that client also reads the Windows cert store. Without it,
+# downloads behind an SSL-inspecting proxy still fail. A `cargo machete` /
+# remove-unused-deps pass will flag this as unused — it is not.
+ureq = { version = "2", default-features = false, features = ["native-certs"] }
 
 [dev-dependencies]
 tempfile = "3.23.0"

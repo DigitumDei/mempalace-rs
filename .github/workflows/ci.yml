@@ -275,8 +275,8 @@ jobs:
       - name: Run mempalace-cli tests
         run: cargo test -p mempalace-cli --locked -- --nocapture
 
-  build-and-package:
-    name: Build And Package
+  release-gate:
+    name: Release Gate
     runs-on: ubuntu-latest
     needs:
       - workspace-build
@@ -288,43 +288,88 @@ jobs:
       - graph-tests
       - mcp-tests
       - cli-tests
+    steps:
+      - name: Tests green
+        run: echo "All workspace tests passed; proceeding to release builds."
+
+  release-host:
+    name: Release ${{ matrix.asset }}
+    needs: release-gate
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - asset: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - asset: macos-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+          - asset: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
 
     steps:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Install packaging dependencies
+      - name: Install protobuf compiler (Linux)
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
 
+      - name: Install protobuf compiler (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
+      - name: Install protobuf compiler (Windows)
+        if: runner.os == 'Windows'
+        run: choco install protoc --no-progress -y
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.asset }}
 
       - name: Build release artifacts
-        run: cargo build --release --locked -p mempalace-cli -p mempalace-mcp
+        run: cargo build --release --locked -p mempalace-cli -p mempalace-mcp --target ${{ matrix.target }}
+
+      - name: Stage binaries
+        shell: bash
+        run: |
+          ext=""
+          [ "${{ runner.os }}" = "Windows" ] && ext=".exe"
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/mempalace-cli${ext}" "dist/mempalace-cli-${{ matrix.asset }}${ext}"
+          cp "target/${{ matrix.target }}/release/mempalace-mcp${ext}" "dist/mempalace-mcp-${{ matrix.asset }}${ext}"
 
       - name: Smoke packaged binaries
+        shell: bash
         run: |
-          ./target/release/mempalace-cli --help
-          ./target/release/mempalace-mcp --help
+          ext=""
+          [ "${{ runner.os }}" = "Windows" ] && ext=".exe"
+          "dist/mempalace-cli-${{ matrix.asset }}${ext}" --help
+          "dist/mempalace-mcp-${{ matrix.asset }}${ext}" --help
 
       - name: Upload release artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: mempalace-release-binaries
-          path: |
-            target/release/mempalace-cli
-            target/release/mempalace-mcp
+          name: release-${{ matrix.asset }}
+          path: dist/*
           if-no-files-found: error
 
   publish-nightly:
     name: Publish Nightly Release
     runs-on: ubuntu-latest
-    needs: build-and-package
+    needs:
+      - release-host
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     permissions:
       contents: write
@@ -336,16 +381,14 @@ jobs:
       - name: Download release artifacts
         uses: actions/download-artifact@v4
         with:
-          name: mempalace-release-binaries
-          path: artifacts
+          pattern: release-*
+          merge-multiple: true
+          path: nightly
 
       - name: Stage nightly assets
         run: |
-          mkdir -p nightly
           short_sha="${GITHUB_SHA::7}"
-          cp artifacts/mempalace-cli "nightly/mempalace-cli-linux-x86_64"
-          cp artifacts/mempalace-mcp "nightly/mempalace-mcp-linux-x86_64"
-          chmod +x nightly/*
+          chmod +x nightly/mempalace-* || true
           (cd nightly && sha256sum * > SHA256SUMS)
           echo "SHORT_SHA=$short_sha" >> "$GITHUB_ENV"
 
@@ -357,6 +400,15 @@ jobs:
           body: |
             Rolling nightly build from `main` @ ${{ github.sha }}.
 
+            Binaries (each as `mempalace-cli-*` and `mempalace-mcp-*`):
+            - `linux-x86_64` — glibc (requires glibc 2.38+, set by the bundled ONNX Runtime)
+            - `macos-arm64` (Apple Silicon)
+            - `windows-x86_64.exe`
+
+            Intel macOS, musl, and older-glibc targets are not shipped: `ort` provides
+            no prebuilt ONNX Runtime for them.
+
+            `SHA256SUMS` lists checksums for every asset.
             Overwritten on every push to `main`. Not a stable release.
           prerelease: true
           make_latest: false

@@ -2168,7 +2168,9 @@ mod tests {
                 fs::create_dir_all(parent).unwrap();
             }
             fs::write(&full, content).unwrap();
-            run(&["add", path]);
+            // Force-add so a developer's global gitignore (e.g. one that excludes
+            // `mempalace.yaml`) can't silently block staging the fixture file.
+            run(&["add", "-f", path]);
         }
         run(&[
             "-c", "user.email=test@test.com",

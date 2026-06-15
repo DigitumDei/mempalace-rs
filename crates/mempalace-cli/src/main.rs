@@ -28,6 +28,8 @@ use mempalace_storage::{DrawerFilter, DrawerStore, StorageEngine, StorageLayout}
 use serde_yaml::Mapping;
 use tracing_subscriber::{EnvFilter, fmt};
 
+mod setup;
+
 const DEFERRED_COMMAND_DOC: &str = "docs/rust-phase-plans/Phase09-Deferred-Commands.md";
 
 const INIT_HEADER_WIDTH: usize = 55;
@@ -233,6 +235,15 @@ enum Commands {
         #[arg(long)]
         wing: Option<String>,
     },
+    /// Wire the mempalace MCP server into your installed AI coding tools.
+    Setup {
+        #[arg(long = "dry-run", help = "Preview what would change without writing anything or running tool commands")]
+        dry_run: bool,
+        #[arg(long = "mcp-path", help = "Path to the mempalace-mcp binary (default: ~/.mempalace/bin/mempalace-mcp[.exe])")]
+        mcp_path: Option<PathBuf>,
+        #[arg(long, value_delimiter = ',', help = "Limit to specific tools (comma-separated): claude,codex,gemini,opencode,copilot,antigravity,jules")]
+        tools: Option<Vec<String>>,
+    },
     /// Deferred in Rust Phase 9. See the linked decision record.
     Split {
         dir: PathBuf,
@@ -412,6 +423,10 @@ where
         Commands::Status => execute_status(cli.palace.as_deref(), context),
         Commands::WakeUp { wing } => {
             execute_wake_up(wing, cli.palace.as_deref(), context, provider_factory)
+        }
+        Commands::Setup { dry_run, mcp_path, tools } => {
+            let report = setup::run_setup(&setup::SetupOptions { mcp_path, dry_run, only: tools });
+            Ok(CliOutput::success(report.render()))
         }
         Commands::Split { .. } => Ok(deferred_command("split")),
         Commands::Compress { .. } => Ok(deferred_command("compress")),

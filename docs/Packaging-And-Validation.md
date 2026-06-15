@@ -15,7 +15,7 @@ The supported set is bounded by the prebuilt ONNX Runtime binaries that `ort`
 ships (see `ort-sys`'s `dist.txt`). Targets `ort` does **not** provide a prebuilt
 for are therefore not built:
 
-- **musl** — no prebuilt (the original blocker in issue #14 / PR #12).
+- **musl** — no prebuilt (the original blocker; see the musl attempt in PR #12).
 - **Intel macOS (`x86_64-apple-darwin`)** — `ort` 2.0.0-rc.11 ships no Intel-macOS
   binary at all.
 - **Older glibc / "any container" (e.g. manylinux_2_28)** — `ort`'s Linux prebuilt

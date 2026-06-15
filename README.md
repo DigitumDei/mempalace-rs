@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="docs/mempalace_logo.png" alt="MemPalace" width="280">
+  <img src="docs/assets/mempalace-rs-logo.png" alt="mempalace-rs" width="280">
 </div>
 
 # mempalace-rs

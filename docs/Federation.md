@@ -1,5 +1,9 @@
 # Federation Guide
 
+<div align="center">
+  <img src="assets/mempalace-rs-banner.png" alt="Federated MemPalace — a central palace linked to remote palaces" width="100%">
+</div>
+
 Federation lets several MemPalace clients share one or more **remote palaces** over
 an HTTP REST API. An agent talking to its local MCP server sees a single seamless
 palace: reads for selected wings are transparently merged across local and remote,

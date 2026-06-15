@@ -1,7 +1,5 @@
 <div align="center">
   <img src="docs/assets/mempalace-rs-logo.png" alt="mempalace-rs" width="280">
-  <br><br>
-  <img src="docs/assets/mempalace-rs-banner.png" alt="MemPalace — persistent, structured memory for LLM agents" width="100%">
 </div>
 
 # mempalace-rs

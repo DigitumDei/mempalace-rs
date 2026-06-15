@@ -208,6 +208,12 @@ enum Commands {
         extract: CliExtractMode,
         #[arg(long, help = "Mine only files changed vs the merge-base with the default branch (local branch-delta mining)")]
         branch: bool,
+        #[arg(
+            long = "batch-size",
+            value_name = "N",
+            help = "Largest batch to process at once; lower it to bound peak memory/CPU on low-spec machines. Local mine: chunks embedded per batch (default: a file's chunks together). Remote mine: files per request (default: 64). 0 or omitted keeps the default."
+        )]
+        batch_size: Option<usize>,
     },
     /// Find anything, exact words.
     Search {
@@ -377,7 +383,7 @@ where
         Commands::Init { dir, yes } => {
             execute_init(&dir, yes, cli.palace.as_deref(), context, validation_provider_factory)
         }
-        Commands::Mine { dir, mode, wing, agent, limit, dry_run, reindex, extract, branch } => {
+        Commands::Mine { dir, mode, wing, agent, limit, dry_run, reindex, extract, branch, batch_size } => {
             execute_mine(
                 &dir,
                 mode,
@@ -388,6 +394,7 @@ where
                 reindex,
                 extract,
                 branch,
+                batch_size,
                 cli.palace.as_deref(),
                 context,
                 provider_factory,
@@ -501,6 +508,7 @@ fn execute_mine<F, P>(
     reindex: bool,
     extract: CliExtractMode,
     branch: bool,
+    batch_size: Option<usize>,
     palace_override: Option<&Path>,
     context: &CliContext,
     provider_factory: F,
@@ -546,6 +554,7 @@ where
                 &agent,
                 limit,
                 dry_run,
+                batch_size,
                 &config,
                 &runtime,
                 &rule,
@@ -575,6 +584,17 @@ where
     let mut provider = provider_factory(config.embedding_profile, default_embedding_cache_dir())
         .map_err(provider_error)?;
 
+    // `--batch-size N` (N>0) caps the chunks embedded per batch, letting low-spec
+    // machines bound peak memory/CPU. It overrides the low_cpu default; when unset
+    // we keep prior behavior (low_cpu's batch size if enabled, else embed each
+    // file's chunks in a single batch).
+    let max_embed_batch_size = batch_size.filter(|&n| n > 0).or_else(|| {
+        config
+            .low_cpu
+            .enabled
+            .then(|| config.low_cpu.effective_ingest_batch_size())
+    });
+
     let summary = match mode {
         CliMode::Projects => runtime
             .block_on(ingest_project(
@@ -587,10 +607,7 @@ where
                     limit: if limit == 0 { None } else { Some(limit) },
                     dry_run,
                     reindex,
-                    max_embed_batch_size: config
-                        .low_cpu
-                        .enabled
-                        .then_some(config.low_cpu.effective_ingest_batch_size()),
+                    max_embed_batch_size,
                     branch,
                 },
             ))
@@ -610,10 +627,7 @@ where
                     limit: if limit == 0 { None } else { Some(limit) },
                     dry_run,
                     reindex,
-                    max_embed_batch_size: config
-                        .low_cpu
-                        .enabled
-                        .then_some(config.low_cpu.effective_ingest_batch_size()),
+                    max_embed_batch_size,
                 },
             ))
             .map_err(ingest_error)?,
@@ -659,10 +673,15 @@ fn execute_remote_mine(
     agent: &str,
     limit: usize,
     dry_run: bool,
+    batch_size: Option<usize>,
     config: &MempalaceConfig,
     runtime: &tokio::runtime::Runtime,
     rule: &mempalace_config::ResolvedRouteRule,
 ) -> Result<CliOutput, clap::Error> {
+    // `--batch-size N` (N>0) caps files per remote request, letting low-spec
+    // machines bound how much is held/serialized at once. The ~4 MiB byte cap
+    // still applies as an independent guardrail against the server body limit.
+    let max_files_per_batch = batch_size.filter(|&n| n > 0).unwrap_or(REMOTE_BATCH_MAX_FILES);
     // ── 1. Prepare the batch (no embedding, no storage) ─────────────────────
     let prepared = prepare_project_batch(&ProjectIngestRequest {
         project_dir: source_dir.to_path_buf(),
@@ -721,6 +740,7 @@ fn execute_remote_mine(
             ),
             format!("  Files to send: {}", prepared.files.len()),
             format!("  Total chunks: {total_chunks}"),
+            format!("  Max files/batch: {max_files_per_batch}"),
         ];
         if let Some(ref warning) = branch_warning {
             lines.push(format!("  {}", warning.trim()));
@@ -778,7 +798,7 @@ fn execute_remote_mine(
     let agent_owned = agent.to_owned();
 
     // Split files into batches.
-    let batches = build_remote_batches(prepared.files);
+    let batches = build_remote_batches(prepared.files, max_files_per_batch);
 
     let mut ingested_count: usize = 0;
     let mut skipped_count: usize = 0;
@@ -857,11 +877,16 @@ fn execute_remote_mine(
     Ok(CliOutput::success(output))
 }
 
-/// Split a flat list of [`IngestFileDto`] into batches bounded by
-/// [`REMOTE_BATCH_MAX_FILES`] files and [`REMOTE_BATCH_MAX_BYTES`] chunk text.
+/// Split a flat list of [`IngestFileDto`] into batches bounded by `max_files`
+/// files (caller-supplied; from `--batch-size`, defaulting to
+/// [`REMOTE_BATCH_MAX_FILES`]) and [`REMOTE_BATCH_MAX_BYTES`] of chunk text.
 fn build_remote_batches(
     files: Vec<mempalace_federation::IngestFileDto>,
+    max_files: usize,
 ) -> Vec<Vec<mempalace_federation::IngestFileDto>> {
+    // Guard against a zero slipping through: a 0 cap would never flush on the
+    // file count and silently disable that bound. Treat it as the default.
+    let max_files = if max_files == 0 { REMOTE_BATCH_MAX_FILES } else { max_files };
     let mut batches: Vec<Vec<mempalace_federation::IngestFileDto>> = Vec::new();
     let mut current: Vec<mempalace_federation::IngestFileDto> = Vec::new();
     let mut current_bytes: usize = 0;
@@ -872,7 +897,7 @@ fn build_remote_batches(
         // An oversized single file goes alone in its own batch.
         let would_overflow_bytes =
             current_bytes + file_bytes > REMOTE_BATCH_MAX_BYTES && !current.is_empty();
-        let would_overflow_files = current.len() >= REMOTE_BATCH_MAX_FILES;
+        let would_overflow_files = current.len() >= max_files;
 
         if would_overflow_bytes || would_overflow_files {
             batches.push(std::mem::take(&mut current));
@@ -1926,6 +1951,66 @@ mod tests {
         assert!(wake_up.stdout.contains("ESSENTIAL STORY"));
 
         fs::remove_dir_all(config_root).unwrap();
+    }
+
+    #[test]
+    fn mine_accepts_batch_size_on_local_path() {
+        let workspace = tempdir().unwrap();
+        let project_dir = setup_project_fixture(workspace.path());
+        let config_root = temp_config_root("batch-size-local");
+        let context = CliContext::for_tests(config_root.clone());
+
+        run_cli(["init", project_dir.to_str().unwrap(), "--yes"], &context, stub_provider).unwrap();
+
+        // --batch-size 1 forces single-chunk embed batches; mining still ingests
+        // every file, proving the flag is accepted and threads through cleanly.
+        let mine = run_cli(
+            ["mine", project_dir.to_str().unwrap(), "--batch-size", "1"],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+        assert_eq!(mine.exit_code, 0, "stderr: {}", mine.stderr);
+        assert!(
+            mine.stdout.contains("Files ingested: 3"),
+            "expected 3 files ingested with --batch-size 1: {}",
+            mine.stdout
+        );
+
+        fs::remove_dir_all(config_root).unwrap();
+    }
+
+    #[test]
+    fn build_remote_batches_respects_max_files() {
+        use mempalace_federation::{IngestChunkDto, IngestFileDto};
+
+        let make_file = |name: &str| IngestFileDto {
+            relative_path: name.to_owned(),
+            content_hash: "hash".to_owned(),
+            file_hash: None,
+            chunks: vec![IngestChunkDto {
+                chunk_index: 0,
+                room: "general".to_owned(),
+                text: "x".to_owned(),
+                byte_start: None,
+                byte_end: None,
+                line_start: None,
+                line_end: None,
+            }],
+        };
+
+        let files: Vec<_> = (0..5).map(|i| make_file(&format!("f{i}.rs"))).collect();
+
+        // Cap of 2 files/batch over 5 tiny files → 3 batches sized [2, 2, 1].
+        let batches = build_remote_batches(files.clone(), 2);
+        assert_eq!(batches.len(), 3, "expected 3 batches at cap 2");
+        assert!(batches.iter().all(|b| b.len() <= 2), "no batch may exceed the cap");
+        assert_eq!(batches.iter().map(Vec::len).sum::<usize>(), 5, "no file dropped");
+
+        // 0 falls back to the default cap → a single batch for 5 tiny files.
+        let batches = build_remote_batches(files, 0);
+        assert_eq!(batches.len(), 1, "0 must fall back to the default cap");
+        assert_eq!(batches[0].len(), 5);
     }
 
     #[test]

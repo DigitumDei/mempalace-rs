@@ -804,12 +804,16 @@ mod tests {
             &self,
             filter: &DrawerFilter,
         ) -> Result<Vec<DrawerRecord>, StorageError> {
-            Ok(self
+            let mut results: Vec<DrawerRecord> = self
                 .drawers
                 .iter()
                 .filter(|drawer| filter_matches(drawer, filter))
                 .cloned()
-                .collect())
+                .collect();
+            if let Some(limit) = filter.limit {
+                results.truncate(limit);
+            }
+            Ok(results)
         }
     }
 
@@ -932,7 +936,11 @@ mod tests {
             _filter: &DrawerFilter,
         ) -> Result<Vec<DrawerRecord>, StorageError> {
             *self.list_calls.lock().unwrap() += 1;
-            Ok(self.drawers.clone())
+            let mut drawers = self.drawers.clone();
+            if let Some(limit) = _filter.limit {
+                drawers.truncate(limit);
+            }
+            Ok(drawers)
         }
     }
 

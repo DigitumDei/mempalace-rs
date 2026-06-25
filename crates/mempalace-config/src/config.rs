@@ -25,6 +25,7 @@ const DEFAULT_LOW_CPU_QUEUE_LIMIT: usize = 32;
 const DEFAULT_LOW_CPU_INGEST_BATCH_SIZE: usize = 8;
 const DEFAULT_LOW_CPU_SEARCH_RESULTS_LIMIT: usize = 5;
 const DEFAULT_LOW_CPU_WAKE_UP_DRAWERS_LIMIT: usize = 8;
+const MAX_SEARCH_RESULTS_LIMIT: usize = 200;
 const DEGRADED_LOW_CPU_QUEUE_LIMIT: usize = 8;
 const DEGRADED_LOW_CPU_INGEST_BATCH_SIZE: usize = 4;
 const DEGRADED_LOW_CPU_SEARCH_RESULTS_LIMIT: usize = 3;
@@ -194,14 +195,15 @@ impl LowCpuRuntimeConfig {
 
     pub fn effective_search_results_limit(&self) -> usize {
         if !self.enabled {
-            return usize::MAX;
+            return MAX_SEARCH_RESULTS_LIMIT;
         }
 
-        if self.degraded_mode {
+        let base = if self.degraded_mode {
             self.search_results_limit.min(DEGRADED_LOW_CPU_SEARCH_RESULTS_LIMIT)
         } else {
             self.search_results_limit
-        }
+        };
+        base.min(MAX_SEARCH_RESULTS_LIMIT)
     }
 
     pub fn effective_wake_up_drawers_limit(&self) -> usize {

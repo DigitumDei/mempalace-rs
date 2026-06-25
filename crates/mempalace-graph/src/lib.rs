@@ -2005,7 +2005,11 @@ mod tests {
                 &self,
                 _filter: &DrawerFilter,
             ) -> mempalace_storage::Result<Vec<DrawerRecord>> {
-                Ok(self.0.clone())
+                let mut drawers = self.0.clone();
+                if let Some(limit) = _filter.limit {
+                    drawers.truncate(limit);
+                }
+                Ok(drawers)
             }
         }
 

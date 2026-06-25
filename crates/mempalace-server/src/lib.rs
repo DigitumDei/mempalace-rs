@@ -281,6 +281,7 @@ impl TokenRegistry {
     }
 
     fn read_file(path: &PathBuf) -> Result<TokenRegistryInner, ServerError> {
+        Self::check_token_file_permissions(path)?;
         let raw = std::fs::read_to_string(path)
             .map_err(|source| ServerError::Io { path: path.clone(), source })?;
         let file_entries: Vec<TokenEntry> =
@@ -306,6 +307,32 @@ impl TokenRegistry {
         }
         let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
         Ok(TokenRegistryInner { entries, mtime })
+    }
+
+    /// Verify the token file is not group- or world-readable.
+    ///
+    /// On Unix this checks `mode & 0o077 == 0`.  On Windows the check is
+    /// skipped because the platform permission model is fundamentally
+    /// different and the file lives in the user's home directory by default.
+    #[cfg(unix)]
+    fn check_token_file_permissions(path: &PathBuf) -> Result<(), ServerError> {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = std::fs::metadata(path)
+            .map_err(|source| ServerError::Io { path: path.clone(), source })?;
+        let mode = meta.permissions().mode();
+        if mode & 0o077 != 0 {
+            return Err(ServerError::TokenFile(format!(
+                "token file `{}` has permissions {:#o}; expected 0600 or more restrictive",
+                path.display(),
+                mode & 0o777,
+            )));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn check_token_file_permissions(_path: &PathBuf) -> Result<(), ServerError> {
+        Ok(())
     }
 
     /// Re-reads the token file if its mtime has changed since last load.
@@ -790,10 +817,23 @@ where
     let wing = params.wing.as_deref().map(WingId::new).transpose()?;
     let room = params.room.as_deref().map(RoomId::new).transpose()?;
 
+    // Over-fetch from storage to compensate for diary rows that are filtered
+    // out below — otherwise a page whose first `limit` rows contain diary
+    // entries would silently return fewer than `limit` non-diary results to
+    // the client, with no cursor to continue from.  The 2x factor is a
+    // heuristic; if diary entries ever exceed it the result will be shorter
+    // than `limit`, but that is rare and strictly better than the
+    // unbounded-load-all-then-take approach.
+    let storage_limit = limit.saturating_mul(2);
     let drawers = state
         .storage
         .drawer_store()
-        .list_drawers(&DrawerFilter { wing, room, ..DrawerFilter::default() })
+        .list_drawers(&DrawerFilter {
+            wing,
+            room,
+            limit: Some(storage_limit),
+            ..DrawerFilter::default()
+        })
         .await?;
 
     let mut drawers_filtered: Vec<DrawerRecord> = drawers

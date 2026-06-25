@@ -364,6 +364,9 @@ impl DrawerStore for LanceDrawerStore {
         if !filter_sql.is_empty() {
             query = query.only_if(filter_sql);
         }
+        if let Some(limit) = filter.limit {
+            query = query.limit(limit);
+        }
         let stream = query.execute().await?;
         let batches = stream.try_collect::<Vec<_>>().await?;
         records_from_batches(&batches)

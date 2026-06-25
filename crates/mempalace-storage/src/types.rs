@@ -30,6 +30,8 @@ pub struct DrawerFilter {
     pub room: Option<RoomId>,
     pub hall: Option<String>,
     pub source_file: Option<String>,
+    /// Maximum number of drawers to return.  `None` means unlimited.
+    pub limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

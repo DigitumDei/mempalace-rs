@@ -17,6 +17,12 @@ use crate::{
 /// Bodies larger than this are truncated to avoid flooding logs.
 const MAX_ERROR_BODY: usize = 2048;
 
+/// Maximum response body (in bytes) accepted from a remote peer on success.
+///
+/// Responses larger than this are rejected as [`RemoteError::InvalidResponse`]
+/// to prevent memory exhaustion (peer OOM).
+const MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
+
 /// A reqwest-backed HTTP client for one remote MemPalace federation endpoint.
 ///
 /// Build with [`RemoteClient::new`]; then use via the [`RemoteApi`] trait.
@@ -66,6 +72,7 @@ impl RemoteClient {
         let http = reqwest::Client::builder()
             .use_rustls_tls()
             .timeout(endpoint.timeout)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| RemoteError::InvalidConfig {
                 remote: endpoint.name.clone(),
@@ -141,27 +148,29 @@ impl RemoteClient {
 
         let status = response.status();
 
+        // Read the full body with a size cap to prevent peer OOM (both success
+        // and error paths re-use these bytes).
+        let mut bytes = Vec::new();
+        let mut response = response;
+        while let Ok(Some(chunk)) = response.chunk().await {
+            bytes.extend_from_slice(&chunk);
+            // For error responses use a tighter limit; for success the full
+            // cap is safe because the server controls the schema.
+            let cap = if status.is_success() { MAX_RESPONSE_BYTES } else { MAX_ERROR_BODY };
+            if bytes.len() >= cap {
+                break;
+            }
+        }
+
         if status == reqwest::StatusCode::UNAUTHORIZED {
             return Err(RemoteError::Unauthorized { remote: self.name.clone() });
         }
 
         if !status.is_success() {
-            // Read the body in chunks, stopping at MAX_ERROR_BODY to avoid
-            // memory exhaustion from large error responses (e.g. HTML pages).
-            let mut response = response;
-            let mut bytes = Vec::new();
-            while let Ok(Some(chunk)) = response.chunk().await {
-                bytes.extend_from_slice(&chunk);
-                if bytes.len() >= MAX_ERROR_BODY {
-                    break;
-                }
-            }
             let raw = String::from_utf8_lossy(&bytes).into_owned();
             let body = if let Ok(err_body) = serde_json::from_str::<ErrorBody>(&raw) {
                 format!("{}: {}", err_body.code, err_body.message)
             } else if raw.len() > MAX_ERROR_BODY {
-                // Truncate on a char boundary — slicing at a fixed byte offset
-                // would panic mid-way through a multi-byte UTF-8 character.
                 let mut cut = MAX_ERROR_BODY;
                 while !raw.is_char_boundary(cut) {
                     cut -= 1;
@@ -177,7 +186,7 @@ impl RemoteClient {
             });
         }
 
-        response.json::<T>().await.map_err(|e| RemoteError::InvalidResponse {
+        serde_json::from_slice(&bytes).map_err(|e| RemoteError::InvalidResponse {
             remote: self.name.clone(),
             message: e.to_string(),
         })

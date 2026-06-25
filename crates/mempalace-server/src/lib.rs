@@ -1175,10 +1175,11 @@ where
     }
     let mut total_ingest_text_bytes = 0usize;
     for file in &body.files {
-        let file_text_bytes: usize = file.chunks.iter().map(|chunk| chunk.text.len()).sum();
-        total_ingest_text_bytes = total_ingest_text_bytes
-            .checked_add(file_text_bytes)
-            .ok_or_else(|| ServerError::InvalidParams("ingest text is too large".to_owned()))?;
+        for chunk in &file.chunks {
+            total_ingest_text_bytes = total_ingest_text_bytes
+                .checked_add(chunk.text.len())
+                .ok_or_else(|| ServerError::InvalidParams("ingest text is too large".to_owned()))?;
+        }
     }
     if total_ingest_text_bytes > MAX_INGEST_TEXT_BYTES {
         return Err(ServerError::InvalidParams(format!(

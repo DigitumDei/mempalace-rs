@@ -152,7 +152,10 @@ impl RemoteClient {
         // and error paths re-use these bytes).
         let mut bytes = Vec::new();
         let mut response = response;
-        while let Ok(Some(chunk)) = response.chunk().await {
+        while let Some(chunk) = response.chunk().await.map_err(|e| RemoteError::Unreachable {
+            remote: self.name.clone(),
+            message: e.to_string(),
+        })? {
             bytes.extend_from_slice(&chunk);
             // For error responses use a tighter limit; for success the full
             // cap is safe because the server controls the schema.

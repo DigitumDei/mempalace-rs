@@ -28,6 +28,21 @@ use tempfile::TempDir;
 // ─── Test token ───────────────────────────────────────────────────────────────
 
 const TEST_TOKEN: &str = "fed-e2e-secret-token-xyz";
+fn restrict_token_file(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o600);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+}
 
 // ─── Shared spawning helpers ──────────────────────────────────────────────────
 
@@ -42,6 +57,7 @@ fn write_token_file(dir: &TempDir) -> PathBuf {
         .unwrap(),
     )
     .unwrap();
+    restrict_token_file(&path);
     path
 }
 

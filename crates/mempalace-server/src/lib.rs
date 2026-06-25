@@ -1951,6 +1951,22 @@ mod tests {
     const BOB_TOKEN: &str = "bob-secret-token";
     const BAD_TOKEN: &str = "bad-token-xyz";
 
+    fn restrict_token_file(path: &std::path::Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut permissions = std::fs::metadata(path).unwrap().permissions();
+            permissions.set_mode(0o600);
+            std::fs::set_permissions(path, permissions).unwrap();
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+        }
+    }
+
     struct Harness {
         router: Router,
         _tempdir: TempDir,
@@ -1971,6 +1987,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+        restrict_token_file(&token_file);
 
         let config = MempalaceConfig {
             schema_version: 1,
@@ -2077,6 +2094,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+        restrict_token_file(&token_file);
 
         let err = TokenRegistry::load(token_file).unwrap_err();
         assert!(err.to_string().contains("must not be empty"), "{err}");
@@ -2094,6 +2112,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+        restrict_token_file(&token_file);
         let registry = TokenRegistry::load(token_file.clone()).unwrap();
         assert_eq!(registry.authenticate(ALICE_TOKEN).as_deref(), Some("alice"));
         assert_eq!(registry.authenticate(""), None);
@@ -2115,6 +2134,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+        restrict_token_file(&token_file);
         let registry = TokenRegistry::load(token_file.clone()).unwrap();
         assert_eq!(registry.authenticate(ALICE_TOKEN).as_deref(), Some("alice"));
 
@@ -2137,6 +2157,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+        restrict_token_file(&token_file);
         assert_eq!(registry.authenticate(ALICE_TOKEN).as_deref(), Some("alice"));
     }
 
@@ -2527,6 +2548,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+        restrict_token_file(&token_file);
 
         let config = MempalaceConfig {
             schema_version: 1,

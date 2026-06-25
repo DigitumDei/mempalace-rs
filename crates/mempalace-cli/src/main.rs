@@ -2420,6 +2420,22 @@ mod tests {
 
     // ─── Remote mine e2e tests ───────────────────────────────────────────────
 
+    fn restrict_token_file(path: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut permissions = fs::metadata(path).unwrap().permissions();
+            permissions.set_mode(0o600);
+            fs::set_permissions(path, permissions).unwrap();
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+        }
+    }
+
     /// Write a minimal token file into `dir` and return the path.
     fn write_test_token_file(dir: &Path, token: &str) -> PathBuf {
         let path = dir.join("tokens.json");
@@ -2431,6 +2447,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+        restrict_token_file(&path);
         path
     }
 

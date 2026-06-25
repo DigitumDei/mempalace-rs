@@ -304,7 +304,7 @@ jobs:
             os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
           - asset: macos-arm64
-            os: macos-latest
+            os: macos-15
             target: aarch64-apple-darwin
           - asset: windows-x86_64
             os: windows-latest

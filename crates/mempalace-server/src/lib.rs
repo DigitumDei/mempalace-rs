@@ -22,7 +22,7 @@
 //! # }
 //! ```
 
-use std::path::PathBuf;
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
 
@@ -36,21 +36,21 @@ use axum::{Json, Router};
 use blake3::Hasher;
 use mempalace_config::MempalaceConfig;
 use mempalace_core::{
-    DIARY_ROOM, DIARY_TOPIC_PREFIX, DrawerId, DrawerRecord, RoomId,
-    SHARED_AGENT_DIARY_WING, SearchQuery, SourceLocator, WingId, mined_drawer_id, resolve_records,
+    DIARY_ROOM, DIARY_TOPIC_PREFIX, DrawerId, DrawerRecord, RoomId, SHARED_AGENT_DIARY_WING,
+    SearchQuery, SourceLocator, WingId, hash_bytes, mined_drawer_id, resolve_records,
 };
 use mempalace_embeddings::{EmbeddingProvider, EmbeddingRequest};
 use mempalace_federation::{
-    AddDrawerRequest, AddDrawerResponse, ChangesQuery, ChangesResponse, ChangeEventDto,
+    AddDrawerRequest, AddDrawerResponse, ChangeEventDto, ChangesQuery, ChangesResponse,
     CheckDuplicateRequest, CheckDuplicateResponse, DrawerSearchRequest, DrawerSearchResponse,
-    ErrorBody, FEDERATION_API_VERSION, IngestBatchRequest, IngestBatchResponse, IngestFileResult,
-    InfoResponse, KgAddFactRequest, KgInvalidateRequest, KgQueryRequest, ListDrawersQuery,
+    ErrorBody, FEDERATION_API_VERSION, InfoResponse, IngestBatchRequest, IngestBatchResponse,
+    IngestFileResult, KgAddFactRequest, KgInvalidateRequest, KgQueryRequest, ListDrawersQuery,
     ListDrawersResponse, RemoteDrawerResult,
 };
 use mempalace_graph::{AddFactRequest, EntityKind, KnowledgeGraphRuntime, QueryDirection};
 use mempalace_search::{SearchRuntime, SearchRuntimePolicy};
 use mempalace_storage::{
-    ChangeEvent, ChangeLogStore, ChangeCursor, DrawerFilter, DrawerStore, DuplicateStrategy,
+    ChangeCursor, ChangeEvent, ChangeLogStore, DrawerFilter, DrawerStore, DuplicateStrategy,
     IngestCommitRequest, IngestManifestStore, StorageEngine,
 };
 use serde_json::{Value, json};
@@ -68,6 +68,22 @@ const DUPLICATE_SEARCH_LIMIT: usize = 5;
 const DEFAULT_PAGE_LIMIT: usize = 50;
 /// Maximum page size clients may request.
 const MAX_PAGE_LIMIT: usize = 200;
+/// Maximum bytes accepted for single-drawer writes and duplicate checks.
+const MAX_DRAWER_CONTENT_BYTES: usize = 256 * 1024;
+/// Maximum bytes accepted for a semantic search query.
+const MAX_SEARCH_QUERY_BYTES: usize = 16 * 1024;
+/// Maximum number of files in one remote ingest request.
+const MAX_INGEST_FILES: usize = 128;
+/// Maximum chunks accepted for any single file in one remote ingest request.
+const MAX_INGEST_CHUNKS_PER_FILE: usize = 512;
+/// Maximum total chunk text bytes accepted in one remote ingest request.
+const MAX_INGEST_TEXT_BYTES: usize = 8 * 1024 * 1024;
+/// Maximum bytes accepted in free-form KG string fields.
+const MAX_KG_FIELD_BYTES: usize = 4096;
+/// Default timeline rows returned when no limit is requested.
+const DEFAULT_KG_TIMELINE_LIMIT: usize = 100;
+/// Maximum timeline rows clients may request.
+const MAX_KG_TIMELINE_LIMIT: usize = 200;
 
 // ─── Errors ──────────────────────────────────────────────────────────────────
 
@@ -126,6 +142,19 @@ pub enum ServerError {
 
 impl IntoResponse for ServerError {
     fn into_response(self) -> Response {
+        if matches!(
+            &self,
+            Self::Storage(_)
+                | Self::Search(_)
+                | Self::Graph(_)
+                | Self::Core(_)
+                | Self::Embeddings(_)
+                | Self::Json(_)
+                | Self::Io { .. }
+                | Self::TokenFile(_)
+        ) {
+            warn!(error = %self, "federation request failed with internal error");
+        }
         let (status, code, message) = match &self {
             Self::InvalidParams(msg) => {
                 (StatusCode::BAD_REQUEST, "invalid_params", msg.as_str().to_owned())
@@ -146,30 +175,44 @@ impl IntoResponse for ServerError {
                 "near-duplicate content detected; add check_duplicate first if intentional"
                     .to_owned(),
             ),
-            Self::Storage(err) => (
+            Self::Storage(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "storage_error",
-                err.to_string(),
+                "storage operation failed".to_owned(),
             ),
-            Self::Search(err) => {
-                (StatusCode::INTERNAL_SERVER_ERROR, "search_error", err.to_string())
-            }
-            Self::Graph(err) => {
-                (StatusCode::INTERNAL_SERVER_ERROR, "graph_error", err.to_string())
-            }
-            Self::Core(err) => (StatusCode::INTERNAL_SERVER_ERROR, "core_error", err.to_string()),
-            Self::Embeddings(err) => {
-                (StatusCode::INTERNAL_SERVER_ERROR, "embedding_error", err.to_string())
-            }
-            Self::Json(err) => (StatusCode::INTERNAL_SERVER_ERROR, "json_error", err.to_string()),
-            Self::Io { path, source } => (
+            Self::Search(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "io_error",
-                format!("I/O error at {}: {}", path.display(), source),
+                "search_error",
+                "search operation failed".to_owned(),
             ),
-            Self::TokenFile(msg) => {
-                (StatusCode::INTERNAL_SERVER_ERROR, "token_file_error", msg.clone())
+            Self::Graph(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "graph_error",
+                "knowledge graph operation failed".to_owned(),
+            ),
+            Self::Core(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "core_error",
+                "core operation failed".to_owned(),
+            ),
+            Self::Embeddings(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "embedding_error",
+                "embedding operation failed".to_owned(),
+            ),
+            Self::Json(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "json_error",
+                "serialization operation failed".to_owned(),
+            ),
+            Self::Io { .. } => {
+                (StatusCode::INTERNAL_SERVER_ERROR, "io_error", "I/O operation failed".to_owned())
             }
+            Self::TokenFile(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "token_file_error",
+                "token registry unavailable".to_owned(),
+            ),
         };
         let body = if let Self::Duplicate(matches) = &self {
             // 409 body includes the matches list so clients can inspect duplicates
@@ -238,24 +281,58 @@ impl TokenRegistry {
     }
 
     fn read_file(path: &PathBuf) -> Result<TokenRegistryInner, ServerError> {
-        let raw = std::fs::read_to_string(path).map_err(|source| ServerError::Io {
-            path: path.clone(),
-            source,
-        })?;
-        let file_entries: Vec<TokenEntry> = serde_json::from_str(&raw)
-            .map_err(|err| ServerError::TokenFile(err.to_string()))?;
-        let entries = file_entries
-            .into_iter()
-            .map(|entry| TokenRegistryEntry {
+        Self::check_token_file_permissions(path)?;
+        let raw = std::fs::read_to_string(path)
+            .map_err(|source| ServerError::Io { path: path.clone(), source })?;
+        let file_entries: Vec<TokenEntry> =
+            serde_json::from_str(&raw).map_err(|err| ServerError::TokenFile(err.to_string()))?;
+        let mut entries = Vec::with_capacity(file_entries.len());
+        for entry in file_entries {
+            if entry.name.trim().is_empty() {
+                return Err(ServerError::TokenFile(
+                    "token entry name must not be empty".to_owned(),
+                ));
+            }
+            if entry.enabled && entry.token.trim().is_empty() {
+                return Err(ServerError::TokenFile(format!(
+                    "enabled token `{}` must not be empty",
+                    entry.name
+                )));
+            }
+            entries.push(TokenRegistryEntry {
                 name: entry.name,
                 enabled: entry.enabled,
                 token_hash: blake3::hash(entry.token.as_bytes()),
-            })
-            .collect();
-        let mtime = std::fs::metadata(path)
-            .and_then(|m| m.modified())
-            .ok();
+            });
+        }
+        let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
         Ok(TokenRegistryInner { entries, mtime })
+    }
+
+    /// Verify the token file is not group- or world-readable.
+    ///
+    /// On Unix this checks `mode & 0o077 == 0`.  On Windows the check is
+    /// skipped because the platform permission model is fundamentally
+    /// different and the file lives in the user's home directory by default.
+    #[cfg(unix)]
+    fn check_token_file_permissions(path: &PathBuf) -> Result<(), ServerError> {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = std::fs::metadata(path)
+            .map_err(|source| ServerError::Io { path: path.clone(), source })?;
+        let mode = meta.permissions().mode();
+        if mode & 0o077 != 0 {
+            return Err(ServerError::TokenFile(format!(
+                "token file `{}` has permissions {:#o}; expected 0600 or more restrictive",
+                path.display(),
+                mode & 0o777,
+            )));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn check_token_file_permissions(_path: &PathBuf) -> Result<(), ServerError> {
+        Ok(())
     }
 
     /// Re-reads the token file if its mtime has changed since last load.
@@ -280,11 +357,17 @@ impl TokenRegistry {
         match Self::read_file(&self.path) {
             Ok(new_inner) => *guard = new_inner,
             Err(err) => {
-                // Keep serving the last-good token set, but record the current
-                // mtime so we don't retry disk I/O + write-lock on every request
-                // until the file actually changes again.
-                warn!("failed to reload token file: {err}");
-                guard.mtime = current_mtime;
+                // Fail closed on malformed reloads so emergency revocation edits
+                // cannot leave the previous token set active indefinitely.
+                warn!(
+                    "failed to reload token file; disabled all tokens until reload succeeds: {err}"
+                );
+                guard.entries.clear();
+                if matches!(err, ServerError::TokenFile(_)) {
+                    guard.mtime = current_mtime;
+                } else {
+                    guard.mtime = None;
+                }
             }
         }
     }
@@ -292,6 +375,9 @@ impl TokenRegistry {
     /// Authenticates `presented` token using constant-time comparison on BLAKE3
     /// hashes. Returns `Some(name)` for an enabled, matching token; `None` otherwise.
     pub fn authenticate(&self, presented: &str) -> Option<String> {
+        if presented.trim().is_empty() {
+            return None;
+        }
         self.check_reload();
         let presented_hash = blake3::hash(presented.as_bytes());
         let guard = self.inner.read().ok()?;
@@ -299,8 +385,7 @@ impl TokenRegistry {
             if !entry.enabled {
                 continue;
             }
-            let eq: bool =
-                presented_hash.as_bytes().ct_eq(entry.token_hash.as_bytes()).into();
+            let eq: bool = presented_hash.as_bytes().ct_eq(entry.token_hash.as_bytes()).into();
             if eq {
                 return Some(entry.name.clone());
             }
@@ -475,11 +560,14 @@ async fn route_drawers_search<P>(
 where
     P: EmbeddingProvider + Send + Sync + 'static,
 {
-    let limit = body
-        .limit
-        .unwrap_or(5)
-        .max(1)
-        .min(state.config.low_cpu.effective_search_results_limit());
+    if body.query.len() > MAX_SEARCH_QUERY_BYTES {
+        return Err(ServerError::InvalidParams(format!(
+            "query must be at most {MAX_SEARCH_QUERY_BYTES} bytes"
+        )));
+    }
+
+    let limit =
+        body.limit.unwrap_or(5).max(1).min(state.config.low_cpu.effective_search_results_limit());
 
     let wing = body.wing.as_deref().map(WingId::new).transpose()?;
     let room = body.room.as_deref().map(RoomId::new).transpose()?;
@@ -537,6 +625,11 @@ where
     P: EmbeddingProvider + Send + Sync + 'static,
 {
     let identity = auth.0.0;
+    if body.content.len() > MAX_DRAWER_CONTENT_BYTES {
+        return Err(ServerError::InvalidParams(format!(
+            "content must be at most {MAX_DRAWER_CONTENT_BYTES} bytes"
+        )));
+    }
 
     // Reject diary-shaped writes
     if is_diary_wing_or_room(&body.wing, &body.room) {
@@ -566,7 +659,8 @@ where
     };
 
     let now = OffsetDateTime::now_utc();
-    let drawer_id = generated_drawer_id("drawer", wing.as_str(), room.as_str(), &body.content, now)?;
+    let drawer_id =
+        generated_drawer_id("drawer", wing.as_str(), room.as_str(), &body.content, now)?;
     let source_file = body.source_file.unwrap_or_default();
     let record = build_drawer_record(
         &state,
@@ -598,9 +692,7 @@ where
         occurred_at: now,
         entity_id: drawer_id.as_str().to_owned(),
         actor: Some(identity),
-        details_json: Some(
-            json!({"wing": wing.as_str(), "room": room.as_str()}).to_string(),
-        ),
+        details_json: Some(json!({"wing": wing.as_str(), "room": room.as_str()}).to_string()),
     })?;
 
     Ok(Json(AddDrawerResponse {
@@ -620,6 +712,12 @@ async fn route_drawers_check_duplicate<P>(
 where
     P: EmbeddingProvider + Send + Sync + 'static,
 {
+    if body.content.len() > MAX_DRAWER_CONTENT_BYTES {
+        return Err(ServerError::InvalidParams(format!(
+            "content must be at most {MAX_DRAWER_CONTENT_BYTES} bytes"
+        )));
+    }
+
     let threshold = body.threshold.unwrap_or(DEFAULT_DUPLICATE_THRESHOLD);
     let matches = find_duplicates(&state, &body.content, threshold).await?;
     // Filter diary matches
@@ -632,10 +730,7 @@ where
         })
         .collect();
     let is_duplicate = !matches.is_empty();
-    Ok(Json(CheckDuplicateResponse {
-        is_duplicate,
-        matches: Value::Array(matches),
-    }))
+    Ok(Json(CheckDuplicateResponse { is_duplicate, matches: Value::Array(matches) }))
 }
 
 // ─── Drawers: get by id ───────────────────────────────────────────────────────
@@ -722,10 +817,23 @@ where
     let wing = params.wing.as_deref().map(WingId::new).transpose()?;
     let room = params.room.as_deref().map(RoomId::new).transpose()?;
 
+    // Over-fetch from storage to compensate for diary rows that are filtered
+    // out below — otherwise a page whose first `limit` rows contain diary
+    // entries would silently return fewer than `limit` non-diary results to
+    // the client, with no cursor to continue from.  The 2x factor is a
+    // heuristic; if diary entries ever exceed it the result will be shorter
+    // than `limit`, but that is rare and strictly better than the
+    // unbounded-load-all-then-take approach.
+    let storage_limit = limit.saturating_mul(2);
     let drawers = state
         .storage
         .drawer_store()
-        .list_drawers(&DrawerFilter { wing, room, ..DrawerFilter::default() })
+        .list_drawers(&DrawerFilter {
+            wing,
+            room,
+            limit: Some(storage_limit),
+            ..DrawerFilter::default()
+        })
         .await?;
 
     let mut drawers_filtered: Vec<DrawerRecord> = drawers
@@ -757,6 +865,7 @@ async fn route_kg_query<P>(
 where
     P: EmbeddingProvider + Send + Sync + 'static,
 {
+    validate_kg_field("entity", &body.entity)?;
     let as_of = body.as_of.as_deref().map(parse_date).transpose()?;
     let direction = parse_direction(body.direction.as_deref().unwrap_or("both"))?;
     let runtime = KnowledgeGraphRuntime::new(state.storage.operational_store());
@@ -781,6 +890,9 @@ where
     P: EmbeddingProvider + Send + Sync + 'static,
 {
     let identity = auth.0.0;
+    validate_kg_field("subject", &body.subject)?;
+    validate_kg_field("predicate", &body.predicate)?;
+    validate_kg_field("object", &body.object)?;
     let valid_from = body.valid_from.as_deref().map(parse_date).transpose()?;
     let runtime = KnowledgeGraphRuntime::new(state.storage.operational_store());
     let now = OffsetDateTime::now_utc();
@@ -829,6 +941,9 @@ where
     P: EmbeddingProvider + Send + Sync + 'static,
 {
     let identity = auth.0.0;
+    validate_kg_field("subject", &body.subject)?;
+    validate_kg_field("predicate", &body.predicate)?;
+    validate_kg_field("object", &body.object)?;
     let ended_text = body.ended.clone();
     let ended = ended_text
         .as_deref()
@@ -864,25 +979,39 @@ where
 
 // ─── KG: timeline ─────────────────────────────────────────────────────────────
 
+/// Query parameters for `GET /v1/kg/timeline`.
+#[derive(Debug, serde::Deserialize)]
+pub struct KgTimelineQuery {
+    /// Optional entity filter.
+    pub entity: Option<String>,
+    /// Maximum number of timeline rows to return.
+    pub limit: Option<usize>,
+}
+
 async fn route_kg_timeline<P>(
     State(state): State<Arc<ServerState<P>>>,
-    Query(params): Query<std::collections::HashMap<String, String>>,
+    Query(params): Query<KgTimelineQuery>,
 ) -> Result<impl IntoResponse, ServerError>
 where
     P: EmbeddingProvider + Send + Sync + 'static,
 {
-    let entity = params.get("entity").cloned();
+    if let Some(entity) = &params.entity {
+        validate_kg_field("entity", entity)?;
+    }
+    let limit = params.limit.unwrap_or(DEFAULT_KG_TIMELINE_LIMIT).max(1).min(MAX_KG_TIMELINE_LIMIT);
+    let entity = params.entity;
     let runtime = KnowledgeGraphRuntime::new(state.storage.operational_store());
-    let timeline = runtime.timeline(entity.as_deref())?;
+    let mut timeline = runtime.timeline(entity.as_deref())?;
+    let total_count = timeline.len();
+    timeline.truncate(limit);
     let count = timeline.len();
     Ok(Json(json!({
         "entity": entity.clone().unwrap_or_else(|| "all".to_owned()),
         "timeline": timeline,
         "count": count,
+        "total_count": total_count,
     })))
 }
-
-// ─── KG: stats ───────────────────────────────────────────────────────────────
 
 async fn route_kg_stats<P>(
     State(state): State<Arc<ServerState<P>>>,
@@ -903,9 +1032,9 @@ async fn route_taxonomy<P>(
 where
     P: EmbeddingProvider + Send + Sync + 'static,
 {
-    let drawers =
-        state.storage.drawer_store().list_drawers(&DrawerFilter::default()).await?;
-    let mut taxonomy = std::collections::BTreeMap::<String, std::collections::BTreeMap<String, usize>>::new();
+    let drawers = state.storage.drawer_store().list_drawers(&DrawerFilter::default()).await?;
+    let mut taxonomy =
+        std::collections::BTreeMap::<String, std::collections::BTreeMap<String, usize>>::new();
     for drawer in &drawers {
         if is_diary_wing_or_room(drawer.wing.as_str(), drawer.room.as_str()) {
             continue;
@@ -927,8 +1056,7 @@ async fn route_wings<P>(
 where
     P: EmbeddingProvider + Send + Sync + 'static,
 {
-    let drawers =
-        state.storage.drawer_store().list_drawers(&DrawerFilter::default()).await?;
+    let drawers = state.storage.drawer_store().list_drawers(&DrawerFilter::default()).await?;
     let mut wings = std::collections::BTreeMap::<String, usize>::new();
     for drawer in &drawers {
         if is_diary_wing_or_room(drawer.wing.as_str(), drawer.room.as_str()) {
@@ -999,10 +1127,7 @@ where
 
     let cursor = params.cursor.as_deref().map(decode_cursor).transpose()?;
 
-    let page = state
-        .storage
-        .operational_store()
-        .get_changes_page(since, cursor, limit)?;
+    let page = state.storage.operational_store().get_changes_page(since, cursor, limit)?;
 
     let next_cursor = page.next_cursor.map(|c| encode_cursor(&c));
 
@@ -1043,6 +1168,24 @@ where
     if body.repo_id.is_empty() {
         return Err(ServerError::InvalidParams("repo_id must not be empty".to_owned()));
     }
+    if body.files.len() > MAX_INGEST_FILES {
+        return Err(ServerError::InvalidParams(format!(
+            "files must contain at most {MAX_INGEST_FILES} entries"
+        )));
+    }
+    let mut total_ingest_text_bytes = 0usize;
+    for file in &body.files {
+        for chunk in &file.chunks {
+            total_ingest_text_bytes = total_ingest_text_bytes
+                .checked_add(chunk.text.len())
+                .ok_or_else(|| ServerError::InvalidParams("ingest text is too large".to_owned()))?;
+        }
+    }
+    if total_ingest_text_bytes > MAX_INGEST_TEXT_BYTES {
+        return Err(ServerError::InvalidParams(format!(
+            "ingest chunk text must total at most {MAX_INGEST_TEXT_BYTES} bytes"
+        )));
+    }
 
     // ── Diary guard: any chunk's room ─────────────────────────────────────────
     for file in &body.files {
@@ -1060,13 +1203,9 @@ where
     };
 
     // ── resolve_root for this wing (may be empty) ─────────────────────────────
-    let resolve_root = state
-        .config
-        .server
-        .checkouts
-        .get(wing.as_str())
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_default();
+    let resolve_root_path = state.config.server.checkouts.get(wing.as_str()).cloned();
+    let resolve_root =
+        resolve_root_path.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
 
     let now = OffsetDateTime::now_utc();
     let wing_str = wing.as_str().to_owned();
@@ -1081,8 +1220,30 @@ where
     let mut warned_missing_checkout = false;
 
     for file in &body.files {
-        let source_key =
-            format!("projects:{wing_str}:{repo_id_hash}:{}", file.relative_path);
+        let source_key = format!("projects:{wing_str}:{repo_id_hash}:{}", file.relative_path);
+
+        if file.chunks.is_empty() {
+            file_results.push(IngestFileResult {
+                relative_path: file.relative_path.clone(),
+                status: "failed".to_owned(),
+                drawers_written: 0,
+                error: Some("chunks must not be empty".to_owned()),
+            });
+            files_failed += 1;
+            continue;
+        }
+        if file.chunks.len() > MAX_INGEST_CHUNKS_PER_FILE {
+            file_results.push(IngestFileResult {
+                relative_path: file.relative_path.clone(),
+                status: "failed".to_owned(),
+                drawers_written: 0,
+                error: Some(format!(
+                    "chunks must contain at most {MAX_INGEST_CHUNKS_PER_FILE} entries"
+                )),
+            });
+            files_failed += 1;
+            continue;
+        }
 
         // ── Per-file validation ────────────────────────────────────────────────
         // relative_path safety: locator resolution joins it onto the server's
@@ -1157,6 +1318,40 @@ where
             }
         }
 
+        // If a checkout is configured, locator-backed rows must match the actual
+        // server-side file bytes before any locator is stored.
+        if let Some(file_hash) = &file.file_hash {
+            if let Some(root) = &resolve_root_path {
+                match read_checkout_file_for_locator(root.as_path(), &file.relative_path) {
+                    Ok(bytes) => {
+                        let actual_hash = hash_bytes(&bytes);
+                        if actual_hash != *file_hash {
+                            file_results.push(IngestFileResult {
+                                relative_path: file.relative_path.clone(),
+                                status: "failed".to_owned(),
+                                drawers_written: 0,
+                                error: Some(
+                                    "file_hash does not match server checkout file".to_owned(),
+                                ),
+                            });
+                            files_failed += 1;
+                            continue;
+                        }
+                    }
+                    Err(err) => {
+                        file_results.push(IngestFileResult {
+                            relative_path: file.relative_path.clone(),
+                            status: "failed".to_owned(),
+                            drawers_written: 0,
+                            error: Some(err),
+                        });
+                        files_failed += 1;
+                        continue;
+                    }
+                }
+            }
+        }
+
         // Validate empty chunk text
         if let Some(chunk) = file.chunks.iter().find(|c| c.text.is_empty()) {
             file_results.push(IngestFileResult {
@@ -1170,8 +1365,7 @@ where
         }
 
         // ── Skip-unchanged check ───────────────────────────────────────────────
-        let existing =
-            state.storage.operational_store().get_ingested_file(&source_key);
+        let existing = state.storage.operational_store().get_ingested_file(&source_key);
         match existing {
             Ok(Some(record)) if record.content_hash == file.content_hash => {
                 file_results.push(IngestFileResult {
@@ -1183,12 +1377,12 @@ where
                 files_skipped += 1;
                 continue;
             }
-            Err(err) => {
+            Err(_) => {
                 file_results.push(IngestFileResult {
                     relative_path: file.relative_path.clone(),
                     status: "failed".to_owned(),
                     drawers_written: 0,
-                    error: Some(err.to_string()),
+                    error: Some("ingest metadata lookup failed".to_owned()),
                 });
                 files_failed += 1;
                 continue;
@@ -1235,8 +1429,8 @@ where
         for batch in texts.chunks(batch_size.max(1)) {
             let request = match EmbeddingRequest::new(batch.to_vec()) {
                 Ok(r) => r,
-                Err(err) => {
-                    embed_error = Some(err.to_string());
+                Err(_) => {
+                    embed_error = Some("embedding request is invalid".to_owned());
                     break;
                 }
             };
@@ -1248,8 +1442,8 @@ where
                 Ok(resp) => {
                     all_vectors.extend_from_slice(resp.vectors());
                 }
-                Err(err) => {
-                    embed_error = Some(err.to_string());
+                Err(_) => {
+                    embed_error = Some("embedding operation failed".to_owned());
                     break;
                 }
             }
@@ -1284,10 +1478,8 @@ where
             let embedding = match all_vectors.get(i) {
                 Some(v) => v.clone(),
                 None => {
-                    build_error = Some(format!(
-                        "chunk {}: no embedding vector returned",
-                        chunk.chunk_index
-                    ));
+                    build_error =
+                        Some(format!("chunk {}: no embedding vector returned", chunk.chunk_index));
                     break;
                 }
             };
@@ -1377,12 +1569,12 @@ where
                 files_ingested += 1;
                 total_drawers_written += n;
             }
-            Err(err) => {
+            Err(_) => {
                 file_results.push(IngestFileResult {
                     relative_path: file.relative_path.clone(),
                     status: "failed".to_owned(),
                     drawers_written: 0,
-                    error: Some(err.to_string()),
+                    error: Some("ingest storage operation failed".to_owned()),
                 });
                 files_failed += 1;
             }
@@ -1430,24 +1622,44 @@ fn is_diary_wing_or_room(wing: &str, room: &str) -> bool {
     wing == SHARED_AGENT_DIARY_WING || room == DIARY_ROOM
 }
 
+/// Reads a mapped checkout file only when the resolved path remains under the
+/// mapped checkout root.
+fn read_checkout_file_for_locator(root: &FsPath, relative_path: &str) -> Result<Vec<u8>, String> {
+    let root = root.canonicalize().map_err(|_| "checkout root is not readable".to_owned())?;
+    let path = root
+        .join(relative_path)
+        .canonicalize()
+        .map_err(|_| "checkout file is not readable".to_owned())?;
+    if !path.starts_with(&root) {
+        return Err("checkout file escapes configured root".to_owned());
+    }
+    std::fs::read(path).map_err(|_| "checkout file is not readable".to_owned())
+}
+
 /// Returns `Some(error)` when `relative_path` is not a safe repo-relative path
 /// for batch ingest. The path is later joined onto the server's checkout root
 /// during locator resolution, so absolute paths, drive letters, backslashes,
-/// `..` traversal, and `.git` access must all be rejected. The `.git` guard
-/// matters because a client could otherwise ingest `.git/config` (or a
-/// credentials file) and read it back through locator resolution.
+/// traversal, VCS metadata, and secret env files must all be rejected.
 fn invalid_ingest_relative_path(path: &str) -> Option<String> {
     if path.is_empty() {
         return Some("relative_path must not be empty".to_owned());
     }
     if path.starts_with('/') || path.contains('\\') || path.contains(':') {
-        return Some(format!(
-            "relative_path `{path}` must be a forward-slash repo-relative path"
-        ));
+        return Some(format!("relative_path `{path}` must be a forward-slash repo-relative path"));
     }
-    if path.split('/').any(|segment| segment == ".." || segment == ".git") {
+    if path.split('/').any(|segment| {
+        let lower = segment.to_ascii_lowercase();
+        segment.is_empty()
+            || segment == "."
+            || segment == ".."
+            || lower == ".git"
+            || lower == ".hg"
+            || lower == ".svn"
+            || lower == ".env"
+            || lower.starts_with(".env.")
+    }) {
         return Some(format!(
-            "relative_path `{path}` must not contain `..` or `.git` segments"
+            "relative_path `{path}` must not contain empty, traversal, VCS, or .env segments"
         ));
     }
     None
@@ -1474,11 +1686,7 @@ fn is_diary_change_event(event: &ChangeEvent) -> bool {
 
 /// Converts a storage `ChangeEvent` to the federation wire DTO.
 fn change_event_to_dto(event: ChangeEvent) -> Result<ChangeEventDto, ServerError> {
-    let details = event
-        .details_json
-        .as_deref()
-        .map(serde_json::from_str::<Value>)
-        .transpose()?;
+    let details = event.details_json.as_deref().map(serde_json::from_str::<Value>).transpose()?;
     Ok(ChangeEventDto {
         event_type: event.event_type,
         occurred_at: format_rfc3339(event.occurred_at)?,
@@ -1510,9 +1718,9 @@ fn decode_cursor(s: &str) -> Result<ChangeCursor, ServerError> {
             "invalid cursor timestamp `{ts_part}`; expected RFC 3339"
         ))
     })?;
-    let rowid = rowid_part.parse::<i64>().map_err(|_| {
-        ServerError::InvalidParams(format!("invalid cursor rowid `{rowid_part}`"))
-    })?;
+    let rowid = rowid_part
+        .parse::<i64>()
+        .map_err(|_| ServerError::InvalidParams(format!("invalid cursor rowid `{rowid_part}`")))?;
     Ok(ChangeCursor { occurred_at, rowid })
 }
 
@@ -1602,12 +1810,11 @@ where
         let mut search = state.search.lock().await;
         search.provider_mut().embed(&request)?
     };
-    let embedding =
-        response.vectors().first().cloned().ok_or_else(|| {
-            ServerError::Embeddings(mempalace_embeddings::EmbeddingError::ProviderContract(
-                "provider returned no vector for single-drawer ingest".to_owned(),
-            ))
-        })?;
+    let embedding = response.vectors().first().cloned().ok_or_else(|| {
+        ServerError::Embeddings(mempalace_embeddings::EmbeddingError::ProviderContract(
+            "provider returned no vector for single-drawer ingest".to_owned(),
+        ))
+    })?;
     Ok(DrawerRecord {
         id,
         wing,
@@ -1661,6 +1868,16 @@ fn format_date(date: Date) -> String {
         .unwrap_or_else(|_| date.to_string())
 }
 
+/// Validates a free-form KG field before it is passed to the graph store.
+fn validate_kg_field(name: &str, value: &str) -> Result<(), ServerError> {
+    if value.len() > MAX_KG_FIELD_BYTES {
+        return Err(ServerError::InvalidParams(format!(
+            "{name} must be at most {MAX_KG_FIELD_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
 /// Parses a `YYYY-MM-DD` date string.
 fn parse_date(s: &str) -> Result<Date, ServerError> {
     // Try RFC3339 first (take date part)
@@ -1702,8 +1919,7 @@ fn infer_entity_kind(name: &str) -> EntityKind {
         && tokens.iter().all(|token| {
             let mut chars = token.chars();
             let Some(first) = chars.next() else { return false };
-            first.is_ascii_uppercase()
-                && chars.all(|ch| ch.is_ascii_lowercase() || ch == '\'')
+            first.is_ascii_uppercase() && chars.all(|ch| ch.is_ascii_lowercase() || ch == '\'')
         })
     {
         return EntityKind::Person;
@@ -1736,6 +1952,23 @@ mod tests {
     const BOB_TOKEN: &str = "bob-secret-token";
     const BAD_TOKEN: &str = "bad-token-xyz";
 
+    fn restrict_token_file(path: &std::path::Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let metadata = std::fs::metadata(path).unwrap();
+            let mut permissions = metadata.permissions();
+            permissions.set_mode(if metadata.is_dir() { 0o700 } else { 0o600 });
+            std::fs::set_permissions(path, permissions).unwrap();
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+        }
+    }
+
     struct Harness {
         router: Router,
         _tempdir: TempDir,
@@ -1756,6 +1989,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+        restrict_token_file(&token_file);
 
         let config = MempalaceConfig {
             schema_version: 1,
@@ -1850,6 +2084,86 @@ mod tests {
         assert_eq!(body["federation_api_version"], 1u32);
     }
 
+    #[test]
+    fn token_registry_rejects_enabled_empty_token() {
+        let tempdir = TempDir::new().unwrap();
+        let token_file = tempdir.path().join("tokens.json");
+        std::fs::write(
+            &token_file,
+            serde_json::to_string(&serde_json::json!([
+                {"token": "", "name": "empty", "enabled": true},
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        restrict_token_file(&token_file);
+
+        let err = TokenRegistry::load(token_file).unwrap_err();
+        assert!(err.to_string().contains("must not be empty"), "{err}");
+    }
+
+    #[test]
+    fn token_reload_parse_error_fails_closed() {
+        let tempdir = TempDir::new().unwrap();
+        let token_file = tempdir.path().join("tokens.json");
+        std::fs::write(
+            &token_file,
+            serde_json::to_string(&serde_json::json!([
+                {"token": ALICE_TOKEN, "name": "alice", "enabled": true},
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        restrict_token_file(&token_file);
+        let registry = TokenRegistry::load(token_file.clone()).unwrap();
+        assert_eq!(registry.authenticate(ALICE_TOKEN).as_deref(), Some("alice"));
+        assert_eq!(registry.authenticate(""), None);
+
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(&token_file, "not valid json").unwrap();
+        assert_eq!(registry.authenticate(ALICE_TOKEN), None);
+    }
+
+    #[test]
+    fn token_reload_io_error_fails_closed_but_retries() {
+        let tempdir = TempDir::new().unwrap();
+        let token_file = tempdir.path().join("tokens.json");
+        std::fs::write(
+            &token_file,
+            serde_json::to_string(&serde_json::json!([
+                {"token": ALICE_TOKEN, "name": "alice", "enabled": true},
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        restrict_token_file(&token_file);
+        let registry = TokenRegistry::load(token_file.clone()).unwrap();
+        assert_eq!(registry.authenticate(ALICE_TOKEN).as_deref(), Some("alice"));
+
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::remove_file(&token_file).unwrap();
+        std::fs::create_dir(&token_file).unwrap();
+        restrict_token_file(&token_file);
+        assert_eq!(registry.authenticate(ALICE_TOKEN), None);
+        {
+            let guard = registry.inner.read().unwrap();
+            assert!(guard.entries.is_empty());
+            assert!(guard.mtime.is_none());
+        }
+
+        std::fs::remove_dir(&token_file).unwrap();
+        std::fs::write(
+            &token_file,
+            serde_json::to_string(&serde_json::json!([
+                {"token": ALICE_TOKEN, "name": "alice", "enabled": true},
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        restrict_token_file(&token_file);
+        assert_eq!(registry.authenticate(ALICE_TOKEN).as_deref(), Some("alice"));
+    }
+
     // ─── 3. Add + search + get ────────────────────────────────────────────────
 
     #[tokio::test]
@@ -1924,12 +2238,7 @@ mod tests {
         let first = harness
             .router
             .clone()
-            .oneshot(authed_json_request(
-                Method::POST,
-                "/v1/drawers",
-                ALICE_TOKEN,
-                payload.clone(),
-            ))
+            .oneshot(authed_json_request(Method::POST, "/v1/drawers", ALICE_TOKEN, payload.clone()))
             .await
             .unwrap();
         assert_eq!(first.status(), StatusCode::OK);
@@ -2242,6 +2551,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+        restrict_token_file(&token_file);
 
         let config = MempalaceConfig {
             schema_version: 1,
@@ -2308,12 +2618,7 @@ mod tests {
         let resp = harness
             .router
             .clone()
-            .oneshot(authed_json_request(
-                Method::POST,
-                "/v1/ingest/batch",
-                ALICE_TOKEN,
-                req,
-            ))
+            .oneshot(authed_json_request(Method::POST, "/v1/ingest/batch", ALICE_TOKEN, req))
             .await
             .unwrap();
 
@@ -2371,7 +2676,12 @@ mod tests {
         let resp1 = harness
             .router
             .clone()
-            .oneshot(authed_json_request(Method::POST, "/v1/ingest/batch", ALICE_TOKEN, req.clone()))
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/ingest/batch",
+                ALICE_TOKEN,
+                req.clone(),
+            ))
             .await
             .unwrap();
         assert_eq!(resp1.status(), StatusCode::OK);
@@ -2554,11 +2864,14 @@ mod tests {
             .method(Method::POST)
             .uri("/v1/ingest/batch")
             .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(serde_json::to_vec(&json!({
-                "wing": "wing_x",
-                "repo_id": "github.com/acme/r",
-                "files": []
-            })).unwrap()))
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "wing": "wing_x",
+                    "repo_id": "github.com/acme/r",
+                    "files": []
+                }))
+                .unwrap(),
+            ))
             .unwrap();
         let resp = harness.router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -2727,6 +3040,59 @@ mod tests {
         assert!(!stale, "locator should resolve non-stale with matching file hash");
     }
 
+    #[tokio::test]
+    async fn ingest_batch_checkout_mapped_rejects_file_hash_mismatch() {
+        use std::collections::BTreeMap;
+
+        let checkout_dir = TempDir::new().unwrap();
+        let rel_path = "src/secret.rs";
+        std::fs::create_dir_all(checkout_dir.path().join("src")).unwrap();
+        std::fs::write(checkout_dir.path().join(rel_path), b"server side secret bytes").unwrap();
+
+        let wing = "wing_checkout_mismatch";
+        let mut checkouts = BTreeMap::new();
+        checkouts.insert(wing.to_owned(), checkout_dir.path().to_path_buf());
+        let harness = make_harness_with_checkouts(checkouts).await;
+
+        let resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/ingest/batch",
+                ALICE_TOKEN,
+                json!({
+                    "wing": wing,
+                    "repo_id": "github.com/acme/checkout-test",
+                    "files": [
+                        {
+                            "relative_path": rel_path,
+                            "content_hash": "ch-secret-checkout",
+                            "file_hash": "deadbeef",
+                            "chunks": [
+                                {
+                                    "chunk_index": 0,
+                                    "room": "backend",
+                                    "text": "client supplied benign text",
+                                    "byte_start": 0,
+                                    "byte_end": 23,
+                                    "line_start": 1,
+                                    "line_end": 1
+                                }
+                            ]
+                        }
+                    ]
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["files"][0]["status"], "failed");
+        assert!(body["files"][0]["error"].as_str().unwrap().contains("file_hash does not match"));
+    }
+
     /// Unmapped wing: locator rows with empty resolve_root → search returns stale.
     #[tokio::test]
     async fn ingest_batch_unmapped_wing_produces_stale_and_warning() {
@@ -2815,6 +3181,8 @@ mod tests {
                          "chunks": [{"chunk_index": 0, "room": "general", "text": "x y z"}]},
                         {"relative_path": ".git/config", "content_hash": "c5",
                          "chunks": [{"chunk_index": 0, "room": "general", "text": "x y z"}]},
+                        {"relative_path": ".env", "content_hash": "c6",
+                         "chunks": [{"chunk_index": 0, "room": "general", "text": "x y z"}]},
                         {"relative_path": "src/ok.rs", "content_hash": "c4",
                          "chunks": [{"chunk_index": 0, "room": "general",
                                      "text": "perfectly safe path content"}]}
@@ -2830,7 +3198,8 @@ mod tests {
         assert_eq!(files[1]["status"], "failed");
         assert_eq!(files[2]["status"], "failed");
         assert_eq!(files[3]["status"], "failed", ".git path must be rejected");
-        assert_eq!(files[4]["status"], "ingested", "safe path must still ingest");
+        assert_eq!(files[4]["status"], "failed", ".env path must be rejected");
+        assert_eq!(files[5]["status"], "ingested", "safe path must still ingest");
     }
 
     /// Duplicate chunk_index within one file → per-file "failed".
@@ -2872,8 +3241,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp).await;
         let caps = body["capabilities"].as_array().unwrap();
-        let cap_strings: Vec<&str> =
-            caps.iter().filter_map(|v| v.as_str()).collect();
+        let cap_strings: Vec<&str> = caps.iter().filter_map(|v| v.as_str()).collect();
         assert!(cap_strings.contains(&"ingest"), "capabilities must include 'ingest'");
     }
 }

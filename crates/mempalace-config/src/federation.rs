@@ -223,6 +223,15 @@ pub(crate) fn resolve_federation_config(
                 ),
             });
         }
+        if url.starts_with("http://") && !is_loopback_http_url(&url) {
+            return Err(MempalaceError::ConfigParse {
+                path: config_path.to_path_buf(),
+                message: format!(
+                    "federation.remotes.{}.url `{url}` must use https:// unless it targets localhost or loopback",
+                    raw.name
+                ),
+            });
+        }
 
         let token = resolve_token(&raw.name, raw.token_env.as_deref(), raw.token, &env_lookup);
         let timeout =
@@ -340,6 +349,20 @@ fn infer_single_remote(
             ),
         }),
     }
+}
+
+/// Returns true when a plain-HTTP remote URL targets local development only.
+fn is_loopback_http_url(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("http://") else {
+        return false;
+    };
+    let authority = rest.split('/').next().unwrap_or_default();
+    let host = if let Some(stripped) = authority.strip_prefix('[') {
+        stripped.split(']').next().unwrap_or_default()
+    } else {
+        authority.split(':').next().unwrap_or_default()
+    };
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
 }
 
 /// Resolve the bearer token for a remote: env var wins over inline token.
@@ -817,6 +840,42 @@ mod tests {
         };
         let fed = resolve_federation_config(Some(section), config_path(), no_env()).unwrap();
         assert_eq!(fed.remotes["r"].token, None);
+    }
+
+    #[test]
+    fn remote_http_requires_loopback_host() {
+        let section = FederationConfigV1 {
+            remotes: vec![RemoteConfigV1 {
+                name: "r".to_owned(),
+                url: "http://example.com".to_owned(),
+                token: Some("tok".to_owned()),
+                token_env: None,
+                timeout_ms: None,
+            }],
+            default_mode: None,
+            wings: BTreeMap::new(),
+            kg: None,
+        };
+        let err = resolve_federation_config(Some(section), config_path(), no_env()).unwrap_err();
+        assert!(err.to_string().contains("must use https://"), "{err}");
+    }
+
+    #[test]
+    fn loopback_http_remote_is_allowed_for_local_dev() {
+        let section = FederationConfigV1 {
+            remotes: vec![RemoteConfigV1 {
+                name: "r".to_owned(),
+                url: "http://127.0.0.1:8765".to_owned(),
+                token: Some("tok".to_owned()),
+                token_env: None,
+                timeout_ms: None,
+            }],
+            default_mode: None,
+            wings: BTreeMap::new(),
+            kg: None,
+        };
+        let fed = resolve_federation_config(Some(section), config_path(), no_env()).unwrap();
+        assert_eq!(fed.remotes["r"].url, "http://127.0.0.1:8765");
     }
 
     // ── 7. timeout_ms absent → 5s default ────────────────────────────────────

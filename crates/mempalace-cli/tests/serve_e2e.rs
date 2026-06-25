@@ -15,6 +15,21 @@ use mempalace_server::{TokenRegistry, build_router};
 use tempfile::TempDir;
 
 const TEST_TOKEN: &str = "serve-e2e-secret-token";
+fn restrict_token_file(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o600);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+}
 
 /// Write a minimal token file and return the path.
 fn write_token_file(dir: &TempDir) -> PathBuf {
@@ -27,6 +42,7 @@ fn write_token_file(dir: &TempDir) -> PathBuf {
         .unwrap(),
     )
     .unwrap();
+    restrict_token_file(&path);
     path
 }
 

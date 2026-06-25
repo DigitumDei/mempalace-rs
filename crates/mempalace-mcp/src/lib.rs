@@ -2644,8 +2644,9 @@ mod tests {
         let stale_result =
             results.iter().find(|r| r["room"] == "stale").expect("stale locator row in results");
         assert_eq!(stale_result["stale"], json!(true));
-        // Best-effort text still resolves from the current (in-bounds) file bytes.
-        assert_eq!(stale_result["text"], "auth migration parity");
+        let stale_text = stale_result["text"].as_str().unwrap();
+        assert!(stale_text.contains("changed since mining"), "{stale_text}");
+        assert!(!stale_text.contains("auth migration parity"), "{stale_text}");
     }
 
     #[tokio::test]

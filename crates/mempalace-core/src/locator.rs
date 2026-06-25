@@ -46,14 +46,31 @@ pub struct ResolvedSnippet {
 ///
 /// * If the file is readable and its hash matches `locator.file_hash`, the byte
 ///   slice `byte_start..byte_end` is returned as-is (`stale: false`).
-/// * If the hash mismatches: `stale: true`; if the range is still in-bounds and
-///   valid UTF-8 the current bytes are returned, otherwise a placeholder.
+/// * If the hash mismatches: `stale: true` + placeholder. Returning current
+///   bytes on mismatch would let a stale or forged locator reveal unrelated
+///   server-side file contents.
 /// * If the file is missing or unreadable: `stale: true` + placeholder.
 pub fn resolve_locator(locator: &SourceLocator, source_file: &str) -> ResolvedSnippet {
-    let path = Path::new(&locator.resolve_root).join(source_file);
-    let bytes = std::fs::read(&path).ok();
+    let bytes = read_locator_file(&locator.resolve_root, source_file);
     let current_hash = bytes.as_deref().map(hash_bytes);
     resolve_from_bytes(locator, source_file, bytes.as_deref(), current_hash.as_deref())
+}
+
+/// Reads a locator target only when it stays within a configured resolve root.
+///
+/// Legacy or hostile rows may contain absolute paths, `..`, or symlink escapes.
+/// Canonicalising both paths keeps resolution defensive even if ingest-side path
+/// validation missed a row in the past.
+fn read_locator_file(resolve_root: &str, source_file: &str) -> Option<Vec<u8>> {
+    if resolve_root.trim().is_empty() {
+        return None;
+    }
+    let root = Path::new(resolve_root).canonicalize().ok()?;
+    let path = root.join(source_file).canonicalize().ok()?;
+    if !path.starts_with(&root) {
+        return None;
+    }
+    std::fs::read(path).ok()
 }
 
 /// Shared resolution core for [`resolve_locator`] and [`resolve_records`].
@@ -72,24 +89,22 @@ fn resolve_from_bytes(
         };
     };
 
-    // try_from instead of `as`: on 32-bit targets an offset beyond usize::MAX
-    // must fall through to the stale path, not silently truncate.
-    let start = usize::try_from(locator.byte_start).unwrap_or(usize::MAX);
-    let end = usize::try_from(locator.byte_end).unwrap_or(usize::MAX);
-    let slice_text =
-        bytes.get(start..end).and_then(|slice| std::str::from_utf8(slice).ok()).map(str::to_owned);
-
-    // Hash match — slice must be valid UTF-8 by construction; if bounds or UTF-8
-    // fail anyway (defensive, never panic), fall through to the stale path.
     if current_hash == Some(locator.file_hash.as_str()) {
+        // try_from instead of `as`: on 32-bit targets an offset beyond usize::MAX
+        // must fall through to the stale path, not silently truncate.
+        let start = usize::try_from(locator.byte_start).unwrap_or(usize::MAX);
+        let end = usize::try_from(locator.byte_end).unwrap_or(usize::MAX);
+        let slice_text = bytes
+            .get(start..end)
+            .and_then(|slice| std::str::from_utf8(slice).ok())
+            .map(str::to_owned);
         if let Some(text) = slice_text {
             return ResolvedSnippet { text, stale: false };
         }
     }
 
-    // Hash mismatch or defensive failure: best-effort current text, else placeholder.
-    let text = slice_text
-        .unwrap_or_else(|| format!("[stale] {source_file} changed since mining; re-run mine"));
+    // Hash mismatch or defensive failure: never return current bytes.
+    let text = format!("[stale] {source_file} changed since mining; re-run mine");
     ResolvedSnippet { text, stale: true }
 }
 
@@ -116,8 +131,7 @@ pub fn resolve_records(records: &mut [DrawerRecord]) -> Vec<bool> {
 
         let cache_key = (locator.resolve_root.clone(), record.source_file.clone());
         let cached = file_cache.entry(cache_key).or_insert_with(|| {
-            let path = Path::new(&locator.resolve_root).join(&record.source_file);
-            std::fs::read(&path).ok().map(|bytes| {
+            read_locator_file(&locator.resolve_root, &record.source_file).map(|bytes| {
                 let digest = hash_bytes(&bytes);
                 (bytes, digest)
             })
@@ -142,7 +156,7 @@ pub fn resolve_records(records: &mut [DrawerRecord]) -> Vec<bool> {
 mod tests {
     use std::io::Write as _;
 
-    use tempfile::NamedTempFile;
+    use tempfile::{NamedTempFile, TempDir};
     use time::macros::datetime;
 
     use super::*;
@@ -217,8 +231,8 @@ mod tests {
         let locator = make_locator(root, "deadbeef", 0, 5);
         let snippet = resolve_locator(&locator, name);
         assert!(snippet.stale);
-        // Best-effort: range is in-bounds and valid UTF-8
-        assert_eq!(snippet.text, "hello");
+        assert!(snippet.text.contains("changed since mining"));
+        assert!(!snippet.text.contains("hello"));
     }
 
     #[test]
@@ -227,6 +241,31 @@ mod tests {
         let snippet = resolve_locator(&locator, "ghost.txt");
         assert!(snippet.stale);
         assert!(snippet.text.contains("missing"));
+    }
+
+    #[test]
+    fn resolve_locator_empty_root_is_stale_placeholder() {
+        let hash = crate::hash::hash_bytes(b"hello world");
+        let locator = make_locator("", &hash, 0, 5);
+        let snippet = resolve_locator(&locator, "some/file.txt");
+        assert!(snippet.stale);
+        assert!(snippet.text.contains("missing"));
+        assert!(!snippet.text.contains("hello"));
+    }
+
+    #[test]
+    fn resolve_locator_rejects_path_escape_from_legacy_rows() {
+        let tempdir = TempDir::new().unwrap();
+        let root = tempdir.path().join("checkout");
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = tempdir.path().join("outside.txt");
+        std::fs::write(&outside, b"server secret bytes").unwrap();
+
+        let hash = crate::hash::hash_bytes(b"server secret bytes");
+        let locator = make_locator(root.to_str().unwrap(), &hash, 0, 19);
+        let snippet = resolve_locator(&locator, "../outside.txt");
+        assert!(snippet.stale);
+        assert!(!snippet.text.contains("server secret bytes"));
     }
 
     #[test]

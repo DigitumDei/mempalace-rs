@@ -336,7 +336,11 @@ impl TokenRegistry {
                     "failed to reload token file; disabled all tokens until reload succeeds: {err}"
                 );
                 guard.entries.clear();
-                guard.mtime = current_mtime;
+                if matches!(err, ServerError::TokenFile(_)) {
+                    guard.mtime = current_mtime;
+                } else {
+                    guard.mtime = None;
+                }
             }
         }
     }
@@ -2057,6 +2061,43 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(1100));
         std::fs::write(&token_file, "not valid json").unwrap();
         assert_eq!(registry.authenticate(ALICE_TOKEN), None);
+    }
+
+    #[test]
+    fn token_reload_io_error_fails_closed_but_retries() {
+        let tempdir = TempDir::new().unwrap();
+        let token_file = tempdir.path().join("tokens.json");
+        std::fs::write(
+            &token_file,
+            serde_json::to_string(&serde_json::json!([
+                {"token": ALICE_TOKEN, "name": "alice", "enabled": true},
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        let registry = TokenRegistry::load(token_file.clone()).unwrap();
+        assert_eq!(registry.authenticate(ALICE_TOKEN).as_deref(), Some("alice"));
+
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::remove_file(&token_file).unwrap();
+        std::fs::create_dir(&token_file).unwrap();
+        assert_eq!(registry.authenticate(ALICE_TOKEN), None);
+        {
+            let guard = registry.inner.read().unwrap();
+            assert!(guard.entries.is_empty());
+            assert!(guard.mtime.is_none());
+        }
+
+        std::fs::remove_dir(&token_file).unwrap();
+        std::fs::write(
+            &token_file,
+            serde_json::to_string(&serde_json::json!([
+                {"token": ALICE_TOKEN, "name": "alice", "enabled": true},
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(registry.authenticate(ALICE_TOKEN).as_deref(), Some("alice"));
     }
 
     // ─── 3. Add + search + get ────────────────────────────────────────────────

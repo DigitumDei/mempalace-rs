@@ -1956,8 +1956,9 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
 
-            let mut permissions = std::fs::metadata(path).unwrap().permissions();
-            permissions.set_mode(0o600);
+            let metadata = std::fs::metadata(path).unwrap();
+            let mut permissions = metadata.permissions();
+            permissions.set_mode(if metadata.is_dir() { 0o700 } else { 0o600 });
             std::fs::set_permissions(path, permissions).unwrap();
         }
 
@@ -2141,6 +2142,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(1100));
         std::fs::remove_file(&token_file).unwrap();
         std::fs::create_dir(&token_file).unwrap();
+        restrict_token_file(&token_file);
         assert_eq!(registry.authenticate(ALICE_TOKEN), None);
         {
             let guard = registry.inner.read().unwrap();

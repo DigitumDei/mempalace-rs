@@ -774,7 +774,7 @@ fn execute_remote_mine(
             return if dual_write {
                 Ok(CliOutput::success(format!("  Remote replication: failed — {msg}")))
             } else {
-                Err(clap::Error::raw(clap::error::ErrorKind::Io, msg))
+                Ok(CliOutput::failure(1, msg))
             };
         }
     };
@@ -798,7 +798,7 @@ fn execute_remote_mine(
                 return if dual_write {
                     Ok(CliOutput::success(output))
                 } else {
-                    Err(clap::Error::raw(clap::error::ErrorKind::Io, output))
+                    Ok(CliOutput::failure(1, output))
                 };
             }
         };
@@ -862,7 +862,7 @@ fn execute_remote_mine(
             return if dual_write {
                 Ok(CliOutput::success(output))
             } else {
-                Err(clap::Error::raw(clap::error::ErrorKind::Io, output))
+                Ok(CliOutput::failure(1, output))
             };
         }
     };
@@ -894,7 +894,7 @@ fn execute_remote_mine(
             return if dual_write {
                 Ok(CliOutput::success(output))
             } else {
-                Err(clap::Error::raw(clap::error::ErrorKind::Io, output))
+                Ok(CliOutput::failure(1, output))
             };
         }
     };
@@ -920,7 +920,7 @@ fn execute_remote_mine(
         return if dual_write {
             Ok(CliOutput::success(msg))
         } else {
-            Err(clap::Error::raw(clap::error::ErrorKind::Io, msg))
+            Ok(CliOutput::failure(1, msg))
         };
     }
 
@@ -973,7 +973,7 @@ fn execute_remote_mine(
                     return if dual_write {
                         Ok(CliOutput::success(output))
                     } else {
-                        Err(clap::Error::raw(clap::error::ErrorKind::Io, output))
+                        Ok(CliOutput::failure(1, output))
                     };
                 }
             };
@@ -2871,25 +2871,14 @@ mod tests {
             stub_provider,
         );
 
-        // Should fail (either Err or exit_code != 0) and the message must say
-        // the remote is unreachable with no local fallback.
-        match result {
-            Err(error) => {
-                let msg = error.to_string();
-                assert!(
-                    msg.contains("unreachable") && msg.contains("local"),
-                    "error should mention unreachable and no local fallback: {msg}"
-                );
-            }
-            Ok(output) => {
-                assert_ne!(output.exit_code, 0, "should fail when remote unreachable");
-                assert!(
-                    output.stderr.contains("unreachable") && output.stderr.contains("local"),
-                    "error should mention unreachable and no local fallback: {}",
-                    output.stderr
-                );
-            }
-        }
+        // Should fail through legacy CliOutput path with exit code 1.
+        let output = result.expect("remote-only must return Ok(CliOutput), not Err");
+        assert_eq!(output.exit_code, 1, "remote-only must exit code 1: {output:?}");
+        assert!(
+            output.stderr.contains("unreachable") && output.stderr.contains("local"),
+            "error should mention unreachable and no local fallback: {}",
+            output.stderr
+        );
 
         remove_dir_all_if_exists(&config_root);
     }
@@ -3048,23 +3037,14 @@ mod tests {
             stub_provider,
         );
 
-        match result {
-            Err(error) => {
-                let msg = error.to_string();
-                assert!(
-                    msg.contains("unreachable") && msg.contains("local"),
-                    "legacy error should mention unreachable and no fallback: {msg}"
-                );
-            }
-            Ok(output) => {
-                assert_ne!(output.exit_code, 0, "legacy remote-only must fail: {:?}", output);
-                assert!(
-                    output.stderr.contains("unreachable") && output.stderr.contains("local"),
-                    "legacy error should mention unreachable and no fallback: {}",
-                    output.stderr
-                );
-            }
-        }
+        // Must fail through legacy CliOutput path with exit code 1.
+        let output = result.expect("legacy remote-only must return Ok(CliOutput), not Err");
+        assert_eq!(output.exit_code, 1, "legacy remote-only must exit code 1: {output:?}");
+        assert!(
+            output.stderr.contains("unreachable") && output.stderr.contains("local"),
+            "legacy error should mention unreachable and no fallback: {}",
+            output.stderr
+        );
 
         remove_dir_all_if_exists(&config_root);
     }

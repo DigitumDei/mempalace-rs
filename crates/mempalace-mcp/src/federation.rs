@@ -123,6 +123,25 @@ impl FederationRouter {
         resolve_kg_route(&self.rules)
     }
 
+    /// Returns `true` when the resolved route indicates a dual-write
+    /// (`write: both` — local write + best-effort remote replication).
+    pub fn is_dual_write(&self, route: &ResolvedRouteRule) -> bool {
+        route.mode == RouteMode::Combined && route.write == WriteTarget::Both
+    }
+
+    /// Resolves the effective write intent from a route rule.
+    ///
+    /// - `Local` mode or `Combined + write:local` → `WriteTarget::Local`
+    /// - `Remote` mode or `Combined + write:remote` → `WriteTarget::Remote`
+    /// - `Combined + write:both` → `WriteTarget::Both`
+    pub fn resolve_write_target(&self, route: &ResolvedRouteRule) -> WriteTarget {
+        match route.mode {
+            RouteMode::Local => WriteTarget::Local,
+            RouteMode::Remote => WriteTarget::Remote,
+            RouteMode::Combined => route.write,
+        }
+    }
+
     fn remote_for_rule(&self, rule: &ResolvedRouteRule) -> Option<&Arc<dyn RemoteApi>> {
         rule.remote.as_ref().and_then(|name| self.remotes.get(name))
     }
@@ -304,6 +323,13 @@ impl FederationRouter {
     /// Route an add-drawer operation. Returns `None` when the caller should
     /// execute locally; `Some(remote_result)` when routed to a remote.
     ///
+    /// Callers MUST filter `write:both` routes before calling this method
+    /// (use [`Self::is_dual_write`] to check). This method handles:
+    /// - `Local` mode → returns `None`
+    /// - `Remote` mode → sends the add to the configured remote
+    /// - `Combined + write:remote` → sends the add to the configured remote
+    /// - `Combined + write:both` → returns `None` (defensive; callers should skip)
+    ///
     /// Pre-add duplicate check is performed before posting the add request; if
     /// the duplicate check itself fails (transport error) a warning is emitted
     /// and the add proceeds (the server re-checks anyway).
@@ -317,14 +343,17 @@ impl FederationRouter {
         route: &ResolvedRouteRule,
         duplicate_threshold: f32,
     ) -> ToolResult<Option<Value>> {
+        // ── Resolve the target remote for remote-only writes ───────────────
+        // Dual-write (Both) routes are handled by add_drawer_replicate and
+        // should not reach this method. We keep Both as a defensive arm.
         let target_remote = match route.mode {
             RouteMode::Local => None,
             RouteMode::Remote => route.remote.as_deref(),
             RouteMode::Combined => match route.write {
-                // Both: caller handles replication after local write via
-                // add_drawer_replicate. Skip remote work here.
-                WriteTarget::Local | WriteTarget::Both => None,
+                WriteTarget::Local => None,
                 WriteTarget::Remote => route.remote.as_deref(),
+                // Defensive: caller should have filtered Both via is_dual_write.
+                WriteTarget::Both => None,
             }
         };
         let Some(remote_name) = target_remote else {
@@ -412,6 +441,10 @@ impl FederationRouter {
     /// returns [`ReplicationStatus::Failed`].  On success returns
     /// [`ReplicationStatus::Replicated`].  Never blocks the caller from the
     /// local write path.
+    ///
+    /// **Diary guard:** Diary-shaped drawers (`wing == SHARED_AGENT_DIARY_WING`
+    /// or `room == DIARY_ROOM`) are never replicated remotely — returns
+    /// [`ReplicationStatus::Skipped`] immediately.
     pub async fn add_drawer_replicate(
         &self,
         wing: &str,
@@ -422,6 +455,11 @@ impl FederationRouter {
         route: &ResolvedRouteRule,
         duplicate_threshold: f32,
     ) -> ReplicationStatus {
+        // ── Diary guard: diary-shaped drawers never replicate ──────────────
+        if wing == SHARED_AGENT_DIARY_WING || room == DIARY_ROOM {
+            return ReplicationStatus::Skipped;
+        }
+
         let remote_name = match &route.write {
             WriteTarget::Both => route.remote.as_deref(),
             _ => return ReplicationStatus::Skipped,
@@ -955,13 +993,17 @@ impl FederationRouter {
         valid_from: Option<&str>,
         route: &ResolvedRouteRule,
     ) -> ToolResult<Option<Value>> {
+        // ── Resolve the target remote for remote-only writes ───────────────
+        // Dual-write (Both) routes are handled by kg_add_replicate and
+        // should not reach this method. We keep Both as a defensive arm.
         let target_remote = match route.mode {
             RouteMode::Local => None,
             RouteMode::Remote => route.remote.as_deref(),
             RouteMode::Combined => match route.write {
-                // Both: caller handles replication via kg_add_replicate.
-                WriteTarget::Local | WriteTarget::Both => None,
+                WriteTarget::Local => None,
                 WriteTarget::Remote => route.remote.as_deref(),
+                // Defensive: caller should have filtered Both via is_dual_write.
+                WriteTarget::Both => None,
             }
         };
         let Some(remote_name) = target_remote else {
@@ -1058,13 +1100,17 @@ impl FederationRouter {
         ended: Option<&str>,
         route: &ResolvedRouteRule,
     ) -> ToolResult<Option<Value>> {
+        // ── Resolve the target remote for remote-only writes ───────────────
+        // Dual-write (Both) routes are handled by kg_invalidate_replicate and
+        // should not reach this method. We keep Both as a defensive arm.
         let target_remote = match route.mode {
             RouteMode::Local => None,
             RouteMode::Remote => route.remote.as_deref(),
             RouteMode::Combined => match route.write {
-                // Both: caller handles replication via kg_invalidate_replicate.
-                WriteTarget::Local | WriteTarget::Both => None,
+                WriteTarget::Local => None,
                 WriteTarget::Remote => route.remote.as_deref(),
+                // Defensive: caller should have filtered Both via is_dual_write.
+                WriteTarget::Both => None,
             }
         };
         let Some(remote_name) = target_remote else {
@@ -2116,6 +2162,75 @@ mod tests {
             .await;
 
         assert_eq!(status, ReplicationStatus::Skipped);
+    }
+
+    #[tokio::test]
+    async fn e2e_add_drawer_replicate_skipped_for_diary_wing() {
+        let mock = MockRemote::default();
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+
+        let route = make_both_route("alpha");
+        let status = router
+            .add_drawer_replicate(
+                SHARED_AGENT_DIARY_WING, "r", "diary content", "diary:general", "agent",
+                &route, 0.9,
+            )
+            .await;
+
+        assert_eq!(
+            status,
+            ReplicationStatus::Skipped,
+            "diary wing should not replicate"
+        );
+    }
+
+    #[tokio::test]
+    async fn e2e_add_drawer_replicate_skipped_for_diary_room() {
+        let mock = MockRemote::default();
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+
+        let route = make_both_route("alpha");
+        let status = router
+            .add_drawer_replicate(
+                "wing_code", DIARY_ROOM, "diary content", "diary:general", "agent",
+                &route, 0.9,
+            )
+            .await;
+
+        assert_eq!(
+            status,
+            ReplicationStatus::Skipped,
+            "diary room should not replicate"
+        );
+    }
+
+    #[tokio::test]
+    async fn e2e_add_drawer_replicate_succeeds_with_real_route_via_write_intent() {
+        let mock = MockRemote::default();
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+
+        // Verify that is_dual_write correctly identifies both routes.
+        let both_route = make_both_route("alpha");
+        assert!(router.is_dual_write(&both_route));
+
+        // Verify resolve_write_target returns the expected variants.
+        let remote_route = make_combined_route("alpha");
+        assert_eq!(router.resolve_write_target(&remote_route), WriteTarget::Remote);
+
+        let local_route = ResolvedRouteRule {
+            mode: RouteMode::Local,
+            remote: None,
+            write: WriteTarget::Local,
+        };
+        assert_eq!(router.resolve_write_target(&local_route), WriteTarget::Local);
+
+        assert_eq!(router.resolve_write_target(&both_route), WriteTarget::Both);
     }
 
     #[tokio::test]

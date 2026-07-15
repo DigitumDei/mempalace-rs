@@ -1125,7 +1125,7 @@ where
                 Some(room.as_str()),
                 if source_file.is_empty() { None } else { Some(source_file.as_str()) },
             );
-            route.mode == RouteMode::Combined && route.write == WriteTarget::Both
+            router.is_dual_write(&route)
         });
 
         if let Some(router) = &self.federation {
@@ -1504,7 +1504,7 @@ where
         // ── Federation path ──
         let is_both = self.federation.as_ref().is_some_and(|router| {
             let route = router.resolve_kg_route();
-            route.mode == RouteMode::Combined && route.write == WriteTarget::Both
+            router.is_dual_write(&route)
         });
 
         if let Some(router) = &self.federation {
@@ -1613,7 +1613,7 @@ where
         // ── Federation path ──
         let is_both = self.federation.as_ref().is_some_and(|router| {
             let route = router.resolve_kg_route();
-            route.mode == RouteMode::Combined && route.write == WriteTarget::Both
+            router.is_dual_write(&route)
         });
 
         if let Some(router) = &self.federation {

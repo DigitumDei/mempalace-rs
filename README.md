@@ -10,15 +10,30 @@ MemPalace stores conversation and project context locally so your AI can search 
 
 ## Quick start
 
+Install the latest nightly build — downloads the binaries for your platform, verifies checksums, installs to `~/.mempalace/bin`, adds it to your PATH, and registers the MCP server with detected AI tools (Claude Code, Codex, Gemini, and more):
+
+**macOS (Apple Silicon) / Linux (x86_64, glibc 2.38+):**
+
 ```bash
-cargo build --release -p mempalace-cli -p mempalace-mcp
-./target/release/mempalace-cli init /path/to/project
-./target/release/mempalace-cli mine /path/to/project
+curl -fsSL https://raw.githubusercontent.com/DigitumDei/mempalace-rs/main/install.sh | sh
 ```
 
-Then point your MCP client at `./target/release/mempalace-mcp`.
+**Windows (x86_64):**
 
-See the [Quickstart guide](docs/Quickstart.md) for the full walkthrough — building, initializing, mining, searching, and connecting to Claude/Cursor/Cline.
+```powershell
+irm https://raw.githubusercontent.com/DigitumDei/mempalace-rs/main/install.ps1 | iex
+```
+
+Then create and fill a palace for a project:
+
+```bash
+mempalace-cli init /path/to/project
+mempalace-cli mine /path/to/project
+```
+
+Nightlies are rolling builds from `main`; re-run the installer to update. Other platforms (Intel macOS, ARM Linux, musl) need a [source build](docs/Quickstart.md#1b-build-from-source-alternative).
+
+See the [Quickstart guide](docs/Quickstart.md) for the full walkthrough — installing, initializing, mining, searching, and connecting to Claude/Cursor/Cline.
 
 ## Overview
 
@@ -54,6 +69,8 @@ MemPalace provides a palace-style memory store with:
 | `mempalace-remote` | Federation HTTP client (RemoteApi trait + RemoteClient) |
 
 ## Requirements
+
+These apply only when building from source — the prebuilt nightly install above needs none of them (including the corporate-SSL configuration below).
 
 - Rust 1.88+
 - `protobuf-compiler` (for storage layer)

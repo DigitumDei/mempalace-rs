@@ -729,6 +729,23 @@ async fn remote_down_degrades_reads() {
         kg_warnings.is_some() && !kg_warnings.unwrap().is_empty(),
         "kg_query with dead remote must include warnings: {kg_query}"
     );
+
+    // ── Local delete_drawer must report applied_to=local ─────────────────────
+    let local_delete = call_tool(
+        &server,
+        6,
+        "mempalace_delete_drawer",
+        json!({"drawer_id": local_add["drawer_id"]}),
+    )
+    .await;
+    assert_eq!(
+        local_delete["success"], true,
+        "local delete must succeed: {local_delete}"
+    );
+    assert_eq!(
+        local_delete["applied_to"], "local",
+        "local delete must report applied_to=local: {local_delete}"
+    );
 }
 
 // ─── Test 5: diary_room_never_routes_remote ───────────────────────────────────

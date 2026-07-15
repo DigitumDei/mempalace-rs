@@ -1281,7 +1281,13 @@ where
             actor: None,
             details_json: None,
         });
-        Ok(json!({ "success": true, "drawer_id": drawer_id }))
+        let mut result = json!({ "success": true, "drawer_id": drawer_id });
+        if self.federation.is_some() {
+            if let Some(obj) = result.as_object_mut() {
+                obj.insert("applied_to".to_owned(), json!("local"));
+            }
+        }
+        Ok(result)
     }
 
     async fn tool_diary_write(&mut self, arguments: &Value) -> ToolResult<Value> {

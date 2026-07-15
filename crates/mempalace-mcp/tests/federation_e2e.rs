@@ -1762,8 +1762,8 @@ async fn add_drawer_both_replication_fails_with_remote_rejection() {
 // ─── Test 23: add_drawer_both_duplicate_replication ─────────────────────────
 
 /// The content already exists on the hub (seeded via a Remote route).
-/// A subsequent Both write for the same content must succeed locally but
-/// report replication as failed with reason "duplicate exists on remote".
+/// A subsequent Both write for the same exact content must succeed locally but
+/// report replication as converged (exact content already on remote).
 #[tokio::test]
 async fn add_drawer_both_duplicate_replication() {
     let hub_dir = TempDir::new().unwrap();
@@ -1829,35 +1829,28 @@ async fn add_drawer_both_duplicate_replication() {
     )
     .await;
 
-    // Local write must succeed despite replication failure.
+    // Local write must succeed.
     assert_eq!(dup["success"], true, "both add with duplicate content must succeed locally: {dup}");
     assert_eq!(
         dup["applied_to"], "local",
         "both add must report applied_to=local: {dup}"
     );
 
-    // Replication must be failed due to duplicate on hub.
+    // Replication must be converged (exact same content already on hub).
     let replication = dup.get("replication").expect("both add must include replication field");
     assert_eq!(
-        replication["status"], "failed",
-        "replication must report status=failed for duplicate content; got: {replication}"
+        replication["status"], "converged",
+        "replication must report status=converged for exact duplicate content; got: {replication}"
     );
     assert_eq!(
         replication["remote"], "hub",
         "replication must report remote=hub; got: {replication}"
     );
-    // The reason should mention the duplicate.
-    let reason = replication["reason"].as_str().unwrap_or("");
-    assert!(
-        reason.contains("duplicate"),
-        "replication failure reason must mention 'duplicate'; got: {reason}"
-    );
 
-    // Warnings must be present.
-    let warnings = dup.get("warnings").and_then(|w| w.as_array());
+    // No warnings for converged replication.
     assert!(
-        warnings.is_some() && !warnings.unwrap().is_empty(),
-        "both add with duplicate replication must include warnings array; got: {dup}"
+        dup.get("warnings").is_none(),
+        "converged replication must not produce warnings; got: {dup}"
     );
 }
 

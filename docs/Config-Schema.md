@@ -349,9 +349,14 @@ diary-local writes omit the field entirely. The shape is a tagged union:
 { "status": "failed", "remote": "work", "reason": "transport failure: timeout" }
 ```
 
+```json
+{ "status": "converged", "remote": "work" }
+```
+
 | Variant | Meaning |
 |---|---|
 | `replicated` | Best-effort remote write to the named remote succeeded. |
+| `converged` | Exact content already exists on the named remote; state is converged. |
 | `failed` | Best-effort remote write failed; `reason` contains a human-readable description. The local write was unaffected. |
 
 The `replication` field is absent when federation is not configured, the route

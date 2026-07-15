@@ -6,7 +6,7 @@ use mempalace_config::{
     FederationRuntimeConfig, ReplicationStatus, ResolvedRouteRule, RouteMode, WriteTarget,
     resolve_kg_route, resolve_route, RouteQuery,
 };
-use mempalace_core::{DIARY_ROOM, DIARY_TOPIC_PREFIX, SHARED_AGENT_DIARY_WING};
+use mempalace_core::{hash_text, DIARY_ROOM, DIARY_TOPIC_PREFIX, SHARED_AGENT_DIARY_WING};
 use mempalace_federation::{
     AddDrawerRequest, ChangesQuery, DrawerSearchRequest, RemoteDrawerResult,
 };
@@ -506,6 +506,25 @@ impl FederationRouter {
         };
         match api.check_duplicate(pre_check_req).await {
             Ok(resp) if resp.is_duplicate => {
+                let content_hash = hash_text(content);
+                let is_exact_match = resp.matches.as_array().map_or(false, |arr| {
+                    arr.iter().any(|m| {
+                        m.get("content_hash")
+                            .and_then(|v| v.as_str())
+                            .map_or(false, |h| h == content_hash)
+                    })
+                });
+
+                if is_exact_match {
+                    tracing::info!(
+                        remote = %remote_name,
+                        wing = %wing,
+                        room = %room,
+                        "add_drawer replicate: exact content already exists remotely; converged"
+                    );
+                    return ReplicationStatus::Converged { remote: remote_name.to_owned() };
+                }
+
                 tracing::warn!(
                     remote = %remote_name,
                     wing = %wing,
@@ -2147,8 +2166,30 @@ mod tests {
             ReplicationStatus::Failed { remote, .. } => {
                 assert_eq!(remote, "alpha");
             }
-            other => panic!("expected Failed, got {other:?}"),
+            other => panic!("expected Failed (similarity-only), got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn e2e_add_drawer_replicate_converged_exact_match() {
+        let content = "exact match content";
+        let content_hash = hash_text(content);
+        let mut mock = MockRemote::default();
+        mock.duplicate_matches = vec![json!({
+            "drawer_id": "exact-1",
+            "similarity": 1.0,
+            "content_hash": content_hash,
+        })];
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+
+        let route = make_both_route("alpha");
+        let status = router
+            .add_drawer_replicate("w", "r", content, "file.txt", "agent", &route, 0.9)
+            .await;
+
+        assert_eq!(status, ReplicationStatus::Converged { remote: "alpha".to_owned() });
     }
 
     #[tokio::test]

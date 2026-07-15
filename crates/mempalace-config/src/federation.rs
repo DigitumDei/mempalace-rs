@@ -85,6 +85,11 @@ pub enum ReplicationStatus {
         /// Remote that received the replication.
         remote: String,
     },
+    /// Remote already has exact same content; state is converged.
+    Converged {
+        /// Remote that already has the content.
+        remote: String,
+    },
     /// Best-effort replication to the remote failed.
     Failed {
         /// Remote that was targeted.
@@ -969,6 +974,11 @@ mod tests {
         // Replicated
         let val = serde_json::to_value(ReplicationStatus::Replicated { remote: "hub".to_owned() }).unwrap();
         assert_eq!(val["status"], "replicated");
+        assert_eq!(val["remote"], "hub");
+
+        // Converged
+        let val = serde_json::to_value(ReplicationStatus::Converged { remote: "hub".to_owned() }).unwrap();
+        assert_eq!(val["status"], "converged");
         assert_eq!(val["remote"], "hub");
 
         // Failed

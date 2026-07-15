@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use blake3::Hasher;
-use mempalace_config::{ConfigLoader, MempalaceConfig, RouteMode, WriteTarget};
+use mempalace_config::{ConfigLoader, MempalaceConfig, ReplicationStatus, RouteMode, WriteTarget};
 use mempalace_core::{
     DIARY_HALL, DIARY_ROOM, DIARY_TOPIC_PREFIX, DrawerId, DrawerRecord, EmbeddingProfile, RoomId,
     SHARED_AGENT_DIARY_WING, SearchQuery, WingId,
@@ -1118,38 +1118,37 @@ where
         let source_file = optional_string(arguments, "source_file")?.unwrap_or_default();
         let added_by = optional_string(arguments, "added_by")?.unwrap_or_else(|| "mcp".to_owned());
 
-        // ── Federation path ──
-        let is_both = self.federation.as_ref().is_some_and(|router| {
-            let route = router.resolve_drawer_route(
+        // ── Resolve federation route once, reuse for dual-write decisions ──
+        let route = self.federation.as_ref().map(|router| {
+            router.resolve_drawer_route(
                 Some(wing.as_str()),
                 Some(room.as_str()),
                 if source_file.is_empty() { None } else { Some(source_file.as_str()) },
-            );
-            router.is_dual_write(&route)
+            )
         });
+        let is_both = match (&self.federation, &route) {
+            (Some(router), Some(route)) => router.is_dual_write(route),
+            _ => false,
+        };
 
-        if let Some(router) = &self.federation {
-            let route = router.resolve_drawer_route(
-                Some(wing.as_str()),
-                Some(room.as_str()),
-                if source_file.is_empty() { None } else { Some(source_file.as_str()) },
-            );
-
-            if !is_both {
-                if let Some(remote_resp) = router
-                    .add_drawer_remote(
-                        wing.as_str(),
-                        room.as_str(),
-                        &content,
-                        &source_file,
-                        &added_by,
-                        &route,
-                        DEFAULT_DUPLICATE_THRESHOLD,
-                    )
-                    .await?
-                {
-                    // Remote handled the add — no local change-log entry needed.
-                    return Ok(remote_resp);
+        // ── Non-Both federation: remote-only or local-only ──
+        if !is_both {
+            if let Some(router) = &self.federation {
+                if let Some(route) = &route {
+                    if let Some(remote_resp) = router
+                        .add_drawer_remote(
+                            wing.as_str(),
+                            room.as_str(),
+                            &content,
+                            &source_file,
+                            &added_by,
+                            route,
+                            DEFAULT_DUPLICATE_THRESHOLD,
+                        )
+                        .await?
+                    {
+                        return Ok(remote_resp);
+                    }
                 }
             }
         }
@@ -1208,27 +1207,30 @@ where
             "room": room,
         });
 
-        // ── Both-mode replication after local write ──
+        // ── Both-mode: best-effort remote replication after local write ──
         if is_both {
             if let Some(router) = &self.federation {
-                let route = router.resolve_drawer_route(
-                    Some(result["wing"].as_str().unwrap_or("")),
-                    Some(result["room"].as_str().unwrap_or("")),
-                    if source_file.is_empty() { None } else { Some(source_file.as_str()) },
-                );
-                let replication = router
-                    .add_drawer_replicate(
-                        result["wing"].as_str().unwrap_or(""),
-                        result["room"].as_str().unwrap_or(""),
-                        &content_clone,
-                        &source_file,
-                        &added_by,
-                        &route,
-                        DEFAULT_DUPLICATE_THRESHOLD,
-                    )
-                    .await;
-                if let Some(obj) = result.as_object_mut() {
-                    obj.insert("replication".to_owned(), json!(replication));
+                if let Some(route) = &route {
+                    let replication = router
+                        .add_drawer_replicate(
+                            wing.as_str(),
+                            room.as_str(),
+                            &content_clone,
+                            &source_file,
+                            &added_by,
+                            route,
+                            DEFAULT_DUPLICATE_THRESHOLD,
+                        )
+                        .await;
+                    if let Some(obj) = result.as_object_mut() {
+                        obj.insert("replication".to_owned(), json!(replication));
+                        if matches!(replication, ReplicationStatus::Failed { .. }) {
+                            obj.insert(
+                                "warning".to_owned(),
+                                json!("local write succeeded but remote replication failed"),
+                            );
+                        }
+                    }
                 }
             }
         }

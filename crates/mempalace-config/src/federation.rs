@@ -1427,4 +1427,144 @@ mod tests {
         assert_eq!(result.remote.as_deref(), Some("work"));
         assert_eq!(result.write, WriteTarget::Both);
     }
+
+    // ── 12. Full config JSON with write:"both" parses and resolves ─────────────
+    #[test]
+    fn full_config_parses_write_both_wing_and_kg() {
+        let json = r#"{
+            "federation": {
+                "remotes": [
+                    { "name": "hub", "url": "https://palace.example" }
+                ],
+                "default_mode": "local",
+                "wings": {
+                    "wing_team": { "mode": "combined", "remote": "hub", "write": "both" }
+                },
+                "kg": { "mode": "combined", "remote": "hub", "write": "both" }
+            }
+        }"#;
+
+        let file: crate::config::ConfigFileV1 = serde_json::from_str(json).unwrap();
+        let fed = resolve_federation_config(file.federation, config_path(), no_env()).unwrap();
+
+        // Wing rule preserves write:both
+        let wing = fed.wings.get("wing_team").unwrap();
+        assert_eq!(wing.mode, RouteMode::Combined);
+        assert_eq!(wing.remote.as_deref(), Some("hub"));
+        assert_eq!(wing.write, WriteTarget::Both);
+
+        // KG rule preserves write:both
+        let kg = fed.kg.as_ref().unwrap();
+        assert_eq!(kg.mode, RouteMode::Combined);
+        assert_eq!(kg.remote.as_deref(), Some("hub"));
+        assert_eq!(kg.write, WriteTarget::Both);
+
+        // Default mode unchanged
+        assert_eq!(fed.default_mode, RouteMode::Local);
+        assert_eq!(fed.default_remote, None);
+    }
+
+    // ── 13. write:"both" on non-combined mode falls back to Local ──────────────
+    #[test]
+    fn write_both_on_local_mode_falls_back_to_local() {
+        let section = FederationConfigV1 {
+            remotes: vec![],
+            default_mode: None,
+            wings: {
+                let mut m = BTreeMap::new();
+                m.insert(
+                    "wing_local".to_owned(),
+                    RouteRuleV1 {
+                        mode: RouteMode::Local,
+                        remote: None,
+                        write: Some(WriteTarget::Both),
+                    },
+                );
+                m
+            },
+            kg: None,
+        };
+        let fed = resolve_federation_config(Some(section), config_path(), no_env()).unwrap();
+        let rule = fed.wings.get("wing_local").unwrap();
+        assert_eq!(rule.mode, RouteMode::Local);
+        assert_eq!(rule.remote, None);
+        assert_eq!(rule.write, WriteTarget::Local);
+    }
+
+    #[test]
+    fn write_both_on_remote_mode_falls_back_to_local() {
+        let section = FederationConfigV1 {
+            remotes: vec![RemoteConfigV1 {
+                name: "hub".to_owned(),
+                url: "https://palace.example".to_owned(),
+                token: None,
+                token_env: None,
+                timeout_ms: None,
+            }],
+            default_mode: None,
+            wings: {
+                let mut m = BTreeMap::new();
+                m.insert(
+                    "wing_remote".to_owned(),
+                    RouteRuleV1 {
+                        mode: RouteMode::Remote,
+                        remote: Some("hub".to_owned()),
+                        write: Some(WriteTarget::Both),
+                    },
+                );
+                m
+            },
+            kg: None,
+        };
+        let fed = resolve_federation_config(Some(section), config_path(), no_env()).unwrap();
+        let rule = fed.wings.get("wing_remote").unwrap();
+        assert_eq!(rule.mode, RouteMode::Remote);
+        assert_eq!(rule.remote.as_deref(), Some("hub"));
+        // write must fall back to Local because mode is not Combined
+        assert_eq!(rule.write, WriteTarget::Local);
+    }
+
+    // ── 14. Project YAML with write:"both" ─────────────────────────────────────
+    #[test]
+    fn project_yaml_with_write_both_parses() {
+        let yaml = "wing: project_gamma\nrouting:\n  mode: combined\n  remote: hub\n  write: both\n";
+        let config: crate::config::ProjectConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.wing, "project_gamma");
+        let routing = config.routing.unwrap();
+        assert_eq!(routing.mode, RouteMode::Combined);
+        assert_eq!(routing.remote.as_deref(), Some("hub"));
+        assert_eq!(routing.write, Some(WriteTarget::Both));
+    }
+
+    // ── 15. resolve_kg_route: write:both KG wins over default_mode Remote ──────
+    #[test]
+    fn resolve_kg_route_both_wins_over_default_remote() {
+        let fed = {
+            let mut remotes = BTreeMap::new();
+            remotes.insert(
+                "hub".to_owned(),
+                ResolvedRemote {
+                    name: "hub".to_owned(),
+                    url: "https://palace.example".to_owned(),
+                    token: None,
+                    timeout: Duration::from_secs(5),
+                },
+            );
+            FederationRuntimeConfig {
+                remotes,
+                default_mode: RouteMode::Remote,
+                default_remote: Some("hub".to_owned()),
+                wings: BTreeMap::new(),
+                kg: Some(ResolvedRouteRule {
+                    mode: RouteMode::Combined,
+                    remote: Some("hub".to_owned()),
+                    write: WriteTarget::Both,
+                }),
+            }
+        };
+        let result = resolve_kg_route(&fed);
+        assert_eq!(result.mode, RouteMode::Combined);
+        assert_eq!(result.remote.as_deref(), Some("hub"));
+        assert_eq!(result.write, WriteTarget::Both);
+    }
 }

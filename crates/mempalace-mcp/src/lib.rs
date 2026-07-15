@@ -1503,26 +1503,29 @@ where
         let object = required_string(arguments, "object")?;
         let valid_from_text = optional_string(arguments, "valid_from")?;
 
-        // ── Federation path ──
-        let is_both = self.federation.as_ref().is_some_and(|router| {
-            let route = router.resolve_kg_route();
-            router.is_dual_write(&route)
-        });
+        // ── Resolve federation route once, reuse for dual-write decisions ──
+        let route = self.federation.as_ref().map(|router| router.resolve_kg_route());
+        let is_both = match (&self.federation, &route) {
+            (Some(router), Some(route)) => router.is_dual_write(route),
+            _ => false,
+        };
 
-        if let Some(router) = &self.federation {
-            let route = router.resolve_kg_route();
-            if !is_both {
-                if let Some(remote_resp) = router
-                    .kg_add_remote(
-                        &subject,
-                        &predicate,
-                        &object,
-                        valid_from_text.as_deref(),
-                        &route,
-                    )
-                    .await?
-                {
-                    return Ok(remote_resp);
+        // ── Non-Both federation: remote-only or local-only ──
+        if !is_both {
+            if let Some(router) = &self.federation {
+                if let Some(route) = &route {
+                    if let Some(remote_resp) = router
+                        .kg_add_remote(
+                            &subject,
+                            &predicate,
+                            &object,
+                            valid_from_text.as_deref(),
+                            route,
+                        )
+                        .await?
+                    {
+                        return Ok(remote_resp);
+                    }
                 }
             }
         }
@@ -1575,19 +1578,26 @@ where
             }
         }
 
-        // ── Both-mode replication after local KG add ──
+        // ── Both-mode: best-effort remote replication after local KG add ──
         if is_both {
             if let Some(router) = &self.federation {
-                let route = router.resolve_kg_route();
-                let replication = router
-                    .kg_add_replicate(
-                        &sub, &pred, &obj,
-                        valid_from_text.as_deref(),
-                        &route,
-                    )
-                    .await;
-                if let Some(p) = payload.as_object_mut() {
-                    p.insert("replication".to_owned(), json!(replication));
+                if let Some(route) = &route {
+                    let replication = router
+                        .kg_add_replicate(
+                            &sub, &pred, &obj,
+                            valid_from_text.as_deref(),
+                            route,
+                        )
+                        .await;
+                    if let Some(p) = payload.as_object_mut() {
+                        p.insert("replication".to_owned(), json!(replication));
+                        if matches!(replication, ReplicationStatus::Failed { .. }) {
+                            p.insert(
+                                "warning".to_owned(),
+                                json!("local write succeeded but remote replication failed"),
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -1612,26 +1622,29 @@ where
             .transpose()?
             .unwrap_or_else(|| OffsetDateTime::now_utc().date());
 
-        // ── Federation path ──
-        let is_both = self.federation.as_ref().is_some_and(|router| {
-            let route = router.resolve_kg_route();
-            router.is_dual_write(&route)
-        });
+        // ── Resolve federation route once, reuse for dual-write decisions ──
+        let route = self.federation.as_ref().map(|router| router.resolve_kg_route());
+        let is_both = match (&self.federation, &route) {
+            (Some(router), Some(route)) => router.is_dual_write(route),
+            _ => false,
+        };
 
-        if let Some(router) = &self.federation {
-            let route = router.resolve_kg_route();
-            if !is_both {
-                if let Some(remote_resp) = router
-                    .kg_invalidate_remote(
-                        &subject,
-                        &predicate,
-                        &object,
-                        ended_text.as_deref(),
-                        &route,
-                    )
-                    .await?
-                {
-                    return Ok(remote_resp);
+        // ── Non-Both federation: remote-only or local-only ──
+        if !is_both {
+            if let Some(router) = &self.federation {
+                if let Some(route) = &route {
+                    if let Some(remote_resp) = router
+                        .kg_invalidate_remote(
+                            &subject,
+                            &predicate,
+                            &object,
+                            ended_text.as_deref(),
+                            route,
+                        )
+                        .await?
+                    {
+                        return Ok(remote_resp);
+                    }
                 }
             }
         }
@@ -1671,19 +1684,26 @@ where
             }
         }
 
-        // ── Both-mode replication after local KG invalidation ──
+        // ── Both-mode: best-effort remote replication after local KG invalidation ──
         if is_both {
             if let Some(router) = &self.federation {
-                let route = router.resolve_kg_route();
-                let replication = router
-                    .kg_invalidate_replicate(
-                        &sub, &pred, &obj,
-                        ended_text.as_deref(),
-                        &route,
-                    )
-                    .await;
-                if let Some(p) = payload.as_object_mut() {
-                    p.insert("replication".to_owned(), json!(replication));
+                if let Some(route) = &route {
+                    let replication = router
+                        .kg_invalidate_replicate(
+                            &sub, &pred, &obj,
+                            ended_text.as_deref(),
+                            route,
+                        )
+                        .await;
+                    if let Some(p) = payload.as_object_mut() {
+                        p.insert("replication".to_owned(), json!(replication));
+                        if matches!(replication, ReplicationStatus::Failed { .. }) {
+                            p.insert(
+                                "warning".to_owned(),
+                                json!("local write succeeded but remote replication failed"),
+                            );
+                        }
+                    }
                 }
             }
         }

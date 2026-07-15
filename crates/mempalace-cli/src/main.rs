@@ -3856,4 +3856,90 @@ mod tests {
 
         remove_dir_all_if_exists(&config_root);
     }
+
+    #[test]
+    fn mine_combined_both_diary_wing_uses_local_only() {
+        // combined+both config with a healthy remote targeting wing_agents,
+        // but the diary hard-override in route resolution forces local-only
+        // execution. No remote replication must be attempted.
+        const TOKEN: &str = "diary-wing-tok-009";
+        let workspace = tempdir().unwrap();
+
+        let server_palace = workspace.path().join("server-palace");
+        fs::create_dir_all(&server_palace).unwrap();
+        let addr = spawn_test_server(server_palace.clone(), TOKEN);
+        let server_url = format!("http://{addr}");
+
+        // Project dir with wing_agents as the wing.
+        let project_dir = workspace.path().join("diary-project");
+        fs::create_dir_all(&project_dir).unwrap();
+        write_file(
+            &project_dir.join("entry.md"),
+            "Today I learned about federation routing.\n".repeat(5).as_str(),
+        );
+
+        let config_root = temp_config_root("diary-wing-local");
+        let context = CliContext::for_tests(config_root.clone());
+        let palace_dir = config_root.join("palace");
+
+        run_cli(["init", project_dir.to_str().unwrap(), "--yes"], &context, stub_provider).unwrap();
+
+        // Overwrite config with combined+both routing for wing_agents targeting
+        // a healthy remote server. The diary hard-override in resolve_route
+        // must force local-only regardless.
+        let wing_name = "wing_agents";
+        let remote_name = "hub";
+        write_combined_cli_config(
+            &config_root,
+            remote_name,
+            &server_url,
+            TOKEN,
+            wing_name,
+            &palace_dir,
+            &project_dir,
+        );
+
+        // Re-read project config to set wing_agents in mempalace.yaml.
+        let yaml = "wing: wing_agents\nrooms:\n  - name: diary\n    description: Daily entries\n";
+        fs::write(project_dir.join("mempalace.yaml"), yaml).unwrap();
+
+        let context = CliContext::for_tests(config_root.clone());
+        let output = run_cli(
+            ["mine", project_dir.to_str().unwrap()],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+
+        // Must exit 0 and ingest locally.
+        assert_eq!(
+            output.exit_code, 0,
+            "diary-wing mine with combined+both config: stderr={:?}",
+            output.stderr
+        );
+        assert!(
+            output.stdout.contains("Files ingested:"),
+            "must show local ingestion: {}",
+            output.stdout
+        );
+
+        // Must NOT contain any replication labels (diary hard-override forces local-only).
+        assert!(
+            !output.stdout.contains("replication:"),
+            "diary wing must not attempt replication: {}",
+            output.stdout
+        );
+        assert!(
+            !output.stdout.contains("Remote replication:"),
+            "diary wing must not show Remote replication: {}",
+            output.stdout
+        );
+        assert!(
+            !output.stdout.contains("Remote:"),
+            "diary wing must not mention Remote: {}",
+            output.stdout
+        );
+
+        remove_dir_all_if_exists(&config_root);
+    }
 }

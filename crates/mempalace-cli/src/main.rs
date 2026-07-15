@@ -543,8 +543,10 @@ where
     let runtime = build_runtime(&config).map_err(runtime_error)?;
 
     // ── Routing decision (projects mode only) ────────────────────────────────
+    let mut is_both = false;
+    let mut both_rule: Option<mempalace_config::ResolvedRouteRule> = None;
+
     if mode == CliMode::Projects {
-        // Load the project config to get the wing name and routing.
         let project_config =
             ConfigLoader::load_project_config(&source_dir).map_err(config_error)?;
         let wing_name = wing
@@ -560,8 +562,7 @@ where
         let use_remote = !branch
             && (rule.mode == RouteMode::Remote
                 || (rule.mode == RouteMode::Combined
-                    && (rule.write == WriteTarget::Remote
-                        || rule.write == WriteTarget::Both)));
+                    && rule.write == WriteTarget::Remote));
 
         if use_remote {
             return execute_remote_mine(
@@ -576,6 +577,12 @@ where
                 &rule,
             );
         }
+
+        // Both: do local mine first, then attempt best-effort remote replication.
+        is_both = !branch
+            && rule.mode == RouteMode::Combined
+            && rule.write == WriteTarget::Both;
+        both_rule = if is_both { Some(rule) } else { None };
     } else {
         // Convos mode: --branch is not supported; remote routing is not supported.
         if branch {
@@ -584,8 +591,7 @@ where
                 "--branch requires --mode projects; branch-delta mining is not supported for conversations\n",
             ));
         }
-        // Conversation mining is always local: routing rules are wing-based and
-        // convo directories carry no project wing config to resolve against.
+        // Conversation mining is always local.
     }
 
     // ── Local mine path (unchanged from before for federation-absent/local-route) ─
@@ -618,8 +624,8 @@ where
                 &mut provider,
                 &ProjectIngestRequest {
                     project_dir: source_dir.clone(),
-                    wing,
-                    agent,
+                    wing: wing.clone(),
+                    agent: agent.clone(),
                     limit: if limit == 0 { None } else { Some(limit) },
                     dry_run,
                     reindex,
@@ -634,8 +640,8 @@ where
                 &mut provider,
                 &ConversationIngestRequest {
                     convo_dir: source_dir.clone(),
-                    wing,
-                    agent,
+                    wing: wing.clone(),
+                    agent: agent.clone(),
                     extract_mode: match extract {
                         CliExtractMode::Exchange => ConversationExtractMode::Exchange,
                         CliExtractMode::General => ConversationExtractMode::General,
@@ -648,6 +654,35 @@ where
             ))
             .map_err(ingest_error)?,
     };
+
+    // ── Both-mode replication: best-effort remote mine after local ───────────
+    if is_both {
+        if let Some(ref rule) = both_rule {
+            let local_lines = render_mine_summary(
+                mode, &source_dir, &config.palace_path, dry_run, &summary,
+            );
+            let remote_result = execute_remote_mine(
+                &source_dir,
+                wing,
+                &agent,
+                limit,
+                dry_run,
+                batch_size,
+                &config,
+                &runtime,
+                rule,
+            );
+            let combined = match remote_result {
+                Ok(output) => {
+                    format!("{}\n  Remote replication: succeeded\n{}", local_lines.trim(), output.stdout.trim())
+                }
+                Err(e) => {
+                    format!("{}\n  Remote replication: failed — {}\n", local_lines.trim(), e)
+                }
+            };
+            return Ok(CliOutput::success(combined));
+        }
+    }
 
     Ok(CliOutput::success(render_mine_summary(
         mode,

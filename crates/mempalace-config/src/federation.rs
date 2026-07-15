@@ -74,6 +74,26 @@ pub enum WriteTarget {
     Both,
 }
 
+/// Result of a best-effort remote replication attempt (for [`WriteTarget::Both`]).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "status")]
+pub enum ReplicationStatus {
+    /// No replication was attempted (route is not `write: both`).
+    Skipped,
+    /// Best-effort replication to the remote succeeded.
+    Replicated {
+        /// Remote that received the replication.
+        remote: String,
+    },
+    /// Best-effort replication to the remote failed.
+    Failed {
+        /// Remote that was targeted.
+        remote: String,
+        /// Human-readable failure reason.
+        reason: String,
+    },
+}
+
 /// File-level routing rule for a wing or the knowledge graph.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouteRuleV1 {
@@ -938,6 +958,27 @@ mod tests {
         assert_eq!(serde_json::to_string(&WriteTarget::Both).unwrap(), "\"both\"");
     }
 
+    #[test]
+    fn replication_status_serde() {
+        // Skipped
+        let val = serde_json::to_value(ReplicationStatus::Skipped).unwrap();
+        assert_eq!(val["status"], "skipped");
+
+        // Replicated
+        let val = serde_json::to_value(ReplicationStatus::Replicated { remote: "hub".to_owned() }).unwrap();
+        assert_eq!(val["status"], "replicated");
+        assert_eq!(val["remote"], "hub");
+
+        // Failed
+        let val = serde_json::to_value(ReplicationStatus::Failed {
+            remote: "hub".to_owned(),
+            reason: "timeout".to_owned(),
+        }).unwrap();
+        assert_eq!(val["status"], "failed");
+        assert_eq!(val["remote"], "hub");
+        assert_eq!(val["reason"], "timeout");
+    }
+
     // ── 9. ProjectConfig YAML with routing ────────────────────────────────────
     #[test]
     fn project_config_with_routing_parses() {
@@ -1058,6 +1099,20 @@ mod tests {
                     mode: RouteMode::Combined,
                     remote: Some("work".to_owned()),
                     write: WriteTarget::Local,
+                },
+            );
+            FederationRuntimeConfig { wings, ..base }
+        };
+
+        let fed_with_wing_write_both = {
+            let base = work_remote_federation();
+            let mut wings = BTreeMap::new();
+            wings.insert(
+                "wing_both".to_owned(),
+                ResolvedRouteRule {
+                    mode: RouteMode::Combined,
+                    remote: Some("work".to_owned()),
+                    write: WriteTarget::Both,
                 },
             );
             FederationRuntimeConfig { wings, ..base }
@@ -1244,6 +1299,64 @@ mod tests {
                     write: WriteTarget::Local,
                 },
             },
+            // 13. Combined wing rule with write:both → Combined(work, write:Both)
+            Case {
+                name: "combined wing rule write:both → write Both",
+                federation: fed_with_wing_write_both.clone(),
+                project_routing: None,
+                query_wing: Some("wing_both"),
+                query_room: None,
+                query_source_file: None,
+                expected: ResolvedRouteRule {
+                    mode: RouteMode::Combined,
+                    remote: Some("work".to_owned()),
+                    write: WriteTarget::Both,
+                },
+            },
+            // 14. Project routing write:both → Combined(work, write:Both)
+            Case {
+                name: "project routing write:both → write Both",
+                federation: work_remote_federation(),
+                project_routing: Some(ProjectRoutingConfig {
+                    mode: RouteMode::Combined,
+                    remote: Some("work".to_owned()),
+                    write: Some(WriteTarget::Both),
+                }),
+                query_wing: Some("wing_other"),
+                query_room: None,
+                query_source_file: None,
+                expected: ResolvedRouteRule {
+                    mode: RouteMode::Combined,
+                    remote: Some("work".to_owned()),
+                    write: WriteTarget::Both,
+                },
+            },
+            // 15. Diary wing hard override wins over write:both wing rule
+            Case {
+                name: "diary wing hard override wins over write:both",
+                federation: {
+                    let base = work_remote_federation();
+                    let mut wings = BTreeMap::new();
+                    wings.insert(
+                        SHARED_AGENT_DIARY_WING.to_owned(),
+                        ResolvedRouteRule {
+                            mode: RouteMode::Combined,
+                            remote: Some("work".to_owned()),
+                            write: WriteTarget::Both,
+                        },
+                    );
+                    FederationRuntimeConfig { wings, ..base }
+                },
+                project_routing: None,
+                query_wing: Some(SHARED_AGENT_DIARY_WING),
+                query_room: None,
+                query_source_file: None,
+                expected: ResolvedRouteRule {
+                    mode: RouteMode::Local,
+                    remote: None,
+                    write: WriteTarget::Local,
+                },
+            },
         ];
 
         for case in &cases {
@@ -1294,5 +1407,22 @@ mod tests {
         let result = resolve_kg_route(&fed_empty);
         assert_eq!(result.mode, RouteMode::Local);
         assert_eq!(result.remote, None);
+
+        // kg rule with write:both → Both
+        let fed_kg_both = {
+            let base = work_remote_federation();
+            FederationRuntimeConfig {
+                kg: Some(ResolvedRouteRule {
+                    mode: RouteMode::Combined,
+                    remote: Some("work".to_owned()),
+                    write: WriteTarget::Both,
+                }),
+                ..base
+            }
+        };
+        let result = resolve_kg_route(&fed_kg_both);
+        assert_eq!(result.mode, RouteMode::Combined);
+        assert_eq!(result.remote.as_deref(), Some("work"));
+        assert_eq!(result.write, WriteTarget::Both);
     }
 }

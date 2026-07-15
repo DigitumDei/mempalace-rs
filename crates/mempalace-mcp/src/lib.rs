@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use blake3::Hasher;
-use mempalace_config::{ConfigLoader, MempalaceConfig, RouteMode};
+use mempalace_config::{ConfigLoader, MempalaceConfig, RouteMode, WriteTarget};
 use mempalace_core::{
     DIARY_HALL, DIARY_ROOM, DIARY_TOPIC_PREFIX, DrawerId, DrawerRecord, EmbeddingProfile, RoomId,
     SHARED_AGENT_DIARY_WING, SearchQuery, WingId,
@@ -1109,29 +1109,38 @@ where
         let added_by = optional_string(arguments, "added_by")?.unwrap_or_else(|| "mcp".to_owned());
 
         // ── Federation path ──
-        if let Some(router) = &self.federation {
-            // Pass room and source_file so diary hard-override can fire (e.g.
-            // room == DIARY_ROOM or source_file starts with DIARY_TOPIC_PREFIX).
+        let is_both = self.federation.as_ref().is_some_and(|router| {
             let route = router.resolve_drawer_route(
                 Some(wing.as_str()),
                 Some(room.as_str()),
                 if source_file.is_empty() { None } else { Some(source_file.as_str()) },
             );
-            if let Some(remote_resp) = router
-                .add_drawer_remote(
-                    wing.as_str(),
-                    room.as_str(),
-                    &content,
-                    &source_file,
-                    &added_by,
-                    &route,
-                    DEFAULT_DUPLICATE_THRESHOLD,
-                )
-                .await?
-            {
-                // Remote handled the add — no local change-log entry needed.
-                // The remote palace records its own change event.
-                return Ok(remote_resp);
+            route.mode == RouteMode::Combined && route.write == WriteTarget::Both
+        });
+
+        if let Some(router) = &self.federation {
+            let route = router.resolve_drawer_route(
+                Some(wing.as_str()),
+                Some(room.as_str()),
+                if source_file.is_empty() { None } else { Some(source_file.as_str()) },
+            );
+
+            if !is_both {
+                if let Some(remote_resp) = router
+                    .add_drawer_remote(
+                        wing.as_str(),
+                        room.as_str(),
+                        &content,
+                        &source_file,
+                        &added_by,
+                        &route,
+                        DEFAULT_DUPLICATE_THRESHOLD,
+                    )
+                    .await?
+                {
+                    // Remote handled the add — no local change-log entry needed.
+                    return Ok(remote_resp);
+                }
             }
         }
 
@@ -1146,6 +1155,7 @@ where
 
         let now = OffsetDateTime::now_utc();
         let drawer_id = generated_drawer_id("drawer", wing.as_str(), room.as_str(), &content, now)?;
+        let content_clone = content.clone();
         let record = self
             .build_drawer_record(
                 drawer_id.clone(),
@@ -1165,7 +1175,7 @@ where
             .commit_ingest(IngestCommitRequest {
                 ingest_kind: "mcp_write".to_owned(),
                 source_key: format!("mcp:{}", drawer_id.as_str()),
-                source_file,
+                source_file: source_file.clone(),
                 content_hash: record.content_hash.clone(),
                 drawers: vec![record],
                 duplicate_strategy: DuplicateStrategy::Error,
@@ -1177,16 +1187,43 @@ where
             event_type: "drawer_added".to_owned(),
             occurred_at: now,
             entity_id: drawer_id.as_str().to_owned(),
-            actor: Some(added_by),
+            actor: Some(added_by.clone()),
             details_json: Some(json!({"wing": wing.as_str(), "room": room.as_str()}).to_string()),
         });
 
-        Ok(json!({
+        let mut result = json!({
             "success": true,
             "drawer_id": drawer_id,
             "wing": wing,
             "room": room,
-        }))
+        });
+
+        // ── Both-mode replication after local write ──
+        if is_both {
+            if let Some(router) = &self.federation {
+                let route = router.resolve_drawer_route(
+                    Some(result["wing"].as_str().unwrap_or("")),
+                    Some(result["room"].as_str().unwrap_or("")),
+                    if source_file.is_empty() { None } else { Some(source_file.as_str()) },
+                );
+                let replication = router
+                    .add_drawer_replicate(
+                        result["wing"].as_str().unwrap_or(""),
+                        result["room"].as_str().unwrap_or(""),
+                        &content_clone,
+                        &source_file,
+                        &added_by,
+                        &route,
+                        DEFAULT_DUPLICATE_THRESHOLD,
+                    )
+                    .await;
+                if let Some(obj) = result.as_object_mut() {
+                    obj.insert("replication".to_owned(), json!(replication));
+                }
+            }
+        }
+
+        Ok(result)
     }
 
     async fn tool_delete_drawer(&mut self, arguments: &Value) -> ToolResult<Value> {
@@ -1455,19 +1492,26 @@ where
         let valid_from_text = optional_string(arguments, "valid_from")?;
 
         // ── Federation path ──
+        let is_both = self.federation.as_ref().is_some_and(|router| {
+            let route = router.resolve_kg_route();
+            route.mode == RouteMode::Combined && route.write == WriteTarget::Both
+        });
+
         if let Some(router) = &self.federation {
             let route = router.resolve_kg_route();
-            if let Some(remote_resp) = router
-                .kg_add_remote(
-                    &subject,
-                    &predicate,
-                    &object,
-                    valid_from_text.as_deref(),
-                    &route,
-                )
-                .await?
-            {
-                return Ok(remote_resp);
+            if !is_both {
+                if let Some(remote_resp) = router
+                    .kg_add_remote(
+                        &subject,
+                        &predicate,
+                        &object,
+                        valid_from_text.as_deref(),
+                        &route,
+                    )
+                    .await?
+                {
+                    return Ok(remote_resp);
+                }
             }
         }
 
@@ -1483,8 +1527,8 @@ where
                     subject: subject.clone(),
                     subject_type: infer_entity_kind(&subject),
                     predicate: predicate.clone(),
-                    object: object.clone(),
                     object_type: infer_entity_kind(&object),
+                    object: object.clone(),
                     valid_from,
                     valid_to: None,
                     confidence: 1.0,
@@ -1495,6 +1539,9 @@ where
             )
             .map_tool_internal()?;
 
+        let sub = subject.clone();
+        let pred = predicate.clone();
+        let obj = object.clone();
         self.log_change(ChangeEvent {
             event_type: "kg_fact_added".to_owned(),
             occurred_at: now,
@@ -1508,13 +1555,31 @@ where
         let mut payload = json!({
             "success": true,
             "triple_id": triple_id,
-            "fact": format!("{subject} → {predicate} → {object}"),
+            "fact": format!("{sub} → {pred} → {obj}"),
         });
         if self.federation.is_some() {
             if let Some(obj) = payload.as_object_mut() {
                 obj.insert("applied_to".to_owned(), json!("local"));
             }
         }
+
+        // ── Both-mode replication after local KG add ──
+        if is_both {
+            if let Some(router) = &self.federation {
+                let route = router.resolve_kg_route();
+                let replication = router
+                    .kg_add_replicate(
+                        &sub, &pred, &obj,
+                        valid_from_text.as_deref(),
+                        &route,
+                    )
+                    .await;
+                if let Some(p) = payload.as_object_mut() {
+                    p.insert("replication".to_owned(), json!(replication));
+                }
+            }
+        }
+
         Ok(payload)
     }
 
@@ -1536,19 +1601,26 @@ where
             .unwrap_or_else(|| OffsetDateTime::now_utc().date());
 
         // ── Federation path ──
+        let is_both = self.federation.as_ref().is_some_and(|router| {
+            let route = router.resolve_kg_route();
+            route.mode == RouteMode::Combined && route.write == WriteTarget::Both
+        });
+
         if let Some(router) = &self.federation {
             let route = router.resolve_kg_route();
-            if let Some(remote_resp) = router
-                .kg_invalidate_remote(
-                    &subject,
-                    &predicate,
-                    &object,
-                    ended_text.as_deref(),
-                    &route,
-                )
-                .await?
-            {
-                return Ok(remote_resp);
+            if !is_both {
+                if let Some(remote_resp) = router
+                    .kg_invalidate_remote(
+                        &subject,
+                        &predicate,
+                        &object,
+                        ended_text.as_deref(),
+                        &route,
+                    )
+                    .await?
+                {
+                    return Ok(remote_resp);
+                }
             }
         }
 
@@ -1556,6 +1628,10 @@ where
         let runtime = KnowledgeGraphRuntime::new(self.storage.operational_store());
         let invalidated =
             runtime.invalidate(&subject, &predicate, &object, ended, now).map_tool_internal()?;
+
+        let sub = subject.clone();
+        let pred = predicate.clone();
+        let obj = object.clone();
 
         if invalidated > 0 {
             self.log_change(ChangeEvent {
@@ -1574,7 +1650,7 @@ where
         let mut payload = json!({
             "success": invalidated > 0,
             "invalidated": invalidated,
-            "fact": format!("{subject} → {predicate} → {object}"),
+            "fact": format!("{sub} → {pred} → {obj}"),
             "ended": ended_text.unwrap_or_else(|| "today".to_owned()),
         });
         if self.federation.is_some() {
@@ -1582,6 +1658,24 @@ where
                 obj.insert("applied_to".to_owned(), json!("local"));
             }
         }
+
+        // ── Both-mode replication after local KG invalidation ──
+        if is_both {
+            if let Some(router) = &self.federation {
+                let route = router.resolve_kg_route();
+                let replication = router
+                    .kg_invalidate_replicate(
+                        &sub, &pred, &obj,
+                        ended_text.as_deref(),
+                        &route,
+                    )
+                    .await;
+                if let Some(p) = payload.as_object_mut() {
+                    p.insert("replication".to_owned(), json!(replication));
+                }
+            }
+        }
+
         Ok(payload)
     }
 

@@ -1657,6 +1657,210 @@ async fn add_drawer_both_replicates_successfully() {
     );
 }
 
+// ─── Test 22: add_drawer_both_replication_fails_with_remote_rejection ───────
+
+/// Combined/write:Both wing rule with a reachable remote that rejects the
+/// replication attempt (wrong bearer token → HTTP 401). The local write must
+/// still succeed, `applied_to` must be `"local"`, and `replication.status`
+/// must be `"failed"` with a non-empty `reason` and a `warnings` array.
+#[tokio::test]
+async fn add_drawer_both_replication_fails_with_remote_rejection() {
+    let hub_dir = TempDir::new().unwrap();
+    let local_dir = TempDir::new().unwrap();
+
+    let addr = spawn_server(&hub_dir).await;
+    let hub_url = format!("http://{addr}");
+
+    // Use a wrong token so the hub rejects the replication with HTTP 401.
+    let bad_token = "wrong-token-xyz-does-not-match";
+
+    let mut remotes = BTreeMap::new();
+    remotes.insert(
+        "hub".to_owned(),
+        ResolvedRemote {
+            name: "hub".to_owned(),
+            url: hub_url,
+            token: Some(bad_token.to_owned()),
+            timeout: Duration::from_secs(5),
+        },
+    );
+
+    let mut wing_rules = BTreeMap::new();
+    wing_rules.insert("wing_both_reject".to_owned(), combined_wing_rule_both_write());
+
+    let federation = FederationRuntimeConfig {
+        remotes,
+        default_mode: RouteMode::Local,
+        default_remote: None,
+        wings: wing_rules,
+        kg: None,
+    };
+
+    let config = MempalaceConfig {
+        schema_version: 1,
+        collection_name: "mempalace_drawers".to_owned(),
+        palace_path: local_dir.path().join("palace"),
+        embedding_profile: EmbeddingProfile::Balanced,
+        low_cpu: LowCpuRuntimeConfig::defaults_for_profile(EmbeddingProfile::Balanced),
+        server: ServerRuntimeConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            token_file: local_dir.path().join("server_tokens.json"),
+            checkouts: std::collections::BTreeMap::new(),
+        },
+        federation,
+    };
+
+    let server =
+        McpServer::from_parts(config, DeterministicStubProvider::new(EmbeddingProfile::Balanced))
+            .await
+            .unwrap();
+
+    let add = call_tool(
+        &server,
+        1,
+        "mempalace_add_drawer",
+        json!({
+            "wing": "wing_both_reject",
+            "room": "reject-room",
+            "content": "dual-write e2e remote rejection test drawer",
+            "added_by": "reject-test"
+        }),
+    )
+    .await;
+
+    // Local write must succeed.
+    assert_eq!(add["success"], true, "both add with wrong token must still succeed: {add}");
+    assert_eq!(
+        add["applied_to"], "local",
+        "both add with wrong token must report applied_to=local: {add}"
+    );
+
+    // Replication must be failed.
+    let replication = add.get("replication").expect("both add must include replication field");
+    assert_eq!(
+        replication["status"], "failed",
+        "replication must report status=failed with wrong token; got: {replication}"
+    );
+    assert_eq!(
+        replication["remote"], "hub",
+        "replication must report remote=hub; got: {replication}"
+    );
+    let reason = replication["reason"].as_str().unwrap_or("");
+    assert!(
+        !reason.is_empty(),
+        "replication failure must include a non-empty reason; got: {replication}"
+    );
+
+    // Warnings must be present.
+    let warnings = add.get("warnings").and_then(|w| w.as_array());
+    assert!(
+        warnings.is_some() && !warnings.unwrap().is_empty(),
+        "both add with failed replication must include warnings array; got: {add}"
+    );
+}
+
+// ─── Test 23: add_drawer_both_duplicate_replication ─────────────────────────
+
+/// The content already exists on the hub (seeded via a Remote route).
+/// A subsequent Both write for the same content must succeed locally but
+/// report replication as failed with reason "duplicate exists on remote".
+#[tokio::test]
+async fn add_drawer_both_duplicate_replication() {
+    let hub_dir = TempDir::new().unwrap();
+    let local_dir_a = TempDir::new().unwrap();
+    let local_dir_b = TempDir::new().unwrap();
+
+    let addr = spawn_server(&hub_dir).await;
+    let hub_url = format!("http://{addr}");
+
+    let content = "dual-write e2e duplicate replication test content unique zyxw";
+
+    // ── Server A: Remote write to seed content on the hub ───────────────────
+    let mut wing_rules_a = BTreeMap::new();
+    wing_rules_a.insert("wing_seed".to_owned(), combined_wing_rule_remote_write());
+
+    let server_a = mcp_server_with_hub(
+        &local_dir_a,
+        &hub_url,
+        wing_rules_a,
+        RouteMode::Local,
+        None,
+    )
+    .await;
+
+    let seed = call_tool(
+        &server_a,
+        1,
+        "mempalace_add_drawer",
+        json!({
+            "wing": "wing_seed",
+            "room": "seed-room",
+            "content": content,
+            "added_by": "dup-test"
+        }),
+    )
+    .await;
+    assert_eq!(seed["success"], true, "seed add must succeed: {seed}");
+    assert_eq!(seed["origin"], "hub", "seed must go to hub: {seed}");
+
+    // ── Server B: Both write with the same content ──────────────────────────
+    let mut wing_rules_b = BTreeMap::new();
+    wing_rules_b.insert("wing_both_dup".to_owned(), combined_wing_rule_both_write());
+
+    let server_b = mcp_server_with_hub(
+        &local_dir_b,
+        &hub_url,
+        wing_rules_b,
+        RouteMode::Local,
+        None,
+    )
+    .await;
+
+    let dup = call_tool(
+        &server_b,
+        1,
+        "mempalace_add_drawer",
+        json!({
+            "wing": "wing_both_dup",
+            "room": "dup-room",
+            "content": content,
+            "added_by": "dup-test"
+        }),
+    )
+    .await;
+
+    // Local write must succeed despite replication failure.
+    assert_eq!(dup["success"], true, "both add with duplicate content must succeed locally: {dup}");
+    assert_eq!(
+        dup["applied_to"], "local",
+        "both add must report applied_to=local: {dup}"
+    );
+
+    // Replication must be failed due to duplicate on hub.
+    let replication = dup.get("replication").expect("both add must include replication field");
+    assert_eq!(
+        replication["status"], "failed",
+        "replication must report status=failed for duplicate content; got: {replication}"
+    );
+    assert_eq!(
+        replication["remote"], "hub",
+        "replication must report remote=hub; got: {replication}"
+    );
+    // The reason should mention the duplicate.
+    let reason = replication["reason"].as_str().unwrap_or("");
+    assert!(
+        reason.contains("duplicate"),
+        "replication failure reason must mention 'duplicate'; got: {reason}"
+    );
+
+    // Warnings must be present.
+    let warnings = dup.get("warnings").and_then(|w| w.as_array());
+    assert!(
+        warnings.is_some() && !warnings.unwrap().is_empty(),
+        "both add with duplicate replication must include warnings array; got: {dup}"
+    );
+}
+
 // ─── Test 13: add_drawer_both_replication_fails_with_down_remote ────────────
 
 /// Combined/write:Both wing rule with the remote down (dead address).
@@ -1953,10 +2157,29 @@ async fn kg_invalidate_both_replicates_successfully() {
     .await;
     assert_eq!(add_resp["success"], true, "kg_add must succeed: {add_resp}");
 
+    // Verify the fact exists on the hub before invalidation.
+    let query_before = call_tool(
+        &server,
+        2,
+        "mempalace_kg_query",
+        json!({"entity": "InvalidateBothTest", "direction": "outgoing"}),
+    )
+    .await;
+    let facts_before = query_before["facts"].as_array().expect("facts must be array");
+    let hub_fact_before = facts_before.iter().find(|f| {
+        f["origin"].as_str() == Some("hub")
+            && f["predicate"].as_str() == Some("replication")
+            && f["object"].as_str() == Some("active")
+    });
+    assert!(
+        hub_fact_before.is_some(),
+        "kg_query must include the fact from hub origin BEFORE invalidation; facts: {facts_before:?}"
+    );
+
     // Now invalidate.
     let invalidate = call_tool(
         &server,
-        2,
+        3,
         "mempalace_kg_invalidate",
         json!({
             "subject": "InvalidateBothTest",
@@ -1986,6 +2209,25 @@ async fn kg_invalidate_both_replicates_successfully() {
     assert!(
         invalidate.get("warnings").is_none(),
         "kg_invalidate must not have warnings on success: {invalidate}"
+    );
+
+    // ── Verify the fact is actually invalidated on the hub ──────────────────
+    let kg_query = call_tool(
+        &server,
+        4,
+        "mempalace_kg_query",
+        json!({"entity": "InvalidateBothTest", "direction": "outgoing"}),
+    )
+    .await;
+    let facts = kg_query["facts"].as_array().expect("facts must be array");
+    let hub_fact = facts.iter().find(|f| {
+        f["origin"].as_str() == Some("hub")
+            && f["predicate"].as_str() == Some("replication")
+            && f["object"].as_str() == Some("active")
+    });
+    assert!(
+        hub_fact.is_none(),
+        "kg_query must NOT include the invalidated fact from hub origin; facts: {facts:?}"
     );
 }
 

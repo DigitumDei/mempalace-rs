@@ -559,30 +559,20 @@ where
     let plan = resolve_plan(&source_dir, mode, &wing, branch, &config)?;
 
     match plan {
-        ExecPlan::Remote(rule) => execute_remote_mine(
-            &source_dir, wing, &agent, limit, dry_run, batch_size, &config, &runtime, &rule,
-        ),
+        ExecPlan::Remote(rule) => Ok(execute_remote_mine(
+            &source_dir, wing, &agent, limit, dry_run, batch_size, &config, &runtime, &rule, false,
+        )),
         ExecPlan::Both(rule) => {
             let (_local_summary, local_output) = execute_local_mine(
                 &source_dir, mode, wing.clone(), agent.clone(), limit, dry_run, reindex,
                 extract, branch, batch_size, &config, &runtime, &provider_factory,
             )?;
 
-            let remote_result = execute_remote_mine(
-                &source_dir, wing, &agent, limit, dry_run, batch_size, &config, &runtime, &rule,
+            let remote_output = execute_remote_mine(
+                &source_dir, wing, &agent, limit, dry_run, batch_size, &config, &runtime, &rule, true,
             );
 
-            let combined = match remote_result {
-                Ok(output) if output.exit_code == 0 => {
-                    format!("{}\n  Remote replication: succeeded\n{}", local_output.trim(), output.stdout.trim())
-                }
-                Ok(output) => {
-                    format!("{}\n  Remote replication: failed — {}\n", local_output.trim(), output.stderr.trim())
-                }
-                Err(e) => {
-                    format!("{}\n  Remote replication: failed — {}\n", local_output.trim(), e)
-                }
-            };
+            let combined = format!("{}\n{}", local_output.trim(), remote_output.stdout.trim());
             Ok(CliOutput::success(combined))
         }
         ExecPlan::Local => {
@@ -755,13 +745,14 @@ fn execute_remote_mine(
     config: &MempalaceConfig,
     runtime: &tokio::runtime::Runtime,
     rule: &mempalace_config::ResolvedRouteRule,
-) -> Result<CliOutput, clap::Error> {
+    dual_write: bool,
+) -> CliOutput {
     // `--batch-size N` (N>0) caps files per remote request, letting low-spec
     // machines bound how much is held/serialized at once. The ~4 MiB byte cap
     // still applies as an independent guardrail against the server body limit.
     let max_files_per_batch = batch_size.filter(|&n| n > 0).unwrap_or(REMOTE_BATCH_MAX_FILES);
     // ── 1. Prepare the batch (no embedding, no storage) ─────────────────────
-    let prepared = prepare_project_batch(&ProjectIngestRequest {
+    let prepared = match prepare_project_batch(&ProjectIngestRequest {
         project_dir: source_dir.to_path_buf(),
         wing: wing_override.clone(),
         agent: agent.to_owned(),
@@ -770,22 +761,33 @@ fn execute_remote_mine(
         reindex: false,
         max_embed_batch_size: None,
         branch: false,
-    })
-    .map_err(|e| branch_delta_error(e, ingest_error))?;
+    }) {
+        Ok(p) => p,
+        Err(e) => {
+            let msg = format!("failed to prepare project batch: {e}\n");
+            return if dual_write { CliOutput::success(format!("  Remote replication: failed — {msg}")) } else { CliOutput::failure(1, msg) };
+        }
+    };
 
     // ── 2. Resolve the remote config entry ──────────────────────────────────
     let remote_name = rule.remote.as_deref().unwrap_or("remote");
     let resolved_remote =
-        config.federation.remotes.get(remote_name).ok_or_else(|| {
-            clap::Error::raw(
-                clap::error::ErrorKind::Io,
-                format!(
+        match config.federation.remotes.get(remote_name) {
+            Some(r) => r,
+            None => {
+                let msg = format!(
                     "federation config error: route for wing '{}' refers to remote '{}', \
                      but no such remote is defined in config.federation.remotes\n",
                     prepared.wing, remote_name
-                ),
-            )
-        })?;
+                );
+                let output = if dual_write {
+                    format!("  Remote replication: failed — {msg}")
+                } else {
+                    format!("{msg}")
+                };
+                return if dual_write { CliOutput::success(output) } else { CliOutput::failure(1, output) };
+            }
+        };
     let remote_url = resolved_remote.url.clone();
 
     // ── 3. Non-default-branch warning text (computed early for dry-run) ─────
@@ -824,7 +826,7 @@ fn execute_remote_mine(
             lines.push(format!("  {}", warning.trim()));
         }
         lines.push(format!("{}\n", "=".repeat(SEARCH_HEADER_WIDTH)));
-        return Ok(CliOutput::success(lines.join("\n")));
+        return CliOutput::success(lines.join("\n"));
     }
 
     // ── 5. Build the remote client ───────────────────────────────────────────
@@ -834,39 +836,66 @@ fn execute_remote_mine(
         token: resolved_remote.token.clone(),
         timeout: resolved_remote.timeout,
     };
-    let client = RemoteClient::new(endpoint).map_err(|e| {
-        clap::Error::raw(
-            clap::error::ErrorKind::Io,
-            format!("failed to build remote client for '{}': {e}\n", remote_name),
-        )
-    })?;
+    let client = match RemoteClient::new(endpoint) {
+        Ok(c) => c,
+        Err(e) => {
+            let msg = format!("failed to build remote client for '{}': {e}\n", remote_name);
+            let output = if dual_write {
+                format!("  Remote replication: failed — {msg}")
+            } else {
+                format!("{msg}")
+            };
+            return if dual_write { CliOutput::success(output) } else { CliOutput::failure(1, output) };
+        }
+    };
 
     // ── 6. Capabilities check ────────────────────────────────────────────────
     // Call through the trait to avoid shadowing by the `info` field on RemoteClient.
     let api: &dyn RemoteApi = &client;
-    let info_resp = runtime.block_on(api.info()).map_err(|e| {
-        let msg = match e {
-            RemoteError::Unreachable { ref message, .. } => format!(
-                "remote '{}' is unreachable at {}: {}\n\
-                 Note: writes do not fall back to local.\n",
-                remote_name, remote_url, message
-            ),
-            other => format!("remote '{}' info() failed: {other}\n", remote_name),
-        };
-        clap::Error::raw(clap::error::ErrorKind::Io, msg)
-    })?;
+    let info_resp = match runtime.block_on(api.info()) {
+        Ok(resp) => resp,
+        Err(e) => {
+            let msg = match e {
+                RemoteError::Unreachable { ref message, .. } => format!(
+                    "remote '{}' is unreachable at {}: {}",
+                    remote_name, remote_url, message
+                ),
+                other => format!("remote '{}' info() failed: {other}", remote_name),
+            };
+            let output = if dual_write {
+                format!(
+                    "  Remote replication: failed — {msg}\n\
+                     Note: the local mine completed successfully; remote replication was skipped.\n"
+                )
+            } else {
+                format!(
+                    "{msg}\n\
+                     Note: writes do not fall back to local.\n"
+                )
+            };
+            return if dual_write { CliOutput::success(output) } else { CliOutput::failure(1, output) };
+        }
+    };
 
     if !info_resp.capabilities.iter().any(|c| c == "ingest") {
-        return Ok(CliOutput::failure(
-            1,
+        let msg = if dual_write {
+            format!(
+                "  Remote replication: skipped — remote '{}' does not support the ingest capability.\n\
+                 Server capabilities: {}\n\
+                 Note: the local mine completed successfully.\n",
+                remote_name,
+                info_resp.capabilities.join(", ")
+            )
+        } else {
             format!(
                 "remote '{}' does not support the ingest capability; \
                  please upgrade the remote server.\n\
                  Server capabilities: {}\n",
                 remote_name,
                 info_resp.capabilities.join(", ")
-            ),
-        ));
+            )
+        };
+        return if dual_write { CliOutput::success(msg) } else { CliOutput::failure(1, msg) };
     }
 
     // ── 7. Batch and send ────────────────────────────────────────────────────
@@ -896,16 +925,27 @@ fn execute_remote_mine(
         };
 
         let resp: IngestBatchResponse =
-            runtime.block_on(api.ingest_batch(req)).map_err(|e| {
-                clap::Error::raw(
-                    clap::error::ErrorKind::Io,
-                    format!(
-                        "remote '{}' transport error after {} batch(es): {e}\n\
-                         Note: writes do not fall back to local.\n",
+            match runtime.block_on(api.ingest_batch(req)) {
+                Ok(resp) => resp,
+                Err(e) => {
+                    let msg = format!(
+                        "remote '{}' transport error after {} batch(es): {e}",
                         remote_name, batches_sent
-                    ),
-                )
-            })?;
+                    );
+                    let output = if dual_write {
+                        format!(
+                            "  Remote replication: failed — {msg}\n\
+                             Note: the local mine completed successfully; remote replication was interrupted.\n"
+                        )
+                    } else {
+                        format!(
+                            "{msg}\n\
+                             Note: writes do not fall back to local.\n"
+                        )
+                    };
+                    return if dual_write { CliOutput::success(output) } else { CliOutput::failure(1, output) };
+                }
+            };
 
         batches_sent += 1;
 
@@ -950,9 +990,10 @@ fn execute_remote_mine(
         &all_warnings,
         &failed_files,
         branch_warning.as_deref(),
+        dual_write,
     );
 
-    Ok(CliOutput::success(output))
+    CliOutput::success(output)
 }
 
 /// Split a flat list of [`IngestFileDto`] into batches bounded by `max_files`
@@ -1007,12 +1048,14 @@ fn render_remote_mine_summary(
     warnings: &[String],
     failed_files: &[(String, String)],
     branch_warning: Option<&str>,
+    dual_write: bool,
 ) -> String {
+    let mode_label = if dual_write { "replication (best-effort)" } else { "projects (remote)" };
     let mut lines = vec![
         format!("\n{}", "=".repeat(SEARCH_HEADER_WIDTH)),
         "  Mine complete".to_owned(),
         "=".repeat(SEARCH_HEADER_WIDTH),
-        "  Mode: projects (remote)".to_owned(),
+        format!("  Mode: {mode_label}"),
         format!("  Source: {}", source_dir.display()),
         format!("  Remote: {remote_name} ({remote_url})"),
         format!("  Wing: {wing}"),
@@ -1022,6 +1065,16 @@ fn render_remote_mine_summary(
         format!("  Files failed: {failed_count}"),
         format!("  Drawers written: {drawers_written}"),
     ];
+
+    if dual_write {
+        if failed_count > 0 {
+            lines.insert(1, "  Remote replication: partial — some files had errors".to_owned());
+            lines.insert(2, String::new());
+        } else {
+            lines.insert(1, "  Remote replication: succeeded".to_owned());
+            lines.insert(2, String::new());
+        }
+    }
 
     if !warnings.is_empty() {
         lines.push(String::new());

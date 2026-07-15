@@ -560,7 +560,8 @@ where
         let use_remote = !branch
             && (rule.mode == RouteMode::Remote
                 || (rule.mode == RouteMode::Combined
-                    && rule.write == WriteTarget::Remote));
+                    && (rule.write == WriteTarget::Remote
+                        || rule.write == WriteTarget::Both)));
 
         if use_remote {
             return execute_remote_mine(

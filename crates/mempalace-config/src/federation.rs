@@ -70,6 +70,8 @@ pub enum WriteTarget {
     Local,
     /// Writes go to the remote server.
     Remote,
+    /// Writes go to both local and remote (best-effort remote replication).
+    Both,
 }
 
 /// File-level routing rule for a wing or the knowledge graph.
@@ -927,8 +929,13 @@ mod tests {
             serde_json::from_str::<WriteTarget>("\"remote\"").unwrap(),
             WriteTarget::Remote
         );
+        assert_eq!(
+            serde_json::from_str::<WriteTarget>("\"both\"").unwrap(),
+            WriteTarget::Both
+        );
         assert_eq!(serde_json::to_string(&WriteTarget::Local).unwrap(), "\"local\"");
         assert_eq!(serde_json::to_string(&WriteTarget::Remote).unwrap(), "\"remote\"");
+        assert_eq!(serde_json::to_string(&WriteTarget::Both).unwrap(), "\"both\"");
     }
 
     // ── 9. ProjectConfig YAML with routing ────────────────────────────────────

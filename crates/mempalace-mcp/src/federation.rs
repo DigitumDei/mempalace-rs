@@ -320,12 +320,9 @@ impl FederationRouter {
         let target_remote = match route.mode {
             RouteMode::Local => None,
             RouteMode::Remote => route.remote.as_deref(),
-            RouteMode::Combined => {
-                if route.write == WriteTarget::Remote {
-                    route.remote.as_deref()
-                } else {
-                    None
-                }
+            RouteMode::Combined => match route.write {
+                WriteTarget::Local => None,
+                WriteTarget::Remote | WriteTarget::Both => route.remote.as_deref(),
             }
         };
         let Some(remote_name) = target_remote else {
@@ -343,11 +340,19 @@ impl FederationRouter {
         match api.check_duplicate(pre_check_req).await {
             Ok(resp) if resp.is_duplicate => {
                 let mut matches = resp.matches.as_array().cloned().unwrap_or_default();
-                // Annotate each match with origin.
                 for m in &mut matches {
                     if let Some(obj) = m.as_object_mut() {
                         obj.insert("origin".to_owned(), json!(remote_name));
                     }
+                }
+                if route.write == WriteTarget::Both {
+                    tracing::warn!(
+                        remote = %remote_name,
+                        wing = %wing,
+                        room = %room,
+                        "add_drawer remote duplicate check hit for Both write; skipping remote add, proceeding locally"
+                    );
+                    return Ok(None);
                 }
                 return Ok(Some(json!({
                     "success": false,
@@ -355,16 +360,21 @@ impl FederationRouter {
                     "matches": matches,
                 })));
             }
-            Ok(_) => {
-                // Not a duplicate — proceed with add.
-            }
+            Ok(_) => {}
             Err(e) => {
+                if route.write == WriteTarget::Both {
+                    tracing::warn!(
+                        remote = %remote_name,
+                        "pre-add duplicate check failed for Both write (proceeding locally): {e}"
+                    );
+                    return Ok(None);
+                }
                 tracing::warn!(
                     remote = %remote_name,
                     "pre-add duplicate check failed (proceeding with add): {e}"
                 );
             }
-        }
+        };
 
         let req = AddDrawerRequest {
             wing: wing.to_owned(),
@@ -375,6 +385,17 @@ impl FederationRouter {
         };
         match api.add_drawer(req).await {
             Ok(resp) => {
+                if route.write == WriteTarget::Both {
+                    if !resp.success {
+                        tracing::warn!(
+                            remote = %remote_name,
+                            wing = %wing,
+                            room = %room,
+                            "add_drawer remote rejected for Both write; proceeding locally"
+                        );
+                    }
+                    return Ok(None);
+                }
                 // resp.success is true on 2xx; keep a defensive branch just in case.
                 if resp.success {
                     Ok(Some(json!({
@@ -394,6 +415,15 @@ impl FederationRouter {
                 }
             }
             Err(RemoteError::RemoteRejected { status: 409, .. }) => {
+                if route.write == WriteTarget::Both {
+                    tracing::warn!(
+                        remote = %remote_name,
+                        wing = %wing,
+                        room = %room,
+                        "add_drawer remote duplicate (409) for Both write; proceeding locally"
+                    );
+                    return Ok(None);
+                }
                 // Race condition: duplicate inserted between pre-check and add.
                 Ok(Some(json!({
                     "success": false,
@@ -402,9 +432,20 @@ impl FederationRouter {
                     "origin": remote_name,
                 })))
             }
-            Err(e) => Err(ToolError::Internal(McpError::Federation(format!(
-                "remote `{remote_name}` add_drawer failed: {e}"
-            )))),
+            Err(e) => {
+                if route.write == WriteTarget::Both {
+                    tracing::warn!(
+                        remote = %remote_name,
+                        wing = %wing,
+                        room = %room,
+                        "add_drawer remote failed for Both write (proceeding locally): {e}"
+                    );
+                    return Ok(None);
+                }
+                Err(ToolError::Internal(McpError::Federation(format!(
+                    "remote `{remote_name}` add_drawer failed: {e}"
+                ))))
+            }
         }
     }
 
@@ -842,12 +883,9 @@ impl FederationRouter {
         let target_remote = match route.mode {
             RouteMode::Local => None,
             RouteMode::Remote => route.remote.as_deref(),
-            RouteMode::Combined => {
-                if route.write == WriteTarget::Remote {
-                    route.remote.as_deref()
-                } else {
-                    None
-                }
+            RouteMode::Combined => match route.write {
+                WriteTarget::Local => None,
+                WriteTarget::Remote | WriteTarget::Both => route.remote.as_deref(),
             }
         };
         let Some(remote_name) = target_remote else {
@@ -864,14 +902,29 @@ impl FederationRouter {
         };
         match api.kg_add_fact(req).await {
             Ok(mut resp) => {
+                if route.write == WriteTarget::Both {
+                    return Ok(None);
+                }
                 if let Some(obj) = resp.as_object_mut() {
                     obj.insert("applied_to".to_owned(), json!(format_remote_origin(remote_name)));
                 }
                 Ok(Some(resp))
             }
-            Err(e) => Err(ToolError::Internal(McpError::Federation(format!(
-                "remote `{remote_name}` kg_add_fact failed: {e}"
-            )))),
+            Err(e) => {
+                if route.write == WriteTarget::Both {
+                    tracing::warn!(
+                        remote = %remote_name,
+                        subject = %subject,
+                        predicate = %predicate,
+                        object = %object,
+                        "kg_add_fact remote failed for Both write (proceeding locally): {e}"
+                    );
+                    return Ok(None);
+                }
+                Err(ToolError::Internal(McpError::Federation(format!(
+                    "remote `{remote_name}` kg_add_fact failed: {e}"
+                ))))
+            }
         }
     }
 
@@ -886,12 +939,9 @@ impl FederationRouter {
         let target_remote = match route.mode {
             RouteMode::Local => None,
             RouteMode::Remote => route.remote.as_deref(),
-            RouteMode::Combined => {
-                if route.write == WriteTarget::Remote {
-                    route.remote.as_deref()
-                } else {
-                    None
-                }
+            RouteMode::Combined => match route.write {
+                WriteTarget::Local => None,
+                WriteTarget::Remote | WriteTarget::Both => route.remote.as_deref(),
             }
         };
         let Some(remote_name) = target_remote else {
@@ -908,14 +958,29 @@ impl FederationRouter {
         };
         match api.kg_invalidate(req).await {
             Ok(mut resp) => {
+                if route.write == WriteTarget::Both {
+                    return Ok(None);
+                }
                 if let Some(obj) = resp.as_object_mut() {
                     obj.insert("applied_to".to_owned(), json!(format_remote_origin(remote_name)));
                 }
                 Ok(Some(resp))
             }
-            Err(e) => Err(ToolError::Internal(McpError::Federation(format!(
-                "remote `{remote_name}` kg_invalidate failed: {e}"
-            )))),
+            Err(e) => {
+                if route.write == WriteTarget::Both {
+                    tracing::warn!(
+                        remote = %remote_name,
+                        subject = %subject,
+                        predicate = %predicate,
+                        object = %object,
+                        "kg_invalidate remote failed for Both write (proceeding locally): {e}"
+                    );
+                    return Ok(None);
+                }
+                Err(ToolError::Internal(McpError::Federation(format!(
+                    "remote `{remote_name}` kg_invalidate failed: {e}"
+                ))))
+            }
         }
     }
 

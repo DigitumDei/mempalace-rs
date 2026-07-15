@@ -1854,6 +1854,121 @@ async fn add_drawer_both_duplicate_replication() {
     );
 }
 
+// ─── Test 12b: add_drawer_both_near_duplicate_same_wing_room_rejected ──────────
+
+/// Combined/write:Both mode. A near-duplicate (different exact content but
+/// same semantic wing/room) must be rejected with `success: false,
+/// reason: "duplicate"` and must NOT attempt remote replication.
+///
+/// Regression test: the retry-reuse predicate must check content_hash in
+/// addition to wing+room, otherwise a near-duplicate is incorrectly
+/// treated as an idempotent retry.
+#[tokio::test]
+async fn add_drawer_both_near_duplicate_same_wing_room_rejected() {
+    let dead_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let dead_addr = dead_listener.local_addr().unwrap();
+    drop(dead_listener);
+    let dead_url = format!("http://{dead_addr}");
+
+    let local_dir = TempDir::new().unwrap();
+
+    let mut remotes = BTreeMap::new();
+    remotes.insert(
+        "hub".to_owned(),
+        ResolvedRemote {
+            name: "hub".to_owned(),
+            url: dead_url,
+            token: Some(TEST_TOKEN.to_owned()),
+            timeout: Duration::from_millis(500),
+        },
+    );
+
+    let mut wing_rules = BTreeMap::new();
+    wing_rules.insert("wing_both_near_dup".to_owned(), combined_wing_rule_both_write());
+
+    let federation = FederationRuntimeConfig {
+        remotes,
+        default_mode: RouteMode::Local,
+        default_remote: None,
+        wings: wing_rules,
+        kg: None,
+    };
+
+    let config = MempalaceConfig {
+        schema_version: 1,
+        collection_name: "mempalace_drawers".to_owned(),
+        palace_path: local_dir.path().join("palace"),
+        embedding_profile: EmbeddingProfile::Balanced,
+        low_cpu: LowCpuRuntimeConfig::defaults_for_profile(EmbeddingProfile::Balanced),
+        server: ServerRuntimeConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            token_file: local_dir.path().join("server_tokens.json"),
+            checkouts: std::collections::BTreeMap::new(),
+        },
+        federation,
+    };
+
+    let server =
+        McpServer::from_parts(config, DeterministicStubProvider::new(EmbeddingProfile::Balanced))
+            .await
+            .unwrap();
+
+    // ── First add: content A ────────────────────────────────────────────────
+    let content_a = "near duplicate alpha content that is semantically similar";
+    let first = call_tool(
+        &server,
+        1,
+        "mempalace_add_drawer",
+        json!({
+            "wing": "wing_both_near_dup",
+            "room": "near-dup-room",
+            "content": content_a,
+            "added_by": "near-dup-test"
+        }),
+    )
+    .await;
+
+    // Local write must succeed (remote is down, replication will fail — that's OK).
+    assert_eq!(first["success"], true, "first add must succeed locally: {first}");
+
+    // ── Second add: content B — near-duplicate in same wing/room ────────────
+    // This content produces the same deterministic embedding vector as content A
+    // (both fall into the "other" keyword category), so semantic search finds it.
+    // But the exact text differs, so content_hash differs.
+    let content_b = "near duplicate beta content that is semantically similar";
+    let second = call_tool(
+        &server,
+        2,
+        "mempalace_add_drawer",
+        json!({
+            "wing": "wing_both_near_dup",
+            "room": "near-dup-room",
+            "content": content_b,
+            "added_by": "near-dup-test"
+        }),
+    )
+    .await;
+
+    // Near-duplicate must be rejected — different content_hash prevents retry reuse.
+    assert_eq!(second["success"], false, "near-duplicate must be rejected: {second}");
+    assert_eq!(
+        second["reason"], "duplicate",
+        "near-duplicate must report reason=duplicate; got: {second}"
+    );
+
+    // No replication must be attempted for a rejected duplicate.
+    assert!(
+        second.get("replication").is_none(),
+        "rejected near-duplicate must not include a replication field; got: {second}"
+    );
+
+    // No warnings for a rejected duplicate.
+    assert!(
+        second.get("warnings").is_none(),
+        "rejected near-duplicate must not include warnings; got: {second}"
+    );
+}
+
 // ─── Test 13: add_drawer_both_replication_fails_with_down_remote ────────────
 
 /// Combined/write:Both wing rule with the remote down (dead address).

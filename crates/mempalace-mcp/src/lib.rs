@@ -1117,6 +1117,7 @@ where
         let content = required_string(arguments, "content")?;
         let source_file = optional_string(arguments, "source_file")?.unwrap_or_default();
         let added_by = optional_string(arguments, "added_by")?.unwrap_or_else(|| "mcp".to_owned());
+        let content_hash = hash_text(&content);
 
         // ── Resolve federation route once, reuse for dual-write decisions ──
         let route = self.federation.as_ref().map(|router| {
@@ -1160,6 +1161,9 @@ where
                 if let Some(existing) = duplicates.iter().find(|d| {
                     d.get("wing").and_then(|w| w.as_str()) == Some(wing.as_str())
                         && d.get("room").and_then(|r| r.as_str()) == Some(room.as_str())
+                        && d.get("content_hash")
+                            .and_then(|h| h.as_str())
+                            == Some(content_hash.as_str())
                 }) {
                     let existing_drawer_id = existing["id"].as_str().unwrap_or("");
                     let mut result = json!({

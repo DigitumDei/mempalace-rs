@@ -1785,6 +1785,7 @@ where
                 "room": r.room,
                 "similarity": r.score,
                 "content": snippet,
+                "content_hash": r.content_hash,
             })
         })
         .collect())

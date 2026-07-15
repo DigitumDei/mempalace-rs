@@ -260,6 +260,7 @@ where
                 content: entry.record.content.clone(),
                 source_file: source_label(&entry.record.source_file).to_owned(),
                 stale: entry.stale,
+                content_hash: Some(entry.record.content_hash.clone()),
             })
             .collect())
     }
@@ -1352,6 +1353,7 @@ mod tests {
                         .to_owned(),
                     source_file: "team.txt".to_owned(),
                     stale: false,
+                    content_hash: None,
                 },
                 mempalace_core::SearchResult {
                     drawer_id: None,
@@ -1362,6 +1364,7 @@ mod tests {
                         .to_owned(),
                     source_file: "code.txt".to_owned(),
                     stale: false,
+                    content_hash: None,
                 },
             ],
             None,

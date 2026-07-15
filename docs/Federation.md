@@ -238,6 +238,8 @@ local-first protocol:
    carries a `replication` field typed as
    [`ReplicationStatus`](Config-Schema.md#replicationstatus):
    - `{"status": "replicated", "remote": "<name>"}` — remote succeeded.
+   - `{"status": "converged", "remote": "<name>"}` — remote already had
+     the exact content (content-hash match); state is converged.
    - `{"status": "failed", "remote": "<name>", "reason": "..."}` — remote
      failed; the local write is unaffected.
    Non-`both` routes and diary-local writes omit the `replication` field

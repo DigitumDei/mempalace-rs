@@ -63,7 +63,7 @@ use federation::FederationRouter;
 //   complete first, then a best-effort remote replication is attempted via the
 //   corresponding `*_replicate` method (`add_drawer_replicate`, `kg_add_replicate`,
 //   `kg_invalidate_replicate`). The response carries a `replication` field with
-//   `ReplicationStatus` — `replicated` or `failed`. The `replication` field is
+//   `ReplicationStatus` — `replicated`, `converged`, or `failed`. The `replication` field is
 //   absent for non-`both` routes and diary-local writes. The remote failure
 //   never blocks or rolls back the local write.
 //
@@ -1791,6 +1791,7 @@ where
                     "room": result.room,
                     "similarity": round_similarity(result.score),
                     "content": snippet,
+                    "content_hash": result.content_hash,
                 })
             })
             .collect())

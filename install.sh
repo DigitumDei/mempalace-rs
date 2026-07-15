@@ -28,7 +28,16 @@ while [ $# -gt 0 ]; do
             INSTALL_DIR="$1"
             ;;
         -h|--help)
-            sed -n '2,12p' "$0" 2>/dev/null || true
+            cat <<'EOF'
+MemPalace installer — downloads the nightly build for this platform,
+verifies checksums, installs to ~/.mempalace/bin, and registers the MCP
+server with detected AI tools.
+
+Options (pass via `sh -s -- <flags>` when piping):
+  --no-setup           skip `mempalace-cli setup` (MCP registration)
+  --no-path            skip adding the install dir to your shell PATH
+  --install-dir <dir>  install somewhere other than ~/.mempalace/bin
+EOF
             exit 0
             ;;
         *) echo "error: unknown option: $1" >&2; exit 1 ;;
@@ -53,7 +62,7 @@ case "${OS}/${ARCH}" in
 esac
 
 if [ "${PLATFORM}" = "linux-x86_64" ] && command -v ldd >/dev/null 2>&1; then
-    GLIBC_VERSION="$(ldd --version 2>/dev/null | head -n1 | grep -oE '[0-9]+\.[0-9]+$' || true)"
+    GLIBC_VERSION="$(ldd --version 2>/dev/null | head -n1 | grep -oE '[0-9]+\.[0-9]+' | head -n1 || true)"
     if [ -n "${GLIBC_VERSION}" ]; then
         GLIBC_MAJOR="${GLIBC_VERSION%%.*}"
         GLIBC_MINOR="${GLIBC_VERSION#*.}"
@@ -90,10 +99,10 @@ grep -E "^[0-9a-fA-F]{64} [ *](${CLI_ASSET}|${MCP_ASSET})\$" "${TMP_DIR}/SHA256S
 [ "$(wc -l < "${TMP_DIR}/SHA256SUMS.filtered")" -eq 2 ] \
     || err "SHA256SUMS is missing entries for ${PLATFORM} assets"
 if command -v sha256sum >/dev/null 2>&1; then
-    (cd "${TMP_DIR}" && sha256sum --strict -c SHA256SUMS.filtered >/dev/null) \
+    (cd "${TMP_DIR}" && sha256sum -c SHA256SUMS.filtered >/dev/null) \
         || err "checksum verification FAILED — aborting install"
 else
-    (cd "${TMP_DIR}" && shasum -a 256 --strict -c SHA256SUMS.filtered >/dev/null) \
+    (cd "${TMP_DIR}" && shasum -a 256 -c SHA256SUMS.filtered >/dev/null) \
         || err "checksum verification FAILED — aborting install"
 fi
 

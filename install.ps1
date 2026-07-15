@@ -30,7 +30,7 @@ $repo = 'DigitumDei/mempalace-rs'
 $releaseUrl = "https://github.com/$repo/releases/download/nightly"
 $assets = @('mempalace-cli-windows-x86_64.exe', 'mempalace-mcp-windows-x86_64.exe')
 
-if ($env:PROCESSOR_ARCHITECTURE -ne 'AMD64') {
+if ($env:PROCESSOR_ARCHITECTURE -ne 'AMD64' -and $env:PROCESSOR_ARCHITEW6432 -ne 'AMD64') {
     throw "Unsupported architecture: $env:PROCESSOR_ARCHITECTURE. Nightly builds cover Windows x86_64 only. Build from source instead: https://github.com/$repo/blob/main/docs/Quickstart.md"
 }
 

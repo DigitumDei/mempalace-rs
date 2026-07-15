@@ -513,6 +513,12 @@ where
     Ok(CliOutput::success(lines.join("\n")))
 }
 
+enum ExecPlan {
+    Local,
+    Remote(mempalace_config::ResolvedRouteRule),
+    Both(mempalace_config::ResolvedRouteRule),
+}
+
 fn execute_mine<F, P>(
     dir: &Path,
     mode: CliMode,
@@ -542,59 +548,118 @@ where
     let config = load_runtime_config(palace_override, context).map_err(config_error)?;
     let runtime = build_runtime(&config).map_err(runtime_error)?;
 
-    // ── Routing decision (projects mode only) ────────────────────────────────
-    let mut is_both = false;
-    let mut both_rule: Option<mempalace_config::ResolvedRouteRule> = None;
-
-    if mode == CliMode::Projects {
-        let project_config =
-            ConfigLoader::load_project_config(&source_dir).map_err(config_error)?;
-        let wing_name = wing
-            .clone()
-            .unwrap_or_else(|| project_config.wing.clone());
-
-        let rule = resolve_route(
-            &config.federation,
-            project_config.routing.as_ref(),
-            RouteQuery { wing: Some(&wing_name), room: None, source_file: None },
-        );
-
-        let use_remote = !branch
-            && (rule.mode == RouteMode::Remote
-                || (rule.mode == RouteMode::Combined
-                    && rule.write == WriteTarget::Remote));
-
-        if use_remote {
-            return execute_remote_mine(
-                &source_dir,
-                wing,
-                &agent,
-                limit,
-                dry_run,
-                batch_size,
-                &config,
-                &runtime,
-                &rule,
-            );
-        }
-
-        // Both: do local mine first, then attempt best-effort remote replication.
-        is_both = !branch
-            && rule.mode == RouteMode::Combined
-            && rule.write == WriteTarget::Both;
-        both_rule = if is_both { Some(rule) } else { None };
-    } else {
-        // Convos mode: --branch is not supported; remote routing is not supported.
-        if branch {
-            return Ok(CliOutput::failure(
-                1,
-                "--branch requires --mode projects; branch-delta mining is not supported for conversations\n",
-            ));
-        }
-        // Conversation mining is always local.
+    // Convos mode: --branch is not supported; remote routing is not supported.
+    if mode == CliMode::Convos && branch {
+        return Ok(CliOutput::failure(
+            1,
+            "--branch requires --mode projects; branch-delta mining is not supported for conversations\n",
+        ));
     }
 
-    // ── Local mine path (unchanged from before for federation-absent/local-route) ─
+    let plan = resolve_plan(&source_dir, mode, &wing, branch, &config)?;
+
+    match plan {
+        ExecPlan::Remote(rule) => execute_remote_mine(
+            &source_dir, wing, &agent, limit, dry_run, batch_size, &config, &runtime, &rule,
+        ),
+        ExecPlan::Both(rule) => {
+            let (_local_summary, local_output) = execute_local_mine(
+                &source_dir, mode, wing.clone(), agent.clone(), limit, dry_run, reindex,
+                extract, branch, batch_size, &config, &runtime, &provider_factory,
+            )?;
+
+            let remote_result = execute_remote_mine(
+                &source_dir, wing, &agent, limit, dry_run, batch_size, &config, &runtime, &rule,
+            );
+
+            let combined = match remote_result {
+                Ok(output) if output.exit_code == 0 => {
+                    format!("{}\n  Remote replication: succeeded\n{}", local_output.trim(), output.stdout.trim())
+                }
+                Ok(output) => {
+                    format!("{}\n  Remote replication: failed — {}\n", local_output.trim(), output.stderr.trim())
+                }
+                Err(e) => {
+                    format!("{}\n  Remote replication: failed — {}\n", local_output.trim(), e)
+                }
+            };
+            Ok(CliOutput::success(combined))
+        }
+        ExecPlan::Local => {
+            let (_summary, local_output) = execute_local_mine(
+                &source_dir, mode, wing, agent, limit, dry_run, reindex, extract, branch,
+                batch_size, &config, &runtime, &provider_factory,
+            )?;
+            Ok(CliOutput::success(local_output))
+        }
+    }
+}
+
+/// Resolve the execution plan for a mine operation.
+///
+/// Returns [`ExecPlan::Local`] for conversations, `--branch`, and local-only
+/// routes. Returns [`ExecPlan::Remote`] for remote-only or combined+write:remote
+/// routes. Returns [`ExecPlan::Both`] for combined+write:both dual-write routes.
+fn resolve_plan(
+    source_dir: &Path,
+    mode: CliMode,
+    wing: &Option<String>,
+    branch: bool,
+    config: &MempalaceConfig,
+) -> Result<ExecPlan, clap::Error> {
+    if mode != CliMode::Projects || branch {
+        // Conversations and --branch are always local.
+        return Ok(ExecPlan::Local);
+    }
+
+    let project_config =
+        ConfigLoader::load_project_config(source_dir).map_err(config_error)?;
+    let wing_name = wing
+        .clone()
+        .unwrap_or_else(|| project_config.wing.clone());
+
+    let rule = resolve_route(
+        &config.federation,
+        project_config.routing.as_ref(),
+        RouteQuery { wing: Some(&wing_name), room: None, source_file: None },
+    );
+
+    if rule.mode == RouteMode::Remote
+        || (rule.mode == RouteMode::Combined && rule.write == WriteTarget::Remote)
+    {
+        Ok(ExecPlan::Remote(rule))
+    } else if rule.mode == RouteMode::Combined && rule.write == WriteTarget::Both {
+        Ok(ExecPlan::Both(rule))
+    } else {
+        Ok(ExecPlan::Local)
+    }
+}
+
+/// Execute the local mine path: open storage, run ingestion, render summary.
+///
+/// Used by [`ExecPlan::Local`] and [`ExecPlan::Both`] to perform the local
+/// ingestion. For `--branch` mode this is the only execution step; remote
+/// replication is never attempted for branch-delta mining.
+#[allow(clippy::too_many_arguments)]
+fn execute_local_mine<F, P>(
+    source_dir: &Path,
+    mode: CliMode,
+    wing: Option<String>,
+    agent: String,
+    limit: usize,
+    dry_run: bool,
+    reindex: bool,
+    extract: CliExtractMode,
+    branch: bool,
+    batch_size: Option<usize>,
+    config: &MempalaceConfig,
+    runtime: &tokio::runtime::Runtime,
+    provider_factory: &F,
+) -> Result<(IngestSummary, String), clap::Error>
+where
+    F: Fn(EmbeddingProfile, PathBuf) -> Result<P, Box<dyn std::error::Error>>,
+    P: EmbeddingProvider,
+{
     let use_temp_storage = dry_run && !palace_exists(&config.palace_path);
     let dry_run_storage =
         if use_temp_storage { Some(tempfile::tempdir().map_err(io_error)?) } else { None };
@@ -606,10 +671,6 @@ where
     let mut provider = provider_factory(config.embedding_profile, default_embedding_cache_dir())
         .map_err(provider_error)?;
 
-    // `--batch-size N` (N>0) caps the chunks embedded per batch, letting low-spec
-    // machines bound peak memory/CPU. It overrides the low_cpu default; when unset
-    // we keep prior behavior (low_cpu's batch size if enabled, else embed each
-    // file's chunks in a single batch).
     let max_embed_batch_size = batch_size.filter(|&n| n > 0).or_else(|| {
         config
             .low_cpu
@@ -623,7 +684,7 @@ where
                 &engine,
                 &mut provider,
                 &ProjectIngestRequest {
-                    project_dir: source_dir.clone(),
+                    project_dir: source_dir.to_path_buf(),
                     wing: wing.clone(),
                     agent: agent.clone(),
                     limit: if limit == 0 { None } else { Some(limit) },
@@ -639,7 +700,7 @@ where
                 &engine,
                 &mut provider,
                 &ConversationIngestRequest {
-                    convo_dir: source_dir.clone(),
+                    convo_dir: source_dir.to_path_buf(),
                     wing: wing.clone(),
                     agent: agent.clone(),
                     extract_mode: match extract {
@@ -655,45 +716,8 @@ where
             .map_err(ingest_error)?,
     };
 
-    // ── Both-mode replication: best-effort remote mine after local ───────────
-    if is_both {
-        if let Some(ref rule) = both_rule {
-            let local_lines = render_mine_summary(
-                mode, &source_dir, &config.palace_path, dry_run, &summary,
-            );
-            let remote_result = execute_remote_mine(
-                &source_dir,
-                wing,
-                &agent,
-                limit,
-                dry_run,
-                batch_size,
-                &config,
-                &runtime,
-                rule,
-            );
-            let combined = match remote_result {
-                Ok(output) if output.exit_code == 0 => {
-                    format!("{}\n  Remote replication: succeeded\n{}", local_lines.trim(), output.stdout.trim())
-                }
-                Ok(output) => {
-                    format!("{}\n  Remote replication: failed — {}\n", local_lines.trim(), output.stderr.trim())
-                }
-                Err(e) => {
-                    format!("{}\n  Remote replication: failed — {}\n", local_lines.trim(), e)
-                }
-            };
-            return Ok(CliOutput::success(combined));
-        }
-    }
-
-    Ok(CliOutput::success(render_mine_summary(
-        mode,
-        &source_dir,
-        &config.palace_path,
-        dry_run,
-        &summary,
-    )))
+    let rendered = render_mine_summary(mode, source_dir, &config.palace_path, dry_run, &summary);
+    Ok((summary, rendered))
 }
 
 /// Map an [`IngestError`] to a clap error, giving a friendly message for

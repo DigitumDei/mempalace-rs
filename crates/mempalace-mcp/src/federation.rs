@@ -6,7 +6,7 @@ use mempalace_config::{
     FederationRuntimeConfig, ReplicationStatus, ResolvedRouteRule, RouteMode, WriteTarget,
     resolve_kg_route, resolve_route, RouteQuery,
 };
-use mempalace_core::{DIARY_ROOM, SHARED_AGENT_DIARY_WING};
+use mempalace_core::{DIARY_ROOM, DIARY_TOPIC_PREFIX, SHARED_AGENT_DIARY_WING};
 use mempalace_federation::{
     AddDrawerRequest, ChangesQuery, DrawerSearchRequest, RemoteDrawerResult,
 };
@@ -320,15 +320,20 @@ impl FederationRouter {
 
     // ─── Add drawer ──────────────────────────────────────────────────────────────
 
-    /// Route an add-drawer operation. Returns `None` when the caller should
-    /// execute locally; `Some(remote_result)` when routed to a remote.
+    /// Route an add-drawer operation to a remote server.
     ///
-    /// Callers MUST filter `write:both` routes before calling this method
-    /// (use [`Self::is_dual_write`] to check). This method handles:
-    /// - `Local` mode → returns `None`
-    /// - `Remote` mode → sends the add to the configured remote
+    /// Returns `Some(remote_result)` when the write is routed to a remote;
+    /// `None` when the caller should execute locally.
+    ///
+    /// - `Local` → returns `Ok(None)`
+    /// - `Remote` → sends the add to the configured remote
     /// - `Combined + write:remote` → sends the add to the configured remote
     /// - `Combined + write:both` → returns `None` (defensive; callers should skip)
+    ///
+    /// **Diary guard:** Diary-shaped drawers (`wing == SHARED_AGENT_DIARY_WING`,
+    /// `room == DIARY_ROOM`, or `source_file` starting with
+    /// `DIARY_TOPIC_PREFIX`) are never written remotely — returns `Ok(None)`
+    /// immediately.
     ///
     /// Pre-add duplicate check is performed before posting the add request; if
     /// the duplicate check itself fails (transport error) a warning is emitted
@@ -343,6 +348,14 @@ impl FederationRouter {
         route: &ResolvedRouteRule,
         duplicate_threshold: f32,
     ) -> ToolResult<Option<Value>> {
+        // ── Diary guard: diary-shaped drawers never write remotely ──────────
+        if wing == SHARED_AGENT_DIARY_WING
+            || room == DIARY_ROOM
+            || source_file.starts_with(DIARY_TOPIC_PREFIX)
+        {
+            return Ok(None);
+        }
+
         // ── Resolve the target remote for remote-only writes ───────────────
         // Dual-write (Both) routes are handled by add_drawer_replicate and
         // should not reach this method. We keep Both as a defensive arm.
@@ -442,8 +455,9 @@ impl FederationRouter {
     /// [`ReplicationStatus::Replicated`].  Never blocks the caller from the
     /// local write path.
     ///
-    /// **Diary guard:** Diary-shaped drawers (`wing == SHARED_AGENT_DIARY_WING`
-    /// or `room == DIARY_ROOM`) are never replicated remotely — returns
+    /// **Diary guard:** Diary-shaped drawers (`wing == SHARED_AGENT_DIARY_WING`,
+    /// `room == DIARY_ROOM`, or `source_file` starting with
+    /// `DIARY_TOPIC_PREFIX`) are never replicated remotely — returns
     /// [`ReplicationStatus::Skipped`] immediately.
     pub async fn add_drawer_replicate(
         &self,
@@ -456,7 +470,10 @@ impl FederationRouter {
         duplicate_threshold: f32,
     ) -> ReplicationStatus {
         // ── Diary guard: diary-shaped drawers never replicate ──────────────
-        if wing == SHARED_AGENT_DIARY_WING || room == DIARY_ROOM {
+        if wing == SHARED_AGENT_DIARY_WING
+            || room == DIARY_ROOM
+            || source_file.starts_with(DIARY_TOPIC_PREFIX)
+        {
             return ReplicationStatus::Skipped;
         }
 
@@ -2209,6 +2226,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn e2e_add_drawer_replicate_skipped_for_diary_source_file() {
+        let mock = MockRemote::default();
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+
+        let route = make_both_route("alpha");
+        let status = router
+            .add_drawer_replicate(
+                "wing_code", "room", "diary content", "diary:standup", "agent",
+                &route, 0.9,
+            )
+            .await;
+
+        assert_eq!(
+            status,
+            ReplicationStatus::Skipped,
+            "diary source_file should not replicate"
+        );
+    }
+
+    #[tokio::test]
     async fn e2e_add_drawer_replicate_succeeds_with_real_route_via_write_intent() {
         let mock = MockRemote::default();
         let mut remotes = BTreeMap::new();
@@ -2356,6 +2395,72 @@ mod tests {
             .unwrap();
 
         assert!(result.is_none(), "local route should not produce remote result");
+    }
+
+    #[tokio::test]
+    async fn e2e_add_drawer_remote_skipped_for_diary_wing() {
+        let mock = MockRemote::default();
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+
+        let route = make_combined_route("alpha");
+        let result = router
+            .add_drawer_remote(
+                SHARED_AGENT_DIARY_WING, "r", "content", "file.txt", "agent",
+                &route, 0.9,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            result.is_none(),
+            "diary wing should not write remotely"
+        );
+    }
+
+    #[tokio::test]
+    async fn e2e_add_drawer_remote_skipped_for_diary_room() {
+        let mock = MockRemote::default();
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+
+        let route = make_combined_route("alpha");
+        let result = router
+            .add_drawer_remote(
+                "wing_code", DIARY_ROOM, "content", "file.txt", "agent",
+                &route, 0.9,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            result.is_none(),
+            "diary room should not write remotely"
+        );
+    }
+
+    #[tokio::test]
+    async fn e2e_add_drawer_remote_skipped_for_diary_source_file() {
+        let mock = MockRemote::default();
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+
+        let route = make_combined_route("alpha");
+        let result = router
+            .add_drawer_remote(
+                "wing_code", "room", "content", "diary:standup", "agent",
+                &route, 0.9,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            result.is_none(),
+            "diary source_file should not write remotely"
+        );
     }
 
     #[tokio::test]

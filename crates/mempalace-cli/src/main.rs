@@ -2761,6 +2761,82 @@ mod tests {
         addr
     }
 
+    /// Spawn a minimal federation server whose `/v1/info` response does NOT
+    /// advertise the `ingest` capability. Used to test the unsupported-remote
+    /// guard in the dual-write path.
+    fn spawn_no_ingest_server(token: &str) -> std::net::SocketAddr {
+        use axum::{
+            Router, middleware,
+            extract::State,
+            http::{StatusCode, header},
+            response::IntoResponse,
+            routing::get,
+        };
+        use std::sync::Arc;
+
+        let token_dir = tempfile::tempdir().unwrap();
+        let token_file = write_test_token_file(token_dir.path(), token);
+        let tokens = mempalace_server::TokenRegistry::load(token_file).unwrap();
+        let tokens = Arc::new(tokens);
+
+        #[derive(Clone)]
+        struct NoIngestState {
+            tokens: Arc<mempalace_server::TokenRegistry>,
+        }
+
+        async fn auth(
+            State(state): State<NoIngestState>,
+            request: axum::http::Request<axum::body::Body>,
+            next: middleware::Next,
+        ) -> impl IntoResponse {
+            let token = request
+                .headers()
+                .get(header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "));
+            match token.and_then(|t| state.tokens.authenticate(t)) {
+                Some(_) => next.run(request).await.into_response(),
+                None => StatusCode::UNAUTHORIZED.into_response(),
+            }
+        }
+
+        async fn info() -> impl axum::response::IntoResponse {
+            axum::Json(mempalace_federation::InfoResponse {
+                server_version: env!("CARGO_PKG_VERSION").to_owned(),
+                federation_api_version: mempalace_federation::FEDERATION_API_VERSION,
+                embedding_profile: "balanced".to_owned(),
+                capabilities: vec![
+                    "drawers".to_owned(),
+                    "kg".to_owned(),
+                    "changes".to_owned(),
+                    "taxonomy".to_owned(),
+                ],
+            })
+        }
+
+        let state = NoIngestState { tokens };
+        let router = Router::new()
+            .route("/v1/info", get(info))
+            .layer(middleware::from_fn_with_state(state.clone(), auth))
+            .with_state(state);
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener =
+            rt.block_on(tokio::net::TcpListener::bind("127.0.0.1:0")).unwrap();
+        let addr = rt.block_on(async { listener.local_addr().unwrap() });
+        rt.spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        std::mem::forget(rt);
+        std::mem::forget(token_dir);
+
+        addr
+    }
+
     /// Write a CLI config.json with federation remotes pointing at `server_url`,
     /// with an inline `token`. Also writes a per-project mempalace.yaml.
     fn write_remote_cli_config(
@@ -3694,6 +3770,88 @@ mod tests {
             !mine.stdout.contains("Remote:"),
             "local-only route must not mention Remote: {}",
             mine.stdout
+        );
+
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn mine_combined_both_unsupported_remote() {
+        // combined + write:both where the remote server does NOT advertise the
+        // "ingest" capability — local mine must succeed, replication must be
+        // reported as skipped, and exit code must be 0.
+        const TOKEN: &str = "unsupported-remote-tok-008";
+        let workspace = tempdir().unwrap();
+
+        // Server without "ingest" capability.
+        let addr = spawn_no_ingest_server(TOKEN);
+        let server_url = format!("http://{addr}");
+
+        let project_dir = workspace.path().join("no-ingest-project");
+        fs::create_dir_all(&project_dir).unwrap();
+        write_file(
+            &project_dir.join("backend/auth.rs"),
+            "Auth login flow keeps auth checks in the backend service.\n"
+                .repeat(5)
+                .as_str(),
+        );
+        write_file(
+            &project_dir.join("docs/roadmap.md"),
+            "Roadmap plan tracks the migration milestones.\n".repeat(5).as_str(),
+        );
+
+        let config_root = temp_config_root("unsupported-remote");
+        let context = CliContext::for_tests(config_root.clone());
+        let palace_dir = config_root.join("palace");
+
+        run_cli(["init", project_dir.to_str().unwrap(), "--yes"], &context, stub_provider).unwrap();
+
+        let wing_name = "wing_noingestproject";
+        let remote_name = "hub";
+        write_combined_cli_config(
+            &config_root,
+            remote_name,
+            &server_url,
+            TOKEN,
+            wing_name,
+            &palace_dir,
+            &project_dir,
+        );
+
+        let context = CliContext::for_tests(config_root.clone());
+        let output = run_cli(
+            ["mine", project_dir.to_str().unwrap()],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+
+        // Exit code 0 — local success even though remote is unsupported.
+        assert_eq!(output.exit_code, 0, "combined mine failed: stderr={:?}", output.stderr);
+        assert!(
+            output.stdout.contains("Files ingested:"),
+            "local ingestion must appear: {}",
+            output.stdout
+        );
+        assert!(
+            output.stdout.contains("replication: skipped"),
+            "must report replication as skipped: {}",
+            output.stdout
+        );
+        assert!(
+            output.stdout.contains("does not support the ingest capability"),
+            "must identify unsupported ingest capability: {}",
+            output.stdout
+        );
+        assert!(
+            output.stdout.contains("Server capabilities: drawers, kg, changes, taxonomy"),
+            "must list server capabilities: {}",
+            output.stdout
+        );
+        assert!(
+            output.stdout.contains("local mine completed successfully"),
+            "must note local mine success: {}",
+            output.stdout
         );
 
         remove_dir_all_if_exists(&config_root);

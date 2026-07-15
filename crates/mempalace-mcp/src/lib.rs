@@ -1155,6 +1155,51 @@ where
 
         let duplicates = self.find_duplicates(&content, DEFAULT_DUPLICATE_THRESHOLD).await?;
         if !duplicates.is_empty() {
+            // ── Both-mode: same wing+room → retry, reuse local, retry remote ──
+            if is_both {
+                if let Some(existing) = duplicates.iter().find(|d| {
+                    d.get("wing").and_then(|w| w.as_str()) == Some(wing.as_str())
+                        && d.get("room").and_then(|r| r.as_str()) == Some(room.as_str())
+                }) {
+                    let existing_drawer_id = existing["id"].as_str().unwrap_or("");
+                    let mut result = json!({
+                        "success": true,
+                        "drawer_id": existing_drawer_id,
+                        "wing": wing,
+                        "room": room,
+                    });
+                    if self.federation.is_some() {
+                        if let Some(obj) = result.as_object_mut() {
+                            obj.insert("applied_to".to_owned(), json!("local"));
+                        }
+                    }
+                    if let Some(router) = &self.federation {
+                        if let Some(route) = &route {
+                            let replication = router
+                                .add_drawer_replicate(
+                                    wing.as_str(),
+                                    room.as_str(),
+                                    &content,
+                                    &source_file,
+                                    &added_by,
+                                    route,
+                                    DEFAULT_DUPLICATE_THRESHOLD,
+                                )
+                                .await;
+                            if let Some(obj) = result.as_object_mut() {
+                                obj.insert("replication".to_owned(), json!(replication));
+                                if matches!(replication, ReplicationStatus::Failed { .. }) {
+                                    obj.insert(
+                                        "warnings".to_owned(),
+                                        json!(["local content already existed; remote replication failed"]),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    return Ok(result);
+                }
+            }
             return Ok(json!({
                 "success": false,
                 "reason": "duplicate",

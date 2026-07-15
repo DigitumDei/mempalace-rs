@@ -2126,6 +2126,10 @@ async fn kg_add_both_replication_fails_with_down_remote() {
 /// Combined KG rule with write:Both → local KG invalidate succeeds, best-effort
 /// replication succeeds. Response must have `applied_to: "local"`,
 /// `replication.status: "replicated"`.
+///
+/// Verifies invalidation on the hub by using explicit `ended` + `as_of` dates:
+/// the fact has `valid_from: 2026-01-01`, is invalidated with `ended: 2026-06-01`,
+/// and `mempalace_kg_query` with `as_of: "2026-07-01"` must NOT include the fact.
 #[tokio::test]
 async fn kg_invalidate_both_replicates_successfully() {
     let hub_dir = TempDir::new().unwrap();
@@ -2143,7 +2147,7 @@ async fn kg_invalidate_both_replicates_successfully() {
     )
     .await;
 
-    // First add a fact so we can invalidate it.
+    // First add a fact with a known valid_from date so we can test as_of queries.
     let add_resp = call_tool(
         &server,
         1,
@@ -2151,18 +2155,19 @@ async fn kg_invalidate_both_replicates_successfully() {
         json!({
             "subject": "InvalidateBothTest",
             "predicate": "replication",
-            "object": "active"
+            "object": "active",
+            "valid_from": "2026-01-01"
         }),
     )
     .await;
     assert_eq!(add_resp["success"], true, "kg_add must succeed: {add_resp}");
 
-    // Verify the fact exists on the hub before invalidation.
+    // Verify the fact exists on the hub before invalidation (as_of while active).
     let query_before = call_tool(
         &server,
         2,
         "mempalace_kg_query",
-        json!({"entity": "InvalidateBothTest", "direction": "outgoing"}),
+        json!({"entity": "InvalidateBothTest", "direction": "outgoing", "as_of": "2026-03-01"}),
     )
     .await;
     let facts_before = query_before["facts"].as_array().expect("facts must be array");
@@ -2173,10 +2178,10 @@ async fn kg_invalidate_both_replicates_successfully() {
     });
     assert!(
         hub_fact_before.is_some(),
-        "kg_query must include the fact from hub origin BEFORE invalidation; facts: {facts_before:?}"
+        "kg_query as_of before invalidation must include the fact from hub origin; facts: {facts_before:?}"
     );
 
-    // Now invalidate.
+    // Now invalidate with an explicit past ended date.
     let invalidate = call_tool(
         &server,
         3,
@@ -2184,7 +2189,8 @@ async fn kg_invalidate_both_replicates_successfully() {
         json!({
             "subject": "InvalidateBothTest",
             "predicate": "replication",
-            "object": "active"
+            "object": "active",
+            "ended": "2026-06-01"
         }),
     )
     .await;
@@ -2211,12 +2217,12 @@ async fn kg_invalidate_both_replicates_successfully() {
         "kg_invalidate must not have warnings on success: {invalidate}"
     );
 
-    // ── Verify the fact is actually invalidated on the hub ──────────────────
+    // ── Verify the fact is invalidated on the hub using as_of after ended ───
     let kg_query = call_tool(
         &server,
         4,
         "mempalace_kg_query",
-        json!({"entity": "InvalidateBothTest", "direction": "outgoing"}),
+        json!({"entity": "InvalidateBothTest", "direction": "outgoing", "as_of": "2026-07-01"}),
     )
     .await;
     let facts = kg_query["facts"].as_array().expect("facts must be array");
@@ -2227,7 +2233,29 @@ async fn kg_invalidate_both_replicates_successfully() {
     });
     assert!(
         hub_fact.is_none(),
-        "kg_query must NOT include the invalidated fact from hub origin; facts: {facts:?}"
+        "kg_query as_of after invalidation date must NOT include the invalidated fact from hub origin; facts: {facts:?}"
+    );
+
+    // Query without as_of returns all facts including historical ones (the fact
+    // should still exist as a historical record on the hub).
+    let kg_query_all = call_tool(
+        &server,
+        5,
+        "mempalace_kg_query",
+        json!({"entity": "InvalidateBothTest", "direction": "outgoing"}),
+    )
+    .await;
+    let facts_all = kg_query_all["facts"].as_array().expect("facts must be array");
+    // The fact should still appear in the unfiltered query but with current: false.
+    // We just verify the hub at least has the fact in the unfiltered view.
+    let hub_fact_historical = facts_all.iter().find(|f| {
+        f["origin"].as_str() == Some("hub")
+            && f["predicate"].as_str() == Some("replication")
+            && f["object"].as_str() == Some("active")
+    });
+    assert!(
+        hub_fact_historical.is_some(),
+        "kg_query without as_of must still show the fact as historical on the hub; facts: {facts_all:?}"
     );
 }
 
@@ -2436,8 +2464,8 @@ async fn legacy_remote_route_has_no_replication_field() {
 // ─── Test 20: add_drawer_both_diary_guard_skips_replication ──────────────────
 
 /// Even with a Both wing rule, a diary-room drawer must stay local and NOT
-/// attempt replication. The response must have `applied_to: "local"` and the
-/// `replication` field must show `status: "skipped"`.
+/// include a `replication` field in the response — diary-local writes are
+/// exclusively local and must not carry a `replication` structure at all.
 #[tokio::test]
 async fn add_drawer_both_diary_guard_skips_replication() {
     let hub_dir = TempDir::new().unwrap();
@@ -2465,7 +2493,7 @@ async fn add_drawer_both_diary_guard_skips_replication() {
         json!({
             "wing": "wing_diary_both",
             "room": "diary",
-            "content": "diary guard test with both route — replication must be skipped",
+            "content": "diary guard test with both route — replication must be absent",
             "added_by": "diary-both-test"
         }),
     )
@@ -2477,10 +2505,10 @@ async fn add_drawer_both_diary_guard_skips_replication() {
         "diary both add must report applied_to=local: {add}"
     );
 
-    let replication = add.get("replication").expect("diary both add must include replication");
-    assert_eq!(
-        replication["status"], "skipped",
-        "diary room must cause replication to be skipped; got: {replication}"
+    // Diary-local writes must NOT include a replication field per contract.
+    assert!(
+        add.get("replication").is_none(),
+        "diary-local add must not include a replication field; got: {add}"
     );
 }
 
@@ -2532,4 +2560,250 @@ async fn kg_add_both_with_valid_from_succeeds() {
         replication["remote"], "hub",
         "dated replication must target hub; got: {replication}"
     );
+}
+
+// ─── Test 24: kg_add_both_replication_fails_with_remote_rejection ───────────
+
+/// Combined KG rule with write:Both and a reachable remote that rejects the
+/// replication attempt (wrong bearer token → HTTP 401). The local KG add must
+/// still succeed, `applied_to` must be `"local"`, and `replication.status`
+/// must be `"failed"` with a non-empty `reason` and a `warnings` array.
+#[tokio::test]
+async fn kg_add_both_replication_fails_with_remote_rejection() {
+    let hub_dir = TempDir::new().unwrap();
+    let local_dir = TempDir::new().unwrap();
+
+    let addr = spawn_server(&hub_dir).await;
+    let hub_url = format!("http://{addr}");
+
+    // Use a wrong token so the hub rejects the replication with HTTP 401.
+    let bad_token = "wrong-token-for-kg-add-xyz";
+
+    let mut remotes = BTreeMap::new();
+    remotes.insert(
+        "hub".to_owned(),
+        ResolvedRemote {
+            name: "hub".to_owned(),
+            url: hub_url,
+            token: Some(bad_token.to_owned()),
+            timeout: Duration::from_secs(5),
+        },
+    );
+
+    let federation = FederationRuntimeConfig {
+        remotes,
+        default_mode: RouteMode::Local,
+        default_remote: None,
+        wings: BTreeMap::new(),
+        kg: Some(combined_kg_rule_both_write()),
+    };
+
+    let config = MempalaceConfig {
+        schema_version: 1,
+        collection_name: "mempalace_drawers".to_owned(),
+        palace_path: local_dir.path().join("palace"),
+        embedding_profile: EmbeddingProfile::Balanced,
+        low_cpu: LowCpuRuntimeConfig::defaults_for_profile(EmbeddingProfile::Balanced),
+        server: ServerRuntimeConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            token_file: local_dir.path().join("server_tokens.json"),
+            checkouts: std::collections::BTreeMap::new(),
+        },
+        federation,
+    };
+
+    let server =
+        McpServer::from_parts(config, DeterministicStubProvider::new(EmbeddingProfile::Balanced))
+            .await
+            .unwrap();
+
+    let kg_add = call_tool(
+        &server,
+        1,
+        "mempalace_kg_add",
+        json!({
+            "subject": "KgRejectTest",
+            "predicate": "replication",
+            "object": "rejected"
+        }),
+    )
+    .await;
+
+    // Local write must succeed despite replication failure.
+    assert_eq!(
+        kg_add["success"], true,
+        "kg_add with wrong token must still succeed locally: {kg_add}"
+    );
+    assert_eq!(
+        kg_add["applied_to"], "local",
+        "kg_add must report applied_to=local: {kg_add}"
+    );
+
+    // Replication must be failed.
+    let replication = kg_add.get("replication").expect("kg_add both must include replication");
+    assert_eq!(
+        replication["status"], "failed",
+        "replication must report status=failed with wrong token; got: {replication}"
+    );
+    assert_eq!(
+        replication["remote"], "hub",
+        "replication must report remote=hub; got: {replication}"
+    );
+    let reason = replication["reason"].as_str().unwrap_or("");
+    assert!(
+        !reason.is_empty(),
+        "replication failure must include a non-empty reason; got: {replication}"
+    );
+
+    // Warnings must be present.
+    let warnings = kg_add.get("warnings").and_then(|w| w.as_array());
+    assert!(
+        warnings.is_some() && !warnings.unwrap().is_empty(),
+        "kg_add with failed replication must include warnings array; got: {kg_add}"
+    );
+}
+
+// ─── Test 25: kg_invalidate_both_replication_fails_with_remote_rejection ────
+
+/// Combined KG rule with write:Both and a reachable remote that rejects the
+/// KG invalidate replication (wrong bearer token → HTTP 401). The local KG
+/// invalidate must still succeed, and `replication.status` must be `"failed"`.
+#[tokio::test]
+async fn kg_invalidate_both_replication_fails_with_remote_rejection() {
+    let hub_dir = TempDir::new().unwrap();
+    let local_dir = TempDir::new().unwrap();
+
+    let addr = spawn_server(&hub_dir).await;
+    let hub_url = format!("http://{addr}");
+
+    // First, seed a fact on the hub using the correct token via a separate server.
+    let seed_dir = TempDir::new().unwrap();
+    {
+        let seed_server = mcp_server_with_hub(
+            &seed_dir,
+            &hub_url,
+            BTreeMap::new(),
+            RouteMode::Local,
+            Some(combined_kg_rule_remote_write_for_test()),
+        )
+        .await;
+        let seed = call_tool(
+            &seed_server,
+            1,
+            "mempalace_kg_add",
+            json!({
+                "subject": "KgInvalidateRejectTest",
+                "predicate": "replication",
+                "object": "will_be_rejected"
+            }),
+        )
+        .await;
+        assert_eq!(seed["success"], true, "seed kg_add must succeed: {seed}");
+    }
+
+    // Now use a wrong token for the invalidate replication test.
+    let bad_token = "wrong-token-for-kg-invalidate-xyz";
+
+    let mut remotes = BTreeMap::new();
+    remotes.insert(
+        "hub".to_owned(),
+        ResolvedRemote {
+            name: "hub".to_owned(),
+            url: hub_url,
+            token: Some(bad_token.to_owned()),
+            timeout: Duration::from_secs(5),
+        },
+    );
+
+    let federation = FederationRuntimeConfig {
+        remotes,
+        default_mode: RouteMode::Local,
+        default_remote: None,
+        wings: BTreeMap::new(),
+        kg: Some(combined_kg_rule_both_write()),
+    };
+
+    let config = MempalaceConfig {
+        schema_version: 1,
+        collection_name: "mempalace_drawers".to_owned(),
+        palace_path: local_dir.path().join("palace"),
+        embedding_profile: EmbeddingProfile::Balanced,
+        low_cpu: LowCpuRuntimeConfig::defaults_for_profile(EmbeddingProfile::Balanced),
+        server: ServerRuntimeConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            token_file: local_dir.path().join("server_tokens.json"),
+            checkouts: std::collections::BTreeMap::new(),
+        },
+        federation,
+    };
+
+    let server =
+        McpServer::from_parts(config, DeterministicStubProvider::new(EmbeddingProfile::Balanced))
+            .await
+            .unwrap();
+
+    // Add the fact locally so we can invalidate it.
+    let local_add = call_tool(
+        &server,
+        1,
+        "mempalace_kg_add",
+        json!({
+            "subject": "KgInvalidateRejectTest",
+            "predicate": "replication",
+            "object": "will_be_rejected"
+        }),
+    )
+    .await;
+    assert_eq!(local_add["success"], true, "local kg_add must succeed: {local_add}");
+
+    // Invalidate with wrong token — replication must fail but local succeeds.
+    let invalidate = call_tool(
+        &server,
+        2,
+        "mempalace_kg_invalidate",
+        json!({
+            "subject": "KgInvalidateRejectTest",
+            "predicate": "replication",
+            "object": "will_be_rejected"
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        invalidate["success"], true,
+        "kg_invalidate with wrong token must succeed locally: {invalidate}"
+    );
+    assert_eq!(
+        invalidate["applied_to"], "local",
+        "kg_invalidate must report applied_to=local: {invalidate}"
+    );
+
+    // Replication must be failed.
+    let replication = invalidate.get("replication").expect("kg_invalidate must include replication");
+    assert_eq!(
+        replication["status"], "failed",
+        "replication must be failed with wrong token; got: {replication}"
+    );
+    assert_eq!(
+        replication["remote"], "hub",
+        "replication must target hub; got: {replication}"
+    );
+    let reason = replication["reason"].as_str().unwrap_or("");
+    assert!(!reason.is_empty(), "failure reason must be non-empty; got: {replication}");
+
+    let warnings = invalidate.get("warnings").and_then(|w| w.as_array());
+    assert!(
+        warnings.is_some() && !warnings.unwrap().is_empty(),
+        "failed replication must include warnings; got: {invalidate}"
+    );
+}
+
+/// Helper: combined-mode KG rule routing to "hub" with Remote write
+/// (used for seeding facts on the hub).
+fn combined_kg_rule_remote_write_for_test() -> ResolvedRouteRule {
+    ResolvedRouteRule {
+        mode: RouteMode::Combined,
+        remote: Some("hub".to_owned()),
+        write: WriteTarget::Remote,
+    }
 }

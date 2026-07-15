@@ -32,7 +32,7 @@ MemPalace provides a palace-style memory store with:
 - Locator-based mined storage: project file chunks store byte/line ranges instead of duplicated text; snippets are resolved lazily from the checkout at read time with stale detection
 - Branch-delta mining (`mine --branch`): mines only files changed vs the merge-base with the default branch, plus untracked files — keeps the local palace in sync with ongoing branch work without re-ingesting the whole repo
 - Federated project mining: when a wing's route targets a remote palace, `mine` prepares chunks locally and pushes them to the remote server via `POST /v1/ingest/batch`; the server embeds and stores them, so teams can share a single mined index without distributing embedding workload to every client
-- Federation: an HTTP server (`mempalace-cli serve`) shares a palace with other clients; per-wing `local`/`remote`/`combined` routing merges remote and local results, with bearer-token auth — see the [Federation guide](docs/Federation.md)
+- Federation: an HTTP server (`mempalace-cli serve`) shares a palace with other clients; per-wing `local`/`remote`/`combined` routing merges remote and local results, with bearer-token auth and `write: both` local-first dual-write support — see the [Federation guide](docs/Federation.md)
 
 ## Crates
 

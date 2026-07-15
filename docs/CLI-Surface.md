@@ -50,6 +50,7 @@ Behavior:
 - In low-CPU mode, ingest batching is clamped by the resolved low-CPU runtime config. An explicit `--batch-size` overrides that clamp (it takes precedence over the low-CPU default).
 - `--reindex` bypasses the unchanged-content skip in both `projects` and `convos` modes.
 - When the wing's federation route targets a remote palace (mode `remote`, or mode `combined` with `write: remote`) and `--branch` is not set, the CLI prepares chunks locally and pushes them to `POST /v1/ingest/batch` on the remote server. The remote must advertise the `"ingest"` capability in `GET /v1/info`; older servers that lack this endpoint return a 404, which surfaces as a `RemoteRejected` error with a prompt to upgrade.
+- When the wing's federation route is `combined` with `write: both` and `--branch` is not set, the CLI performs a **local-first dual-write**: the full local mine (embedding, storage, summary) runs first, then a best-effort remote push is attempted. The remote result is appended to the mine output; a remote failure is reported without rolling back the local mine. See [Federation guide](Federation.md#write-both--local-first-dual-write-semantics) for the full semantics.
 - `--branch` overrides any remote route for the wing — branch-delta mining is always local.
 
 ### `search <query>`

@@ -30,6 +30,14 @@ it all locally for dev testing.
   - `remote` — served only from the named remote.
   - `combined` — local and remote are merged on read; `write` selects which side
     new writes go to.
+- **Write target** — only meaningful in `combined` mode:
+  - `local` — writes go to the local palace only (default).
+  - `remote` — writes go to the remote palace only.
+  - `both` — **local-first dual-write**: writes go to the local palace first,
+    then best-effort remote replication is attempted. The remote leg is
+    non-blocking for the caller: success or failure is reported as a
+    `replication` status on the response, never preventing the local write from
+    completing.
 - **Wing name is the join key.** The same wing name on both sides is treated as
   one combined wing. There is no separate handshake to "link" wings — naming them
   identically is the link.
@@ -37,9 +45,12 @@ it all locally for dev testing.
   across origins (round-robin), because similarity scores are not comparable
   across embedding profiles. Every result is annotated with its `origin`
   (`local` or `remote:<name>`).
-- **Reads degrade, writes do not.** A remote that is unreachable during a read is
-  reported as a warning and skipped — the local side still returns. A write to a
-  down remote is an explicit error with **no silent local fallback**.
+- **Reads degrade, writes do not (except `both`).** A remote that is unreachable
+  during a read is reported as a warning and skipped — the local side still
+  returns. A write to a down remote (`write: remote`) is an explicit error with
+  **no silent local fallback**. The `write: both` target is the exception: the
+  local write always succeeds, and a remote failure is reported as a
+  `replication` status on the response without aborting the operation.
 - **Diary is always local.** `wing_agents`, the `diary` room, and `diary:`-prefixed
   sources are hard-pinned to local storage. Any config that tries to route them
   remote is warned about and ignored, and the server rejects diary-shaped writes
@@ -165,7 +176,8 @@ Clients (the CLI and the MCP server) read `federation` from
     "default_mode": "local",
     "wings": {
       "wing_teamdocs": { "mode": "remote",   "remote": "work" },
-      "wing_bigrepo":  { "mode": "combined", "remote": "work", "write": "local" }
+      "wing_bigrepo":  { "mode": "combined", "remote": "work", "write": "local" },
+      "wing_shared":   { "mode": "combined", "remote": "work", "write": "both" }
     },
     "kg": { "mode": "combined", "remote": "work", "write": "remote" }
   }
@@ -211,6 +223,48 @@ routing:
 This sits at precedence step 2 — a global `federation.wings` rule for the same
 wing still overrides it.
 
+### `write: both` — local-first dual-write semantics
+
+When `write: both` is configured, every federatable write operation follows a
+local-first protocol:
+
+1. **Local write always happens first.** The local storage commit completes
+   before any remote attempt begins.
+2. **Best-effort remote replication** is then attempted against the configured
+   remote. Transport errors, duplicate rejections, and server errors are all
+   caught and reported — they never roll back or abort the local write.
+3. **Partial-success reporting.** The response carries a `replication` field
+   typed as [`ReplicationStatus`](Config-Schema.md#replicationstatus):
+   - `{"status": "replicated", "remote": "<name>"}` — remote succeeded.
+   - `{"status": "failed", "remote": "<name>", "reason": "..."}` — remote
+     failed; the local write is unaffected.
+   - `{"status": "skipped"}` — no replication was attempted (route is not
+     `write: both`).
+4. **Idempotency:** Both the local and remote paths use content-hash
+   deduplication for drawer writes and triple-identity checks for KG facts,
+   so replaying a failed remote replication is safe — the remote will either
+   commit or report a harmless duplicate.
+5. **No retry is built in.** The replication attempt fires once. Operators
+   monitoring `replication: failed` responses should re-apply the write or
+   fix connectivity and replay. Because of idempotency, a manual or automated
+   retry loop is safe at any time.
+6. **Diary-local-only override still applies.** Even with `write: both`, diary
+   targets (`wing_agents`, `diary` room, `diary:`-prefixed sources) are always
+   local-only — the remote replication leg is skipped silently, and the
+   response reports `replication: {"status": "skipped"}`. No config can
+   federate diary content.
+
+This applies to all federated write paths:
+- **Drawer writes** (`mempalace_add_drawer` via MCP) — local commit, then
+  pre-check duplicate on remote before writing.
+- **KG fact adds** (`mempalace_kg_add`) — local KG commit, then remote.
+- **KG fact invalidations** (`mempalace_kg_invalidate`) — local invalidation,
+  then remote.
+- **Mining** (`mempalace-cli mine` with `write: both`) — local mine completes
+  fully (embedding, storage, summary), then a best-effort remote push is
+  attempted. The remote result is appended to the mine output; a remote failure
+  is reported without rolling back the local mine.
+
 ## Part 3 — Federated mining
 
 Mining a project whose wing routes to a remote (`mode: remote`, or `mode: combined`
@@ -249,7 +303,10 @@ source keys and drawer ids** — no disjoint histories, and re-pushes dedupe cle
 
 ### Failure behavior
 
-- Remote unreachable → explicit error, no local fallback.
+- Remote unreachable (and mode is `remote` or `combined` with `write: remote`)
+  → explicit error, no local fallback.
+- Remote unreachable during `write: both` replication → local write succeeds;
+  the `replication` field carries `{"status": "failed", ...}`.
 - A bad single file → reported `failed` in the 200 response body; the rest of the
   batch still commits.
 - Diary-shaped wing/room → rejected with HTTP 422.
@@ -286,9 +343,14 @@ This is the intended end state of federation + locator storage + branch mining:
 3. The wing is configured `combined`. Search merges both sides; `content_hash`
    deduplication means chunks identical between remote-main and local-branch are
    not double-counted, while branch-local changes overlay the shared main index.
+4. With `write: both`, any additional writes (e.g. authored drawers or
+   knowledge-graph facts) land in the local palace and are best-effort
+   replicated to the shared remote, keeping both sides in sync without blocking
+   the local workflow.
 
 The result: every agent searches one wing and transparently sees shared main
-knowledge overlaid with the local branch's in-progress changes.
+knowledge overlaid with the local branch's in-progress changes, and writes
+propagate to the shared palace when the remote is reachable.
 
 ## Part 5 — Federated reads, wake-up, and changes
 
@@ -367,8 +429,10 @@ Notes:
 ## Troubleshooting
 
 ### `remote '<name>' is unreachable ... writes do not fall back to local`
-The hub is down or the URL/port is wrong. Federated writes intentionally do not
-fall back — fix connectivity or switch the wing to `local`.
+The hub is down or the URL/port is wrong. Federated writes with `write: remote`
+intentionally do not fall back — fix connectivity or switch the wing to a
+different target. For `write: both`, the local write still succeeds; check the
+`replication` field on the response for the failure detail.
 
 ### `remote '<name>' does not support the ingest capability`
 The hub is an older build without `POST /v1/ingest/batch`. Upgrade the server.

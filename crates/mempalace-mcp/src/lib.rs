@@ -56,7 +56,15 @@ use federation::FederationRouter;
 //   to the write-target side ONLY (local or the configured remote). The response
 //   reports the touched side via `"applied_to": "local"` | `"remote:<name>"`.
 //   In Local mode the write is local; in Remote mode the write goes to the remote
-//   KG only; Combined uses the resolved `write` field (local or remote).
+//   KG only; Combined uses the resolved `write` field (local, remote, or both).
+//
+// **`write: both` — local-first dual-write:**
+//   When the resolved `write` field is `WriteTarget::Both`, the local write always
+//   completes first, then a best-effort remote replication is attempted via the
+//   corresponding `*_replicate` method (`add_drawer_replicate`, `kg_add_replicate`,
+//   `kg_invalidate_replicate`). The response carries a `replication` field with
+//   `ReplicationStatus` — `replicated`, `failed`, or `skipped`. The remote
+//   failure never blocks or rolls back the local write.
 //
 // **Wing name collisions:** During `list_wings` merging, a wing that exists both
 //   locally and on a remote while its resolved route is Local-only triggers a
@@ -67,7 +75,8 @@ use federation::FederationRouter;
 //
 // **Write routing:** In Combined mode, `AddDrawer`, `DeleteDrawer`, `KgAdd`, and
 //   `KgInvalidate` write to the target indicated by the resolved rule's `write`
-//   field (local or remote). Read tools always fan out to both sources.
+//   field (local, remote, or both). When `write: both`, the local write completes
+//   first, then best-effort remote replication is attempted.
 //
 // **Per-project routing** (`resolve_route`'s `project_routing` parameter) is not
 //   wired at the MCP layer — the stdio server has no per-project context, so it

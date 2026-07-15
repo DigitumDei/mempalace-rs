@@ -104,6 +104,7 @@ pub struct RouteRuleV1 {
     #[serde(default)]
     pub remote: Option<String>,
     /// Write target for [`RouteMode::Combined`]; ignored for other modes.
+    /// Defaults to [`WriteTarget::Local`] when absent.
     #[serde(default)]
     pub write: Option<WriteTarget>,
 }
@@ -160,6 +161,7 @@ pub struct ResolvedRouteRule {
     /// Target remote name; always `Some` when `mode` is not [`RouteMode::Local`].
     pub remote: Option<String>,
     /// Write target; only meaningful for [`RouteMode::Combined`].
+    /// See [`WriteTarget`] variants for semantics.
     pub write: WriteTarget,
 }
 

@@ -66,7 +66,9 @@ Added after the initial v1 freeze; now part of the shipped surface.
   get, delete), `kg` (query, facts, facts/invalidate, timeline, stats), `taxonomy`,
   `wings`, `rooms`, `changes`, and `ingest/batch` (bulk mined-chunk ingest).
 - Client routing (`federation` config section): per-wing and KG `local` / `remote`
-  / `combined` modes; federated mining and `mine --branch` branch-delta mining.
+  / `combined` modes with `write` target `local` / `remote` / `both`;
+  local-first dual-write with best-effort remote replication in `both` mode;
+  federated mining and `mine --branch` branch-delta mining.
 - MCP read fan-out: combined search/taxonomy/status, plus `remote_changes` in
   `mempalace_wake_up` and remote merge in `mempalace_get_changes_since`.
 

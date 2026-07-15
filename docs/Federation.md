@@ -250,9 +250,9 @@ local-first protocol:
    retry loop is safe at any time.
 6. **Diary-local-only override still applies.** Even with `write: both`, diary
    targets (`wing_agents`, `diary` room, `diary:`-prefixed sources) are always
-   local-only — the remote replication leg is skipped silently, and the
-   response reports `replication: {"status": "skipped"}`. No config can
-   federate diary content.
+   local-only — routing resolves to local before `write: both` is detected, so
+   no replication leg is attempted and the response carries no `replication`
+   field. No config can federate diary content.
 
 This applies to all federated write paths:
 - **Drawer writes** (`mempalace_add_drawer` via MCP) — local commit, then

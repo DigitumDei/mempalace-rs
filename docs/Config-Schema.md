@@ -352,7 +352,7 @@ reporting the result of the best-effort remote leg. The shape is a tagged union:
 
 | Variant | Meaning |
 |---|---|
-| `skipped` | No replication was attempted (route is not `write: both`, or diary hard override suppressed it). |
+| `skipped` | No replication was attempted (route is not `write: both`). Note: diary-local writes do not produce this variant — the field is absent because routing resolves to local before `write: both` is ever checked. |
 | `replicated` | Best-effort remote write to the named remote succeeded. |
 | `failed` | Best-effort remote write failed; `reason` contains a human-readable description. The local write was unaffected. |
 

@@ -975,6 +975,7 @@ fn execute_remote_mine(
                             &failed_files,
                             branch_warning.as_deref(),
                             true,
+                            true,
                         );
                         let with_error = format!(
                             "{}\n  {}\n  Note: remote replication was incomplete — {msg}.\n",
@@ -1046,6 +1047,7 @@ fn execute_remote_mine(
         &failed_files,
         branch_warning.as_deref(),
         dual_write,
+        false,
     );
 
     Ok(CliOutput::success(output))
@@ -1104,6 +1106,7 @@ fn render_remote_mine_summary(
     failed_files: &[(String, String)],
     branch_warning: Option<&str>,
     dual_write: bool,
+    replication_incomplete: bool,
 ) -> String {
     let mode_label = if dual_write { "replication (best-effort)" } else { "projects (remote)" };
     let mut lines = vec![
@@ -1122,7 +1125,7 @@ fn render_remote_mine_summary(
     ];
 
     if dual_write {
-        if failed_count > 0 {
+        if replication_incomplete || failed_count > 0 {
             lines.insert(1, "  Remote replication: partial — some files had errors".to_owned());
             lines.insert(2, String::new());
         } else {
@@ -2200,6 +2203,69 @@ mod tests {
     }
 
     #[test]
+    fn render_remote_mine_summary_labels_partial_on_incomplete() {
+        let src = Path::new("/tmp/src");
+
+        // No per-file failures, but replication_incomplete=true → "partial".
+        let output = render_remote_mine_summary(
+            src, "hub", "http://example.com", "wing_test", "repo-1",
+            5, 0, 0, 5, &[], &[], None, true, true,
+        );
+        assert!(
+            output.contains("replication: partial"),
+            "incomplete=true must produce 'partial', got: {output}",
+        );
+        assert!(
+            !output.contains("replication: succeeded"),
+            "incomplete=true must NOT say 'succeeded', got: {output}",
+        );
+
+        // No per-file failures, replication_incomplete=false → "succeeded".
+        let output = render_remote_mine_summary(
+            src, "hub", "http://example.com", "wing_test", "repo-1",
+            5, 0, 0, 5, &[], &[], None, true, false,
+        );
+        assert!(
+            output.contains("replication: succeeded"),
+            "incomplete=false + no file failures must say 'succeeded', got: {output}",
+        );
+
+        // Per-file failures, replication_incomplete=false → "partial".
+        let output = render_remote_mine_summary(
+            src, "hub", "http://example.com", "wing_test", "repo-1",
+            3, 0, 2, 3, &[], &[("bad.rs".into(), "err".into())], None, true, false,
+        );
+        assert!(
+            output.contains("replication: partial"),
+            "file failures must produce 'partial', got: {output}",
+        );
+
+        // Both incomplete AND per-file failures → still "partial".
+        let output = render_remote_mine_summary(
+            src, "hub", "http://example.com", "wing_test", "repo-1",
+            3, 0, 2, 3, &[], &[("bad.rs".into(), "err".into())], None, true, true,
+        );
+        assert!(
+            output.contains("replication: partial"),
+            "incomplete=true with file failures must produce 'partial', got: {output}",
+        );
+        assert!(
+            !output.contains("replication: succeeded"),
+            "incomplete=true with file failures must NOT say 'succeeded', got: {output}",
+        );
+
+        // Non dual_write: no replication label at all.
+        let output = render_remote_mine_summary(
+            src, "hub", "http://example.com", "wing_test", "repo-1",
+            5, 0, 0, 5, &[], &[], None, false, false,
+        );
+        assert!(
+            !output.contains("replication:"),
+            "non-dual-write must not contain 'replication:', got: {output}",
+        );
+    }
+
+    #[test]
     fn mine_dry_run_reports_work_without_writing_storage_files() {
         let workspace = tempdir().unwrap();
         let project_dir = setup_project_fixture(workspace.path());
@@ -3110,6 +3176,145 @@ mod tests {
             reindex.stdout
         );
         assert!(reindex.stdout.contains("Files ingested: 3"), "reindex output: {:?}", reindex.stdout);
+
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    /// Spawn a test server that self-destructs after processing 2 requests
+    /// (the handshake GET /v1/info + the first ingest_batch POST). Subsequent
+    /// requests see a transport-level connection failure.
+    fn spawn_self_destruct_server(
+        palace_dir: PathBuf,
+        token: &str,
+    ) -> std::net::SocketAddr {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::Notify;
+
+        let token_dir = tempfile::tempdir().unwrap();
+        let token_file = write_test_token_file(token_dir.path(), token);
+        let config = remote_test_config(palace_dir, token_file.clone());
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let notify = Arc::new(Notify::new());
+
+        let addr = rt.block_on(async {
+            let tokens = mempalace_server::TokenRegistry::load(&token_file).unwrap();
+            let provider = mempalace_embeddings::DeterministicStubProvider::new(
+                mempalace_config::EmbeddingProfile::Balanced,
+            );
+            let router = mempalace_server::build_router(config, provider, tokens).unwrap();
+
+            let counter = Arc::new(AtomicUsize::new(0));
+            let app = router.layer(axum::middleware::from_fn({
+                let c = counter.clone();
+                let n = notify.clone();
+                move |req: axum::extract::Request, next: axum::middleware::Next| {
+                    let c = c.clone();
+                    let n = n.clone();
+                    async move {
+                        let resp = next.run(req).await;
+                        let prev = c.fetch_add(1, Ordering::SeqCst);
+                        if prev >= 1 {
+                            // 2nd completed (handshake + first ingest) → kill server
+                            n.notify_one();
+                        }
+                        resp
+                    }
+                }
+            }));
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(async { notify.notified().await; })
+                    .await
+                    .ok();
+            });
+            addr
+        });
+
+        std::mem::forget(rt);
+        std::mem::forget(token_dir);
+        addr
+    }
+
+    #[test]
+    fn mine_combined_both_partial_on_batch_transport_failure() {
+        // Regression: when the first remote batch succeeds but a later batch
+        // suffers a transport error, the output must say "partial" — never
+        // "replication: succeeded".
+        const TOKEN: &str = "partial-batch-tok-003";
+        let workspace = tempdir().unwrap();
+
+        // Server palace dir.
+        let server_palace = workspace.path().join("server-palace");
+        fs::create_dir_all(&server_palace).unwrap();
+        let proxy_addr = spawn_self_destruct_server(server_palace.clone(), TOKEN);
+        let proxy_url = format!("http://{proxy_addr}");
+
+        // Project dir with enough files for 3 batches at batch-size 1.
+        let project_dir = workspace.path().join("multi-batch-project");
+        fs::create_dir_all(&project_dir).unwrap();
+        for i in 0..3 {
+            write_file(
+                &project_dir.join(format!("file{i}.rs")),
+                &format!("// File {i}\nfn example_{i}() -> bool {{ true }}\n").repeat(5),
+            );
+        }
+
+        // CLI config dir.
+        let config_root = temp_config_root("partial-batch-e2e");
+        let context = CliContext::for_tests(config_root.clone());
+        let palace_dir = config_root.join("palace");
+
+        run_cli(["init", project_dir.to_str().unwrap(), "--yes"], &context, stub_provider).unwrap();
+
+        let wing_name = "wing_multibatch";
+        let remote_name = "hub";
+        write_combined_cli_config(
+            &config_root,
+            remote_name,
+            &proxy_url,
+            TOKEN,
+            wing_name,
+            &palace_dir,
+            &project_dir,
+        );
+
+        let context = CliContext::for_tests(config_root.clone());
+        let output = run_cli(
+            [
+                "mine",
+                project_dir.to_str().unwrap(),
+                "--batch-size",
+                "1",
+            ],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+
+        assert_eq!(output.exit_code, 0, "combined mine must exit 0: stderr={:?}", output.stderr);
+        assert!(
+            output.stdout.contains("Files ingested:"),
+            "local ingestion must appear: {}",
+            output.stdout
+        );
+        assert!(
+            output.stdout.contains("replication: partial"),
+            "must report partial replication: {}",
+            output.stdout
+        );
+        assert!(
+            !output.stdout.contains("replication: succeeded"),
+            "must NOT claim full replication success: {}",
+            output.stdout
+        );
 
         remove_dir_all_if_exists(&config_root);
     }

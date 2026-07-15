@@ -1125,7 +1125,10 @@ fn render_remote_mine_summary(
     ];
 
     if dual_write {
-        if replication_incomplete || failed_count > 0 {
+        if replication_incomplete {
+            lines.insert(1, "  Remote replication: partial — transport interrupted".to_owned());
+            lines.insert(2, String::new());
+        } else if failed_count > 0 {
             lines.insert(1, "  Remote replication: partial — some files had errors".to_owned());
             lines.insert(2, String::new());
         } else {
@@ -2206,7 +2209,7 @@ mod tests {
     fn render_remote_mine_summary_labels_partial_on_incomplete() {
         let src = Path::new("/tmp/src");
 
-        // No per-file failures, but replication_incomplete=true → "partial".
+        // No per-file failures, but replication_incomplete=true → "partial — transport interrupted".
         let output = render_remote_mine_summary(
             src, "hub", "http://example.com", "wing_test", "repo-1",
             5, 0, 0, 5, &[], &[], None, true, true,
@@ -2214,6 +2217,10 @@ mod tests {
         assert!(
             output.contains("replication: partial"),
             "incomplete=true must produce 'partial', got: {output}",
+        );
+        assert!(
+            output.contains("transport interrupted"),
+            "incomplete=true without file errors must say 'transport interrupted', got: {output}",
         );
         assert!(
             !output.contains("replication: succeeded"),
@@ -2230,7 +2237,7 @@ mod tests {
             "incomplete=false + no file failures must say 'succeeded', got: {output}",
         );
 
-        // Per-file failures, replication_incomplete=false → "partial".
+        // Per-file failures, replication_incomplete=false → "partial — some files had errors".
         let output = render_remote_mine_summary(
             src, "hub", "http://example.com", "wing_test", "repo-1",
             3, 0, 2, 3, &[], &[("bad.rs".into(), "err".into())], None, true, false,
@@ -2239,8 +2246,12 @@ mod tests {
             output.contains("replication: partial"),
             "file failures must produce 'partial', got: {output}",
         );
+        assert!(
+            output.contains("some files had errors"),
+            "file failures must say 'some files had errors', got: {output}",
+        );
 
-        // Both incomplete AND per-file failures → still "partial".
+        // Both incomplete AND per-file failures → "partial — transport interrupted".
         let output = render_remote_mine_summary(
             src, "hub", "http://example.com", "wing_test", "repo-1",
             3, 0, 2, 3, &[], &[("bad.rs".into(), "err".into())], None, true, true,
@@ -2248,6 +2259,14 @@ mod tests {
         assert!(
             output.contains("replication: partial"),
             "incomplete=true with file failures must produce 'partial', got: {output}",
+        );
+        assert!(
+            output.contains("transport interrupted"),
+            "incomplete=true with file failures must say 'transport interrupted', got: {output}",
+        );
+        assert!(
+            !output.contains("some files had errors"),
+            "incomplete=true must not say 'some files had errors', got: {output}",
         );
         assert!(
             !output.contains("replication: succeeded"),
@@ -3180,15 +3199,15 @@ mod tests {
         remove_dir_all_if_exists(&config_root);
     }
 
-    /// Spawn a test server that self-destructs after processing 2 requests
-    /// (the handshake GET /v1/info + the first ingest_batch POST). Subsequent
-    /// requests see a transport-level connection failure.
+    /// Spawn a test server that deliberately delays the third request (info +
+    /// first ingest batch are fast; the third is the second ingest batch) to
+    /// exceed the client's 5-second timeout, causing a deterministic transport
+    /// failure. Subsequent requests respond normally, so a retry works.
     fn spawn_self_destruct_server(
         palace_dir: PathBuf,
         token: &str,
     ) -> std::net::SocketAddr {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        use tokio::sync::Notify;
 
         let token_dir = tempfile::tempdir().unwrap();
         let token_file = write_test_token_file(token_dir.path(), token);
@@ -3198,8 +3217,6 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-
-        let notify = Arc::new(Notify::new());
 
         let addr = rt.block_on(async {
             let tokens = mempalace_server::TokenRegistry::load(&token_file).unwrap();
@@ -3211,18 +3228,16 @@ mod tests {
             let counter = Arc::new(AtomicUsize::new(0));
             let app = router.layer(axum::middleware::from_fn({
                 let c = counter.clone();
-                let n = notify.clone();
                 move |req: axum::extract::Request, next: axum::middleware::Next| {
                     let c = c.clone();
-                    let n = n.clone();
                     async move {
-                        let resp = next.run(req).await;
                         let prev = c.fetch_add(1, Ordering::SeqCst);
-                        if prev >= 1 {
-                            // 2nd completed (handshake + first ingest) → kill server
-                            n.notify_one();
+                        // prev=0: info handshake, prev=1: first ingest batch,
+                        // prev=2: second ingest batch — sleep past client timeout.
+                        if prev == 2 {
+                            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
                         }
-                        resp
+                        next.run(req).await
                     }
                 }
             }));
@@ -3230,10 +3245,7 @@ mod tests {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             tokio::spawn(async move {
-                axum::serve(listener, app)
-                    .with_graceful_shutdown(async { notify.notified().await; })
-                    .await
-                    .ok();
+                axum::serve(listener, app).await.ok();
             });
             addr
         });
@@ -3311,9 +3323,135 @@ mod tests {
             output.stdout
         );
         assert!(
+            output.stdout.contains("transport interrupted"),
+            "must mention transport interruption: {}",
+            output.stdout
+        );
+        assert!(
             !output.stdout.contains("replication: succeeded"),
             "must NOT claim full replication success: {}",
             output.stdout
+        );
+        assert!(
+            !output.stdout.contains("some files had errors"),
+            "must NOT claim file-level errors when the only issue was transport: {}",
+            output.stdout
+        );
+
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn mine_combined_both_retry_safe_replication() {
+        // Regression: after a transport interruption mid-way through a combined
+        // write:both mine, retrying the same project must not create duplicate
+        // local drawers, and the remote must report previously-replicated files
+        // as skipped_unchanged.
+        const TOKEN: &str = "retry-safe-tok-004";
+        let workspace = tempdir().unwrap();
+
+        // Server palace dir — single server used for both mines.
+        let server_palace = workspace.path().join("server-palace");
+        fs::create_dir_all(&server_palace).unwrap();
+        let proxy_addr = spawn_self_destruct_server(server_palace.clone(), TOKEN);
+        let proxy_url = format!("http://{proxy_addr}");
+
+        // Project dir with 3 files so batch-size 1 produces 3 batches.
+        let project_dir = workspace.path().join("retry-project");
+        fs::create_dir_all(&project_dir).unwrap();
+        for i in 0..3 {
+            write_file(
+                &project_dir.join(format!("file{i}.rs")),
+                &format!("// File {i}\nfn example_{i}() -> bool {{ true }}\n").repeat(5),
+            );
+        }
+
+        // ── First mine (interrupted) ──────────────────────────────────────────
+        let config_root = temp_config_root("retry-safe-e2e");
+        let context = CliContext::for_tests(config_root.clone());
+        let palace_dir = config_root.join("palace");
+
+        run_cli(["init", project_dir.to_str().unwrap(), "--yes"], &context, stub_provider).unwrap();
+
+        let wing_name = "wing_retryproject";
+        let remote_name = "hub";
+        write_combined_cli_config(
+            &config_root,
+            remote_name,
+            &proxy_url,
+            TOKEN,
+            wing_name,
+            &palace_dir,
+            &project_dir,
+        );
+
+        let context = CliContext::for_tests(config_root.clone());
+        let first_output = run_cli(
+            ["mine", project_dir.to_str().unwrap(), "--batch-size", "1"],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+
+        assert_eq!(first_output.exit_code, 0, "first mine must exit 0: stderr={:?}", first_output.stderr);
+        assert!(first_output.stdout.contains("Files ingested: 3"), "local mine must ingest 3: {}",
+            first_output.stdout);
+        assert!(
+            first_output.stdout.contains("replication: partial"),
+            "first mine must report partial replication: {}",
+            first_output.stdout
+        );
+        assert!(
+            first_output.stdout.contains("transport interrupted"),
+            "first mine must mention transport interruption: {}",
+            first_output.stdout
+        );
+
+        // ── Second mine (retry — server is now past the slow delay) ───────────
+        let second_output = run_cli(
+            ["mine", project_dir.to_str().unwrap(), "--batch-size", "1"],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+
+        assert_eq!(second_output.exit_code, 0, "second mine must exit 0: stderr={:?}", second_output.stderr);
+
+        // Local mine re-ingests nothing because files are unchanged.
+        assert!(
+            second_output.stdout.contains("Files skipped unchanged: 3"),
+            "retry must skip all locally-unchanged files: {}",
+            second_output.stdout
+        );
+        assert!(
+            second_output.stdout.contains("Files ingested: 0"),
+            "retry must not re-ingest unchanged files: {}",
+            second_output.stdout
+        );
+
+        // Remote should report the previously-replicated file as skipped_unchanged
+        // and the remaining two as ingested.
+        assert!(
+            second_output.stdout.contains("replication: succeeded"),
+            "second mine must report full replication success: {}",
+            second_output.stdout
+        );
+        assert!(
+            second_output.stdout.contains("Files ingested: 2"),
+            "remote mine must ingest the two files that were not previously replicated: {}",
+            second_output.stdout
+        );
+
+        // ── Verify no duplicates: local drawer count is unchanged after retry ──
+        let status = run_cli(["status"], &context, stub_provider).unwrap();
+        assert_eq!(status.exit_code, 0, "status failed: stderr={:?}", status.stderr);
+        // The fixture has 3 files → 3 drawers after the first mine.
+        // After retry there should still be 3 (no duplicates, nothing added).
+        let drawer_count_line = status.stdout.lines().find(|l| l.contains("drawers")).unwrap_or("");
+        assert!(
+            drawer_count_line.contains("3 drawers"),
+            "must have exactly 3 drawers after retry, not more (no duplicates): {}",
+            status.stdout
         );
 
         remove_dir_all_if_exists(&config_root);

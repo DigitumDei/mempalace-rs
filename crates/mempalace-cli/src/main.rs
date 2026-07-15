@@ -954,14 +954,38 @@ fn execute_remote_mine(
             match runtime.block_on(api.ingest_batch(req)) {
                 Ok(resp) => resp,
                 Err(e) => {
-                    let partial_label = if batches_sent > 0 { "partial" } else { "failed" };
                     let msg = format!(
                         "remote '{}' transport error after {} batch(es): {e}",
                         remote_name, batches_sent
                     );
+                    if dual_write && batches_sent > 0 {
+                        // Some batches completed — render partial summary showing
+                        // what was achieved before the transport interruption.
+                        let partial = render_remote_mine_summary(
+                            source_dir,
+                            remote_name,
+                            &remote_url,
+                            &wing,
+                            &repo_id,
+                            ingested_count,
+                            skipped_count,
+                            failed_count,
+                            total_drawers_written,
+                            &all_warnings,
+                            &failed_files,
+                            branch_warning.as_deref(),
+                            true,
+                        );
+                        let with_error = format!(
+                            "{}\n  {}\n  Note: remote replication was incomplete — {msg}.\n",
+                            partial.trim(),
+                            "─".repeat(SEARCH_HEADER_WIDTH),
+                        );
+                        return Ok(CliOutput::success(with_error));
+                    }
                     let output = if dual_write {
                         format!(
-                            "  Remote replication: {partial_label} — {msg}\n\
+                            "  Remote replication: failed — {msg}\n\
                              Note: the local mine completed successfully; remote replication was incomplete.\n"
                         )
                     } else {

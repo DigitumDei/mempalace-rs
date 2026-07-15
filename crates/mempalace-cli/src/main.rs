@@ -3456,4 +3456,246 @@ mod tests {
 
         remove_dir_all_if_exists(&config_root);
     }
+
+    #[test]
+    fn mine_combined_both_branch_uses_local_only() {
+        // combined+both config with a healthy remote, but --branch forces
+        // local-only execution. No remote replication must be attempted.
+        const TOKEN: &str = "branch-local-tok-005";
+        let workspace = tempdir().unwrap();
+
+        let server_palace = workspace.path().join("server-palace");
+        fs::create_dir_all(&server_palace).unwrap();
+        let addr = spawn_test_server(server_palace.clone(), TOKEN);
+        let server_url = format!("http://{addr}");
+
+        let repo_dir = workspace.path().join("repo");
+        fs::create_dir_all(&repo_dir).unwrap();
+        let base_content = "fn base() -> i32 { 42 }\n".repeat(20);
+        git_init_repo(
+            &repo_dir,
+            &[
+                ("mempalace.yaml", "wing: branchtest\nrooms:\n  - name: general\n"),
+                ("base.rs", &base_content),
+                ("stable.rs", "fn stable() -> &str { \"hello\" }\n"),
+            ],
+        );
+
+        // Create feature branch.
+        let run_git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo_dir)
+                .status()
+                .unwrap();
+        };
+        run_git(&["checkout", "-b", "feature"]);
+        let changed = "fn base() -> i32 { 99 }\n".repeat(20);
+        fs::write(repo_dir.join("base.rs"), &changed).unwrap();
+
+        let config_root = temp_config_root("branch-local");
+        let context = CliContext::for_tests(config_root.clone());
+        let palace_dir = config_root.join("palace");
+
+        run_cli(["init", repo_dir.to_str().unwrap(), "--yes"], &context, stub_provider).unwrap();
+
+        let wing_name = "wing_branchtest";
+        let remote_name = "hub";
+        write_combined_cli_config(
+            &config_root,
+            remote_name,
+            &server_url,
+            TOKEN,
+            wing_name,
+            &palace_dir,
+            &repo_dir,
+        );
+
+        let context = CliContext::for_tests(config_root.clone());
+        let output = run_cli(
+            ["mine", repo_dir.to_str().unwrap(), "--branch"],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+
+        // Must exit 0 and ingest the changed file locally.
+        assert_eq!(
+            output.exit_code, 0,
+            "branch mine with combined+both config: stderr={:?}",
+            output.stderr
+        );
+        assert!(
+            output.stdout.contains("Files ingested: 1"),
+            "must ingest the changed file: {}",
+            output.stdout
+        );
+
+        // Must NOT contain any replication labels (branch forces local-only).
+        assert!(
+            !output.stdout.contains("replication:"),
+            "branch mode must not attempt replication: {}",
+            output.stdout
+        );
+        assert!(
+            !output.stdout.contains("Remote replication:"),
+            "branch mode must not show Remote replication: {}",
+            output.stdout
+        );
+
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn mine_combined_both_convos_uses_local_only() {
+        // combined+both config with a healthy remote, but --mode convos forces
+        // local-only execution. No remote replication must be attempted.
+        const TOKEN: &str = "convos-local-tok-006";
+        let workspace = tempdir().unwrap();
+
+        let server_palace = workspace.path().join("server-palace");
+        fs::create_dir_all(&server_palace).unwrap();
+        let addr = spawn_test_server(server_palace.clone(), TOKEN);
+        let server_url = format!("http://{addr}");
+
+        let convo_dir = setup_convo_fixture(workspace.path());
+
+        let config_root = temp_config_root("convos-local");
+        let context = CliContext::for_tests(config_root.clone());
+        let palace_dir = config_root.join("palace");
+
+        // Write combined+both config manually (no init for convos).
+        let wing_name = "wing_talks";
+        let remote_name = "hub";
+        write_combined_cli_config(
+            &config_root,
+            remote_name,
+            &server_url,
+            TOKEN,
+            wing_name,
+            &palace_dir,
+            // The project_dir parameter in write_combined_cli_config writes
+            // a mempalace.yaml. We'll use the convo dir for that.
+            &convo_dir,
+        );
+
+        let context = CliContext::for_tests(config_root.clone());
+        let output = run_cli(
+            [
+                "--palace",
+                workspace.path().join("convo-palace").to_str().unwrap(),
+                "mine",
+                convo_dir.to_str().unwrap(),
+                "--mode",
+                "convos",
+                "--wing",
+                "talks",
+            ],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+
+        // Must exit 0 and ingest conversation files.
+        assert_eq!(
+            output.exit_code, 0,
+            "convos mine with combined+both config: stderr={:?}",
+            output.stderr
+        );
+        assert!(
+            output.stdout.contains("Files ingested:"),
+            "must show local ingestion: {}",
+            output.stdout
+        );
+
+        // Must NOT contain any replication labels (convos mode forces local-only).
+        assert!(
+            !output.stdout.contains("replication:"),
+            "convos mode must not attempt replication: {}",
+            output.stdout
+        );
+        assert!(
+            !output.stdout.contains("Remote replication:"),
+            "convos mode must not show Remote replication: {}",
+            output.stdout
+        );
+
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn mine_local_only_route_with_federation() {
+        // Federation remotes are defined, but the wing is NOT mapped to any
+        // remote — the route resolves to local-only. No remote replication
+        // must be attempted.
+        const TOKEN: &str = "local-route-tok-007";
+        let workspace = tempdir().unwrap();
+
+        // Start a server to prove we *could* replicate if configured.
+        let server_palace = workspace.path().join("server-palace");
+        fs::create_dir_all(&server_palace).unwrap();
+        let addr = spawn_test_server(server_palace.clone(), TOKEN);
+        let server_url = format!("http://{addr}");
+
+        let project_dir = setup_project_fixture(workspace.path());
+
+        let config_root = temp_config_root("local-route");
+        let context = CliContext::for_tests(config_root.clone());
+        let palace_dir = config_root.join("palace");
+
+        // Write config with federation remotes defined but NO wing routing.
+        fs::create_dir_all(&config_root).unwrap();
+        let config_json = serde_json::json!({
+            "version": 1,
+            "palace_path": palace_dir.to_str().unwrap(),
+            "federation": {
+                "remotes": [{"name": "hub", "url": server_url, "token": TOKEN}],
+                "wings": {}
+            }
+        });
+        fs::write(
+            config_root.join("config.json"),
+            serde_json::to_string_pretty(&config_json).unwrap(),
+        )
+        .unwrap();
+
+        // Write project config.
+        let yaml = "wing: wing_project_alpha\nrooms:\n  - name: general\n    description: General files\n";
+        fs::write(project_dir.join("mempalace.yaml"), yaml).unwrap();
+
+        let context = CliContext::for_tests(config_root.clone());
+
+        // First mine must succeed locally.
+        let mine = run_cli(
+            ["mine", project_dir.to_str().unwrap()],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+        assert_eq!(mine.exit_code, 0, "local mine must succeed: stderr={:?}", mine.stderr);
+        assert!(
+            mine.stdout.contains("Files ingested: 3"),
+            "must ingest all 3 fixture files: {}",
+            mine.stdout
+        );
+
+        // Must NOT contain any replication or remote labels.
+        assert!(
+            !mine.stdout.contains("replication:"),
+            "local-only route must not attempt replication: {}",
+            mine.stdout
+        );
+        assert!(
+            !mine.stdout.contains("Remote replication:"),
+            "local-only route must not show Remote replication: {}",
+            mine.stdout
+        );
+        assert!(
+            !mine.stdout.contains("Remote:"),
+            "local-only route must not mention Remote: {}",
+            mine.stdout
+        );
+
+        remove_dir_all_if_exists(&config_root);
+    }
 }

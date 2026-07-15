@@ -180,9 +180,11 @@ routing:
 - `mode`: `local`, `remote`, or `combined`
 - `remote`: name of a remote defined in `~/.mempalace/config.json` federation.remotes. May be omitted when exactly one remote is configured.
 - `write`: `local`, `remote`, or `both`. Only meaningful for `combined` mode. Default: `local`.
-  - `both` performs a local-first dual-write: the local write always completes,
-    then best-effort remote replication is attempted. The response reports the
-    result as a `replication` status — see [`ReplicationStatus`](#replicationstatus).
+  - `both` performs a local-first dual-write: the local write must complete
+    successfully, then best-effort remote replication is attempted. Remote
+    failure does not roll back the local write or change the success result.
+    The outcome of the remote leg is reported as a `replication` field on MCP
+    tool responses — see [`ReplicationStatus`](#replicationstatus).
 
 ## Server Config
 
@@ -295,8 +297,8 @@ Validation:
   - `write`: `local` | `remote` | `both`. Only meaningful for `combined` mode. Default: `local`.
     - `local` — writes go to the local palace only.
     - `remote` — writes go to the remote palace only.
-    - `both` — local-first dual-write; local write always completes, then
-      best-effort remote replication is attempted. See
+    - `both` — local-first dual-write; the local write must complete first,
+      then best-effort remote replication is attempted. See
       [`ReplicationStatus`](#replicationstatus) for the response shape.
 
 #### `federation.kg`
@@ -335,12 +337,9 @@ Config load succeeds with a warning (does not fail) for:
 
 ### `ReplicationStatus`
 
-When `write: both` is configured, write responses carry a `replication` field
-reporting the result of the best-effort remote leg. The shape is a tagged union:
-
-```json
-{ "status": "skipped" }
-```
+When `write: both` is configured, MCP tool responses carry a `replication` field
+reporting the result of the best-effort remote leg. Non-`both` routes and
+diary-local writes omit the field entirely. The shape is a tagged union:
 
 ```json
 { "status": "replicated", "remote": "work" }
@@ -352,9 +351,8 @@ reporting the result of the best-effort remote leg. The shape is a tagged union:
 
 | Variant | Meaning |
 |---|---|
-| `skipped` | No replication was attempted (route is not `write: both`). Note: diary-local writes do not produce this variant — the field is absent because routing resolves to local before `write: both` is ever checked. |
 | `replicated` | Best-effort remote write to the named remote succeeded. |
 | `failed` | Best-effort remote write failed; `reason` contains a human-readable description. The local write was unaffected. |
 
-The `replication` field is absent when federation is not configured or the route
-does not use `write: both`.
+The `replication` field is absent when federation is not configured, the route
+does not use `write: both`, or the write targets a diary-local destination.

@@ -59,12 +59,13 @@ use federation::FederationRouter;
 //   KG only; Combined uses the resolved `write` field (local, remote, or both).
 //
 // **`write: both` — local-first dual-write:**
-//   When the resolved `write` field is `WriteTarget::Both`, the local write always
-//   completes first, then a best-effort remote replication is attempted via the
+//   When the resolved `write` field is `WriteTarget::Both`, the local write must
+//   complete first, then a best-effort remote replication is attempted via the
 //   corresponding `*_replicate` method (`add_drawer_replicate`, `kg_add_replicate`,
 //   `kg_invalidate_replicate`). The response carries a `replication` field with
-//   `ReplicationStatus` — `replicated`, `failed`, or `skipped`. The remote
-//   failure never blocks or rolls back the local write.
+//   `ReplicationStatus` — `replicated` or `failed`. The `replication` field is
+//   absent for non-`both` routes and diary-local writes. The remote failure
+//   never blocks or rolls back the local write.
 //
 // **Wing name collisions:** During `list_wings` merging, a wing that exists both
 //   locally and on a remote while its resolved route is Local-only triggers a

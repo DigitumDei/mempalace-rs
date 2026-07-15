@@ -1206,6 +1206,11 @@ where
             "wing": wing,
             "room": room,
         });
+        if self.federation.is_some() {
+            if let Some(obj) = result.as_object_mut() {
+                obj.insert("applied_to".to_owned(), json!("local"));
+            }
+        }
 
         // ── Both-mode: best-effort remote replication after local write ──
         if is_both {
@@ -1226,8 +1231,8 @@ where
                         obj.insert("replication".to_owned(), json!(replication));
                         if matches!(replication, ReplicationStatus::Failed { .. }) {
                             obj.insert(
-                                "warning".to_owned(),
-                                json!("local write succeeded but remote replication failed"),
+                                "warnings".to_owned(),
+                                json!(["local write succeeded but remote replication failed"]),
                             );
                         }
                     }
@@ -1593,8 +1598,8 @@ where
                         p.insert("replication".to_owned(), json!(replication));
                         if matches!(replication, ReplicationStatus::Failed { .. }) {
                             p.insert(
-                                "warning".to_owned(),
-                                json!("local write succeeded but remote replication failed"),
+                                "warnings".to_owned(),
+                                json!(["local write succeeded but remote replication failed"]),
                             );
                         }
                     }
@@ -1699,8 +1704,8 @@ where
                         p.insert("replication".to_owned(), json!(replication));
                         if matches!(replication, ReplicationStatus::Failed { .. }) {
                             p.insert(
-                                "warning".to_owned(),
-                                json!("local write succeeded but remote replication failed"),
+                                "warnings".to_owned(),
+                                json!(["local write succeeded but remote replication failed"]),
                             );
                         }
                     }

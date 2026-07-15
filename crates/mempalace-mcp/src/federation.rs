@@ -393,6 +393,8 @@ impl FederationRouter {
                     "success": false,
                     "reason": "duplicate",
                     "matches": matches,
+                    "origin": remote_name,
+                    "applied_to": format_remote_origin(remote_name),
                 })));
             }
             Ok(_) => {}
@@ -421,6 +423,7 @@ impl FederationRouter {
                         "wing": resp.wing,
                         "room": resp.room,
                         "origin": remote_name,
+                        "applied_to": format_remote_origin(remote_name),
                     })))
                 } else {
                     // Defensive: server indicated failure on 2xx (shouldn't happen in v1).
@@ -428,6 +431,7 @@ impl FederationRouter {
                         "success": false,
                         "reason": "rejected",
                         "origin": remote_name,
+                        "applied_to": format_remote_origin(remote_name),
                     })))
                 }
             }
@@ -438,6 +442,7 @@ impl FederationRouter {
                     "reason": "duplicate",
                     "matches": [],
                     "origin": remote_name,
+                    "applied_to": format_remote_origin(remote_name),
                 })))
             }
             Err(e) => {
@@ -646,6 +651,7 @@ impl FederationRouter {
                         "success": true,
                         "drawer_id": drawer_id,
                         "origin": name,
+                        "applied_to": format_remote_origin(name),
                     })));
                 }
                 Err(e) if e.is_degradable() => continue,
@@ -2330,6 +2336,7 @@ mod tests {
 
         assert_eq!(result["success"], true);
         assert_eq!(result["origin"], "alpha");
+        assert_eq!(result["applied_to"], "remote:alpha");
         assert_eq!(result["drawer_id"], "rem-drawer-1");
     }
 
@@ -2350,6 +2357,8 @@ mod tests {
 
         assert_eq!(result["success"], false);
         assert_eq!(result["reason"], "duplicate");
+        assert_eq!(result["origin"], "alpha");
+        assert_eq!(result["applied_to"], "remote:alpha");
         let matches = result["matches"].as_array().unwrap();
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0]["origin"], "alpha");
@@ -2372,9 +2381,10 @@ mod tests {
 
         assert_eq!(result["success"], false);
         assert_eq!(result["reason"], "duplicate");
+        assert_eq!(result["origin"], "alpha");
+        assert_eq!(result["applied_to"], "remote:alpha");
         let matches = result["matches"].as_array().unwrap();
         assert_eq!(matches.len(), 0);
-        assert_eq!(result["origin"], "alpha");
     }
 
     #[tokio::test]
@@ -2495,6 +2505,7 @@ mod tests {
         assert_eq!(result["success"], true);
         assert_eq!(result["drawer_id"], "drawer-1");
         assert_eq!(result["origin"], "bbb");
+        assert_eq!(result["applied_to"], "remote:bbb");
     }
 
     #[tokio::test]
@@ -2509,6 +2520,7 @@ mod tests {
         assert_eq!(result["success"], true);
         assert_eq!(result["drawer_id"], "drawer-1");
         assert_eq!(result["origin"], "alpha");
+        assert_eq!(result["applied_to"], "remote:alpha");
     }
 
     #[tokio::test]

@@ -236,6 +236,10 @@ async fn add_remote_search_combined_delete_remote_roundtrip() {
         add_shared["origin"], "hub",
         "add_shared must report origin=hub; got: {add_shared}"
     );
+    assert_eq!(
+        add_shared["applied_to"], "remote:hub",
+        "add_shared must report applied_to=remote:hub; got: {add_shared}"
+    );
     let remote_drawer_id = add_shared["drawer_id"]
         .as_str()
         .expect("add_shared must return drawer_id")
@@ -321,6 +325,10 @@ async fn add_remote_search_combined_delete_remote_roundtrip() {
         delete_resp["origin"], "hub",
         "delete must fall back to the remote and report origin=hub; got: {delete_resp}"
     );
+    assert_eq!(
+        delete_resp["applied_to"], "remote:hub",
+        "delete must report applied_to=remote:hub; got: {delete_resp}"
+    );
     let echoed_id = delete_resp["drawer_id"].as_str().unwrap_or("");
     assert_eq!(
         echoed_id, remote_drawer_id,
@@ -377,6 +385,10 @@ async fn duplicate_add_remote_returns_duplicate_shape() {
     .await;
     assert_eq!(first["success"], true, "first add must succeed; got: {first}");
     assert_eq!(first["origin"], "hub", "first add must report hub origin; got: {first}");
+    assert_eq!(
+        first["applied_to"], "remote:hub",
+        "first add must report applied_to=remote:hub; got: {first}"
+    );
 
     // Second identical add — must return success=false with reason=duplicate.
     let second = call_tool(
@@ -490,6 +502,10 @@ async fn different_embedding_profiles_per_side() {
     .await;
     assert_eq!(hub_add["success"], true, "hub add must succeed: {hub_add}");
     assert_eq!(hub_add["origin"], "hub", "hub add must go to hub: {hub_add}");
+    assert_eq!(
+        hub_add["applied_to"], "remote:hub",
+        "hub add must report applied_to=remote:hub: {hub_add}"
+    );
 
     // Seed local side directly (wing_local has no rule → Local).
     let local_add = call_tool(
@@ -637,6 +653,10 @@ async fn remote_down_degrades_reads() {
         local_add["success"], true,
         "local add with dead remote must still succeed: {local_add}"
     );
+    assert_eq!(
+        local_add["applied_to"], "local",
+        "local add must report applied_to=local: {local_add}"
+    );
 
     // Seed a local KG fact.
     let kg_add = call_tool(
@@ -647,6 +667,10 @@ async fn remote_down_degrades_reads() {
     )
     .await;
     assert_eq!(kg_add["success"], true, "kg_add must succeed locally: {kg_add}");
+    assert_eq!(
+        kg_add["applied_to"], "local",
+        "kg_add must report applied_to=local: {kg_add}"
+    );
 
     // Combined-mode search with dead remote → local results + warnings.
     let search = call_tool(
@@ -924,6 +948,7 @@ async fn wake_up_includes_remote_changes_from_hub() {
     .await;
     assert_eq!(add1["success"], true, "hub add 1 must succeed: {add1}");
     assert_eq!(add1["origin"], "hub", "add1 must go to hub: {add1}");
+    assert_eq!(add1["applied_to"], "remote:hub", "add1 must report applied_to=remote:hub: {add1}");
     let entity_id1 = add1["drawer_id"].as_str().unwrap().to_owned();
 
     let add2 = call_tool(
@@ -940,6 +965,7 @@ async fn wake_up_includes_remote_changes_from_hub() {
     .await;
     assert_eq!(add2["success"], true, "hub add 2 must succeed: {add2}");
     assert_eq!(add2["origin"], "hub", "add2 must go to hub: {add2}");
+    assert_eq!(add2["applied_to"], "remote:hub", "add2 must report applied_to=remote:hub: {add2}");
     let entity_id2 = add2["drawer_id"].as_str().unwrap().to_owned();
 
     // Call mempalace_wake_up.
@@ -1332,6 +1358,7 @@ async fn diary_events_never_appear_in_remote_changes() {
     .await;
     assert_eq!(hub_add["success"], true, "hub drawer add must succeed: {hub_add}");
     assert_eq!(hub_add["origin"], "hub", "hub drawer must go to hub: {hub_add}");
+    assert_eq!(hub_add["applied_to"], "remote:hub", "hub drawer must report applied_to=remote:hub: {hub_add}");
     let hub_drawer_id = hub_add["drawer_id"].as_str().unwrap().to_owned();
 
     // ── Step 5: write a diary entry LOCALLY on the local MCP server.
@@ -1438,6 +1465,7 @@ async fn get_changes_since_includes_local_and_remote_origins() {
     .await;
     assert_eq!(hub_add["success"], true, "hub add must succeed: {hub_add}");
     assert_eq!(hub_add["origin"], "hub", "hub add must go to hub: {hub_add}");
+    assert_eq!(hub_add["applied_to"], "remote:hub", "hub add must report applied_to=remote:hub: {hub_add}");
 
     // Add a drawer locally (wing without a remote rule → default Local).
     // "rust cli tooling" cluster → [0,0,1,0] vector.

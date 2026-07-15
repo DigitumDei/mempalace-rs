@@ -559,18 +559,24 @@ where
     let plan = resolve_plan(&source_dir, mode, &wing, branch, &config)?;
 
     match plan {
-        ExecPlan::Remote(rule) => Ok(execute_remote_mine(
+        ExecPlan::Remote(rule) => execute_remote_mine(
             &source_dir, wing, &agent, limit, dry_run, batch_size, &config, &runtime, &rule, false,
-        )),
+        ),
         ExecPlan::Both(rule) => {
             let (_local_summary, local_output) = execute_local_mine(
                 &source_dir, mode, wing.clone(), agent.clone(), limit, dry_run, reindex,
                 extract, branch, batch_size, &config, &runtime, &provider_factory,
             )?;
 
-            let remote_output = execute_remote_mine(
+            let remote_output = match execute_remote_mine(
                 &source_dir, wing, &agent, limit, dry_run, batch_size, &config, &runtime, &rule, true,
-            );
+            ) {
+                Ok(ok) => ok,
+                Err(e) => CliOutput::success(format!(
+                    "  Remote replication: failed — {e}\n\
+                     Note: the local mine completed successfully; remote replication encountered an error.\n"
+                )),
+            };
 
             let combined = format!("{}\n{}", local_output.trim(), remote_output.stdout.trim());
             Ok(CliOutput::success(combined))
@@ -746,7 +752,7 @@ fn execute_remote_mine(
     runtime: &tokio::runtime::Runtime,
     rule: &mempalace_config::ResolvedRouteRule,
     dual_write: bool,
-) -> CliOutput {
+) -> Result<CliOutput, clap::Error> {
     // `--batch-size N` (N>0) caps files per remote request, letting low-spec
     // machines bound how much is held/serialized at once. The ~4 MiB byte cap
     // still applies as an independent guardrail against the server body limit.
@@ -765,7 +771,11 @@ fn execute_remote_mine(
         Ok(p) => p,
         Err(e) => {
             let msg = format!("failed to prepare project batch: {e}\n");
-            return if dual_write { CliOutput::success(format!("  Remote replication: failed — {msg}")) } else { CliOutput::failure(1, msg) };
+            return if dual_write {
+                Ok(CliOutput::success(format!("  Remote replication: failed — {msg}")))
+            } else {
+                Err(clap::Error::raw(clap::error::ErrorKind::Io, msg))
+            };
         }
     };
 
@@ -785,7 +795,11 @@ fn execute_remote_mine(
                 } else {
                     format!("{msg}")
                 };
-                return if dual_write { CliOutput::success(output) } else { CliOutput::failure(1, output) };
+                return if dual_write {
+                    Ok(CliOutput::success(output))
+                } else {
+                    Err(clap::Error::raw(clap::error::ErrorKind::Io, output))
+                };
             }
         };
     let remote_url = resolved_remote.url.clone();
@@ -826,7 +840,7 @@ fn execute_remote_mine(
             lines.push(format!("  {}", warning.trim()));
         }
         lines.push(format!("{}\n", "=".repeat(SEARCH_HEADER_WIDTH)));
-        return CliOutput::success(lines.join("\n"));
+        return Ok(CliOutput::success(lines.join("\n")));
     }
 
     // ── 5. Build the remote client ───────────────────────────────────────────
@@ -845,7 +859,11 @@ fn execute_remote_mine(
             } else {
                 format!("{msg}")
             };
-            return if dual_write { CliOutput::success(output) } else { CliOutput::failure(1, output) };
+            return if dual_write {
+                Ok(CliOutput::success(output))
+            } else {
+                Err(clap::Error::raw(clap::error::ErrorKind::Io, output))
+            };
         }
     };
 
@@ -873,7 +891,11 @@ fn execute_remote_mine(
                      Note: writes do not fall back to local.\n"
                 )
             };
-            return if dual_write { CliOutput::success(output) } else { CliOutput::failure(1, output) };
+            return if dual_write {
+                Ok(CliOutput::success(output))
+            } else {
+                Err(clap::Error::raw(clap::error::ErrorKind::Io, output))
+            };
         }
     };
 
@@ -895,7 +917,11 @@ fn execute_remote_mine(
                 info_resp.capabilities.join(", ")
             )
         };
-        return if dual_write { CliOutput::success(msg) } else { CliOutput::failure(1, msg) };
+        return if dual_write {
+            Ok(CliOutput::success(msg))
+        } else {
+            Err(clap::Error::raw(clap::error::ErrorKind::Io, msg))
+        };
     }
 
     // ── 7. Batch and send ────────────────────────────────────────────────────
@@ -928,14 +954,15 @@ fn execute_remote_mine(
             match runtime.block_on(api.ingest_batch(req)) {
                 Ok(resp) => resp,
                 Err(e) => {
+                    let partial_label = if batches_sent > 0 { "partial" } else { "failed" };
                     let msg = format!(
                         "remote '{}' transport error after {} batch(es): {e}",
                         remote_name, batches_sent
                     );
                     let output = if dual_write {
                         format!(
-                            "  Remote replication: failed — {msg}\n\
-                             Note: the local mine completed successfully; remote replication was interrupted.\n"
+                            "  Remote replication: {partial_label} — {msg}\n\
+                             Note: the local mine completed successfully; remote replication was incomplete.\n"
                         )
                     } else {
                         format!(
@@ -943,7 +970,11 @@ fn execute_remote_mine(
                              Note: writes do not fall back to local.\n"
                         )
                     };
-                    return if dual_write { CliOutput::success(output) } else { CliOutput::failure(1, output) };
+                    return if dual_write {
+                        Ok(CliOutput::success(output))
+                    } else {
+                        Err(clap::Error::raw(clap::error::ErrorKind::Io, output))
+                    };
                 }
             };
 
@@ -993,7 +1024,7 @@ fn execute_remote_mine(
         dual_write,
     );
 
-    CliOutput::success(output)
+    Ok(CliOutput::success(output))
 }
 
 /// Split a flat list of [`IngestFileDto`] into batches bounded by `max_files`
@@ -2655,6 +2686,39 @@ mod tests {
         fs::write(project_dir.join("mempalace.yaml"), yaml).unwrap();
     }
 
+    /// Write a CLI config for `combined` + `write: both` routing.
+    fn write_combined_cli_config(
+        config_dir: &Path,
+        remote_name: &str,
+        server_url: &str,
+        inline_token: &str,
+        wing_name: &str,
+        palace_dir: &Path,
+        project_dir: &Path,
+    ) {
+        fs::create_dir_all(config_dir).unwrap();
+        let config_json = serde_json::json!({
+            "version": 1,
+            "palace_path": palace_dir.to_str().unwrap(),
+            "federation": {
+                "remotes": [{"name": remote_name, "url": server_url, "token": inline_token}],
+                "wings": {
+                    wing_name: {"mode": "combined", "write": "both", "remote": remote_name}
+                }
+            }
+        });
+        fs::write(
+            config_dir.join("config.json"),
+            serde_json::to_string_pretty(&config_json).unwrap(),
+        )
+        .unwrap();
+
+        let yaml = format!(
+            "wing: {wing_name}\nrooms:\n  - name: general\n    description: General files\n"
+        );
+        fs::write(project_dir.join("mempalace.yaml"), yaml).unwrap();
+    }
+
     #[test]
     fn mine_remote_routed_e2e_ingests_to_server() {
         const TOKEN: &str = "remote-mine-e2e-tok-001";
@@ -2822,6 +2886,181 @@ mod tests {
                 assert!(
                     output.stderr.contains("unreachable") && output.stderr.contains("local"),
                     "error should mention unreachable and no local fallback: {}",
+                    output.stderr
+                );
+            }
+        }
+
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn mine_combined_both_unreachable_returns_local_success() {
+        let workspace = tempdir().unwrap();
+        let project_dir = workspace.path().join("combinedproject");
+        fs::create_dir_all(&project_dir).unwrap();
+        write_file(
+            &project_dir.join("code.rs"),
+            "fn example() -> bool { true }\n".repeat(10).as_str(),
+        );
+
+        let config_root = temp_config_root("combined-unreachable");
+        let context = CliContext::for_tests(config_root.clone());
+        let palace_dir = config_root.join("palace");
+
+        // init creates the local palace and writes default config.json.
+        run_cli(["init", project_dir.to_str().unwrap(), "--yes"], &context, stub_provider).unwrap();
+
+        // Overwrite config.json with combined+both routing pointing at
+        // an unreachable port.
+        let remote_name = "hub";
+        let server_url = "http://127.0.0.1:1";
+        write_combined_cli_config(
+            &config_root,
+            remote_name,
+            server_url,
+            "combined-unreachable-tok",
+            "wing_combinedproject",
+            &palace_dir,
+            &project_dir,
+        );
+
+        let context = CliContext::for_tests(config_root.clone());
+        let output = run_cli(
+            ["mine", project_dir.to_str().unwrap()],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+
+        // Must succeed locally despite remote being unreachable.
+        assert_eq!(output.exit_code, 0, "combined mine failed: stderr={:?}", output.stderr);
+        assert!(
+            output.stdout.contains("Files ingested:"),
+            "local ingestion must appear: {}",
+            output.stdout
+        );
+        assert!(
+            output.stdout.contains("replication: failed") || output.stdout.contains("replication: skipped"),
+            "remote replication failure must be reported: {}",
+            output.stdout
+        );
+
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn mine_combined_both_remote_success_reports_with_local() {
+        const TOKEN: &str = "combined-success-tok-002";
+        let workspace = tempdir().unwrap();
+
+        // Server palace dir.
+        let server_palace = workspace.path().join("server-palace");
+        fs::create_dir_all(&server_palace).unwrap();
+        let addr = spawn_test_server(server_palace.clone(), TOKEN);
+        let server_url = format!("http://{addr}");
+
+        // Project dir.
+        let project_dir = workspace.path().join("myproject");
+        fs::create_dir_all(&project_dir).unwrap();
+        write_file(
+            &project_dir.join("backend/auth.rs"),
+            "Auth login flow keeps auth checks in the backend service.\n"
+                .repeat(5)
+                .as_str(),
+        );
+        write_file(
+            &project_dir.join("docs/roadmap.md"),
+            "Roadmap plan tracks the migration milestones.\n".repeat(5).as_str(),
+        );
+
+        // CLI config dir: init local palace, then overwrite with combined+both.
+        let config_root = temp_config_root("combined-e2e");
+        let context = CliContext::for_tests(config_root.clone());
+        let palace_dir = config_root.join("palace");
+
+        run_cli(["init", project_dir.to_str().unwrap(), "--yes"], &context, stub_provider).unwrap();
+
+        let wing_name = "wing_myproject";
+        let remote_name = "hub";
+        write_combined_cli_config(
+            &config_root,
+            remote_name,
+            &server_url,
+            TOKEN,
+            wing_name,
+            &palace_dir,
+            &project_dir,
+        );
+
+        let context = CliContext::for_tests(config_root.clone());
+        let output = run_cli(
+            ["mine", project_dir.to_str().unwrap()],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+
+        assert_eq!(output.exit_code, 0, "combined mine failed: stderr={:?}", output.stderr);
+        assert!(
+            output.stdout.contains("Files ingested:"),
+            "must show local ingestion results: {}",
+            output.stdout
+        );
+        assert!(
+            output.stdout.contains("replication: succeeded"),
+            "remote replication must report success: {}",
+            output.stdout
+        );
+
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn mine_remote_only_unreachable_still_fails_legacy() {
+        // Verify that a remote-only (not combined) route still fails through
+        // the legacy error path when the remote is unreachable.
+        let workspace = tempdir().unwrap();
+        let project_dir = workspace.path().join("legacy-remote");
+        fs::create_dir_all(&project_dir).unwrap();
+        write_file(
+            &project_dir.join("code.rs"),
+            "fn example() -> bool { true }\n".repeat(10).as_str(),
+        );
+
+        let config_root = temp_config_root("legacy-remote-unreachable");
+        let wing_name = "wing_legacyremote";
+        let remote_name = "hub";
+        let server_url = "http://127.0.0.1:1";
+        write_remote_cli_config(
+            &config_root,
+            remote_name,
+            server_url,
+            "legacy-unreachable-tok",
+            wing_name,
+            &project_dir,
+        );
+
+        let context = CliContext::for_tests(config_root.clone());
+        let result = run_cli(
+            ["mine", project_dir.to_str().unwrap()],
+            &context,
+            stub_provider,
+        );
+
+        match result {
+            Err(error) => {
+                let msg = error.to_string();
+                assert!(
+                    msg.contains("unreachable") && msg.contains("local"),
+                    "legacy error should mention unreachable and no fallback: {msg}"
+                );
+            }
+            Ok(output) => {
+                assert_ne!(output.exit_code, 0, "legacy remote-only must fail: {:?}", output);
+                assert!(
+                    output.stderr.contains("unreachable") && output.stderr.contains("local"),
+                    "legacy error should mention unreachable and no fallback: {}",
                     output.stderr
                 );
             }

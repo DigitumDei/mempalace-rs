@@ -427,10 +427,16 @@ impl FederationRouter {
             _ => return ReplicationStatus::Skipped,
         };
         let Some(remote_name) = remote_name else {
-            return ReplicationStatus::Skipped;
+            return ReplicationStatus::Failed {
+                remote: "(none)".to_owned(),
+                reason: "write:both route has no remote configured".to_owned(),
+            };
         };
         let Some(api) = self.remotes.get(remote_name) else {
-            return ReplicationStatus::Skipped;
+            return ReplicationStatus::Failed {
+                remote: remote_name.to_owned(),
+                reason: "no client available for remote".to_owned(),
+            };
         };
 
         // ── Pre-add duplicate check (best-effort) ─────────────────────────
@@ -1000,10 +1006,16 @@ impl FederationRouter {
             _ => return ReplicationStatus::Skipped,
         };
         let Some(remote_name) = remote_name else {
-            return ReplicationStatus::Skipped;
+            return ReplicationStatus::Failed {
+                remote: "(none)".to_owned(),
+                reason: "write:both route has no remote configured".to_owned(),
+            };
         };
         let Some(api) = self.remotes.get(remote_name) else {
-            return ReplicationStatus::Skipped;
+            return ReplicationStatus::Failed {
+                remote: remote_name.to_owned(),
+                reason: "no client available for remote".to_owned(),
+            };
         };
         let req = mempalace_federation::KgAddFactRequest {
             subject: subject.to_owned(),
@@ -1097,10 +1109,16 @@ impl FederationRouter {
             _ => return ReplicationStatus::Skipped,
         };
         let Some(remote_name) = remote_name else {
-            return ReplicationStatus::Skipped;
+            return ReplicationStatus::Failed {
+                remote: "(none)".to_owned(),
+                reason: "write:both route has no remote configured".to_owned(),
+            };
         };
         let Some(api) = self.remotes.get(remote_name) else {
-            return ReplicationStatus::Skipped;
+            return ReplicationStatus::Failed {
+                remote: remote_name.to_owned(),
+                reason: "no client available for remote".to_owned(),
+            };
         };
         let req = mempalace_federation::KgInvalidateRequest {
             subject: subject.to_owned(),
@@ -2617,6 +2635,7 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn e2e_wing_availability_includes_configured_wings() {
         let mock = MockRemote::default();
         let mut remotes = BTreeMap::new();
         remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);

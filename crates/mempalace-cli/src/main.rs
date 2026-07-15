@@ -673,8 +673,11 @@ where
                 rule,
             );
             let combined = match remote_result {
-                Ok(output) => {
+                Ok(output) if output.exit_code == 0 => {
                     format!("{}\n  Remote replication: succeeded\n{}", local_lines.trim(), output.stdout.trim())
+                }
+                Ok(output) => {
+                    format!("{}\n  Remote replication: failed — {}\n", local_lines.trim(), output.stderr.trim())
                 }
                 Err(e) => {
                     format!("{}\n  Remote replication: failed — {}\n", local_lines.trim(), e)

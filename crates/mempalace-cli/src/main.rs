@@ -568,15 +568,9 @@ where
                 extract, branch, batch_size, &config, &runtime, &provider_factory,
             )?;
 
-            let remote_output = match execute_remote_mine(
+            let remote_output = execute_remote_mine(
                 &source_dir, wing, &agent, limit, dry_run, batch_size, &config, &runtime, &rule, true,
-            ) {
-                Ok(ok) => ok,
-                Err(e) => CliOutput::success(format!(
-                    "  Remote replication: failed — {e}\n\
-                     Note: the local mine completed successfully; remote replication encountered an error.\n"
-                )),
-            };
+            )?;
 
             let combined = format!("{}\n{}", local_output.trim(), remote_output.stdout.trim());
             Ok(CliOutput::success(combined))

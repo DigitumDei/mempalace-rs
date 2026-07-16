@@ -1555,12 +1555,17 @@ where
         let runtime = KnowledgeGraphRuntime::new(self.storage.operational_store());
         let route = self.federation.as_ref().map(|router| router.resolve_kg_route());
         let federated_read = route.as_ref().is_some_and(|route| route.mode != RouteMode::Local);
-        let facts = match runtime.query_entity(&entity, as_of, direction) {
-            Ok(facts) => facts,
-            // A federated query may name an entity that exists only on the remote.
-            // Keep the local side empty so federation can still complete the read.
-            Err(mempalace_graph::GraphError::UnknownEntity { .. }) if federated_read => Vec::new(),
-            Err(error) => return Err(ToolError::Internal(McpError::Graph(error))),
+        let local_read = route.as_ref().map_or(true, |route| route.mode != RouteMode::Remote);
+        let facts = if local_read {
+            match runtime.query_entity(&entity, as_of, direction) {
+                Ok(facts) => facts,
+                // A federated query may name an entity that exists only on the remote.
+                // Keep the local side empty so federation can still complete the read.
+                Err(mempalace_graph::GraphError::UnknownEntity { .. }) if federated_read => Vec::new(),
+                Err(error) => return Err(ToolError::Internal(McpError::Graph(error))),
+            }
+        } else {
+            Vec::new()
         };
         let count = facts.len();
         let mut payload = json!({
@@ -1797,11 +1802,16 @@ where
         let runtime = KnowledgeGraphRuntime::new(self.storage.operational_store());
         let route = self.federation.as_ref().map(|router| router.resolve_kg_route());
         let federated_read = route.as_ref().is_some_and(|route| route.mode != RouteMode::Local);
-        let timeline = match runtime.timeline(entity.as_deref()) {
-            Ok(timeline) => timeline,
-            // See `tool_kg_query`: an entity can be known only by a remote.
-            Err(mempalace_graph::GraphError::UnknownEntity { .. }) if federated_read => Vec::new(),
-            Err(error) => return Err(ToolError::Internal(McpError::Graph(error))),
+        let local_read = route.as_ref().map_or(true, |route| route.mode != RouteMode::Remote);
+        let timeline = if local_read {
+            match runtime.timeline(entity.as_deref()) {
+                Ok(timeline) => timeline,
+                // See `tool_kg_query`: an entity can be known only by a remote.
+                Err(mempalace_graph::GraphError::UnknownEntity { .. }) if federated_read => Vec::new(),
+                Err(error) => return Err(ToolError::Internal(McpError::Graph(error))),
+            }
+        } else {
+            Vec::new()
         };
         let count = timeline.len();
         let mut payload = json!({

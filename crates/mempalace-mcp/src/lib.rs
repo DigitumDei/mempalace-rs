@@ -851,9 +851,17 @@ where
         let mut wings = BTreeMap::<String, usize>::new();
         let mut rooms = include_rooms.then(BTreeMap::<String, usize>::new);
         for drawer in &drawers {
-            *wings.entry(drawer.wing.as_str().to_owned()).or_default() += 1;
+            if let Some(count) = wings.get_mut(drawer.wing.as_str()) {
+                *count += 1;
+            } else {
+                wings.insert(drawer.wing.as_str().to_owned(), 1);
+            }
             if let Some(rooms) = &mut rooms {
-                *rooms.entry(drawer.room.as_str().to_owned()).or_default() += 1;
+                if let Some(count) = rooms.get_mut(drawer.room.as_str()) {
+                    *count += 1;
+                } else {
+                    rooms.insert(drawer.room.as_str().to_owned(), 1);
+                }
             }
         }
         let mut payload = json!({

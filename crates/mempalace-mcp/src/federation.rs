@@ -2572,68 +2572,32 @@ mod tests {
     }
 
     // ── DeleteDrawer route-matrix: verify exclusion from write routing ──────
+    //
+    // These tests are deliberately in federation.rs (the low-level module) and
+    // verify that `delete_drawer_remote` — the method called by
+    // `tool_delete_drawer` as a fallback — ignores routing rules and tries all
+    // remotes.  The full local-first + fallback path is covered in lib.rs tests
+    // via `tool_delete_drawer` directly.
 
     #[tokio::test]
-    async fn e2e_delete_drawer_fallback_ignores_route_mode() {
-        // DeleteDrawer does not use write target routing — it tries local first,
-        // then falls back to ALL remotes regardless of the wing's resolved route.
-        // Test that even with a Remote-mode route the fallback still fires.
+    async fn e2e_delete_drawer_remote_ignores_routing() {
+        // Configure a Combined/write:Both route.  delete_drawer_remote must
+        // still try remotes by its own logic (iterate all in order) rather than
+        // delegating to a replicate path.  This test proves the low-level
+        // function is agnostic to routing.
         let mock = MockRemote::default();
         let mut remotes = BTreeMap::new();
         remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
         let mut router = make_router(remotes);
-        // Override to Remote mode (write: remote) — should not change behavior.
-        router.rules.default_mode = RouteMode::Remote;
+        router.rules.wings.insert("wing_code".to_owned(), ResolvedRouteRule {
+            mode: RouteMode::Combined,
+            remote: Some("alpha".to_owned()),
+            write: WriteTarget::Both,
+        });
 
-        let result = router.delete_drawer_remote("drawer-1").await.unwrap().unwrap();
-
-        assert_eq!(result["success"], true);
-        assert_eq!(result["origin"], "alpha");
-    }
-
-    #[tokio::test]
-    async fn e2e_delete_drawer_fallback_ignores_dual_write() {
-        // Even with a `write: both` route (dual-write config), DeleteDrawer does
-        // NOT dual-write. It deletes locally first; if not found, it falls back
-        // to remotes — but it calls delete_drawer_remote (not a replicate path).
-        let mock = MockRemote::default();
-        let mut remotes = BTreeMap::new();
-        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
-        let mut router = make_router(remotes);
-
-        // delete_drawer_remote is the fallback path — it has no concept of
-        // replication; it just tries each remote.
         let result = router.delete_drawer_remote("drawer-1").await.unwrap().unwrap();
         assert_eq!(result["success"], true);
         assert_eq!(result["origin"], "alpha");
-        // The response does NOT carry a "replication" field — verification that
-        // DeleteDrawer is excluded from dual-write semantics.
-        assert!(
-            !result.as_object().unwrap().contains_key("replication"),
-            "DeleteDrawer must never produce a replication field; got: {result}"
-        );
-    }
-
-    #[tokio::test]
-    async fn e2e_delete_drawer_route_matrix_all_remotes_fallback() {
-        // Route-matrix: regardless of write target (local, remote, both),
-        // delete_drawer_remote always tries ALL remotes in order.
-        // Test with 2 remotes and one failure per combination.
-        for write_target in [WriteTarget::Local, WriteTarget::Remote, WriteTarget::Both] {
-            let mut mock_fail = MockRemote::default();
-            mock_fail.delete_succeeds = false;
-            let mock_ok = MockRemote::default();
-
-            let mut remotes = BTreeMap::new();
-            remotes.insert("aaa".to_owned(), Arc::new(mock_fail) as Arc<dyn RemoteApi>);
-            remotes.insert("bbb".to_owned(), Arc::new(mock_ok) as Arc<dyn RemoteApi>);
-            let router = make_router(remotes);
-
-            let result = router.delete_drawer_remote("drawer-1").await.unwrap().unwrap();
-            assert_eq!(result["origin"], "bbb",
-                "write_target={write_target:?}: should fall through aaa to bbb"
-            );
-        }
     }
 
     #[tokio::test]

@@ -5029,6 +5029,308 @@ mod tests {
         );
     }
 
+    // ── DeleteDrawer route-matrix: runtime tests through tool_delete_drawer ────
+    //
+    // These tests verify that `mempalace_delete_drawer`:
+    //   a) Always attempts local deletion first, regardless of write target.
+    //   b) Falls back to remotes only after a local miss.
+    //   c) Never attaches a `replication` field.
+    //
+    // The mock `RemoteApi` below is minimal — only `delete_drawer` is wired.
+
+    struct DeleteDrawerMock {
+        delete_succeeds: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl mempalace_remote::RemoteApi for DeleteDrawerMock {
+        async fn info(&self) -> mempalace_remote::Result<mempalace_federation::InfoResponse> {
+            panic!("unexpected info call")
+        }
+        async fn search_drawers(
+            &self,
+            _req: mempalace_federation::DrawerSearchRequest,
+        ) -> mempalace_remote::Result<mempalace_federation::DrawerSearchResponse> {
+            panic!("unexpected search_drawers call")
+        }
+        async fn check_duplicate(
+            &self,
+            _req: mempalace_federation::CheckDuplicateRequest,
+        ) -> mempalace_remote::Result<mempalace_federation::CheckDuplicateResponse> {
+            panic!("unexpected check_duplicate call")
+        }
+        async fn add_drawer(
+            &self,
+            _req: mempalace_federation::AddDrawerRequest,
+        ) -> mempalace_remote::Result<mempalace_federation::AddDrawerResponse> {
+            panic!("unexpected add_drawer call")
+        }
+        async fn list_drawers(
+            &self,
+            _query: mempalace_federation::ListDrawersQuery,
+        ) -> mempalace_remote::Result<mempalace_federation::ListDrawersResponse> {
+            panic!("unexpected list_drawers call")
+        }
+        async fn get_drawer(&self, _drawer_id: &str) -> mempalace_remote::Result<serde_json::Value> {
+            panic!("unexpected get_drawer call")
+        }
+        async fn delete_drawer(&self, _drawer_id: &str) -> mempalace_remote::Result<()> {
+            if self.delete_succeeds {
+                Ok(())
+            } else {
+                Err(mempalace_remote::RemoteError::RemoteRejected {
+                    remote: "mock".to_owned(),
+                    status: 404,
+                    body: "not found".to_owned(),
+                })
+            }
+        }
+        async fn kg_query(
+            &self,
+            _req: mempalace_federation::KgQueryRequest,
+        ) -> mempalace_remote::Result<serde_json::Value> {
+            panic!("unexpected kg_query call")
+        }
+        async fn kg_add_fact(
+            &self,
+            _req: mempalace_federation::KgAddFactRequest,
+        ) -> mempalace_remote::Result<serde_json::Value> {
+            panic!("unexpected kg_add_fact call")
+        }
+        async fn kg_invalidate(
+            &self,
+            _req: mempalace_federation::KgInvalidateRequest,
+        ) -> mempalace_remote::Result<serde_json::Value> {
+            panic!("unexpected kg_invalidate call")
+        }
+        async fn kg_timeline(
+            &self,
+            _entity: Option<&str>,
+        ) -> mempalace_remote::Result<serde_json::Value> {
+            panic!("unexpected kg_timeline call")
+        }
+        async fn kg_stats(&self) -> mempalace_remote::Result<serde_json::Value> {
+            panic!("unexpected kg_stats call")
+        }
+        async fn taxonomy(&self) -> mempalace_remote::Result<serde_json::Value> {
+            panic!("unexpected taxonomy call")
+        }
+        async fn wings(&self) -> mempalace_remote::Result<serde_json::Value> {
+            panic!("unexpected wings call")
+        }
+        async fn rooms(&self, _wing: Option<&str>) -> mempalace_remote::Result<serde_json::Value> {
+            panic!("unexpected rooms call")
+        }
+        async fn changes(
+            &self,
+            _query: mempalace_federation::ChangesQuery,
+        ) -> mempalace_remote::Result<mempalace_federation::ChangesResponse> {
+            panic!("unexpected changes call")
+        }
+        async fn ingest_batch(
+            &self,
+            _req: mempalace_federation::IngestBatchRequest,
+        ) -> mempalace_remote::Result<mempalace_federation::IngestBatchResponse> {
+            panic!("unexpected ingest_batch call")
+        }
+    }
+
+    fn make_delete_drawer_rules(
+        remotes: &BTreeMap<String, Arc<dyn mempalace_remote::RemoteApi>>,
+        write: WriteTarget,
+    ) -> FederationRuntimeConfig {
+        let mut rules_remotes = BTreeMap::new();
+        for name in remotes.keys() {
+            rules_remotes.insert(name.clone(), ResolvedRemote {
+                name: name.clone(),
+                url: "https://mock.example".to_owned(),
+                token: None,
+                timeout: std::time::Duration::from_secs(5),
+            });
+        }
+        FederationRuntimeConfig {
+            remotes: rules_remotes,
+            default_mode: RouteMode::Combined,
+            default_remote: remotes.keys().next().cloned(),
+            wings: [(
+                "wing_code".to_owned(),
+                ResolvedRouteRule {
+                    mode: RouteMode::Combined,
+                    remote: remotes.keys().next().cloned(),
+                    write,
+                },
+            )]
+            .into(),
+            kg: None,
+        }
+    }
+
+    struct DeleteDrawerTestCtx {
+        #[allow(dead_code)]
+        _tempdir: TempDir,
+        runtime: McpRuntime<DeterministicStubProvider>,
+    }
+
+    async fn make_delete_drawer_ctx(
+        remotes: BTreeMap<String, Arc<dyn mempalace_remote::RemoteApi>>,
+        write: WriteTarget,
+    ) -> DeleteDrawerTestCtx {
+        let rules = make_delete_drawer_rules(&remotes, write);
+        let tempdir = TempDir::new().unwrap();
+        let palace_path = tempdir.path().join("palace");
+        let config = MempalaceConfig {
+            federation: FederationRuntimeConfig::default(),
+            ..make_base_config(&palace_path, &tempdir)
+        };
+        let mut runtime = McpRuntime::new(config, DeterministicStubProvider::new(EmbeddingProfile::Balanced))
+            .await
+            .unwrap();
+        // Inject mock federation — avoid real HTTP connections.
+        runtime.federation = Some(FederationRouter::with_remotes(rules, remotes));
+        DeleteDrawerTestCtx { _tempdir: tempdir, runtime }
+    }
+
+    #[tokio::test]
+    async fn tool_delete_drawer_with_write_remote_local_hit() {
+        // Given a Combined/write:Remote wing route, and a drawer that exists
+        // locally, DeleteDrawer must delete locally — not forward to the remote.
+        let remotes = BTreeMap::from([(
+            "alpha".to_owned(),
+            Arc::new(DeleteDrawerMock { delete_succeeds: true }) as Arc<dyn mempalace_remote::RemoteApi>,
+        )]);
+        let mut ctx = make_delete_drawer_ctx(remotes, WriteTarget::Remote).await;
+
+        // Seed a drawer into the local store so it will be found locally.
+        let local_id = DrawerId::new("local-test-drawer-001").unwrap();
+        let now = OffsetDateTime::now_utc();
+        ctx.runtime
+            .storage
+            .drawer_store()
+            .put_drawers(
+                &[DrawerRecord {
+                    id: local_id.clone(),
+                    wing: WingId::new("wing_code").unwrap(),
+                    room: RoomId::new("test-room").unwrap(),
+                    hall: None,
+                    date: Some(now.date()),
+                    source_file: "test.txt".to_owned(),
+                    chunk_index: 0,
+                    ingest_mode: "test".to_owned(),
+                    extract_mode: None,
+                    added_by: "test".to_owned(),
+                    filed_at: now,
+                    importance: None,
+                    emotional_weight: None,
+                    weight: None,
+                    content: "test content".to_owned(),
+                    content_hash: mempalace_core::hash_text("test content"),
+                    embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
+                    locator: None,
+                }],
+                DuplicateStrategy::Error,
+            )
+            .await
+            .unwrap();
+
+        let result = ctx
+            .runtime
+            .tool_delete_drawer(&json!({"drawer_id": local_id.as_str()}))
+            .await
+            .unwrap();
+
+        assert_eq!(result["success"], true);
+        assert_eq!(result["drawer_id"], local_id.as_str());
+        assert_eq!(result["applied_to"], "local");
+        assert!(
+            !result.as_object().unwrap().contains_key("replication"),
+            "DeleteDrawer must never produce a replication field; got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_delete_drawer_with_write_both_local_hit() {
+        // Given a Combined/write:Both wing route, and a drawer that exists
+        // locally, DeleteDrawer must delete locally — no replication attempt.
+        let remotes = BTreeMap::from([(
+            "alpha".to_owned(),
+            Arc::new(DeleteDrawerMock { delete_succeeds: true }) as Arc<dyn mempalace_remote::RemoteApi>,
+        )]);
+        let mut ctx = make_delete_drawer_ctx(remotes, WriteTarget::Both).await;
+
+        let local_id = DrawerId::new("local-test-drawer-002").unwrap();
+        let now = OffsetDateTime::now_utc();
+        ctx.runtime
+            .storage
+            .drawer_store()
+            .put_drawers(
+                &[DrawerRecord {
+                    id: local_id.clone(),
+                    wing: WingId::new("wing_code").unwrap(),
+                    room: RoomId::new("test-room").unwrap(),
+                    hall: None,
+                    date: Some(now.date()),
+                    source_file: "test.txt".to_owned(),
+                    chunk_index: 0,
+                    ingest_mode: "test".to_owned(),
+                    extract_mode: None,
+                    added_by: "test".to_owned(),
+                    filed_at: now,
+                    importance: None,
+                    emotional_weight: None,
+                    weight: None,
+                    content: "test content".to_owned(),
+                    content_hash: mempalace_core::hash_text("test content"),
+                    embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
+                    locator: None,
+                }],
+                DuplicateStrategy::Error,
+            )
+            .await
+            .unwrap();
+
+        let result = ctx
+            .runtime
+            .tool_delete_drawer(&json!({"drawer_id": local_id.as_str()}))
+            .await
+            .unwrap();
+
+        assert_eq!(result["success"], true);
+        assert_eq!(result["drawer_id"], local_id.as_str());
+        assert_eq!(result["applied_to"], "local");
+        assert!(
+            !result.as_object().unwrap().contains_key("replication"),
+            "DeleteDrawer must never produce a replication field; got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_delete_drawer_fallback_remote_ignores_routing() {
+        // Given a Combined/write:Both wing route, and a drawer that does NOT
+        // exist locally, DeleteDrawer must fall back across remotes. The response
+        // must report the remote origin and must NOT carry a replication field.
+        let remotes = BTreeMap::from([(
+            "alpha".to_owned(),
+            Arc::new(DeleteDrawerMock { delete_succeeds: true }) as Arc<dyn mempalace_remote::RemoteApi>,
+        )]);
+        let mut ctx = make_delete_drawer_ctx(remotes, WriteTarget::Both).await;
+
+        // Do NOT seed any drawer — local delete will return 0, triggering fallback.
+        let result = ctx
+            .runtime
+            .tool_delete_drawer(&json!({"drawer_id": "non-existent-drawer-999"}))
+            .await
+            .unwrap();
+
+        assert_eq!(result["success"], true);
+        assert_eq!(result["drawer_id"], "non-existent-drawer-999");
+        assert_eq!(result["origin"], "alpha");
+        assert_eq!(result["applied_to"], "remote:alpha");
+        assert!(
+            !result.as_object().unwrap().contains_key("replication"),
+            "DeleteDrawer must never produce a replication field; got: {result}"
+        );
+    }
+
     async fn test_harness_with_federation(federation: FederationRuntimeConfig) -> TestHarness {
         let tempdir = TempDir::new().unwrap();
         let palace_path = tempdir.path().join("palace");

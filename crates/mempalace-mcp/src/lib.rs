@@ -1750,7 +1750,7 @@ where
             "success": invalidated > 0,
             "invalidated": invalidated,
             "fact": format!("{sub} → {pred} → {obj}"),
-            "ended": ended_text.unwrap_or_else(|| "today".to_owned()),
+            "ended": ended_text.as_deref().unwrap_or("today"),
         });
         if self.federation.is_some() {
             if let Some(obj) = payload.as_object_mut() {

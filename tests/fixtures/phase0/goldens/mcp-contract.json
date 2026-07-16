@@ -353,7 +353,7 @@
           "name": "mempalace_add_drawer"
         },
         {
-          "description": "Delete a drawer by ID. Irreversible.",
+          "description": "Delete a drawer by ID. Irreversible. Local deletion first by ID; if not found locally, falls back to remotes in name order. Does not use write routing.",
           "inputSchema": {
             "properties": {
               "drawer_id": {

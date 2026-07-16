@@ -869,7 +869,13 @@ where
     let as_of = body.as_of.as_deref().map(parse_date).transpose()?;
     let direction = parse_direction(body.direction.as_deref().unwrap_or("both"))?;
     let runtime = KnowledgeGraphRuntime::new(state.storage.operational_store());
-    let facts = runtime.query_entity(&body.entity, as_of, direction)?;
+    // A federation peer can legitimately have no record of an entity that is
+    // present elsewhere in the federation. Represent that as an empty read.
+    let facts = match runtime.query_entity(&body.entity, as_of, direction) {
+        Ok(facts) => facts,
+        Err(mempalace_graph::GraphError::UnknownEntity { .. }) => Vec::new(),
+        Err(error) => return Err(error.into()),
+    };
     let count = facts.len();
     Ok(Json(json!({
         "entity": body.entity,
@@ -1001,7 +1007,11 @@ where
     let limit = params.limit.unwrap_or(DEFAULT_KG_TIMELINE_LIMIT).max(1).min(MAX_KG_TIMELINE_LIMIT);
     let entity = params.entity;
     let runtime = KnowledgeGraphRuntime::new(state.storage.operational_store());
-    let mut timeline = runtime.timeline(entity.as_deref())?;
+    let mut timeline = match runtime.timeline(entity.as_deref()) {
+        Ok(timeline) => timeline,
+        Err(mempalace_graph::GraphError::UnknownEntity { .. }) => Vec::new(),
+        Err(error) => return Err(error.into()),
+    };
     let total_count = timeline.len();
     timeline.truncate(limit);
     let count = timeline.len();

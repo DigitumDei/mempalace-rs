@@ -2519,6 +2519,7 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
     use std::sync::mpsc;
 
@@ -5040,6 +5041,13 @@ mod tests {
 
     struct DeleteDrawerMock {
         delete_succeeds: bool,
+        delete_call_count: AtomicU64,
+    }
+
+    impl DeleteDrawerMock {
+        fn delete_call_count(&self) -> u64 {
+            self.delete_call_count.load(Ordering::SeqCst)
+        }
     }
 
     #[async_trait::async_trait]
@@ -5075,6 +5083,7 @@ mod tests {
             panic!("unexpected get_drawer call")
         }
         async fn delete_drawer(&self, _drawer_id: &str) -> mempalace_remote::Result<()> {
+            self.delete_call_count.fetch_add(1, Ordering::SeqCst);
             if self.delete_succeeds {
                 Ok(())
             } else {
@@ -5194,9 +5203,14 @@ mod tests {
     async fn tool_delete_drawer_with_write_remote_local_hit() {
         // Given a Combined/write:Remote wing route, and a drawer that exists
         // locally, DeleteDrawer must delete locally — not forward to the remote.
+        let mock = Arc::new(DeleteDrawerMock {
+            delete_succeeds: true,
+            delete_call_count: AtomicU64::new(0),
+        });
+        let mock_for_assert = mock.clone();
         let remotes = BTreeMap::from([(
             "alpha".to_owned(),
-            Arc::new(DeleteDrawerMock { delete_succeeds: true }) as Arc<dyn mempalace_remote::RemoteApi>,
+            mock as Arc<dyn mempalace_remote::RemoteApi>,
         )]);
         let mut ctx = make_delete_drawer_ctx(remotes, WriteTarget::Remote).await;
 
@@ -5245,15 +5259,25 @@ mod tests {
             !result.as_object().unwrap().contains_key("replication"),
             "DeleteDrawer must never produce a replication field; got: {result}"
         );
+        assert_eq!(
+            mock_for_assert.delete_call_count(),
+            0,
+            "write:Remote local hit must not call the remote"
+        );
     }
 
     #[tokio::test]
     async fn tool_delete_drawer_with_write_both_local_hit() {
         // Given a Combined/write:Both wing route, and a drawer that exists
         // locally, DeleteDrawer must delete locally — no replication attempt.
+        let mock = Arc::new(DeleteDrawerMock {
+            delete_succeeds: true,
+            delete_call_count: AtomicU64::new(0),
+        });
+        let mock_for_assert = mock.clone();
         let remotes = BTreeMap::from([(
             "alpha".to_owned(),
-            Arc::new(DeleteDrawerMock { delete_succeeds: true }) as Arc<dyn mempalace_remote::RemoteApi>,
+            mock as Arc<dyn mempalace_remote::RemoteApi>,
         )]);
         let mut ctx = make_delete_drawer_ctx(remotes, WriteTarget::Both).await;
 
@@ -5301,6 +5325,11 @@ mod tests {
             !result.as_object().unwrap().contains_key("replication"),
             "DeleteDrawer must never produce a replication field; got: {result}"
         );
+        assert_eq!(
+            mock_for_assert.delete_call_count(),
+            0,
+            "write:Both local hit must not call the remote"
+        );
     }
 
     #[tokio::test]
@@ -5308,9 +5337,14 @@ mod tests {
         // Given a Combined/write:Both wing route, and a drawer that does NOT
         // exist locally, DeleteDrawer must fall back across remotes. The response
         // must report the remote origin and must NOT carry a replication field.
+        let mock = Arc::new(DeleteDrawerMock {
+            delete_succeeds: true,
+            delete_call_count: AtomicU64::new(0),
+        });
+        let mock_for_assert = mock.clone();
         let remotes = BTreeMap::from([(
             "alpha".to_owned(),
-            Arc::new(DeleteDrawerMock { delete_succeeds: true }) as Arc<dyn mempalace_remote::RemoteApi>,
+            mock as Arc<dyn mempalace_remote::RemoteApi>,
         )]);
         let mut ctx = make_delete_drawer_ctx(remotes, WriteTarget::Both).await;
 
@@ -5328,6 +5362,11 @@ mod tests {
         assert!(
             !result.as_object().unwrap().contains_key("replication"),
             "DeleteDrawer must never produce a replication field; got: {result}"
+        );
+        assert_eq!(
+            mock_for_assert.delete_call_count(),
+            1,
+            "fallback must call the remote exactly once"
         );
     }
 

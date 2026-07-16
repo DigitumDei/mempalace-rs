@@ -3277,6 +3277,7 @@ mod tests {
         palace_dir: PathBuf,
         token: &str,
     ) -> std::net::SocketAddr {
+        use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let token_dir = tempfile::tempdir().unwrap();
@@ -3289,11 +3290,13 @@ mod tests {
             .unwrap();
 
         let addr = rt.block_on(async {
-            let tokens = mempalace_server::TokenRegistry::load(&token_file).unwrap();
+            let tokens = mempalace_server::TokenRegistry::load(token_file).unwrap();
             let provider = mempalace_embeddings::DeterministicStubProvider::new(
-                mempalace_config::EmbeddingProfile::Balanced,
+                EmbeddingProfile::Balanced,
             );
-            let router = mempalace_server::build_router(config, provider, tokens).unwrap();
+            let router = mempalace_server::build_router(config, provider, tokens)
+                .await
+                .unwrap();
 
             let counter = Arc::new(AtomicUsize::new(0));
             let app = router.layer(axum::middleware::from_fn({

@@ -213,6 +213,71 @@ fn combined_kg_rule_both_write() -> ResolvedRouteRule {
     }
 }
 
+#[tokio::test]
+async fn federated_kg_reads_return_empty_for_unknown_entities() {
+    let hub_dir = TempDir::new().unwrap();
+    let local_dir = TempDir::new().unwrap();
+    let addr = spawn_server(&hub_dir).await;
+    let hub_url = format!("http://{addr}");
+
+    // A federation endpoint must return an empty result for an entity absent
+    // from this palace, rather than making the peer appear unavailable.
+    let hub_client = RemoteClient::new(RemoteEndpoint {
+        name: "hub".to_owned(),
+        base_url: hub_url.clone(),
+        token: Some(TEST_TOKEN.to_owned()),
+        timeout: Duration::from_secs(5),
+    })
+    .unwrap();
+    let remote = hub_client
+        .kg_query(KgQueryRequest {
+            entity: "unknown federation entity".to_owned(),
+            as_of: None,
+            direction: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(remote["count"], 0);
+    assert_eq!(remote["facts"], json!([]));
+
+    let server = mcp_server_with_hub(
+        &local_dir,
+        &hub_url,
+        BTreeMap::new(),
+        RouteMode::Local,
+        Some(ResolvedRouteRule {
+            mode: RouteMode::Combined,
+            remote: Some("hub".to_owned()),
+            write: WriteTarget::Local,
+        }),
+    )
+    .await;
+
+    // The local palace also lacks the entity. It must still merge the remote
+    // result instead of short-circuiting with an unknown-entity error.
+    let response = call_tool(
+        &server,
+        1,
+        "mempalace_kg_query",
+        json!({"entity": "unknown federation entity"}),
+    )
+    .await;
+    assert_eq!(response["count"], 0);
+    assert_eq!(response["facts"], json!([]));
+    assert!(response.get("warnings").is_none(), "{response}");
+
+    let timeline = call_tool(
+        &server,
+        2,
+        "mempalace_kg_timeline",
+        json!({"entity": "unknown federation entity"}),
+    )
+    .await;
+    assert_eq!(timeline["count"], 0);
+    assert_eq!(timeline["timeline"], json!([]));
+    assert!(timeline.get("warnings").is_none(), "{timeline}");
+}
+
 // ─── Test 1: add_remote_search_combined_delete_remote_roundtrip ──────────────
 
 /// Flagship flow:

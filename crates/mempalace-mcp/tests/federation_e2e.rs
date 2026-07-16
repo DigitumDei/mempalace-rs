@@ -1969,6 +1969,230 @@ async fn add_drawer_both_near_duplicate_same_wing_room_rejected() {
     );
 }
 
+// ─── Test 26: add_drawer_both_retry_reuses_local_drawer_and_replicates ──────
+
+/// Dual-write retry regression:
+///
+/// 1. First write:both add while the remote is unavailable → local success,
+///    replication fails with `status: "failed"`.
+/// 2. Retry the identical add with remote restored → existing local drawer is
+///    reused (same `drawer_id`), replication reaches `status: "replicated"`,
+///    the remote contains the drawer (confirmed via search), and no duplicate
+///    local drawer is created.
+///
+/// Retain coverage that same-wing/room near-duplicates with different content
+/// hashes remain rejected (Test 12b above).
+#[tokio::test]
+async fn add_drawer_both_retry_reuses_local_drawer_and_replicates() {
+    // ── Phase 1: Remote unavailable ──────────────────────────────────────────
+    // Bind a dead port for the first MCP server so replication fails.
+    let dead_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let dead_addr = dead_listener.local_addr().unwrap();
+    drop(dead_listener);
+    let dead_url = format!("http://{dead_addr}");
+
+    // The real hub lives on a *different* port that stays alive throughout.
+    let hub_dir = TempDir::new().unwrap();
+    let addr = spawn_server(&hub_dir).await;
+    let hub_url = format!("http://{addr}");
+
+    let local_dir = TempDir::new().unwrap();
+    let content = "dual-write retry regression test content unique xyzzy";
+    let wing = "wing_retry";
+    let room = "retry-room";
+    let added_by = "retry-test";
+
+    // ── Server A: points at dead address; replication must fail ──────────
+    let mut remotes_a = BTreeMap::new();
+    remotes_a.insert(
+        "hub".to_owned(),
+        ResolvedRemote {
+            name: "hub".to_owned(),
+            url: dead_url,
+            token: Some(TEST_TOKEN.to_owned()),
+            timeout: Duration::from_millis(500),
+        },
+    );
+    let mut wing_rules_a = BTreeMap::new();
+    wing_rules_a.insert(wing.to_owned(), combined_wing_rule_both_write());
+    let federation_a = FederationRuntimeConfig {
+        remotes: remotes_a,
+        default_mode: RouteMode::Local,
+        default_remote: None,
+        wings: wing_rules_a,
+        kg: None,
+    };
+    let config_a = MempalaceConfig {
+        schema_version: 1,
+        collection_name: "mempalace_drawers".to_owned(),
+        palace_path: local_dir.path().join("palace"),
+        embedding_profile: EmbeddingProfile::Balanced,
+        low_cpu: LowCpuRuntimeConfig::defaults_for_profile(EmbeddingProfile::Balanced),
+        server: ServerRuntimeConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            token_file: local_dir.path().join("server_tokens.json"),
+            checkouts: std::collections::BTreeMap::new(),
+        },
+        federation: federation_a,
+    };
+    let server_a =
+        McpServer::from_parts(config_a, DeterministicStubProvider::new(EmbeddingProfile::Balanced))
+            .await
+            .unwrap();
+
+    // First add while remote is down.
+    let first = call_tool(
+        &server_a,
+        1,
+        "mempalace_add_drawer",
+        json!({
+            "wing": wing,
+            "room": room,
+            "content": content,
+            "added_by": added_by,
+        }),
+    )
+    .await;
+
+    // Local write must succeed.
+    assert_eq!(first["success"], true, "first add must succeed locally: {first}");
+    assert_eq!(
+        first["applied_to"], "local",
+        "first add must report applied_to=local: {first}"
+    );
+    let drawer_id = first["drawer_id"]
+        .as_str()
+        .expect("first add must return drawer_id")
+        .to_owned();
+
+    // Replication must fail (remote is down).
+    let replication = first.get("replication").expect("both add must include replication");
+    assert_eq!(
+        replication["status"], "failed",
+        "replication must fail with down remote; got: {replication}"
+    );
+    // Warnings must be present.
+    let warnings = first.get("warnings").and_then(|w| w.as_array());
+    assert!(
+        warnings.is_some() && !warnings.unwrap().is_empty(),
+        "failed replication must include warnings; got: {first}"
+    );
+
+    // Release server A (closes the storage engine).
+    drop(server_a);
+
+    // ── Phase 2: Remote restored — retry the identical add ───────────────────
+    let mut remotes_b = BTreeMap::new();
+    remotes_b.insert(
+        "hub".to_owned(),
+        ResolvedRemote {
+            name: "hub".to_owned(),
+            url: hub_url,
+            token: Some(TEST_TOKEN.to_owned()),
+            timeout: Duration::from_secs(5),
+        },
+    );
+    let mut wing_rules_b = BTreeMap::new();
+    wing_rules_b.insert(wing.to_owned(), combined_wing_rule_both_write());
+    let federation_b = FederationRuntimeConfig {
+        remotes: remotes_b,
+        default_mode: RouteMode::Local,
+        default_remote: None,
+        wings: wing_rules_b,
+        kg: None,
+    };
+    let config_b = MempalaceConfig {
+        schema_version: 1,
+        collection_name: "mempalace_drawers".to_owned(),
+        // Same palace directory as server A — the existing drawer is still there.
+        palace_path: local_dir.path().join("palace"),
+        embedding_profile: EmbeddingProfile::Balanced,
+        low_cpu: LowCpuRuntimeConfig::defaults_for_profile(EmbeddingProfile::Balanced),
+        server: ServerRuntimeConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            token_file: local_dir.path().join("server_tokens_b.json"),
+            checkouts: std::collections::BTreeMap::new(),
+        },
+        federation: federation_b,
+    };
+    let server_b =
+        McpServer::from_parts(config_b, DeterministicStubProvider::new(EmbeddingProfile::Balanced))
+            .await
+            .unwrap();
+
+    // Retry the identical add — must reuse the existing local drawer and
+    // succeed at replicating to the now-available remote.
+    let retry = call_tool(
+        &server_b,
+        1,
+        "mempalace_add_drawer",
+        json!({
+            "wing": wing,
+            "room": room,
+            "content": content,
+            "added_by": added_by,
+        }),
+    )
+    .await;
+
+    // Existing local drawer must be reused (same drawer_id).
+    assert_eq!(retry["success"], true, "retry add must succeed: {retry}");
+    assert_eq!(
+        retry["applied_to"], "local",
+        "retry must report applied_to=local: {retry}"
+    );
+    assert_eq!(
+        retry["drawer_id"].as_str().unwrap_or(""),
+        drawer_id,
+        "retry must reuse the same drawer_id (was {drawer_id}); got: {retry}"
+    );
+
+    // Replication must succeed now (hub is alive, content not yet on hub).
+    let replication2 = retry.get("replication").expect("retry add must include replication");
+    assert_eq!(
+        replication2["status"], "replicated",
+        "retry replication must be replicated; got: {replication2}"
+    );
+    assert_eq!(
+        replication2["remote"], "hub",
+        "retry replication must report remote=hub; got: {replication2}"
+    );
+
+    // No warnings on successful replication.
+    assert!(
+        retry.get("warnings").is_none(),
+        "retry must not have warnings on success; got: {retry}"
+    );
+
+    // ── Verify the drawer landed on the hub via search ─────────────────────
+    let search = call_tool(
+        &server_b,
+        2,
+        "mempalace_search",
+        json!({
+            "query": "dual-write retry regression test content unique xyzzy",
+            "wing": wing,
+            "limit": 5,
+        }),
+    )
+    .await;
+    let results = search["results"].as_array().expect("search results must be array");
+    let hub_hit = results.iter().any(|r| r["origin"].as_str() == Some("hub"));
+    assert!(
+        hub_hit,
+        "search must include a hub-origin result (replication landed); results: {results:?}"
+    );
+
+    // ── Verify no duplicate local drawer ──────────────────────────────────
+    let status = call_tool(&server_b, 3, "mempalace_list_wings", json!({})).await;
+    let wings = status["wings"].as_object().expect("wings must be an object");
+    let local_count = wings.get(wing).and_then(|v| v.as_u64()).unwrap_or(0);
+    assert_eq!(
+        local_count, 1,
+        "must have exactly 1 local drawer in {wing} after retry; got {local_count}; wings: {wings:?}"
+    );
+}
+
 // ─── Test 13: add_drawer_both_replication_fails_with_down_remote ────────────
 
 /// Combined/write:Both wing rule with the remote down (dead address).

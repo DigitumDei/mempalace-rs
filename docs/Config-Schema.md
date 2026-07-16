@@ -179,7 +179,12 @@ routing:
 
 - `mode`: `local`, `remote`, or `combined`
 - `remote`: name of a remote defined in `~/.mempalace/config.json` federation.remotes. May be omitted when exactly one remote is configured.
-- `write`: `local` or `remote`. Only meaningful for `combined` mode. Default: `local`.
+- `write`: `local`, `remote`, or `both`. Only meaningful for `combined` mode. Default: `local`.
+  - `both` performs a local-first dual-write: the local write must complete
+    successfully, then best-effort remote replication is attempted. Remote
+    failure does not roll back the local write or change the success result.
+    The outcome of the remote leg is reported as a `replication` field on MCP
+    tool responses — see [`ReplicationStatus`](#replicationstatus).
 
 ## Server Config
 
@@ -250,7 +255,8 @@ The optional `federation` section of `~/.mempalace/config.json` controls routing
     "default_mode": "local",
     "wings": {
       "wing_teamdocs": { "mode": "remote", "remote": "work" },
-      "wing_bigrepo":  { "mode": "combined", "remote": "work", "write": "local" }
+      "wing_bigrepo":  { "mode": "combined", "remote": "work", "write": "local" },
+      "wing_shared":   { "mode": "combined", "remote": "work", "write": "both" }
     },
     "kg": { "mode": "combined", "remote": "work", "write": "remote" }
   }
@@ -288,7 +294,12 @@ Validation:
 - Each routing rule:
   - `mode`: `local` | `remote` | `combined` (required)
   - `remote`: name of an entry in `federation.remotes`. May be omitted when exactly one remote is configured; required (and fails config load if missing) when multiple remotes are configured.
-  - `write`: `local` | `remote`. Only meaningful for `combined` mode. Default: `local`.
+  - `write`: `local` | `remote` | `both`. Only meaningful for `combined` mode. Default: `local`.
+    - `local` — writes go to the local palace only.
+    - `remote` — writes go to the remote palace only.
+    - `both` — local-first dual-write; the local write must complete first,
+      then best-effort remote replication is attempted. See
+      [`ReplicationStatus`](#replicationstatus) for the response shape.
 
 #### `federation.kg`
 
@@ -323,3 +334,30 @@ Config load succeeds with a warning (does not fail) for:
 - `token_env` set but the named environment variable is absent at startup
 - `write` set on a rule whose `mode` is not `combined` (ignored)
 - A non-local rule for `wing_agents` (ignored; the diary hard override applies at resolution time)
+
+### `ReplicationStatus`
+
+When `write: both` is configured, MCP tool responses carry a `replication` field
+reporting the result of the best-effort remote leg. Non-`both` routes and
+diary-local writes omit the field entirely. The shape is a tagged union:
+
+```json
+{ "status": "replicated", "remote": "work" }
+```
+
+```json
+{ "status": "failed", "remote": "work", "reason": "transport failure: timeout" }
+```
+
+```json
+{ "status": "converged", "remote": "work" }
+```
+
+| Variant | Meaning |
+|---|---|
+| `replicated` | Best-effort remote write to the named remote succeeded. |
+| `converged` | Exact content already exists on the named remote; state is converged. |
+| `failed` | Best-effort remote write failed; `reason` contains a human-readable description. The local write was unaffected. |
+
+The `replication` field is absent when federation is not configured, the route
+does not use `write: both`, or the write targets a diary-local destination.

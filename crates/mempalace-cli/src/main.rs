@@ -513,6 +513,12 @@ where
     Ok(CliOutput::success(lines.join("\n")))
 }
 
+enum ExecPlan {
+    Local,
+    Remote(mempalace_config::ResolvedRouteRule),
+    Both(mempalace_config::ResolvedRouteRule),
+}
+
 fn execute_mine<F, P>(
     dir: &Path,
     mode: CliMode,
@@ -542,52 +548,108 @@ where
     let config = load_runtime_config(palace_override, context).map_err(config_error)?;
     let runtime = build_runtime(&config).map_err(runtime_error)?;
 
-    // ── Routing decision (projects mode only) ────────────────────────────────
-    if mode == CliMode::Projects {
-        // Load the project config to get the wing name and routing.
-        let project_config =
-            ConfigLoader::load_project_config(&source_dir).map_err(config_error)?;
-        let wing_name = wing
-            .clone()
-            .unwrap_or_else(|| project_config.wing.clone());
-
-        let rule = resolve_route(
-            &config.federation,
-            project_config.routing.as_ref(),
-            RouteQuery { wing: Some(&wing_name), room: None, source_file: None },
-        );
-
-        let use_remote = !branch
-            && (rule.mode == RouteMode::Remote
-                || (rule.mode == RouteMode::Combined
-                    && rule.write == WriteTarget::Remote));
-
-        if use_remote {
-            return execute_remote_mine(
-                &source_dir,
-                wing,
-                &agent,
-                limit,
-                dry_run,
-                batch_size,
-                &config,
-                &runtime,
-                &rule,
-            );
-        }
-    } else {
-        // Convos mode: --branch is not supported; remote routing is not supported.
-        if branch {
-            return Ok(CliOutput::failure(
-                1,
-                "--branch requires --mode projects; branch-delta mining is not supported for conversations\n",
-            ));
-        }
-        // Conversation mining is always local: routing rules are wing-based and
-        // convo directories carry no project wing config to resolve against.
+    // Convos mode: --branch is not supported; remote routing is not supported.
+    if mode == CliMode::Convos && branch {
+        return Ok(CliOutput::failure(
+            1,
+            "--branch requires --mode projects; branch-delta mining is not supported for conversations\n",
+        ));
     }
 
-    // ── Local mine path (unchanged from before for federation-absent/local-route) ─
+    let plan = resolve_plan(&source_dir, mode, &wing, branch, &config)?;
+
+    match plan {
+        ExecPlan::Remote(rule) => execute_remote_mine(
+            &source_dir, wing, &agent, limit, dry_run, batch_size, &config, &runtime, &rule, false,
+        ),
+        ExecPlan::Both(rule) => {
+            let (_local_summary, local_output) = execute_local_mine(
+                &source_dir, mode, wing.clone(), agent.clone(), limit, dry_run, reindex,
+                extract, branch, batch_size, &config, &runtime, &provider_factory,
+            )?;
+
+            let remote_output = execute_remote_mine(
+                &source_dir, wing, &agent, limit, dry_run, batch_size, &config, &runtime, &rule, true,
+            )?;
+
+            let combined = format!("{}\n{}", local_output.trim(), remote_output.stdout.trim());
+            Ok(CliOutput::success(combined))
+        }
+        ExecPlan::Local => {
+            let (_summary, local_output) = execute_local_mine(
+                &source_dir, mode, wing, agent, limit, dry_run, reindex, extract, branch,
+                batch_size, &config, &runtime, &provider_factory,
+            )?;
+            Ok(CliOutput::success(local_output))
+        }
+    }
+}
+
+/// Resolve the execution plan for a mine operation.
+///
+/// Returns [`ExecPlan::Local`] for conversations, `--branch`, and local-only
+/// routes. Returns [`ExecPlan::Remote`] for remote-only or combined+write:remote
+/// routes. Returns [`ExecPlan::Both`] for combined+write:both dual-write routes.
+fn resolve_plan(
+    source_dir: &Path,
+    mode: CliMode,
+    wing: &Option<String>,
+    branch: bool,
+    config: &MempalaceConfig,
+) -> Result<ExecPlan, clap::Error> {
+    if mode != CliMode::Projects || branch {
+        // Conversations and --branch are always local.
+        return Ok(ExecPlan::Local);
+    }
+
+    let project_config =
+        ConfigLoader::load_project_config(source_dir).map_err(config_error)?;
+    let wing_name = wing
+        .clone()
+        .unwrap_or_else(|| project_config.wing.clone());
+
+    let rule = resolve_route(
+        &config.federation,
+        project_config.routing.as_ref(),
+        RouteQuery { wing: Some(&wing_name), room: None, source_file: None },
+    );
+
+    if rule.mode == RouteMode::Remote
+        || (rule.mode == RouteMode::Combined && rule.write == WriteTarget::Remote)
+    {
+        Ok(ExecPlan::Remote(rule))
+    } else if rule.mode == RouteMode::Combined && rule.write == WriteTarget::Both {
+        Ok(ExecPlan::Both(rule))
+    } else {
+        Ok(ExecPlan::Local)
+    }
+}
+
+/// Execute the local mine path: open storage, run ingestion, render summary.
+///
+/// Used by [`ExecPlan::Local`] and [`ExecPlan::Both`] to perform the local
+/// ingestion. For `--branch` mode this is the only execution step; remote
+/// replication is never attempted for branch-delta mining.
+#[allow(clippy::too_many_arguments)]
+fn execute_local_mine<F, P>(
+    source_dir: &Path,
+    mode: CliMode,
+    wing: Option<String>,
+    agent: String,
+    limit: usize,
+    dry_run: bool,
+    reindex: bool,
+    extract: CliExtractMode,
+    branch: bool,
+    batch_size: Option<usize>,
+    config: &MempalaceConfig,
+    runtime: &tokio::runtime::Runtime,
+    provider_factory: &F,
+) -> Result<(IngestSummary, String), clap::Error>
+where
+    F: Fn(EmbeddingProfile, PathBuf) -> Result<P, Box<dyn std::error::Error>>,
+    P: EmbeddingProvider,
+{
     let use_temp_storage = dry_run && !palace_exists(&config.palace_path);
     let dry_run_storage =
         if use_temp_storage { Some(tempfile::tempdir().map_err(io_error)?) } else { None };
@@ -599,10 +661,6 @@ where
     let mut provider = provider_factory(config.embedding_profile, default_embedding_cache_dir())
         .map_err(provider_error)?;
 
-    // `--batch-size N` (N>0) caps the chunks embedded per batch, letting low-spec
-    // machines bound peak memory/CPU. It overrides the low_cpu default; when unset
-    // we keep prior behavior (low_cpu's batch size if enabled, else embed each
-    // file's chunks in a single batch).
     let max_embed_batch_size = batch_size.filter(|&n| n > 0).or_else(|| {
         config
             .low_cpu
@@ -616,9 +674,9 @@ where
                 &engine,
                 &mut provider,
                 &ProjectIngestRequest {
-                    project_dir: source_dir.clone(),
-                    wing,
-                    agent,
+                    project_dir: source_dir.to_path_buf(),
+                    wing: wing.clone(),
+                    agent: agent.clone(),
                     limit: if limit == 0 { None } else { Some(limit) },
                     dry_run,
                     reindex,
@@ -632,9 +690,9 @@ where
                 &engine,
                 &mut provider,
                 &ConversationIngestRequest {
-                    convo_dir: source_dir.clone(),
-                    wing,
-                    agent,
+                    convo_dir: source_dir.to_path_buf(),
+                    wing: wing.clone(),
+                    agent: agent.clone(),
                     extract_mode: match extract {
                         CliExtractMode::Exchange => ConversationExtractMode::Exchange,
                         CliExtractMode::General => ConversationExtractMode::General,
@@ -648,13 +706,8 @@ where
             .map_err(ingest_error)?,
     };
 
-    Ok(CliOutput::success(render_mine_summary(
-        mode,
-        &source_dir,
-        &config.palace_path,
-        dry_run,
-        &summary,
-    )))
+    let rendered = render_mine_summary(mode, source_dir, &config.palace_path, dry_run, &summary);
+    Ok((summary, rendered))
 }
 
 /// Map an [`IngestError`] to a clap error, giving a friendly message for
@@ -692,13 +745,14 @@ fn execute_remote_mine(
     config: &MempalaceConfig,
     runtime: &tokio::runtime::Runtime,
     rule: &mempalace_config::ResolvedRouteRule,
+    dual_write: bool,
 ) -> Result<CliOutput, clap::Error> {
     // `--batch-size N` (N>0) caps files per remote request, letting low-spec
     // machines bound how much is held/serialized at once. The ~4 MiB byte cap
     // still applies as an independent guardrail against the server body limit.
     let max_files_per_batch = batch_size.filter(|&n| n > 0).unwrap_or(REMOTE_BATCH_MAX_FILES);
     // ── 1. Prepare the batch (no embedding, no storage) ─────────────────────
-    let prepared = prepare_project_batch(&ProjectIngestRequest {
+    let prepared = match prepare_project_batch(&ProjectIngestRequest {
         project_dir: source_dir.to_path_buf(),
         wing: wing_override.clone(),
         agent: agent.to_owned(),
@@ -707,22 +761,41 @@ fn execute_remote_mine(
         reindex: false,
         max_embed_batch_size: None,
         branch: false,
-    })
-    .map_err(|e| branch_delta_error(e, ingest_error))?;
+    }) {
+        Ok(p) => p,
+        Err(e) => {
+            let msg = format!("failed to prepare project batch: {e}\n");
+            return if dual_write {
+                Ok(CliOutput::success(format!("  Remote replication: failed — {msg}")))
+            } else {
+                Ok(CliOutput::failure(1, msg))
+            };
+        }
+    };
 
     // ── 2. Resolve the remote config entry ──────────────────────────────────
     let remote_name = rule.remote.as_deref().unwrap_or("remote");
     let resolved_remote =
-        config.federation.remotes.get(remote_name).ok_or_else(|| {
-            clap::Error::raw(
-                clap::error::ErrorKind::Io,
-                format!(
+        match config.federation.remotes.get(remote_name) {
+            Some(r) => r,
+            None => {
+                let msg = format!(
                     "federation config error: route for wing '{}' refers to remote '{}', \
                      but no such remote is defined in config.federation.remotes\n",
                     prepared.wing, remote_name
-                ),
-            )
-        })?;
+                );
+                let output = if dual_write {
+                    format!("  Remote replication: failed — {msg}")
+                } else {
+                    format!("{msg}")
+                };
+                return if dual_write {
+                    Ok(CliOutput::success(output))
+                } else {
+                    Ok(CliOutput::failure(1, output))
+                };
+            }
+        };
     let remote_url = resolved_remote.url.clone();
 
     // ── 3. Non-default-branch warning text (computed early for dry-run) ─────
@@ -771,39 +844,78 @@ fn execute_remote_mine(
         token: resolved_remote.token.clone(),
         timeout: resolved_remote.timeout,
     };
-    let client = RemoteClient::new(endpoint).map_err(|e| {
-        clap::Error::raw(
-            clap::error::ErrorKind::Io,
-            format!("failed to build remote client for '{}': {e}\n", remote_name),
-        )
-    })?;
+    let client = match RemoteClient::new(endpoint) {
+        Ok(c) => c,
+        Err(e) => {
+            let msg = format!("failed to build remote client for '{}': {e}\n", remote_name);
+            let output = if dual_write {
+                format!("  Remote replication: failed — {msg}")
+            } else {
+                format!("{msg}")
+            };
+            return if dual_write {
+                Ok(CliOutput::success(output))
+            } else {
+                Ok(CliOutput::failure(1, output))
+            };
+        }
+    };
 
     // ── 6. Capabilities check ────────────────────────────────────────────────
     // Call through the trait to avoid shadowing by the `info` field on RemoteClient.
     let api: &dyn RemoteApi = &client;
-    let info_resp = runtime.block_on(api.info()).map_err(|e| {
-        let msg = match e {
-            RemoteError::Unreachable { ref message, .. } => format!(
-                "remote '{}' is unreachable at {}: {}\n\
-                 Note: writes do not fall back to local.\n",
-                remote_name, remote_url, message
-            ),
-            other => format!("remote '{}' info() failed: {other}\n", remote_name),
-        };
-        clap::Error::raw(clap::error::ErrorKind::Io, msg)
-    })?;
+    let info_resp = match runtime.block_on(api.info()) {
+        Ok(resp) => resp,
+        Err(e) => {
+            let msg = match e {
+                RemoteError::Unreachable { ref message, .. } => format!(
+                    "remote '{}' is unreachable at {}: {}",
+                    remote_name, remote_url, message
+                ),
+                other => format!("remote '{}' info() failed: {other}", remote_name),
+            };
+            let output = if dual_write {
+                format!(
+                    "  Remote replication: failed — {msg}\n\
+                     Note: the local mine completed successfully; remote replication was skipped.\n"
+                )
+            } else {
+                format!(
+                    "{msg}\n\
+                     Note: writes do not fall back to local.\n"
+                )
+            };
+            return if dual_write {
+                Ok(CliOutput::success(output))
+            } else {
+                Ok(CliOutput::failure(1, output))
+            };
+        }
+    };
 
     if !info_resp.capabilities.iter().any(|c| c == "ingest") {
-        return Ok(CliOutput::failure(
-            1,
+        let msg = if dual_write {
+            format!(
+                "  Remote replication: skipped — remote '{}' does not support the ingest capability.\n\
+                 Server capabilities: {}\n\
+                 Note: the local mine completed successfully.\n",
+                remote_name,
+                info_resp.capabilities.join(", ")
+            )
+        } else {
             format!(
                 "remote '{}' does not support the ingest capability; \
                  please upgrade the remote server.\n\
                  Server capabilities: {}\n",
                 remote_name,
                 info_resp.capabilities.join(", ")
-            ),
-        ));
+            )
+        };
+        return if dual_write {
+            Ok(CliOutput::success(msg))
+        } else {
+            Ok(CliOutput::failure(1, msg))
+        };
     }
 
     // ── 7. Batch and send ────────────────────────────────────────────────────
@@ -833,16 +945,57 @@ fn execute_remote_mine(
         };
 
         let resp: IngestBatchResponse =
-            runtime.block_on(api.ingest_batch(req)).map_err(|e| {
-                clap::Error::raw(
-                    clap::error::ErrorKind::Io,
-                    format!(
-                        "remote '{}' transport error after {} batch(es): {e}\n\
-                         Note: writes do not fall back to local.\n",
+            match runtime.block_on(api.ingest_batch(req)) {
+                Ok(resp) => resp,
+                Err(e) => {
+                    let msg = format!(
+                        "remote '{}' transport error after {} batch(es): {e}",
                         remote_name, batches_sent
-                    ),
-                )
-            })?;
+                    );
+                    if dual_write && batches_sent > 0 {
+                        // Some batches completed — render partial summary showing
+                        // what was achieved before the transport interruption.
+                        let partial = render_remote_mine_summary(
+                            source_dir,
+                            remote_name,
+                            &remote_url,
+                            &wing,
+                            &repo_id,
+                            ingested_count,
+                            skipped_count,
+                            failed_count,
+                            total_drawers_written,
+                            &all_warnings,
+                            &failed_files,
+                            branch_warning.as_deref(),
+                            true,
+                            true,
+                        );
+                        let with_error = format!(
+                            "{}\n  {}\n  Note: remote replication was incomplete — {msg}.\n",
+                            partial.trim(),
+                            "─".repeat(SEARCH_HEADER_WIDTH),
+                        );
+                        return Ok(CliOutput::success(with_error));
+                    }
+                    let output = if dual_write {
+                        format!(
+                            "  Remote replication: failed — {msg}\n\
+                             Note: the local mine completed successfully; remote replication was incomplete.\n"
+                        )
+                    } else {
+                        format!(
+                            "{msg}\n\
+                             Note: writes do not fall back to local.\n"
+                        )
+                    };
+                    return if dual_write {
+                        Ok(CliOutput::success(output))
+                    } else {
+                        Ok(CliOutput::failure(1, output))
+                    };
+                }
+            };
 
         batches_sent += 1;
 
@@ -887,6 +1040,8 @@ fn execute_remote_mine(
         &all_warnings,
         &failed_files,
         branch_warning.as_deref(),
+        dual_write,
+        false,
     );
 
     Ok(CliOutput::success(output))
@@ -944,12 +1099,15 @@ fn render_remote_mine_summary(
     warnings: &[String],
     failed_files: &[(String, String)],
     branch_warning: Option<&str>,
+    dual_write: bool,
+    replication_incomplete: bool,
 ) -> String {
+    let mode_label = if dual_write { "replication (best-effort)" } else { "projects (remote)" };
     let mut lines = vec![
         format!("\n{}", "=".repeat(SEARCH_HEADER_WIDTH)),
         "  Mine complete".to_owned(),
         "=".repeat(SEARCH_HEADER_WIDTH),
-        "  Mode: projects (remote)".to_owned(),
+        format!("  Mode: {mode_label}"),
         format!("  Source: {}", source_dir.display()),
         format!("  Remote: {remote_name} ({remote_url})"),
         format!("  Wing: {wing}"),
@@ -959,6 +1117,19 @@ fn render_remote_mine_summary(
         format!("  Files failed: {failed_count}"),
         format!("  Drawers written: {drawers_written}"),
     ];
+
+    if dual_write {
+        if replication_incomplete {
+            lines.insert(1, "  Remote replication: partial — transport interrupted".to_owned());
+            lines.insert(2, String::new());
+        } else if failed_count > 0 {
+            lines.insert(1, "  Remote replication: partial — some files had errors".to_owned());
+            lines.insert(2, String::new());
+        } else {
+            lines.insert(1, "  Remote replication: succeeded".to_owned());
+            lines.insert(2, String::new());
+        }
+    }
 
     if !warnings.is_empty() {
         lines.push(String::new());
@@ -2029,6 +2200,85 @@ mod tests {
     }
 
     #[test]
+    fn render_remote_mine_summary_labels_partial_on_incomplete() {
+        let src = Path::new("/tmp/src");
+
+        // No per-file failures, but replication_incomplete=true → "partial — transport interrupted".
+        let output = render_remote_mine_summary(
+            src, "hub", "http://example.com", "wing_test", "repo-1",
+            5, 0, 0, 5, &[], &[], None, true, true,
+        );
+        assert!(
+            output.contains("replication: partial"),
+            "incomplete=true must produce 'partial', got: {output}",
+        );
+        assert!(
+            output.contains("transport interrupted"),
+            "incomplete=true without file errors must say 'transport interrupted', got: {output}",
+        );
+        assert!(
+            !output.contains("replication: succeeded"),
+            "incomplete=true must NOT say 'succeeded', got: {output}",
+        );
+
+        // No per-file failures, replication_incomplete=false → "succeeded".
+        let output = render_remote_mine_summary(
+            src, "hub", "http://example.com", "wing_test", "repo-1",
+            5, 0, 0, 5, &[], &[], None, true, false,
+        );
+        assert!(
+            output.contains("replication: succeeded"),
+            "incomplete=false + no file failures must say 'succeeded', got: {output}",
+        );
+
+        // Per-file failures, replication_incomplete=false → "partial — some files had errors".
+        let output = render_remote_mine_summary(
+            src, "hub", "http://example.com", "wing_test", "repo-1",
+            3, 0, 2, 3, &[], &[("bad.rs".into(), "err".into())], None, true, false,
+        );
+        assert!(
+            output.contains("replication: partial"),
+            "file failures must produce 'partial', got: {output}",
+        );
+        assert!(
+            output.contains("some files had errors"),
+            "file failures must say 'some files had errors', got: {output}",
+        );
+
+        // Both incomplete AND per-file failures → "partial — transport interrupted".
+        let output = render_remote_mine_summary(
+            src, "hub", "http://example.com", "wing_test", "repo-1",
+            3, 0, 2, 3, &[], &[("bad.rs".into(), "err".into())], None, true, true,
+        );
+        assert!(
+            output.contains("replication: partial"),
+            "incomplete=true with file failures must produce 'partial', got: {output}",
+        );
+        assert!(
+            output.contains("transport interrupted"),
+            "incomplete=true with file failures must say 'transport interrupted', got: {output}",
+        );
+        assert!(
+            !output.contains("some files had errors"),
+            "incomplete=true must not say 'some files had errors', got: {output}",
+        );
+        assert!(
+            !output.contains("replication: succeeded"),
+            "incomplete=true with file failures must NOT say 'succeeded', got: {output}",
+        );
+
+        // Non dual_write: no replication label at all.
+        let output = render_remote_mine_summary(
+            src, "hub", "http://example.com", "wing_test", "repo-1",
+            5, 0, 0, 5, &[], &[], None, false, false,
+        );
+        assert!(
+            !output.contains("replication:"),
+            "non-dual-write must not contain 'replication:', got: {output}",
+        );
+    }
+
+    #[test]
     fn mine_dry_run_reports_work_without_writing_storage_files() {
         let workspace = tempdir().unwrap();
         let project_dir = setup_project_fixture(workspace.path());
@@ -2505,6 +2755,82 @@ mod tests {
         addr
     }
 
+    /// Spawn a minimal federation server whose `/v1/info` response does NOT
+    /// advertise the `ingest` capability. Used to test the unsupported-remote
+    /// guard in the dual-write path.
+    fn spawn_no_ingest_server(token: &str) -> std::net::SocketAddr {
+        use axum::{
+            Router, middleware,
+            extract::State,
+            http::{StatusCode, header},
+            response::IntoResponse,
+            routing::get,
+        };
+        use std::sync::Arc;
+
+        let token_dir = tempfile::tempdir().unwrap();
+        let token_file = write_test_token_file(token_dir.path(), token);
+        let tokens = mempalace_server::TokenRegistry::load(token_file).unwrap();
+        let tokens = Arc::new(tokens);
+
+        #[derive(Clone)]
+        struct NoIngestState {
+            tokens: Arc<mempalace_server::TokenRegistry>,
+        }
+
+        async fn auth(
+            State(state): State<NoIngestState>,
+            request: axum::http::Request<axum::body::Body>,
+            next: middleware::Next,
+        ) -> impl IntoResponse {
+            let token = request
+                .headers()
+                .get(header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "));
+            match token.and_then(|t| state.tokens.authenticate(t)) {
+                Some(_) => next.run(request).await.into_response(),
+                None => StatusCode::UNAUTHORIZED.into_response(),
+            }
+        }
+
+        async fn info() -> impl axum::response::IntoResponse {
+            axum::Json(mempalace_federation::InfoResponse {
+                server_version: env!("CARGO_PKG_VERSION").to_owned(),
+                federation_api_version: mempalace_federation::FEDERATION_API_VERSION,
+                embedding_profile: "balanced".to_owned(),
+                capabilities: vec![
+                    "drawers".to_owned(),
+                    "kg".to_owned(),
+                    "changes".to_owned(),
+                    "taxonomy".to_owned(),
+                ],
+            })
+        }
+
+        let state = NoIngestState { tokens };
+        let router = Router::new()
+            .route("/v1/info", get(info))
+            .layer(middleware::from_fn_with_state(state.clone(), auth))
+            .with_state(state);
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener =
+            rt.block_on(tokio::net::TcpListener::bind("127.0.0.1:0")).unwrap();
+        let addr = rt.block_on(async { listener.local_addr().unwrap() });
+        rt.spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        std::mem::forget(rt);
+        std::mem::forget(token_dir);
+
+        addr
+    }
+
     /// Write a CLI config.json with federation remotes pointing at `server_url`,
     /// with an inline `token`. Also writes a per-project mempalace.yaml.
     fn write_remote_cli_config(
@@ -2533,6 +2859,39 @@ mod tests {
         .unwrap();
 
         // Write the project config.
+        let yaml = format!(
+            "wing: {wing_name}\nrooms:\n  - name: general\n    description: General files\n"
+        );
+        fs::write(project_dir.join("mempalace.yaml"), yaml).unwrap();
+    }
+
+    /// Write a CLI config for `combined` + `write: both` routing.
+    fn write_combined_cli_config(
+        config_dir: &Path,
+        remote_name: &str,
+        server_url: &str,
+        inline_token: &str,
+        wing_name: &str,
+        palace_dir: &Path,
+        project_dir: &Path,
+    ) {
+        fs::create_dir_all(config_dir).unwrap();
+        let config_json = serde_json::json!({
+            "version": 1,
+            "palace_path": palace_dir.to_str().unwrap(),
+            "federation": {
+                "remotes": [{"name": remote_name, "url": server_url, "token": inline_token}],
+                "wings": {
+                    wing_name: {"mode": "combined", "write": "both", "remote": remote_name}
+                }
+            }
+        });
+        fs::write(
+            config_dir.join("config.json"),
+            serde_json::to_string_pretty(&config_json).unwrap(),
+        )
+        .unwrap();
+
         let yaml = format!(
             "wing: {wing_name}\nrooms:\n  - name: general\n    description: General files\n"
         );
@@ -2691,25 +3050,180 @@ mod tests {
             stub_provider,
         );
 
-        // Should fail (either Err or exit_code != 0) and the message must say
-        // the remote is unreachable with no local fallback.
-        match result {
-            Err(error) => {
-                let msg = error.to_string();
-                assert!(
-                    msg.contains("unreachable") && msg.contains("local"),
-                    "error should mention unreachable and no local fallback: {msg}"
-                );
-            }
-            Ok(output) => {
-                assert_ne!(output.exit_code, 0, "should fail when remote unreachable");
-                assert!(
-                    output.stderr.contains("unreachable") && output.stderr.contains("local"),
-                    "error should mention unreachable and no local fallback: {}",
-                    output.stderr
-                );
-            }
-        }
+        // Should fail through legacy CliOutput path with exit code 1.
+        let output = result.expect("remote-only must return Ok(CliOutput), not Err");
+        assert_eq!(output.exit_code, 1, "remote-only must exit code 1: {output:?}");
+        assert!(
+            output.stderr.contains("unreachable") && output.stderr.contains("local"),
+            "error should mention unreachable and no local fallback: {}",
+            output.stderr
+        );
+
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn mine_combined_both_unreachable_returns_local_success() {
+        let workspace = tempdir().unwrap();
+        let project_dir = workspace.path().join("combinedproject");
+        fs::create_dir_all(&project_dir).unwrap();
+        write_file(
+            &project_dir.join("code.rs"),
+            "fn example() -> bool { true }\n".repeat(10).as_str(),
+        );
+
+        let config_root = temp_config_root("combined-unreachable");
+        let context = CliContext::for_tests(config_root.clone());
+        let palace_dir = config_root.join("palace");
+
+        // init creates the local palace and writes default config.json.
+        run_cli(["init", project_dir.to_str().unwrap(), "--yes"], &context, stub_provider).unwrap();
+
+        // Overwrite config.json with combined+both routing pointing at
+        // an unreachable port.
+        let remote_name = "hub";
+        let server_url = "http://127.0.0.1:1";
+        write_combined_cli_config(
+            &config_root,
+            remote_name,
+            server_url,
+            "combined-unreachable-tok",
+            "wing_combinedproject",
+            &palace_dir,
+            &project_dir,
+        );
+
+        let context = CliContext::for_tests(config_root.clone());
+        let output = run_cli(
+            ["mine", project_dir.to_str().unwrap()],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+
+        // Must succeed locally despite remote being unreachable.
+        assert_eq!(output.exit_code, 0, "combined mine failed: stderr={:?}", output.stderr);
+        assert!(
+            output.stdout.contains("Files ingested:"),
+            "local ingestion must appear: {}",
+            output.stdout
+        );
+        assert!(
+            output.stdout.contains("replication: failed") || output.stdout.contains("replication: skipped"),
+            "remote replication failure must be reported: {}",
+            output.stdout
+        );
+
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn mine_combined_both_remote_success_reports_with_local() {
+        const TOKEN: &str = "combined-success-tok-002";
+        let workspace = tempdir().unwrap();
+
+        // Server palace dir.
+        let server_palace = workspace.path().join("server-palace");
+        fs::create_dir_all(&server_palace).unwrap();
+        let addr = spawn_test_server(server_palace.clone(), TOKEN);
+        let server_url = format!("http://{addr}");
+
+        // Project dir.
+        let project_dir = workspace.path().join("myproject");
+        fs::create_dir_all(&project_dir).unwrap();
+        write_file(
+            &project_dir.join("backend/auth.rs"),
+            "Auth login flow keeps auth checks in the backend service.\n"
+                .repeat(5)
+                .as_str(),
+        );
+        write_file(
+            &project_dir.join("docs/roadmap.md"),
+            "Roadmap plan tracks the migration milestones.\n".repeat(5).as_str(),
+        );
+
+        // CLI config dir: init local palace, then overwrite with combined+both.
+        let config_root = temp_config_root("combined-e2e");
+        let context = CliContext::for_tests(config_root.clone());
+        let palace_dir = config_root.join("palace");
+
+        run_cli(["init", project_dir.to_str().unwrap(), "--yes"], &context, stub_provider).unwrap();
+
+        let wing_name = "wing_myproject";
+        let remote_name = "hub";
+        write_combined_cli_config(
+            &config_root,
+            remote_name,
+            &server_url,
+            TOKEN,
+            wing_name,
+            &palace_dir,
+            &project_dir,
+        );
+
+        let context = CliContext::for_tests(config_root.clone());
+        let output = run_cli(
+            ["mine", project_dir.to_str().unwrap()],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+
+        assert_eq!(output.exit_code, 0, "combined mine failed: stderr={:?}", output.stderr);
+        assert!(
+            output.stdout.contains("Files ingested:"),
+            "must show local ingestion results: {}",
+            output.stdout
+        );
+        assert!(
+            output.stdout.contains("replication: succeeded"),
+            "remote replication must report success: {}",
+            output.stdout
+        );
+
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn mine_remote_only_unreachable_still_fails_legacy() {
+        // Verify that a remote-only (not combined) route still fails through
+        // the legacy error path when the remote is unreachable.
+        let workspace = tempdir().unwrap();
+        let project_dir = workspace.path().join("legacy-remote");
+        fs::create_dir_all(&project_dir).unwrap();
+        write_file(
+            &project_dir.join("code.rs"),
+            "fn example() -> bool { true }\n".repeat(10).as_str(),
+        );
+
+        let config_root = temp_config_root("legacy-remote-unreachable");
+        let wing_name = "wing_legacyremote";
+        let remote_name = "hub";
+        let server_url = "http://127.0.0.1:1";
+        write_remote_cli_config(
+            &config_root,
+            remote_name,
+            server_url,
+            "legacy-unreachable-tok",
+            wing_name,
+            &project_dir,
+        );
+
+        let context = CliContext::for_tests(config_root.clone());
+        let result = run_cli(
+            ["mine", project_dir.to_str().unwrap()],
+            &context,
+            stub_provider,
+        );
+
+        // Must fail through legacy CliOutput path with exit code 1.
+        let output = result.expect("legacy remote-only must return Ok(CliOutput), not Err");
+        assert_eq!(output.exit_code, 1, "legacy remote-only must exit code 1: {output:?}");
+        assert!(
+            output.stderr.contains("unreachable") && output.stderr.contains("local"),
+            "legacy error should mention unreachable and no fallback: {}",
+            output.stderr
+        );
 
         remove_dir_all_if_exists(&config_root);
     }
@@ -2751,6 +3265,677 @@ mod tests {
             reindex.stdout
         );
         assert!(reindex.stdout.contains("Files ingested: 3"), "reindex output: {:?}", reindex.stdout);
+
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    /// Spawn a test server that deliberately delays the third request (info +
+    /// first ingest batch are fast; the third is the second ingest batch) to
+    /// exceed the client's 5-second timeout, causing a deterministic transport
+    /// failure. Subsequent requests respond normally, so a retry works.
+    fn spawn_self_destruct_server(
+        palace_dir: PathBuf,
+        token: &str,
+    ) -> std::net::SocketAddr {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let token_dir = tempfile::tempdir().unwrap();
+        let token_file = write_test_token_file(token_dir.path(), token);
+        let config = remote_test_config(palace_dir, token_file.clone());
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let addr = rt.block_on(async {
+            let tokens = mempalace_server::TokenRegistry::load(token_file).unwrap();
+            let provider = mempalace_embeddings::DeterministicStubProvider::new(
+                EmbeddingProfile::Balanced,
+            );
+            let router = mempalace_server::build_router(config, provider, tokens)
+                .await
+                .unwrap();
+
+            let counter = Arc::new(AtomicUsize::new(0));
+            let app = router.layer(axum::middleware::from_fn({
+                let c = counter.clone();
+                move |req: axum::extract::Request, next: axum::middleware::Next| {
+                    let c = c.clone();
+                    async move {
+                        let prev = c.fetch_add(1, Ordering::SeqCst);
+                        // prev=0: info handshake, prev=1: first ingest batch,
+                        // prev=2: second ingest batch — sleep past client timeout.
+                        if prev == 2 {
+                            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                        }
+                        next.run(req).await
+                    }
+                }
+            }));
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.ok();
+            });
+            addr
+        });
+
+        std::mem::forget(rt);
+        std::mem::forget(token_dir);
+        addr
+    }
+
+    #[test]
+    fn mine_combined_both_partial_on_batch_transport_failure() {
+        // Regression: when the first remote batch succeeds but a later batch
+        // suffers a transport error, the output must say "partial" — never
+        // "replication: succeeded".
+        const TOKEN: &str = "partial-batch-tok-003";
+        let workspace = tempdir().unwrap();
+
+        // Server palace dir.
+        let server_palace = workspace.path().join("server-palace");
+        fs::create_dir_all(&server_palace).unwrap();
+        let proxy_addr = spawn_self_destruct_server(server_palace.clone(), TOKEN);
+        let proxy_url = format!("http://{proxy_addr}");
+
+        // Project dir with enough files for 3 batches at batch-size 1.
+        let project_dir = workspace.path().join("multi-batch-project");
+        fs::create_dir_all(&project_dir).unwrap();
+        for i in 0..3 {
+            write_file(
+                &project_dir.join(format!("file{i}.rs")),
+                &format!("// File {i}\nfn example_{i}() -> bool {{ true }}\n").repeat(5),
+            );
+        }
+
+        // CLI config dir.
+        let config_root = temp_config_root("partial-batch-e2e");
+        let context = CliContext::for_tests(config_root.clone());
+        let palace_dir = config_root.join("palace");
+
+        run_cli(["init", project_dir.to_str().unwrap(), "--yes"], &context, stub_provider).unwrap();
+
+        let wing_name = "wing_multibatch";
+        let remote_name = "hub";
+        write_combined_cli_config(
+            &config_root,
+            remote_name,
+            &proxy_url,
+            TOKEN,
+            wing_name,
+            &palace_dir,
+            &project_dir,
+        );
+
+        let context = CliContext::for_tests(config_root.clone());
+        let output = run_cli(
+            [
+                "mine",
+                project_dir.to_str().unwrap(),
+                "--batch-size",
+                "1",
+            ],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+
+        assert_eq!(output.exit_code, 0, "combined mine must exit 0: stderr={:?}", output.stderr);
+        assert!(
+            output.stdout.contains("Files ingested:"),
+            "local ingestion must appear: {}",
+            output.stdout
+        );
+        assert!(
+            output.stdout.contains("replication: partial"),
+            "must report partial replication: {}",
+            output.stdout
+        );
+        assert!(
+            output.stdout.contains("transport interrupted"),
+            "must mention transport interruption: {}",
+            output.stdout
+        );
+        assert!(
+            !output.stdout.contains("replication: succeeded"),
+            "must NOT claim full replication success: {}",
+            output.stdout
+        );
+        assert!(
+            !output.stdout.contains("some files had errors"),
+            "must NOT claim file-level errors when the only issue was transport: {}",
+            output.stdout
+        );
+
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn mine_combined_both_retry_safe_replication() {
+        // Regression: after a transport interruption mid-way through a combined
+        // write:both mine, retrying the same project must not create duplicate
+        // local drawers, and the remote must report previously-replicated files
+        // as skipped_unchanged.
+        const TOKEN: &str = "retry-safe-tok-004";
+        let workspace = tempdir().unwrap();
+
+        // Server palace dir — single server used for both mines.
+        let server_palace = workspace.path().join("server-palace");
+        fs::create_dir_all(&server_palace).unwrap();
+        let proxy_addr = spawn_self_destruct_server(server_palace.clone(), TOKEN);
+        let proxy_url = format!("http://{proxy_addr}");
+
+        // Project dir with 3 files so batch-size 1 produces 3 batches.
+        let project_dir = workspace.path().join("retry-project");
+        fs::create_dir_all(&project_dir).unwrap();
+        for i in 0..3 {
+            write_file(
+                &project_dir.join(format!("file{i}.rs")),
+                &format!("// File {i}\nfn example_{i}() -> bool {{ true }}\n").repeat(5),
+            );
+        }
+
+        // ── First mine (interrupted) ──────────────────────────────────────────
+        let config_root = temp_config_root("retry-safe-e2e");
+        let context = CliContext::for_tests(config_root.clone());
+        let palace_dir = config_root.join("palace");
+
+        run_cli(["init", project_dir.to_str().unwrap(), "--yes"], &context, stub_provider).unwrap();
+
+        let wing_name = "wing_retryproject";
+        let remote_name = "hub";
+        write_combined_cli_config(
+            &config_root,
+            remote_name,
+            &proxy_url,
+            TOKEN,
+            wing_name,
+            &palace_dir,
+            &project_dir,
+        );
+
+        let context = CliContext::for_tests(config_root.clone());
+        let first_output = run_cli(
+            ["mine", project_dir.to_str().unwrap(), "--batch-size", "1"],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+
+        assert_eq!(first_output.exit_code, 0, "first mine must exit 0: stderr={:?}", first_output.stderr);
+        assert!(first_output.stdout.contains("Files ingested: 3"), "local mine must ingest 3: {}",
+            first_output.stdout);
+        assert!(
+            first_output.stdout.contains("replication: partial"),
+            "first mine must report partial replication: {}",
+            first_output.stdout
+        );
+        assert!(
+            first_output.stdout.contains("transport interrupted"),
+            "first mine must mention transport interruption: {}",
+            first_output.stdout
+        );
+
+        // ── Second mine (retry — server is now past the slow delay) ───────────
+        let second_output = run_cli(
+            ["mine", project_dir.to_str().unwrap(), "--batch-size", "1"],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+
+        assert_eq!(second_output.exit_code, 0, "second mine must exit 0: stderr={:?}", second_output.stderr);
+
+        // Local mine re-ingests nothing because files are unchanged.
+        assert!(
+            second_output.stdout.contains("Files skipped unchanged: 3"),
+            "retry must skip all locally-unchanged files: {}",
+            second_output.stdout
+        );
+        assert!(
+            second_output.stdout.contains("Files ingested: 0"),
+            "retry must not re-ingest unchanged files: {}",
+            second_output.stdout
+        );
+
+        // Remote should report the previously-replicated file as skipped_unchanged
+        // and the remaining two as ingested.
+        assert!(
+            second_output.stdout.contains("replication: succeeded"),
+            "second mine must report full replication success: {}",
+            second_output.stdout
+        );
+        assert!(
+            second_output.stdout.contains("Files ingested: 2"),
+            "remote mine must ingest the two files that were not previously replicated: {}",
+            second_output.stdout
+        );
+
+        // ── Verify no duplicates: local drawer count is unchanged after retry ──
+        let status = run_cli(["status"], &context, stub_provider).unwrap();
+        assert_eq!(status.exit_code, 0, "status failed: stderr={:?}", status.stderr);
+        // The fixture has 3 files → 3 drawers after the first mine.
+        // After retry there should still be 3 (no duplicates, nothing added).
+        let drawer_count_line = status.stdout.lines().find(|l| l.contains("drawers")).unwrap_or("");
+        assert!(
+            drawer_count_line.contains("3 drawers"),
+            "must have exactly 3 drawers after retry, not more (no duplicates): {}",
+            status.stdout
+        );
+
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn mine_combined_both_branch_uses_local_only() {
+        // combined+both config with a healthy remote, but --branch forces
+        // local-only execution. No remote replication must be attempted.
+        const TOKEN: &str = "branch-local-tok-005";
+        let workspace = tempdir().unwrap();
+
+        let server_palace = workspace.path().join("server-palace");
+        fs::create_dir_all(&server_palace).unwrap();
+        let addr = spawn_test_server(server_palace.clone(), TOKEN);
+        let server_url = format!("http://{addr}");
+
+        let repo_dir = workspace.path().join("repo");
+        fs::create_dir_all(&repo_dir).unwrap();
+        let base_content = "fn base() -> i32 { 42 }\n".repeat(20);
+        git_init_repo(
+            &repo_dir,
+            &[
+                ("mempalace.yaml", "wing: branchtest\nrooms:\n  - name: general\n"),
+                ("base.rs", &base_content),
+                ("stable.rs", "fn stable() -> &str { \"hello\" }\n"),
+            ],
+        );
+
+        // Create feature branch.
+        let run_git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo_dir)
+                .status()
+                .unwrap();
+        };
+        run_git(&["checkout", "-b", "feature"]);
+        let changed = "fn base() -> i32 { 99 }\n".repeat(20);
+        fs::write(repo_dir.join("base.rs"), &changed).unwrap();
+
+        let config_root = temp_config_root("branch-local");
+        let context = CliContext::for_tests(config_root.clone());
+        let palace_dir = config_root.join("palace");
+
+        run_cli(["init", repo_dir.to_str().unwrap(), "--yes"], &context, stub_provider).unwrap();
+
+        let wing_name = "wing_branchtest";
+        let remote_name = "hub";
+        write_combined_cli_config(
+            &config_root,
+            remote_name,
+            &server_url,
+            TOKEN,
+            wing_name,
+            &palace_dir,
+            &repo_dir,
+        );
+
+        let context = CliContext::for_tests(config_root.clone());
+        let output = run_cli(
+            ["mine", repo_dir.to_str().unwrap(), "--branch"],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+
+        // Must exit 0 and ingest the changed file locally.
+        assert_eq!(
+            output.exit_code, 0,
+            "branch mine with combined+both config: stderr={:?}",
+            output.stderr
+        );
+        assert!(
+            output.stdout.contains("Files ingested: 1"),
+            "must ingest the changed file: {}",
+            output.stdout
+        );
+
+        // Must NOT contain any replication labels (branch forces local-only).
+        assert!(
+            !output.stdout.contains("replication:"),
+            "branch mode must not attempt replication: {}",
+            output.stdout
+        );
+        assert!(
+            !output.stdout.contains("Remote replication:"),
+            "branch mode must not show Remote replication: {}",
+            output.stdout
+        );
+
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn mine_combined_both_convos_uses_local_only() {
+        // combined+both config with a healthy remote, but --mode convos forces
+        // local-only execution. No remote replication must be attempted.
+        const TOKEN: &str = "convos-local-tok-006";
+        let workspace = tempdir().unwrap();
+
+        let server_palace = workspace.path().join("server-palace");
+        fs::create_dir_all(&server_palace).unwrap();
+        let addr = spawn_test_server(server_palace.clone(), TOKEN);
+        let server_url = format!("http://{addr}");
+
+        let convo_dir = setup_convo_fixture(workspace.path());
+
+        let config_root = temp_config_root("convos-local");
+        let context = CliContext::for_tests(config_root.clone());
+        let palace_dir = config_root.join("palace");
+
+        // Write combined+both config manually (no init for convos).
+        let wing_name = "wing_talks";
+        let remote_name = "hub";
+        write_combined_cli_config(
+            &config_root,
+            remote_name,
+            &server_url,
+            TOKEN,
+            wing_name,
+            &palace_dir,
+            // The project_dir parameter in write_combined_cli_config writes
+            // a mempalace.yaml. We'll use the convo dir for that.
+            &convo_dir,
+        );
+
+        let context = CliContext::for_tests(config_root.clone());
+        let output = run_cli(
+            [
+                "--palace",
+                workspace.path().join("convo-palace").to_str().unwrap(),
+                "mine",
+                convo_dir.to_str().unwrap(),
+                "--mode",
+                "convos",
+                "--wing",
+                "talks",
+            ],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+
+        // Must exit 0 and ingest conversation files.
+        assert_eq!(
+            output.exit_code, 0,
+            "convos mine with combined+both config: stderr={:?}",
+            output.stderr
+        );
+        assert!(
+            output.stdout.contains("Files ingested:"),
+            "must show local ingestion: {}",
+            output.stdout
+        );
+
+        // Must NOT contain any replication labels (convos mode forces local-only).
+        assert!(
+            !output.stdout.contains("replication:"),
+            "convos mode must not attempt replication: {}",
+            output.stdout
+        );
+        assert!(
+            !output.stdout.contains("Remote replication:"),
+            "convos mode must not show Remote replication: {}",
+            output.stdout
+        );
+
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn mine_local_only_route_with_federation() {
+        // Federation remotes are defined, but the wing is NOT mapped to any
+        // remote — the route resolves to local-only. No remote replication
+        // must be attempted.
+        const TOKEN: &str = "local-route-tok-007";
+        let workspace = tempdir().unwrap();
+
+        // Start a server to prove we *could* replicate if configured.
+        let server_palace = workspace.path().join("server-palace");
+        fs::create_dir_all(&server_palace).unwrap();
+        let addr = spawn_test_server(server_palace.clone(), TOKEN);
+        let server_url = format!("http://{addr}");
+
+        let project_dir = setup_project_fixture(workspace.path());
+
+        let config_root = temp_config_root("local-route");
+        let context = CliContext::for_tests(config_root.clone());
+        let palace_dir = config_root.join("palace");
+
+        // Write config with federation remotes defined but NO wing routing.
+        fs::create_dir_all(&config_root).unwrap();
+        let config_json = serde_json::json!({
+            "version": 1,
+            "palace_path": palace_dir.to_str().unwrap(),
+            "federation": {
+                "remotes": [{"name": "hub", "url": server_url, "token": TOKEN}],
+                "wings": {}
+            }
+        });
+        fs::write(
+            config_root.join("config.json"),
+            serde_json::to_string_pretty(&config_json).unwrap(),
+        )
+        .unwrap();
+
+        // Write project config.
+        let yaml = "wing: wing_project_alpha\nrooms:\n  - name: general\n    description: General files\n";
+        fs::write(project_dir.join("mempalace.yaml"), yaml).unwrap();
+
+        let context = CliContext::for_tests(config_root.clone());
+
+        // First mine must succeed locally.
+        let mine = run_cli(
+            ["mine", project_dir.to_str().unwrap()],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+        assert_eq!(mine.exit_code, 0, "local mine must succeed: stderr={:?}", mine.stderr);
+        assert!(
+            mine.stdout.contains("Files ingested: 3"),
+            "must ingest all 3 fixture files: {}",
+            mine.stdout
+        );
+
+        // Must NOT contain any replication or remote labels.
+        assert!(
+            !mine.stdout.contains("replication:"),
+            "local-only route must not attempt replication: {}",
+            mine.stdout
+        );
+        assert!(
+            !mine.stdout.contains("Remote replication:"),
+            "local-only route must not show Remote replication: {}",
+            mine.stdout
+        );
+        assert!(
+            !mine.stdout.contains("Remote:"),
+            "local-only route must not mention Remote: {}",
+            mine.stdout
+        );
+
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn mine_combined_both_unsupported_remote() {
+        // combined + write:both where the remote server does NOT advertise the
+        // "ingest" capability — local mine must succeed, replication must be
+        // reported as skipped, and exit code must be 0.
+        const TOKEN: &str = "unsupported-remote-tok-008";
+        let workspace = tempdir().unwrap();
+
+        // Server without "ingest" capability.
+        let addr = spawn_no_ingest_server(TOKEN);
+        let server_url = format!("http://{addr}");
+
+        let project_dir = workspace.path().join("no-ingest-project");
+        fs::create_dir_all(&project_dir).unwrap();
+        write_file(
+            &project_dir.join("backend/auth.rs"),
+            "Auth login flow keeps auth checks in the backend service.\n"
+                .repeat(5)
+                .as_str(),
+        );
+        write_file(
+            &project_dir.join("docs/roadmap.md"),
+            "Roadmap plan tracks the migration milestones.\n".repeat(5).as_str(),
+        );
+
+        let config_root = temp_config_root("unsupported-remote");
+        let context = CliContext::for_tests(config_root.clone());
+        let palace_dir = config_root.join("palace");
+
+        run_cli(["init", project_dir.to_str().unwrap(), "--yes"], &context, stub_provider).unwrap();
+
+        let wing_name = "wing_noingestproject";
+        let remote_name = "hub";
+        write_combined_cli_config(
+            &config_root,
+            remote_name,
+            &server_url,
+            TOKEN,
+            wing_name,
+            &palace_dir,
+            &project_dir,
+        );
+
+        let context = CliContext::for_tests(config_root.clone());
+        let output = run_cli(
+            ["mine", project_dir.to_str().unwrap()],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+
+        // Exit code 0 — local success even though remote is unsupported.
+        assert_eq!(output.exit_code, 0, "combined mine failed: stderr={:?}", output.stderr);
+        assert!(
+            output.stdout.contains("Files ingested:"),
+            "local ingestion must appear: {}",
+            output.stdout
+        );
+        assert!(
+            output.stdout.contains("replication: skipped"),
+            "must report replication as skipped: {}",
+            output.stdout
+        );
+        assert!(
+            output.stdout.contains("does not support the ingest capability"),
+            "must identify unsupported ingest capability: {}",
+            output.stdout
+        );
+        assert!(
+            output.stdout.contains("Server capabilities: drawers, kg, changes, taxonomy"),
+            "must list server capabilities: {}",
+            output.stdout
+        );
+        assert!(
+            output.stdout.contains("local mine completed successfully"),
+            "must note local mine success: {}",
+            output.stdout
+        );
+
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn mine_combined_both_diary_wing_uses_local_only() {
+        // combined+both config with a healthy remote targeting wing_agents,
+        // but the diary hard-override in route resolution forces local-only
+        // execution. No remote replication must be attempted.
+        const TOKEN: &str = "diary-wing-tok-009";
+        let workspace = tempdir().unwrap();
+
+        let server_palace = workspace.path().join("server-palace");
+        fs::create_dir_all(&server_palace).unwrap();
+        let addr = spawn_test_server(server_palace.clone(), TOKEN);
+        let server_url = format!("http://{addr}");
+
+        // Project dir with wing_agents as the wing.
+        let project_dir = workspace.path().join("diary-project");
+        fs::create_dir_all(&project_dir).unwrap();
+        write_file(
+            &project_dir.join("entry.md"),
+            "Today I learned about federation routing.\n".repeat(5).as_str(),
+        );
+
+        let config_root = temp_config_root("diary-wing-local");
+        let context = CliContext::for_tests(config_root.clone());
+        let palace_dir = config_root.join("palace");
+
+        run_cli(["init", project_dir.to_str().unwrap(), "--yes"], &context, stub_provider).unwrap();
+
+        // Overwrite config with combined+both routing for wing_agents targeting
+        // a healthy remote server. The diary hard-override in resolve_route
+        // must force local-only regardless.
+        let wing_name = "wing_agents";
+        let remote_name = "hub";
+        write_combined_cli_config(
+            &config_root,
+            remote_name,
+            &server_url,
+            TOKEN,
+            wing_name,
+            &palace_dir,
+            &project_dir,
+        );
+
+        // Re-read project config to set wing_agents in mempalace.yaml.
+        let yaml = "wing: wing_agents\nrooms:\n  - name: diary\n    description: Daily entries\n";
+        fs::write(project_dir.join("mempalace.yaml"), yaml).unwrap();
+
+        let context = CliContext::for_tests(config_root.clone());
+        let output = run_cli(
+            ["mine", project_dir.to_str().unwrap()],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+
+        // Must exit 0 and ingest locally.
+        assert_eq!(
+            output.exit_code, 0,
+            "diary-wing mine with combined+both config: stderr={:?}",
+            output.stderr
+        );
+        assert!(
+            output.stdout.contains("Files ingested:"),
+            "must show local ingestion: {}",
+            output.stdout
+        );
+
+        // Must NOT contain any replication labels (diary hard-override forces local-only).
+        assert!(
+            !output.stdout.contains("replication:"),
+            "diary wing must not attempt replication: {}",
+            output.stdout
+        );
+        assert!(
+            !output.stdout.contains("Remote replication:"),
+            "diary wing must not show Remote replication: {}",
+            output.stdout
+        );
+        assert!(
+            !output.stdout.contains("Remote:"),
+            "diary wing must not mention Remote: {}",
+            output.stdout
+        );
 
         remove_dir_all_if_exists(&config_root);
     }

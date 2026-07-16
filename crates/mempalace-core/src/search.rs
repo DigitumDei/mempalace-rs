@@ -60,6 +60,10 @@ pub struct SearchResult {
     /// shapes remain byte-identical for non-stale results.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub stale: bool,
+    /// Content hash of the drawer, present only when the result is from a
+    /// duplicate check that needs exact-match detection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
 }
 
 #[cfg(test)]
@@ -81,6 +85,7 @@ mod tests {
             content: "auth migration parity".to_owned(),
             source_file: "team.txt".to_owned(),
             stale: false,
+            content_hash: None,
         };
 
         let value = serde_json::to_value(&result).unwrap();
@@ -107,6 +112,7 @@ mod tests {
             content: "text".to_owned(),
             source_file: "f.txt".to_owned(),
             stale: false,
+            content_hash: None,
         };
         let stale = SearchResult { stale: true, ..non_stale.clone() };
         let non_stale_json = serde_json::to_value(&non_stale).unwrap();

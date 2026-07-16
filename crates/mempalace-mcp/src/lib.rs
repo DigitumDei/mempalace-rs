@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use blake3::Hasher;
-use mempalace_config::{ConfigLoader, MempalaceConfig, RouteMode};
+use mempalace_config::{ConfigLoader, MempalaceConfig, ReplicationStatus, RouteMode, WriteTarget};
 use mempalace_core::{
     DIARY_HALL, DIARY_ROOM, DIARY_TOPIC_PREFIX, DrawerId, DrawerRecord, EmbeddingProfile, RoomId,
     SHARED_AGENT_DIARY_WING, SearchQuery, WingId,
@@ -43,7 +43,18 @@ use federation::FederationRouter;
 //
 // **Routable — uses `resolve_route()` per wing/room:**
 //   Search, ListWings, ListRooms, GetTaxonomy, Status, CheckDuplicate,
-//   AddDrawer, DeleteDrawer
+//   AddDrawer
+//
+// **DeleteDrawer — ID-based local deletion with remote fallback:**
+//   DeleteDrawer is NOT a dual-write or write-routed operation. It deletes by
+//   drawer ID in the local palace first. If not found locally, it falls back
+//   by attempting deletion across ALL configured remotes (in deterministic name
+//   order), regardless of wing routing rules. Dual-written drawers have
+//   independent IDs on each side with no durable cross-palace ID mapping, so
+//   `write:remote` and `write:both` routing is irrelevant — the fallback is a
+//   best-effort attempt to delete the same ID on every remote. The response
+//   reports `applied_to: "local"` or `"remote:<name>"` and never carries a
+//   `replication` field.
 //
 // **Routable — uses `resolve_kg_route()` (knowledge-graph-specific routing):**
 //   KgQuery, KgAdd, KgInvalidate, KgTimeline, KgStats
@@ -56,7 +67,16 @@ use federation::FederationRouter;
 //   to the write-target side ONLY (local or the configured remote). The response
 //   reports the touched side via `"applied_to": "local"` | `"remote:<name>"`.
 //   In Local mode the write is local; in Remote mode the write goes to the remote
-//   KG only; Combined uses the resolved `write` field (local or remote).
+//   KG only; Combined uses the resolved `write` field (local, remote, or both).
+//
+// **`write: both` — local-first dual-write:**
+//   When the resolved `write` field is `WriteTarget::Both`, the local write must
+//   complete first, then a best-effort remote replication is attempted via the
+//   corresponding `*_replicate` method (`add_drawer_replicate`, `kg_add_replicate`,
+//   `kg_invalidate_replicate`). The response carries a `replication` field with
+//   `ReplicationStatus` — `replicated`, `converged`, or `failed`. The `replication` field is
+//   absent for non-`both` routes and diary-local writes. The remote failure
+//   never blocks or rolls back the local write.
 //
 // **Wing name collisions:** During `list_wings` merging, a wing that exists both
 //   locally and on a remote while its resolved route is Local-only triggers a
@@ -65,9 +85,10 @@ use federation::FederationRouter;
 // **Wing names are the federation join key** — the same wing name on both sides
 //   is merged-by-name in combined reads.
 //
-// **Write routing:** In Combined mode, `AddDrawer`, `DeleteDrawer`, `KgAdd`, and
+// **Write routing:** In Combined mode, `AddDrawer`, `KgAdd`, and
 //   `KgInvalidate` write to the target indicated by the resolved rule's `write`
-//   field (local or remote). Read tools always fan out to both sources.
+//   field (local, remote, or both). `DeleteDrawer` is excluded — see its section
+//   above.
 //
 // **Per-project routing** (`resolve_route`'s `project_routing` parameter) is not
 //   wired at the MCP layer — the stdio server has no per-project context, so it
@@ -134,7 +155,10 @@ pub struct ToolDefinition {
 pub enum ToolRoutingCategory {
     /// Tool is always served from the local palace; never federated.
     LocalOnly,
-    /// Tool routes via wing/room rules (`resolve_route`).
+    /// Tool routes via wing/room rules (`resolve_route`). Exception: DeleteDrawer
+    /// is categorized here because it can reach remotes, but it does NOT use
+    /// `resolve_route()` for write target — it deletes by ID locally first, then
+    /// falls back to all remotes regardless of wing routing.
     RoutableDrawer,
     /// Tool routes via KG-specific rules (`resolve_kg_route`).
     RoutableKg,
@@ -399,7 +423,7 @@ impl ToolName {
             },
             Self::DeleteDrawer => ToolDefinition {
                 name: self.as_str(),
-                description: "Delete a drawer by ID. Irreversible.",
+                description: "Delete a drawer by ID. Irreversible. Local deletion first by ID; if not found locally, falls back to remotes in name order. Does not use write routing.",
                 input_schema: json!({
                     "type":"object",
                     "properties":{"drawer_id":{"type":"string","description":"ID of the drawer to delete"}},
@@ -1107,36 +1131,93 @@ where
         let content = required_string(arguments, "content")?;
         let source_file = optional_string(arguments, "source_file")?.unwrap_or_default();
         let added_by = optional_string(arguments, "added_by")?.unwrap_or_else(|| "mcp".to_owned());
+        let content_hash = hash_text(&content);
 
-        // ── Federation path ──
-        if let Some(router) = &self.federation {
-            // Pass room and source_file so diary hard-override can fire (e.g.
-            // room == DIARY_ROOM or source_file starts with DIARY_TOPIC_PREFIX).
-            let route = router.resolve_drawer_route(
+        // ── Resolve federation route once, reuse for dual-write decisions ──
+        let route = self.federation.as_ref().map(|router| {
+            router.resolve_drawer_route(
                 Some(wing.as_str()),
                 Some(room.as_str()),
                 if source_file.is_empty() { None } else { Some(source_file.as_str()) },
-            );
-            if let Some(remote_resp) = router
-                .add_drawer_remote(
-                    wing.as_str(),
-                    room.as_str(),
-                    &content,
-                    &source_file,
-                    &added_by,
-                    &route,
-                    DEFAULT_DUPLICATE_THRESHOLD,
-                )
-                .await?
-            {
-                // Remote handled the add — no local change-log entry needed.
-                // The remote palace records its own change event.
-                return Ok(remote_resp);
+            )
+        });
+        let is_both = match (&self.federation, &route) {
+            (Some(router), Some(route)) => router.is_dual_write(route),
+            _ => false,
+        };
+
+        // ── Non-Both federation: remote-only or local-only ──
+        if !is_both {
+            if let Some(router) = &self.federation {
+                if let Some(route) = &route {
+                    if let Some(remote_resp) = router
+                        .add_drawer_remote(
+                            wing.as_str(),
+                            room.as_str(),
+                            &content,
+                            &source_file,
+                            &added_by,
+                            route,
+                            DEFAULT_DUPLICATE_THRESHOLD,
+                        )
+                        .await?
+                    {
+                        return Ok(remote_resp);
+                    }
+                }
             }
         }
 
         let duplicates = self.find_duplicates(&content, DEFAULT_DUPLICATE_THRESHOLD).await?;
         if !duplicates.is_empty() {
+            // ── Both-mode: same wing+room → retry, reuse local, retry remote ──
+            if is_both {
+                if let Some(existing) = duplicates.iter().find(|d| {
+                    d.get("wing").and_then(|w| w.as_str()) == Some(wing.as_str())
+                        && d.get("room").and_then(|r| r.as_str()) == Some(room.as_str())
+                        && d.get("content_hash")
+                            .and_then(|h| h.as_str())
+                            == Some(content_hash.as_str())
+                }) {
+                    let existing_drawer_id = existing["id"].as_str().unwrap_or("");
+                    let mut result = json!({
+                        "success": true,
+                        "drawer_id": existing_drawer_id,
+                        "wing": wing,
+                        "room": room,
+                    });
+                    if self.federation.is_some() {
+                        if let Some(obj) = result.as_object_mut() {
+                            obj.insert("applied_to".to_owned(), json!("local"));
+                        }
+                    }
+                    if let Some(router) = &self.federation {
+                        if let Some(route) = &route {
+                            let replication = router
+                                .add_drawer_replicate(
+                                    wing.as_str(),
+                                    room.as_str(),
+                                    &content,
+                                    &source_file,
+                                    &added_by,
+                                    route,
+                                    DEFAULT_DUPLICATE_THRESHOLD,
+                                )
+                                .await;
+                            if let Some(obj) = result.as_object_mut() {
+                                obj.insert("replication".to_owned(), json!(replication));
+                                if matches!(replication, ReplicationStatus::Failed { .. }) {
+                                    obj.insert(
+                                        "warnings".to_owned(),
+                                        json!(["local content already existed; remote replication failed"]),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    return Ok(result);
+                }
+            }
             return Ok(json!({
                 "success": false,
                 "reason": "duplicate",
@@ -1146,6 +1227,7 @@ where
 
         let now = OffsetDateTime::now_utc();
         let drawer_id = generated_drawer_id("drawer", wing.as_str(), room.as_str(), &content, now)?;
+        let content_clone = content.clone();
         let record = self
             .build_drawer_record(
                 drawer_id.clone(),
@@ -1165,7 +1247,7 @@ where
             .commit_ingest(IngestCommitRequest {
                 ingest_kind: "mcp_write".to_owned(),
                 source_key: format!("mcp:{}", drawer_id.as_str()),
-                source_file,
+                source_file: source_file.clone(),
                 content_hash: record.content_hash.clone(),
                 drawers: vec![record],
                 duplicate_strategy: DuplicateStrategy::Error,
@@ -1177,16 +1259,51 @@ where
             event_type: "drawer_added".to_owned(),
             occurred_at: now,
             entity_id: drawer_id.as_str().to_owned(),
-            actor: Some(added_by),
+            actor: Some(added_by.clone()),
             details_json: Some(json!({"wing": wing.as_str(), "room": room.as_str()}).to_string()),
         });
 
-        Ok(json!({
+        let mut result = json!({
             "success": true,
             "drawer_id": drawer_id,
             "wing": wing,
             "room": room,
-        }))
+        });
+        if self.federation.is_some() {
+            if let Some(obj) = result.as_object_mut() {
+                obj.insert("applied_to".to_owned(), json!("local"));
+            }
+        }
+
+        // ── Both-mode: best-effort remote replication after local write ──
+        if is_both {
+            if let Some(router) = &self.federation {
+                if let Some(route) = &route {
+                    let replication = router
+                        .add_drawer_replicate(
+                            wing.as_str(),
+                            room.as_str(),
+                            &content_clone,
+                            &source_file,
+                            &added_by,
+                            route,
+                            DEFAULT_DUPLICATE_THRESHOLD,
+                        )
+                        .await;
+                    if let Some(obj) = result.as_object_mut() {
+                        obj.insert("replication".to_owned(), json!(replication));
+                        if matches!(replication, ReplicationStatus::Failed { .. }) {
+                            obj.insert(
+                                "warnings".to_owned(),
+                                json!(["local write succeeded but remote replication failed"]),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(result)
     }
 
     async fn tool_delete_drawer(&mut self, arguments: &Value) -> ToolResult<Value> {
@@ -1227,7 +1344,13 @@ where
             actor: None,
             details_json: None,
         });
-        Ok(json!({ "success": true, "drawer_id": drawer_id }))
+        let mut result = json!({ "success": true, "drawer_id": drawer_id });
+        if self.federation.is_some() {
+            if let Some(obj) = result.as_object_mut() {
+                obj.insert("applied_to".to_owned(), json!("local"));
+            }
+        }
+        Ok(result)
     }
 
     async fn tool_diary_write(&mut self, arguments: &Value) -> ToolResult<Value> {
@@ -1454,20 +1577,30 @@ where
         let object = required_string(arguments, "object")?;
         let valid_from_text = optional_string(arguments, "valid_from")?;
 
-        // ── Federation path ──
-        if let Some(router) = &self.federation {
-            let route = router.resolve_kg_route();
-            if let Some(remote_resp) = router
-                .kg_add_remote(
-                    &subject,
-                    &predicate,
-                    &object,
-                    valid_from_text.as_deref(),
-                    &route,
-                )
-                .await?
-            {
-                return Ok(remote_resp);
+        // ── Resolve federation route once, reuse for dual-write decisions ──
+        let route = self.federation.as_ref().map(|router| router.resolve_kg_route());
+        let is_both = match (&self.federation, &route) {
+            (Some(router), Some(route)) => router.is_dual_write(route),
+            _ => false,
+        };
+
+        // ── Non-Both federation: remote-only or local-only ──
+        if !is_both {
+            if let Some(router) = &self.federation {
+                if let Some(route) = &route {
+                    if let Some(remote_resp) = router
+                        .kg_add_remote(
+                            &subject,
+                            &predicate,
+                            &object,
+                            valid_from_text.as_deref(),
+                            route,
+                        )
+                        .await?
+                    {
+                        return Ok(remote_resp);
+                    }
+                }
             }
         }
 
@@ -1483,8 +1616,8 @@ where
                     subject: subject.clone(),
                     subject_type: infer_entity_kind(&subject),
                     predicate: predicate.clone(),
-                    object: object.clone(),
                     object_type: infer_entity_kind(&object),
+                    object: object.clone(),
                     valid_from,
                     valid_to: None,
                     confidence: 1.0,
@@ -1495,6 +1628,9 @@ where
             )
             .map_tool_internal()?;
 
+        let sub = subject.clone();
+        let pred = predicate.clone();
+        let obj = object.clone();
         self.log_change(ChangeEvent {
             event_type: "kg_fact_added".to_owned(),
             occurred_at: now,
@@ -1508,13 +1644,38 @@ where
         let mut payload = json!({
             "success": true,
             "triple_id": triple_id,
-            "fact": format!("{subject} → {predicate} → {object}"),
+            "fact": format!("{sub} → {pred} → {obj}"),
         });
         if self.federation.is_some() {
             if let Some(obj) = payload.as_object_mut() {
                 obj.insert("applied_to".to_owned(), json!("local"));
             }
         }
+
+        // ── Both-mode: best-effort remote replication after local KG add ──
+        if is_both {
+            if let Some(router) = &self.federation {
+                if let Some(route) = &route {
+                    let replication = router
+                        .kg_add_replicate(
+                            &sub, &pred, &obj,
+                            valid_from_text.as_deref(),
+                            route,
+                        )
+                        .await;
+                    if let Some(p) = payload.as_object_mut() {
+                        p.insert("replication".to_owned(), json!(replication));
+                        if matches!(replication, ReplicationStatus::Failed { .. }) {
+                            p.insert(
+                                "warnings".to_owned(),
+                                json!(["local write succeeded but remote replication failed"]),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(payload)
     }
 
@@ -1535,20 +1696,30 @@ where
             .transpose()?
             .unwrap_or_else(|| OffsetDateTime::now_utc().date());
 
-        // ── Federation path ──
-        if let Some(router) = &self.federation {
-            let route = router.resolve_kg_route();
-            if let Some(remote_resp) = router
-                .kg_invalidate_remote(
-                    &subject,
-                    &predicate,
-                    &object,
-                    ended_text.as_deref(),
-                    &route,
-                )
-                .await?
-            {
-                return Ok(remote_resp);
+        // ── Resolve federation route once, reuse for dual-write decisions ──
+        let route = self.federation.as_ref().map(|router| router.resolve_kg_route());
+        let is_both = match (&self.federation, &route) {
+            (Some(router), Some(route)) => router.is_dual_write(route),
+            _ => false,
+        };
+
+        // ── Non-Both federation: remote-only or local-only ──
+        if !is_both {
+            if let Some(router) = &self.federation {
+                if let Some(route) = &route {
+                    if let Some(remote_resp) = router
+                        .kg_invalidate_remote(
+                            &subject,
+                            &predicate,
+                            &object,
+                            ended_text.as_deref(),
+                            route,
+                        )
+                        .await?
+                    {
+                        return Ok(remote_resp);
+                    }
+                }
             }
         }
 
@@ -1556,6 +1727,10 @@ where
         let runtime = KnowledgeGraphRuntime::new(self.storage.operational_store());
         let invalidated =
             runtime.invalidate(&subject, &predicate, &object, ended, now).map_tool_internal()?;
+
+        let sub = subject.clone();
+        let pred = predicate.clone();
+        let obj = object.clone();
 
         if invalidated > 0 {
             self.log_change(ChangeEvent {
@@ -1574,14 +1749,39 @@ where
         let mut payload = json!({
             "success": invalidated > 0,
             "invalidated": invalidated,
-            "fact": format!("{subject} → {predicate} → {object}"),
-            "ended": ended_text.unwrap_or_else(|| "today".to_owned()),
+            "fact": format!("{sub} → {pred} → {obj}"),
+            "ended": ended_text.as_deref().unwrap_or("today"),
         });
         if self.federation.is_some() {
             if let Some(obj) = payload.as_object_mut() {
                 obj.insert("applied_to".to_owned(), json!("local"));
             }
         }
+
+        // ── Both-mode: best-effort remote replication after local KG invalidation ──
+        if is_both {
+            if let Some(router) = &self.federation {
+                if let Some(route) = &route {
+                    let replication = router
+                        .kg_invalidate_replicate(
+                            &sub, &pred, &obj,
+                            ended_text.as_deref(),
+                            route,
+                        )
+                        .await;
+                    if let Some(p) = payload.as_object_mut() {
+                        p.insert("replication".to_owned(), json!(replication));
+                        if matches!(replication, ReplicationStatus::Failed { .. }) {
+                            p.insert(
+                                "warnings".to_owned(),
+                                json!(["local write succeeded but remote replication failed"]),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(payload)
     }
 
@@ -1654,6 +1854,7 @@ where
                     "room": result.room,
                     "similarity": round_similarity(result.score),
                     "content": snippet,
+                    "content_hash": result.content_hash,
                 })
             })
             .collect())
@@ -2318,6 +2519,7 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
     use std::sync::mpsc;
 
@@ -4825,6 +5027,346 @@ mod tests {
         assert!(
             events.iter().all(|e| e.get("origin").is_none()),
             "events must NOT have `origin` when federation is off: {payload}"
+        );
+    }
+
+    // ── DeleteDrawer route-matrix: runtime tests through tool_delete_drawer ────
+    //
+    // These tests verify that `mempalace_delete_drawer`:
+    //   a) Always attempts local deletion first, regardless of write target.
+    //   b) Falls back to remotes only after a local miss.
+    //   c) Never attaches a `replication` field.
+    //
+    // The mock `RemoteApi` below is minimal — only `delete_drawer` is wired.
+
+    struct DeleteDrawerMock {
+        delete_succeeds: bool,
+        delete_call_count: AtomicU64,
+    }
+
+    impl DeleteDrawerMock {
+        fn delete_call_count(&self) -> u64 {
+            self.delete_call_count.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl mempalace_remote::RemoteApi for DeleteDrawerMock {
+        async fn info(&self) -> mempalace_remote::Result<mempalace_federation::InfoResponse> {
+            panic!("unexpected info call")
+        }
+        async fn search_drawers(
+            &self,
+            _req: mempalace_federation::DrawerSearchRequest,
+        ) -> mempalace_remote::Result<mempalace_federation::DrawerSearchResponse> {
+            panic!("unexpected search_drawers call")
+        }
+        async fn check_duplicate(
+            &self,
+            _req: mempalace_federation::CheckDuplicateRequest,
+        ) -> mempalace_remote::Result<mempalace_federation::CheckDuplicateResponse> {
+            panic!("unexpected check_duplicate call")
+        }
+        async fn add_drawer(
+            &self,
+            _req: mempalace_federation::AddDrawerRequest,
+        ) -> mempalace_remote::Result<mempalace_federation::AddDrawerResponse> {
+            panic!("unexpected add_drawer call")
+        }
+        async fn list_drawers(
+            &self,
+            _query: mempalace_federation::ListDrawersQuery,
+        ) -> mempalace_remote::Result<mempalace_federation::ListDrawersResponse> {
+            panic!("unexpected list_drawers call")
+        }
+        async fn get_drawer(&self, _drawer_id: &str) -> mempalace_remote::Result<serde_json::Value> {
+            panic!("unexpected get_drawer call")
+        }
+        async fn delete_drawer(&self, _drawer_id: &str) -> mempalace_remote::Result<()> {
+            self.delete_call_count.fetch_add(1, Ordering::SeqCst);
+            if self.delete_succeeds {
+                Ok(())
+            } else {
+                Err(mempalace_remote::RemoteError::RemoteRejected {
+                    remote: "mock".to_owned(),
+                    status: 404,
+                    body: "not found".to_owned(),
+                })
+            }
+        }
+        async fn kg_query(
+            &self,
+            _req: mempalace_federation::KgQueryRequest,
+        ) -> mempalace_remote::Result<serde_json::Value> {
+            panic!("unexpected kg_query call")
+        }
+        async fn kg_add_fact(
+            &self,
+            _req: mempalace_federation::KgAddFactRequest,
+        ) -> mempalace_remote::Result<serde_json::Value> {
+            panic!("unexpected kg_add_fact call")
+        }
+        async fn kg_invalidate(
+            &self,
+            _req: mempalace_federation::KgInvalidateRequest,
+        ) -> mempalace_remote::Result<serde_json::Value> {
+            panic!("unexpected kg_invalidate call")
+        }
+        async fn kg_timeline(
+            &self,
+            _entity: Option<&str>,
+        ) -> mempalace_remote::Result<serde_json::Value> {
+            panic!("unexpected kg_timeline call")
+        }
+        async fn kg_stats(&self) -> mempalace_remote::Result<serde_json::Value> {
+            panic!("unexpected kg_stats call")
+        }
+        async fn taxonomy(&self) -> mempalace_remote::Result<serde_json::Value> {
+            panic!("unexpected taxonomy call")
+        }
+        async fn wings(&self) -> mempalace_remote::Result<serde_json::Value> {
+            panic!("unexpected wings call")
+        }
+        async fn rooms(&self, _wing: Option<&str>) -> mempalace_remote::Result<serde_json::Value> {
+            panic!("unexpected rooms call")
+        }
+        async fn changes(
+            &self,
+            _query: mempalace_federation::ChangesQuery,
+        ) -> mempalace_remote::Result<mempalace_federation::ChangesResponse> {
+            panic!("unexpected changes call")
+        }
+        async fn ingest_batch(
+            &self,
+            _req: mempalace_federation::IngestBatchRequest,
+        ) -> mempalace_remote::Result<mempalace_federation::IngestBatchResponse> {
+            panic!("unexpected ingest_batch call")
+        }
+    }
+
+    fn make_delete_drawer_rules(
+        remotes: &BTreeMap<String, Arc<dyn mempalace_remote::RemoteApi>>,
+        write: WriteTarget,
+    ) -> FederationRuntimeConfig {
+        let mut rules_remotes = BTreeMap::new();
+        for name in remotes.keys() {
+            rules_remotes.insert(name.clone(), ResolvedRemote {
+                name: name.clone(),
+                url: "https://mock.example".to_owned(),
+                token: None,
+                timeout: std::time::Duration::from_secs(5),
+            });
+        }
+        FederationRuntimeConfig {
+            remotes: rules_remotes,
+            default_mode: RouteMode::Combined,
+            default_remote: remotes.keys().next().cloned(),
+            wings: [(
+                "wing_code".to_owned(),
+                ResolvedRouteRule {
+                    mode: RouteMode::Combined,
+                    remote: remotes.keys().next().cloned(),
+                    write,
+                },
+            )]
+            .into(),
+            kg: None,
+        }
+    }
+
+    struct DeleteDrawerTestCtx {
+        #[allow(dead_code)]
+        _tempdir: TempDir,
+        runtime: McpRuntime<DeterministicStubProvider>,
+    }
+
+    async fn make_delete_drawer_ctx(
+        remotes: BTreeMap<String, Arc<dyn mempalace_remote::RemoteApi>>,
+        write: WriteTarget,
+    ) -> DeleteDrawerTestCtx {
+        let rules = make_delete_drawer_rules(&remotes, write);
+        let tempdir = TempDir::new().unwrap();
+        let palace_path = tempdir.path().join("palace");
+        let config = MempalaceConfig {
+            federation: FederationRuntimeConfig::default(),
+            ..make_base_config(&palace_path, &tempdir)
+        };
+        let mut runtime = McpRuntime::new(config, DeterministicStubProvider::new(EmbeddingProfile::Balanced))
+            .await
+            .unwrap();
+        // Inject mock federation — avoid real HTTP connections.
+        runtime.federation = Some(FederationRouter::with_remotes(rules, remotes));
+        DeleteDrawerTestCtx { _tempdir: tempdir, runtime }
+    }
+
+    #[tokio::test]
+    async fn tool_delete_drawer_with_write_remote_local_hit() {
+        // Given a Combined/write:Remote wing route, and a drawer that exists
+        // locally, DeleteDrawer must delete locally — not forward to the remote.
+        let mock = Arc::new(DeleteDrawerMock {
+            delete_succeeds: true,
+            delete_call_count: AtomicU64::new(0),
+        });
+        let mock_for_assert = mock.clone();
+        let remotes = BTreeMap::from([(
+            "alpha".to_owned(),
+            mock as Arc<dyn mempalace_remote::RemoteApi>,
+        )]);
+        let mut ctx = make_delete_drawer_ctx(remotes, WriteTarget::Remote).await;
+
+        // Seed a drawer into the local store so it will be found locally.
+        let local_id = DrawerId::new("local-test-drawer-001").unwrap();
+        let now = OffsetDateTime::now_utc();
+        ctx.runtime
+            .storage
+            .drawer_store()
+            .put_drawers(
+                &[DrawerRecord {
+                    id: local_id.clone(),
+                    wing: WingId::new("wing_code").unwrap(),
+                    room: RoomId::new("test-room").unwrap(),
+                    hall: None,
+                    date: Some(now.date()),
+                    source_file: "test.txt".to_owned(),
+                    chunk_index: 0,
+                    ingest_mode: "test".to_owned(),
+                    extract_mode: None,
+                    added_by: "test".to_owned(),
+                    filed_at: now,
+                    importance: None,
+                    emotional_weight: None,
+                    weight: None,
+                    content: "test content".to_owned(),
+                    content_hash: mempalace_core::hash_text("test content"),
+                    embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
+                    locator: None,
+                }],
+                DuplicateStrategy::Error,
+            )
+            .await
+            .unwrap();
+
+        let result = ctx
+            .runtime
+            .tool_delete_drawer(&json!({"drawer_id": local_id.as_str()}))
+            .await
+            .unwrap();
+
+        assert_eq!(result["success"], true);
+        assert_eq!(result["drawer_id"], local_id.as_str());
+        assert_eq!(result["applied_to"], "local");
+        assert!(
+            !result.as_object().unwrap().contains_key("replication"),
+            "DeleteDrawer must never produce a replication field; got: {result}"
+        );
+        assert_eq!(
+            mock_for_assert.delete_call_count(),
+            0,
+            "write:Remote local hit must not call the remote"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_delete_drawer_with_write_both_local_hit() {
+        // Given a Combined/write:Both wing route, and a drawer that exists
+        // locally, DeleteDrawer must delete locally — no replication attempt.
+        let mock = Arc::new(DeleteDrawerMock {
+            delete_succeeds: true,
+            delete_call_count: AtomicU64::new(0),
+        });
+        let mock_for_assert = mock.clone();
+        let remotes = BTreeMap::from([(
+            "alpha".to_owned(),
+            mock as Arc<dyn mempalace_remote::RemoteApi>,
+        )]);
+        let mut ctx = make_delete_drawer_ctx(remotes, WriteTarget::Both).await;
+
+        let local_id = DrawerId::new("local-test-drawer-002").unwrap();
+        let now = OffsetDateTime::now_utc();
+        ctx.runtime
+            .storage
+            .drawer_store()
+            .put_drawers(
+                &[DrawerRecord {
+                    id: local_id.clone(),
+                    wing: WingId::new("wing_code").unwrap(),
+                    room: RoomId::new("test-room").unwrap(),
+                    hall: None,
+                    date: Some(now.date()),
+                    source_file: "test.txt".to_owned(),
+                    chunk_index: 0,
+                    ingest_mode: "test".to_owned(),
+                    extract_mode: None,
+                    added_by: "test".to_owned(),
+                    filed_at: now,
+                    importance: None,
+                    emotional_weight: None,
+                    weight: None,
+                    content: "test content".to_owned(),
+                    content_hash: mempalace_core::hash_text("test content"),
+                    embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
+                    locator: None,
+                }],
+                DuplicateStrategy::Error,
+            )
+            .await
+            .unwrap();
+
+        let result = ctx
+            .runtime
+            .tool_delete_drawer(&json!({"drawer_id": local_id.as_str()}))
+            .await
+            .unwrap();
+
+        assert_eq!(result["success"], true);
+        assert_eq!(result["drawer_id"], local_id.as_str());
+        assert_eq!(result["applied_to"], "local");
+        assert!(
+            !result.as_object().unwrap().contains_key("replication"),
+            "DeleteDrawer must never produce a replication field; got: {result}"
+        );
+        assert_eq!(
+            mock_for_assert.delete_call_count(),
+            0,
+            "write:Both local hit must not call the remote"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_delete_drawer_fallback_remote_ignores_routing() {
+        // Given a Combined/write:Both wing route, and a drawer that does NOT
+        // exist locally, DeleteDrawer must fall back across remotes. The response
+        // must report the remote origin and must NOT carry a replication field.
+        let mock = Arc::new(DeleteDrawerMock {
+            delete_succeeds: true,
+            delete_call_count: AtomicU64::new(0),
+        });
+        let mock_for_assert = mock.clone();
+        let remotes = BTreeMap::from([(
+            "alpha".to_owned(),
+            mock as Arc<dyn mempalace_remote::RemoteApi>,
+        )]);
+        let mut ctx = make_delete_drawer_ctx(remotes, WriteTarget::Both).await;
+
+        // Do NOT seed any drawer — local delete will return 0, triggering fallback.
+        let result = ctx
+            .runtime
+            .tool_delete_drawer(&json!({"drawer_id": "non-existent-drawer-999"}))
+            .await
+            .unwrap();
+
+        assert_eq!(result["success"], true);
+        assert_eq!(result["drawer_id"], "non-existent-drawer-999");
+        assert_eq!(result["origin"], "alpha");
+        assert_eq!(result["applied_to"], "remote:alpha");
+        assert!(
+            !result.as_object().unwrap().contains_key("replication"),
+            "DeleteDrawer must never produce a replication field; got: {result}"
+        );
+        assert_eq!(
+            mock_for_assert.delete_call_count(),
+            1,
+            "fallback must call the remote exactly once"
         );
     }
 

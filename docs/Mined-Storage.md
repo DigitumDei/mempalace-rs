@@ -168,7 +168,9 @@ The following files are never discovered regardless of extension:
 
 When a wing's federation route resolves to `mode: remote` (or `mode: combined`
 with `write: remote`), running `mine <dir>` routes to the remote palace instead
-of writing locally.
+of writing locally. When the route resolves to `mode: combined` with
+`write: both`, the mine runs locally first, then a best-effort remote push is
+attempted (see [Federation guide](Federation.md#write-both--local-first-dual-write-semantics)).
 
 ### Flow
 
@@ -186,9 +188,11 @@ of writing locally.
 5. Per-file results (`ingested`, `skipped_unchanged`, `failed`) are aggregated
    and printed in the same mine-summary format as a local run.
 
-If the remote is unreachable, the run fails with an explicit error. There is no
-silent fallback to local storage (matching the write semantics of other
-federated operations).
+If the remote is unreachable and the route is `remote` or `combined` with
+`write: remote`, the run fails with an explicit error. There is no silent
+fallback to local storage (matching the write semantics of other federated
+operations). For `write: both`, the local mine still succeeds and the remote
+failure is appended to the mine output without rolling back.
 
 If the current git branch differs from the repository's default branch, `mine`
 prints a warning line before sending. The run is not blocked.

@@ -3,10 +3,10 @@ use std::fmt;
 use std::sync::Arc;
 
 use mempalace_config::{
-    FederationRuntimeConfig, ResolvedRouteRule, RouteMode, WriteTarget, resolve_kg_route,
-    resolve_route, RouteQuery,
+    FederationRuntimeConfig, ReplicationStatus, ResolvedRouteRule, RouteMode, WriteTarget,
+    resolve_kg_route, resolve_route, RouteQuery,
 };
-use mempalace_core::{DIARY_ROOM, SHARED_AGENT_DIARY_WING};
+use mempalace_core::{hash_text, DIARY_ROOM, DIARY_TOPIC_PREFIX, SHARED_AGENT_DIARY_WING};
 use mempalace_federation::{
     AddDrawerRequest, ChangesQuery, DrawerSearchRequest, RemoteDrawerResult,
 };
@@ -121,6 +121,25 @@ impl FederationRouter {
 
     pub fn resolve_kg_route(&self) -> ResolvedRouteRule {
         resolve_kg_route(&self.rules)
+    }
+
+    /// Returns `true` when the resolved route indicates a dual-write
+    /// (`write: both` — local write + best-effort remote replication).
+    pub fn is_dual_write(&self, route: &ResolvedRouteRule) -> bool {
+        route.mode == RouteMode::Combined && route.write == WriteTarget::Both
+    }
+
+    /// Resolves the effective write intent from a route rule.
+    ///
+    /// - `Local` mode or `Combined + write:local` → `WriteTarget::Local`
+    /// - `Remote` mode or `Combined + write:remote` → `WriteTarget::Remote`
+    /// - `Combined + write:both` → `WriteTarget::Both`
+    pub fn resolve_write_target(&self, route: &ResolvedRouteRule) -> WriteTarget {
+        match route.mode {
+            RouteMode::Local => WriteTarget::Local,
+            RouteMode::Remote => WriteTarget::Remote,
+            RouteMode::Combined => route.write,
+        }
     }
 
     fn remote_for_rule(&self, rule: &ResolvedRouteRule) -> Option<&Arc<dyn RemoteApi>> {
@@ -301,8 +320,20 @@ impl FederationRouter {
 
     // ─── Add drawer ──────────────────────────────────────────────────────────────
 
-    /// Route an add-drawer operation. Returns `None` when the caller should
-    /// execute locally; `Some(remote_result)` when routed to a remote.
+    /// Route an add-drawer operation to a remote server.
+    ///
+    /// Returns `Some(remote_result)` when the write is routed to a remote;
+    /// `None` when the caller should execute locally.
+    ///
+    /// - `Local` → returns `Ok(None)`
+    /// - `Remote` → sends the add to the configured remote
+    /// - `Combined + write:remote` → sends the add to the configured remote
+    /// - `Combined + write:both` → returns `None` (defensive; callers should skip)
+    ///
+    /// **Diary guard:** Diary-shaped drawers (`wing == SHARED_AGENT_DIARY_WING`,
+    /// `room == DIARY_ROOM`, or `source_file` starting with
+    /// `DIARY_TOPIC_PREFIX`) are never written remotely — returns `Ok(None)`
+    /// immediately.
     ///
     /// Pre-add duplicate check is performed before posting the add request; if
     /// the duplicate check itself fails (transport error) a warning is emitted
@@ -317,15 +348,25 @@ impl FederationRouter {
         route: &ResolvedRouteRule,
         duplicate_threshold: f32,
     ) -> ToolResult<Option<Value>> {
+        // ── Diary guard: diary-shaped drawers never write remotely ──────────
+        if wing == SHARED_AGENT_DIARY_WING
+            || room == DIARY_ROOM
+            || source_file.starts_with(DIARY_TOPIC_PREFIX)
+        {
+            return Ok(None);
+        }
+
+        // ── Resolve the target remote for remote-only writes ───────────────
+        // Dual-write (Both) routes are handled by add_drawer_replicate and
+        // should not reach this method. We keep Both as a defensive arm.
         let target_remote = match route.mode {
             RouteMode::Local => None,
             RouteMode::Remote => route.remote.as_deref(),
-            RouteMode::Combined => {
-                if route.write == WriteTarget::Remote {
-                    route.remote.as_deref()
-                } else {
-                    None
-                }
+            RouteMode::Combined => match route.write {
+                WriteTarget::Local => None,
+                WriteTarget::Remote => route.remote.as_deref(),
+                // Defensive: caller should have filtered Both via is_dual_write.
+                WriteTarget::Both => None,
             }
         };
         let Some(remote_name) = target_remote else {
@@ -343,7 +384,6 @@ impl FederationRouter {
         match api.check_duplicate(pre_check_req).await {
             Ok(resp) if resp.is_duplicate => {
                 let mut matches = resp.matches.as_array().cloned().unwrap_or_default();
-                // Annotate each match with origin.
                 for m in &mut matches {
                     if let Some(obj) = m.as_object_mut() {
                         obj.insert("origin".to_owned(), json!(remote_name));
@@ -353,18 +393,18 @@ impl FederationRouter {
                     "success": false,
                     "reason": "duplicate",
                     "matches": matches,
+                    "origin": remote_name,
+                    "applied_to": format_remote_origin(remote_name),
                 })));
             }
-            Ok(_) => {
-                // Not a duplicate — proceed with add.
-            }
+            Ok(_) => {}
             Err(e) => {
                 tracing::warn!(
                     remote = %remote_name,
                     "pre-add duplicate check failed (proceeding with add): {e}"
                 );
             }
-        }
+        };
 
         let req = AddDrawerRequest {
             wing: wing.to_owned(),
@@ -383,6 +423,7 @@ impl FederationRouter {
                         "wing": resp.wing,
                         "room": resp.room,
                         "origin": remote_name,
+                        "applied_to": format_remote_origin(remote_name),
                     })))
                 } else {
                     // Defensive: server indicated failure on 2xx (shouldn't happen in v1).
@@ -390,6 +431,7 @@ impl FederationRouter {
                         "success": false,
                         "reason": "rejected",
                         "origin": remote_name,
+                        "applied_to": format_remote_origin(remote_name),
                     })))
                 }
             }
@@ -400,11 +442,164 @@ impl FederationRouter {
                     "reason": "duplicate",
                     "matches": [],
                     "origin": remote_name,
+                    "applied_to": format_remote_origin(remote_name),
                 })))
             }
-            Err(e) => Err(ToolError::Internal(McpError::Federation(format!(
-                "remote `{remote_name}` add_drawer failed: {e}"
-            )))),
+            Err(e) => {
+                Err(ToolError::Internal(McpError::Federation(format!(
+                    "remote `{remote_name}` add_drawer failed: {e}"
+                ))))
+            }
+        }
+    }
+
+    /// Best-effort remote replication for [`WriteTarget::Both`] after the
+    /// local write has already completed.  Attempts a pre-add duplicate check
+    /// first; if it hits a duplicate or transport failure, logs a warning and
+    /// returns [`ReplicationStatus::Failed`].  On success returns
+    /// [`ReplicationStatus::Replicated`].  Never blocks the caller from the
+    /// local write path.
+    ///
+    /// **Diary guard:** Diary-shaped drawers (`wing == SHARED_AGENT_DIARY_WING`,
+    /// `room == DIARY_ROOM`, or `source_file` starting with
+    /// `DIARY_TOPIC_PREFIX`) are never replicated remotely — returns
+    /// [`ReplicationStatus::Skipped`] immediately.
+    pub async fn add_drawer_replicate(
+        &self,
+        wing: &str,
+        room: &str,
+        content: &str,
+        source_file: &str,
+        added_by: &str,
+        route: &ResolvedRouteRule,
+        duplicate_threshold: f32,
+    ) -> ReplicationStatus {
+        // ── Diary guard: diary-shaped drawers never replicate ──────────────
+        if wing == SHARED_AGENT_DIARY_WING
+            || room == DIARY_ROOM
+            || source_file.starts_with(DIARY_TOPIC_PREFIX)
+        {
+            return ReplicationStatus::Skipped;
+        }
+
+        let remote_name = match &route.write {
+            WriteTarget::Both => route.remote.as_deref(),
+            _ => return ReplicationStatus::Skipped,
+        };
+        let Some(remote_name) = remote_name else {
+            return ReplicationStatus::Failed {
+                remote: "(none)".to_owned(),
+                reason: "write:both route has no remote configured".to_owned(),
+            };
+        };
+        let Some(api) = self.remotes.get(remote_name) else {
+            return ReplicationStatus::Failed {
+                remote: remote_name.to_owned(),
+                reason: "no client available for remote".to_owned(),
+            };
+        };
+
+        // ── Pre-add duplicate check (best-effort) ─────────────────────────
+        let pre_check_req = mempalace_federation::CheckDuplicateRequest {
+            content: content.to_owned(),
+            threshold: Some(duplicate_threshold),
+        };
+        match api.check_duplicate(pre_check_req).await {
+            Ok(resp) if resp.is_duplicate => {
+                let content_hash = hash_text(content);
+                let is_exact_match = resp.matches.as_array().map_or(false, |arr| {
+                    arr.iter().any(|m| {
+                        m.get("content_hash")
+                            .and_then(|v| v.as_str())
+                            .map_or(false, |h| h == content_hash)
+                    })
+                });
+
+                if is_exact_match {
+                    tracing::info!(
+                        remote = %remote_name,
+                        wing = %wing,
+                        room = %room,
+                        "add_drawer replicate: exact content already exists remotely; converged"
+                    );
+                    return ReplicationStatus::Converged { remote: remote_name.to_owned() };
+                }
+
+                tracing::warn!(
+                    remote = %remote_name,
+                    wing = %wing,
+                    room = %room,
+                    "add_drawer replicate: duplicate exists remotely; skipping add"
+                );
+                return ReplicationStatus::Failed {
+                    remote: remote_name.to_owned(),
+                    reason: "duplicate exists on remote".to_owned(),
+                };
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    remote = %remote_name,
+                    "add_drawer replicate: pre-check failed: {e}"
+                );
+                return ReplicationStatus::Failed {
+                    remote: remote_name.to_owned(),
+                    reason: format!("pre-check failed: {e}"),
+                };
+            }
+        };
+
+        let req = AddDrawerRequest {
+            wing: wing.to_owned(),
+            room: room.to_owned(),
+            content: content.to_owned(),
+            source_file: if source_file.is_empty() { None } else { Some(source_file.to_owned()) },
+            added_by: Some(added_by.to_owned()),
+        };
+        match api.add_drawer(req).await {
+            Ok(resp) if resp.success => {
+                tracing::info!(
+                    remote = %remote_name,
+                    wing = %wing,
+                    room = %room,
+                    "add_drawer replicate: remote write succeeded"
+                );
+                ReplicationStatus::Replicated { remote: remote_name.to_owned() }
+            }
+            Ok(_) => {
+                tracing::warn!(
+                    remote = %remote_name,
+                    wing = %wing,
+                    room = %room,
+                    "add_drawer replicate: remote rejected the write"
+                );
+                ReplicationStatus::Failed {
+                    remote: remote_name.to_owned(),
+                    reason: "remote rejected the write".to_owned(),
+                }
+            }
+            Err(RemoteError::RemoteRejected { status: 409, .. }) => {
+                tracing::warn!(
+                    remote = %remote_name,
+                    wing = %wing,
+                    room = %room,
+                    "add_drawer replicate: remote duplicate (409)"
+                );
+                ReplicationStatus::Failed {
+                    remote: remote_name.to_owned(),
+                    reason: "duplicate (409) on remote".to_owned(),
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    remote = %remote_name,
+                    "add_drawer replicate: transport failure: {e}"
+                );
+                ReplicationStatus::Failed {
+                    remote: remote_name.to_owned(),
+                    reason: format!("transport failure: {e}"),
+                }
+            }
         }
     }
 
@@ -475,6 +670,7 @@ impl FederationRouter {
                         "success": true,
                         "drawer_id": drawer_id,
                         "origin": name,
+                        "applied_to": format_remote_origin(name),
                     })));
                 }
                 Err(e) if e.is_degradable() => continue,
@@ -839,15 +1035,17 @@ impl FederationRouter {
         valid_from: Option<&str>,
         route: &ResolvedRouteRule,
     ) -> ToolResult<Option<Value>> {
+        // ── Resolve the target remote for remote-only writes ───────────────
+        // Dual-write (Both) routes are handled by kg_add_replicate and
+        // should not reach this method. We keep Both as a defensive arm.
         let target_remote = match route.mode {
             RouteMode::Local => None,
             RouteMode::Remote => route.remote.as_deref(),
-            RouteMode::Combined => {
-                if route.write == WriteTarget::Remote {
-                    route.remote.as_deref()
-                } else {
-                    None
-                }
+            RouteMode::Combined => match route.write {
+                WriteTarget::Local => None,
+                WriteTarget::Remote => route.remote.as_deref(),
+                // Defensive: caller should have filtered Both via is_dual_write.
+                WriteTarget::Both => None,
             }
         };
         let Some(remote_name) = target_remote else {
@@ -869,9 +1067,70 @@ impl FederationRouter {
                 }
                 Ok(Some(resp))
             }
-            Err(e) => Err(ToolError::Internal(McpError::Federation(format!(
-                "remote `{remote_name}` kg_add_fact failed: {e}"
-            )))),
+            Err(e) => {
+                Err(ToolError::Internal(McpError::Federation(format!(
+                    "remote `{remote_name}` kg_add_fact failed: {e}"
+                ))))
+            }
+        }
+    }
+
+    /// Best-effort remote KG fact replication for [`WriteTarget::Both`] after
+    /// the local KG write has already completed.
+    pub async fn kg_add_replicate(
+        &self,
+        subject: &str,
+        predicate: &str,
+        object: &str,
+        valid_from: Option<&str>,
+        route: &ResolvedRouteRule,
+    ) -> ReplicationStatus {
+        let remote_name = match &route.write {
+            WriteTarget::Both => route.remote.as_deref(),
+            _ => return ReplicationStatus::Skipped,
+        };
+        let Some(remote_name) = remote_name else {
+            return ReplicationStatus::Failed {
+                remote: "(none)".to_owned(),
+                reason: "write:both route has no remote configured".to_owned(),
+            };
+        };
+        let Some(api) = self.remotes.get(remote_name) else {
+            return ReplicationStatus::Failed {
+                remote: remote_name.to_owned(),
+                reason: "no client available for remote".to_owned(),
+            };
+        };
+        let req = mempalace_federation::KgAddFactRequest {
+            subject: subject.to_owned(),
+            predicate: predicate.to_owned(),
+            object: object.to_owned(),
+            valid_from: valid_from.map(|s| s.to_owned()),
+        };
+        match api.kg_add_fact(req).await {
+            Ok(_) => {
+                tracing::info!(
+                    remote = %remote_name,
+                    subject = %subject,
+                    predicate = %predicate,
+                    object = %object,
+                    "kg_add replicate: remote write succeeded"
+                );
+                ReplicationStatus::Replicated { remote: remote_name.to_owned() }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    remote = %remote_name,
+                    subject = %subject,
+                    predicate = %predicate,
+                    object = %object,
+                    "kg_add replicate: remote failed: {e}"
+                );
+                ReplicationStatus::Failed {
+                    remote: remote_name.to_owned(),
+                    reason: format!("{e}"),
+                }
+            }
         }
     }
 
@@ -883,15 +1142,17 @@ impl FederationRouter {
         ended: Option<&str>,
         route: &ResolvedRouteRule,
     ) -> ToolResult<Option<Value>> {
+        // ── Resolve the target remote for remote-only writes ───────────────
+        // Dual-write (Both) routes are handled by kg_invalidate_replicate and
+        // should not reach this method. We keep Both as a defensive arm.
         let target_remote = match route.mode {
             RouteMode::Local => None,
             RouteMode::Remote => route.remote.as_deref(),
-            RouteMode::Combined => {
-                if route.write == WriteTarget::Remote {
-                    route.remote.as_deref()
-                } else {
-                    None
-                }
+            RouteMode::Combined => match route.write {
+                WriteTarget::Local => None,
+                WriteTarget::Remote => route.remote.as_deref(),
+                // Defensive: caller should have filtered Both via is_dual_write.
+                WriteTarget::Both => None,
             }
         };
         let Some(remote_name) = target_remote else {
@@ -913,9 +1174,70 @@ impl FederationRouter {
                 }
                 Ok(Some(resp))
             }
-            Err(e) => Err(ToolError::Internal(McpError::Federation(format!(
-                "remote `{remote_name}` kg_invalidate failed: {e}"
-            )))),
+            Err(e) => {
+                Err(ToolError::Internal(McpError::Federation(format!(
+                    "remote `{remote_name}` kg_invalidate failed: {e}"
+                ))))
+            }
+        }
+    }
+
+    /// Best-effort remote KG invalidation replication for [`WriteTarget::Both`]
+    /// after the local KG invalidation has already completed.
+    pub async fn kg_invalidate_replicate(
+        &self,
+        subject: &str,
+        predicate: &str,
+        object: &str,
+        ended: Option<&str>,
+        route: &ResolvedRouteRule,
+    ) -> ReplicationStatus {
+        let remote_name = match &route.write {
+            WriteTarget::Both => route.remote.as_deref(),
+            _ => return ReplicationStatus::Skipped,
+        };
+        let Some(remote_name) = remote_name else {
+            return ReplicationStatus::Failed {
+                remote: "(none)".to_owned(),
+                reason: "write:both route has no remote configured".to_owned(),
+            };
+        };
+        let Some(api) = self.remotes.get(remote_name) else {
+            return ReplicationStatus::Failed {
+                remote: remote_name.to_owned(),
+                reason: "no client available for remote".to_owned(),
+            };
+        };
+        let req = mempalace_federation::KgInvalidateRequest {
+            subject: subject.to_owned(),
+            predicate: predicate.to_owned(),
+            object: object.to_owned(),
+            ended: ended.map(|s| s.to_owned()),
+        };
+        match api.kg_invalidate(req).await {
+            Ok(_) => {
+                tracing::info!(
+                    remote = %remote_name,
+                    subject = %subject,
+                    predicate = %predicate,
+                    object = %object,
+                    "kg_invalidate replicate: remote write succeeded"
+                );
+                ReplicationStatus::Replicated { remote: remote_name.to_owned() }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    remote = %remote_name,
+                    subject = %subject,
+                    predicate = %predicate,
+                    object = %object,
+                    "kg_invalidate replicate: remote failed: {e}"
+                );
+                ReplicationStatus::Failed {
+                    remote: remote_name.to_owned(),
+                    reason: format!("{e}"),
+                }
+            }
         }
     }
 
@@ -1786,6 +2108,240 @@ mod tests {
         }
     }
 
+    fn make_both_route(remote_name: &str) -> ResolvedRouteRule {
+        ResolvedRouteRule {
+            mode: RouteMode::Combined,
+            remote: Some(remote_name.to_owned()),
+            write: WriteTarget::Both,
+        }
+    }
+
+    // ── add_drawer_replicate tests ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn e2e_add_drawer_remote_skips_work_for_both() {
+        let mock = MockRemote::default();
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+
+        let route = make_both_route("alpha");
+        let result = router
+            .add_drawer_remote("w", "r", "content", "file.txt", "agent", &route, 0.9)
+            .await
+            .unwrap();
+
+        assert!(result.is_none(), "Both route should not produce remote result from add_drawer_remote");
+    }
+
+    #[tokio::test]
+    async fn e2e_add_drawer_replicate_succeeds() {
+        let mock = MockRemote::default();
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+
+        let route = make_both_route("alpha");
+        let status = router
+            .add_drawer_replicate("w", "r", "content", "file.txt", "agent", &route, 0.9)
+            .await;
+
+        assert_eq!(status, ReplicationStatus::Replicated { remote: "alpha".to_owned() });
+    }
+
+    #[tokio::test]
+    async fn e2e_add_drawer_replicate_duplicate_remote() {
+        let mut mock = MockRemote::default();
+        mock.duplicate_matches = vec![json!({"drawer_id":"dup-1","similarity":0.95})];
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+
+        let route = make_both_route("alpha");
+        let status = router
+            .add_drawer_replicate("w", "r", "content", "file.txt", "agent", &route, 0.9)
+            .await;
+
+        match status {
+            ReplicationStatus::Failed { remote, .. } => {
+                assert_eq!(remote, "alpha");
+            }
+            other => panic!("expected Failed (similarity-only), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn e2e_add_drawer_replicate_converged_exact_match() {
+        let content = "exact match content";
+        let content_hash = hash_text(content);
+        let mut mock = MockRemote::default();
+        mock.duplicate_matches = vec![json!({
+            "drawer_id": "exact-1",
+            "similarity": 1.0,
+            "content_hash": content_hash,
+        })];
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+
+        let route = make_both_route("alpha");
+        let status = router
+            .add_drawer_replicate("w", "r", content, "file.txt", "agent", &route, 0.9)
+            .await;
+
+        assert_eq!(status, ReplicationStatus::Converged { remote: "alpha".to_owned() });
+    }
+
+    #[tokio::test]
+    async fn e2e_add_drawer_replicate_remote_failure() {
+        let mut mock = MockRemote::default();
+        mock.fail_on = Some("add_drawer".to_owned());
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+
+        let route = make_both_route("alpha");
+        let status = router
+            .add_drawer_replicate("w", "r", "content", "file.txt", "agent", &route, 0.9)
+            .await;
+
+        match status {
+            ReplicationStatus::Failed { remote, .. } => {
+                assert_eq!(remote, "alpha");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn e2e_add_drawer_replicate_409_race() {
+        let mut mock = MockRemote::default();
+        mock.duplicate_matches = vec![]; // pre-check passes (no duplicate detected)
+        mock.add_drawer_409 = true;      // but the actual add_drawer gets a 409
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+
+        let route = make_both_route("alpha");
+        let status = router
+            .add_drawer_replicate("w", "r", "content", "file.txt", "agent", &route, 0.9)
+            .await;
+
+        match status {
+            ReplicationStatus::Failed { remote, reason } => {
+                assert_eq!(remote, "alpha");
+                assert_eq!(reason, "duplicate (409) on remote");
+            }
+            other => panic!("expected Failed (409 race), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn e2e_add_drawer_replicate_skipped_for_non_both() {
+        let mock = MockRemote::default();
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+
+        let route = make_combined_route("alpha"); // write:remote
+        let status = router
+            .add_drawer_replicate("w", "r", "content", "file.txt", "agent", &route, 0.9)
+            .await;
+
+        assert_eq!(status, ReplicationStatus::Skipped);
+    }
+
+    #[tokio::test]
+    async fn e2e_add_drawer_replicate_skipped_for_diary_wing() {
+        let mock = MockRemote::default();
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+
+        let route = make_both_route("alpha");
+        let status = router
+            .add_drawer_replicate(
+                SHARED_AGENT_DIARY_WING, "r", "diary content", "diary:general", "agent",
+                &route, 0.9,
+            )
+            .await;
+
+        assert_eq!(
+            status,
+            ReplicationStatus::Skipped,
+            "diary wing should not replicate"
+        );
+    }
+
+    #[tokio::test]
+    async fn e2e_add_drawer_replicate_skipped_for_diary_room() {
+        let mock = MockRemote::default();
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+
+        let route = make_both_route("alpha");
+        let status = router
+            .add_drawer_replicate(
+                "wing_code", DIARY_ROOM, "diary content", "diary:general", "agent",
+                &route, 0.9,
+            )
+            .await;
+
+        assert_eq!(
+            status,
+            ReplicationStatus::Skipped,
+            "diary room should not replicate"
+        );
+    }
+
+    #[tokio::test]
+    async fn e2e_add_drawer_replicate_skipped_for_diary_source_file() {
+        let mock = MockRemote::default();
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+
+        let route = make_both_route("alpha");
+        let status = router
+            .add_drawer_replicate(
+                "wing_code", "room", "diary content", "diary:standup", "agent",
+                &route, 0.9,
+            )
+            .await;
+
+        assert_eq!(
+            status,
+            ReplicationStatus::Skipped,
+            "diary source_file should not replicate"
+        );
+    }
+
+    #[tokio::test]
+    async fn e2e_add_drawer_replicate_succeeds_with_real_route_via_write_intent() {
+        let mock = MockRemote::default();
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+
+        // Verify that is_dual_write correctly identifies both routes.
+        let both_route = make_both_route("alpha");
+        assert!(router.is_dual_write(&both_route));
+
+        // Verify resolve_write_target returns the expected variants.
+        let remote_route = make_combined_route("alpha");
+        assert_eq!(router.resolve_write_target(&remote_route), WriteTarget::Remote);
+
+        let local_route = ResolvedRouteRule {
+            mode: RouteMode::Local,
+            remote: None,
+            write: WriteTarget::Local,
+        };
+        assert_eq!(router.resolve_write_target(&local_route), WriteTarget::Local);
+
+        assert_eq!(router.resolve_write_target(&both_route), WriteTarget::Both);
+    }
+
     #[tokio::test]
     async fn e2e_search_merges_and_annotates_origin() {
         let mut mock = MockRemote::default();
@@ -1844,6 +2400,7 @@ mod tests {
 
         assert_eq!(result["success"], true);
         assert_eq!(result["origin"], "alpha");
+        assert_eq!(result["applied_to"], "remote:alpha");
         assert_eq!(result["drawer_id"], "rem-drawer-1");
     }
 
@@ -1864,6 +2421,8 @@ mod tests {
 
         assert_eq!(result["success"], false);
         assert_eq!(result["reason"], "duplicate");
+        assert_eq!(result["origin"], "alpha");
+        assert_eq!(result["applied_to"], "remote:alpha");
         let matches = result["matches"].as_array().unwrap();
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0]["origin"], "alpha");
@@ -1886,9 +2445,10 @@ mod tests {
 
         assert_eq!(result["success"], false);
         assert_eq!(result["reason"], "duplicate");
+        assert_eq!(result["origin"], "alpha");
+        assert_eq!(result["applied_to"], "remote:alpha");
         let matches = result["matches"].as_array().unwrap();
         assert_eq!(matches.len(), 0);
-        assert_eq!(result["origin"], "alpha");
     }
 
     #[tokio::test]
@@ -1909,6 +2469,72 @@ mod tests {
             .unwrap();
 
         assert!(result.is_none(), "local route should not produce remote result");
+    }
+
+    #[tokio::test]
+    async fn e2e_add_drawer_remote_skipped_for_diary_wing() {
+        let mock = MockRemote::default();
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+
+        let route = make_combined_route("alpha");
+        let result = router
+            .add_drawer_remote(
+                SHARED_AGENT_DIARY_WING, "r", "content", "file.txt", "agent",
+                &route, 0.9,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            result.is_none(),
+            "diary wing should not write remotely"
+        );
+    }
+
+    #[tokio::test]
+    async fn e2e_add_drawer_remote_skipped_for_diary_room() {
+        let mock = MockRemote::default();
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+
+        let route = make_combined_route("alpha");
+        let result = router
+            .add_drawer_remote(
+                "wing_code", DIARY_ROOM, "content", "file.txt", "agent",
+                &route, 0.9,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            result.is_none(),
+            "diary room should not write remotely"
+        );
+    }
+
+    #[tokio::test]
+    async fn e2e_add_drawer_remote_skipped_for_diary_source_file() {
+        let mock = MockRemote::default();
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+
+        let route = make_combined_route("alpha");
+        let result = router
+            .add_drawer_remote(
+                "wing_code", "room", "content", "diary:standup", "agent",
+                &route, 0.9,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            result.is_none(),
+            "diary source_file should not write remotely"
+        );
     }
 
     #[tokio::test]
@@ -1943,6 +2569,7 @@ mod tests {
         assert_eq!(result["success"], true);
         assert_eq!(result["drawer_id"], "drawer-1");
         assert_eq!(result["origin"], "bbb");
+        assert_eq!(result["applied_to"], "remote:bbb");
     }
 
     #[tokio::test]
@@ -1957,6 +2584,7 @@ mod tests {
         assert_eq!(result["success"], true);
         assert_eq!(result["drawer_id"], "drawer-1");
         assert_eq!(result["origin"], "alpha");
+        assert_eq!(result["applied_to"], "remote:alpha");
     }
 
     #[tokio::test]
@@ -1964,6 +2592,35 @@ mod tests {
         let router = FederationRouter::new(FederationRuntimeConfig::default());
         let result = router.delete_drawer_remote("drawer-1").await.unwrap();
         assert!(result.is_none());
+    }
+
+    // ── DeleteDrawer route-matrix: verify exclusion from write routing ──────
+    //
+    // These tests are deliberately in federation.rs (the low-level module) and
+    // verify that `delete_drawer_remote` — the method called by
+    // `tool_delete_drawer` as a fallback — ignores routing rules and tries all
+    // remotes.  The full local-first + fallback path is covered in lib.rs tests
+    // via `tool_delete_drawer` directly.
+
+    #[tokio::test]
+    async fn e2e_delete_drawer_remote_ignores_routing() {
+        // Configure a Combined/write:Both route.  delete_drawer_remote must
+        // still try remotes by its own logic (iterate all in order) rather than
+        // delegating to a replicate path.  This test proves the low-level
+        // function is agnostic to routing.
+        let mock = MockRemote::default();
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let mut router = make_router(remotes);
+        router.rules.wings.insert("wing_code".to_owned(), ResolvedRouteRule {
+            mode: RouteMode::Combined,
+            remote: Some("alpha".to_owned()),
+            write: WriteTarget::Both,
+        });
+
+        let result = router.delete_drawer_remote("drawer-1").await.unwrap().unwrap();
+        assert_eq!(result["success"], true);
+        assert_eq!(result["origin"], "alpha");
     }
 
     #[tokio::test]
@@ -2164,6 +2821,142 @@ mod tests {
         };
         let result = router.kg_invalidate_remote("A", "loves", "B", None, &route).await.unwrap().unwrap();
         assert_eq!(result["applied_to"], "remote:alpha");
+    }
+
+    // ── KG replicate tests ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn e2e_kg_add_remote_skips_work_for_both() {
+        let mock = MockRemote::default();
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+
+        let route = make_both_route("alpha");
+        let result = router
+            .kg_add_remote("A", "loves", "B", None, &route)
+            .await
+            .unwrap();
+
+        assert!(result.is_none(), "Both route should not produce remote result from kg_add_remote");
+    }
+
+    #[tokio::test]
+    async fn e2e_kg_add_replicate_succeeds() {
+        let mock = MockRemote::default();
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+
+        let route = make_both_route("alpha");
+        let status = router
+            .kg_add_replicate("A", "loves", "B", None, &route)
+            .await;
+
+        assert_eq!(status, ReplicationStatus::Replicated { remote: "alpha".to_owned() });
+    }
+
+    #[tokio::test]
+    async fn e2e_kg_add_replicate_remote_failure() {
+        let mut mock = MockRemote::default();
+        mock.fail_on = Some("kg_add".to_owned());
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+
+        let route = make_both_route("alpha");
+        let status = router
+            .kg_add_replicate("A", "loves", "B", None, &route)
+            .await;
+
+        match status {
+            ReplicationStatus::Failed { remote, .. } => {
+                assert_eq!(remote, "alpha");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn e2e_kg_add_replicate_skipped_for_non_both() {
+        let mock = MockRemote::default();
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+
+        let route = make_combined_route("alpha");
+        let status = router
+            .kg_add_replicate("A", "loves", "B", None, &route)
+            .await;
+
+        assert_eq!(status, ReplicationStatus::Skipped);
+    }
+
+    #[tokio::test]
+    async fn e2e_kg_invalidate_remote_skips_work_for_both() {
+        let mock = MockRemote::default();
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+
+        let route = make_both_route("alpha");
+        let result = router
+            .kg_invalidate_remote("A", "loves", "B", None, &route)
+            .await
+            .unwrap();
+
+        assert!(result.is_none(), "Both route should not produce remote result from kg_invalidate_remote");
+    }
+
+    #[tokio::test]
+    async fn e2e_kg_invalidate_replicate_succeeds() {
+        let mock = MockRemote::default();
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+
+        let route = make_both_route("alpha");
+        let status = router
+            .kg_invalidate_replicate("A", "loves", "B", None, &route)
+            .await;
+
+        assert_eq!(status, ReplicationStatus::Replicated { remote: "alpha".to_owned() });
+    }
+
+    #[tokio::test]
+    async fn e2e_kg_invalidate_replicate_remote_failure() {
+        let mut mock = MockRemote::default();
+        mock.fail_on = Some("kg_invalidate".to_owned());
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+
+        let route = make_both_route("alpha");
+        let status = router
+            .kg_invalidate_replicate("A", "loves", "B", None, &route)
+            .await;
+
+        match status {
+            ReplicationStatus::Failed { remote, .. } => {
+                assert_eq!(remote, "alpha");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn e2e_kg_invalidate_replicate_skipped_for_non_both() {
+        let mock = MockRemote::default();
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+
+        let route = make_combined_route("alpha");
+        let status = router
+            .kg_invalidate_replicate("A", "loves", "B", None, &route)
+            .await;
+
+        assert_eq!(status, ReplicationStatus::Skipped);
     }
 
     #[tokio::test]

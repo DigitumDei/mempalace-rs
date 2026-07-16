@@ -23,6 +23,7 @@ use mempalace_core::EmbeddingProfile;
 use mempalace_mcp::{DeterministicStubProvider, JsonRpcRequest, McpServer, decode_tool_payload};
 use mempalace_server::{TokenRegistry, build_router};
 use serde_json::{Value, json};
+use mempalace_remote::{RemoteApi, RemoteClient, RemoteEndpoint};
 use tempfile::TempDir;
 
 // ─── Test token ───────────────────────────────────────────────────────────────
@@ -2087,7 +2088,7 @@ async fn add_drawer_both_retry_reuses_local_drawer_and_replicates() {
         "hub".to_owned(),
         ResolvedRemote {
             name: "hub".to_owned(),
-            url: hub_url,
+            url: hub_url.clone(),
             token: Some(TEST_TOKEN.to_owned()),
             timeout: Duration::from_secs(5),
         },
@@ -2164,32 +2165,51 @@ async fn add_drawer_both_retry_reuses_local_drawer_and_replicates() {
         "retry must not have warnings on success; got: {retry}"
     );
 
-    // ── Verify the drawer landed on the hub via search ─────────────────────
-    let search = call_tool(
-        &server_b,
-        2,
-        "mempalace_search",
-        json!({
-            "query": "dual-write retry regression test content unique xyzzy",
-            "wing": wing,
-            "limit": 5,
-        }),
-    )
-    .await;
-    let results = search["results"].as_array().expect("search results must be array");
-    let hub_hit = results.iter().any(|r| r["origin"].as_str() == Some("hub"));
-    assert!(
-        hub_hit,
-        "search must include a hub-origin result (replication landed); results: {results:?}"
-    );
-
-    // ── Verify no duplicate local drawer ──────────────────────────────────
-    let status = call_tool(&server_b, 3, "mempalace_list_wings", json!({})).await;
-    let wings = status["wings"].as_object().expect("wings must be an object");
-    let local_count = wings.get(wing).and_then(|v| v.as_u64()).unwrap_or(0);
+    // ── Verify local drawer count via a local-only server ──────────────────
+    drop(server_b);
+    let local_only_config = MempalaceConfig {
+        schema_version: 1,
+        collection_name: "mempalace_drawers".to_owned(),
+        palace_path: local_dir.path().join("palace"),
+        embedding_profile: EmbeddingProfile::Balanced,
+        low_cpu: LowCpuRuntimeConfig::defaults_for_profile(EmbeddingProfile::Balanced),
+        server: ServerRuntimeConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            token_file: local_dir.path().join("local_only_tokens.json"),
+            checkouts: std::collections::BTreeMap::new(),
+        },
+        federation: FederationRuntimeConfig::default(),
+    };
+    let local_only_server =
+        McpServer::from_parts(local_only_config, DeterministicStubProvider::new(EmbeddingProfile::Balanced))
+            .await
+            .unwrap();
+    let local_status = call_tool(&local_only_server, 1, "mempalace_list_wings", json!({})).await;
+    drop(local_only_server);
+    let local_wings = local_status["wings"].as_object().expect("wings must be an object");
+    let local_count = local_wings.get(wing).and_then(|v| v.as_u64()).unwrap_or(0);
     assert_eq!(
         local_count, 1,
-        "must have exactly 1 local drawer in {wing} after retry; got {local_count}; wings: {wings:?}"
+        "must have exactly 1 local drawer in {wing} after retry; got {local_count}; wings: {local_wings:?}"
+    );
+
+    // ── Verify the drawer landed on the hub via direct hub API ─────────────
+    let hub_client = RemoteClient::new(RemoteEndpoint {
+        name: "hub".into(),
+        base_url: hub_url,
+        token: Some(TEST_TOKEN.to_owned()),
+        timeout: Duration::from_secs(5),
+    })
+    .unwrap();
+    let hub_wings = hub_client.wings().await.expect("hub wings query must succeed");
+    let hub_wing_count = hub_wings["wings"]
+        .as_object()
+        .and_then(|w| w.get(wing))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    assert_eq!(
+        hub_wing_count, 1,
+        "hub must have exactly 1 drawer in {wing}; got {hub_wing_count}; wings: {hub_wings:?}"
     );
 }
 

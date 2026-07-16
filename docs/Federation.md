@@ -274,6 +274,15 @@ This applies to all federated write paths:
   attempted. The remote result is appended to the mine output; a remote failure
   is reported without rolling back the local mine.
 
+> **DeleteDrawer is excluded from write routing.** `mempalace_delete_drawer` does
+> not use `write` target resolution. It always deletes by drawer ID in the local
+> palace first. If the drawer is not found locally, it falls back by attempting
+> deletion on ALL configured remotes (in deterministic name order), regardless of
+> wing routing. This is because dual-written drawers have independent IDs on each
+> side with no durable cross-palace ID mapping — routing cannot select the
+> "correct" remote by wing. The response reports `applied_to: "local"` or
+> `"remote:<name>"` and never carries a `replication` field.
+
 ## Part 3 — Federated mining
 
 Mining a project whose wing routes to a remote (`mode: remote`, or `mode: combined`

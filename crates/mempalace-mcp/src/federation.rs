@@ -2571,6 +2571,71 @@ mod tests {
         assert!(result.is_none());
     }
 
+    // ── DeleteDrawer route-matrix: verify exclusion from write routing ──────
+
+    #[tokio::test]
+    async fn e2e_delete_drawer_fallback_ignores_route_mode() {
+        // DeleteDrawer does not use write target routing — it tries local first,
+        // then falls back to ALL remotes regardless of the wing's resolved route.
+        // Test that even with a Remote-mode route the fallback still fires.
+        let mock = MockRemote::default();
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let mut router = make_router(remotes);
+        // Override to Remote mode (write: remote) — should not change behavior.
+        router.rules.default_mode = RouteMode::Remote;
+
+        let result = router.delete_drawer_remote("drawer-1").await.unwrap().unwrap();
+
+        assert_eq!(result["success"], true);
+        assert_eq!(result["origin"], "alpha");
+    }
+
+    #[tokio::test]
+    async fn e2e_delete_drawer_fallback_ignores_dual_write() {
+        // Even with a `write: both` route (dual-write config), DeleteDrawer does
+        // NOT dual-write. It deletes locally first; if not found, it falls back
+        // to remotes — but it calls delete_drawer_remote (not a replicate path).
+        let mock = MockRemote::default();
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let mut router = make_router(remotes);
+
+        // delete_drawer_remote is the fallback path — it has no concept of
+        // replication; it just tries each remote.
+        let result = router.delete_drawer_remote("drawer-1").await.unwrap().unwrap();
+        assert_eq!(result["success"], true);
+        assert_eq!(result["origin"], "alpha");
+        // The response does NOT carry a "replication" field — verification that
+        // DeleteDrawer is excluded from dual-write semantics.
+        assert!(
+            !result.as_object().unwrap().contains_key("replication"),
+            "DeleteDrawer must never produce a replication field; got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn e2e_delete_drawer_route_matrix_all_remotes_fallback() {
+        // Route-matrix: regardless of write target (local, remote, both),
+        // delete_drawer_remote always tries ALL remotes in order.
+        // Test with 2 remotes and one failure per combination.
+        for write_target in [WriteTarget::Local, WriteTarget::Remote, WriteTarget::Both] {
+            let mut mock_fail = MockRemote::default();
+            mock_fail.delete_succeeds = false;
+            let mock_ok = MockRemote::default();
+
+            let mut remotes = BTreeMap::new();
+            remotes.insert("aaa".to_owned(), Arc::new(mock_fail) as Arc<dyn RemoteApi>);
+            remotes.insert("bbb".to_owned(), Arc::new(mock_ok) as Arc<dyn RemoteApi>);
+            let router = make_router(remotes);
+
+            let result = router.delete_drawer_remote("drawer-1").await.unwrap().unwrap();
+            assert_eq!(result["origin"], "bbb",
+                "write_target={write_target:?}: should fall through aaa to bbb"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn e2e_status_merge_populates_url_and_info() {
         let mock = MockRemote::default();

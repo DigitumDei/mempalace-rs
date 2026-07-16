@@ -43,7 +43,18 @@ use federation::FederationRouter;
 //
 // **Routable — uses `resolve_route()` per wing/room:**
 //   Search, ListWings, ListRooms, GetTaxonomy, Status, CheckDuplicate,
-//   AddDrawer, DeleteDrawer
+//   AddDrawer
+//
+// **DeleteDrawer — ID-based local deletion with remote fallback:**
+//   DeleteDrawer is NOT a dual-write or write-routed operation. It deletes by
+//   drawer ID in the local palace first. If not found locally, it falls back
+//   by attempting deletion across ALL configured remotes (in deterministic name
+//   order), regardless of wing routing rules. Dual-written drawers have
+//   independent IDs on each side with no durable cross-palace ID mapping, so
+//   `write:remote` and `write:both` routing is irrelevant — the fallback is a
+//   best-effort attempt to delete the same ID on every remote. The response
+//   reports `applied_to: "local"` or `"remote:<name>"` and never carries a
+//   `replication` field.
 //
 // **Routable — uses `resolve_kg_route()` (knowledge-graph-specific routing):**
 //   KgQuery, KgAdd, KgInvalidate, KgTimeline, KgStats
@@ -74,10 +85,10 @@ use federation::FederationRouter;
 // **Wing names are the federation join key** — the same wing name on both sides
 //   is merged-by-name in combined reads.
 //
-// **Write routing:** In Combined mode, `AddDrawer`, `DeleteDrawer`, `KgAdd`, and
+// **Write routing:** In Combined mode, `AddDrawer`, `KgAdd`, and
 //   `KgInvalidate` write to the target indicated by the resolved rule's `write`
-//   field (local, remote, or both). When `write: both`, the local write completes
-//   first, then best-effort remote replication is attempted.
+//   field (local, remote, or both). `DeleteDrawer` is excluded — see its section
+//   above.
 //
 // **Per-project routing** (`resolve_route`'s `project_routing` parameter) is not
 //   wired at the MCP layer — the stdio server has no per-project context, so it
@@ -144,7 +155,10 @@ pub struct ToolDefinition {
 pub enum ToolRoutingCategory {
     /// Tool is always served from the local palace; never federated.
     LocalOnly,
-    /// Tool routes via wing/room rules (`resolve_route`).
+    /// Tool routes via wing/room rules (`resolve_route`). Exception: DeleteDrawer
+    /// is categorized here because it can reach remotes, but it does NOT use
+    /// `resolve_route()` for write target — it deletes by ID locally first, then
+    /// falls back to all remotes regardless of wing routing.
     RoutableDrawer,
     /// Tool routes via KG-specific rules (`resolve_kg_route`).
     RoutableKg,
@@ -409,7 +423,7 @@ impl ToolName {
             },
             Self::DeleteDrawer => ToolDefinition {
                 name: self.as_str(),
-                description: "Delete a drawer by ID. Irreversible.",
+                description: "Delete a drawer by ID. Irreversible. Local deletion first by ID; if not found locally, falls back to remotes in name order. Does not use write routing.",
                 input_schema: json!({
                     "type":"object",
                     "properties":{"drawer_id":{"type":"string","description":"ID of the drawer to delete"}},

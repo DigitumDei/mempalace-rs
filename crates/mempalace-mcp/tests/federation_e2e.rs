@@ -20,6 +20,7 @@ use mempalace_config::{
     ResolvedRouteRule, RouteMode, ServerRuntimeConfig, WriteTarget,
 };
 use mempalace_core::EmbeddingProfile;
+use mempalace_federation::{DrawerSearchRequest, KgQueryRequest};
 use mempalace_mcp::{DeterministicStubProvider, JsonRpcRequest, McpServer, decode_tool_payload};
 use mempalace_server::{TokenRegistry, build_router};
 use serde_json::{Value, json};
@@ -1643,24 +1644,31 @@ async fn add_drawer_both_replicates_successfully() {
     );
     let _drawer_id = add["drawer_id"].as_str().unwrap().to_owned();
 
-    // ── Verify the drawer landed on the hub via combined search ─────────────
-    let search = call_tool(
-        &server,
-        2,
-        "mempalace_search",
-        json!({
-            "query": "dual-write e2e test drawer successful replication",
-            "wing": "wing_both",
-            "limit": 5
-        }),
-    )
-    .await;
-    let results = search["results"].as_array().expect("results must be array");
-    assert!(!results.is_empty(), "search wing_both must return results; got: {search}");
-    let hub_hit = results.iter().any(|r| r["origin"].as_str() == Some("hub"));
+    // ── Verify the drawer landed on the hub directly ───────────────────────
+    // Combined search deduplicates the local and replicated copies and prefers
+    // local, so it cannot prove the remote write occurred.
+    let hub_client = RemoteClient::new(RemoteEndpoint {
+        name: "hub".into(),
+        base_url: hub_url,
+        token: Some(TEST_TOKEN.to_owned()),
+        timeout: Duration::from_secs(5),
+    })
+    .unwrap();
+    let hub_search = hub_client
+        .search_drawers(DrawerSearchRequest {
+            query: "dual-write e2e test drawer successful replication".to_owned(),
+            wing: Some("wing_both".to_owned()),
+            room: Some("both-room".to_owned()),
+            limit: Some(5),
+        })
+        .await
+        .expect("hub search must succeed");
+    let hub_hit = hub_search.results.iter().any(|result| {
+        result.content == "dual-write e2e test drawer successful replication"
+    });
     assert!(
         hub_hit,
-        "search must include hub-origin result (remote replication landed); results: {results:?}"
+        "hub search must include the replicated drawer; results: {hub_search:?}"
     );
 }
 
@@ -2368,23 +2376,32 @@ async fn kg_add_both_replicates_successfully() {
         "kg_add must not have warnings on success: {kg_add}"
     );
 
-    // Verify the fact exists on the hub via combined kg_query.
-    let kg_query = call_tool(
-        &server,
-        2,
-        "mempalace_kg_query",
-        json!({"entity": "BothTest", "direction": "outgoing"}),
-    )
-    .await;
-    let facts = kg_query["facts"].as_array().expect("facts must be array");
-    let hub_fact = facts.iter().find(|f| {
-        f["origin"].as_str() == Some("hub")
-            && f["predicate"].as_str() == Some("uses_protocol")
-            && f["object"].as_str() == Some("dual_write_kg")
+    // Verify the fact exists on the hub directly. Combined KG queries dedupe
+    // identical facts and prefer local, so no separate hub-origin fact remains.
+    let hub_client = RemoteClient::new(RemoteEndpoint {
+        name: "hub".into(),
+        base_url: hub_url,
+        token: Some(TEST_TOKEN.to_owned()),
+        timeout: Duration::from_secs(5),
+    })
+    .unwrap();
+    let hub_query = hub_client
+        .kg_query(KgQueryRequest {
+            entity: "BothTest".to_owned(),
+            as_of: None,
+            direction: Some("outgoing".to_owned()),
+        })
+        .await
+        .expect("hub KG query must succeed");
+    let hub_fact = hub_query["facts"].as_array().and_then(|facts| {
+        facts.iter().find(|f| {
+            f["predicate"].as_str() == Some("uses_protocol")
+                && f["object"].as_str() == Some("dual_write_kg")
+        })
     });
     assert!(
         hub_fact.is_some(),
-        "kg query must include the fact from hub origin; facts: {facts:?}"
+        "hub KG query must include the replicated fact; response: {hub_query}"
     );
 }
 
@@ -2516,23 +2533,32 @@ async fn kg_invalidate_both_replicates_successfully() {
     .await;
     assert_eq!(add_resp["success"], true, "kg_add must succeed: {add_resp}");
 
-    // Verify the fact exists on the hub before invalidation (as_of while active).
-    let query_before = call_tool(
-        &server,
-        2,
-        "mempalace_kg_query",
-        json!({"entity": "InvalidateBothTest", "direction": "outgoing", "as_of": "2026-03-01"}),
-    )
-    .await;
-    let facts_before = query_before["facts"].as_array().expect("facts must be array");
-    let hub_fact_before = facts_before.iter().find(|f| {
-        f["origin"].as_str() == Some("hub")
-            && f["predicate"].as_str() == Some("replication")
-            && f["object"].as_str() == Some("active")
+    // Verify the fact exists on the hub before invalidation. Combined KG queries
+    // dedupe replicated facts, so query the hub directly.
+    let hub_client = RemoteClient::new(RemoteEndpoint {
+        name: "hub".into(),
+        base_url: hub_url.clone(),
+        token: Some(TEST_TOKEN.to_owned()),
+        timeout: Duration::from_secs(5),
+    })
+    .unwrap();
+    let hub_before = hub_client
+        .kg_query(KgQueryRequest {
+            entity: "InvalidateBothTest".to_owned(),
+            as_of: Some("2026-03-01".to_owned()),
+            direction: Some("outgoing".to_owned()),
+        })
+        .await
+        .expect("hub KG query before invalidation must succeed");
+    let hub_fact_before = hub_before["facts"].as_array().and_then(|facts| {
+        facts.iter().find(|f| {
+            f["predicate"].as_str() == Some("replication")
+                && f["object"].as_str() == Some("active")
+        })
     });
     assert!(
         hub_fact_before.is_some(),
-        "kg_query as_of before invalidation must include the fact from hub origin; facts: {facts_before:?}"
+        "hub KG query before invalidation must include the fact; response: {hub_before}"
     );
 
     // Now invalidate with an explicit past ended date.
@@ -2572,44 +2598,45 @@ async fn kg_invalidate_both_replicates_successfully() {
     );
 
     // ── Verify the fact is invalidated on the hub using as_of after ended ───
-    let kg_query = call_tool(
-        &server,
-        4,
-        "mempalace_kg_query",
-        json!({"entity": "InvalidateBothTest", "direction": "outgoing", "as_of": "2026-07-01"}),
-    )
-    .await;
-    let facts = kg_query["facts"].as_array().expect("facts must be array");
-    let hub_fact = facts.iter().find(|f| {
-        f["origin"].as_str() == Some("hub")
-            && f["predicate"].as_str() == Some("replication")
-            && f["object"].as_str() == Some("active")
+    let hub_after = hub_client
+        .kg_query(KgQueryRequest {
+            entity: "InvalidateBothTest".to_owned(),
+            as_of: Some("2026-07-01".to_owned()),
+            direction: Some("outgoing".to_owned()),
+        })
+        .await
+        .expect("hub KG query after invalidation must succeed");
+    let hub_fact = hub_after["facts"].as_array().and_then(|facts| {
+        facts.iter().find(|f| {
+            f["predicate"].as_str() == Some("replication")
+                && f["object"].as_str() == Some("active")
+        })
     });
     assert!(
         hub_fact.is_none(),
-        "kg_query as_of after invalidation date must NOT include the invalidated fact from hub origin; facts: {facts:?}"
+        "hub KG query after invalidation must not include the fact; response: {hub_after}"
     );
 
     // Query without as_of returns all facts including historical ones (the fact
     // should still exist as a historical record on the hub).
-    let kg_query_all = call_tool(
-        &server,
-        5,
-        "mempalace_kg_query",
-        json!({"entity": "InvalidateBothTest", "direction": "outgoing"}),
-    )
-    .await;
-    let facts_all = kg_query_all["facts"].as_array().expect("facts must be array");
+    let hub_all = hub_client
+        .kg_query(KgQueryRequest {
+            entity: "InvalidateBothTest".to_owned(),
+            as_of: None,
+            direction: Some("outgoing".to_owned()),
+        })
+        .await
+        .expect("hub KG query without as_of must succeed");
+    let facts_all = hub_all["facts"].as_array().expect("hub facts must be array");
     // The fact should still appear in the unfiltered query but with current: false.
     // We just verify the hub at least has the fact in the unfiltered view.
     let hub_fact_historical = facts_all.iter().find(|f| {
-        f["origin"].as_str() == Some("hub")
-            && f["predicate"].as_str() == Some("replication")
+        f["predicate"].as_str() == Some("replication")
             && f["object"].as_str() == Some("active")
     });
     assert!(
         hub_fact_historical.is_some(),
-        "kg_query without as_of must still show the fact as historical on the hub; facts: {facts_all:?}"
+        "hub KG query without as_of must show the historical fact; facts: {facts_all:?}"
     );
 }
 

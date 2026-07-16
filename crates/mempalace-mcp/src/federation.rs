@@ -2214,6 +2214,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn e2e_add_drawer_replicate_409_race() {
+        let mut mock = MockRemote::default();
+        mock.duplicate_matches = vec![]; // pre-check passes (no duplicate detected)
+        mock.add_drawer_409 = true;      // but the actual add_drawer gets a 409
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+
+        let route = make_both_route("alpha");
+        let status = router
+            .add_drawer_replicate("w", "r", "content", "file.txt", "agent", &route, 0.9)
+            .await;
+
+        match status {
+            ReplicationStatus::Failed { remote, reason } => {
+                assert_eq!(remote, "alpha");
+                assert_eq!(reason, "duplicate (409) on remote");
+            }
+            other => panic!("expected Failed (409 race), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn e2e_add_drawer_replicate_skipped_for_non_both() {
         let mock = MockRemote::default();
         let mut remotes = BTreeMap::new();

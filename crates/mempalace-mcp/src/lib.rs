@@ -765,7 +765,7 @@ where
             .unwrap_or_else(|| OffsetDateTime::now_utc() - Duration::days(1));
 
         let identity = self.read_identity_text()?;
-        let status = self.status_payload().await?;
+        let status = self.status_payload(false).await?;
         let latest_events = self
             .storage
             .operational_store()
@@ -832,7 +832,7 @@ where
     }
 
     async fn tool_status(&mut self) -> ToolResult<Value> {
-        let mut payload = self.status_payload().await?;
+        let mut payload = self.status_payload(true).await?;
         if let Some(router) = &self.federation {
             payload = router.status_merge(payload).await?;
             let local_wings: BTreeMap<String, usize> = payload["wings"]
@@ -846,22 +846,35 @@ where
         Ok(payload)
     }
 
-    async fn status_payload(&mut self) -> ToolResult<Value> {
+    async fn status_payload(&mut self, include_rooms: bool) -> ToolResult<Value> {
         let drawers = self.list_all_drawers().await?;
         let mut wings = BTreeMap::<String, usize>::new();
-        let mut rooms = BTreeMap::<String, usize>::new();
+        let mut rooms = include_rooms.then(BTreeMap::<String, usize>::new);
         for drawer in &drawers {
-            *wings.entry(drawer.wing.as_str().to_owned()).or_default() += 1;
-            *rooms.entry(drawer.room.as_str().to_owned()).or_default() += 1;
+            if let Some(count) = wings.get_mut(drawer.wing.as_str()) {
+                *count += 1;
+            } else {
+                wings.insert(drawer.wing.as_str().to_owned(), 1);
+            }
+            if let Some(rooms) = &mut rooms {
+                if let Some(count) = rooms.get_mut(drawer.room.as_str()) {
+                    *count += 1;
+                } else {
+                    rooms.insert(drawer.room.as_str().to_owned(), 1);
+                }
+            }
         }
-        Ok(json!({
+        let mut payload = json!({
             "total_drawers": drawers.len(),
             "wings": wings,
-            "rooms": rooms,
             "palace_path": self.config.palace_path,
             "protocol": PALACE_PROTOCOL,
             "aaak_dialect": AAAK_SPEC,
-        }))
+        });
+        if let Some(rooms) = rooms {
+            payload["rooms"] = json!(rooms);
+        }
+        Ok(payload)
     }
 
     async fn tool_identity_read(&mut self) -> ToolResult<Value> {
@@ -3046,6 +3059,7 @@ mod tests {
         assert_eq!(payload["total_drawers"], 2);
         assert_eq!(payload["protocol"], PALACE_PROTOCOL);
         assert_eq!(payload["aaak_dialect"], AAAK_SPEC);
+        assert!(payload.get("rooms").is_some());
     }
 
     #[tokio::test]
@@ -3098,6 +3112,10 @@ mod tests {
         assert_eq!(payload["status"]["total_drawers"], 5);
         assert_eq!(payload["status"]["protocol"], PALACE_PROTOCOL);
         assert_eq!(payload["status"]["aaak_dialect"], AAAK_SPEC);
+        assert!(
+            payload["status"].get("rooms").is_none(),
+            "wake-up status should not enumerate rooms: {payload}"
+        );
         assert_eq!(payload["current_project"]["wing"], "wing_wakeup_project");
         assert_eq!(payload["diary"]["scope"], "all_wings");
         assert_eq!(payload["diary"]["current_agent"], "Wake Bot");

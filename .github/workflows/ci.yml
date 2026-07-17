@@ -143,7 +143,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload embedding benchmark artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: embedding-baselines
           path: |
@@ -359,7 +359,7 @@ jobs:
           "dist/mempalace-mcp-${{ matrix.asset }}${ext}" --help
 
       - name: Upload release artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.asset }}
           path: dist/*

@@ -3,15 +3,21 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
 
+concurrency:
+  group: jules-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
   review:
+    # Fork PRs don't receive repo secrets — skip at the job level.
+    if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
       contents: read
       statuses: write
     steps:
-      - uses: DigitumDei/jules-pr-reviewer@main
+      - uses: DigitumDei/jules-pr-reviewer@v2
         with:
           jules_api_key: ${{ secrets.JULES_API_KEY }}
           github_token: ${{ secrets.GITHUB_TOKEN }}

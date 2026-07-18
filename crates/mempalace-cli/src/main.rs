@@ -508,11 +508,17 @@ where
     let project_config = if existing_config {
         ConfigLoader::load_project_config(&project_dir).map_err(config_error)?
     } else {
-        ProjectConfig {
-            wing: wing_name_for_dir(&project_dir),
-            rooms: detection.rooms.clone(),
-            routing: None,
-        }
+        let derived_wing = wing_name_for_dir(&project_dir);
+        let candidate_project_id =
+            derive_project_id(&project_dir, &derived_wing, explicit_project_id);
+        ConfigLoader::resolve_project_config(
+            &project_dir,
+            context.config_base_dir.as_deref(),
+            Some(&candidate_project_id),
+            &derived_wing,
+            detection.rooms.clone(),
+        )
+        .map_err(config_error)?
     };
     let derived_project_id = derive_project_id(&project_dir, &project_config.wing, explicit_project_id);
     let project_id = if explicit_project_id.filter(|id| !id.trim().is_empty()).is_some() {
@@ -526,6 +532,27 @@ where
         .map_err(config_error)?
         .unwrap_or(derived_project_id)
     };
+    if explicit_project_id.filter(|id| !id.trim().is_empty()).is_none()
+        && project_id.starts_with("wing:")
+        && ConfigLoader::load_project_registry(context.config_base_dir.as_deref())
+            .map_err(config_error)?
+            .projects
+            .contains_key(&project_id)
+        && ConfigLoader::find_project_id(
+            context.config_base_dir.as_deref(),
+            &project_dir,
+            None,
+        )
+        .map_err(config_error)?
+        .is_none()
+    {
+        return Ok(CliOutput::failure(
+            1,
+            format!(
+                "project `{project_id}` is ambiguous for a checkout without a Git origin; pass --project-id\n"
+            ),
+        ));
+    }
     let project_root = project_root_relative(&project_dir);
     let registry_path = ConfigLoader::register_project(
         context.config_base_dir.as_deref(),
@@ -597,11 +624,17 @@ fn execute_project_command(
             {
                 ConfigLoader::load_project_config(&project_dir).map_err(config_error)?
             } else {
-                ProjectConfig {
-                    wing: wing_name_for_dir(&project_dir),
-                    rooms: detection.rooms,
-                    routing: None,
-                }
+                let derived_wing = wing.clone().unwrap_or_else(|| wing_name_for_dir(&project_dir));
+                let candidate_project_id =
+                    derive_project_id(&project_dir, &derived_wing, explicit_project_id.as_deref());
+                ConfigLoader::resolve_project_config(
+                    &project_dir,
+                    context.config_base_dir.as_deref(),
+                    Some(&candidate_project_id),
+                    &derived_wing,
+                    detection.rooms,
+                )
+                .map_err(config_error)?
             };
             if let Some(wing) = wing {
                 project_config.wing = wing;
@@ -626,6 +659,30 @@ fn execute_project_command(
                 .map_err(config_error)?
                 .unwrap_or(derived_project_id)
             };
+            if explicit_project_id
+                .as_deref()
+                .filter(|id| !id.trim().is_empty())
+                .is_none()
+                && project_id.starts_with("wing:")
+                && ConfigLoader::load_project_registry(context.config_base_dir.as_deref())
+                    .map_err(config_error)?
+                    .projects
+                    .contains_key(&project_id)
+                && ConfigLoader::find_project_id(
+                    context.config_base_dir.as_deref(),
+                    &project_dir,
+                    None,
+                )
+                .map_err(config_error)?
+                .is_none()
+            {
+                return Ok(CliOutput::failure(
+                    1,
+                    format!(
+                        "project `{project_id}` is ambiguous for a checkout without a Git origin; pass --project-id\n"
+                    ),
+                ));
+            }
             let registry_path = ConfigLoader::register_project(
                 context.config_base_dir.as_deref(),
                 &project_id,
@@ -841,8 +898,9 @@ where
             .clone()
             .unwrap_or_else(|| project_config.wing.clone());
 
-        let project_routing = if wing.is_some()
-            && wing.as_deref() != Some(project_config.wing.as_str())
+        let project_routing = if wing
+            .as_deref()
+            .is_some_and(|override_wing| !wing_ids_equal(override_wing, &project_config.wing))
         {
             None
         } else {
@@ -1015,7 +1073,7 @@ enum ProjectCommands {
         project_id: String,
         #[arg(long)]
         dir: Option<PathBuf>,
-        #[arg(long = "repo-config", default_value_t = true)]
+        #[arg(long = "repo-config")]
         repo_config: bool,
     },
 }
@@ -2049,6 +2107,13 @@ fn wing_name_for_dir(project_dir: &Path) -> String {
     if name.starts_with("wing_") { name } else { format!("wing_{name}") }
 }
 
+fn wing_ids_equal(left: &str, right: &str) -> bool {
+    match (WingId::normalized(left), WingId::normalized(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left.eq_ignore_ascii_case(right),
+    }
+}
+
 fn count_project_files(project_dir: &Path) -> std::io::Result<usize> {
     let mut total = 0usize;
     let mut stack = vec![project_dir.to_path_buf()];
@@ -2342,6 +2407,23 @@ mod tests {
         assert!(config_root.join("config.json").exists());
         assert!(config_root.join("palace").exists());
         fs::remove_dir_all(config_root).unwrap();
+    }
+
+    #[test]
+    fn init_does_not_reuse_wing_only_id_for_an_unrelated_checkout() {
+        let workspace = tempdir().unwrap();
+        let first = setup_project_fixture(&workspace.path().join("first"));
+        let second = setup_project_fixture(&workspace.path().join("second"));
+        let config_root = temp_config_root("wing-only-id");
+        let context = CliContext::for_tests(config_root.clone());
+
+        let first_init = run_cli(["init", first.to_str().unwrap()], &context, stub_provider).unwrap();
+        assert_eq!(first_init.exit_code, 0);
+        let second_init = run_cli(["init", second.to_str().unwrap()], &context, stub_provider).unwrap();
+        assert_eq!(second_init.exit_code, 1);
+        assert!(second_init.stderr.contains("pass --project-id"));
+
+        remove_dir_all_if_exists(&config_root);
     }
 
     #[test]
@@ -2883,6 +2965,45 @@ mod tests {
         let list = run_cli(["project", "list"], &context, stub_provider).unwrap();
         assert!(list.stdout.contains("Projects: 0"));
         remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn project_export_requires_explicit_repo_config_flag() {
+        let workspace = tempdir().unwrap();
+        let project_dir = setup_project_fixture(workspace.path());
+        let config_root = temp_config_root("project-export-flag");
+        let context = CliContext::for_tests(config_root.clone());
+        let project_id = "local/project-export";
+
+        let register = run_cli(
+            [
+                "project",
+                "register",
+                project_dir.to_str().unwrap(),
+                "--wing",
+                "wing_export",
+                "--project-id",
+                project_id,
+            ],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+        assert_eq!(register.exit_code, 0);
+
+        let export = run_cli(["project", "export", project_id], &context, stub_provider).unwrap();
+        assert_eq!(export.exit_code, 1);
+        assert!(export.stderr.contains("requires --repo-config"));
+        assert!(!project_dir.join("mempalace.yaml").exists());
+
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn equivalent_wing_ids_preserve_project_routing() {
+        assert!(wing_ids_equal("wing_app", "app"));
+        assert!(wing_ids_equal("APP", "wing_app"));
+        assert!(!wing_ids_equal("wing_app", "wing_other"));
     }
 
     #[test]

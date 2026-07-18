@@ -464,7 +464,7 @@ impl ConfigLoader {
         let path_matches = registry
             .projects
             .iter()
-            .filter(|(_, entry)| project_entry_matches_path(entry, path))
+            .filter(|(project_id, entry)| project_entry_matches_path(project_id, entry, path))
             .collect::<Vec<_>>();
         if path_matches.len() > 1 {
             let ids = path_matches
@@ -480,7 +480,7 @@ impl ConfigLoader {
         if let Some((_, entry)) = path_matches.first() {
             return Ok(entry.project_config());
         }
-        if let Some(project_id) = project_id {
+        if let Some(project_id) = project_id.filter(|id| project_id_hint_has_repository_identity(id)) {
             if let Some(entry) = registry.projects.get(project_id) {
                 return Ok(entry.project_config());
             }
@@ -533,7 +533,7 @@ impl ConfigLoader {
         let matches = registry
             .projects
             .iter()
-            .filter(|(_, entry)| project_entry_matches_path(entry, path))
+            .filter(|(project_id, entry)| project_entry_matches_path(project_id, entry, path))
             .map(|(id, _)| id.clone())
             .collect::<Vec<_>>();
         if matches.len() > 1 {
@@ -549,7 +549,10 @@ impl ConfigLoader {
         if let Some(id) = matches.into_iter().next() {
             return Ok(Some(id));
         }
-        if let Some(id) = project_id_hint.filter(|id| registry.projects.contains_key(*id)) {
+        if let Some(id) = project_id_hint
+            .filter(|id| project_id_hint_has_repository_identity(id))
+            .filter(|id| registry.projects.contains_key(*id))
+        {
             return Ok(Some(id.to_owned()));
         }
         Ok(None)
@@ -587,6 +590,7 @@ impl ConfigLoader {
                     && existing.checkouts.iter().any(|alias| {
                         alias.canonicalize().unwrap_or_else(|_| alias.to_path_buf()) == resolved
                     })
+                    && !shared_monorepo_checkout(existing_id, existing, project_id, &entry)
                 {
                     return Err(MempalaceError::ConfigParse {
                         path: paths.project_registry_file,
@@ -600,6 +604,15 @@ impl ConfigLoader {
         }
 
         if let Some(existing) = registry.projects.get(project_id).cloned() {
+            if entry.wing.trim().is_empty() {
+                entry.wing = existing.wing.clone();
+            }
+            if entry.rooms.is_empty() {
+                entry.rooms = existing.rooms.clone();
+            }
+            if entry.routing.is_none() {
+                entry.routing = existing.routing.clone();
+            }
             for checkout in existing.checkouts {
                 if !entry.checkouts.iter().any(|candidate| {
                     candidate.canonicalize().unwrap_or_else(|_| candidate.to_path_buf())
@@ -647,7 +660,11 @@ fn resolve_paths(base_dir_override: Option<&Path>) -> Result<ResolvedPaths> {
     })
 }
 
-fn project_entry_matches_path(entry: &ProjectRegistryEntryV1, path: &Path) -> bool {
+fn project_entry_matches_path(
+    project_id: &str,
+    entry: &ProjectRegistryEntryV1,
+    path: &Path,
+) -> bool {
     let canonical_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     if entry.checkouts.iter().any(|checkout| {
         checkout.canonicalize().unwrap_or_else(|_| checkout.to_path_buf()) == canonical_path
@@ -660,9 +677,13 @@ fn project_entry_matches_path(entry: &ProjectRegistryEntryV1, path: &Path) -> bo
     };
 
     if let Some(repository_root) = git_repository_root(&canonical_path) {
-        if let Ok(relative) = canonical_path.strip_prefix(&repository_root) {
-            if normalize_project_root(&relative.to_string_lossy()) == project_root {
-                return true;
+        let repository_matches = git_remote_identity(&repository_root)
+            .is_some_and(|identity| identity == project_repository_identity(project_id));
+        if repository_matches {
+            if let Ok(relative) = canonical_path.strip_prefix(&repository_root) {
+                if normalize_project_root(&relative.to_string_lossy()) == project_root {
+                    return true;
+                }
             }
         }
     }
@@ -675,6 +696,29 @@ fn project_entry_matches_path(entry: &ProjectRegistryEntryV1, path: &Path) -> bo
             .map(|relative| normalize_project_root(&relative.to_string_lossy()) == project_root)
             .unwrap_or(false)
     })
+}
+
+fn project_repository_identity(project_id: &str) -> &str {
+    project_id.split_once('#').map_or(project_id, |(identity, _)| identity)
+}
+
+fn project_id_hint_has_repository_identity(project_id: &str) -> bool {
+    let identity = project_repository_identity(project_id);
+    !identity.is_empty() && !identity.starts_with("wing:")
+}
+
+fn shared_monorepo_checkout(
+    existing_id: &str,
+    existing: &ProjectRegistryEntryV1,
+    project_id: &str,
+    entry: &ProjectRegistryEntryV1,
+) -> bool {
+    if project_repository_identity(existing_id) != project_repository_identity(project_id) {
+        return false;
+    }
+
+    normalize_project_root(existing.project_root.as_deref().unwrap_or("."))
+        != normalize_project_root(entry.project_root.as_deref().unwrap_or("."))
 }
 
 fn normalize_project_root(value: &str) -> String {
@@ -693,6 +737,45 @@ fn git_repository_root(path: &Path) -> Option<PathBuf> {
     }
     let value = String::from_utf8(output.stdout).ok()?;
     PathBuf::from(value.trim()).canonicalize().ok()
+}
+
+fn git_remote_identity(repository_root: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .args(["-C", &repository_root.to_string_lossy(), "remote", "get-url", "origin"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    normalize_git_remote_url(std::str::from_utf8(&output.stdout).ok()?.trim())
+}
+
+fn normalize_git_remote_url(url: &str) -> Option<String> {
+    let url = url.trim().trim_end_matches('/');
+    let url = url.strip_suffix(".git").unwrap_or(url).trim_end_matches('/');
+    if url.is_empty() {
+        return None;
+    }
+
+    let (host, path) = if let Some((_, remainder)) = url.split_once("://") {
+        let authority = remainder.split('/').next()?;
+        let host = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
+        let path = remainder.strip_prefix(authority)?.trim_start_matches('/');
+        (host, path)
+    } else if let Some((user_host, path)) = url.split_once(':') {
+        let host = user_host.rsplit_once('@').map_or(user_host, |(_, host)| host);
+        (host, path)
+    } else {
+        return None;
+    };
+
+    let host = host.split(':').next().unwrap_or(host).to_ascii_lowercase();
+    let path = path.trim_matches('/');
+    if host.is_empty() || path.is_empty() {
+        None
+    } else {
+        Some(format!("{host}/{path}"))
+    }
 }
 
 fn read_config_file(path: &Path) -> Result<ConfigFileV1> {
@@ -876,6 +959,7 @@ fn expand_path(value: &str) -> Result<PathBuf> {
 mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use mempalace_core::EmbeddingProfile;
@@ -1258,6 +1342,168 @@ mod tests {
         fs::remove_dir_all(config_base).unwrap();
         fs::remove_dir_all(repository).unwrap();
         fs::remove_dir_all(clone).unwrap();
+    }
+
+    #[test]
+    fn monorepo_project_root_does_not_match_an_unrelated_repository() {
+        let config_base = temp_dir();
+        let repository = temp_dir();
+        let subproject = repository.join("crates").join("api");
+        fs::create_dir_all(&subproject).unwrap();
+        let run = |args: &[&str]| {
+            let status = Command::new("git").args(args).current_dir(&repository).status().unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run(&["init"]);
+        run(&["remote", "add", "origin", "https://github.com/example/unrelated.git"]);
+
+        ConfigLoader::register_project(
+            Some(&config_base),
+            "github.com/example/monorepo#crates/api",
+            ProjectRegistryEntryV1 {
+                wing: "wing_api".to_owned(),
+                rooms: Vec::new(),
+                routing: None,
+                checkouts: Vec::new(),
+                project_root: Some("crates/api".to_owned()),
+            },
+            None,
+        )
+        .unwrap();
+
+        let resolved = ConfigLoader::resolve_project_config(
+            &subproject,
+            Some(&config_base),
+            Some("github.com/example/unrelated#crates/api"),
+            "wing_derived",
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(resolved.wing, "wing_derived");
+
+        fs::remove_dir_all(config_base).unwrap();
+        fs::remove_dir_all(repository).unwrap();
+    }
+
+    #[test]
+    fn wing_only_project_id_hints_are_not_reused_for_unmatched_checkouts() {
+        let config_base = temp_dir();
+        let project = temp_dir();
+        fs::create_dir_all(&project).unwrap();
+        ConfigLoader::register_project(
+            Some(&config_base),
+            "wing:wing_app",
+            ProjectRegistryEntryV1 {
+                wing: "wing_registered".to_owned(),
+                rooms: Vec::new(),
+                routing: None,
+                checkouts: Vec::new(),
+                project_root: None,
+            },
+            None,
+        )
+        .unwrap();
+
+        let resolved = ConfigLoader::resolve_project_config(
+            &project,
+            Some(&config_base),
+            Some("wing:wing_app"),
+            "wing_derived",
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(resolved.wing, "wing_derived");
+
+        fs::remove_dir_all(config_base).unwrap();
+        fs::remove_dir_all(project).unwrap();
+    }
+
+    #[test]
+    fn monorepo_project_roots_can_share_one_checkout_alias() {
+        let config_base = temp_dir();
+        let repository = temp_dir();
+        fs::create_dir_all(&repository).unwrap();
+        for (project_id, project_root, wing) in [
+            ("github.com/example/monorepo#crates/api", "crates/api", "wing_api"),
+            ("github.com/example/monorepo#packages/web", "packages/web", "wing_web"),
+        ] {
+            ConfigLoader::register_project(
+                Some(&config_base),
+                project_id,
+                ProjectRegistryEntryV1 {
+                    wing: wing.to_owned(),
+                    rooms: Vec::new(),
+                    routing: None,
+                    checkouts: Vec::new(),
+                    project_root: Some(project_root.to_owned()),
+                },
+                Some(&repository),
+            )
+            .unwrap();
+        }
+
+        let registry = ConfigLoader::load_project_registry(Some(&config_base)).unwrap();
+        assert_eq!(registry.projects.len(), 2);
+        let canonical_repository = repository.canonicalize().unwrap();
+        assert_eq!(registry.projects["github.com/example/monorepo#crates/api"].checkouts, vec![canonical_repository.clone()]);
+        assert_eq!(registry.projects["github.com/example/monorepo#packages/web"].checkouts, vec![canonical_repository]);
+
+        fs::remove_dir_all(config_base).unwrap();
+        fs::remove_dir_all(repository).unwrap();
+    }
+
+    #[test]
+    fn registering_an_existing_project_preserves_central_declarations() {
+        let config_base = temp_dir();
+        let checkout = temp_dir();
+        fs::create_dir_all(&checkout).unwrap();
+        let project_id = "github.com/example/repo";
+        ConfigLoader::register_project(
+            Some(&config_base),
+            project_id,
+            ProjectRegistryEntryV1 {
+                wing: "wing_curated".to_owned(),
+                rooms: vec![ProjectRoomConfig {
+                    name: "backend".to_owned(),
+                    description: Some("Curated".to_owned()),
+                    keywords: vec!["api".to_owned()],
+                }],
+                routing: Some(crate::federation::ProjectRoutingConfig {
+                    mode: crate::federation::RouteMode::Local,
+                    remote: None,
+                    write: None,
+                }),
+                checkouts: Vec::new(),
+                project_root: None,
+            },
+            Some(&checkout),
+        )
+        .unwrap();
+        ConfigLoader::register_project(
+            Some(&config_base),
+            project_id,
+            ProjectRegistryEntryV1 {
+                wing: String::new(),
+                rooms: Vec::new(),
+                routing: None,
+                checkouts: Vec::new(),
+                project_root: None,
+            },
+            Some(&checkout),
+        )
+        .unwrap();
+
+        let entry = ConfigLoader::load_project_registry(Some(&config_base))
+            .unwrap()
+            .projects
+            .remove(project_id)
+            .unwrap();
+        assert_eq!(entry.wing, "wing_curated");
+        assert_eq!(entry.rooms[0].name, "backend");
+        assert!(entry.routing.is_some());
+
+        fs::remove_dir_all(config_base).unwrap();
+        fs::remove_dir_all(checkout).unwrap();
     }
 
     #[test]

@@ -559,6 +559,7 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| derive_repo_id(&root, &wing_name));
     let project_root_key = stable_project_root_key(&repo_id);
+    let legacy_root_key = hash_text(&root.to_string_lossy());
     let branch_name = request.branch.then(|| {
         resolve_current_branch(&root).unwrap_or_else(|| "detached".to_owned())
     });
@@ -611,11 +612,37 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
                         )
                     },
                 );
-                if !request.reindex {
-                    if let Some(existing) =
-                        engine.operational_store().get_ingested_file(&sk)?
+                let looked_up = engine.operational_store().get_ingested_file(&sk)?;
+                let current_existing = looked_up.as_ref().filter(|record| record.source_key == sk);
+                let migrated_source_key = if branch_name.is_none() {
+                    let legacy_sk = legacy_project_source_key(
+                        ingest_kind,
+                        &legacy_root_key,
+                        &wing_name,
+                        &file.relative_path,
+                    );
+                    let legacy_record = if let Some(record) =
+                        looked_up.as_ref().filter(|record| record.source_key != sk)
                     {
+                        Some(record.clone())
+                    } else {
+                        engine
+                            .operational_store()
+                            .get_ingested_file(&legacy_sk)?
+                            .filter(|record| record.source_key != sk)
+                    };
+                    legacy_record.map(|record| record.source_key)
+                } else {
+                    None
+                };
+                if !request.reindex {
+                    if let Some(existing) = current_existing {
                         if existing.content_hash == prepared.content_hash {
+                            if !request.dry_run {
+                                if let Some(old_key) = migrated_source_key.as_deref() {
+                                    engine.remove_source_key(old_key).await?;
+                                }
+                            }
                             summary.skipped_unchanged += 1;
                             continue;
                         }
@@ -633,6 +660,9 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
                             Vec::new(),
                         )
                         .await?;
+                        if let Some(old_key) = migrated_source_key.as_deref() {
+                            engine.remove_source_key(old_key).await?;
+                        }
                     }
                     summary.ingested_files += 1;
                     summary.truncated_files += usize::from(prepared.truncated);
@@ -672,6 +702,9 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
                         source_drawers,
                     )
                     .await?;
+                    if let Some(old_key) = migrated_source_key.as_deref() {
+                        engine.remove_source_key(old_key).await?;
+                    }
                 }
 
                 summary.ingested_files += 1;
@@ -682,6 +715,23 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
                 summary.unreadable_files += 1;
             }
             Err(error) => return Err(error),
+        }
+    }
+
+    // Remove path-hash source rows that were not present in this mine.  This
+    // catches files deleted before the stable project-id migration ran.
+    if branch_name.is_none() && request.limit.is_none() && !request.dry_run {
+        let current_rel_paths: BTreeSet<&str> =
+            files.iter().map(|file| file.relative_path.as_str()).collect();
+        let legacy_prefix = format!("{ingest_kind}:{wing_name}:{legacy_root_key}:");
+        for key in engine
+            .operational_store()
+            .ingested_source_keys_with_prefix(&legacy_prefix)?
+        {
+            let rel = key.splitn(4, ':').nth(3).unwrap_or("");
+            if !current_rel_paths.contains(rel) {
+                engine.remove_source_key(&key).await?;
+            }
         }
     }
 
@@ -2803,6 +2853,15 @@ fn project_source_key(
     source_key_with_root_key(ingest_kind, project_root_key, wing, None, relative_path)
 }
 
+fn legacy_project_source_key(
+    ingest_kind: &str,
+    root_key: &str,
+    wing: &str,
+    relative_path: &str,
+) -> String {
+    source_key_with_root_key(ingest_kind, root_key, wing, None, relative_path)
+}
+
 fn project_branch_source_key(
     ingest_kind: &str,
     project_root_key: &str,
@@ -2929,7 +2988,9 @@ mod tests {
         EmbeddingProvider, EmbeddingRequest, EmbeddingResponse, StartupValidation,
         StartupValidationStatus,
     };
-    use mempalace_storage::{DrawerFilter, DrawerStore};
+    use mempalace_storage::{
+        DrawerFilter, DrawerStore, DuplicateStrategy, IngestCommitRequest,
+    };
     use serde_json::json;
     use tempfile::tempdir;
 
@@ -4346,6 +4407,92 @@ mod tests {
             utf8_dto.content_hash, stored.content_hash,
             "prepare_project_batch content_hash must match stored content_hash"
         );
+    }
+
+    #[tokio::test]
+    async fn project_ingest_migrates_legacy_path_hashed_source_keys() {
+        let tempdir = tempdir().unwrap();
+        let project_dir = tempdir.path().join("project");
+        fs::create_dir_all(project_dir.join("src")).unwrap();
+        fs::write(
+            project_dir.join("mempalace.yaml"),
+            "wing: migration_test\nrooms:\n  - name: general\n",
+        )
+        .unwrap();
+        fs::write(
+            project_dir.join("src/main.rs"),
+            "fn main() { println!(\"migration\"); }\n".repeat(12),
+        )
+        .unwrap();
+
+        let root = project_dir.canonicalize().unwrap();
+        let wing_name = "migration_test";
+        let legacy_key = legacy_project_source_key(
+            "projects",
+            &hash_text(&root.to_string_lossy()),
+            wing_name,
+            "src/main.rs",
+        );
+        let repo_id = derive_repo_id(&root, wing_name);
+        let stable_key = project_source_key(
+            "projects",
+            &stable_project_root_key(&repo_id),
+            wing_name,
+            "src/main.rs",
+        );
+
+        let engine = open_engine(&tempdir.path().join("palace")).await;
+        let mut provider = FakeEmbeddingProvider::new(EmbeddingProfile::Balanced.metadata().dimensions);
+        let legacy_drawers = build_drawers(
+            &mut provider,
+            &wing_id(wing_name).unwrap(),
+            &legacy_key,
+            "src/main.rs",
+            "projects",
+            None,
+            "legacy",
+            None,
+            vec![Chunk {
+                content: "legacy drawer content that should be migrated".to_owned(),
+                chunk_index: 0,
+                room_hint: Some("general".to_owned()),
+                date_hint: None,
+                byte_range: None,
+            }],
+            None,
+        )
+        .unwrap();
+        engine
+            .commit_ingest(IngestCommitRequest {
+                ingest_kind: "projects".to_owned(),
+                source_key: legacy_key.clone(),
+                source_file: "src/main.rs".to_owned(),
+                content_hash: "legacy-content-hash".to_owned(),
+                drawers: legacy_drawers,
+                duplicate_strategy: DuplicateStrategy::Overwrite,
+            })
+            .await
+            .unwrap();
+
+        ingest_project(
+            &engine,
+            &mut provider,
+            &ProjectIngestRequest::new(&project_dir),
+        )
+        .await
+        .unwrap();
+
+        assert!(engine.operational_store().get_ingested_file(&legacy_key).unwrap().is_none());
+        assert!(engine
+            .operational_store()
+            .committed_drawer_ids_for_source_key(&legacy_key)
+            .unwrap()
+            .is_empty());
+        assert!(!engine
+            .operational_store()
+            .committed_drawer_ids_for_source_key(&stable_key)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

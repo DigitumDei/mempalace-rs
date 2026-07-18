@@ -133,13 +133,49 @@ Override order:
 
 ## Project Config File
 
-Primary path:
+Repository-local compatibility path:
 
 - `<project>/mempalace.yaml`
 
 Legacy fallback path accepted by the loader:
 
 - `<project>/mempal.yaml`
+
+Repository-local files are optional. The default CLI workflow stores project
+declarations centrally at `<base-dir>/projects.json` (normally
+`~/.mempalace/projects.json`) so clones and worktrees can share one mapping.
+
+The registry is keyed by a normalized Git origin when available and stores the
+wing, room rules, optional federation route, and checkout-path aliases. A
+registry entry has the same project fields as the YAML shape below, plus
+`checkouts` and an optional `project_root` for monorepos:
+
+```json
+{
+  "version": 1,
+  "projects": {
+    "github.com/digitumdei/mempalace-rs": {
+      "wing": "wing_mempalace_rs",
+      "checkouts": ["D:/SourceCode/mempalace-rs"],
+      "rooms": [
+        {"name": "crates", "description": "Rust crates", "keywords": ["rust"]}
+      ],
+      "routing": {"mode": "local"},
+      "project_root": null
+    }
+  }
+}
+```
+
+Resolution order is: explicit CLI selection/wing, repository-local YAML (when
+present), the centralized registry, then derived defaults. Existing YAML files
+remain supported as portable overrides and for backward compatibility. `init`
+and `project register` import an existing YAML declaration into the registry
+without modifying the repository file. Use `--repo-config` when you explicitly
+want a file written; `--yes` is required when that would replace an existing
+file. Monorepo entries use `<origin>#<project-root>` IDs, while checkout paths
+are aliases only. Ambiguous aliases or subproject mappings are reported as
+conflicts.
 
 Frozen YAML shape:
 

@@ -3,6 +3,7 @@ use std::env;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use mempalace_core::{EmbeddingProfile, MempalaceError, Result};
 use serde::{Deserialize, Serialize};
@@ -15,6 +16,7 @@ use crate::federation::{
 pub const DEFAULT_BASE_DIR: &str = "~/.mempalace";
 pub const DEFAULT_COLLECTION_NAME: &str = "mempalace_drawers";
 const CONFIG_FILE_NAME: &str = "config.json";
+const PROJECT_REGISTRY_FILE_NAME: &str = "projects.json";
 const PROJECT_CONFIG_FILE_NAME: &str = "mempalace.yaml";
 const LEGACY_PROJECT_CONFIG_FILE_NAME: &str = "mempal.yaml";
 const DEFAULT_SERVER_BIND: &str = "127.0.0.1:8765";
@@ -36,6 +38,7 @@ pub struct ResolvedPaths {
     pub base_dir: PathBuf,
     pub palace_dir: PathBuf,
     pub config_file: PathBuf,
+    pub project_registry_file: PathBuf,
     pub people_map_file: PathBuf,
 }
 
@@ -286,6 +289,64 @@ pub struct ProjectConfig {
     pub routing: Option<ProjectRoutingConfig>,
 }
 
+/// Central project registry stored in the local MemPalace configuration
+/// directory.  The registry is deliberately separate from repository files so
+/// clones and worktrees can share one project declaration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectRegistryFileV1 {
+    #[serde(default = "default_version")]
+    pub version: u32,
+    #[serde(default)]
+    pub projects: BTreeMap<String, ProjectRegistryEntryV1>,
+}
+
+impl Default for ProjectRegistryFileV1 {
+    fn default() -> Self {
+        Self { version: 1, projects: BTreeMap::new() }
+    }
+}
+
+/// One centrally registered project declaration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectRegistryEntryV1 {
+    /// Wing receiving mined project drawers.
+    pub wing: String,
+    /// Room rules used by project mining.
+    #[serde(default)]
+    pub rooms: Vec<ProjectRoomConfig>,
+    /// Optional project-level federation route.
+    #[serde(default)]
+    pub routing: Option<ProjectRoutingConfig>,
+    /// Checkout paths used as local discovery aliases.
+    #[serde(default)]
+    pub checkouts: Vec<PathBuf>,
+    /// Optional repository-relative root for monorepo declarations.
+    #[serde(default)]
+    pub project_root: Option<String>,
+}
+
+impl From<ProjectConfig> for ProjectRegistryEntryV1 {
+    fn from(config: ProjectConfig) -> Self {
+        Self {
+            wing: config.wing,
+            rooms: config.rooms,
+            routing: config.routing,
+            checkouts: Vec::new(),
+            project_root: None,
+        }
+    }
+}
+
+impl ProjectRegistryEntryV1 {
+    fn project_config(&self) -> ProjectConfig {
+        ProjectConfig {
+            wing: self.wing.clone(),
+            rooms: self.rooms.clone(),
+            routing: self.routing.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectRoomConfig {
     pub name: String,
@@ -380,6 +441,195 @@ impl ConfigLoader {
             message: err.to_string(),
         })
     }
+
+    /// Resolve a project declaration from an optional repository-local file,
+    /// then the centralized registry, and finally derived defaults.
+    ///
+    /// `project_id` should be a stable repository identity such as a
+    /// normalized Git origin.  `registry_base_dir` selects the local
+    /// MemPalace installation whose `projects.json` should be consulted.
+    pub fn resolve_project_config(
+        path: &Path,
+        registry_base_dir: Option<&Path>,
+        project_id: Option<&str>,
+        derived_wing: &str,
+        derived_rooms: Vec<ProjectRoomConfig>,
+    ) -> Result<ProjectConfig> {
+        let local_config_path = resolve_project_config_path(path);
+        if local_config_path.exists() {
+            return Self::load_project_config(path);
+        }
+
+        let registry = Self::load_project_registry(registry_base_dir)?;
+        let path_matches = registry
+            .projects
+            .iter()
+            .filter(|(_, entry)| project_entry_matches_path(entry, path))
+            .collect::<Vec<_>>();
+        if path_matches.len() > 1 {
+            let ids = path_matches
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(MempalaceError::ConfigParse {
+                path: resolve_paths(registry_base_dir)?.project_registry_file,
+                message: format!("conflicting project declarations match `{}`: {ids}", path.display()),
+            });
+        }
+        if let Some((_, entry)) = path_matches.first() {
+            return Ok(entry.project_config());
+        }
+        if let Some(project_id) = project_id {
+            if let Some(entry) = registry.projects.get(project_id) {
+                return Ok(entry.project_config());
+            }
+        }
+
+        Ok(ProjectConfig {
+            wing: derived_wing.to_owned(),
+            rooms: if derived_rooms.is_empty() {
+                vec![ProjectRoomConfig {
+                    name: "general".to_owned(),
+                    description: Some("All project files".to_owned()),
+                    keywords: Vec::new(),
+                }]
+            } else {
+                derived_rooms
+            },
+            routing: None,
+        })
+    }
+
+    /// Read the centralized project registry.  A missing registry is treated
+    /// as an empty registry so first-run mining can use derived defaults.
+    pub fn load_project_registry(
+        base_dir_override: Option<&Path>,
+    ) -> Result<ProjectRegistryFileV1> {
+        let paths = resolve_paths(base_dir_override)?;
+        read_project_registry_file(&paths.project_registry_file)
+    }
+
+    /// Load one centralized project declaration by its durable project ID.
+    /// This is used for explicit CLI selectors, which intentionally take
+    /// precedence over repository-local compatibility files.
+    pub fn load_project_by_id(
+        base_dir_override: Option<&Path>,
+        project_id: &str,
+    ) -> Result<Option<ProjectConfig>> {
+        let registry = Self::load_project_registry(base_dir_override)?;
+        Ok(registry.projects.get(project_id).map(ProjectRegistryEntryV1::project_config))
+    }
+
+    /// Find the durable registry ID associated with a checkout.  The path is
+    /// only used for discovery; callers should persist the returned ID rather
+    /// than deriving an absolute-path identity.
+    pub fn find_project_id(
+        base_dir_override: Option<&Path>,
+        path: &Path,
+        project_id_hint: Option<&str>,
+    ) -> Result<Option<String>> {
+        let registry = Self::load_project_registry(base_dir_override)?;
+        let matches = registry
+            .projects
+            .iter()
+            .filter(|(_, entry)| project_entry_matches_path(entry, path))
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        if matches.len() > 1 {
+            return Err(MempalaceError::ConfigParse {
+                path: resolve_paths(base_dir_override)?.project_registry_file,
+                message: format!(
+                    "conflicting project declarations match `{}`: {}",
+                    path.display(),
+                    matches.join(", ")
+                ),
+            });
+        }
+        if let Some(id) = matches.into_iter().next() {
+            return Ok(Some(id));
+        }
+        if let Some(id) = project_id_hint.filter(|id| registry.projects.contains_key(*id)) {
+            return Ok(Some(id.to_owned()));
+        }
+        Ok(None)
+    }
+
+    /// Register or replace one project declaration in the centralized
+    /// registry.  The checkout path is stored as a discovery alias; the
+    /// registry key remains the stable project identity.
+    pub fn register_project(
+        base_dir_override: Option<&Path>,
+        project_id: &str,
+        mut entry: ProjectRegistryEntryV1,
+        checkout: Option<&Path>,
+    ) -> Result<PathBuf> {
+        let paths = resolve_paths(base_dir_override)?;
+        fs::create_dir_all(&paths.base_dir).map_err(|source| MempalaceError::ConfigWrite {
+            path: paths.base_dir.clone(),
+            source,
+        })?;
+
+        if let Some(checkout) = checkout {
+            let resolved = checkout.canonicalize().unwrap_or_else(|_| checkout.to_path_buf());
+            if !entry.checkouts.iter().any(|existing| {
+                existing.canonicalize().unwrap_or_else(|_| existing.to_path_buf()) == resolved
+            }) {
+                entry.checkouts.push(resolved);
+            }
+        }
+
+        let mut registry = read_project_registry_file(&paths.project_registry_file)?;
+        if let Some(checkout) = checkout {
+            let resolved = checkout.canonicalize().unwrap_or_else(|_| checkout.to_path_buf());
+            for (existing_id, existing) in &registry.projects {
+                if existing_id != project_id
+                    && existing.checkouts.iter().any(|alias| {
+                        alias.canonicalize().unwrap_or_else(|_| alias.to_path_buf()) == resolved
+                    })
+                {
+                    return Err(MempalaceError::ConfigParse {
+                        path: paths.project_registry_file,
+                        message: format!(
+                            "conflicting project declarations map checkout `{}` to `{existing_id}` and `{project_id}`",
+                            resolved.display()
+                        ),
+                    });
+                }
+            }
+        }
+
+        if let Some(existing) = registry.projects.get(project_id).cloned() {
+            for checkout in existing.checkouts {
+                if !entry.checkouts.iter().any(|candidate| {
+                    candidate.canonicalize().unwrap_or_else(|_| candidate.to_path_buf())
+                        == checkout.canonicalize().unwrap_or_else(|_| checkout.to_path_buf())
+                }) {
+                    entry.checkouts.push(checkout);
+                }
+            }
+            if entry.project_root.is_none() {
+                entry.project_root = existing.project_root;
+            }
+        }
+        registry.projects.insert(project_id.to_owned(), entry);
+        write_project_registry_file(&paths.project_registry_file, &registry)?;
+        Ok(paths.project_registry_file)
+    }
+
+    /// Remove a project declaration from the centralized registry.
+    pub fn remove_project(
+        base_dir_override: Option<&Path>,
+        project_id: &str,
+    ) -> Result<(PathBuf, bool)> {
+        let paths = resolve_paths(base_dir_override)?;
+        let mut registry = read_project_registry_file(&paths.project_registry_file)?;
+        let removed = registry.projects.remove(project_id).is_some();
+        if removed {
+            write_project_registry_file(&paths.project_registry_file, &registry)?;
+        }
+        Ok((paths.project_registry_file, removed))
+    }
 }
 
 fn resolve_paths(base_dir_override: Option<&Path>) -> Result<ResolvedPaths> {
@@ -391,9 +641,58 @@ fn resolve_paths(base_dir_override: Option<&Path>) -> Result<ResolvedPaths> {
     Ok(ResolvedPaths {
         palace_dir: base_dir.join("palace"),
         config_file: base_dir.join(CONFIG_FILE_NAME),
+        project_registry_file: base_dir.join(PROJECT_REGISTRY_FILE_NAME),
         people_map_file: base_dir.join("people_map.json"),
         base_dir,
     })
+}
+
+fn project_entry_matches_path(entry: &ProjectRegistryEntryV1, path: &Path) -> bool {
+    let canonical_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    if entry.checkouts.iter().any(|checkout| {
+        checkout.canonicalize().unwrap_or_else(|_| checkout.to_path_buf()) == canonical_path
+    }) {
+        return true;
+    }
+
+    let Some(project_root) = entry.project_root.as_deref().map(normalize_project_root) else {
+        return false;
+    };
+
+    if let Some(repository_root) = git_repository_root(&canonical_path) {
+        if let Ok(relative) = canonical_path.strip_prefix(&repository_root) {
+            if normalize_project_root(&relative.to_string_lossy()) == project_root {
+                return true;
+            }
+        }
+    }
+
+    entry.checkouts.iter().any(|checkout| {
+        let canonical_checkout = checkout.canonicalize().unwrap_or_else(|_| checkout.to_path_buf());
+        canonical_path
+            .strip_prefix(&canonical_checkout)
+            .ok()
+            .map(|relative| normalize_project_root(&relative.to_string_lossy()) == project_root)
+            .unwrap_or(false)
+    })
+}
+
+fn normalize_project_root(value: &str) -> String {
+    let normalized = value.replace('\\', "/");
+    let normalized = normalized.trim_matches('/').trim_start_matches("./");
+    if normalized.is_empty() { ".".to_owned() } else { normalized.to_owned() }
+}
+
+fn git_repository_root(path: &Path) -> Option<PathBuf> {
+    let output = Command::new("git")
+        .args(["-C", &path.to_string_lossy(), "rev-parse", "--show-toplevel"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8(output.stdout).ok()?;
+    PathBuf::from(value.trim()).canonicalize().ok()
 }
 
 fn read_config_file(path: &Path) -> Result<ConfigFileV1> {
@@ -413,6 +712,50 @@ fn read_config_file(path: &Path) -> Result<ConfigFileV1> {
     }
 
     Ok(file)
+}
+
+fn read_project_registry_file(path: &Path) -> Result<ProjectRegistryFileV1> {
+    if !path.exists() {
+        return Ok(ProjectRegistryFileV1::default());
+    }
+
+    let body = fs::read_to_string(path)
+        .map_err(|source| MempalaceError::ConfigRead { path: path.to_path_buf(), source })?;
+    let file: ProjectRegistryFileV1 = serde_json::from_str(&body).map_err(|err| {
+        MempalaceError::ConfigParse { path: path.to_path_buf(), message: err.to_string() }
+    })?;
+    if file.version != 1 {
+        return Err(MempalaceError::UnsupportedConfigVersion(file.version));
+    }
+    for (project_id, entry) in &file.projects {
+        if let (Some((_, id_root)), Some(entry_root)) =
+            (project_id.split_once('#'), entry.project_root.as_deref())
+        {
+            if normalize_project_root(id_root) != normalize_project_root(entry_root) {
+                return Err(MempalaceError::ConfigParse {
+                    path: path.to_path_buf(),
+                    message: format!(
+                        "conflicting project declaration `{project_id}`: ID root `{id_root}` differs from project_root `{entry_root}`"
+                    ),
+                });
+            }
+        }
+    }
+    Ok(file)
+}
+
+fn write_project_registry_file(
+    path: &Path,
+    registry: &ProjectRegistryFileV1,
+) -> Result<()> {
+    let body = serde_json::to_string_pretty(registry).map_err(|err| MempalaceError::ConfigParse {
+        path: path.to_path_buf(),
+        message: err.to_string(),
+    })?;
+    fs::write(path, body).map_err(|source| MempalaceError::ConfigWrite {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 fn resolve_profile(
@@ -539,7 +882,8 @@ mod tests {
 
     use super::{
         ConfigLoader, DEFAULT_COLLECTION_NAME, DEFAULT_LOW_CPU_INGEST_BATCH_SIZE,
-        LowCpuConfigFileV1, LowCpuRuntimeConfig,
+        LowCpuConfigFileV1, LowCpuRuntimeConfig, ProjectConfig, ProjectRegistryEntryV1,
+        ProjectRoomConfig,
     };
 
     fn temp_dir() -> PathBuf {
@@ -767,6 +1111,180 @@ mod tests {
         assert!(config.rooms.is_empty());
 
         fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn centralized_project_registry_resolves_by_identity_and_checkout_alias() {
+        let config_base = temp_dir();
+        let project = temp_dir();
+        fs::create_dir_all(&project).unwrap();
+        let entry = ProjectRegistryEntryV1 {
+            wing: "wing_registered".to_owned(),
+            rooms: vec![ProjectRoomConfig {
+                name: "backend".to_owned(),
+                description: Some("Backend code".to_owned()),
+                keywords: vec!["api".to_owned()],
+            }],
+            routing: None,
+            checkouts: Vec::new(),
+            project_root: None,
+        };
+
+        ConfigLoader::register_project(
+            Some(&config_base),
+            "github.com/example/repo",
+            entry,
+            Some(&project),
+        )
+        .unwrap();
+
+        let by_identity = ConfigLoader::resolve_project_config(
+            &project,
+            Some(&config_base),
+            Some("github.com/example/repo"),
+            "wing_derived",
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(by_identity.wing, "wing_registered");
+        assert_eq!(by_identity.rooms[0].name, "backend");
+
+        let by_alias = ConfigLoader::resolve_project_config(
+            &project,
+            Some(&config_base),
+            Some("github.com/other/repo"),
+            "wing_derived",
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(by_alias.wing, "wing_registered");
+
+        let registry = ConfigLoader::load_project_registry(Some(&config_base)).unwrap();
+        assert_eq!(registry.projects.len(), 1);
+        assert!(config_base.join("projects.json").is_file());
+
+        fs::remove_dir_all(config_base).unwrap();
+        fs::remove_dir_all(project).unwrap();
+    }
+
+    #[test]
+    fn local_project_config_has_precedence_over_central_registry() {
+        let config_base = temp_dir();
+        let project = temp_dir();
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join("mempalace.yaml"), "wing: local\nrooms: []\n").unwrap();
+        ConfigLoader::register_project(
+            Some(&config_base),
+            "github.com/example/repo",
+            ProjectRegistryEntryV1 {
+                wing: "central".to_owned(),
+                rooms: Vec::new(),
+                routing: None,
+                checkouts: vec![project.clone()],
+                project_root: None,
+            },
+            None,
+        )
+        .unwrap();
+
+        let config = ConfigLoader::resolve_project_config(
+            &project,
+            Some(&config_base),
+            Some("github.com/example/repo"),
+            "derived",
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(config, ProjectConfig { wing: "local".to_owned(), rooms: Vec::new(), routing: None });
+
+        fs::remove_dir_all(config_base).unwrap();
+        fs::remove_dir_all(project).unwrap();
+    }
+
+    #[test]
+    fn monorepo_project_root_matches_subproject_checkout_and_aliases_merge() {
+        let config_base = temp_dir();
+        let repository = temp_dir();
+        let subproject = repository.join("crates").join("api");
+        fs::create_dir_all(&subproject).unwrap();
+        let entry = ProjectRegistryEntryV1 {
+            wing: "wing_api".to_owned(),
+            rooms: vec![ProjectRoomConfig {
+                name: "api".to_owned(),
+                description: None,
+                keywords: Vec::new(),
+            }],
+            routing: None,
+            checkouts: Vec::new(),
+            project_root: Some("crates/api".to_owned()),
+        };
+
+        ConfigLoader::register_project(
+            Some(&config_base),
+            "github.com/example/monorepo#crates/api",
+            entry,
+            Some(&repository),
+        )
+        .unwrap();
+        let clone = temp_dir();
+        fs::create_dir_all(&clone).unwrap();
+        ConfigLoader::register_project(
+            Some(&config_base),
+            "github.com/example/monorepo#crates/api",
+            ProjectRegistryEntryV1 {
+                wing: "wing_api".to_owned(),
+                rooms: Vec::new(),
+                routing: None,
+                checkouts: Vec::new(),
+                project_root: Some("crates/api".to_owned()),
+            },
+            Some(&clone),
+        )
+        .unwrap();
+
+        let resolved = ConfigLoader::resolve_project_config(
+            &subproject,
+            Some(&config_base),
+            Some("github.com/example/monorepo"),
+            "derived",
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(resolved.wing, "wing_api");
+        let registry = ConfigLoader::load_project_registry(Some(&config_base)).unwrap();
+        let entry = registry.projects.get("github.com/example/monorepo#crates/api").unwrap();
+        assert_eq!(entry.checkouts.len(), 2);
+
+        fs::remove_dir_all(config_base).unwrap();
+        fs::remove_dir_all(repository).unwrap();
+        fs::remove_dir_all(clone).unwrap();
+    }
+
+    #[test]
+    fn registering_the_same_checkout_under_two_ids_reports_conflict() {
+        let config_base = temp_dir();
+        let project = temp_dir();
+        fs::create_dir_all(&project).unwrap();
+        let entry = ProjectRegistryEntryV1 {
+            wing: "wing_one".to_owned(),
+            rooms: Vec::new(),
+            routing: None,
+            checkouts: Vec::new(),
+            project_root: None,
+        };
+        ConfigLoader::register_project(Some(&config_base), "one", entry.clone(), Some(&project))
+            .unwrap();
+        let error = ConfigLoader::register_project(
+            Some(&config_base),
+            "two",
+            ProjectRegistryEntryV1 { wing: "wing_two".to_owned(), ..entry },
+            Some(&project),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("conflicting project declarations"));
+
+        fs::remove_dir_all(config_base).unwrap();
+        fs::remove_dir_all(project).unwrap();
     }
 
     #[test]

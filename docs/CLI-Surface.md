@@ -13,17 +13,27 @@ This is the frozen command surface for `mempalace-cli` v1.
 
 Purpose:
 - Detect rooms from the project folder structure.
-- Create or overwrite `mempalace.yaml` in the target project.
+- Register the project centrally under the configured MemPalace base directory.
 - Initialize the default global config tree if needed.
 - Run embedding startup validation and report the status.
 
 Flags:
 - `--yes`
-  Overwrite an existing `mempalace.yaml`.
+  Permit replacing an existing repository-local config when `--repo-config` is
+  also supplied.
+- `--repo-config`
+  Also write a portable repository-local `mempalace.yaml`. Without this flag,
+  `init` does not modify repository files.
+- `--project-id <STRING>`
+  Use an explicit durable identity when the repository has no usable Git
+  origin. The same option is available on `mine` and `project register`.
 
 Notes:
 - Wing name is derived from the directory name, lowercased with spaces and hyphens normalized to underscores.
 - Room detection is folder-name-based and always includes a `general` room.
+- The central registry is stored at `<base-dir>/projects.json` (normally
+  `~/.mempalace/projects.json`) and uses normalized Git origin identity when
+  available, with checkout paths as discovery aliases.
 
 ### `mine <dir>`
 
@@ -33,6 +43,9 @@ Purpose:
 Flags:
 - `--mode <projects|convos>`
 - `--wing <STRING>`
+- `--project-id <STRING>`
+  Select a centralized declaration explicitly. This takes precedence over a
+  repository-local compatibility file.
 - `--agent <STRING>` default: `mempalace`
 - `--limit <N>` default: `0`, meaning no explicit limit
 - `--dry-run`
@@ -40,18 +53,40 @@ Flags:
 - `--reindex`
   Re-process files that were previously ingested and are unchanged on disk by bypassing the unchanged-content skip. In `projects` mode this converts existing content rows to locator rows — use it as the one-time migration step after upgrading a palace from pre-locator storage.
 - `--branch`
-  Mine only files changed vs the merge-base with the default branch (plus untracked files). Always writes to the local palace regardless of federation routing. Uses the `projects-branch` source-key namespace so branch rows never collide with a full mine. Unsupported for `--mode convos`.
+  Mine only files changed vs the merge-base with the default branch (plus untracked files). Always writes to the local palace regardless of federation routing. Uses the `projects-branch` source-key namespace so branch rows never collide with a full mine; keys include stable project identity and branch name. Unsupported for `--mode convos`.
 - `--batch-size <N>` default: unset
   Largest batch to process at once; lower it to bound peak memory and CPU on low-spec machines. For a local mine it caps the number of chunks embedded per batch (default: a file's chunks are embedded together). For a remote-routed mine it caps the number of files per `POST /v1/ingest/batch` request (default: `64`); the ~4 MiB per-request byte cap still applies as an independent guardrail. `0` or omitted keeps the defaults.
 
 Behavior:
 - `projects` uses the project ingest path.
 - `convos` uses the conversation ingest path.
+- Project resolution checks explicit CLI values, optional repository-local
+  config, the central project registry, and then derived defaults. A project
+  can therefore be mined without `mempalace.yaml`.
 - In low-CPU mode, ingest batching is clamped by the resolved low-CPU runtime config. An explicit `--batch-size` overrides that clamp (it takes precedence over the low-CPU default).
 - `--reindex` bypasses the unchanged-content skip in both `projects` and `convos` modes.
 - When the wing's federation route targets a remote palace (mode `remote`, or mode `combined` with `write: remote`) and `--branch` is not set, the CLI prepares chunks locally and pushes them to `POST /v1/ingest/batch` on the remote server. The remote must advertise the `"ingest"` capability in `GET /v1/info`; older servers that lack this endpoint return a 404, which surfaces as a `RemoteRejected` error with a prompt to upgrade.
 - When the wing's federation route is `combined` with `write: both` and `--branch` is not set, the CLI performs a **local-first dual-write**: the full local mine (embedding, storage, summary) runs first, then a best-effort remote push is attempted. The remote result is appended to the mine output; a remote failure is reported without rolling back the local mine. See [Federation guide](Federation.md#write-both--local-first-dual-write-semantics) for the full semantics.
 - `--branch` overrides any remote route for the wing — branch-delta mining is always local.
+
+### `project <register|show|list|remove|export>`
+
+Purpose:
+- Inspect and manage centralized project declarations.
+
+Commands:
+- `project register <dir> [--wing <STRING>]` registers or updates a project
+  using existing repository rules when present, otherwise detected room rules.
+- `project register --project-id <STRING>` supplies an explicit identity for a
+  repository without an origin.
+- `project show <dir>` displays the declaration resolved for a checkout.
+- `project list` lists registered project identities and wings.
+- `project remove <project-id>` removes one registry entry.
+- `project export <project-id> [--dir <PATH>] --repo-config` writes the
+  centralized declaration as a portable repository-local override.
+
+`project register --repo-config` additionally emits a portable repository-local
+`mempalace.yaml`.
 
 ### `search <query>`
 

@@ -330,6 +330,21 @@ impl CliOutput {
     }
 }
 
+/// Combine a local success with a best-effort remote replication result.
+///
+/// The local write determines the command's exit status. If a future remote
+/// path returns a failure output instead of encoding its status in stdout, its
+/// stderr still needs to be surfaced to the user without turning the local
+/// success into a command failure.
+fn combine_dual_write_outputs(local: CliOutput, remote: CliOutput) -> CliOutput {
+    let remote_text = if remote.exit_code == 0 || remote.stderr.trim().is_empty() {
+        remote.stdout
+    } else {
+        remote.stderr
+    };
+    CliOutput::success(format!("{}\n{}", local.stdout.trim(), remote_text.trim()))
+}
+
 fn run_cli<I, T, F, P>(
     args: I,
     context: &CliContext,
@@ -967,11 +982,7 @@ where
                 Some(&project_id),
                 true,
             )?;
-            return Ok(CliOutput::success(format!(
-                "{}\n{}",
-                local_output.stdout.trim(),
-                remote_output.stdout.trim()
-            )));
+            return Ok(combine_dual_write_outputs(local_output, remote_output));
         }
 
         // ── Local mine path continues below with the resolved declaration. ──
@@ -2768,6 +2779,19 @@ mod tests {
             !output.contains("replication:"),
             "non-dual-write must not contain 'replication:', got: {output}",
         );
+    }
+
+    #[test]
+    fn dual_write_surfaces_remote_stderr_without_failing_local_success() {
+        let output = combine_dual_write_outputs(
+            CliOutput::success("local mine complete"),
+            CliOutput::failure(1, "remote replication failed"),
+        );
+
+        assert_eq!(output.exit_code, 0);
+        assert!(output.stdout.contains("local mine complete"));
+        assert!(output.stdout.contains("remote replication failed"));
+        assert!(output.stderr.is_empty());
     }
 
     #[test]

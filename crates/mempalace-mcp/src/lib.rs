@@ -448,7 +448,7 @@ impl ToolName {
             },
             Self::DiaryRead => ToolDefinition {
                 name: self.as_str(),
-                description: "Read complete diary entries across all wings. Pass entry_id from wake-up to retrieve one entry's full detail; otherwise filters narrow recent entries by wing, agent author, or topic. Always local; never federated.",
+                description: "Read complete diary entries by entry_id for full detail, or list recent entries with filters. Always local; never federated.",
                 input_schema: json!({
                     "type":"object",
                     "properties":{
@@ -1447,6 +1447,10 @@ where
     }
 
     async fn diary_read_payload(&mut self, filters: DiaryReadFilters) -> ToolResult<Value> {
+        if let Some(entry_id) = filters.entry_id.clone() {
+            return self.diary_read_detail(entry_id, &filters).await;
+        }
+
         let room = parse_room_id(DIARY_ROOM)?;
         let mut drawers = self
             .storage
@@ -1466,7 +1470,7 @@ where
                 "agent": filters.agent_name.clone(),
                 "wing": filters.wing.as_ref().map(|wing| wing.as_str()),
                 "topic": filters.topic.clone(),
-                "since": format_rfc3339(filters.since)?,
+                "since": filters.since.map(format_rfc3339).transpose()?,
                 "entries": [],
                 "message": "No diary entries yet.",
             }));
@@ -1485,11 +1489,60 @@ where
             "agent": filters.agent_name.clone(),
             "wing": filters.wing.as_ref().map(|wing| wing.as_str()),
             "topic": filters.topic.clone(),
-            "since": format_rfc3339(filters.since)?,
+            "since": filters.since.map(format_rfc3339).transpose()?,
             "entries": entries,
             "total": total,
             "showing": total.min(filters.last_n),
         }))
+    }
+
+    async fn diary_read_detail(
+        &mut self,
+        entry_id: DrawerId,
+        filters: &DiaryReadFilters,
+    ) -> ToolResult<Value> {
+        let drawer = self.storage.drawer_store().get_drawer(&entry_id).await.map_tool()?;
+
+        let Some(drawer) = drawer else {
+            return Ok(json!({
+                "entry_id": entry_id.as_str(),
+                "message": "Diary entry not found.",
+            }));
+        };
+
+        if drawer.ingest_mode != "diary" {
+            return Ok(json!({
+                "entry_id": entry_id.as_str(),
+                "message": "Entry is not a diary entry.",
+            }));
+        }
+
+        if let Some(agent_name) = filters.agent_name.as_deref() {
+            if drawer.added_by != agent_name {
+                return Ok(json!({
+                    "entry_id": entry_id.as_str(),
+                    "message": "Diary entry not found for this agent.",
+                }));
+            }
+        }
+        if let Some(wing) = filters.wing.as_ref() {
+            if drawer.wing != *wing {
+                return Ok(json!({
+                    "entry_id": entry_id.as_str(),
+                    "message": "Diary entry not found for this wing.",
+                }));
+            }
+        }
+        if let Some(topic) = filters.topic.as_deref() {
+            if diary_entry_topic(&drawer) != topic {
+                return Ok(json!({
+                    "entry_id": entry_id.as_str(),
+                    "message": "Diary entry not found for this topic.",
+                }));
+            }
+        }
+
+        render_diary_entry(drawer, true, None)
     }
 
     async fn wake_up_diary_payload(
@@ -2365,7 +2418,7 @@ struct DiaryReadFilters {
     wing: Option<WingId>,
     topic: Option<String>,
     entry_id: Option<DrawerId>,
-    since: OffsetDateTime,
+    since: Option<OffsetDateTime>,
     last_n: usize,
 }
 
@@ -2380,13 +2433,17 @@ impl DiaryReadFilters {
             .as_deref()
             .map(parse_drawer_id)
             .transpose()?;
-        let since = optional_string(arguments, "since")?
-            .as_deref()
-            .map(parse_since_timestamp)
-            .transpose()?
-            .unwrap_or_else(|| {
-                if entry_id.is_some() { OffsetDateTime::UNIX_EPOCH } else { now - Duration::days(1) }
-            });
+        let since = if entry_id.is_some() {
+            None
+        } else {
+            Some(
+                optional_string(arguments, "since")?
+                    .as_deref()
+                    .map(parse_since_timestamp)
+                    .transpose()?
+                    .unwrap_or_else(|| now - Duration::days(1)),
+            )
+        };
         let last_n = optional_usize(arguments, "last_n")?.unwrap_or(10);
         Ok(Self { agent_name, wing, topic, entry_id, since, last_n })
     }
@@ -2401,8 +2458,13 @@ fn parse_since_timestamp(value: &str) -> ToolResult<OffsetDateTime> {
 }
 
 fn diary_entry_matches(drawer: &DrawerRecord, filters: &DiaryReadFilters) -> bool {
-    if drawer.ingest_mode != "diary" || drawer.filed_at < filters.since {
+    if drawer.ingest_mode != "diary" {
         return false;
+    }
+    if let Some(since) = filters.since {
+        if drawer.filed_at < since {
+            return false;
+        }
     }
     if let Some(agent_name) = filters.agent_name.as_deref() {
         if drawer.added_by != agent_name {
@@ -3536,8 +3598,14 @@ mod tests {
                 .await,
         )
         .unwrap();
-        assert_eq!(detail["entries"][0]["content"], full_entry);
-        assert_eq!(detail["entries"][0]["entry_id"], entry_id);
+        assert_eq!(detail["content"], full_entry);
+        assert_eq!(detail["entry_id"], entry_id);
+        assert_eq!(detail["agent"], "Summary Bot");
+        assert_eq!(detail["topic"], "summary");
+        assert!(detail.get("since").is_none());
+        assert!(detail.get("entries").is_none());
+        assert!(detail.get("total").is_none());
+        assert!(detail.get("showing").is_none());
 
         let rejected = harness
             .server

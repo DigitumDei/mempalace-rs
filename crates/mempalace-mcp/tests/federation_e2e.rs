@@ -1420,6 +1420,7 @@ async fn diary_events_never_appear_in_remote_changes() {
             json!({
                 "agent_name": "hub-agent",
                 "entry": "hub diary entry — must not appear in federated changes feed",
+                "summary": "Hub diary entry.",
                 "topic": "diary-filter-test"
             }),
         )
@@ -1475,6 +1476,7 @@ async fn diary_events_never_appear_in_remote_changes() {
         json!({
             "agent_name": "local-agent",
             "entry": "local diary entry — must appear with origin=local",
+            "summary": "Local diary entry.",
             "topic": "local-diary-test"
         }),
     )

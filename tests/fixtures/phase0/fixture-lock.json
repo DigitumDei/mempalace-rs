@@ -7,7 +7,7 @@
     "goldens/palace-graph.json": "fb2ac6eff8121d7a564b7d7ce895e32c1b58dd9e1f089786077476cc662dfc67",
     "inventory/cli-help.json": "2592f920cd18bc6df625474721d4564120d8b537a3f2de3bfe57c5db74129579",
     "inventory/environment.json": "f42db39ff92f7fd30e895796f7db4e2da00d5e02ebe6a4b917da06128dd88b53",
-    "inventory/mcp-tools.json": "95c26269980633a980dd9425725db0f6e567ddb03fd3953014cf7a6621e33e78"
+    "inventory/mcp-tools.json": "548a0114a80ce3707fbade7706ca45114fe8dd0b20f9cb2b7b345319a701e85d"
   },
   "input_hashes": {
     "inputs/convos/product_strategy.txt": "0153de51c16a1c6e6407b9548325a75d78364fb71d6762b4d4638a533ec98658",

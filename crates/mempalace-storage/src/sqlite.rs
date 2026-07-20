@@ -141,6 +141,15 @@ CREATE TABLE IF NOT EXISTS change_log (
 CREATE INDEX IF NOT EXISTS idx_change_log_occurred_at ON change_log(occurred_at ASC);
         "#,
     ),
+    (
+        "0006_diary_summaries",
+        r#"
+CREATE TABLE IF NOT EXISTS diary_summaries (
+    entry_id TEXT PRIMARY KEY,
+    summary TEXT NOT NULL
+);
+        "#,
+    ),
 ];
 
 pub trait IngestManifestStore {
@@ -285,6 +294,7 @@ impl SqliteOperationalStore {
             "0003_knowledge_graph_facts",
             "0004_knowledge_graph_fact_lookup_index",
             "0005_change_log",
+            "0006_diary_summaries",
         ]
     }
 
@@ -342,6 +352,37 @@ impl SqliteOperationalStore {
              PRAGMA synchronous = NORMAL;",
         )?;
         Ok(connection)
+    }
+}
+
+/// Persistent summaries for diary entries. Diary content remains in the drawer
+/// store; keeping summaries here avoids rewriting existing Lance rows.
+pub trait DiaryStore {
+    fn store_diary_summary(&self, entry_id: &DrawerId, summary: &str) -> Result<()>;
+    fn get_diary_summary(&self, entry_id: &DrawerId) -> Result<Option<String>>;
+}
+
+impl DiaryStore for SqliteOperationalStore {
+    fn store_diary_summary(&self, entry_id: &DrawerId, summary: &str) -> Result<()> {
+        let connection = self.open_connection()?;
+        connection.execute(
+            "INSERT INTO diary_summaries (entry_id, summary) VALUES (?1, ?2)
+             ON CONFLICT(entry_id) DO UPDATE SET summary = excluded.summary",
+            params![entry_id.as_str(), summary],
+        )?;
+        Ok(())
+    }
+
+    fn get_diary_summary(&self, entry_id: &DrawerId) -> Result<Option<String>> {
+        let connection = self.open_connection()?;
+        connection
+            .query_row(
+                "SELECT summary FROM diary_summaries WHERE entry_id = ?1",
+                [entry_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
     }
 }
 

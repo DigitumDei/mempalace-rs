@@ -67,11 +67,15 @@
     }
   },
   "mempalace_diary_read": {
-    "description": "Read recent diary entries across all wings. Defaults to entries since the past day; optional filters narrow by wing, agent author, or topic. Always local; never federated.",
+    "description": "Read complete diary entries across all wings. Pass entry_id from wake-up to retrieve one entry's full detail; otherwise filters narrow recent entries by wing, agent author, or topic. Always local; never federated.",
     "input_schema": {
       "properties": {
         "agent_name": {
           "description": "Filter by diary author (optional, default: all agents)",
+          "type": "string"
+        },
+        "entry_id": {
+          "description": "Retrieve the complete entry for this wake-up entry identifier",
           "type": "string"
         },
         "last_n": {
@@ -95,7 +99,7 @@
     }
   },
   "mempalace_diary_write": {
-    "description": "Write a diary entry. Project-scoped entries are stored in the specified project wing; agent-scoped entries are stored in the shared wing_agents diary. The agent name is recorded as author attribution, not as the storage partition. Always local; never federated.",
+    "description": "Write a diary entry with a concise summary of at most 400 characters. Project-scoped entries are stored in the specified project wing; agent-scoped entries are stored in the shared wing_agents diary. The agent name is recorded as author attribution, not as the storage partition. Always local; never federated.",
     "input_schema": {
       "properties": {
         "agent_name": {
@@ -104,6 +108,10 @@
         },
         "entry": {
           "description": "Your diary entry",
+          "type": "string"
+        },
+        "summary": {
+          "description": "Required summary (at most 400 characters) covering the outcome and important TODOs",
           "type": "string"
         },
         "scope": {
@@ -125,7 +133,8 @@
       },
       "required": [
         "agent_name",
-        "entry"
+        "entry",
+        "summary"
       ],
       "type": "object"
     }

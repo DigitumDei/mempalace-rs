@@ -10,7 +10,7 @@ pub use engine::StorageEngine;
 pub use error::{Result, StorageError};
 pub use lance::LanceDrawerStore;
 pub use sqlite::{
-    ChangeCursor, ChangeEvent, ChangeLogStore, ChangePage, EntityRegistryStore, GraphStore,
+    ChangeCursor, ChangeEvent, ChangeLogStore, ChangePage, DiaryStore, EntityRegistryStore, GraphStore,
     IngestManifestStore, KnowledgeGraphStore, SqliteOperationalStore, ToolStateStore,
 };
 pub use types::{

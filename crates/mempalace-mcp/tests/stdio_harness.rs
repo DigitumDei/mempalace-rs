@@ -92,7 +92,7 @@ async fn server_handles_embedding_backed_tool_calls_over_transport() {
     let input = concat!(
         "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"mempalace_add_drawer\",\"arguments\":{\"wing\":\"wing_code\",\"room\":\"backend\",\"content\":\"Rust MCP transport coverage note\",\"source_file\":\"transport.md\",\"added_by\":\"stdio-test\"}}}\n",
         "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"mempalace_check_duplicate\",\"arguments\":{\"content\":\"Rust MCP transport coverage note\",\"threshold\":0.9}}}\n",
-        "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"mempalace_diary_write\",\"arguments\":{\"agent_name\":\"Transport Bot\",\"entry\":\"SESSION:2026-04-17|transport.coverage\",\"topic\":\"transport\"}}}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"mempalace_diary_write\",\"arguments\":{\"agent_name\":\"Transport Bot\",\"entry\":\"SESSION:2026-04-17|transport.coverage\",\"summary\":\"Transport coverage complete.\",\"topic\":\"transport\"}}}\n",
         "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"mempalace_diary_read\",\"arguments\":{\"agent_name\":\"Transport Bot\",\"last_n\":1}}}\n"
     );
 

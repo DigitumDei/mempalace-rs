@@ -10,8 +10,8 @@ use std::sync::Arc;
 use blake3::Hasher;
 use mempalace_config::{ConfigLoader, MempalaceConfig, ReplicationStatus, RouteMode, WriteTarget};
 use mempalace_core::{
-    DIARY_HALL, DIARY_ROOM, DIARY_TOPIC_PREFIX, DrawerId, DrawerRecord, EmbeddingProfile, RoomId,
-    SHARED_AGENT_DIARY_WING, SearchQuery, WingId,
+    DIARY_HALL, DIARY_ROOM, DIARY_SUMMARY_MAX_CHARS, DIARY_TOPIC_PREFIX, DrawerId, DrawerRecord,
+    EmbeddingProfile, RoomId, SHARED_AGENT_DIARY_WING, SearchQuery, WingId,
 };
 use mempalace_embeddings::{
     EmbeddingError, EmbeddingProvider, EmbeddingRequest, FastembedProvider,
@@ -23,8 +23,8 @@ use mempalace_graph::{
 };
 use mempalace_search::{SearchRuntime, SearchRuntimePolicy};
 use mempalace_storage::{
-    ChangeEvent, ChangeLogStore, DrawerFilter, DrawerStore, DuplicateStrategy, IngestCommitRequest,
-    StorageEngine,
+    ChangeEvent, ChangeLogStore, DiaryStore, DrawerFilter, DrawerStore, DuplicateStrategy,
+    IngestCommitRequest, StorageEngine,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -110,7 +110,7 @@ const WAKE_UP_PROJECT_MIN_SEARCH_LIMIT: usize = 50;
 const IDENTITY_UPDATE_MAX_CONTENT_BYTES: usize = 16 * 1024;
 const IDENTITY_MAX_BYTES: usize = 64 * 1024;
 
-pub const PALACE_PROTOCOL: &str = "IMPORTANT — MemPalace Memory Protocol:\n1. ON WAKE-UP: Call mempalace_wake_up with agent_name to load identity, palace status, recent changes, current project context, and recent diaries across agents.\n2. BEFORE RESPONDING about any person, project, or past event: call mempalace_kg_query or mempalace_search FIRST. Never guess — verify.\n3. IF UNSURE about a fact (name, gender, age, relationship): say \"let me check\" and query the palace. Wrong is worse than slow.\n4. AFTER EACH SESSION: call mempalace_diary_write to record what happened, what you learned, what matters.\n5. WHEN FACTS CHANGE: call mempalace_kg_invalidate on the old fact, mempalace_kg_add for the new one.\n6. WHEN IDENTITY CHANGES: call mempalace_identity_update so future sessions wake up with the corrected identity.\n\nThis protocol ensures the AI KNOWS before it speaks. Storage is not memory — but storage + this protocol = memory.";
+pub const PALACE_PROTOCOL: &str = "IMPORTANT — MemPalace Memory Protocol:\n1. ON WAKE-UP: Call mempalace_wake_up with agent_name to load identity, palace status, recent changes, current project context, and recent diary summaries across agents. Use mempalace_diary_read with an entry_id when full diary detail is needed.\n2. BEFORE RESPONDING about any person, project, or past event: call mempalace_kg_query or mempalace_search FIRST. Never guess — verify.\n3. IF UNSURE about a fact (name, gender, age, relationship): say \"let me check\" and query the palace. Wrong is worse than slow.\n4. AFTER EACH SESSION: call mempalace_diary_write to record what happened, what you learned, what matters, with a concise summary.\n5. WHEN FACTS CHANGE: call mempalace_kg_invalidate on the old fact, mempalace_kg_add for the new one.\n6. WHEN IDENTITY CHANGES: call mempalace_identity_update so future sessions wake up with the corrected identity.\n\nThis protocol ensures the AI KNOWS before it speaks. Storage is not memory — but storage + this protocol = memory.";
 
 pub const AAAK_SPEC: &str = "AAAK is a compressed memory dialect that MemPalace uses for efficient storage.\nIt is designed to be readable by both humans and LLMs without decoding.\n\nFORMAT:\n  ENTITIES: 3-letter uppercase codes. ALC=Alice, JOR=Jordan, RIL=Riley, MAX=Max, BEN=Ben.\n  EMOTIONS: *action markers* before/during text. *warm*=joy, *fierce*=determined, *raw*=vulnerable, *bloom*=tenderness.\n  STRUCTURE: Pipe-separated fields. FAM: family | PROJ: projects | ⚠: warnings/reminders.\n  DATES: ISO format (2026-03-31). COUNTS: Nx = N mentions (e.g., 570x).\n  IMPORTANCE: ★ to ★★★★★ (1-5 scale).\n  HALLS: hall_facts, hall_events, hall_discoveries, hall_preferences, hall_advice.\n  WINGS: wing_user, wing_agent, wing_team, wing_code, wing_myproject, wing_hardware, wing_ue5, wing_ai_research.\n  ROOMS: Hyphenated slugs representing named ideas (e.g., chromadb-setup, gpu-pricing).\n\nEXAMPLE:\n  FAM: ALC→♡JOR | 2D(kids): RIL(18,sports) MAX(11,chess+swimming) | BEN(contributor)\n\nRead AAAK naturally — expand codes mentally, treat *markers* as emotional context.\nWhen WRITING AAAK: use entity codes, mark emotions, keep structure tight.";
 
@@ -432,28 +432,30 @@ impl ToolName {
             },
             Self::DiaryWrite => ToolDefinition {
                 name: self.as_str(),
-                description: "Write a diary entry. Project-scoped entries are stored in the specified project wing; agent-scoped entries are stored in the shared wing_agents diary. The agent name is recorded as author attribution, not as the storage partition. Always local; never federated.",
+                description: "Write a diary entry with a concise summary of at most 400 characters. Project-scoped entries are stored in the specified project wing; agent-scoped entries are stored in the shared wing_agents diary. The agent name is recorded as author attribution, not as the storage partition. Always local; never federated.",
                 input_schema: json!({
                     "type":"object",
                     "properties":{
                         "agent_name":{"type":"string","description":"Your name — recorded as the diary author"},
                         "entry":{"type":"string","description":"Your diary entry"},
+                        "summary":{"type":"string","description":"Required summary (at most 400 characters) covering the outcome and important TODOs"},
                         "topic":{"type":"string","description":"Topic tag (optional, default: general)"},
                         "scope":{"type":"string","description":"Where to store the entry: agent or project (optional, default: agent)","enum":["agent","project"]},
                         "wing":{"type":"string","description":"Project wing for project-scoped entries. Ignored for agent-scoped entries, which always use wing_agents."}
                     },
-                    "required":["agent_name","entry"]
+                    "required":["agent_name","entry","summary"]
                 }),
             },
             Self::DiaryRead => ToolDefinition {
                 name: self.as_str(),
-                description: "Read recent diary entries across all wings. Defaults to entries since the past day; optional filters narrow by wing, agent author, or topic. Always local; never federated.",
+                description: "Read complete diary entries by entry_id for full detail, or list recent entries with filters. Always local; never federated.",
                 input_schema: json!({
                     "type":"object",
                     "properties":{
                         "agent_name":{"type":"string","description":"Filter by diary author (optional, default: all agents)"},
                         "wing":{"type":"string","description":"Filter by wing (optional, default: all wings)"},
                         "topic":{"type":"string","description":"Filter by topic tag (optional, default: all topics)"},
+                        "entry_id":{"type":"string","description":"Retrieve the complete entry for this wake-up entry identifier"},
                         "since":{"type":"string","description":"Return entries filed at or after this RFC 3339 timestamp (optional, default: 24 hours ago)"},
                         "last_n":{"type":"integer","description":"Number of recent entries to read (default: 10)"}
                     }
@@ -1350,6 +1352,16 @@ where
                 "error": format!("Drawer not found: {}", drawer_id.as_str()),
             }));
         }
+        // The LanceDB deletion has already succeeded. A SQLite cleanup failure
+        // must not make this operation appear to have failed: callers would
+        // retry against a missing drawer and could never remove the summary.
+        if let Err(error) = self.storage.operational_store().delete_diary_summary(&drawer_id) {
+            tracing::warn!(
+                %drawer_id,
+                %error,
+                "failed to delete diary summary after drawer deletion"
+            );
+        }
         self.log_change(ChangeEvent {
             event_type: "drawer_deleted".to_owned(),
             occurred_at: OffsetDateTime::now_utc(),
@@ -1369,6 +1381,8 @@ where
     async fn tool_diary_write(&mut self, arguments: &Value) -> ToolResult<Value> {
         let agent_name = required_string(arguments, "agent_name")?;
         let entry = required_string(arguments, "entry")?;
+        let summary = required_string(arguments, "summary")?;
+        validate_diary_summary(&summary)?;
         let topic = optional_string(arguments, "topic")?.unwrap_or_else(|| "general".to_owned());
         let scope = optional_string(arguments, "scope")?.unwrap_or_else(|| "agent".to_owned());
         let wing_name = diary_write_wing_name(&scope, optional_string(arguments, "wing")?)?;
@@ -1393,15 +1407,22 @@ where
             )
             .await?;
 
+        // Record the summary with its pending ingest state before exposing the
+        // drawer, so a crash after the Lance write leaves a recoverable pending
+        // run (not an orphaned summary) and a retry does not create a silently
+        // divergent prior entry.
         self.storage
-            .commit_ingest(IngestCommitRequest {
-                ingest_kind: "diary".to_owned(),
-                source_key: format!("diary:{}", drawer_id.as_str()),
-                source_file,
-                content_hash: record.content_hash.clone(),
-                drawers: vec![record],
-                duplicate_strategy: DuplicateStrategy::Error,
-            })
+            .commit_diary_ingest(
+                IngestCommitRequest {
+                    ingest_kind: "diary".to_owned(),
+                    source_key: format!("diary:{}", drawer_id.as_str()),
+                    source_file,
+                    content_hash: record.content_hash.clone(),
+                    drawers: vec![record],
+                    duplicate_strategy: DuplicateStrategy::Error,
+                },
+                &summary,
+            )
             .await
             .map_tool()?;
 
@@ -1424,6 +1445,7 @@ where
             "scope": scope,
             "wing": stored_wing,
             "timestamp": format_rfc3339(now)?,
+            "summary": summary,
         }))
     }
 
@@ -1433,6 +1455,10 @@ where
     }
 
     async fn diary_read_payload(&mut self, filters: DiaryReadFilters) -> ToolResult<Value> {
+        if let Some(entry_id) = filters.entry_id.clone() {
+            return self.diary_read_detail(entry_id, &filters).await;
+        }
+
         let room = parse_room_id(DIARY_ROOM)?;
         let mut drawers = self
             .storage
@@ -1452,7 +1478,7 @@ where
                 "agent": filters.agent_name.clone(),
                 "wing": filters.wing.as_ref().map(|wing| wing.as_str()),
                 "topic": filters.topic.clone(),
-                "since": format_rfc3339(filters.since)?,
+                "since": filters.since.map(format_rfc3339).transpose()?,
                 "entries": [],
                 "message": "No diary entries yet.",
             }));
@@ -1463,7 +1489,7 @@ where
         let entries = drawers
             .into_iter()
             .take(filters.last_n)
-            .map(|drawer| render_diary_entry(drawer, true))
+            .map(|drawer| render_diary_entry(drawer, true, None))
             .collect::<ToolResult<Vec<_>>>()?;
 
         Ok(json!({
@@ -1471,11 +1497,68 @@ where
             "agent": filters.agent_name.clone(),
             "wing": filters.wing.as_ref().map(|wing| wing.as_str()),
             "topic": filters.topic.clone(),
-            "since": format_rfc3339(filters.since)?,
+            "since": filters.since.map(format_rfc3339).transpose()?,
             "entries": entries,
             "total": total,
             "showing": total.min(filters.last_n),
         }))
+    }
+
+    async fn diary_read_detail(
+        &mut self,
+        entry_id: DrawerId,
+        filters: &DiaryReadFilters,
+    ) -> ToolResult<Value> {
+        let drawer = self.storage.drawer_store().get_drawer(&entry_id).await.map_tool()?;
+
+        let Some(drawer) = drawer else {
+            return Ok(json!({
+                "entry_id": entry_id.as_str(),
+                "message": "Diary entry not found.",
+            }));
+        };
+
+        let diary_room = parse_room_id(DIARY_ROOM)?;
+        if drawer.room != diary_room {
+            return Ok(json!({
+                "entry_id": entry_id.as_str(),
+                "message": "Diary entry not found.",
+            }));
+        }
+
+        if drawer.ingest_mode != "diary" {
+            return Ok(json!({
+                "entry_id": entry_id.as_str(),
+                "message": "Entry is not a diary entry.",
+            }));
+        }
+
+        if let Some(agent_name) = filters.agent_name.as_deref() {
+            if drawer.added_by != agent_name {
+                return Ok(json!({
+                    "entry_id": entry_id.as_str(),
+                    "message": "Diary entry not found for this agent.",
+                }));
+            }
+        }
+        if let Some(wing) = filters.wing.as_ref() {
+            if drawer.wing != *wing {
+                return Ok(json!({
+                    "entry_id": entry_id.as_str(),
+                    "message": "Diary entry not found for this wing.",
+                }));
+            }
+        }
+        if let Some(topic) = filters.topic.as_deref() {
+            if diary_entry_topic(&drawer) != topic {
+                return Ok(json!({
+                    "entry_id": entry_id.as_str(),
+                    "message": "Diary entry not found for this topic.",
+                }));
+            }
+        }
+
+        render_diary_entry(drawer, true, None)
     }
 
     async fn wake_up_diary_payload(
@@ -1504,7 +1587,27 @@ where
                     Some(drawer)
                 }
             })
-            .map(|drawer| render_diary_entry(drawer, true))
+            .collect::<Vec<_>>();
+
+        // Bulk-fetch summaries for all entries in a single query.
+        let ids: Vec<DrawerId> = entries.iter().map(|d| d.id.clone()).collect();
+        let summaries: std::collections::HashMap<DrawerId, String> = self
+            .storage
+            .operational_store()
+            .get_diary_summaries(&ids)
+            .map_tool()?
+            .into_iter()
+            .collect();
+
+        let entries = entries
+            .into_iter()
+            .map(|drawer| {
+                let summary = summaries
+                    .get(&drawer.id)
+                    .cloned()
+                    .unwrap_or_else(|| legacy_diary_summary(&drawer.content));
+                render_diary_entry(drawer, true, Some(summary))
+            })
             .collect::<ToolResult<Vec<_>>>()?;
 
         if entries.is_empty() {
@@ -2330,7 +2433,8 @@ struct DiaryReadFilters {
     agent_name: Option<String>,
     wing: Option<WingId>,
     topic: Option<String>,
-    since: OffsetDateTime,
+    entry_id: Option<DrawerId>,
+    since: Option<OffsetDateTime>,
     last_n: usize,
 }
 
@@ -2341,13 +2445,23 @@ impl DiaryReadFilters {
         let wing =
             optional_string(arguments, "wing")?.map(|wing| parse_wing_id(&wing)).transpose()?;
         let topic = optional_string(arguments, "topic")?;
-        let since = optional_string(arguments, "since")?
+        let entry_id = optional_string(arguments, "entry_id")?
             .as_deref()
-            .map(parse_since_timestamp)
-            .transpose()?
-            .unwrap_or_else(|| now - Duration::days(1));
+            .map(parse_drawer_id)
+            .transpose()?;
+        let since = if entry_id.is_some() {
+            None
+        } else {
+            Some(
+                optional_string(arguments, "since")?
+                    .as_deref()
+                    .map(parse_since_timestamp)
+                    .transpose()?
+                    .unwrap_or_else(|| now - Duration::days(1)),
+            )
+        };
         let last_n = optional_usize(arguments, "last_n")?.unwrap_or(10);
-        Ok(Self { agent_name, wing, topic, since, last_n })
+        Ok(Self { agent_name, wing, topic, entry_id, since, last_n })
     }
 }
 
@@ -2360,8 +2474,13 @@ fn parse_since_timestamp(value: &str) -> ToolResult<OffsetDateTime> {
 }
 
 fn diary_entry_matches(drawer: &DrawerRecord, filters: &DiaryReadFilters) -> bool {
-    if drawer.ingest_mode != "diary" || drawer.filed_at < filters.since {
+    if drawer.ingest_mode != "diary" {
         return false;
+    }
+    if let Some(since) = filters.since {
+        if drawer.filed_at < since {
+            return false;
+        }
     }
     if let Some(agent_name) = filters.agent_name.as_deref() {
         if drawer.added_by != agent_name {
@@ -2380,7 +2499,11 @@ fn diary_entry_topic(drawer: &DrawerRecord) -> &str {
     drawer.source_file.strip_prefix(DIARY_TOPIC_PREFIX).unwrap_or("general")
 }
 
-fn render_diary_entry(drawer: DrawerRecord, include_agent: bool) -> ToolResult<Value> {
+fn render_diary_entry(
+    drawer: DrawerRecord,
+    include_agent: bool,
+    summary: Option<String>,
+) -> ToolResult<Value> {
     let topic = diary_entry_topic(&drawer).to_owned();
     let date = drawer.date.map(format_date).unwrap_or_else(|| drawer.filed_at.date().to_string());
     let timestamp = format_rfc3339(drawer.filed_at)?;
@@ -2389,12 +2512,31 @@ fn render_diary_entry(drawer: DrawerRecord, include_agent: bool) -> ToolResult<V
         "timestamp": timestamp,
         "wing": drawer.wing.as_str(),
         "topic": topic,
-        "content": drawer.content,
+        "entry_id": drawer.id.as_str(),
     });
+    if let Some(summary) = summary {
+        entry["summary"] = json!(summary);
+    } else {
+        entry["content"] = json!(drawer.content);
+    }
     if include_agent {
         entry["agent"] = json!(drawer.added_by);
     }
     Ok(entry)
+}
+
+fn validate_diary_summary(summary: &str) -> ToolResult<()> {
+    let length = summary.chars().count();
+    if length > DIARY_SUMMARY_MAX_CHARS {
+        return Err(ToolError::InvalidParams(format!(
+            "`summary` must be at most {DIARY_SUMMARY_MAX_CHARS} characters; received {length}"
+        )));
+    }
+    Ok(())
+}
+
+fn legacy_diary_summary(content: &str) -> String {
+    content.chars().take(DIARY_SUMMARY_MAX_CHARS).collect()
 }
 
 pub(crate) fn round_similarity(value: f32) -> f32 {
@@ -3086,7 +3228,7 @@ mod tests {
             .handle_request(tool_call(
                 601,
                 "mempalace_diary_write",
-                json!({"agent_name":"Wake Bot","entry":"SESSION:wakeup.changed","topic":"wakeup"}),
+                json!({"agent_name":"Wake Bot","entry":"SESSION:wakeup.changed","summary":"Wake-up changed.","topic":"wakeup"}),
             ))
             .await;
         harness
@@ -3094,7 +3236,7 @@ mod tests {
             .handle_request(tool_call(
                 602,
                 "mempalace_diary_write",
-                json!({"agent_name":"Other Bot","entry":"SESSION:other.agent.changed","topic":"handoff"}),
+                json!({"agent_name":"Other Bot","entry":"SESSION:other.agent.changed","summary":"Other agent changed.","topic":"handoff"}),
             ))
             .await;
 
@@ -3190,8 +3332,9 @@ mod tests {
         let diary_entries = payload["diary"]["entries"].as_array().unwrap();
         assert_eq!(payload["diary"]["showing"], 12);
         assert_eq!(diary_entries.len(), 12);
-        assert!(diary_entries.iter().any(|entry| entry["content"] == "SESSION:recent-00"));
-        assert!(diary_entries.iter().any(|entry| entry["content"] == "SESSION:recent-11"));
+        assert!(diary_entries.iter().any(|entry| entry["summary"] == "SESSION:recent-00"));
+        assert!(diary_entries.iter().any(|entry| entry["summary"] == "SESSION:recent-11"));
+        assert!(diary_entries.iter().all(|entry| entry.get("content").is_none()));
     }
 
     #[tokio::test]
@@ -3231,9 +3374,9 @@ mod tests {
         let diary_entries = payload["diary"]["entries"].as_array().unwrap();
         assert_eq!(payload["diary"]["showing"], 10);
         assert_eq!(diary_entries.len(), 10);
-        assert!(diary_entries.iter().any(|entry| entry["content"] == "SESSION:old-11"));
-        assert!(diary_entries.iter().any(|entry| entry["content"] == "SESSION:old-02"));
-        assert!(!diary_entries.iter().any(|entry| entry["content"] == "SESSION:old-01"));
+        assert!(diary_entries.iter().any(|entry| entry["summary"] == "SESSION:old-11"));
+        assert!(diary_entries.iter().any(|entry| entry["summary"] == "SESSION:old-02"));
+        assert!(!diary_entries.iter().any(|entry| entry["summary"] == "SESSION:old-01"));
     }
 
     #[tokio::test]
@@ -3278,8 +3421,8 @@ mod tests {
         assert_eq!(payload["diary"]["since"], "2026-04-01T00:00:00Z");
         assert_eq!(payload["diary"]["showing"], 12);
         assert_eq!(diary_entries.len(), 12);
-        assert!(diary_entries.iter().any(|entry| entry["content"] == "SESSION:since-00"));
-        assert!(diary_entries.iter().any(|entry| entry["content"] == "SESSION:since-11"));
+        assert!(diary_entries.iter().any(|entry| entry["summary"] == "SESSION:since-00"));
+        assert!(diary_entries.iter().any(|entry| entry["summary"] == "SESSION:since-11"));
     }
 
     #[tokio::test]
@@ -3405,7 +3548,7 @@ mod tests {
             .handle_request(tool_call(
                 8,
                 "mempalace_diary_write",
-                json!({"agent_name":"Codex Bot","entry":"SESSION:2026-04-11|phase8.done","topic":"phase8"}),
+                json!({"agent_name":"Codex Bot","entry":"SESSION:2026-04-11|phase8.done","summary":"Phase 8 completed.","topic":"phase8"}),
             ))
             .await;
         let write_payload = decode_tool_payload(&write).unwrap();
@@ -3424,6 +3567,331 @@ mod tests {
         assert_eq!(read_payload["entries"][0]["agent"], "Codex Bot");
         assert_eq!(read_payload["entries"][0]["wing"], SHARED_AGENT_DIARY_WING);
         assert_eq!(read_payload["entries"][0]["topic"], "phase8");
+        assert!(
+            read_payload["entries"][0]["entry_id"].is_string(),
+            "listing responses must expose an entry_id for detail lookup"
+        );
+    }
+
+    #[tokio::test]
+    async fn diary_summary_is_bounded_and_wake_up_supports_detail_lookup() {
+        let harness = test_harness().await;
+        let full_entry = "Completed the implementation. TODO: wait for CI results.";
+        let write = harness
+            .server
+            .handle_request(tool_call(
+                81,
+                "mempalace_diary_write",
+                json!({
+                    "agent_name":"Summary Bot",
+                    "entry":full_entry,
+                    "summary":"Implementation completed; wait for CI.",
+                    "topic":"summary"
+                }),
+            ))
+            .await;
+        let write_payload = decode_tool_payload(&write).unwrap();
+        let entry_id = write_payload["entry_id"].as_str().unwrap();
+        assert_eq!(write_payload["summary"], "Implementation completed; wait for CI.");
+
+        let wake = decode_tool_payload(
+            &harness
+                .server
+                .handle_request(tool_call(82, "mempalace_wake_up", json!({"diary_limit":1})))
+                .await,
+        )
+        .unwrap();
+        let wake_entry = &wake["diary"]["entries"][0];
+        assert_eq!(wake_entry["entry_id"], entry_id);
+        assert_eq!(wake_entry["summary"], "Implementation completed; wait for CI.");
+        assert!(wake_entry.get("content").is_none());
+
+        let detail = decode_tool_payload(
+            &harness
+                .server
+                .handle_request(tool_call(83, "mempalace_diary_read", json!({"entry_id":entry_id})))
+                .await,
+        )
+        .unwrap();
+        assert_eq!(detail["content"], full_entry);
+        assert_eq!(detail["entry_id"], entry_id);
+        assert_eq!(detail["agent"], "Summary Bot");
+        assert_eq!(detail["topic"], "summary");
+        assert!(detail.get("since").is_none());
+        assert!(detail.get("entries").is_none());
+        assert!(detail.get("total").is_none());
+        assert!(detail.get("showing").is_none());
+
+        let rejected = harness
+            .server
+            .handle_request(tool_call(
+                84,
+                "mempalace_diary_write",
+                json!({"agent_name":"Summary Bot","entry":"entry","summary":"x".repeat(401)}),
+            ))
+            .await;
+        assert_eq!(rejected["error"]["code"], json!(-32602));
+    }
+
+    #[tokio::test]
+    async fn entry_id_detail_ignores_conflicting_since_and_last_n_zero() {
+        let harness = test_harness().await;
+        let entry = test_diary_drawer(
+            "entry_id_ignores_since_lastn",
+            "This entry must be returned when entry_id is specified even with aggressive filtering.",
+            datetime!(2026-05-01 12:00:00 UTC),
+        );
+        let runtime = harness.server.runtime.lock().await;
+        runtime
+            .storage
+            .drawer_store()
+            .put_drawers(&[entry], DuplicateStrategy::Error)
+            .await
+            .unwrap();
+        drop(runtime);
+
+        // Provide since pointing to the future and last_n=0 — the entry_id
+        // detail path must ignore both and return the full content.
+        let detail = decode_tool_payload(
+            &harness
+                .server
+                .handle_request(tool_call(
+                    870,
+                    "mempalace_diary_read",
+                    json!({
+                        "entry_id": "entry_id_ignores_since_lastn",
+                        "since": "2099-01-01T00:00:00Z",
+                        "last_n": 0
+                    }),
+                ))
+                .await,
+        )
+        .unwrap();
+        assert_eq!(
+            detail["content"],
+            "This entry must be returned when entry_id is specified even with aggressive filtering."
+        );
+        assert_eq!(detail["entry_id"], "entry_id_ignores_since_lastn");
+        assert!(detail.get("since").is_none());
+        assert!(detail.get("entries").is_none());
+        assert!(detail.get("total").is_none());
+        assert!(detail.get("showing").is_none());
+    }
+
+    #[tokio::test]
+    async fn diary_write_accepts_400_char_multibyte_unicode_summary() {
+        let harness = test_harness().await;
+        let emoji_part = "🔥💡✅⚠️";
+        let padding_len = DIARY_SUMMARY_MAX_CHARS - emoji_part.chars().count();
+        let padding = "x".repeat(padding_len);
+        let summary: String = format!("{emoji_part}{padding}");
+        assert_eq!(summary.chars().count(), DIARY_SUMMARY_MAX_CHARS);
+
+        let write = harness
+            .server
+            .handle_request(tool_call(
+                85,
+                "mempalace_diary_write",
+                json!({
+                    "agent_name":"Unicode Bot",
+                    "entry":"SESSION:unicode-summary",
+                    "summary": summary,
+                    "topic":"unicode"
+                }),
+            ))
+            .await;
+        let payload = decode_tool_payload(&write).unwrap();
+        assert_eq!(payload["success"], true);
+        assert_eq!(payload["summary"].as_str().unwrap().chars().count(), DIARY_SUMMARY_MAX_CHARS);
+
+        // Reject 401 chars with emoji
+        let over_summary: String = format!("🔥{}", "x".repeat(DIARY_SUMMARY_MAX_CHARS));
+        assert_eq!(over_summary.chars().count(), DIARY_SUMMARY_MAX_CHARS + 1);
+        let reject = harness
+            .server
+            .handle_request(tool_call(
+                86,
+                "mempalace_diary_write",
+                json!({
+                    "agent_name":"Unicode Bot",
+                    "entry":"SESSION:unicode-over",
+                    "summary": over_summary,
+                }),
+            ))
+            .await;
+        assert_eq!(reject["error"]["code"], json!(-32602));
+    }
+
+    #[tokio::test]
+    async fn diary_read_detail_bypasses_time_window_and_rejects_mismatched_filters() {
+        let harness = test_harness().await;
+        let old_entry = test_diary_drawer(
+            "detail_old_entry",
+            "This is an old diary entry that should still be retrievable by ID.",
+            datetime!(2026-05-01 12:00:00 UTC),
+        );
+        let runtime = harness.server.runtime.lock().await;
+        runtime
+            .storage
+            .drawer_store()
+            .put_drawers(&[old_entry], DuplicateStrategy::Error)
+            .await
+            .unwrap();
+        drop(runtime);
+
+        let future_since = "2026-06-01T00:00:00Z";
+        let detail = decode_tool_payload(
+            &harness
+                .server
+                .handle_request(tool_call(
+                    86,
+                    "mempalace_diary_read",
+                    json!({
+                        "entry_id": "detail_old_entry",
+                        "since": future_since,
+                        "last_n": 0
+                    }),
+                ))
+                .await,
+        )
+        .unwrap();
+        assert_eq!(detail["entry_id"], "detail_old_entry");
+        assert_eq!(detail["content"], "This is an old diary entry that should still be retrievable by ID.");
+        assert_eq!(detail["agent"], "Wake Test");
+        assert_eq!(detail["topic"], "wakeup");
+        assert!(detail.get("since").is_none());
+        assert!(detail.get("entries").is_none());
+
+        let rejected = decode_tool_payload(
+            &harness
+                .server
+                .handle_request(tool_call(
+                    87,
+                    "mempalace_diary_read",
+                    json!({"entry_id": "detail_old_entry", "agent_name": "Wrong Agent"}),
+                ))
+                .await,
+        )
+        .unwrap();
+        assert_eq!(rejected["message"], "Diary entry not found for this agent.");
+
+        let rejected = decode_tool_payload(
+            &harness
+                .server
+                .handle_request(tool_call(
+                    88,
+                    "mempalace_diary_read",
+                    json!({"entry_id": "detail_old_entry", "wing": "wing_project"}),
+                ))
+                .await,
+        )
+        .unwrap();
+        assert_eq!(rejected["message"], "Diary entry not found for this wing.");
+
+        let rejected = decode_tool_payload(
+            &harness
+                .server
+                .handle_request(tool_call(
+                    89,
+                    "mempalace_diary_read",
+                    json!({"entry_id": "detail_old_entry", "topic": "wrong-topic"}),
+                ))
+                .await,
+        )
+        .unwrap();
+        assert_eq!(rejected["message"], "Diary entry not found for this topic.");
+    }
+
+    #[tokio::test]
+    async fn diary_read_detail_rejects_missing_wrong_room_and_non_diary_entries() {
+        let harness = test_harness().await;
+        let mut wrong_room = test_diary_drawer(
+            "detail_wrong_room",
+            "This drawer is not in the diary room.",
+            datetime!(2026-05-01 12:00:00 UTC),
+        );
+        wrong_room.room = RoomId::new("other_room").unwrap();
+
+        let mut non_diary = test_diary_drawer(
+            "detail_non_diary",
+            "This drawer has a non-diary ingest mode.",
+            datetime!(2026-05-01 12:00:00 UTC),
+        );
+        non_diary.ingest_mode = "manual".to_owned();
+
+        let runtime = harness.server.runtime.lock().await;
+        runtime
+            .storage
+            .drawer_store()
+            .put_drawers(&[wrong_room, non_diary], DuplicateStrategy::Error)
+            .await
+            .unwrap();
+        drop(runtime);
+
+        let missing = decode_tool_payload(
+            &harness
+                .server
+                .handle_request(tool_call(
+                    90,
+                    "mempalace_diary_read",
+                    json!({"entry_id": "detail_missing"}),
+                ))
+                .await,
+        )
+        .unwrap();
+        assert_eq!(missing["message"], "Diary entry not found.");
+
+        let wrong_room = decode_tool_payload(
+            &harness
+                .server
+                .handle_request(tool_call(
+                    91,
+                    "mempalace_diary_read",
+                    json!({"entry_id": "detail_wrong_room"}),
+                ))
+                .await,
+        )
+        .unwrap();
+        assert_eq!(wrong_room["message"], "Diary entry not found.");
+
+        let non_diary = decode_tool_payload(
+            &harness
+                .server
+                .handle_request(tool_call(
+                    92,
+                    "mempalace_diary_read",
+                    json!({"entry_id": "detail_non_diary"}),
+                ))
+                .await,
+        )
+        .unwrap();
+        assert_eq!(non_diary["message"], "Entry is not a diary entry.");
+    }
+
+    #[tokio::test]
+    async fn wake_up_uses_first_400_characters_for_legacy_diary_entries() {
+        let harness = test_harness().await;
+        let content = format!("{}tail", "x".repeat(400));
+        let drawer = test_diary_drawer("diary_legacy_summary", &content, OffsetDateTime::now_utc());
+        let runtime = harness.server.runtime.lock().await;
+        runtime
+            .storage
+            .drawer_store()
+            .put_drawers(&[drawer], DuplicateStrategy::Error)
+            .await
+            .unwrap();
+        drop(runtime);
+
+        let wake = decode_tool_payload(
+            &harness
+                .server
+                .handle_request(tool_call(85, "mempalace_wake_up", json!({"diary_limit":1})))
+                .await,
+        )
+        .unwrap();
+        let entry = &wake["diary"]["entries"][0];
+        assert_eq!(entry["summary"], "x".repeat(400));
+        assert!(entry.get("content").is_none());
     }
 
     #[tokio::test]
@@ -3434,7 +3902,7 @@ mod tests {
             .handle_request(tool_call(
                 90,
                 "mempalace_diary_write",
-                json!({"agent_name":"Worker-One","entry":"SESSION:project","topic":"ops","scope":"project","wing":"wing_mempalace-rs"}),
+                json!({"agent_name":"Worker-One","entry":"SESSION:project","summary":"Project session.","topic":"ops","scope":"project","wing":"wing_mempalace-rs"}),
             ))
             .await;
         let second = harness
@@ -3442,7 +3910,7 @@ mod tests {
             .handle_request(tool_call(
                 91,
                 "mempalace_diary_write",
-                json!({"agent_name":"Worker One","entry":"SESSION:agent","topic":"ops","scope":"agent","wing":"wing_ignored"}),
+                json!({"agent_name":"Worker One","entry":"SESSION:agent","summary":"Agent session.","topic":"ops","scope":"agent","wing":"wing_ignored"}),
             ))
             .await;
         assert_eq!(decode_tool_payload(&first).unwrap()["success"], true);
@@ -3535,12 +4003,12 @@ mod tests {
         let first = harness.server.handle_request(tool_call(
             10,
             "mempalace_diary_write",
-            json!({"agent_name":"Worker One","entry":"SESSION:A","topic":"ops"}),
+            json!({"agent_name":"Worker One","entry":"SESSION:A","summary":"A.","topic":"ops"}),
         ));
         let second = harness.server.handle_request(tool_call(
             11,
             "mempalace_diary_write",
-            json!({"agent_name":"Worker Two","entry":"SESSION:B","topic":"ops"}),
+            json!({"agent_name":"Worker Two","entry":"SESSION:B","summary":"B.","topic":"ops"}),
         ));
         let (left, right) = tokio::join!(first, second);
         assert_eq!(decode_tool_payload(&left).unwrap()["success"], true);
@@ -3870,7 +4338,7 @@ mod tests {
                     .handle_request(tool_call(
                         95,
                         "mempalace_diary_write",
-                        json!({"agent_name":"Worker-One","entry":"SESSION:primary","topic":"ops"}),
+                        json!({"agent_name":"Worker-One","entry":"SESSION:primary","summary":"Primary session.","topic":"ops"}),
                     ))
                     .await,
             )
@@ -4349,7 +4817,7 @@ mod tests {
             .handle_request(tool_call(
                 502,
                 "mempalace_diary_write",
-                json!({"agent_name":"change-bot","entry":"SESSION:test","topic":"changefeed"}),
+                json!({"agent_name":"change-bot","entry":"SESSION:test","summary":"Change feed test.","topic":"changefeed"}),
             ))
             .await;
 
@@ -5408,6 +5876,112 @@ mod tests {
             mock_for_assert.delete_call_count(),
             1,
             "fallback must call the remote exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_delete_drawer_removes_diary_summary_on_local_hit() {
+        // Given a diary drawer with a stored summary, local deletion must also
+        // remove the SQLite summary row so stale summaries do not accumulate.
+        let remotes = BTreeMap::new();
+        let mut ctx = make_delete_drawer_ctx(remotes, WriteTarget::Local).await;
+
+        let drawer_id = DrawerId::new("diary-summary-cleanup-001").unwrap();
+        let now = OffsetDateTime::now_utc();
+        let drawer = test_diary_drawer(drawer_id.as_str(), "test content", now);
+        ctx.runtime
+            .storage
+            .drawer_store()
+            .put_drawers(&[drawer], DuplicateStrategy::Error)
+            .await
+            .unwrap();
+
+        ctx.runtime
+            .storage
+            .operational_store()
+            .store_diary_summary(&drawer_id, "summary to be removed")
+            .unwrap();
+
+        // Sanity-check that the summary exists before deletion.
+        assert!(ctx
+            .runtime
+            .storage
+            .operational_store()
+            .get_diary_summary(&drawer_id)
+            .unwrap()
+            .is_some());
+
+        ctx.runtime
+            .tool_delete_drawer(&json!({"drawer_id": drawer_id.as_str()}))
+            .await
+            .unwrap();
+
+        let stored = ctx
+            .runtime
+            .storage
+            .operational_store()
+            .get_diary_summary(&drawer_id)
+            .unwrap();
+        assert!(
+            stored.is_none(),
+            "local diary drawer deletion must remove its SQLite summary; got: {stored:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_delete_drawer_does_not_remove_diary_summary_on_remote_fallback() {
+        // Given a remote-only fallback (drawer not found locally, remote
+        // succeeds), a locally stored diary summary must NOT be removed.
+        // The summary belongs to a local store and should not be discarded
+        // just because the drawer lives on a remote.
+        let mock = Arc::new(DeleteDrawerMock {
+            delete_succeeds: true,
+            delete_call_count: AtomicU64::new(0),
+        });
+        let remotes = BTreeMap::from([(
+            "alpha".to_owned(),
+            mock as Arc<dyn mempalace_remote::RemoteApi>,
+        )]);
+        let mut ctx = make_delete_drawer_ctx(remotes, WriteTarget::Both).await;
+
+        let drawer_id = DrawerId::new("diary-summary-remote-fallback-001").unwrap();
+
+        // Store a summary for a drawer that does NOT exist locally.
+        ctx.runtime
+            .storage
+            .operational_store()
+            .store_diary_summary(&drawer_id, "summary must survive fallback")
+            .unwrap();
+
+        // Verify the summary is present before the deletion attempt.
+        assert!(ctx
+            .runtime
+            .storage
+            .operational_store()
+            .get_diary_summary(&drawer_id)
+            .unwrap()
+            .is_some());
+
+        let result = ctx
+            .runtime
+            .tool_delete_drawer(&json!({"drawer_id": drawer_id.as_str()}))
+            .await
+            .unwrap();
+
+        assert_eq!(result["success"], true);
+        assert_eq!(result["origin"], "alpha");
+        assert_eq!(result["applied_to"], "remote:alpha");
+
+        // The locally stored summary must still be present.
+        let stored = ctx
+            .runtime
+            .storage
+            .operational_store()
+            .get_diary_summary(&drawer_id)
+            .unwrap();
+        assert!(
+            stored.is_some(),
+            "remote-only fallback must NOT remove a locally stored diary summary"
         );
     }
 

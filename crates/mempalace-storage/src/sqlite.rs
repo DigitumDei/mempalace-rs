@@ -8,7 +8,7 @@ use crate::types::{
     ConfigEntry, EntityRecord, GraphDocument, IngestFileRecord, IngestManifestEntry, IngestRun,
     IngestRunStatus, KnowledgeGraphFact, RetryableRun, ToolStateEntry,
 };
-use mempalace_core::DrawerId;
+use mempalace_core::{DIARY_SUMMARY_MAX_CHARS, DrawerId};
 use time::Date;
 
 const MIGRATIONS: &[(&str, &str)] = &[
@@ -139,6 +139,31 @@ CREATE TABLE IF NOT EXISTS change_log (
 );
 
 CREATE INDEX IF NOT EXISTS idx_change_log_occurred_at ON change_log(occurred_at ASC);
+        "#,
+    ),
+    (
+        "0006_diary_summaries",
+        r#"
+CREATE TABLE IF NOT EXISTS diary_summaries (
+    entry_id TEXT PRIMARY KEY,
+    summary TEXT NOT NULL
+);
+        "#,
+    ),
+    (
+        "0007_diary_summary_length_constraint",
+        r#"
+CREATE TABLE IF NOT EXISTS diary_summaries_v2 (
+    entry_id TEXT PRIMARY KEY,
+    summary TEXT NOT NULL CHECK(length(summary) <= 400)
+);
+
+INSERT INTO diary_summaries_v2 (entry_id, summary)
+SELECT entry_id, SUBSTR(summary, 1, 400) FROM diary_summaries;
+
+DROP TABLE diary_summaries;
+
+ALTER TABLE diary_summaries_v2 RENAME TO diary_summaries;
         "#,
     ),
 ];
@@ -285,6 +310,8 @@ impl SqliteOperationalStore {
             "0003_knowledge_graph_facts",
             "0004_knowledge_graph_fact_lookup_index",
             "0005_change_log",
+            "0006_diary_summaries",
+            "0007_diary_summary_length_constraint",
         ]
     }
 
@@ -342,6 +369,151 @@ impl SqliteOperationalStore {
              PRAGMA synchronous = NORMAL;",
         )?;
         Ok(connection)
+    }
+}
+
+/// Persistent summaries for diary entries. Diary content remains in the drawer
+/// store; keeping summaries here avoids rewriting existing Lance rows.
+pub trait DiaryStore {
+    fn store_diary_summary(&self, entry_id: &DrawerId, summary: &str) -> Result<()>;
+    fn get_diary_summary(&self, entry_id: &DrawerId) -> Result<Option<String>>;
+    fn get_diary_summaries(&self, entry_ids: &[DrawerId]) -> Result<Vec<(DrawerId, String)>>;
+    fn delete_diary_summary(&self, entry_id: &DrawerId) -> Result<()>;
+}
+
+impl DiaryStore for SqliteOperationalStore {
+    fn store_diary_summary(&self, entry_id: &DrawerId, summary: &str) -> Result<()> {
+        if summary.chars().count() > DIARY_SUMMARY_MAX_CHARS {
+            return Err(StorageError::Invariant(format!(
+                "diary summary exceeds maximum length of {DIARY_SUMMARY_MAX_CHARS} characters"
+            )));
+        }
+        let connection = self.open_connection()?;
+        connection.execute(
+            "INSERT INTO diary_summaries (entry_id, summary) VALUES (?1, ?2)
+             ON CONFLICT(entry_id) DO UPDATE SET summary = excluded.summary",
+            params![entry_id.as_str(), summary],
+        )?;
+        Ok(())
+    }
+
+    fn get_diary_summary(&self, entry_id: &DrawerId) -> Result<Option<String>> {
+        let connection = self.open_connection()?;
+        connection
+            .query_row(
+                "SELECT summary FROM diary_summaries WHERE entry_id = ?1",
+                [entry_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    fn get_diary_summaries(&self, entry_ids: &[DrawerId]) -> Result<Vec<(DrawerId, String)>> {
+        if entry_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let connection = self.open_connection()?;
+        let placeholders =
+            std::iter::repeat_n("?", entry_ids.len()).collect::<Vec<_>>().join(", ");
+        let sql = format!(
+            "SELECT entry_id, summary FROM diary_summaries WHERE entry_id IN ({placeholders})"
+        );
+        let mut statement = connection.prepare(&sql)?;
+        let params: Vec<&str> = entry_ids.iter().map(DrawerId::as_str).collect();
+        let rows = statement
+            .query_map(params_from_iter(params), |row| {
+                let raw: String = row.get(0)?;
+                let entry_id = DrawerId::new(raw).map_err(|err| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(err),
+                    )
+                })?;
+                let summary: String = row.get(1)?;
+                Ok((entry_id, summary))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    fn delete_diary_summary(&self, entry_id: &DrawerId) -> Result<()> {
+        let connection = self.open_connection()?;
+        connection.execute("DELETE FROM diary_summaries WHERE entry_id = ?1", [entry_id.as_str()])?;
+        Ok(())
+    }
+}
+
+impl SqliteOperationalStore {
+    /// Create a pending ingest run and store the diary summary in a single
+    /// SQLite transaction.  This ensures that a crash before the Lance drawer
+    /// write still leaves a recoverable pending run alongside the summary,
+    /// rather than an orphaned summary with no run at all.
+    pub fn create_pending_diary_run(
+        &self,
+        ingest_kind: &str,
+        source_key: &str,
+        entries: &[IngestManifestEntry],
+        drawer_id: &DrawerId,
+        summary: &str,
+        created_at: OffsetDateTime,
+    ) -> Result<Option<IngestRun>> {
+        if summary.chars().count() > DIARY_SUMMARY_MAX_CHARS {
+            return Err(StorageError::Invariant(format!(
+                "diary summary exceeds maximum length of {DIARY_SUMMARY_MAX_CHARS} characters"
+            )));
+        }
+        let mut connection = self.open_connection()?;
+        let transaction = connection.transaction()?;
+        let timestamp = encode_time(created_at);
+
+        transaction.execute(
+            "INSERT INTO ingest_runs (ingest_kind, source_key, status, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?4)",
+            params![ingest_kind, source_key, IngestRunStatus::Pending.as_str(), timestamp],
+        )?;
+        let run_id = transaction.last_insert_rowid();
+
+        for entry in entries {
+            transaction.execute(
+                "INSERT INTO ingest_manifests (run_id, drawer_id, source_file, content_hash, status)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    run_id,
+                    entry.drawer_id.as_str(),
+                    entry.source_file,
+                    entry.content_hash,
+                    IngestRunStatus::Pending.as_str()
+                ],
+            )?;
+        }
+
+        let summary_inserted = transaction.execute(
+            "INSERT INTO diary_summaries (entry_id, summary) VALUES (?1, ?2)
+             ON CONFLICT(entry_id) DO NOTHING",
+            params![drawer_id.as_str(), summary],
+        )?;
+
+        // The summary's unique entry ID is the atomic duplicate gate for a
+        // diary ingest.  Roll back the run and manifest rows we staged above
+        // when another writer already owns this entry, rather than allowing a
+        // second writer to reach LanceDB with the same drawer ID.
+        if summary_inserted == 0 {
+            transaction.rollback()?;
+            return Ok(None);
+        }
+
+        transaction.commit()?;
+        Ok(Some(IngestRun {
+            id: run_id,
+            ingest_kind: ingest_kind.to_owned(),
+            source_key: source_key.to_owned(),
+            status: IngestRunStatus::Pending,
+            created_at,
+            updated_at: created_at,
+            failed_reason: None,
+        }))
     }
 }
 
@@ -593,10 +765,6 @@ impl IngestManifestStore for SqliteOperationalStore {
     }
 
     fn ingested_source_keys_with_prefix(&self, prefix: &str) -> Result<Vec<String>> {
-        // Escape LIKE special characters in the caller-supplied prefix so that
-        // a prefix such as "projects:%foo" does not wildcard-match unintended
-        // rows.  The root_key component is hex so escaping is belt-and-braces,
-        // but we do it unconditionally per the plan.
         let escaped: String = prefix
             .chars()
             .flat_map(|ch| match ch {
@@ -633,6 +801,73 @@ impl IngestManifestStore for SqliteOperationalStore {
         transaction.execute("DELETE FROM ingest_files WHERE source_key = ?1", [source_key])?;
         transaction.commit()?;
         Ok(())
+    }
+}
+
+impl SqliteOperationalStore {
+    /// Return stale (older than `older_than`) failed diary runs with their
+    /// manifest drawer IDs.  Used by startup reconciliation to clean up
+    /// orphaned diary summaries and drawers from previous failed writes.
+    pub fn stale_failed_diary_runs(&self, older_than: OffsetDateTime) -> Result<Vec<RetryableRun>> {
+        let connection = self.open_connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id, ingest_kind, source_key, status, created_at, updated_at, failed_reason
+             FROM ingest_runs
+             WHERE status = ?1 AND ingest_kind = 'diary' AND updated_at < ?2
+             ORDER BY id ASC",
+        )?;
+
+        let runs = statement
+            .query_map(
+                params![IngestRunStatus::Failed.as_str(), encode_time(older_than)],
+                |row| {
+                    Ok(IngestRun {
+                        id: row.get(0)?,
+                        ingest_kind: row.get(1)?,
+                        source_key: row.get(2)?,
+                        status: parse_status(row.get::<_, String>(3)?)?,
+                        created_at: decode_time(row.get(4)?).map_err(|err| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                4,
+                                rusqlite::types::Type::Text,
+                                Box::new(err),
+                            )
+                        })?,
+                        updated_at: decode_time(row.get(5)?).map_err(|err| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                5,
+                                rusqlite::types::Type::Text,
+                                Box::new(err),
+                            )
+                        })?,
+                        failed_reason: row.get(6)?,
+                    })
+                },
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        let mut retryable = Vec::with_capacity(runs.len());
+        for run in runs {
+            let mut manifest_statement = connection.prepare(
+                "SELECT drawer_id FROM ingest_manifests WHERE run_id = ?1 ORDER BY drawer_id ASC",
+            )?;
+            let chunk_ids = manifest_statement
+                .query_map([run.id], |row| {
+                    let raw: String = row.get(0)?;
+                    DrawerId::new(raw).map_err(|err| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(err),
+                        )
+                    })
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+
+            retryable.push(RetryableRun { run, chunk_ids });
+        }
+
+        Ok(retryable)
     }
 }
 
@@ -1342,7 +1577,7 @@ mod tests {
     use time::macros::datetime;
 
     use super::{
-        ChangeCursor, ChangeEvent, ChangeLogStore, ChangePage, EntityRegistryStore, GraphStore,
+        ChangeCursor, ChangeEvent, ChangeLogStore, ChangePage, DiaryStore, EntityRegistryStore, GraphStore,
         IngestManifestStore, KnowledgeGraphStore, MIGRATIONS, SqliteOperationalStore,
         ToolStateStore,
     };
@@ -1350,7 +1585,7 @@ mod tests {
         ConfigEntry, EntityRecord, GraphDocument, IngestManifestEntry, IngestRunStatus,
         KnowledgeGraphFact, ToolStateEntry,
     };
-    use mempalace_core::DrawerId;
+    use mempalace_core::{DIARY_SUMMARY_MAX_CHARS, DrawerId};
     use serde_json::json;
     use time::macros::date;
 
@@ -1921,5 +2156,226 @@ VALUES ('chat/file.txt', 'legacy-hash', '2026-04-11T12:00:00Z', 'convos', 2);
         assert_eq!(migrated.source_key, "convos:chat/file.txt");
         assert_eq!(migrated.content_hash, "legacy-hash");
         assert_eq!(migrated.drawer_count, 2);
+    }
+
+    #[test]
+    fn diary_store_rejects_overlong_summary() {
+        let tempdir = tempdir().unwrap();
+        let store = SqliteOperationalStore::new(tempdir.path().join("storage.sqlite3"));
+        store.ensure_schema().unwrap();
+        let did = DrawerId::new("test/overlong").unwrap();
+
+        // Summary at exactly 400 chars is accepted.
+        let ok_summary = "a".repeat(400);
+        store.store_diary_summary(&did, &ok_summary).unwrap();
+        assert_eq!(store.get_diary_summary(&did).unwrap(), Some(ok_summary));
+
+        // Summary at 401 chars is rejected.
+        let long_summary = "b".repeat(401);
+        let err = store.store_diary_summary(&did, &long_summary).unwrap_err();
+        assert!(
+            err.to_string().contains("diary summary exceeds maximum length of 400"),
+            "expected invariant error for overlong summary, got: {err}"
+        );
+
+        // The existing valid summary was not overwritten.
+        assert_eq!(
+            store.get_diary_summary(&did).unwrap(),
+            Some("a".repeat(400))
+        );
+    }
+
+    #[test]
+    fn create_pending_diary_run_rejects_overlong_summary() {
+        let tempdir = tempdir().unwrap();
+        let store = SqliteOperationalStore::new(tempdir.path().join("storage.sqlite3"));
+        store.ensure_schema().unwrap();
+        let did = DrawerId::new("diary/overlong").unwrap();
+
+        let result = store.create_pending_diary_run(
+            "diary",
+            "diary:test",
+            &[IngestManifestEntry {
+                run_id: 0,
+                drawer_id: did.clone(),
+                source_file: "diary:test".to_owned(),
+                content_hash: "hash".to_owned(),
+                status: IngestRunStatus::Pending,
+            }],
+            &did,
+            &"x".repeat(401),
+            datetime!(2026-07-01 00:00:00 UTC),
+        );
+        assert!(
+            result.is_err(),
+            "expected error for overlong summary in create_pending_diary_run"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("diary summary exceeds maximum length of 400"),
+            "expected invariant error, got: {err}"
+        );
+
+        // No pending run was created.
+        let stale = store.stale_pending_runs(datetime!(2026-07-02 00:00:00 UTC)).unwrap();
+        assert!(stale.is_empty(), "no pending run should exist after rejected summary");
+    }
+
+    #[test]
+    fn create_pending_diary_run_does_not_overwrite_an_existing_summary() {
+        let tempdir = tempdir().unwrap();
+        let store = SqliteOperationalStore::new(tempdir.path().join("storage.sqlite3"));
+        store.ensure_schema().unwrap();
+        let did = DrawerId::new("diary/atomic-summary").unwrap();
+        let entry = IngestManifestEntry {
+            run_id: 0,
+            drawer_id: did.clone(),
+            source_file: "diary:test".to_owned(),
+            content_hash: "hash".to_owned(),
+            status: IngestRunStatus::Pending,
+        };
+
+        let first = store
+            .create_pending_diary_run(
+                "diary",
+                "diary:first",
+                &[entry.clone()],
+                &did,
+                "first summary",
+                datetime!(2026-07-01 00:00:00 UTC),
+            )
+            .unwrap();
+        assert!(first.is_some());
+
+        let second = store
+            .create_pending_diary_run(
+                "diary",
+                "diary:second",
+                &[entry],
+                &did,
+                "second summary",
+                datetime!(2026-07-01 00:00:01 UTC),
+            )
+            .unwrap();
+        assert!(second.is_none(), "the existing summary owns this drawer ID");
+        assert_eq!(store.get_diary_summary(&did).unwrap(), Some("first summary".to_owned()));
+
+        let pending = store.stale_pending_runs(datetime!(2026-07-02 00:00:00 UTC)).unwrap();
+        assert_eq!(pending.len(), 1, "the rejected writer must not leave a pending run");
+    }
+
+    #[test]
+    fn get_diary_summaries_fetches_in_bulk() {
+        let tempdir = tempdir().unwrap();
+        let store = SqliteOperationalStore::new(tempdir.path().join("storage.sqlite3"));
+        store.ensure_schema().unwrap();
+
+        let id_a = DrawerId::new("diary/a").unwrap();
+        let id_b = DrawerId::new("diary/b").unwrap();
+        let id_c = DrawerId::new("diary/c").unwrap();
+
+        store.store_diary_summary(&id_a, "summary a").unwrap();
+        store.store_diary_summary(&id_b, "summary b").unwrap();
+
+        let results = store.get_diary_summaries(&[id_a.clone(), id_b.clone(), id_c.clone()]).unwrap();
+        assert_eq!(results.len(), 2, "only stored entries should be returned");
+        assert!(results.contains(&(id_a, "summary a".to_owned())));
+        assert!(results.contains(&(id_b, "summary b".to_owned())));
+    }
+
+    #[test]
+    fn get_diary_summaries_empty_input() {
+        let tempdir = tempdir().unwrap();
+        let store = SqliteOperationalStore::new(tempdir.path().join("storage.sqlite3"));
+        store.ensure_schema().unwrap();
+
+        let results: Vec<(DrawerId, String)> = store.get_diary_summaries(&[]).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn diary_summary_check_constraint_enforced_at_sqlite_level() {
+        let tempdir = tempdir().unwrap();
+        let store = SqliteOperationalStore::new(tempdir.path().join("storage.sqlite3"));
+        store.ensure_schema().unwrap();
+
+        let connection = rusqlite::Connection::open(store.path()).unwrap();
+        let result = connection.execute(
+            "INSERT INTO diary_summaries (entry_id, summary) VALUES (?1, ?2)",
+            rusqlite::params!["diary/too-long", &"x".repeat(401)],
+        );
+        assert!(
+            result.is_err(),
+            "CHECK constraint should reject summary longer than 400 chars"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("CHECK constraint") || err_msg.contains("constraint failed"),
+            "expected constraint failure, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn migration_0007_adds_check_constraint_and_truncates_existing_overlong() {
+        let tempdir = tempdir().unwrap();
+        let store = SqliteOperationalStore::new(tempdir.path().join("storage.sqlite3"));
+
+        // Create the database without the constraint (migration up to 0006).
+        let connection = rusqlite::Connection::open(store.path()).unwrap();
+        connection.execute_batch(
+            r#"
+CREATE TABLE IF NOT EXISTS migrations (
+    version TEXT PRIMARY KEY,
+    applied_at TEXT NOT NULL
+);
+INSERT INTO migrations (version, applied_at) VALUES ('0006_diary_summaries', '2026-07-01T00:00:00Z');
+CREATE TABLE IF NOT EXISTS diary_summaries (
+    entry_id TEXT PRIMARY KEY,
+    summary TEXT NOT NULL
+);
+INSERT INTO diary_summaries (entry_id, summary) VALUES ('diary/short', 'valid summary');
+INSERT INTO diary_summaries (entry_id, summary) VALUES ('diary/long', 'x' || 'y');
+            "#,
+        )
+        .unwrap();
+        // Insert a 500-char summary using a separate execute.
+        connection
+            .execute(
+                "UPDATE diary_summaries SET summary = ?1 WHERE entry_id = 'diary/long'",
+                rusqlite::params![&"z".repeat(500)],
+            )
+            .unwrap();
+        drop(connection);
+
+        // Run the migration (schema up to 0007).
+        store.ensure_schema().unwrap();
+
+        // The long summary should have been truncated to 400 chars.
+        let connection = rusqlite::Connection::open(store.path()).unwrap();
+        let short: String = connection
+            .query_row(
+                "SELECT summary FROM diary_summaries WHERE entry_id = 'diary/short'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(short, "valid summary");
+
+        let truncated: String = connection
+            .query_row(
+                "SELECT summary FROM diary_summaries WHERE entry_id = 'diary/long'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(truncated.len(), 400, "long summary should be truncated to 400 chars");
+        assert_eq!(truncated, "z".repeat(400));
+
+        // Verify the CHECK constraint is active — inserting >400 chars should fail.
+        let result = connection.execute(
+            "INSERT INTO diary_summaries (entry_id, summary) VALUES (?1, ?2)",
+            rusqlite::params!["diary/new-long", &"x".repeat(401)],
+        );
+        assert!(result.is_err(), "CHECK constraint must reject overlong summaries after migration");
     }
 }

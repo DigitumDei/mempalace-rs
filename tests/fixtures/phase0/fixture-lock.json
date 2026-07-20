@@ -3,11 +3,11 @@
   "generated_hashes": {
     "goldens/aaak.json": "ab6ec8fa8705cd067518395ed5e3e4b39e63efd640b4ddbd86d697fb8d8f0e5b",
     "goldens/knowledge-graph.json": "41f9aaf6354b3fec19604912b4de177f475bfdb6f952a687e07afc29ba66a5de",
-    "goldens/mcp-contract.json": "434039f0f8d3b8e457f35ed01e72d2b03178927ff34e2153e617368af97dde34",
+    "goldens/mcp-contract.json": "dd42bbe9ac4da5a13ceb8e5efdaa605f888d63a7908ac32ad60f711843570d02",
     "goldens/palace-graph.json": "fb2ac6eff8121d7a564b7d7ce895e32c1b58dd9e1f089786077476cc662dfc67",
     "inventory/cli-help.json": "2592f920cd18bc6df625474721d4564120d8b537a3f2de3bfe57c5db74129579",
     "inventory/environment.json": "f42db39ff92f7fd30e895796f7db4e2da00d5e02ebe6a4b917da06128dd88b53",
-    "inventory/mcp-tools.json": "95c26269980633a980dd9425725db0f6e567ddb03fd3953014cf7a6621e33e78"
+    "inventory/mcp-tools.json": "6f4a12cd84f859566911fbd96ea5e1cdcd39cb21bb1bc90d30b705e0bf67270b"
   },
   "input_hashes": {
     "inputs/convos/product_strategy.txt": "0153de51c16a1c6e6407b9548325a75d78364fb71d6762b4d4638a533ec98658",

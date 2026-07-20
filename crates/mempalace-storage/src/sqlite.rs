@@ -443,7 +443,9 @@ impl DiaryStore for SqliteOperationalStore {
         connection.execute("DELETE FROM diary_summaries WHERE entry_id = ?1", [entry_id.as_str()])?;
         Ok(())
     }
+}
 
+impl SqliteOperationalStore {
     /// Create a pending ingest run and store the diary summary in a single
     /// SQLite transaction.  This ensures that a crash before the Lance drawer
     /// write still leaves a recoverable pending run alongside the summary,
@@ -684,7 +686,9 @@ impl IngestManifestStore for SqliteOperationalStore {
         transaction.commit()?;
         Ok(())
     }
+}
 
+impl SqliteOperationalStore {
     /// Return stale (older than `older_than`) failed diary runs with their
     /// manifest drawer IDs.  Used by startup reconciliation to clean up
     /// orphaned diary summaries and drawers from previous failed writes.
@@ -749,7 +753,9 @@ impl IngestManifestStore for SqliteOperationalStore {
 
         Ok(retryable)
     }
+}
 
+impl IngestManifestStore for SqliteOperationalStore {
     fn committed_drawer_ids(&self) -> Result<Vec<DrawerId>> {
         let connection = self.open_connection()?;
         let mut statement = connection.prepare(

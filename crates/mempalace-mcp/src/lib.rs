@@ -1397,7 +1397,16 @@ where
             )
             .await?;
 
+        // Record the summary with its pending ingest state before exposing the
+        // drawer, so a crash after the Lance write leaves no orphaned summary
+        // and a retry does not create a silently divergent prior entry.
         self.storage
+            .operational_store()
+            .store_diary_summary(&drawer_id, &summary)
+            .map_tool_internal()?;
+
+        let commit_result = self
+            .storage
             .commit_ingest(IngestCommitRequest {
                 ingest_kind: "diary".to_owned(),
                 source_key: format!("diary:{}", drawer_id.as_str()),
@@ -1406,12 +1415,18 @@ where
                 drawers: vec![record],
                 duplicate_strategy: DuplicateStrategy::Error,
             })
-            .await
-            .map_tool()?;
-        self.storage
-            .operational_store()
-            .store_diary_summary(&drawer_id, &summary)
-            .map_tool_internal()?;
+            .await;
+
+        match commit_result {
+            Ok(_) => {}
+            Err(error) => {
+                self.storage
+                    .operational_store()
+                    .delete_diary_summary(&drawer_id)
+                    .map_tool_internal()?;
+                return Err(error).map_tool();
+            }
+        }
 
         self.log_change(ChangeEvent {
             event_type: "diary_written".to_owned(),

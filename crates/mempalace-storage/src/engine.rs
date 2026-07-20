@@ -101,6 +101,14 @@ impl StorageEngine {
         let stale_runs = self.operational_store.stale_pending_runs(stale_cutoff)?;
         self.prune_orphaned_rows(&stale_runs).await?;
 
+        for retryable in &stale_runs {
+            if retryable.run.ingest_kind == "diary" {
+                for chunk_id in &retryable.chunk_ids {
+                    self.operational_store.delete_diary_summary(chunk_id)?;
+                }
+            }
+        }
+
         for retryable in stale_runs {
             warn!(run_id = retryable.run.id, "marking stale pending ingest run as failed");
             self.operational_store.mark_run_failed(
@@ -199,7 +207,7 @@ mod tests {
     use time::macros::{date, datetime};
 
     use super::StorageEngine;
-    use crate::sqlite::IngestManifestStore;
+    use crate::sqlite::{DiaryStore, IngestManifestStore};
     use crate::types::{DrawerFilter, DrawerStore, DuplicateStrategy, IngestCommitRequest};
     use mempalace_core::{DrawerId, DrawerRecord, EmbeddingProfile, RoomId, WingId};
 
@@ -291,6 +299,48 @@ mod tests {
 
         let drawers = engine.drawer_store().list_drawers(&DrawerFilter::default()).await.unwrap();
         assert!(drawers.is_empty());
+
+        let stale_runs = engine
+            .operational_store()
+            .stale_pending_runs(datetime!(2026-04-20 00:00:00 UTC))
+            .unwrap();
+        assert!(stale_runs.iter().all(|run| run.run.id != created_run.id));
+    }
+
+    #[tokio::test]
+    async fn reconcile_cleans_up_diary_summary_for_stale_diary_run() {
+        let tempdir = tempdir().unwrap();
+        let engine = StorageEngine::open(tempdir.path(), EmbeddingProfile::Balanced).await.unwrap();
+        let drawer_id = mempalace_core::DrawerId::new("diary_wing_test_0001").unwrap();
+
+        // Store a diary summary and a pending diary ingest run.
+        engine.operational_store().store_diary_summary(&drawer_id, "test summary").unwrap();
+        let created_run = engine
+            .operational_store()
+            .create_pending_run(
+                "diary",
+                "diary:diary_wing_test_0001",
+                &[crate::types::IngestManifestEntry {
+                    run_id: 0,
+                    drawer_id: drawer_id.clone(),
+                    source_file: "diary:test".to_owned(),
+                    content_hash: "hash".to_owned(),
+                    status: crate::types::IngestRunStatus::Pending,
+                }],
+                datetime!(2026-04-01 00:00:00 UTC),
+            )
+            .unwrap();
+
+        // Verify summary exists before reconcile.
+        assert_eq!(
+            engine.operational_store().get_diary_summary(&drawer_id).unwrap(),
+            Some("test summary".to_owned())
+        );
+
+        engine.reconcile().await.unwrap();
+
+        // Summary should be deleted after reconcile.
+        assert_eq!(engine.operational_store().get_diary_summary(&drawer_id).unwrap(), None);
 
         let stale_runs = engine
             .operational_store()

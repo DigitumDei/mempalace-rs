@@ -360,6 +360,7 @@ impl SqliteOperationalStore {
 pub trait DiaryStore {
     fn store_diary_summary(&self, entry_id: &DrawerId, summary: &str) -> Result<()>;
     fn get_diary_summary(&self, entry_id: &DrawerId) -> Result<Option<String>>;
+    fn delete_diary_summary(&self, entry_id: &DrawerId) -> Result<()>;
 }
 
 impl DiaryStore for SqliteOperationalStore {
@@ -383,6 +384,12 @@ impl DiaryStore for SqliteOperationalStore {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    fn delete_diary_summary(&self, entry_id: &DrawerId) -> Result<()> {
+        let connection = self.open_connection()?;
+        connection.execute("DELETE FROM diary_summaries WHERE entry_id = ?1", [entry_id.as_str()])?;
+        Ok(())
     }
 }
 

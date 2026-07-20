@@ -10,8 +10,8 @@ use std::sync::Arc;
 use blake3::Hasher;
 use mempalace_config::{ConfigLoader, MempalaceConfig, ReplicationStatus, RouteMode, WriteTarget};
 use mempalace_core::{
-    DIARY_HALL, DIARY_ROOM, DIARY_TOPIC_PREFIX, DrawerId, DrawerRecord, EmbeddingProfile, RoomId,
-    SHARED_AGENT_DIARY_WING, SearchQuery, WingId,
+    DIARY_HALL, DIARY_ROOM, DIARY_SUMMARY_MAX_CHARS, DIARY_TOPIC_PREFIX, DrawerId, DrawerRecord,
+    EmbeddingProfile, RoomId, SHARED_AGENT_DIARY_WING, SearchQuery, WingId,
 };
 use mempalace_embeddings::{
     EmbeddingError, EmbeddingProvider, EmbeddingRequest, FastembedProvider,
@@ -1516,12 +1516,24 @@ where
                     Some(drawer)
                 }
             })
+            .collect::<Vec<_>>();
+
+        // Bulk-fetch summaries for all entries in a single query.
+        let ids: Vec<DrawerId> = entries.iter().map(|d| d.id.clone()).collect();
+        let summaries: std::collections::HashMap<DrawerId, String> = self
+            .storage
+            .operational_store()
+            .get_diary_summaries(&ids)
+            .map_tool()?
+            .into_iter()
+            .collect();
+
+        let entries = entries
+            .into_iter()
             .map(|drawer| {
-                let summary = self
-                    .storage
-                    .operational_store()
-                    .get_diary_summary(&drawer.id)
-                    .map_tool_internal()?
+                let summary = summaries
+                    .get(&drawer.id)
+                    .cloned()
                     .unwrap_or_else(|| legacy_diary_summary(&drawer.content));
                 render_diary_entry(drawer, true, Some(summary))
             })
@@ -2437,8 +2449,6 @@ fn render_diary_entry(
     }
     Ok(entry)
 }
-
-const DIARY_SUMMARY_MAX_CHARS: usize = 400;
 
 fn validate_diary_summary(summary: &str) -> ToolResult<()> {
     let length = summary.chars().count();

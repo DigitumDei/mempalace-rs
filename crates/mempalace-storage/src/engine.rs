@@ -193,12 +193,18 @@ impl StorageEngine {
         // stale failed runs.
         let all_for_prune: Vec<_> =
             stale_runs.iter().cloned().chain(stale_failed_diary.iter().cloned()).collect();
-        let orphaned_ids = self.prune_orphaned_rows(&all_for_prune).await?;
+        self.prune_orphaned_rows(&all_for_prune).await?;
 
-        // Delete diary summaries only for orphaned chunk_ids.
+        // Delete diary summaries for every stale chunk_id that is NOT
+        // committed, regardless of whether the drawer physically exists in
+        // LanceDB.  A crash before the Lance write leaves no drawer, so
+        // prune_orphaned_rows cannot see it, but the summary must still be
+        // removed.
+        let committed_ids =
+            self.operational_store.committed_drawer_ids()?.into_iter().collect::<HashSet<_>>();
         for retryable in &all_for_prune {
             for chunk_id in &retryable.chunk_ids {
-                if orphaned_ids.contains(chunk_id) {
+                if !committed_ids.contains(chunk_id) {
                     self.operational_store.delete_diary_summary(chunk_id)?;
                 }
             }

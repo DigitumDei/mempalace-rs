@@ -67,7 +67,7 @@
     }
   },
   "mempalace_diary_read": {
-    "description": "Read complete diary entries across all wings. Pass entry_id from wake-up to retrieve one entry's full detail; otherwise filters narrow recent entries by wing, agent author, or topic. Always local; never federated.",
+    "description": "Read complete diary entries by entry_id for full detail, or list recent entries with filters. Always local; never federated.",
     "input_schema": {
       "properties": {
         "agent_name": {

@@ -1510,6 +1510,14 @@ where
             }));
         };
 
+        let diary_room = parse_room_id(DIARY_ROOM)?;
+        if drawer.room != diary_room {
+            return Ok(json!({
+                "entry_id": entry_id.as_str(),
+                "message": "Diary entry not found.",
+            }));
+        }
+
         if drawer.ingest_mode != "diary" {
             return Ok(json!({
                 "entry_id": entry_id.as_str(),
@@ -3616,6 +3624,86 @@ mod tests {
             ))
             .await;
         assert_eq!(rejected["error"]["code"], json!(-32602));
+    }
+
+    #[tokio::test]
+    async fn diary_read_detail_bypasses_time_window_and_rejects_mismatched_filters() {
+        let harness = test_harness().await;
+        let old_entry = test_diary_drawer(
+            "detail_old_entry",
+            "This is an old diary entry that should still be retrievable by ID.",
+            datetime!(2026-05-01 12:00:00 UTC),
+        );
+        let runtime = harness.server.runtime.lock().await;
+        runtime
+            .storage
+            .drawer_store()
+            .put_drawers(&[old_entry], DuplicateStrategy::Error)
+            .await
+            .unwrap();
+        drop(runtime);
+
+        let future_since = "2026-06-01T00:00:00Z";
+        let detail = decode_tool_payload(
+            &harness
+                .server
+                .handle_request(tool_call(
+                    86,
+                    "mempalace_diary_read",
+                    json!({
+                        "entry_id": "detail_old_entry",
+                        "since": future_since,
+                        "last_n": 0
+                    }),
+                ))
+                .await,
+        )
+        .unwrap();
+        assert_eq!(detail["entry_id"], "detail_old_entry");
+        assert_eq!(detail["content"], "This is an old diary entry that should still be retrievable by ID.");
+        assert_eq!(detail["agent"], "Wake Test");
+        assert_eq!(detail["topic"], "wakeup");
+        assert!(detail.get("since").is_none());
+        assert!(detail.get("entries").is_none());
+
+        let rejected = decode_tool_payload(
+            &harness
+                .server
+                .handle_request(tool_call(
+                    87,
+                    "mempalace_diary_read",
+                    json!({"entry_id": "detail_old_entry", "agent_name": "Wrong Agent"}),
+                ))
+                .await,
+        )
+        .unwrap();
+        assert_eq!(rejected["message"], "Diary entry not found for this agent.");
+
+        let rejected = decode_tool_payload(
+            &harness
+                .server
+                .handle_request(tool_call(
+                    88,
+                    "mempalace_diary_read",
+                    json!({"entry_id": "detail_old_entry", "wing": "wing_project"}),
+                ))
+                .await,
+        )
+        .unwrap();
+        assert_eq!(rejected["message"], "Diary entry not found for this wing.");
+
+        let rejected = decode_tool_payload(
+            &harness
+                .server
+                .handle_request(tool_call(
+                    89,
+                    "mempalace_diary_read",
+                    json!({"entry_id": "detail_old_entry", "topic": "wrong-topic"}),
+                ))
+                .await,
+        )
+        .unwrap();
+        assert_eq!(rejected["message"], "Diary entry not found for this topic.");
     }
 
     #[tokio::test]

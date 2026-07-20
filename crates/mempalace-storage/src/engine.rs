@@ -698,6 +698,7 @@ mod tests {
 #[allow(clippy::unwrap_used)]
 mod diary_summary_tests {
     use super::StorageEngine;
+    use crate::error::StorageError;
     use crate::types::{DuplicateStrategy, IngestCommitRequest};
     use mempalace_core::{
         DIARY_SUMMARY_MAX_CHARS, DrawerId, DrawerRecord, EmbeddingProfile, RoomId, WingId,
@@ -745,7 +746,7 @@ mod diary_summary_tests {
 
         // Build a 400-char summary that includes multibyte Unicode characters.
         // "🔥" is 1 char (in chars().count()) but 4 bytes in UTF-8.
-        let emoji_part = "🔥💡✅⚠️";
+        let emoji_part = "🔥💡✅❌";
         assert_eq!(emoji_part.chars().count(), 4);
         let padding_len = DIARY_SUMMARY_MAX_CHARS - emoji_part.chars().count();
         let padding = "x".repeat(padding_len);
@@ -903,36 +904,74 @@ mod diary_summary_tests {
     async fn failed_diary_cleanup_removes_summary_but_keeps_existing_drawer() {
         let tempdir = tempdir().unwrap();
         let engine = StorageEngine::open(tempdir.path(), EmbeddingProfile::Balanced).await.unwrap();
-        let drawer_id = DrawerId::new("failed_diary_cleanup_summary").unwrap();
 
-        // Simulate a scenario where commit_diary_ingest creates pending run +
-        // summary in SQLite, but LanceDB write fails.  The recovery path should
-        // remove the summary but the drawer (if one existed previously for a
-        // different run) must remain.
+        let existing_id = DrawerId::new("existing_drawer_survives").unwrap();
 
-        // First, store a valid committed drawer (simulating a previous successful write).
-        let mut existing = diary_record("failed_diary_cleanup_summary", "existing content");
-        existing.content_hash = "existing-hash".to_owned();
-        engine.drawer_store().put_drawers(&[existing], DuplicateStrategy::Error).await.unwrap();
-
-        // Now simulate the failed commit: store summary (as create_pending_diary_run would).
+        // First, create a committed diary entry so an existing drawer exists.
+        let existing_record = diary_record("existing_drawer_survives", "existing diary content");
         engine
-            .operational_store()
-            .store_diary_summary(&drawer_id, "summary from failed write")
+            .commit_diary_ingest(
+                IngestCommitRequest {
+                    ingest_kind: "diary".to_owned(),
+                    source_key: "diary:existing_drawer_survives".to_owned(),
+                    source_file: "diary:test".to_owned(),
+                    content_hash: existing_record.content_hash.clone(),
+                    drawers: vec![existing_record],
+                    duplicate_strategy: DuplicateStrategy::Error,
+                },
+                "existing summary",
+            )
+            .await
             .unwrap();
 
-        // Simulate the failure cleanup (what commit_diary_ingest does on error).
-        engine.operational_store().delete_diary_summary(&drawer_id).unwrap();
+        // Now attempt a second commit_diary_ingest with a DIFFERENT drawer ID but
+        // an invalid embedding dimension, so that put_drawers fails AFTER
+        // create_pending_diary_run has already stored the summary.
+        let failing_id = DrawerId::new("failing_new_drawer").unwrap();
+        let mut failing_record = diary_record("failing_new_drawer", "will fail");
+        failing_record.embedding = vec![1.0, 2.0, 3.0]; // wrong dimensions (3 vs 384)
 
-        // The pre-existing drawer must survive.
-        let drawer = engine.drawer_store().get_drawer(&drawer_id).await.unwrap();
-        assert!(drawer.is_some(), "existing drawer must survive summary-write failure cleanup");
+        let result = engine
+            .commit_diary_ingest(
+                IngestCommitRequest {
+                    ingest_kind: "diary".to_owned(),
+                    source_key: "diary:failing_new_drawer".to_owned(),
+                    source_file: "diary:test".to_owned(),
+                    content_hash: "failing-hash".to_owned(),
+                    drawers: vec![failing_record],
+                    duplicate_strategy: DuplicateStrategy::Error,
+                },
+                "summary from failed write",
+            )
+            .await;
 
-        // Summary must be gone.
-        assert_eq!(
-            engine.operational_store().get_diary_summary(&drawer_id).unwrap(),
-            None
+        // The error should be InvalidEmbeddingDimensions from LanceDB put_drawers.
+        assert!(
+            matches!(&result, Err(StorageError::InvalidEmbeddingDimensions { .. })),
+            "commit_diary_ingest must propagate put_drawers failure; got: {result:?}",
         );
+
+        // Summary for the failed entry must have been cleaned up.
+        assert_eq!(
+            engine.operational_store().get_diary_summary(&failing_id).unwrap(),
+            None,
+            "summary for failed write must be removed",
+        );
+
+        // The existing drawer must still be present.
+        let existing = engine.drawer_store().get_drawer(&existing_id).await.unwrap();
+        assert!(existing.is_some(), "existing drawer must survive summary-write failure cleanup");
+
+        // The failing new drawer must NOT be visible in LanceDB.
+        let failing = engine.drawer_store().get_drawer(&failing_id).await.unwrap();
+        assert!(failing.is_none(), "failing new drawer must not appear in LanceDB");
+
+        // A failed run should exist in the operational store.
+        let stale_failed = engine
+            .operational_store()
+            .stale_failed_diary_runs(datetime!(2026-08-20 00:00:00 UTC))
+            .unwrap();
+        assert!(!stale_failed.is_empty(), "a failed diary run should exist");
     }
 }
 

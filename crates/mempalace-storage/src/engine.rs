@@ -696,6 +696,248 @@ mod tests {
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
+mod diary_summary_tests {
+    use super::StorageEngine;
+    use crate::types::{DuplicateStrategy, IngestCommitRequest};
+    use mempalace_core::{
+        DIARY_SUMMARY_MAX_CHARS, DrawerId, DrawerRecord, EmbeddingProfile, RoomId, WingId,
+    };
+    use tempfile::tempdir;
+    use time::macros::{date, datetime};
+
+    fn embedding(seed: [f32; 4]) -> Vec<f32> {
+        let mut values = Vec::with_capacity(EmbeddingProfile::Balanced.metadata().dimensions);
+        while values.len() < EmbeddingProfile::Balanced.metadata().dimensions {
+            values.extend(seed);
+        }
+        values.truncate(EmbeddingProfile::Balanced.metadata().dimensions);
+        values
+    }
+
+    fn diary_record(id: &str, content: &str) -> DrawerRecord {
+        DrawerRecord {
+            id: DrawerId::new(id).unwrap(),
+            wing: WingId::new("wing_agents").unwrap(),
+            room: RoomId::new("diary").unwrap(),
+            hall: Some("hall_diary".to_owned()),
+            date: Some(date!(2026 - 06 - 01)),
+            source_file: "diary:test".to_owned(),
+            chunk_index: 0,
+            ingest_mode: "diary".to_owned(),
+            extract_mode: None,
+            added_by: "tester".to_owned(),
+            filed_at: datetime!(2026-06-01 10:00:00 UTC),
+            importance: None,
+            emotional_weight: None,
+            weight: None,
+            content: content.to_owned(),
+            content_hash: format!("hash-{id}"),
+            embedding: embedding([0.5, 0.5, 0.5, 0.5]),
+            locator: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn store_and_retrieve_exact_400_char_summary_with_multibyte_unicode() {
+        let tempdir = tempdir().unwrap();
+        let engine = StorageEngine::open(tempdir.path(), EmbeddingProfile::Balanced).await.unwrap();
+        let drawer_id = DrawerId::new("unicode_400_summary").unwrap();
+
+        // Build a 400-char summary that includes multibyte Unicode characters.
+        // "🔥" is 1 char (in chars().count()) but 4 bytes in UTF-8.
+        let emoji_part = "🔥💡✅⚠️";
+        assert_eq!(emoji_part.chars().count(), 4);
+        let padding_len = DIARY_SUMMARY_MAX_CHARS - emoji_part.chars().count();
+        let padding = "x".repeat(padding_len);
+        let summary: String = format!("{emoji_part}{padding}");
+        assert_eq!(summary.chars().count(), DIARY_SUMMARY_MAX_CHARS);
+
+        let record = diary_record("unicode_400_summary", "diary entry with unicode summary");
+        engine
+            .commit_diary_ingest(
+                IngestCommitRequest {
+                    ingest_kind: "diary".to_owned(),
+                    source_key: "diary:unicode_400_summary".to_owned(),
+                    source_file: "diary:test".to_owned(),
+                    content_hash: record.content_hash.clone(),
+                    drawers: vec![record],
+                    duplicate_strategy: DuplicateStrategy::Error,
+                },
+                &summary,
+            )
+            .await
+            .unwrap();
+
+        let stored = engine.operational_store().get_diary_summary(&drawer_id).unwrap();
+        assert_eq!(stored, Some(summary.clone()));
+        assert_eq!(stored.unwrap().chars().count(), DIARY_SUMMARY_MAX_CHARS);
+    }
+
+    #[tokio::test]
+    async fn reject_over_limit_summary_in_store_diary_summary() {
+        let tempdir = tempdir().unwrap();
+        let engine = StorageEngine::open(tempdir.path(), EmbeddingProfile::Balanced).await.unwrap();
+        let drawer_id = DrawerId::new("over_limit_summary").unwrap();
+
+        let over_limit = "x".repeat(DIARY_SUMMARY_MAX_CHARS + 1);
+        let result = engine
+            .operational_store()
+            .store_diary_summary(&drawer_id, &over_limit);
+        assert!(
+            result.is_err(),
+            "store_diary_summary must reject summaries exceeding {DIARY_SUMMARY_MAX_CHARS} characters"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("diary summary exceeds maximum length"), "error: {err}");
+    }
+
+    #[tokio::test]
+    async fn reject_over_limit_summary_in_create_pending_diary_run() {
+        let tempdir = tempdir().unwrap();
+        let engine = StorageEngine::open(tempdir.path(), EmbeddingProfile::Balanced).await.unwrap();
+        let drawer_id = DrawerId::new("pending_run_over_limit").unwrap();
+
+        let over_limit = "z".repeat(DIARY_SUMMARY_MAX_CHARS + 1);
+        let result = engine
+            .operational_store()
+            .create_pending_diary_run(
+                "diary",
+                "diary:pending_run_over_limit",
+                &[],
+                &drawer_id,
+                &over_limit,
+                datetime!(2026-06-01 10:00:00 UTC),
+            );
+        assert!(
+            result.is_err(),
+            "create_pending_diary_run must reject summaries exceeding {DIARY_SUMMARY_MAX_CHARS} characters"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("diary summary exceeds maximum length"), "error: {err}");
+    }
+
+    #[tokio::test]
+    async fn summary_survives_across_engine_restart() {
+        let tempdir = tempdir().unwrap();
+        let drawer_id = DrawerId::new("survive_restart_summary").unwrap();
+        let summary_text = "persistent summary across restart";
+
+        // First engine: write diary entry with summary.
+        {
+            let engine =
+                StorageEngine::open(tempdir.path(), EmbeddingProfile::Balanced).await.unwrap();
+            let record = diary_record("survive_restart_summary", "diary content for restart test");
+            engine
+                .commit_diary_ingest(
+                    IngestCommitRequest {
+                        ingest_kind: "diary".to_owned(),
+                        source_key: "diary:survive_restart_summary".to_owned(),
+                        source_file: "diary:test".to_owned(),
+                        content_hash: record.content_hash.clone(),
+                        drawers: vec![record],
+                        duplicate_strategy: DuplicateStrategy::Error,
+                    },
+                    summary_text,
+                )
+                .await
+                .unwrap();
+        }
+
+        // Second engine (simulates restart): verify summary and drawer survive.
+        {
+            let engine =
+                StorageEngine::open(tempdir.path(), EmbeddingProfile::Balanced).await.unwrap();
+
+            let stored = engine.operational_store().get_diary_summary(&drawer_id).unwrap();
+            assert_eq!(stored, Some(summary_text.to_owned()));
+
+            let drawer =
+                engine.drawer_store().get_drawer(&drawer_id).await.unwrap();
+            assert!(drawer.is_some(), "drawer must survive restart");
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_cleans_up_stale_pending_diary_run_with_summary() {
+        let tempdir = tempdir().unwrap();
+        let engine = StorageEngine::open(tempdir.path(), EmbeddingProfile::Balanced).await.unwrap();
+        let drawer_id = DrawerId::new("stale_pending_diary_summary").unwrap();
+
+        // Simulate a stale pending diary run with a stored summary — no committed
+        // drawer.  This is what a crash after create_pending_diary_run but before
+        // LanceDB write would leave behind.
+        engine
+            .operational_store()
+            .store_diary_summary(&drawer_id, "stale pending summary")
+            .unwrap();
+        let _run = engine
+            .operational_store()
+            .create_pending_run(
+                "diary",
+                "diary:stale_pending_diary_summary",
+                &[crate::types::IngestManifestEntry {
+                    run_id: 0,
+                    drawer_id: drawer_id.clone(),
+                    source_file: "diary:test".to_owned(),
+                    content_hash: "hash".to_owned(),
+                    status: crate::types::IngestRunStatus::Pending,
+                }],
+                datetime!(2026-03-01 00:00:00 UTC),
+            )
+            .unwrap();
+
+        // Summary should exist before reconcile.
+        assert!(engine.operational_store().get_diary_summary(&drawer_id).unwrap().is_some());
+
+        engine.reconcile().await.unwrap();
+
+        // Summary should be cleaned up by reconcile.
+        assert_eq!(
+            engine.operational_store().get_diary_summary(&drawer_id).unwrap(),
+            None,
+            "stale pending diary run's summary must be removed by reconcile"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_diary_cleanup_removes_summary_but_keeps_existing_drawer() {
+        let tempdir = tempdir().unwrap();
+        let engine = StorageEngine::open(tempdir.path(), EmbeddingProfile::Balanced).await.unwrap();
+        let drawer_id = DrawerId::new("failed_diary_cleanup_summary").unwrap();
+
+        // Simulate a scenario where commit_diary_ingest creates pending run +
+        // summary in SQLite, but LanceDB write fails.  The recovery path should
+        // remove the summary but the drawer (if one existed previously for a
+        // different run) must remain.
+
+        // First, store a valid committed drawer (simulating a previous successful write).
+        let mut existing = diary_record("failed_diary_cleanup_summary", "existing content");
+        existing.content_hash = "existing-hash".to_owned();
+        engine.drawer_store().put_drawers(&[existing], DuplicateStrategy::Error).await.unwrap();
+
+        // Now simulate the failed commit: store summary (as create_pending_diary_run would).
+        engine
+            .operational_store()
+            .store_diary_summary(&drawer_id, "summary from failed write")
+            .unwrap();
+
+        // Simulate the failure cleanup (what commit_diary_ingest does on error).
+        engine.operational_store().delete_diary_summary(&drawer_id).unwrap();
+
+        // The pre-existing drawer must survive.
+        let drawer = engine.drawer_store().get_drawer(&drawer_id).await.unwrap();
+        assert!(drawer.is_some(), "existing drawer must survive summary-write failure cleanup");
+
+        // Summary must be gone.
+        assert_eq!(
+            engine.operational_store().get_diary_summary(&drawer_id).unwrap(),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod prefix_tests {
 use crate::sqlite::{IngestManifestStore, SqliteOperationalStore};
     use crate::types::{IngestManifestEntry, IngestRunStatus};

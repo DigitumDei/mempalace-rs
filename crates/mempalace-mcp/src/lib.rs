@@ -3627,6 +3627,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn entry_id_detail_ignores_conflicting_since_and_last_n_zero() {
+        let harness = test_harness().await;
+        let entry = test_diary_drawer(
+            "entry_id_ignores_since_lastn",
+            "This entry must be returned when entry_id is specified even with aggressive filtering.",
+            datetime!(2026-05-01 12:00:00 UTC),
+        );
+        let runtime = harness.server.runtime.lock().await;
+        runtime
+            .storage
+            .drawer_store()
+            .put_drawers(&[entry], DuplicateStrategy::Error)
+            .await
+            .unwrap();
+        drop(runtime);
+
+        // Provide since pointing to the future and last_n=0 — the entry_id
+        // detail path must ignore both and return the full content.
+        let detail = decode_tool_payload(
+            &harness
+                .server
+                .handle_request(tool_call(
+                    870,
+                    "mempalace_diary_read",
+                    json!({
+                        "entry_id": "entry_id_ignores_since_lastn",
+                        "since": "2099-01-01T00:00:00Z",
+                        "last_n": 0
+                    }),
+                ))
+                .await,
+        )
+        .unwrap();
+        assert_eq!(
+            detail["content"],
+            "This entry must be returned when entry_id is specified even with aggressive filtering."
+        );
+        assert_eq!(detail["entry_id"], "entry_id_ignores_since_lastn");
+        assert!(detail.get("since").is_none());
+        assert!(detail.get("entries").is_none());
+        assert!(detail.get("total").is_none());
+        assert!(detail.get("showing").is_none());
+    }
+
+    #[tokio::test]
+    async fn diary_write_accepts_400_char_multibyte_unicode_summary() {
+        let harness = test_harness().await;
+        let emoji_part = "🔥💡✅⚠️";
+        let padding_len = DIARY_SUMMARY_MAX_CHARS - emoji_part.chars().count();
+        let padding = "x".repeat(padding_len);
+        let summary: String = format!("{emoji_part}{padding}");
+        assert_eq!(summary.chars().count(), DIARY_SUMMARY_MAX_CHARS);
+
+        let write = harness
+            .server
+            .handle_request(tool_call(
+                85,
+                "mempalace_diary_write",
+                json!({
+                    "agent_name":"Unicode Bot",
+                    "entry":"SESSION:unicode-summary",
+                    "summary": summary,
+                    "topic":"unicode"
+                }),
+            ))
+            .await;
+        let payload = decode_tool_payload(&write).unwrap();
+        assert_eq!(payload["success"], true);
+        assert_eq!(payload["summary"].as_str().unwrap().chars().count(), DIARY_SUMMARY_MAX_CHARS);
+
+        // Reject 401 chars with emoji
+        let over_summary: String = format!("🔥{}", "x".repeat(DIARY_SUMMARY_MAX_CHARS));
+        assert_eq!(over_summary.chars().count(), DIARY_SUMMARY_MAX_CHARS + 1);
+        let reject = harness
+            .server
+            .handle_request(tool_call(
+                86,
+                "mempalace_diary_write",
+                json!({
+                    "agent_name":"Unicode Bot",
+                    "entry":"SESSION:unicode-over",
+                    "summary": over_summary,
+                }),
+            ))
+            .await;
+        assert_eq!(reject["error"]["code"], json!(-32602));
+    }
+
+    #[tokio::test]
     async fn diary_read_detail_bypasses_time_window_and_rejects_mismatched_filters() {
         let harness = test_harness().await;
         let old_entry = test_diary_drawer(

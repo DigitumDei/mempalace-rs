@@ -1352,6 +1352,8 @@ where
                 "error": format!("Drawer not found: {}", drawer_id.as_str()),
             }));
         }
+        // Remove the diary summary when the deleted drawer is a diary entry.
+        self.storage.operational_store().delete_diary_summary(&drawer_id).map_tool()?;
         self.log_change(ChangeEvent {
             event_type: "drawer_deleted".to_owned(),
             occurred_at: OffsetDateTime::now_utc(),

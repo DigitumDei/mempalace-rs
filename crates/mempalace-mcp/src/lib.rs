@@ -1352,8 +1352,16 @@ where
                 "error": format!("Drawer not found: {}", drawer_id.as_str()),
             }));
         }
-        // Remove the diary summary when the deleted drawer is a diary entry.
-        self.storage.operational_store().delete_diary_summary(&drawer_id).map_tool()?;
+        // The LanceDB deletion has already succeeded. A SQLite cleanup failure
+        // must not make this operation appear to have failed: callers would
+        // retry against a missing drawer and could never remove the summary.
+        if let Err(error) = self.storage.operational_store().delete_diary_summary(&drawer_id) {
+            tracing::warn!(
+                %drawer_id,
+                %error,
+                "failed to delete diary summary after drawer deletion"
+            );
+        }
         self.log_change(ChangeEvent {
             event_type: "drawer_deleted".to_owned(),
             occurred_at: OffsetDateTime::now_utc(),
@@ -2476,11 +2484,6 @@ fn diary_entry_matches(drawer: &DrawerRecord, filters: &DiaryReadFilters) -> boo
     }
     if let Some(agent_name) = filters.agent_name.as_deref() {
         if drawer.added_by != agent_name {
-            return false;
-        }
-    }
-    if let Some(entry_id) = filters.entry_id.as_ref() {
-        if drawer.id != *entry_id {
             return false;
         }
     }

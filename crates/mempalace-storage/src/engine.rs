@@ -699,7 +699,7 @@ mod tests {
 mod diary_summary_tests {
     use super::StorageEngine;
     use crate::error::StorageError;
-    use crate::types::{DuplicateStrategy, IngestCommitRequest};
+    use crate::types::{DrawerFilter, DrawerStore, DuplicateStrategy, IngestCommitRequest};
     use mempalace_core::{
         DIARY_SUMMARY_MAX_CHARS, DrawerId, DrawerRecord, EmbeddingProfile, RoomId, WingId,
     };

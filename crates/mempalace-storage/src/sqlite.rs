@@ -167,6 +167,8 @@ pub trait IngestManifestStore {
     fn committed_drawer_ids_for_source_key(&self, source_key: &str) -> Result<Vec<DrawerId>>;
     fn get_ingested_file(&self, source_key: &str) -> Result<Option<IngestFileRecord>>;
     fn ingested_source_keys_with_prefix(&self, prefix: &str) -> Result<Vec<String>>;
+    /// Remove all ingest metadata for a source key.
+    fn delete_source_key(&self, source_key: &str) -> Result<()>;
 }
 
 pub trait EntityRegistryStore {
@@ -614,6 +616,23 @@ impl IngestManifestStore for SqliteOperationalStore {
             .query_map([pattern], |row| row.get::<_, String>(0))?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(StorageError::from)
+    }
+
+    fn delete_source_key(&self, source_key: &str) -> Result<()> {
+        let mut connection = self.open_connection()?;
+        let transaction = connection.transaction()?;
+        let run_ids = transaction
+            .prepare("SELECT id FROM ingest_runs WHERE source_key = ?1")?
+            .query_map([source_key], |row| row.get::<_, i64>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        for run_id in run_ids {
+            transaction.execute("DELETE FROM ingest_manifests WHERE run_id = ?1", [run_id])?;
+        }
+        transaction.execute("DELETE FROM ingest_runs WHERE source_key = ?1", [source_key])?;
+        transaction.execute("DELETE FROM ingest_files WHERE source_key = ?1", [source_key])?;
+        transaction.commit()?;
+        Ok(())
     }
 }
 

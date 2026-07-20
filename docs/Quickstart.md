@@ -48,10 +48,22 @@ The rest of this guide assumes `mempalace-cli` is on your PATH (the installer do
 
 ## 2. Initialize a palace
 
-Point `init` at any project directory. It detects folders and creates a `mempalace.yaml` room config:
+Point `init` at any project directory. It detects folders and stores the wing
+and room configuration in the local registry (`~/.mempalace/projects.json` by
+default), so no repository file is required:
 
 ```bash
 mempalace-cli init /path/to/your/project
+```
+
+Use `--repo-config` when you explicitly want a portable repository-local
+`mempalace.yaml` as well.
+
+For a repository without a Git `origin`, provide a durable identity explicitly
+so another checkout can resolve the same declaration:
+
+```bash
+./target/release/mempalace-cli init /path/to/your/project --project-id local/my-project
 ```
 
 On first run, you'll see a startup validation status. If it's not `ready`, set `MEMPALACE_EMBED_ALLOW_DOWNLOADS=1` to download embedding assets, then re-run `init`.
@@ -116,7 +128,7 @@ Your AI now has access to `mempalace_search`, `mempalace_add_drawer`, `mempalace
 
 - [Operator guide](Operator-Standard.md) — deployment, troubleshooting, storage recovery
 - [CLI reference](CLI-Surface.md) — all commands and flags
-- [Config schema](Config-Schema.md) — `~/.mempalace/config.json` and `mempalace.yaml`
+- [Config schema](Config-Schema.md) — `~/.mempalace/config.json`, `projects.json`, and optional `mempalace.yaml`
 - [Low-CPU mode](Operator-Low-CPU.md) — constrained environments
 - [Federation](Federation.md) — share a palace across machines: server setup, routing, federated & branch-aware mining
 - [Hook installation](../hooks/README.md) — auto-save for Claude Code

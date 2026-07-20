@@ -22,3 +22,4 @@ jobs:
           jules_api_key: ${{ secrets.JULES_API_KEY }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
           fail_on: blocking
+          timeout_minutes: 60

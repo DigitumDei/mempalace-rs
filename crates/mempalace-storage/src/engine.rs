@@ -155,6 +155,20 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Remove all committed drawers and ingest metadata for a source key.
+    ///
+    /// This is used when migrating source-key identities so old path-based
+    /// rows cannot remain alongside their stable project-id replacements.
+    pub async fn remove_source_key(&self, source_key: &str) -> Result<()> {
+        let drawer_ids =
+            self.operational_store.committed_drawer_ids_for_source_key(source_key)?;
+        if !drawer_ids.is_empty() {
+            self.drawer_store.delete_drawers(&drawer_ids).await?;
+        }
+        self.operational_store.delete_source_key(source_key)?;
+        Ok(())
+    }
+
     async fn prune_orphaned_rows(&self, stale_runs: &[RetryableRun]) -> Result<()> {
         let committed_ids =
             self.operational_store.committed_drawer_ids()?.into_iter().collect::<HashSet<_>>();

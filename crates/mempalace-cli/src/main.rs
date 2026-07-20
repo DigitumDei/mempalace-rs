@@ -8,8 +8,9 @@ use std::path::{Path, PathBuf};
 
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use mempalace_config::{
-    ConfigFileV1, ConfigLoader, MempalaceConfig, ProjectRoomConfig, ResolvedPaths, RouteMode,
-    RouteQuery, WriteTarget, build_runtime, resolve_route,
+    ConfigFileV1, ConfigLoader, MempalaceConfig, ProjectConfig, ProjectRegistryEntryV1,
+    ProjectRoomConfig, ResolvedPaths, RouteMode, RouteQuery, WriteTarget, build_runtime,
+    resolve_route,
 };
 use mempalace_core::{EmbeddingProfile, RoomId, SearchQuery, WingId};
 use mempalace_embeddings::{
@@ -20,7 +21,8 @@ use mempalace_server::{TokenRegistry, build_router};
 use mempalace_federation::{IngestBatchRequest, IngestBatchResponse};
 use mempalace_ingest::{
     ConversationExtractMode, ConversationIngestRequest, IngestError, IngestSummary,
-    ProjectIngestRequest, ingest_conversations, ingest_project, prepare_project_batch,
+    ProjectIngestRequest, derive_project_id, ingest_conversations, ingest_project_with_config,
+    prepare_project_batch_with_config, project_root_relative,
 };
 use mempalace_remote::{RemoteApi, RemoteClient, RemoteEndpoint, RemoteError};
 use mempalace_search::{Layer1Config, SearchRuntime, SearchRuntimePolicy, WakeUpRequest};
@@ -190,6 +192,10 @@ enum Commands {
         dir: PathBuf,
         #[arg(long, help = "Auto-accept detected rooms")]
         yes: bool,
+        #[arg(long = "repo-config", help = "Also write a portable repository-local mempalace.yaml")]
+        repo_config: bool,
+        #[arg(long = "project-id", alias = "project", help = "Explicit stable project ID for repositories without a usable origin")]
+        project_id: Option<String>,
     },
     /// Mine files into the palace.
     Mine {
@@ -198,6 +204,8 @@ enum Commands {
         mode: CliMode,
         #[arg(long)]
         wing: Option<String>,
+        #[arg(long = "project-id", alias = "project", help = "Explicit project registry ID")]
+        project_id: Option<String>,
         #[arg(long, default_value = "mempalace")]
         agent: String,
         #[arg(long, default_value_t = 0)]
@@ -216,6 +224,11 @@ enum Commands {
             help = "Largest batch to process at once; lower it to bound peak memory/CPU on low-spec machines. Local mine: chunks embedded per batch (default: a file's chunks together). Remote mine: files per request (default: 64). 0 or omitted keeps the default."
         )]
         batch_size: Option<usize>,
+    },
+    /// Inspect and manage centralized project declarations.
+    Project {
+        #[command(subcommand)]
+        command: ProjectCommands,
     },
     /// Find anything, exact words.
     Search {
@@ -317,6 +330,21 @@ impl CliOutput {
     }
 }
 
+/// Combine a local success with a best-effort remote replication result.
+///
+/// The local write determines the command's exit status. If a future remote
+/// path returns a failure output instead of encoding its status in stdout, its
+/// stderr still needs to be surfaced to the user without turning the local
+/// success into a command failure.
+fn combine_dual_write_outputs(local: CliOutput, remote: CliOutput) -> CliOutput {
+    let remote_text = if remote.exit_code == 0 || remote.stderr.trim().is_empty() {
+        remote.stdout
+    } else {
+        remote.stderr
+    };
+    CliOutput::success(format!("{}\n{}", local.stdout.trim(), remote_text.trim()))
+}
+
 fn run_cli<I, T, F, P>(
     args: I,
     context: &CliContext,
@@ -391,14 +419,21 @@ where
         return Ok(CliOutput::success(render_help()));
     };
     match command {
-        Commands::Init { dir, yes } => {
-            execute_init(&dir, yes, cli.palace.as_deref(), context, validation_provider_factory)
-        }
-        Commands::Mine { dir, mode, wing, agent, limit, dry_run, reindex, extract, branch, batch_size } => {
+        Commands::Init { dir, yes, repo_config, project_id } => execute_init(
+            &dir,
+            yes,
+            repo_config,
+            project_id.as_deref(),
+            cli.palace.as_deref(),
+            context,
+            validation_provider_factory,
+        ),
+        Commands::Mine { dir, mode, wing, project_id, agent, limit, dry_run, reindex, extract, branch, batch_size } => {
             execute_mine(
                 &dir,
                 mode,
                 wing,
+                project_id,
                 agent,
                 limit,
                 dry_run,
@@ -411,6 +446,7 @@ where
                 provider_factory,
             )
         }
+        Commands::Project { command } => execute_project_command(command, context),
         Commands::Search { query, wing, room, results } => execute_search(
             &query,
             wing,
@@ -443,6 +479,8 @@ where
 fn execute_init<F, P>(
     dir: &Path,
     yes: bool,
+    repo_config: bool,
+    explicit_project_id: Option<&str>,
     palace_override: Option<&Path>,
     context: &CliContext,
     provider_factory: F,
@@ -461,8 +499,10 @@ where
     let file_count = count_project_files(&project_dir).map_err(io_error)?;
     let detection = detect_rooms(&project_dir).map_err(io_error)?;
     let config_path = project_dir.join("mempalace.yaml");
+    let legacy_config_path = project_dir.join("mempal.yaml");
+    let existing_config = config_path.exists() || legacy_config_path.exists();
 
-    if config_path.exists() && !yes {
+    if existing_config && repo_config && !yes {
         return Ok(CliOutput::failure(
             1,
             format!(
@@ -480,14 +520,77 @@ where
     let validation = provider.startup_validation().map_err(provider_error)?;
     log_startup_validation(&validation);
 
-    write_project_config(&config_path, &project_dir, &detection.rooms, yes).map_err(io_error)?;
+    let project_config = if existing_config {
+        ConfigLoader::load_project_config(&project_dir).map_err(config_error)?
+    } else {
+        let derived_wing = wing_name_for_dir(&project_dir);
+        let candidate_project_id =
+            derive_project_id(&project_dir, &derived_wing, explicit_project_id);
+        ConfigLoader::resolve_project_config(
+            &project_dir,
+            context.config_base_dir.as_deref(),
+            Some(&candidate_project_id),
+            &derived_wing,
+            detection.rooms.clone(),
+        )
+        .map_err(config_error)?
+    };
+    let derived_project_id = derive_project_id(&project_dir, &project_config.wing, explicit_project_id);
+    let project_id = if explicit_project_id.filter(|id| !id.trim().is_empty()).is_some() {
+        derived_project_id
+    } else {
+        ConfigLoader::find_project_id(
+            context.config_base_dir.as_deref(),
+            &project_dir,
+            Some(&derived_project_id),
+        )
+        .map_err(config_error)?
+        .unwrap_or(derived_project_id)
+    };
+    if explicit_project_id.filter(|id| !id.trim().is_empty()).is_none()
+        && project_id.starts_with("wing:")
+        && ConfigLoader::load_project_registry(context.config_base_dir.as_deref())
+            .map_err(config_error)?
+            .projects
+            .contains_key(&project_id)
+        && ConfigLoader::find_project_id(
+            context.config_base_dir.as_deref(),
+            &project_dir,
+            None,
+        )
+        .map_err(config_error)?
+        .is_none()
+    {
+        return Ok(CliOutput::failure(
+            1,
+            format!(
+                "project `{project_id}` is ambiguous for a checkout without a Git origin; pass --project-id\n"
+            ),
+        ));
+    }
+    let project_root = project_root_relative(&project_dir);
+    let registry_path = ConfigLoader::register_project(
+        context.config_base_dir.as_deref(),
+        &project_id,
+        ProjectRegistryEntryV1 {
+            project_root,
+            ..ProjectRegistryEntryV1::from(project_config.clone())
+        },
+        Some(&project_dir),
+    )
+    .map_err(config_error)?;
+
+    if repo_config {
+        write_project_config(&config_path, &project_dir, &project_config, true)
+            .map_err(io_error)?;
+    }
 
     let mut lines = vec![
         format!("\n{}", "=".repeat(INIT_HEADER_WIDTH)),
         "  MemPalace Init — Local setup".to_owned(),
         "=".repeat(INIT_HEADER_WIDTH),
         String::new(),
-        format!("  WING: {}", wing_name_for_dir(&project_dir)),
+        format!("  WING: {}", project_config.wing),
         format!("  ({} files found, rooms detected from {})", file_count, detection.source),
         String::new(),
     ];
@@ -501,7 +604,12 @@ where
     lines.extend([
         String::new(),
         format!("{}", "─".repeat(INIT_HEADER_WIDTH)),
-        format!("  Config saved: {}", config_path.display()),
+        format!("  Project registry: {}", registry_path.display()),
+        if repo_config {
+            format!("  Repository config: {}", config_path.display())
+        } else {
+            "  Repository config: not written (use --repo-config to opt in)".to_owned()
+        },
         format!("  Palace path: {}", config.palace_path.display()),
         format!("  Startup validation: {}", validation.status),
         format!("  Global config: {}", runtime_paths.config_file.display()),
@@ -513,16 +621,226 @@ where
     Ok(CliOutput::success(lines.join("\n")))
 }
 
-enum ExecPlan {
-    Local,
-    Remote(mempalace_config::ResolvedRouteRule),
-    Both(mempalace_config::ResolvedRouteRule),
+fn execute_project_command(
+    command: ProjectCommands,
+    context: &CliContext,
+) -> Result<CliOutput, clap::Error> {
+    match command {
+        ProjectCommands::Register { dir, wing, project_id: explicit_project_id, repo_config } => {
+            let project_dir = dir.canonicalize().map_err(|source| {
+                clap::Error::raw(
+                    clap::error::ErrorKind::Io,
+                    format!("failed to access project directory `{}`: {source}", dir.display()),
+                )
+            })?;
+            let detection = detect_rooms(&project_dir).map_err(io_error)?;
+            let mut project_config = if project_dir.join("mempalace.yaml").exists()
+                || project_dir.join("mempal.yaml").exists()
+            {
+                ConfigLoader::load_project_config(&project_dir).map_err(config_error)?
+            } else {
+                let derived_wing = wing.clone().unwrap_or_else(|| wing_name_for_dir(&project_dir));
+                let candidate_project_id =
+                    derive_project_id(&project_dir, &derived_wing, explicit_project_id.as_deref());
+                ConfigLoader::resolve_project_config(
+                    &project_dir,
+                    context.config_base_dir.as_deref(),
+                    Some(&candidate_project_id),
+                    &derived_wing,
+                    detection.rooms,
+                )
+                .map_err(config_error)?
+            };
+            if let Some(wing) = wing {
+                project_config.wing = wing;
+            }
+            let derived_project_id = derive_project_id(
+                &project_dir,
+                &project_config.wing,
+                explicit_project_id.as_deref(),
+            );
+            let project_id = if explicit_project_id
+                .as_deref()
+                .filter(|id| !id.trim().is_empty())
+                .is_some()
+            {
+                derived_project_id
+            } else {
+                ConfigLoader::find_project_id(
+                    context.config_base_dir.as_deref(),
+                    &project_dir,
+                    Some(&derived_project_id),
+                )
+                .map_err(config_error)?
+                .unwrap_or(derived_project_id)
+            };
+            if explicit_project_id
+                .as_deref()
+                .filter(|id| !id.trim().is_empty())
+                .is_none()
+                && project_id.starts_with("wing:")
+                && ConfigLoader::load_project_registry(context.config_base_dir.as_deref())
+                    .map_err(config_error)?
+                    .projects
+                    .contains_key(&project_id)
+                && ConfigLoader::find_project_id(
+                    context.config_base_dir.as_deref(),
+                    &project_dir,
+                    None,
+                )
+                .map_err(config_error)?
+                .is_none()
+            {
+                return Ok(CliOutput::failure(
+                    1,
+                    format!(
+                        "project `{project_id}` is ambiguous for a checkout without a Git origin; pass --project-id\n"
+                    ),
+                ));
+            }
+            let registry_path = ConfigLoader::register_project(
+                context.config_base_dir.as_deref(),
+                &project_id,
+                ProjectRegistryEntryV1 {
+                    project_root: project_root_relative(&project_dir),
+                    ..ProjectRegistryEntryV1::from(project_config.clone())
+                },
+                Some(&project_dir),
+            )
+            .map_err(config_error)?;
+            if repo_config {
+                write_project_config(
+                    &project_dir.join("mempalace.yaml"),
+                    &project_dir,
+                    &project_config,
+                    true,
+                )
+                .map_err(io_error)?;
+            }
+
+            let mut lines = vec![
+                format!("Project registered: {project_id}"),
+                format!("  Wing: {}", project_config.wing),
+                format!("  Registry: {}", registry_path.display()),
+            ];
+            if repo_config {
+                lines.push(format!(
+                    "  Repository config: {}",
+                    project_dir.join("mempalace.yaml").display()
+                ));
+            }
+            Ok(CliOutput::success(format!("{}\n", lines.join("\n"))))
+        }
+        ProjectCommands::Show { dir } => {
+            let project_dir = dir.canonicalize().map_err(|source| {
+                clap::Error::raw(
+                    clap::error::ErrorKind::Io,
+                    format!("failed to access project directory `{}`: {source}", dir.display()),
+                )
+            })?;
+            let derived_wing = wing_name_for_dir(&project_dir);
+            let project_id = derive_project_id(&project_dir, &derived_wing, None);
+            let project_config = ConfigLoader::resolve_project_config(
+                &project_dir,
+                context.config_base_dir.as_deref(),
+                Some(&project_id),
+                &derived_wing,
+                Vec::new(),
+            )
+            .map_err(config_error)?;
+            let project_id = ConfigLoader::find_project_id(
+                context.config_base_dir.as_deref(),
+                &project_dir,
+                Some(&project_id),
+            )
+            .map_err(config_error)?
+            .unwrap_or(project_id);
+            let mut lines = vec![
+                format!("Project: {project_id}"),
+                format!("  Wing: {}", project_config.wing),
+                "  Rooms:".to_owned(),
+            ];
+            lines.extend(project_config.rooms.iter().map(|room| {
+                format!("    - {}", room.name)
+            }));
+            if let Some(routing) = project_config.routing {
+                lines.push(format!("  Routing: {:?}", routing.mode));
+            }
+            Ok(CliOutput::success(format!("{}\n", lines.join("\n"))))
+        }
+        ProjectCommands::List => {
+            let registry = ConfigLoader::load_project_registry(context.config_base_dir.as_deref())
+                .map_err(config_error)?;
+            let mut lines = vec![format!("Projects: {}", registry.projects.len())];
+            for (project_id, entry) in registry.projects {
+                lines.push(format!("  {project_id} -> {}", entry.wing));
+            }
+            Ok(CliOutput::success(format!("{}\n", lines.join("\n"))))
+        }
+        ProjectCommands::Remove { project_id } => {
+            let (registry_path, removed) =
+                ConfigLoader::remove_project(context.config_base_dir.as_deref(), &project_id)
+                    .map_err(config_error)?;
+            if !removed {
+                return Ok(CliOutput::failure(
+                    1,
+                    format!("project `{project_id}` is not registered\n"),
+                ));
+            }
+            Ok(CliOutput::success(format!(
+                "Removed project {project_id} from {}\n",
+                registry_path.display()
+            )))
+        }
+        ProjectCommands::Export { project_id, dir, repo_config } => {
+            if !repo_config {
+                return Ok(CliOutput::failure(
+                    1,
+                    "project export requires --repo-config\n".to_owned(),
+                ));
+            }
+            let registry = ConfigLoader::load_project_registry(context.config_base_dir.as_deref())
+                .map_err(config_error)?;
+            let entry = registry.projects.get(&project_id).ok_or_else(|| {
+                clap::Error::raw(
+                    clap::error::ErrorKind::InvalidValue,
+                    format!("project `{project_id}` is not registered"),
+                )
+            })?;
+            let target_dir = match dir {
+                Some(dir) => dir.canonicalize().map_err(|source| {
+                    clap::Error::raw(
+                        clap::error::ErrorKind::Io,
+                        format!("failed to access project directory `{}`: {source}", dir.display()),
+                    )
+                })?,
+                None => entry.checkouts.first().cloned().ok_or_else(|| {
+                    clap::Error::raw(
+                        clap::error::ErrorKind::InvalidValue,
+                        format!("project `{project_id}` has no checkout alias; pass --dir"),
+                    )
+                })?,
+            };
+            let project_config = ProjectConfig {
+                wing: entry.wing.clone(),
+                rooms: entry.rooms.clone(),
+                routing: entry.routing.clone(),
+            };
+            let path = target_dir.join("mempalace.yaml");
+            write_project_config(&path, &target_dir, &project_config, true).map_err(io_error)?;
+            Ok(CliOutput::success(format!(
+                "Exported project {project_id} to {}\n",
+                path.display()
+            )))
+        }
+}
 }
 
 fn execute_mine<F, P>(
     dir: &Path,
     mode: CliMode,
     wing: Option<String>,
+    explicit_project_id: Option<String>,
     agent: String,
     limit: usize,
     dry_run: bool,
@@ -548,108 +866,154 @@ where
     let config = load_runtime_config(palace_override, context).map_err(config_error)?;
     let runtime = build_runtime(&config).map_err(runtime_error)?;
 
-    // Convos mode: --branch is not supported; remote routing is not supported.
-    if mode == CliMode::Convos && branch {
-        return Ok(CliOutput::failure(
-            1,
-            "--branch requires --mode projects; branch-delta mining is not supported for conversations\n",
-        ));
-    }
+    // ── Routing decision (projects mode only) ────────────────────────────────
+    if mode == CliMode::Projects {
+        let derived_wing = wing.clone().unwrap_or_else(|| wing_name_for_dir(&source_dir));
+        let candidate_project_id = derive_project_id(
+            &source_dir,
+            &derived_wing,
+            explicit_project_id.as_deref(),
+        );
+        let project_config = if let Some(project_id) = explicit_project_id.as_deref() {
+            match ConfigLoader::load_project_by_id(
+                context.config_base_dir.as_deref(),
+                project_id,
+            )
+            .map_err(config_error)? {
+                Some(config) => config,
+                None => {
+                    return Ok(CliOutput::failure(
+                        1,
+                        format!("project `{project_id}` is not registered\n"),
+                    ));
+                }
+            }
+        } else {
+            ConfigLoader::resolve_project_config(
+                &source_dir,
+                context.config_base_dir.as_deref(),
+                Some(&candidate_project_id),
+                &derived_wing,
+                Vec::new(),
+            )
+            .map_err(config_error)?
+        };
+        let project_id = if let Some(project_id) = explicit_project_id.as_deref() {
+            project_id.to_owned()
+        } else {
+            ConfigLoader::find_project_id(
+                context.config_base_dir.as_deref(),
+                &source_dir,
+                Some(&candidate_project_id),
+            )
+            .map_err(config_error)?
+            .unwrap_or_else(|| derive_project_id(&source_dir, &project_config.wing, None))
+        };
+        let wing_name = wing
+            .clone()
+            .unwrap_or_else(|| project_config.wing.clone());
 
-    let plan = resolve_plan(&source_dir, mode, &wing, branch, &config)?;
+        let project_routing = if wing
+            .as_deref()
+            .is_some_and(|override_wing| !wing_ids_equal(override_wing, &project_config.wing))
+        {
+            None
+        } else {
+            project_config.routing.as_ref()
+        };
+        let rule = resolve_route(
+            &config.federation,
+            project_routing,
+            RouteQuery { wing: Some(&wing_name), room: None, source_file: None },
+        );
 
-    match plan {
-        ExecPlan::Remote(rule) => execute_remote_mine(
-            &source_dir, wing, &agent, limit, dry_run, batch_size, &config, &runtime, &rule, false,
-        ),
-        ExecPlan::Both(rule) => {
-            let (_local_summary, local_output) = execute_local_mine(
-                &source_dir, mode, wing.clone(), agent.clone(), limit, dry_run, reindex,
-                extract, branch, batch_size, &config, &runtime, &provider_factory,
+        let use_remote = !branch
+            && (rule.mode == RouteMode::Remote
+                || (rule.mode == RouteMode::Combined
+                    && rule.write == WriteTarget::Remote));
+        let use_both = !branch
+            && rule.mode == RouteMode::Combined
+            && rule.write == WriteTarget::Both;
+
+        if use_remote {
+            return execute_remote_mine(
+                &source_dir,
+                wing,
+                &agent,
+                limit,
+                dry_run,
+                batch_size,
+                &config,
+                &runtime,
+                &rule,
+                &project_config,
+                Some(&project_id),
+                false,
+            );
+        }
+
+        if use_both {
+            let local_output = execute_local_project_mine(
+                &source_dir,
+                wing.clone(),
+                agent.clone(),
+                limit,
+                dry_run,
+                reindex,
+                batch_size,
+                branch,
+                &config,
+                &runtime,
+                &provider_factory,
+                &project_config,
+                Some(&project_id),
             )?;
-
             let remote_output = execute_remote_mine(
-                &source_dir, wing, &agent, limit, dry_run, batch_size, &config, &runtime, &rule, true,
+                &source_dir,
+                wing,
+                &agent,
+                limit,
+                dry_run,
+                batch_size,
+                &config,
+                &runtime,
+                &rule,
+                &project_config,
+                Some(&project_id),
+                true,
             )?;
-
-            let combined = format!("{}\n{}", local_output.trim(), remote_output.stdout.trim());
-            Ok(CliOutput::success(combined))
+            return Ok(combine_dual_write_outputs(local_output, remote_output));
         }
-        ExecPlan::Local => {
-            let (_summary, local_output) = execute_local_mine(
-                &source_dir, mode, wing, agent, limit, dry_run, reindex, extract, branch,
-                batch_size, &config, &runtime, &provider_factory,
-            )?;
-            Ok(CliOutput::success(local_output))
-        }
-    }
-}
 
-/// Resolve the execution plan for a mine operation.
-///
-/// Returns [`ExecPlan::Local`] for conversations, `--branch`, and local-only
-/// routes. Returns [`ExecPlan::Remote`] for remote-only or combined+write:remote
-/// routes. Returns [`ExecPlan::Both`] for combined+write:both dual-write routes.
-fn resolve_plan(
-    source_dir: &Path,
-    mode: CliMode,
-    wing: &Option<String>,
-    branch: bool,
-    config: &MempalaceConfig,
-) -> Result<ExecPlan, clap::Error> {
-    if mode != CliMode::Projects || branch {
-        // Conversations and --branch are always local.
-        return Ok(ExecPlan::Local);
-    }
-
-    let project_config =
-        ConfigLoader::load_project_config(source_dir).map_err(config_error)?;
-    let wing_name = wing
-        .clone()
-        .unwrap_or_else(|| project_config.wing.clone());
-
-    let rule = resolve_route(
-        &config.federation,
-        project_config.routing.as_ref(),
-        RouteQuery { wing: Some(&wing_name), room: None, source_file: None },
-    );
-
-    if rule.mode == RouteMode::Remote
-        || (rule.mode == RouteMode::Combined && rule.write == WriteTarget::Remote)
-    {
-        Ok(ExecPlan::Remote(rule))
-    } else if rule.mode == RouteMode::Combined && rule.write == WriteTarget::Both {
-        Ok(ExecPlan::Both(rule))
+        // ── Local mine path continues below with the resolved declaration. ──
+        return execute_local_project_mine(
+            &source_dir,
+            wing,
+            agent,
+            limit,
+            dry_run,
+            reindex,
+            batch_size,
+            branch,
+            &config,
+            &runtime,
+            provider_factory,
+            &project_config,
+            Some(&project_id),
+        );
     } else {
-        Ok(ExecPlan::Local)
+        // Convos mode: --branch is not supported; remote routing is not supported.
+        if branch {
+            return Ok(CliOutput::failure(
+                1,
+                "--branch requires --mode projects; branch-delta mining is not supported for conversations\n",
+            ));
+        }
+        // Conversation mining is always local: routing rules are wing-based and
+        // convo directories carry no project wing config to resolve against.
     }
-}
 
-/// Execute the local mine path: open storage, run ingestion, render summary.
-///
-/// Used by [`ExecPlan::Local`] and [`ExecPlan::Both`] to perform the local
-/// ingestion. For `--branch` mode this is the only execution step; remote
-/// replication is never attempted for branch-delta mining.
-#[allow(clippy::too_many_arguments)]
-fn execute_local_mine<F, P>(
-    source_dir: &Path,
-    mode: CliMode,
-    wing: Option<String>,
-    agent: String,
-    limit: usize,
-    dry_run: bool,
-    reindex: bool,
-    extract: CliExtractMode,
-    branch: bool,
-    batch_size: Option<usize>,
-    config: &MempalaceConfig,
-    runtime: &tokio::runtime::Runtime,
-    provider_factory: &F,
-) -> Result<(IngestSummary, String), clap::Error>
-where
-    F: Fn(EmbeddingProfile, PathBuf) -> Result<P, Box<dyn std::error::Error>>,
-    P: EmbeddingProvider,
-{
+    // ── Conversation mine path ──────────────────────────────────────────────
     let use_temp_storage = dry_run && !palace_exists(&config.palace_path);
     let dry_run_storage =
         if use_temp_storage { Some(tempfile::tempdir().map_err(io_error)?) } else { None };
@@ -668,46 +1032,126 @@ where
             .then(|| config.low_cpu.effective_ingest_batch_size())
     });
 
-    let summary = match mode {
-        CliMode::Projects => runtime
-            .block_on(ingest_project(
-                &engine,
-                &mut provider,
-                &ProjectIngestRequest {
-                    project_dir: source_dir.to_path_buf(),
-                    wing: wing.clone(),
-                    agent: agent.clone(),
-                    limit: if limit == 0 { None } else { Some(limit) },
-                    dry_run,
-                    reindex,
-                    max_embed_batch_size,
-                    branch,
+    let summary = runtime
+        .block_on(ingest_conversations(
+            &engine,
+            &mut provider,
+            &ConversationIngestRequest {
+                convo_dir: source_dir.clone(),
+                wing,
+                agent,
+                extract_mode: match extract {
+                    CliExtractMode::Exchange => ConversationExtractMode::Exchange,
+                    CliExtractMode::General => ConversationExtractMode::General,
                 },
-            ))
-            .map_err(|e| branch_delta_error(e, ingest_error))?,
-        CliMode::Convos => runtime
-            .block_on(ingest_conversations(
-                &engine,
-                &mut provider,
-                &ConversationIngestRequest {
-                    convo_dir: source_dir.to_path_buf(),
-                    wing: wing.clone(),
-                    agent: agent.clone(),
-                    extract_mode: match extract {
-                        CliExtractMode::Exchange => ConversationExtractMode::Exchange,
-                        CliExtractMode::General => ConversationExtractMode::General,
-                    },
-                    limit: if limit == 0 { None } else { Some(limit) },
-                    dry_run,
-                    reindex,
-                    max_embed_batch_size,
-                },
-            ))
-            .map_err(ingest_error)?,
-    };
+                limit: if limit == 0 { None } else { Some(limit) },
+                dry_run,
+                reindex,
+                max_embed_batch_size,
+            },
+        ))
+        .map_err(ingest_error)?;
 
-    let rendered = render_mine_summary(mode, source_dir, &config.palace_path, dry_run, &summary);
-    Ok((summary, rendered))
+    Ok(CliOutput::success(render_mine_summary(
+        mode,
+        &source_dir,
+        &config.palace_path,
+        dry_run,
+        &summary,
+    )))
+}
+
+#[derive(Debug, Subcommand)]
+enum ProjectCommands {
+    /// Register or update a project declaration.
+    Register {
+        dir: PathBuf,
+        #[arg(long)]
+        wing: Option<String>,
+        #[arg(long = "project-id", alias = "project", help = "Explicit project registry ID")]
+        project_id: Option<String>,
+        #[arg(long = "repo-config")]
+        repo_config: bool,
+    },
+    /// Show the declaration resolved for a checkout.
+    Show { dir: PathBuf },
+    /// List all centralized project declarations.
+    List,
+    /// Remove a declaration by its stable project ID.
+    Remove { project_id: String },
+    /// Export a centralized declaration to a repository-local compatibility file.
+    Export {
+        project_id: String,
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        #[arg(long = "repo-config")]
+        repo_config: bool,
+    },
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_local_project_mine<F, P>(
+    source_dir: &Path,
+    wing: Option<String>,
+    agent: String,
+    limit: usize,
+    dry_run: bool,
+    reindex: bool,
+    batch_size: Option<usize>,
+    branch: bool,
+    config: &MempalaceConfig,
+    runtime: &tokio::runtime::Runtime,
+    provider_factory: F,
+    project_config: &ProjectConfig,
+    project_id: Option<&str>,
+) -> Result<CliOutput, clap::Error>
+where
+    F: Fn(EmbeddingProfile, PathBuf) -> Result<P, Box<dyn std::error::Error>>,
+    P: EmbeddingProvider,
+{
+    let use_temp_storage = dry_run && !palace_exists(&config.palace_path);
+    let dry_run_storage =
+        if use_temp_storage { Some(tempfile::tempdir().map_err(io_error)?) } else { None };
+    let storage_root =
+        dry_run_storage.as_ref().map(|dir| dir.path()).unwrap_or(config.palace_path.as_path());
+    let engine = runtime
+        .block_on(StorageEngine::open(storage_root, config.embedding_profile))
+        .map_err(storage_error)?;
+    let mut provider = provider_factory(config.embedding_profile, default_embedding_cache_dir())
+        .map_err(provider_error)?;
+    let max_embed_batch_size = batch_size.filter(|&n| n > 0).or_else(|| {
+        config
+            .low_cpu
+            .enabled
+            .then(|| config.low_cpu.effective_ingest_batch_size())
+    });
+
+    let summary = runtime
+        .block_on(ingest_project_with_config(
+            &engine,
+            &mut provider,
+            &ProjectIngestRequest {
+                project_dir: source_dir.to_path_buf(),
+                wing,
+                agent,
+                limit: if limit == 0 { None } else { Some(limit) },
+                dry_run,
+                reindex,
+                max_embed_batch_size,
+                branch,
+            },
+            project_config,
+            project_id,
+        ))
+        .map_err(|e| branch_delta_error(e, ingest_error))?;
+
+    Ok(CliOutput::success(render_mine_summary(
+        CliMode::Projects,
+        source_dir,
+        &config.palace_path,
+        dry_run,
+        &summary,
+    )))
 }
 
 /// Map an [`IngestError`] to a clap error, giving a friendly message for
@@ -745,6 +1189,8 @@ fn execute_remote_mine(
     config: &MempalaceConfig,
     runtime: &tokio::runtime::Runtime,
     rule: &mempalace_config::ResolvedRouteRule,
+    project_config: &ProjectConfig,
+    project_id: Option<&str>,
     dual_write: bool,
 ) -> Result<CliOutput, clap::Error> {
     // `--batch-size N` (N>0) caps files per remote request, letting low-spec
@@ -752,7 +1198,8 @@ fn execute_remote_mine(
     // still applies as an independent guardrail against the server body limit.
     let max_files_per_batch = batch_size.filter(|&n| n > 0).unwrap_or(REMOTE_BATCH_MAX_FILES);
     // ── 1. Prepare the batch (no embedding, no storage) ─────────────────────
-    let prepared = match prepare_project_batch(&ProjectIngestRequest {
+    let prepared = match prepare_project_batch_with_config(
+        &ProjectIngestRequest {
         project_dir: source_dir.to_path_buf(),
         wing: wing_override.clone(),
         agent: agent.to_owned(),
@@ -761,7 +1208,10 @@ fn execute_remote_mine(
         reindex: false,
         max_embed_batch_size: None,
         branch: false,
-    }) {
+        },
+        project_config,
+        project_id,
+    ) {
         Ok(p) => p,
         Err(e) => {
             let msg = format!("failed to prepare project batch: {e}\n");
@@ -1619,7 +2069,7 @@ fn project_room(name: &str, description: &str, keywords: &[&str]) -> ProjectRoom
 fn write_project_config(
     config_path: &Path,
     project_dir: &Path,
-    rooms: &[ProjectRoomConfig],
+    project_config: &ProjectConfig,
     overwrite: bool,
 ) -> std::io::Result<()> {
     if config_path.exists() && !overwrite {
@@ -1636,12 +2086,20 @@ fn write_project_config(
     let mut root = Mapping::new();
     root.insert(
         serde_yaml::Value::String("wing".to_owned()),
-        serde_yaml::Value::String(wing_name_for_dir(project_dir)),
+        serde_yaml::Value::String(project_config.wing.clone()),
     );
     root.insert(
         serde_yaml::Value::String("rooms".to_owned()),
-        serde_yaml::to_value(rooms).map_err(|error| std::io::Error::other(error.to_string()))?,
+        serde_yaml::to_value(&project_config.rooms)
+            .map_err(|error| std::io::Error::other(error.to_string()))?,
     );
+    if let Some(routing) = &project_config.routing {
+        root.insert(
+            serde_yaml::Value::String("routing".to_owned()),
+            serde_yaml::to_value(routing)
+                .map_err(|error| std::io::Error::other(error.to_string()))?,
+        );
+    }
 
     fs::write(
         config_path,
@@ -1658,6 +2116,13 @@ fn wing_name_for_dir(project_dir: &Path) -> String {
         .replace('-', "_")
         .replace(' ', "_");
     if name.starts_with("wing_") { name } else { format!("wing_{name}") }
+}
+
+fn wing_ids_equal(left: &str, right: &str) -> bool {
+    match (WingId::normalized(left), WingId::normalized(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left.eq_ignore_ascii_case(right),
+    }
 }
 
 fn count_project_files(project_dir: &Path) -> std::io::Result<usize> {
@@ -1937,7 +2402,7 @@ mod tests {
     }
 
     #[test]
-    fn init_creates_project_config_and_global_config_without_yes_on_first_run() {
+    fn init_registers_project_without_writing_repository_config_by_default() {
         let workspace = tempdir().unwrap();
         let project_dir = setup_project_fixture(workspace.path());
         let config_root = temp_config_root("init");
@@ -1948,14 +2413,32 @@ mod tests {
 
         assert_eq!(output.exit_code, 0);
         assert!(output.stdout.contains("MemPalace Init"));
-        assert!(project_dir.join("mempalace.yaml").exists());
+        assert!(!project_dir.join("mempalace.yaml").exists());
+        assert!(config_root.join("projects.json").exists());
         assert!(config_root.join("config.json").exists());
         assert!(config_root.join("palace").exists());
         fs::remove_dir_all(config_root).unwrap();
     }
 
     #[test]
-    fn init_requires_yes_only_when_overwriting_existing_project_config() {
+    fn init_does_not_reuse_wing_only_id_for_an_unrelated_checkout() {
+        let workspace = tempdir().unwrap();
+        let first = setup_project_fixture(&workspace.path().join("first"));
+        let second = setup_project_fixture(&workspace.path().join("second"));
+        let config_root = temp_config_root("wing-only-id");
+        let context = CliContext::for_tests(config_root.clone());
+
+        let first_init = run_cli(["init", first.to_str().unwrap()], &context, stub_provider).unwrap();
+        assert_eq!(first_init.exit_code, 0);
+        let second_init = run_cli(["init", second.to_str().unwrap()], &context, stub_provider).unwrap();
+        assert_eq!(second_init.exit_code, 1);
+        assert!(second_init.stderr.contains("pass --project-id"));
+
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn init_imports_existing_project_config_without_modifying_repository_file() {
         let workspace = tempdir().unwrap();
         let project_dir = setup_project_fixture(workspace.path());
         let config_root = temp_config_root("init-yes");
@@ -1965,10 +2448,30 @@ mod tests {
 
         let output =
             run_cli(["init", project_dir.to_str().unwrap()], &context, stub_provider).unwrap();
-        assert_eq!(output.exit_code, 1);
-        assert!(output.stderr.contains("with `--yes` to overwrite it"));
+        assert_eq!(output.exit_code, 0);
         assert_eq!(fs::read_to_string(project_dir.join("mempalace.yaml")).unwrap(), existing);
+        assert!(config_root.join("projects.json").is_file());
 
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn init_repo_config_flag_emits_portable_override() {
+        let workspace = tempdir().unwrap();
+        let project_dir = setup_project_fixture(workspace.path());
+        let config_root = temp_config_root("init-repo-config");
+        let context = CliContext::for_tests(config_root.clone());
+
+        let output = run_cli(
+            ["init", project_dir.to_str().unwrap(), "--repo-config"],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+
+        assert_eq!(output.exit_code, 0);
+        assert!(project_dir.join("mempalace.yaml").is_file());
+        assert!(config_root.join("projects.json").is_file());
         remove_dir_all_if_exists(&config_root);
     }
 
@@ -2279,6 +2782,19 @@ mod tests {
     }
 
     #[test]
+    fn dual_write_surfaces_remote_stderr_without_failing_local_success() {
+        let output = combine_dual_write_outputs(
+            CliOutput::success("local mine complete"),
+            CliOutput::failure(1, "remote replication failed"),
+        );
+
+        assert_eq!(output.exit_code, 0);
+        assert!(output.stdout.contains("local mine complete"));
+        assert!(output.stdout.contains("remote replication failed"));
+        assert!(output.stderr.is_empty());
+    }
+
+    #[test]
     fn mine_dry_run_reports_work_without_writing_storage_files() {
         let workspace = tempdir().unwrap();
         let project_dir = setup_project_fixture(workspace.path());
@@ -2386,6 +2902,132 @@ mod tests {
         assert!(status.stdout.contains("WING: wing_overridewing"));
         assert!(!status.stdout.contains("WING: wing_project_alpha"));
         fs::remove_dir_all(config_root).unwrap();
+    }
+
+    #[test]
+    fn mine_projects_uses_central_registry_without_repository_yaml() {
+        let workspace = tempdir().unwrap();
+        let project_dir = setup_project_fixture(workspace.path());
+        let config_root = temp_config_root("central-registry-mine");
+        let context = CliContext::for_tests(config_root.clone());
+
+        let init = run_cli(["init", project_dir.to_str().unwrap()], &context, stub_provider)
+            .unwrap();
+        assert_eq!(init.exit_code, 0);
+        assert!(!project_dir.join("mempalace.yaml").exists());
+
+        let mine = run_cli(
+            ["mine", project_dir.to_str().unwrap(), "--dry-run"],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+        assert_eq!(mine.exit_code, 0);
+        assert!(mine.stdout.contains("Dry run: yes"));
+
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn project_commands_manage_registry_and_export_compatibility_file() {
+        let workspace = tempdir().unwrap();
+        let project_dir = setup_project_fixture(workspace.path());
+        let config_root = temp_config_root("project-commands");
+        let context = CliContext::for_tests(config_root.clone());
+        let project_id = "local/project-alpha";
+
+        let register = run_cli(
+            [
+                "project",
+                "register",
+                project_dir.to_str().unwrap(),
+                "--wing",
+                "wing_registered",
+                "--project-id",
+                project_id,
+            ],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+        assert_eq!(register.exit_code, 0);
+        assert!(register.stdout.contains(project_id));
+
+        let list = run_cli(["project", "list"], &context, stub_provider).unwrap();
+        assert!(list.stdout.contains("Projects: 1"));
+        assert!(list.stdout.contains(project_id));
+
+        let show = run_cli(
+            ["project", "show", project_dir.to_str().unwrap()],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+        assert!(show.stdout.contains("wing_registered"));
+
+        let export = run_cli(
+            ["project", "export", project_id, "--repo-config"],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+        assert_eq!(export.exit_code, 0);
+        assert!(fs::read_to_string(project_dir.join("mempalace.yaml"))
+            .unwrap()
+            .contains("wing_registered"));
+
+        let show_after_export = run_cli(
+            ["project", "show", project_dir.to_str().unwrap()],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+        assert!(show_after_export.stdout.contains("Project: local/project-alpha"));
+
+        let remove = run_cli(["project", "remove", project_id], &context, stub_provider).unwrap();
+        assert_eq!(remove.exit_code, 0);
+        let list = run_cli(["project", "list"], &context, stub_provider).unwrap();
+        assert!(list.stdout.contains("Projects: 0"));
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn project_export_requires_explicit_repo_config_flag() {
+        let workspace = tempdir().unwrap();
+        let project_dir = setup_project_fixture(workspace.path());
+        let config_root = temp_config_root("project-export-flag");
+        let context = CliContext::for_tests(config_root.clone());
+        let project_id = "local/project-export";
+
+        let register = run_cli(
+            [
+                "project",
+                "register",
+                project_dir.to_str().unwrap(),
+                "--wing",
+                "wing_export",
+                "--project-id",
+                project_id,
+            ],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+        assert_eq!(register.exit_code, 0);
+
+        let export = run_cli(["project", "export", project_id], &context, stub_provider).unwrap();
+        assert_eq!(export.exit_code, 1);
+        assert!(export.stderr.contains("requires --repo-config"));
+        assert!(!project_dir.join("mempalace.yaml").exists());
+
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn equivalent_wing_ids_preserve_project_routing() {
+        assert!(wing_ids_equal("wing_app", "app"));
+        assert!(wing_ids_equal("APP", "wing_app"));
+        assert!(!wing_ids_equal("wing_app", "wing_other"));
     }
 
     #[test]

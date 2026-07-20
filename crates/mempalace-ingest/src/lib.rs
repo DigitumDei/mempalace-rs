@@ -7,7 +7,7 @@ use std::io::Read as _;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
-use mempalace_config::{ConfigLoader, ProjectRoomConfig};
+use mempalace_config::{ConfigLoader, ProjectConfig, ProjectRoomConfig};
 use mempalace_core::{DrawerId, DrawerRecord, RoomId, SourceLocator, WingId};
 use mempalace_embeddings::{EmbeddingProvider, EmbeddingRequest};
 pub use mempalace_federation;
@@ -520,9 +520,49 @@ pub async fn ingest_project<P: EmbeddingProvider>(
         .project_dir
         .canonicalize()
         .map_err(|source| IngestError::Io { path: request.project_dir.clone(), source })?;
-    let config = ConfigLoader::load_project_config(&root)?;
+    let derived_wing = request
+        .wing
+        .clone()
+        .unwrap_or_else(|| derived_project_wing(&root));
+    let project_id = derive_project_id(&root, &derived_wing, None);
+    let config = ConfigLoader::resolve_project_config(
+        &root,
+        None,
+        Some(&project_id),
+        &derived_wing,
+        Vec::new(),
+    )?;
+    let repo_id = ConfigLoader::find_project_id(None, &root, Some(&project_id))?
+        .unwrap_or_else(|| derive_project_id(&root, &config.wing, None));
+    ingest_project_with_config(engine, provider, request, &config, Some(&repo_id)).await
+}
+
+/// Mine a project using a project declaration resolved by the caller.
+///
+/// The CLI uses this entry point so its centralized registry can be selected
+/// from the active configuration base directory.  `project_id` should remain
+/// stable across clones and worktrees when available.
+pub async fn ingest_project_with_config<P: EmbeddingProvider>(
+    engine: &StorageEngine,
+    provider: &mut P,
+    request: &ProjectIngestRequest,
+    config: &ProjectConfig,
+    project_id: Option<&str>,
+) -> Result<IngestSummary> {
+    let root = request
+        .project_dir
+        .canonicalize()
+        .map_err(|source| IngestError::Io { path: request.project_dir.clone(), source })?;
     let wing_name = request.wing.clone().unwrap_or_else(|| config.wing.clone());
     let wing_id = wing_id(&wing_name)?;
+    let repo_id = project_id
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| derive_repo_id(&root, &wing_name));
+    let project_root_key = stable_project_root_key(&repo_id);
+    let legacy_root_key = hash_text(&root.to_string_lossy());
+    let branch_name = request.branch.then(|| {
+        resolve_current_branch(&root).unwrap_or_else(|| "detached".to_owned())
+    });
     let discovered = discover_project_files(&root)?;
     let routing_fingerprint = project_routing_fingerprint(&config.rooms);
 
@@ -560,13 +600,49 @@ pub async fn ingest_project<P: EmbeddingProvider>(
     for file in &files {
         match prepare_file_chunks(file, &routing_fingerprint, &config.rooms) {
             Ok(prepared) => {
-                let sk =
-                    source_key(ingest_kind, &root, &wing_name, None, &file.relative_path);
-                if !request.reindex {
-                    if let Some(existing) =
-                        engine.operational_store().get_ingested_file(&sk)?
+                let sk = branch_name.as_deref().map_or_else(
+                    || project_source_key(ingest_kind, &project_root_key, &wing_name, &file.relative_path),
+                    |branch| {
+                        project_branch_source_key(
+                            ingest_kind,
+                            &project_root_key,
+                            &wing_name,
+                            branch,
+                            &file.relative_path,
+                        )
+                    },
+                );
+                let looked_up = engine.operational_store().get_ingested_file(&sk)?;
+                let current_existing = looked_up.as_ref().filter(|record| record.source_key == sk);
+                let migrated_source_key = if branch_name.is_none() {
+                    let legacy_sk = legacy_project_source_key(
+                        ingest_kind,
+                        &legacy_root_key,
+                        &wing_name,
+                        &file.relative_path,
+                    );
+                    let legacy_record = if let Some(record) =
+                        looked_up.as_ref().filter(|record| record.source_key != sk)
                     {
+                        Some(record.clone())
+                    } else {
+                        engine
+                            .operational_store()
+                            .get_ingested_file(&legacy_sk)?
+                            .filter(|record| record.source_key != sk)
+                    };
+                    legacy_record.map(|record| record.source_key)
+                } else {
+                    None
+                };
+                if !request.reindex {
+                    if let Some(existing) = current_existing {
                         if existing.content_hash == prepared.content_hash {
+                            if !request.dry_run {
+                                if let Some(old_key) = migrated_source_key.as_deref() {
+                                    engine.remove_source_key(old_key).await?;
+                                }
+                            }
                             summary.skipped_unchanged += 1;
                             continue;
                         }
@@ -584,6 +660,9 @@ pub async fn ingest_project<P: EmbeddingProvider>(
                             Vec::new(),
                         )
                         .await?;
+                        if let Some(old_key) = migrated_source_key.as_deref() {
+                            engine.remove_source_key(old_key).await?;
+                        }
                     }
                     summary.ingested_files += 1;
                     summary.truncated_files += usize::from(prepared.truncated);
@@ -623,6 +702,9 @@ pub async fn ingest_project<P: EmbeddingProvider>(
                         source_drawers,
                     )
                     .await?;
+                    if let Some(old_key) = migrated_source_key.as_deref() {
+                        engine.remove_source_key(old_key).await?;
+                    }
                 }
 
                 summary.ingested_files += 1;
@@ -636,19 +718,38 @@ pub async fn ingest_project<P: EmbeddingProvider>(
         }
     }
 
+    // Remove path-hash source rows that were not present in this mine.  This
+    // catches files deleted before the stable project-id migration ran.
+    if branch_name.is_none() && request.limit.is_none() && !request.dry_run {
+        let current_rel_paths: BTreeSet<&str> =
+            files.iter().map(|file| file.relative_path.as_str()).collect();
+        let legacy_prefix = format!("{ingest_kind}:{wing_name}:{legacy_root_key}:");
+        for key in engine
+            .operational_store()
+            .ingested_source_keys_with_prefix(&legacy_prefix)?
+        {
+            let rel = key.splitn(4, ':').nth(3).unwrap_or("");
+            if !current_rel_paths.contains(rel) {
+                engine.remove_source_key(&key).await?;
+            }
+        }
+    }
+
     // Branch cleanup pass: remove source keys whose relative paths are no longer
     // in the current delta (files reverted to base or deleted from the branch).
     if request.branch && !request.dry_run {
         let current_rel_paths: BTreeSet<&str> =
             files.iter().map(|f| f.relative_path.as_str()).collect();
-        let root_key = hash_text(&root.to_string_lossy());
-        let prefix = format!("{ingest_kind}:{wing_name}:{root_key}:");
+        let prefix = branch_name.as_deref().map_or_else(
+            || format!("{ingest_kind}:{wing_name}:{project_root_key}:"),
+            |branch| format!("{ingest_kind}:{wing_name}:{project_root_key}:{branch}:"),
+        );
         let stale_keys =
             engine.operational_store().ingested_source_keys_with_prefix(&prefix)?;
         for key in stale_keys {
-            // Key format: projects-branch:{wing}:{root_key}:{rel_path}
-            // Split off the first 3 ':'-delimited segments to get rel_path.
-            let rel = key.splitn(4, ':').nth(3).unwrap_or("");
+            // Key format: projects-branch:{wing}:{root_key}:{branch}:{rel_path}
+            // Split off the first 4 ':'-delimited segments to get rel_path.
+            let rel = key.splitn(5, ':').nth(4).unwrap_or("");
             if !current_rel_paths.contains(rel) {
                 // Only replace if there are committed drawers for this key.
                 if let Some(existing) =
@@ -1302,13 +1403,41 @@ pub fn prepare_project_batch(request: &ProjectIngestRequest) -> Result<PreparedP
         .project_dir
         .canonicalize()
         .map_err(|source| IngestError::Io { path: request.project_dir.clone(), source })?;
-    let config = ConfigLoader::load_project_config(&root)?;
+    let derived_wing = request
+        .wing
+        .clone()
+        .unwrap_or_else(|| derived_project_wing(&root));
+    let project_id = derive_project_id(&root, &derived_wing, None);
+    let config = ConfigLoader::resolve_project_config(
+        &root,
+        None,
+        Some(&project_id),
+        &derived_wing,
+        Vec::new(),
+    )?;
+    let repo_id = ConfigLoader::find_project_id(None, &root, Some(&project_id))?
+        .unwrap_or_else(|| derive_project_id(&root, &config.wing, None));
+    prepare_project_batch_with_config(request, &config, Some(&repo_id))
+}
+
+/// Prepare a project batch using a project declaration resolved by the caller.
+pub fn prepare_project_batch_with_config(
+    request: &ProjectIngestRequest,
+    config: &ProjectConfig,
+    project_id: Option<&str>,
+) -> Result<PreparedProjectMine> {
+    let root = request
+        .project_dir
+        .canonicalize()
+        .map_err(|source| IngestError::Io { path: request.project_dir.clone(), source })?;
     let wing_name = request.wing.clone().unwrap_or_else(|| config.wing.clone());
     let discovered = discover_project_files(&root)?;
     let routing_fingerprint = project_routing_fingerprint(&config.rooms);
     let commit_hash = resolve_commit_hash(&root);
 
-    let repo_id = derive_repo_id(&root, &wing_name);
+    let repo_id = project_id
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| derive_repo_id(&root, &wing_name));
     let default_branch = detect_default_branch(&root);
     let current_branch = resolve_current_branch(&root);
 
@@ -1372,6 +1501,17 @@ pub fn prepare_project_batch(request: &ProjectIngestRequest) -> Result<PreparedP
 }
 
 // ─── Repo identity ───────────────────────────────────────────────────────────
+
+fn derived_project_wing(root: &Path) -> String {
+    let name = root
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("project")
+        .to_ascii_lowercase()
+        .replace('-', "_")
+        .replace(' ', "_");
+    if name.starts_with("wing_") { name } else { format!("wing_{name}") }
+}
 
 /// Derive a machine-independent repository identity string from the git remote
 /// URL of `origin`.  Falls back to `format!("wing:{wing}")` when no remote is
@@ -2667,6 +2807,82 @@ fn source_key(
     relative_path: &str,
 ) -> String {
     let root_key = hash_text(&root.to_string_lossy());
+    source_key_with_root_key(ingest_kind, &root_key, wing, extract_mode, relative_path)
+}
+
+/// Return the repository-relative project root for a checkout, when the
+/// checkout is a subdirectory of a Git repository.  The root repository
+/// itself returns `None`; the value uses forward slashes for registry keys.
+pub fn project_root_relative(root: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .args(["-C", &root.to_string_lossy(), "rev-parse", "--show-toplevel"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let git_root = PathBuf::from(String::from_utf8(output.stdout).ok()?.trim())
+        .canonicalize()
+        .ok()?;
+    let canonical_root = root.canonicalize().ok()?;
+    let relative = canonical_root.strip_prefix(git_root).ok()?;
+    let value = relative.to_string_lossy().replace('\\', "/");
+    (!value.is_empty()).then_some(value)
+}
+
+/// Derive the durable project ID used by the centralized registry and local
+/// project source keys.  An explicit ID is preserved verbatim; otherwise a
+/// monorepo subproject is namespaced below its normalized repository identity.
+pub fn derive_project_id(root: &Path, wing: &str, explicit_id: Option<&str>) -> String {
+    if let Some(explicit_id) = explicit_id.filter(|value| !value.trim().is_empty()) {
+        return explicit_id.trim().to_owned();
+    }
+    let repo_id = derive_repo_id(root, wing);
+    match project_root_relative(root) {
+        Some(project_root) => format!("{repo_id}#{project_root}"),
+        None => repo_id,
+    }
+}
+
+fn project_source_key(
+    ingest_kind: &str,
+    project_root_key: &str,
+    wing: &str,
+    relative_path: &str,
+) -> String {
+    source_key_with_root_key(ingest_kind, project_root_key, wing, None, relative_path)
+}
+
+fn legacy_project_source_key(
+    ingest_kind: &str,
+    root_key: &str,
+    wing: &str,
+    relative_path: &str,
+) -> String {
+    source_key_with_root_key(ingest_kind, root_key, wing, None, relative_path)
+}
+
+fn project_branch_source_key(
+    ingest_kind: &str,
+    project_root_key: &str,
+    wing: &str,
+    branch: &str,
+    relative_path: &str,
+) -> String {
+    format!("{ingest_kind}:{wing}:{project_root_key}:{branch}:{relative_path}")
+}
+
+fn stable_project_root_key(repo_id: &str) -> String {
+    hash_text(&format!("project:{repo_id}"))
+}
+
+fn source_key_with_root_key(
+    ingest_kind: &str,
+    root_key: &str,
+    wing: &str,
+    extract_mode: Option<&str>,
+    relative_path: &str,
+) -> String {
     match extract_mode {
         Some(mode) => format!("{ingest_kind}:{wing}:{mode}:{root_key}:{relative_path}"),
         None => format!("{ingest_kind}:{wing}:{root_key}:{relative_path}"),
@@ -2772,7 +2988,9 @@ mod tests {
         EmbeddingProvider, EmbeddingRequest, EmbeddingResponse, StartupValidation,
         StartupValidationStatus,
     };
-    use mempalace_storage::{DrawerFilter, DrawerStore};
+    use mempalace_storage::{
+        DrawerFilter, DrawerStore, DuplicateStrategy, IngestCommitRequest,
+    };
     use serde_json::json;
     use tempfile::tempdir;
 
@@ -4176,13 +4394,105 @@ mod tests {
         // Resolve the stored source key for src/main.rs.
         let root = project_dir.canonicalize().unwrap();
         let wing_name = "testbatch";
-        let sk = source_key("projects", &root, wing_name, None, "src/main.rs");
+        let repo_id = derive_repo_id(&root, wing_name);
+        let sk = project_source_key(
+            "projects",
+            &stable_project_root_key(&repo_id),
+            wing_name,
+            "src/main.rs",
+        );
         let stored =
             engine.operational_store().get_ingested_file(&sk).unwrap().expect("must be stored");
         assert_eq!(
             utf8_dto.content_hash, stored.content_hash,
             "prepare_project_batch content_hash must match stored content_hash"
         );
+    }
+
+    #[tokio::test]
+    async fn project_ingest_migrates_legacy_path_hashed_source_keys() {
+        let tempdir = tempdir().unwrap();
+        let project_dir = tempdir.path().join("project");
+        fs::create_dir_all(project_dir.join("src")).unwrap();
+        fs::write(
+            project_dir.join("mempalace.yaml"),
+            "wing: migration_test\nrooms:\n  - name: general\n",
+        )
+        .unwrap();
+        fs::write(
+            project_dir.join("src/main.rs"),
+            "fn main() { println!(\"migration\"); }\n".repeat(12),
+        )
+        .unwrap();
+
+        let root = project_dir.canonicalize().unwrap();
+        let wing_name = "migration_test";
+        let legacy_key = legacy_project_source_key(
+            "projects",
+            &hash_text(&root.to_string_lossy()),
+            wing_name,
+            "src/main.rs",
+        );
+        let repo_id = derive_repo_id(&root, wing_name);
+        let stable_key = project_source_key(
+            "projects",
+            &stable_project_root_key(&repo_id),
+            wing_name,
+            "src/main.rs",
+        );
+
+        let engine = open_engine(&tempdir.path().join("palace")).await;
+        let mut provider = FakeEmbeddingProvider::new(EmbeddingProfile::Balanced.metadata().dimensions);
+        let legacy_drawers = build_drawers(
+            &mut provider,
+            &wing_id(wing_name).unwrap(),
+            &legacy_key,
+            "src/main.rs",
+            "projects",
+            None,
+            "legacy",
+            None,
+            vec![Chunk {
+                content: "legacy drawer content that should be migrated".to_owned(),
+                chunk_index: 0,
+                room_hint: Some("general".to_owned()),
+                date_hint: None,
+                byte_range: None,
+            }],
+            None,
+        )
+        .unwrap();
+        engine
+            .commit_ingest(IngestCommitRequest {
+                ingest_kind: "projects".to_owned(),
+                source_key: legacy_key.clone(),
+                source_file: "src/main.rs".to_owned(),
+                content_hash: "legacy-content-hash".to_owned(),
+                drawers: legacy_drawers,
+                duplicate_strategy: DuplicateStrategy::Overwrite,
+            })
+            .await
+            .unwrap();
+
+        ingest_project(
+            &engine,
+            &mut provider,
+            &ProjectIngestRequest::new(&project_dir),
+        )
+        .await
+        .unwrap();
+
+        assert!(engine.operational_store().get_ingested_file(&legacy_key).unwrap().is_none());
+        assert!(engine
+            .operational_store()
+            .committed_drawer_ids_for_source_key(&legacy_key)
+            .unwrap()
+            .is_empty());
+        assert!(!engine
+            .operational_store()
+            .committed_drawer_ids_for_source_key(&stable_key)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -4333,14 +4643,26 @@ mod tests {
         // Source keys must use the projects-branch prefix.
         let root = repo_dir.canonicalize().unwrap();
         let wing_name = "branchtest";
-        let sk_base =
-            source_key("projects-branch", &root, wing_name, None, "base.rs");
+        let repo_id = derive_repo_id(&root, wing_name);
+        let project_root_key = stable_project_root_key(&repo_id);
+        let sk_base = project_branch_source_key(
+            "projects-branch",
+            &project_root_key,
+            wing_name,
+            "feature",
+            "base.rs",
+        );
         let stored_base =
             engine.operational_store().get_ingested_file(&sk_base).unwrap();
         assert!(stored_base.is_some(), "base.rs must be stored under projects-branch key");
 
-        let sk_stable =
-            source_key("projects-branch", &root, wing_name, None, "stable.rs");
+        let sk_stable = project_branch_source_key(
+            "projects-branch",
+            &project_root_key,
+            wing_name,
+            "feature",
+            "stable.rs",
+        );
         let stored_stable =
             engine.operational_store().get_ingested_file(&sk_stable).unwrap();
         assert!(stored_stable.is_none(), "stable.rs must NOT be stored (not in delta)");
@@ -4429,8 +4751,14 @@ mod tests {
         // base.rs drawers must be cleared.
         let root = repo_dir.canonicalize().unwrap();
         let wing_name = "cleanuptest";
-        let sk_base =
-            source_key("projects-branch", &root, wing_name, None, "base.rs");
+        let repo_id = derive_repo_id(&root, wing_name);
+        let sk_base = project_branch_source_key(
+            "projects-branch",
+            &stable_project_root_key(&repo_id),
+            wing_name,
+            "feature",
+            "base.rs",
+        );
         let stored = engine.operational_store().get_ingested_file(&sk_base).unwrap();
         // After cleanup the key exists but with zero drawers (replace-with-empty).
         // The content_hash is now hash_text("removed").

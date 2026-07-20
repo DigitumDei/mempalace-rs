@@ -198,7 +198,8 @@ Clients (the CLI and the MCP server) read `federation` from
 First match wins:
 
 1. Explicit per-wing rule in `federation.wings`
-2. The `routing` block in that wing's project `mempalace.yaml`
+2. The `routing` block in the resolved project declaration (central registry
+   first, with repository-local `mempalace.yaml` as the compatibility override)
 3. `federation.default_mode`
 4. `local` (hard default when no federation config exists)
 
@@ -210,8 +211,8 @@ branch facts local" pattern.
 
 ### Per-project routing
 
-A repo can declare its own route without editing the global config, via
-`mempalace.yaml`:
+A repo can declare its own route without editing the global config, via the
+central project registry or the optional repository-local `mempalace.yaml`:
 
 ```yaml
 wing: wing_myproject

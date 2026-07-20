@@ -3,7 +3,7 @@ use std::path::Path;
 
 use tracing::warn;
 
-use crate::error::Result;
+use crate::error::{Result, StorageError};
 use crate::lance::LanceDrawerStore;
 use crate::sqlite::{DiaryStore, IngestManifestStore, SqliteOperationalStore};
 use crate::types::{
@@ -98,9 +98,13 @@ impl StorageEngine {
 
     /// Coordinate a diary-specific ingest: create the pending run and store the
     /// diary summary in a single SQLite transaction before the LanceDB write,
-    /// then commit on success.  On failure, remove both the summary and the
-    /// drawer so a failed diary write cannot become a visible legacy-fallback
-    /// entry and retries do not create a silently divergent prior entry.
+    /// then commit on success.  On failure, remove only the summary (which was
+    /// speculatively stored) and never touch the drawer — `put_drawers` either
+    /// wrote nothing (on error) or the data belongs to a valid entry that must
+    /// be preserved.
+    ///
+    /// To avoid overwriting an existing diary summary for a duplicate ID, the
+    /// duplicate check is performed *before* any SQLite state is created.
     pub async fn commit_diary_ingest(
         &self,
         request: IngestCommitRequest,
@@ -119,6 +123,16 @@ impl StorageEngine {
                 status: crate::types::IngestRunStatus::Pending,
             })
             .collect::<Vec<_>>();
+
+        // Check for pre-existing drawer *before* creating any SQLite state so a
+        // duplicate write cannot overwrite an existing diary summary or trigger
+        // deletion of a valid committed drawer on the error path.
+        let duplicate_ids = self.drawer_store.existing_ids(&[drawer_id.clone()]).await?;
+        if !duplicate_ids.is_empty() {
+            return Err(StorageError::DuplicateDrawers(
+                duplicate_ids.into_iter().collect(),
+            ));
+        }
 
         // Create pending run AND store diary summary in a single SQLite
         // transaction before the Lance drawer write, so a crash between them
@@ -148,13 +162,12 @@ impl StorageEngine {
                 Ok(run.id)
             }
             Err(error) => {
-                // Remove both resources so a failed diary write leaves no
-                // orphaned drawer or summary behind.
+                // Remove only the speculatively-stored summary.  Never delete
+                // the drawer — put_drawers wrote nothing on error, and if a
+                // racing writer created the same ID between our check and the
+                // write, the data belongs to that writer.
                 if let Err(e) = self.operational_store.delete_diary_summary(&drawer_id) {
                     warn!(error = %e, "failed to delete diary summary on commit failure");
-                }
-                if let Err(e) = self.drawer_store.delete_drawers(&[drawer_id.clone()]).await {
-                    warn!(error = %e, "failed to delete drawer on commit failure");
                 }
                 self.operational_store.mark_run_failed(
                     run.id,
@@ -175,8 +188,9 @@ impl StorageEngine {
         let stale_failed_diary =
             self.operational_store.stale_failed_diary_runs(stale_cutoff)?;
 
-        // prune_orphaned_rows removes any drawer not in committed_ids, which
-        // covers both stale pending and stale failed runs.
+        // prune_orphaned_rows removes drawers whose IDs appear in stale runs
+        // but are not currently committed, covering both stale pending and
+        // stale failed runs.
         let all_for_prune: Vec<_> =
             stale_runs.iter().cloned().chain(stale_failed_diary.iter().cloned()).collect();
         self.prune_orphaned_rows(&all_for_prune).await?;
@@ -273,7 +287,7 @@ impl StorageEngine {
         let orphaned = all_drawers
             .into_iter()
             .map(|record| record.id)
-            .filter(|id| !committed_ids.contains(id) || stale_ids.contains(id))
+            .filter(|id| stale_ids.contains(id) && !committed_ids.contains(id))
             .collect::<Vec<DrawerId>>();
 
         if orphaned.is_empty() {
@@ -292,6 +306,7 @@ mod tests {
     use time::macros::{date, datetime};
 
     use super::StorageEngine;
+    use crate::error::StorageError;
     use crate::sqlite::{DiaryStore, IngestManifestStore};
     use crate::types::{DrawerFilter, DrawerStore, DuplicateStrategy, IngestCommitRequest};
     use mempalace_core::{DrawerId, DrawerRecord, EmbeddingProfile, RoomId, WingId};
@@ -495,7 +510,7 @@ mod tests {
         engine.drawer_store().put_drawers(&[existing], DuplicateStrategy::Error).await.unwrap();
 
         // Now try to commit_diary_ingest with the same drawer ID — should fail
-        // on the DuplicateStrategy::Error check.
+        // on the pre-existing duplicate check before any SQLite state is created.
         let mut diary_record = record("diary_wing_test_0003", "diary:retry", [1.0, 0.0, 0.0, 0.0]);
         diary_record.wing = mempalace_core::WingId::new("wing_agents").unwrap();
         diary_record.room = mempalace_core::RoomId::new("diary").unwrap();
@@ -515,9 +530,12 @@ mod tests {
             )
             .await;
 
-        assert!(result.is_err(), "commit_diary_ingest should fail on duplicate");
+        assert!(
+            matches!(result, Err(StorageError::DuplicateDrawers(_))),
+            "commit_diary_ingest should fail with DuplicateDrawers error on duplicate"
+        );
 
-        // Summary should NOT be present (cleaned up on failure).
+        // No summary was stored (pre-check failed before SQLite state was created).
         assert_eq!(engine.operational_store().get_diary_summary(&drawer_id).unwrap(), None);
 
         // The original drawer from the direct write should still be there.
@@ -525,12 +543,12 @@ mod tests {
         assert_eq!(drawers.len(), 1, "the original drawer should remain");
         assert_eq!(drawers[0].id, drawer_id);
 
-        // The failed run should be marked as failed.
+        // No failed run exists because the pre-check returned before creating any.
         let stale_failed = engine
             .operational_store()
             .stale_failed_diary_runs(datetime!(2026-04-20 00:00:00 UTC))
             .unwrap();
-        assert!(!stale_failed.is_empty(), "should have at least one stale failed diary run");
+        assert!(stale_failed.is_empty(), "no stale failed run should exist");
     }
 
     #[tokio::test]

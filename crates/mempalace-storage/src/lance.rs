@@ -99,7 +99,7 @@ impl LanceDrawerStore {
         Ok(connection.open_table(DRAWERS_TABLE).execute().await?)
     }
 
-    async fn existing_ids(&self, ids: &[DrawerId]) -> Result<HashSet<String>> {
+    pub(crate) async fn existing_ids(&self, ids: &[DrawerId]) -> Result<HashSet<String>> {
         if ids.is_empty() {
             return Ok(HashSet::new());
         }

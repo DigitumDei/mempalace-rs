@@ -3564,6 +3564,10 @@ mod tests {
         assert_eq!(read_payload["entries"][0]["agent"], "Codex Bot");
         assert_eq!(read_payload["entries"][0]["wing"], SHARED_AGENT_DIARY_WING);
         assert_eq!(read_payload["entries"][0]["topic"], "phase8");
+        assert!(
+            read_payload["entries"][0]["entry_id"].is_string(),
+            "listing responses must expose an entry_id for detail lookup"
+        );
     }
 
     #[tokio::test]
@@ -3793,6 +3797,72 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rejected["message"], "Diary entry not found for this topic.");
+    }
+
+    #[tokio::test]
+    async fn diary_read_detail_rejects_missing_wrong_room_and_non_diary_entries() {
+        let harness = test_harness().await;
+        let mut wrong_room = test_diary_drawer(
+            "detail_wrong_room",
+            "This drawer is not in the diary room.",
+            datetime!(2026-05-01 12:00:00 UTC),
+        );
+        wrong_room.room = RoomId::new("other_room").unwrap();
+
+        let mut non_diary = test_diary_drawer(
+            "detail_non_diary",
+            "This drawer has a non-diary ingest mode.",
+            datetime!(2026-05-01 12:00:00 UTC),
+        );
+        non_diary.ingest_mode = "manual".to_owned();
+
+        let runtime = harness.server.runtime.lock().await;
+        runtime
+            .storage
+            .drawer_store()
+            .put_drawers(&[wrong_room, non_diary], DuplicateStrategy::Error)
+            .await
+            .unwrap();
+        drop(runtime);
+
+        let missing = decode_tool_payload(
+            &harness
+                .server
+                .handle_request(tool_call(
+                    90,
+                    "mempalace_diary_read",
+                    json!({"entry_id": "detail_missing"}),
+                ))
+                .await,
+        )
+        .unwrap();
+        assert_eq!(missing["message"], "Diary entry not found.");
+
+        let wrong_room = decode_tool_payload(
+            &harness
+                .server
+                .handle_request(tool_call(
+                    91,
+                    "mempalace_diary_read",
+                    json!({"entry_id": "detail_wrong_room"}),
+                ))
+                .await,
+        )
+        .unwrap();
+        assert_eq!(wrong_room["message"], "Diary entry not found.");
+
+        let non_diary = decode_tool_payload(
+            &harness
+                .server
+                .handle_request(tool_call(
+                    92,
+                    "mempalace_diary_read",
+                    json!({"entry_id": "detail_non_diary"}),
+                ))
+                .await,
+        )
+        .unwrap();
+        assert_eq!(non_diary["message"], "Entry is not a diary entry.");
     }
 
     #[tokio::test]

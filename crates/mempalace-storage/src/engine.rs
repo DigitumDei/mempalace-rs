@@ -103,14 +103,19 @@ impl StorageEngine {
     /// wrote nothing (on error) or the data belongs to a valid entry that must
     /// be preserved.
     ///
-    /// To avoid overwriting an existing diary summary for a duplicate ID, the
-    /// duplicate check is performed *before* any SQLite state is created.
+    /// The SQLite summary insert is also the atomic duplicate gate: a racing
+    /// writer that loses it rolls back without writing to LanceDB.
     pub async fn commit_diary_ingest(
         &self,
         request: IngestCommitRequest,
         diary_summary: &str,
     ) -> Result<i64> {
         let now = OffsetDateTime::now_utc();
+        if request.drawers.len() != 1 {
+            return Err(StorageError::Invariant(
+                "diary ingest requires exactly one drawer".to_owned(),
+            ));
+        }
         let drawer_id = request.drawers[0].id.clone();
         let manifests = request
             .drawers
@@ -124,9 +129,9 @@ impl StorageEngine {
             })
             .collect::<Vec<_>>();
 
-        // Check for pre-existing drawer *before* creating any SQLite state so a
-        // duplicate write cannot overwrite an existing diary summary or trigger
-        // deletion of a valid committed drawer on the error path.
+        // Fast-path already-persisted LanceDB duplicates. The SQLite insert
+        // below remains authoritative because this read cannot exclude a
+        // concurrent writer.
         let duplicate_ids = self.drawer_store.existing_ids(&[drawer_id.clone()]).await?;
         if !duplicate_ids.is_empty() {
             return Err(StorageError::DuplicateDrawers(
@@ -137,14 +142,16 @@ impl StorageEngine {
         // Create pending run AND store diary summary in a single SQLite
         // transaction before the Lance drawer write, so a crash between them
         // leaves a recoverable pending run (not an orphaned summary).
-        let run = self.operational_store.create_pending_diary_run(
+        let Some(run) = self.operational_store.create_pending_diary_run(
             &request.ingest_kind,
             &request.source_key,
             &manifests,
             &drawer_id,
             diary_summary,
             now,
-        )?;
+        )? else {
+            return Err(StorageError::DuplicateDrawers(vec![drawer_id.as_str().to_owned()]));
+        };
 
         let write_result =
             self.drawer_store.put_drawers(&request.drawers, request.duplicate_strategy).await;
@@ -162,10 +169,11 @@ impl StorageEngine {
                 Ok(run.id)
             }
             Err(error) => {
-                // Remove only the speculatively-stored summary.  Never delete
-                // the drawer — put_drawers wrote nothing on error, and if a
-                // racing writer created the same ID between our check and the
-                // write, the data belongs to that writer.
+                // We inserted this summary in the same transaction as `run`,
+                // and the atomic summary gate prevents a concurrent writer
+                // from using it. Remove only this failed attempt's state;
+                // never delete a drawer because it may belong to another
+                // writer that won a LanceDB race.
                 if let Err(e) = self.operational_store.delete_diary_summary(&drawer_id) {
                     warn!(error = %e, "failed to delete diary summary on commit failure");
                 }
@@ -840,6 +848,81 @@ mod diary_summary_tests {
         let stored = engine.operational_store().get_diary_summary(&drawer_id).unwrap();
         assert_eq!(stored, Some(summary.clone()));
         assert_eq!(stored.unwrap().chars().count(), DIARY_SUMMARY_MAX_CHARS);
+    }
+
+    #[tokio::test]
+    async fn concurrent_diary_ingests_preserve_the_winning_summary() {
+        let tempdir = tempdir().unwrap();
+        let engine = StorageEngine::open(tempdir.path(), EmbeddingProfile::Balanced).await.unwrap();
+        let drawer_id = DrawerId::new("concurrent_diary_summary").unwrap();
+        let first_record = diary_record("concurrent_diary_summary", "same diary content");
+        let second_record = first_record.clone();
+
+        let first = engine.commit_diary_ingest(
+            IngestCommitRequest {
+                ingest_kind: "diary".to_owned(),
+                source_key: "diary:concurrent_diary_summary:first".to_owned(),
+                source_file: "diary:test".to_owned(),
+                content_hash: first_record.content_hash.clone(),
+                drawers: vec![first_record],
+                duplicate_strategy: DuplicateStrategy::Error,
+            },
+            "first writer summary",
+        );
+        let second = engine.commit_diary_ingest(
+            IngestCommitRequest {
+                ingest_kind: "diary".to_owned(),
+                source_key: "diary:concurrent_diary_summary:second".to_owned(),
+                source_file: "diary:test".to_owned(),
+                content_hash: second_record.content_hash.clone(),
+                drawers: vec![second_record],
+                duplicate_strategy: DuplicateStrategy::Error,
+            },
+            "second writer summary",
+        );
+
+        let (first_result, second_result) = tokio::join!(first, second);
+        let successes = [&first_result, &second_result]
+            .into_iter()
+            .filter(|result| result.is_ok())
+            .count();
+        assert_eq!(successes, 1, "exactly one writer must claim the drawer ID");
+
+        let expected_summary = if first_result.is_ok() {
+            "first writer summary"
+        } else {
+            "second writer summary"
+        };
+        assert_eq!(
+            engine.operational_store().get_diary_summary(&drawer_id).unwrap(),
+            Some(expected_summary.to_owned()),
+            "the loser must neither overwrite nor delete the winner's summary"
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_diary_ingest_rejects_empty_drawers() {
+        let tempdir = tempdir().unwrap();
+        let engine = StorageEngine::open(tempdir.path(), EmbeddingProfile::Balanced).await.unwrap();
+
+        let result = engine
+            .commit_diary_ingest(
+                IngestCommitRequest {
+                    ingest_kind: "diary".to_owned(),
+                    source_key: "diary:empty".to_owned(),
+                    source_file: "diary:test".to_owned(),
+                    content_hash: "empty".to_owned(),
+                    drawers: Vec::new(),
+                    duplicate_strategy: DuplicateStrategy::Error,
+                },
+                "summary",
+            )
+            .await;
+
+        assert!(
+            matches!(&result, Err(StorageError::Invariant(message)) if message == "diary ingest requires exactly one drawer"),
+            "empty diary ingests must return an error instead of panicking: {result:?}"
+        );
     }
 
     #[tokio::test]

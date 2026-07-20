@@ -458,7 +458,7 @@ impl SqliteOperationalStore {
         drawer_id: &DrawerId,
         summary: &str,
         created_at: OffsetDateTime,
-    ) -> Result<IngestRun> {
+    ) -> Result<Option<IngestRun>> {
         if summary.chars().count() > DIARY_SUMMARY_MAX_CHARS {
             return Err(StorageError::Invariant(format!(
                 "diary summary exceeds maximum length of {DIARY_SUMMARY_MAX_CHARS} characters"
@@ -489,14 +489,23 @@ impl SqliteOperationalStore {
             )?;
         }
 
-        transaction.execute(
+        let summary_inserted = transaction.execute(
             "INSERT INTO diary_summaries (entry_id, summary) VALUES (?1, ?2)
-             ON CONFLICT(entry_id) DO UPDATE SET summary = excluded.summary",
+             ON CONFLICT(entry_id) DO NOTHING",
             params![drawer_id.as_str(), summary],
         )?;
 
+        // The summary's unique entry ID is the atomic duplicate gate for a
+        // diary ingest.  Roll back the run and manifest rows we staged above
+        // when another writer already owns this entry, rather than allowing a
+        // second writer to reach LanceDB with the same drawer ID.
+        if summary_inserted == 0 {
+            transaction.rollback()?;
+            return Ok(None);
+        }
+
         transaction.commit()?;
-        Ok(IngestRun {
+        Ok(Some(IngestRun {
             id: run_id,
             ingest_kind: ingest_kind.to_owned(),
             source_key: source_key.to_owned(),
@@ -504,7 +513,7 @@ impl SqliteOperationalStore {
             created_at,
             updated_at: created_at,
             failed_reason: None,
-        })
+        }))
     }
 }
 
@@ -2210,6 +2219,49 @@ VALUES ('chat/file.txt', 'legacy-hash', '2026-04-11T12:00:00Z', 'convos', 2);
         // No pending run was created.
         let stale = store.stale_pending_runs(datetime!(2026-07-02 00:00:00 UTC)).unwrap();
         assert!(stale.is_empty(), "no pending run should exist after rejected summary");
+    }
+
+    #[test]
+    fn create_pending_diary_run_does_not_overwrite_an_existing_summary() {
+        let tempdir = tempdir().unwrap();
+        let store = SqliteOperationalStore::new(tempdir.path().join("storage.sqlite3"));
+        store.ensure_schema().unwrap();
+        let did = DrawerId::new("diary/atomic-summary").unwrap();
+        let entry = IngestManifestEntry {
+            run_id: 0,
+            drawer_id: did.clone(),
+            source_file: "diary:test".to_owned(),
+            content_hash: "hash".to_owned(),
+            status: IngestRunStatus::Pending,
+        };
+
+        let first = store
+            .create_pending_diary_run(
+                "diary",
+                "diary:first",
+                &[entry.clone()],
+                &did,
+                "first summary",
+                datetime!(2026-07-01 00:00:00 UTC),
+            )
+            .unwrap();
+        assert!(first.is_some());
+
+        let second = store
+            .create_pending_diary_run(
+                "diary",
+                "diary:second",
+                &[entry],
+                &did,
+                "second summary",
+                datetime!(2026-07-01 00:00:01 UTC),
+            )
+            .unwrap();
+        assert!(second.is_none(), "the existing summary owns this drawer ID");
+        assert_eq!(store.get_diary_summary(&did).unwrap(), Some("first summary".to_owned()));
+
+        let pending = store.stale_pending_runs(datetime!(2026-07-02 00:00:00 UTC)).unwrap();
+        assert_eq!(pending.len(), 1, "the rejected writer must not leave a pending run");
     }
 
     #[test]

@@ -193,12 +193,14 @@ impl StorageEngine {
         // stale failed runs.
         let all_for_prune: Vec<_> =
             stale_runs.iter().cloned().chain(stale_failed_diary.iter().cloned()).collect();
-        self.prune_orphaned_rows(&all_for_prune).await?;
+        let orphaned_ids = self.prune_orphaned_rows(&all_for_prune).await?;
 
-        // Delete diary summaries for all stale diary runs (both pending and failed).
+        // Delete diary summaries only for orphaned chunk_ids.
         for retryable in &all_for_prune {
             for chunk_id in &retryable.chunk_ids {
-                self.operational_store.delete_diary_summary(chunk_id)?;
+                if orphaned_ids.contains(chunk_id) {
+                    self.operational_store.delete_diary_summary(chunk_id)?;
+                }
             }
         }
 
@@ -276,7 +278,7 @@ impl StorageEngine {
         Ok(())
     }
 
-    async fn prune_orphaned_rows(&self, stale_runs: &[RetryableRun]) -> Result<()> {
+    async fn prune_orphaned_rows(&self, stale_runs: &[RetryableRun]) -> Result<Vec<DrawerId>> {
         let committed_ids =
             self.operational_store.committed_drawer_ids()?.into_iter().collect::<HashSet<_>>();
         let all_drawers = self.drawer_store.list_drawers(&DrawerFilter::default()).await?;
@@ -291,11 +293,11 @@ impl StorageEngine {
             .collect::<Vec<DrawerId>>();
 
         if orphaned.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         self.drawer_store.delete_drawers(&orphaned).await?;
-        Ok(())
+        Ok(orphaned)
     }
 }
 
@@ -447,6 +449,65 @@ mod tests {
             .stale_pending_runs(datetime!(2026-04-20 00:00:00 UTC))
             .unwrap();
         assert!(stale_runs.iter().all(|run| run.run.id != created_run.id));
+    }
+
+    #[tokio::test]
+    async fn reconcile_preserves_summary_for_committed_drawer() {
+        let tempdir = tempdir().unwrap();
+        let engine = StorageEngine::open(tempdir.path(), EmbeddingProfile::Balanced).await.unwrap();
+        let drawer_id = mempalace_core::DrawerId::new("diary_wing_test_0010").unwrap();
+
+        // Store a diary summary.
+        engine.operational_store().store_diary_summary(&drawer_id, "preserved summary").unwrap();
+
+        // Create a stale pending diary run — but the drawer is committed
+        // (indicating a later successful run).
+        let run = engine
+            .operational_store()
+            .create_pending_run(
+                "diary",
+                "diary:diary_wing_test_0010",
+                &[crate::types::IngestManifestEntry {
+                    run_id: 0,
+                    drawer_id: drawer_id.clone(),
+                    source_file: "diary:test".to_owned(),
+                    content_hash: "hash".to_owned(),
+                    status: crate::types::IngestRunStatus::Pending,
+                }],
+                datetime!(2026-04-01 00:00:00 UTC),
+            )
+            .unwrap();
+        // Mark the run committed so the drawer is tracked.
+        engine.operational_store().mark_run_committed(
+            run.id,
+            "diary:diary_wing_test_0010",
+            "diary:test",
+            "hash",
+            1,
+            datetime!(2026-04-01 01:00:00 UTC),
+        )
+        .unwrap();
+
+        // Actually put the drawer in LanceDB so it's "present" (committed).
+        let mut diary_record = record("diary_wing_test_0010", "diary:test", [1.0, 0.0, 0.0, 0.0]);
+        diary_record.wing = mempalace_core::WingId::new("wing_agents").unwrap();
+        diary_record.room = mempalace_core::RoomId::new("diary").unwrap();
+        diary_record.ingest_mode = "diary".to_owned();
+        engine.drawer_store().put_drawers(&[diary_record], DuplicateStrategy::Error).await.unwrap();
+
+        // Verify summary exists before reconcile.
+        assert_eq!(
+            engine.operational_store().get_diary_summary(&drawer_id).unwrap(),
+            Some("preserved summary".to_owned())
+        );
+
+        engine.reconcile().await.unwrap();
+
+        // Summary must NOT be deleted — the drawer is committed.
+        assert_eq!(
+            engine.operational_store().get_diary_summary(&drawer_id).unwrap(),
+            Some("preserved summary".to_owned())
+        );
     }
 
     #[tokio::test]

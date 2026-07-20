@@ -5,7 +5,7 @@ use tracing::warn;
 
 use crate::error::Result;
 use crate::lance::LanceDrawerStore;
-use crate::sqlite::{IngestManifestStore, SqliteOperationalStore};
+use crate::sqlite::{DiaryStore, IngestManifestStore, SqliteOperationalStore};
 use crate::types::{
     DrawerFilter, DrawerStore, DuplicateStrategy, IngestCommitRequest, IngestManifestEntry,
     RetryableRun, StorageLayout,
@@ -96,19 +96,99 @@ impl StorageEngine {
         }
     }
 
+    /// Coordinate a diary-specific ingest: create the pending run and store the
+    /// diary summary in a single SQLite transaction before the LanceDB write,
+    /// then commit on success.  On failure, remove both the summary and the
+    /// drawer so a failed diary write cannot become a visible legacy-fallback
+    /// entry and retries do not create a silently divergent prior entry.
+    pub async fn commit_diary_ingest(
+        &self,
+        request: IngestCommitRequest,
+        diary_summary: &str,
+    ) -> Result<i64> {
+        let now = OffsetDateTime::now_utc();
+        let drawer_id = request.drawers[0].id.clone();
+        let manifests = request
+            .drawers
+            .iter()
+            .map(|drawer| IngestManifestEntry {
+                run_id: 0,
+                drawer_id: drawer.id.clone(),
+                source_file: request.source_file.clone(),
+                content_hash: drawer.content_hash.clone(),
+                status: crate::types::IngestRunStatus::Pending,
+            })
+            .collect::<Vec<_>>();
+
+        // Create pending run AND store diary summary in a single SQLite
+        // transaction before the Lance drawer write, so a crash between them
+        // leaves a recoverable pending run (not an orphaned summary).
+        let run = self.operational_store.create_pending_diary_run(
+            &request.ingest_kind,
+            &request.source_key,
+            &manifests,
+            &drawer_id,
+            diary_summary,
+            now,
+        )?;
+
+        let write_result =
+            self.drawer_store.put_drawers(&request.drawers, request.duplicate_strategy).await;
+
+        match write_result {
+            Ok(()) => {
+                self.operational_store.mark_run_committed(
+                    run.id,
+                    &request.source_key,
+                    &request.source_file,
+                    &request.content_hash,
+                    request.drawers.len(),
+                    OffsetDateTime::now_utc(),
+                )?;
+                Ok(run.id)
+            }
+            Err(error) => {
+                // Remove both resources so a failed diary write leaves no
+                // orphaned drawer or summary behind.
+                if let Err(e) = self.operational_store.delete_diary_summary(&drawer_id) {
+                    warn!(error = %e, "failed to delete diary summary on commit failure");
+                }
+                if let Err(e) = self.drawer_store.delete_drawers(&[drawer_id.clone()]).await {
+                    warn!(error = %e, "failed to delete drawer on commit failure");
+                }
+                self.operational_store.mark_run_failed(
+                    run.id,
+                    &error.to_string(),
+                    OffsetDateTime::now_utc(),
+                )?;
+                Err(error)
+            }
+        }
+    }
+
     pub async fn reconcile(&self) -> Result<()> {
         let stale_cutoff = OffsetDateTime::now_utc() - self.stale_after;
         let stale_runs = self.operational_store.stale_pending_runs(stale_cutoff)?;
-        self.prune_orphaned_rows(&stale_runs).await?;
 
-        for retryable in &stale_runs {
-            if retryable.run.ingest_kind == "diary" {
-                for chunk_id in &retryable.chunk_ids {
-                    self.operational_store.delete_diary_summary(chunk_id)?;
-                }
+        // Also collect stale failed diary runs to clean up orphaned summaries
+        // and drawers from previous failed writes.
+        let stale_failed_diary =
+            self.operational_store.stale_failed_diary_runs(stale_cutoff)?;
+
+        // prune_orphaned_rows removes any drawer not in committed_ids, which
+        // covers both stale pending and stale failed runs.
+        let all_for_prune: Vec<_> =
+            stale_runs.iter().cloned().chain(stale_failed_diary.iter().cloned()).collect();
+        self.prune_orphaned_rows(&all_for_prune).await?;
+
+        // Delete diary summaries for all stale diary runs (both pending and failed).
+        for retryable in &all_for_prune {
+            for chunk_id in &retryable.chunk_ids {
+                self.operational_store.delete_diary_summary(chunk_id)?;
             }
         }
 
+        // Mark stale pending runs as failed.
         for retryable in stale_runs {
             warn!(run_id = retryable.run.id, "marking stale pending ingest run as failed");
             self.operational_store.mark_run_failed(
@@ -116,6 +196,11 @@ impl StorageEngine {
                 "stale pending ingest run",
                 OffsetDateTime::now_utc(),
             )?;
+        }
+
+        // Log stale failed diary runs that were cleaned up.
+        for retryable in stale_failed_diary {
+            warn!(run_id = retryable.run.id, "finalizing stale failed diary ingest run");
         }
 
         Ok(())
@@ -349,6 +434,163 @@ mod tests {
         assert!(stale_runs.iter().all(|run| run.run.id != created_run.id));
     }
 
+    #[tokio::test]
+    async fn commit_diary_ingest_success() {
+        let tempdir = tempdir().unwrap();
+        let engine = StorageEngine::open(tempdir.path(), EmbeddingProfile::Balanced).await.unwrap();
+        let drawer_id = mempalace_core::DrawerId::new("diary_wing_test_0002").unwrap();
+        let wing = mempalace_core::WingId::new("wing_agents").unwrap();
+        let room = mempalace_core::RoomId::new("diary").unwrap();
+
+        let mut diary_record = record("diary_wing_test_0002", "diary:general", [1.0, 0.0, 0.0, 0.0]);
+        diary_record.wing = wing;
+        diary_record.room = room;
+        diary_record.ingest_mode = "diary".to_owned();
+
+        let run_id = engine
+            .commit_diary_ingest(
+                IngestCommitRequest {
+                    ingest_kind: "diary".to_owned(),
+                    source_key: format!("diary:{}", drawer_id.as_str()),
+                    source_file: "diary:general".to_owned(),
+                    content_hash: diary_record.content_hash.clone(),
+                    drawers: vec![diary_record],
+                    duplicate_strategy: DuplicateStrategy::Error,
+                },
+                "test diary summary",
+            )
+            .await
+            .unwrap();
+
+        assert!(run_id > 0);
+
+        // Summary should be stored.
+        assert_eq!(
+            engine.operational_store().get_diary_summary(&drawer_id).unwrap(),
+            Some("test diary summary".to_owned())
+        );
+
+        // Drawer should be in LanceDB.
+        let drawers = engine.drawer_store().list_drawers(&DrawerFilter::default()).await.unwrap();
+        assert_eq!(drawers.len(), 1);
+        assert_eq!(drawers[0].id, drawer_id);
+
+        // Run should be committed.
+        let committed = engine.operational_store().committed_drawer_ids().unwrap();
+        assert_eq!(committed.len(), 1);
+        assert!(committed.contains(&drawer_id));
+    }
+
+    #[tokio::test]
+    async fn commit_diary_ingest_cleans_up_on_failure() {
+        let tempdir = tempdir().unwrap();
+        let engine = StorageEngine::open(tempdir.path(), EmbeddingProfile::Balanced).await.unwrap();
+        let drawer_id = mempalace_core::DrawerId::new("diary_wing_test_0003").unwrap();
+
+        // First, write a drawer directly to LanceDB to set up a duplicate.
+        let mut existing = record("diary_wing_test_0003", "diary:existing", [1.0, 0.0, 0.0, 0.0]);
+        existing.wing = mempalace_core::WingId::new("wing_agents").unwrap();
+        existing.room = mempalace_core::RoomId::new("diary").unwrap();
+        existing.ingest_mode = "diary".to_owned();
+        engine.drawer_store().put_drawers(&[existing], DuplicateStrategy::Error).await.unwrap();
+
+        // Now try to commit_diary_ingest with the same drawer ID — should fail
+        // on the DuplicateStrategy::Error check.
+        let mut diary_record = record("diary_wing_test_0003", "diary:retry", [1.0, 0.0, 0.0, 0.0]);
+        diary_record.wing = mempalace_core::WingId::new("wing_agents").unwrap();
+        diary_record.room = mempalace_core::RoomId::new("diary").unwrap();
+        diary_record.ingest_mode = "diary".to_owned();
+
+        let result = engine
+            .commit_diary_ingest(
+                IngestCommitRequest {
+                    ingest_kind: "diary".to_owned(),
+                    source_key: format!("diary:{}", drawer_id.as_str()),
+                    source_file: "diary:retry".to_owned(),
+                    content_hash: diary_record.content_hash.clone(),
+                    drawers: vec![diary_record],
+                    duplicate_strategy: DuplicateStrategy::Error,
+                },
+                "should be cleaned up",
+            )
+            .await;
+
+        assert!(result.is_err(), "commit_diary_ingest should fail on duplicate");
+
+        // Summary should NOT be present (cleaned up on failure).
+        assert_eq!(engine.operational_store().get_diary_summary(&drawer_id).unwrap(), None);
+
+        // The original drawer from the direct write should still be there.
+        let drawers = engine.drawer_store().list_drawers(&DrawerFilter::default()).await.unwrap();
+        assert_eq!(drawers.len(), 1, "the original drawer should remain");
+        assert_eq!(drawers[0].id, drawer_id);
+
+        // The failed run should be marked as failed.
+        let stale_failed = engine
+            .operational_store()
+            .stale_failed_diary_runs(datetime!(2026-04-20 00:00:00 UTC))
+            .unwrap();
+        assert!(!stale_failed.is_empty(), "should have at least one stale failed diary run");
+    }
+
+    #[tokio::test]
+    async fn reconcile_cleans_up_stale_failed_diary_run() {
+        let tempdir = tempdir().unwrap();
+        let engine = StorageEngine::open(tempdir.path(), EmbeddingProfile::Balanced).await.unwrap();
+        let drawer_id = mempalace_core::DrawerId::new("diary_wing_failed_0001").unwrap();
+
+        // Manually stage a failed diary run with a summary and a drawer in
+        // LanceDB, simulating a crash that left the old code path incomplete.
+        let mut staged = record("diary_wing_failed_0001", "diary:stale", [1.0, 0.0, 0.0, 0.0]);
+        staged.wing = mempalace_core::WingId::new("wing_agents").unwrap();
+        staged.room = mempalace_core::RoomId::new("diary").unwrap();
+        staged.ingest_mode = "diary".to_owned();
+
+        engine.operational_store().store_diary_summary(&drawer_id, "stale summary").unwrap();
+        let created_run = engine
+            .operational_store()
+            .create_pending_run(
+                "diary",
+                "diary:diary_wing_failed_0001",
+                &[crate::types::IngestManifestEntry {
+                    run_id: 0,
+                    drawer_id: drawer_id.clone(),
+                    source_file: "diary:stale".to_owned(),
+                    content_hash: staged.content_hash.clone(),
+                    status: crate::types::IngestRunStatus::Pending,
+                }],
+                datetime!(2026-03-01 00:00:00 UTC),
+            )
+            .unwrap();
+
+        // Mark the run as failed to simulate the old code path.
+        engine
+            .operational_store()
+            .mark_run_failed(created_run.id, "simulated failure", datetime!(2026-03-01 01:00:00 UTC))
+            .unwrap();
+
+        // Write the drawer to LanceDB (simulating incomplete old cleanup).
+        engine.drawer_store().put_drawers(&[staged], DuplicateStrategy::Error).await.unwrap();
+
+        // Verify pre-reconcile state.
+        assert_eq!(
+            engine.operational_store().get_diary_summary(&drawer_id).unwrap(),
+            Some("stale summary".to_owned())
+        );
+        let drawers = engine.drawer_store().list_drawers(&DrawerFilter::default()).await.unwrap();
+        assert_eq!(drawers.len(), 1);
+
+        // Run reconciliation — it should clean up the stale failed diary run.
+        engine.reconcile().await.unwrap();
+
+        // Summary should be deleted.
+        assert_eq!(engine.operational_store().get_diary_summary(&drawer_id).unwrap(), None);
+
+        // Drawer should be pruned.
+        let drawers = engine.drawer_store().list_drawers(&DrawerFilter::default()).await.unwrap();
+        assert!(drawers.is_empty(), "drawer should be pruned by reconcile");
+    }
+
     // ─── replace_source_drawers tests ─────────────────────────────────────────
 
     #[tokio::test]
@@ -437,7 +679,7 @@ mod tests {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod prefix_tests {
-    use crate::sqlite::{IngestManifestStore, SqliteOperationalStore};
+use crate::sqlite::{IngestManifestStore, SqliteOperationalStore};
     use crate::types::{IngestManifestEntry, IngestRunStatus};
     use mempalace_core::DrawerId;
     use tempfile::tempdir;

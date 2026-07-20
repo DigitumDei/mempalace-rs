@@ -391,6 +391,62 @@ impl DiaryStore for SqliteOperationalStore {
         connection.execute("DELETE FROM diary_summaries WHERE entry_id = ?1", [entry_id.as_str()])?;
         Ok(())
     }
+
+    /// Create a pending ingest run and store the diary summary in a single
+    /// SQLite transaction.  This ensures that a crash before the Lance drawer
+    /// write still leaves a recoverable pending run alongside the summary,
+    /// rather than an orphaned summary with no run at all.
+    pub fn create_pending_diary_run(
+        &self,
+        ingest_kind: &str,
+        source_key: &str,
+        entries: &[IngestManifestEntry],
+        drawer_id: &DrawerId,
+        summary: &str,
+        created_at: OffsetDateTime,
+    ) -> Result<IngestRun> {
+        let mut connection = self.open_connection()?;
+        let transaction = connection.transaction()?;
+        let timestamp = encode_time(created_at);
+
+        transaction.execute(
+            "INSERT INTO ingest_runs (ingest_kind, source_key, status, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?4)",
+            params![ingest_kind, source_key, IngestRunStatus::Pending.as_str(), timestamp],
+        )?;
+        let run_id = transaction.last_insert_rowid();
+
+        for entry in entries {
+            transaction.execute(
+                "INSERT INTO ingest_manifests (run_id, drawer_id, source_file, content_hash, status)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    run_id,
+                    entry.drawer_id.as_str(),
+                    entry.source_file,
+                    entry.content_hash,
+                    IngestRunStatus::Pending.as_str()
+                ],
+            )?;
+        }
+
+        transaction.execute(
+            "INSERT INTO diary_summaries (entry_id, summary) VALUES (?1, ?2)
+             ON CONFLICT(entry_id) DO UPDATE SET summary = excluded.summary",
+            params![drawer_id.as_str(), summary],
+        )?;
+
+        transaction.commit()?;
+        Ok(IngestRun {
+            id: run_id,
+            ingest_kind: ingest_kind.to_owned(),
+            source_key: source_key.to_owned(),
+            status: IngestRunStatus::Pending,
+            created_at,
+            updated_at: created_at,
+            failed_reason: None,
+        })
+    }
 }
 
 impl IngestManifestStore for SqliteOperationalStore {
@@ -570,6 +626,71 @@ impl IngestManifestStore for SqliteOperationalStore {
         )?;
         transaction.commit()?;
         Ok(())
+    }
+
+    /// Return stale (older than `older_than`) failed diary runs with their
+    /// manifest drawer IDs.  Used by startup reconciliation to clean up
+    /// orphaned diary summaries and drawers from previous failed writes.
+    pub fn stale_failed_diary_runs(&self, older_than: OffsetDateTime) -> Result<Vec<RetryableRun>> {
+        let connection = self.open_connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id, ingest_kind, source_key, status, created_at, updated_at, failed_reason
+             FROM ingest_runs
+             WHERE status = ?1 AND ingest_kind = 'diary' AND updated_at < ?2
+             ORDER BY id ASC",
+        )?;
+
+        let runs = statement
+            .query_map(
+                params![IngestRunStatus::Failed.as_str(), encode_time(older_than)],
+                |row| {
+                    Ok(IngestRun {
+                        id: row.get(0)?,
+                        ingest_kind: row.get(1)?,
+                        source_key: row.get(2)?,
+                        status: parse_status(row.get::<_, String>(3)?)?,
+                        created_at: decode_time(row.get(4)?).map_err(|err| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                4,
+                                rusqlite::types::Type::Text,
+                                Box::new(err),
+                            )
+                        })?,
+                        updated_at: decode_time(row.get(5)?).map_err(|err| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                5,
+                                rusqlite::types::Type::Text,
+                                Box::new(err),
+                            )
+                        })?,
+                        failed_reason: row.get(6)?,
+                    })
+                },
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        let mut retryable = Vec::with_capacity(runs.len());
+        for run in runs {
+            let mut manifest_statement = connection.prepare(
+                "SELECT drawer_id FROM ingest_manifests WHERE run_id = ?1 ORDER BY drawer_id ASC",
+            )?;
+            let chunk_ids = manifest_statement
+                .query_map([run.id], |row| {
+                    let raw: String = row.get(0)?;
+                    DrawerId::new(raw).map_err(|err| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(err),
+                        )
+                    })
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+
+            retryable.push(RetryableRun { run, chunk_ids });
+        }
+
+        Ok(retryable)
     }
 
     fn committed_drawer_ids(&self) -> Result<Vec<DrawerId>> {

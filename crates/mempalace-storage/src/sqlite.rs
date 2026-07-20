@@ -686,76 +686,7 @@ impl IngestManifestStore for SqliteOperationalStore {
         transaction.commit()?;
         Ok(())
     }
-}
 
-impl SqliteOperationalStore {
-    /// Return stale (older than `older_than`) failed diary runs with their
-    /// manifest drawer IDs.  Used by startup reconciliation to clean up
-    /// orphaned diary summaries and drawers from previous failed writes.
-    pub fn stale_failed_diary_runs(&self, older_than: OffsetDateTime) -> Result<Vec<RetryableRun>> {
-        let connection = self.open_connection()?;
-        let mut statement = connection.prepare(
-            "SELECT id, ingest_kind, source_key, status, created_at, updated_at, failed_reason
-             FROM ingest_runs
-             WHERE status = ?1 AND ingest_kind = 'diary' AND updated_at < ?2
-             ORDER BY id ASC",
-        )?;
-
-        let runs = statement
-            .query_map(
-                params![IngestRunStatus::Failed.as_str(), encode_time(older_than)],
-                |row| {
-                    Ok(IngestRun {
-                        id: row.get(0)?,
-                        ingest_kind: row.get(1)?,
-                        source_key: row.get(2)?,
-                        status: parse_status(row.get::<_, String>(3)?)?,
-                        created_at: decode_time(row.get(4)?).map_err(|err| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                4,
-                                rusqlite::types::Type::Text,
-                                Box::new(err),
-                            )
-                        })?,
-                        updated_at: decode_time(row.get(5)?).map_err(|err| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                5,
-                                rusqlite::types::Type::Text,
-                                Box::new(err),
-                            )
-                        })?,
-                        failed_reason: row.get(6)?,
-                    })
-                },
-            )?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-
-        let mut retryable = Vec::with_capacity(runs.len());
-        for run in runs {
-            let mut manifest_statement = connection.prepare(
-                "SELECT drawer_id FROM ingest_manifests WHERE run_id = ?1 ORDER BY drawer_id ASC",
-            )?;
-            let chunk_ids = manifest_statement
-                .query_map([run.id], |row| {
-                    let raw: String = row.get(0)?;
-                    DrawerId::new(raw).map_err(|err| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            0,
-                            rusqlite::types::Type::Text,
-                            Box::new(err),
-                        )
-                    })
-                })?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-
-            retryable.push(RetryableRun { run, chunk_ids });
-        }
-
-        Ok(retryable)
-    }
-}
-
-impl IngestManifestStore for SqliteOperationalStore {
     fn committed_drawer_ids(&self) -> Result<Vec<DrawerId>> {
         let connection = self.open_connection()?;
         let mut statement = connection.prepare(
@@ -825,10 +756,6 @@ impl IngestManifestStore for SqliteOperationalStore {
     }
 
     fn ingested_source_keys_with_prefix(&self, prefix: &str) -> Result<Vec<String>> {
-        // Escape LIKE special characters in the caller-supplied prefix so that
-        // a prefix such as "projects:%foo" does not wildcard-match unintended
-        // rows.  The root_key component is hex so escaping is belt-and-braces,
-        // but we do it unconditionally per the plan.
         let escaped: String = prefix
             .chars()
             .flat_map(|ch| match ch {
@@ -865,6 +792,73 @@ impl IngestManifestStore for SqliteOperationalStore {
         transaction.execute("DELETE FROM ingest_files WHERE source_key = ?1", [source_key])?;
         transaction.commit()?;
         Ok(())
+    }
+}
+
+impl SqliteOperationalStore {
+    /// Return stale (older than `older_than`) failed diary runs with their
+    /// manifest drawer IDs.  Used by startup reconciliation to clean up
+    /// orphaned diary summaries and drawers from previous failed writes.
+    pub fn stale_failed_diary_runs(&self, older_than: OffsetDateTime) -> Result<Vec<RetryableRun>> {
+        let connection = self.open_connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id, ingest_kind, source_key, status, created_at, updated_at, failed_reason
+             FROM ingest_runs
+             WHERE status = ?1 AND ingest_kind = 'diary' AND updated_at < ?2
+             ORDER BY id ASC",
+        )?;
+
+        let runs = statement
+            .query_map(
+                params![IngestRunStatus::Failed.as_str(), encode_time(older_than)],
+                |row| {
+                    Ok(IngestRun {
+                        id: row.get(0)?,
+                        ingest_kind: row.get(1)?,
+                        source_key: row.get(2)?,
+                        status: parse_status(row.get::<_, String>(3)?)?,
+                        created_at: decode_time(row.get(4)?).map_err(|err| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                4,
+                                rusqlite::types::Type::Text,
+                                Box::new(err),
+                            )
+                        })?,
+                        updated_at: decode_time(row.get(5)?).map_err(|err| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                5,
+                                rusqlite::types::Type::Text,
+                                Box::new(err),
+                            )
+                        })?,
+                        failed_reason: row.get(6)?,
+                    })
+                },
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        let mut retryable = Vec::with_capacity(runs.len());
+        for run in runs {
+            let mut manifest_statement = connection.prepare(
+                "SELECT drawer_id FROM ingest_manifests WHERE run_id = ?1 ORDER BY drawer_id ASC",
+            )?;
+            let chunk_ids = manifest_statement
+                .query_map([run.id], |row| {
+                    let raw: String = row.get(0)?;
+                    DrawerId::new(raw).map_err(|err| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(err),
+                        )
+                    })
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+
+            retryable.push(RetryableRun { run, chunk_ids });
+        }
+
+        Ok(retryable)
     }
 }
 

@@ -1568,7 +1568,7 @@ mod tests {
     use time::macros::datetime;
 
     use super::{
-        ChangeCursor, ChangeEvent, ChangeLogStore, ChangePage, EntityRegistryStore, GraphStore,
+        ChangeCursor, ChangeEvent, ChangeLogStore, ChangePage, DiaryStore, EntityRegistryStore, GraphStore,
         IngestManifestStore, KnowledgeGraphStore, MIGRATIONS, SqliteOperationalStore,
         ToolStateStore,
     };

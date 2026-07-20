@@ -5561,6 +5561,112 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn tool_delete_drawer_removes_diary_summary_on_local_hit() {
+        // Given a diary drawer with a stored summary, local deletion must also
+        // remove the SQLite summary row so stale summaries do not accumulate.
+        let remotes = BTreeMap::new();
+        let mut ctx = make_delete_drawer_ctx(remotes, WriteTarget::Local).await;
+
+        let drawer_id = DrawerId::new("diary-summary-cleanup-001").unwrap();
+        let now = OffsetDateTime::now_utc();
+        let drawer = test_diary_drawer(drawer_id.as_str(), "test content", now);
+        ctx.runtime
+            .storage
+            .drawer_store()
+            .put_drawers(&[drawer], DuplicateStrategy::Error)
+            .await
+            .unwrap();
+
+        ctx.runtime
+            .storage
+            .operational_store()
+            .store_diary_summary(&drawer_id, "summary to be removed")
+            .unwrap();
+
+        // Sanity-check that the summary exists before deletion.
+        assert!(ctx
+            .runtime
+            .storage
+            .operational_store()
+            .get_diary_summary(&drawer_id)
+            .unwrap()
+            .is_some());
+
+        ctx.runtime
+            .tool_delete_drawer(&json!({"drawer_id": drawer_id.as_str()}))
+            .await
+            .unwrap();
+
+        let stored = ctx
+            .runtime
+            .storage
+            .operational_store()
+            .get_diary_summary(&drawer_id)
+            .unwrap();
+        assert!(
+            stored.is_none(),
+            "local diary drawer deletion must remove its SQLite summary; got: {stored:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_delete_drawer_does_not_remove_diary_summary_on_remote_fallback() {
+        // Given a remote-only fallback (drawer not found locally, remote
+        // succeeds), a locally stored diary summary must NOT be removed.
+        // The summary belongs to a local store and should not be discarded
+        // just because the drawer lives on a remote.
+        let mock = Arc::new(DeleteDrawerMock {
+            delete_succeeds: true,
+            delete_call_count: AtomicU64::new(0),
+        });
+        let remotes = BTreeMap::from([(
+            "alpha".to_owned(),
+            mock as Arc<dyn mempalace_remote::RemoteApi>,
+        )]);
+        let mut ctx = make_delete_drawer_ctx(remotes, WriteTarget::Both).await;
+
+        let drawer_id = DrawerId::new("diary-summary-remote-fallback-001").unwrap();
+
+        // Store a summary for a drawer that does NOT exist locally.
+        ctx.runtime
+            .storage
+            .operational_store()
+            .store_diary_summary(&drawer_id, "summary must survive fallback")
+            .unwrap();
+
+        // Verify the summary is present before the deletion attempt.
+        assert!(ctx
+            .runtime
+            .storage
+            .operational_store()
+            .get_diary_summary(&drawer_id)
+            .unwrap()
+            .is_some());
+
+        let result = ctx
+            .runtime
+            .tool_delete_drawer(&json!({"drawer_id": drawer_id.as_str()}))
+            .await
+            .unwrap();
+
+        assert_eq!(result["success"], true);
+        assert_eq!(result["origin"], "alpha");
+        assert_eq!(result["applied_to"], "remote:alpha");
+
+        // The locally stored summary must still be present.
+        let stored = ctx
+            .runtime
+            .storage
+            .operational_store()
+            .get_diary_summary(&drawer_id)
+            .unwrap();
+        assert!(
+            stored.is_some(),
+            "remote-only fallback must NOT remove a locally stored diary summary"
+        );
+    }
+
     async fn test_harness_with_federation(federation: FederationRuntimeConfig) -> TestHarness {
         let tempdir = TempDir::new().unwrap();
         let palace_path = tempdir.path().join("palace");

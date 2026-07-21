@@ -151,8 +151,7 @@ Each run executes up to three tiers in order:
 2. **Fragment Compaction** — merges small LanceDB fragments to reduce
    storage overhead and improve scan performance.  Triggered when the
    number of small fragments exceeds `small_fragment_threshold` (default:
-   `10`) or when a tail fragment exceeds `tail_threshold_rows` (default:
-   `1024`).
+   `10`).
 3. **Version Retention** — removes version data rows older than
    `version_retention_hours` (default: `24`).
 
@@ -163,7 +162,7 @@ Each run executes up to three tiers in order:
 | `enabled` | `true` | Whether the subsystem runs automatically. |
 | `idle_secs` | `300` | Minimum wall-clock seconds since the last write before a run starts. |
 | `version_retention_hours` | `24` | Maximum age in hours for retained version rows. |
-| `tail_threshold_rows` | `1024` | Row count that triggers tail-fragment compaction. |
+| `tail_threshold_rows` | `1024` | Row count that triggers incremental vector-index optimization. |
 | `small_fragment_threshold` | `10` | Fragment count that triggers small-fragment compaction. |
 
 ### Environment Overrides
@@ -222,10 +221,12 @@ SQLite advisory lease stored in the palace's `storage.sqlite3`:
   next contender can proceed immediately.
 - **Expiry**: if the holding process crashes or is killed, the lease
   expires after 5 minutes and any contender can reclaim it.
-- **`busy_timeout = 0`**: the lease SQLite connection uses a zero
-  busy timeout so lease operations never block on database contention.
-  A denied lease (another process holds it) is returned as a
-  non-error skip, not a retry.
+- **`busy_timeout = 0`**: lease acquisition opens a dedicated SQLite
+   connection with a zero busy timeout so the claim never blocks on
+   database contention.  A denied lease (another process holds it) is
+   returned as a non-error skip, not a retry.  Lease renewal and release
+   use the normal storage connection, which may block briefly under
+   contention.
 
 This ensures that multiple hubs, CLI invocations, or a mix of both
 never run maintenance simultaneously on the same palace.
@@ -242,7 +243,7 @@ The `InfoResponse` body includes these maintenance fields:
 |---|---|---|
 | `maintenance_enabled` | `bool` | Whether the subsystem is enabled. |
 | `maintenance_idle_secs` | `u64` | Configured idle threshold. |
-| `maintenance_last_run` | `serde_json::Value` or `null` | Full JSON-serialized [`MaintenanceRunSummary`] of the last completed run, if any. Contains `run_id`, `started_at`, `finished_at`, `duration`, `cpu_duration`, `status`, and `tier_results`. |
+| `maintenance_last_run` | `serde_json::Value` or `null` | Full JSON-serialized [`MaintenanceRunSummary`] of the last maintenance attempt/run summary. Contains `run_id`, `started_at`, `finished_at`, `duration`, `cpu_duration`, `status`, and `tier_results`. |
 | `maintenance_status` | `MaintenanceStatus` | Typed status enum: `disabled`, `idle`, `running`, `skipped { reason }`, `aborted { reason }`, `failed { message }`, `completed { status }`. Replaces the ambiguity of a null `maintenance_last_run`. |
 
 **Structured logs**

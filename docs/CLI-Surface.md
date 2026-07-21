@@ -163,10 +163,9 @@ Behavior:
 - When maintenance is **enabled**, the command runs all three tiers:
   1. **Vector Index Optimization** — rebuilds LanceDB vector indices for
      faster ANN search.
-  2. **Fragment Compaction** — merges small LanceDB fragments to reduce
-     storage and improve scan performance.  Triggered when the number of
-     small fragments exceeds `small_fragment_threshold` (default: 10)
-     or when a tail fragment exceeds `tail_threshold_rows` (default: 1024).
+   2. **Fragment Compaction** — merges small LanceDB fragments to reduce
+      storage and improve scan performance.  Triggered when the number of
+      small fragments exceeds `small_fragment_threshold` (default: 10).
   3. **Version Retention** — purges version rows older than
      `version_retention_hours` (default: 24).
 - The one-shot CLI bypasses the process-local idle gate (`idle_secs` is

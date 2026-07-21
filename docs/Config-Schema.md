@@ -107,7 +107,7 @@ Validation:
   - `enabled`: boolean — whether the maintenance subsystem runs automatically. Default: `true`.
   - `idle_secs`: positive integer — minimum idle seconds since the last write before maintenance runs. Default: `300`.
   - `version_retention_hours`: positive integer — maximum age in hours for retained version data. Default: `24`.
-  - `tail_threshold_rows`: positive integer — row count threshold that triggers tail compaction. Default: `1024`.
+  - `tail_threshold_rows`: positive integer — row count threshold that triggers incremental vector-index optimization. Default: `1024`.
   - `small_fragment_threshold`: positive integer — number of small LanceDB fragments that trigger fragment compaction. Default: `10`.
 
 Validation:

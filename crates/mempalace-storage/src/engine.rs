@@ -33,10 +33,15 @@ pub struct StorageEngine {
     activity_signal: Arc<AtomicBool>,
     maintenance_holder_id: String,
     last_activity_at: Arc<Mutex<Instant>>,
-    /// Test-only: sent after tier 1 completes so the test can inject activity
-    /// deterministically between tiers.
+    /// Test-only: two-way barrier after tier 1 completion.
+    /// After tier 1 finishes, the maintenance code notifies the test via
+    /// the sender, then waits on the receiver for the test's go-ahead
+    /// before checking for activity.  This makes mid-tier cancellation
+    /// tests deterministic.
     #[cfg(test)]
-    test_tier_completion_tx: Arc<Mutex<Option<std::sync::mpsc::Sender<()>>>>,
+    test_tier_1_notify: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+    #[cfg(test)]
+    test_tier_1_wait: Arc<Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
 }
 
 impl StorageEngine {
@@ -51,7 +56,9 @@ impl StorageEngine {
             maintenance_holder_id: format!("maintenance-{}", std::process::id()),
             last_activity_at: Arc::new(Mutex::new(Instant::now())),
             #[cfg(test)]
-            test_tier_completion_tx: Arc::new(Mutex::new(None)),
+            test_tier_1_notify: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            test_tier_1_wait: Arc::new(Mutex::new(None)),
         };
 
         engine.operational_store.ensure_schema()?;
@@ -688,8 +695,13 @@ impl StorageEngine {
             }
 
             #[cfg(test)]
-            if let Some(tx) = self.test_tier_completion_tx.lock().unwrap().take() {
-                let _ = tx.send(());
+            {
+                if let Some(tx) = self.test_tier_1_notify.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+                if let Some(rx) = self.test_tier_1_wait.lock().unwrap().take() {
+                    let _ = rx.await;
+                }
             }
         }
 
@@ -1486,10 +1498,14 @@ mod tests {
             StorageEngine::open(tempdir.path(), EmbeddingProfile::Balanced).await.unwrap(),
         );
 
-        // Install a one-shot test hook that fires after tier 1 completes.
-        // This lets us inject activity deterministically before tier 2 checks.
-        let (tier1_done_tx, tier1_done_rx) = std::sync::mpsc::channel();
-        engine.test_tier_completion_tx.lock().unwrap() = Some(tier1_done_tx);
+        // Install a two-way barrier: after tier 1, maintenance notifies us
+        // via `notify_rx` and then waits on `continue_rx` until we send
+        // the go-ahead.  This deterministic ordering eliminates the race
+        // between the test signalling activity and maintenance checking it.
+        let (notify_tx, notify_rx) = tokio::sync::oneshot::channel();
+        let (continue_tx, continue_rx) = tokio::sync::oneshot::channel();
+        engine.test_tier_1_notify.lock().unwrap() = Some(notify_tx);
+        engine.test_tier_1_wait.lock().unwrap() = Some(continue_rx);
 
         let settings = MaintenanceSettings { idle_secs: 0, ..MaintenanceSettings::default() };
 
@@ -1498,9 +1514,12 @@ mod tests {
             engine_clone.run_maintenance(&settings).await
         });
 
-        // Wait for tier 1 to complete, then signal activity.
-        tier1_done_rx.recv().unwrap();
+        // Wait for tier 1 to complete (barrier part 1: notification).
+        notify_rx.await.unwrap();
+        // Signal activity while maintenance waits at the barrier.
         engine.signal_activity();
+        // Release the barrier (part 2: continue).
+        continue_tx.send(()).unwrap();
 
         let summary = match handle.await.unwrap() {
             Ok(s) => s,
@@ -1532,8 +1551,7 @@ mod tests {
         let engine = StorageEngine::open(tempdir.path(), EmbeddingProfile::Balanced).await.unwrap();
 
         // Insert drawers in multiple batches to create multiple LanceDB versions
-        // (each put_drawers call creates a new version), then run with aggressive
-        // thresholds so tiers have work to do.
+        // and small fragments.  Each put_drawers call creates a new version.
         for batch in 0..10 {
             let drawers: Vec<_> = (0..4)
                 .map(|i| {
@@ -1550,11 +1568,12 @@ mod tests {
             engine.drawer_store().put_drawers(&drawers, DuplicateStrategy::Error).await.unwrap();
         }
 
+        // Use aggressive thresholds so every tier has work to do.
         let settings = MaintenanceSettings {
             idle_secs: 0,
-            tail_threshold_rows: 2,
-            small_fragment_threshold: 2,
-            version_retention_hours: 1,
+            tail_threshold_rows: 0,
+            small_fragment_threshold: 0,
+            version_retention_hours: 0,
             ..MaintenanceSettings::default()
         };
         let summary = engine.run_maintenance(&settings).await.unwrap();
@@ -1564,32 +1583,32 @@ mod tests {
         // VectorIndexOptimization should have optimised tail rows.
         let vio = &summary.tier_results[0];
         assert_eq!(vio.tier, MaintenanceTier::VectorIndexOptimization);
-        assert!(
-            matches!(vio.outcome, MaintenanceOutcome::Completed { .. })
-                || matches!(vio.outcome, MaintenanceOutcome::Skipped { reason: MaintenanceSkipReason::NothingToDo }),
-            "VectorIndexOptimization outcome unexpected: {:?}",
-            vio.outcome,
-        );
+        match &vio.outcome {
+            MaintenanceOutcome::Completed { items_affected } => {
+                assert!(*items_affected > 0, "expected non-zero items affected for index optimization");
+            }
+            other => panic!("VectorIndexOptimization expected Completed, got {other:?}"),
+        }
 
         // FragmentCompaction should have compacted fragments.
         let fc = &summary.tier_results[1];
         assert_eq!(fc.tier, MaintenanceTier::FragmentCompaction);
-        assert!(
-            matches!(fc.outcome, MaintenanceOutcome::Completed { .. })
-                || matches!(fc.outcome, MaintenanceOutcome::Skipped { reason: MaintenanceSkipReason::NothingToDo }),
-            "FragmentCompaction outcome unexpected: {:?}",
-            fc.outcome,
-        );
+        match &fc.outcome {
+            MaintenanceOutcome::Completed { items_affected } => {
+                assert!(*items_affected > 0, "expected non-zero items affected for compaction");
+            }
+            other => panic!("FragmentCompaction expected Completed, got {other:?}"),
+        }
 
         // VersionRetention should have pruned old versions.
         let vr = &summary.tier_results[2];
         assert_eq!(vr.tier, MaintenanceTier::VersionRetention);
-        assert!(
-            matches!(vr.outcome, MaintenanceOutcome::Completed { .. })
-                || matches!(vr.outcome, MaintenanceOutcome::Skipped { reason: MaintenanceSkipReason::NothingToDo }),
-            "VersionRetention outcome unexpected: {:?}",
-            vr.outcome,
-        );
+        match &vr.outcome {
+            MaintenanceOutcome::Completed { items_affected } => {
+                assert!(*items_affected > 0, "expected non-zero versions pruned");
+            }
+            other => panic!("VersionRetention expected Completed, got {other:?}"),
+        }
     }
 }
 

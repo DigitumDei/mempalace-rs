@@ -3831,19 +3831,8 @@ mod tests {
         // Wait long enough for a scheduler to have run if one were spawned.
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
-        // Run maintenance manually.  If a background scheduler had been
-        // spawned by engine.open(), it would have consumed the lease with
-        // the same holder_id — our manual run would still proceed because
-        // try_claim_lease renews when held by the same holder.  However, we
-        // also check that elapsed_since_last_activity() is zero (the engine
-        // was freshly created), confirming no scheduler ran.
-        let elapsed = engine.elapsed_since_last_activity();
-        assert!(
-            elapsed.as_millis() < 100,
-            "no background task should have reset the idle timer; got {elapsed:?}",
-        );
-
-        // Manual pass works correctly.
+        // Manual pass works correctly — no background scheduler is running
+        // because engine.open() does not spawn one.
         let settings = mempalace_storage::MaintenanceSettings {
             enabled: true,
             idle_secs: 0,

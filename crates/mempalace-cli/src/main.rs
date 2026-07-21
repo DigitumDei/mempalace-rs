@@ -4809,16 +4809,19 @@ mod tests {
         let config_root = tempdir.path().to_path_buf();
         let palace_path = config_root.join("palace");
 
-        // Write config.json with maintenance enabled and a valid idle_secs.
-        // The CLI command overrides idle_secs to 0 internally so the
-        // one-shot pass runs immediately regardless of the config value.
+        // Write config.json with maintenance enabled and aggressive thresholds
+        // so every tier has work to do.  The validation rejects 0, so use the
+        // minimum positive value (1) for tail_threshold_rows and
+        // small_fragment_threshold; version_retention_hours must also be ≥1
+        // even though newly-created versions may not be old enough to prune.
         write_file(
             &config_root.join("config.json"),
-            r#"{"maintenance":{"enabled":true,"idle_secs":300}}"#,
+            r#"{"maintenance":{"enabled":true,"idle_secs":300,"tail_threshold_rows":2,"small_fragment_threshold":2,"version_retention_hours":1}}"#,
         );
 
-        // Initialise a palace and insert some drawers so maintenance has
-        // data to examine.
+        // Initialise a palace and insert drawers in multiple batches to create
+        // multiple LanceDB versions and small fragments, giving every tier
+        // real work.
         tokio::runtime::Runtime::new()
             .unwrap()
             .block_on(async {
@@ -4828,40 +4831,45 @@ mod tests {
                 )
                 .await
                 .unwrap();
-                let records: Vec<_> = (0..20)
-                    .map(|i| {
-                        let id = mempalace_core::DrawerId::new(&format!("wing/room/{i:04}")).unwrap();
-                        let wing = mempalace_core::WingId::new("wing").unwrap();
-                        let room = mempalace_core::RoomId::new("room").unwrap();
-                        let dim = mempalace_core::EmbeddingProfile::Balanced.metadata().dimensions;
-                        let mut embedding = vec![0.1_f32; dim];
-                        embedding[0] = (i as f32) * 0.01;
-                        mempalace_core::DrawerRecord {
-                            id,
-                            wing,
-                            room,
-                            hall: None,
-                            date: None,
-                            source_file: "test.txt".to_owned(),
-                            chunk_index: i,
-                            ingest_mode: "test".to_owned(),
-                            extract_mode: None,
-                            added_by: "tester".to_owned(),
-                            filed_at: time::OffsetDateTime::UNIX_EPOCH,
-                            importance: None,
-                            emotional_weight: None,
-                            weight: None,
-                            content: format!("payload-{i}"),
-                            content_hash: format!("hash-{i}"),
-                            embedding,
-                            locator: None,
-                        }
-                    })
-                    .collect();
-                engine.drawer_store()
-                    .put_drawers(&records, mempalace_storage::DuplicateStrategy::Error)
-                    .await
-                    .unwrap();
+                let dim = mempalace_core::EmbeddingProfile::Balanced.metadata().dimensions;
+                for batch in 0..10 {
+                    let records: Vec<_> = (0..4)
+                        .map(|i| {
+                            let id = mempalace_core::DrawerId::new(
+                                &format!("wing/room/b{batch}_{i:04}"),
+                            )
+                            .unwrap();
+                            let wing = mempalace_core::WingId::new("wing").unwrap();
+                            let room = mempalace_core::RoomId::new("room").unwrap();
+                            let mut embedding = vec![0.1_f32; dim];
+                            embedding[0] = (i as f32) * 0.01;
+                            mempalace_core::DrawerRecord {
+                                id,
+                                wing,
+                                room,
+                                hall: None,
+                                date: None,
+                                source_file: "test.txt".to_owned(),
+                                chunk_index: i,
+                                ingest_mode: "test".to_owned(),
+                                extract_mode: None,
+                                added_by: "tester".to_owned(),
+                                filed_at: time::OffsetDateTime::UNIX_EPOCH,
+                                importance: None,
+                                emotional_weight: None,
+                                weight: None,
+                                content: format!("payload-{batch}-{i}"),
+                                content_hash: format!("hash-{batch}-{i}"),
+                                embedding,
+                                locator: None,
+                            }
+                        })
+                        .collect();
+                    engine.drawer_store()
+                        .put_drawers(&records, mempalace_storage::DuplicateStrategy::Error)
+                        .await
+                        .unwrap();
+                }
             });
 
         let context = CliContext::for_tests(config_root);
@@ -4878,10 +4886,34 @@ mod tests {
             "output should contain run header: {}",
             output.stdout
         );
-        // With data present, all three tiers should have results.
+        // With data present and aggressive thresholds, all three tiers should
+        // appear in the output.  Version retention may be skipped because
+        // versions were created seconds ago (nothing older than 1 hour), but
+        // vector index optimisation and fragment compaction should complete.
         assert!(
             output.stdout.contains("[SUCCESS]") || output.stdout.contains("[PARTIAL]"),
-            "output should show SUCCESS or PARTIAL status: {}",
+            "output should show SUCCESS or PARTIAL: {}",
+            output.stdout
+        );
+        assert!(
+            output.stdout.contains("Vector Index Optimization"),
+            "vector index tier should appear in output: {}",
+            output.stdout
+        );
+        assert!(
+            output.stdout.contains("Fragment Compaction"),
+            "fragment compaction tier should appear in output: {}",
+            output.stdout
+        );
+        assert!(
+            output.stdout.contains("Version Retention"),
+            "version retention tier should appear in output: {}",
+            output.stdout
+        );
+        // At least one tier must report "completed" with positive items.
+        assert!(
+            output.stdout.contains("completed"),
+            "at least one tier should report completed: {}",
             output.stdout
         );
     }
@@ -4892,19 +4924,61 @@ mod tests {
         let config_root = tempdir.path().to_path_buf();
         let palace_path = config_root.join("palace");
 
-        // Explicit version_retention_hours in config so it appears in output.
+        // Use minimum positive thresholds so config validation passes.
+        // version_retention_hours:1 is the minimum; with newly-created
+        // versions the tier will likely be skipped (nothing old enough),
+        // but it should appear in the output with a result.
         write_file(
             &config_root.join("config.json"),
-            r#"{"maintenance":{"enabled":true,"idle_secs":300,"version_retention_hours":12}}"#,
+            r#"{"maintenance":{"enabled":true,"idle_secs":300,"version_retention_hours":1,"small_fragment_threshold":2,"tail_threshold_rows":2}}"#,
         );
 
+        // Create multi-version fixture so pruning has versions to examine.
         tokio::runtime::Runtime::new()
             .unwrap()
-            .block_on(mempalace_storage::StorageEngine::open(
-                &palace_path,
-                mempalace_core::EmbeddingProfile::Balanced,
-            ))
-            .unwrap();
+            .block_on(async {
+                let engine = mempalace_storage::StorageEngine::open(
+                    &palace_path,
+                    mempalace_core::EmbeddingProfile::Balanced,
+                )
+                .await
+                .unwrap();
+                let dim = mempalace_core::EmbeddingProfile::Balanced.metadata().dimensions;
+                for batch in 0..8 {
+                    let id = mempalace_core::DrawerId::new(
+                        &format!("wing/room/v{batch}_0000"),
+                    )
+                    .unwrap();
+                    let wing = mempalace_core::WingId::new("wing").unwrap();
+                    let room = mempalace_core::RoomId::new("room").unwrap();
+                    let mut embedding = vec![0.1_f32; dim];
+                    embedding[0] = (batch as f32) * 0.01;
+                    let record = mempalace_core::DrawerRecord {
+                        id,
+                        wing,
+                        room,
+                        hall: None,
+                        date: None,
+                        source_file: "test.txt".to_owned(),
+                        chunk_index: batch,
+                        ingest_mode: "test".to_owned(),
+                        extract_mode: None,
+                        added_by: "tester".to_owned(),
+                        filed_at: time::OffsetDateTime::UNIX_EPOCH,
+                        importance: None,
+                        emotional_weight: None,
+                        weight: None,
+                        content: format!("payload-{batch}"),
+                        content_hash: format!("hash-{batch}"),
+                        embedding,
+                        locator: None,
+                    };
+                    engine.drawer_store()
+                        .put_drawers(&[record], mempalace_storage::DuplicateStrategy::Error)
+                        .await
+                        .unwrap();
+                }
+            });
 
         let context = CliContext::for_tests(config_root);
         let output = run_cli(
@@ -4918,6 +4992,13 @@ mod tests {
         assert!(
             output.stdout.contains("Version Retention"),
             "output must mention Version Retention tier: {}",
+            output.stdout
+        );
+        // The version retention tier should have a concrete result
+        // (completed or skipped with a reason), not a missing line.
+        assert!(
+            output.stdout.contains("completed") || output.stdout.contains("skipped"),
+            "version retention should show completed or skipped result: {}",
             output.stdout
         );
     }

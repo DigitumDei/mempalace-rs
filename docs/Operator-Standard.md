@@ -185,8 +185,11 @@ variables, which take precedence over `config.json`:
 The HTTP hub (`mempalace-cli serve`) runs maintenance in a background
 tokio task.  The scheduling rules are:
 
-- **Startup check**: on hub startup, one maintenance run executes
-  immediately (subject to the lease gate — see below).
+- **Startup eligibility check**: on hub startup, one maintenance
+  eligibility check runs immediately.  The storage engine initialises its
+  activity timestamp at open time, so the first actual run occurs only
+  after the configured `idle_secs` interval has elapsed without write
+  activity (subject to the lease gate — see below).
 - **Loop**: after each run, the task sleeps for `idle_secs` plus a
   randomised jitter of up to 10% of `idle_secs` to desynchronise
   concurrent hubs.

@@ -51,7 +51,8 @@ use mempalace_graph::{AddFactRequest, EntityKind, KnowledgeGraphRuntime, QueryDi
 use mempalace_search::{SearchRuntime, SearchRuntimePolicy};
 use mempalace_storage::{
     ChangeCursor, ChangeEvent, ChangeLogStore, DrawerFilter, DrawerStore, DuplicateStrategy,
-    IngestCommitRequest, IngestManifestStore, MaintenanceSettings, StorageEngine,
+    IngestCommitRequest, IngestManifestStore, MaintenanceRunSummary, MaintenanceSettings,
+    StorageEngine,
 };
 use serde_json::{Value, json};
 use subtle::ConstantTimeEq;
@@ -416,6 +417,8 @@ pub struct ServerState<P> {
     pub search: Mutex<SearchRuntime<P>>,
     /// Bearer-token registry for auth.
     pub tokens: Arc<TokenRegistry>,
+    /// The most recent maintenance run summary, if any.
+    pub last_maintenance_status: std::sync::Mutex<Option<MaintenanceRunSummary>>,
 }
 
 // ─── Router builder ──────────────────────────────────────────────────────────
@@ -471,31 +474,58 @@ where
         storage,
         search: Mutex::new(search),
         tokens: Arc::new(tokens),
+        last_maintenance_status: std::sync::Mutex::new(None),
     });
 
     // ── Background maintenance task ──────────────────────────────────────────
     //
-    // Runs only in the long-lived HTTP hub.  The loop wakes on the configured
-    // idle interval and calls `run_maintenance` which checks idleness, acquires
-    // a SQLite lease, and executes tiers in cheapest-first order.
+    // Runs only in the long-lived HTTP hub.  Starts with an immediate startup
+    // check, then loops with a jittered sleep so concurrent hubs do not
+    // synchronise their runs.  Every request resets the idle timer via the
+    // activity middleware, so maintenance only fires when the server has been
+    // idle for the configured duration.
     if maintenance_settings.enabled {
-        let storage = state.storage.clone();
+        let task_state = Arc::clone(&state);
         let settings = maintenance_settings;
         tokio::spawn(async move {
-            let check_interval = std::time::Duration::from_secs(settings.idle_secs.max(30));
-            let mut interval = tokio::time::interval(check_interval);
-            // The first tick completes immediately; skip it so we don't run
-            // maintenance right at startup (reconcile already ran in open).
-            interval.tick().await;
+            // Startup maintenance check
+            info!("performing startup maintenance check");
+            match task_state.storage.run_maintenance(&settings).await {
+                Ok(summary) => {
+                    *task_state.last_maintenance_status.lock().unwrap() = Some(summary);
+                }
+                Err(e) => {
+                    warn!(error = %e, "startup maintenance run failed");
+                }
+            }
+
             loop {
-                interval.tick().await;
+                let base = std::time::Duration::from_secs(settings.idle_secs.max(30));
+                let jitter_frac = (std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .subsec_nanos() as f64)
+                    / 1_000_000_000.0;
+                let jitter =
+                    std::time::Duration::from_secs_f64(jitter_frac * base.as_secs_f64() * 0.1);
+                let sleep_dur = base + jitter;
+
+                tokio::time::sleep(sleep_dur).await;
+
                 info!("background maintenance check");
-                if let Err(e) = storage.run_maintenance(&settings).await {
-                    warn!(error = %e, "background maintenance run failed");
+                match task_state.storage.run_maintenance(&settings).await {
+                    Ok(summary) => {
+                        *task_state.last_maintenance_status.lock().unwrap() = Some(summary);
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "background maintenance run failed");
+                    }
                 }
             }
         });
     }
+
+    let activity_state = Arc::clone(&state);
 
     // Unauthenticated routes
     let public = Router::new().route("/v1/health", get(route_health));
@@ -529,7 +559,8 @@ where
         .route("/v1/changes", get(route_changes::<P>))
         .layer(middleware::from_fn_with_state(Arc::clone(&state), auth_middleware::<P>));
 
-    Ok(public.merge(protected).merge(ingest_route).with_state(state))
+    let router = public.merge(protected).merge(ingest_route).with_state(state);
+    Ok(router.layer(middleware::from_fn_with_state(activity_state, activity_middleware::<P>)))
 }
 
 // ─── Auth middleware ──────────────────────────────────────────────────────────
@@ -555,6 +586,22 @@ where
         }
         None => ServerError::Unauthorized.into_response(),
     }
+}
+
+// ─── Activity middleware ───────────────────────────────────────────────────────
+
+/// Signals activity on every incoming request so the background maintenance
+/// scheduler resets its idle timer.
+async fn activity_middleware<P>(
+    State(state): State<Arc<ServerState<P>>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response
+where
+    P: EmbeddingProvider + Send + Sync + 'static,
+{
+    state.storage.signal_activity();
+    next.run(request).await
 }
 
 // ─── Health ──────────────────────────────────────────────────────────────────

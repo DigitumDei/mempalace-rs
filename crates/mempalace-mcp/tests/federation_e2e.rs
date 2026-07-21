@@ -16,8 +16,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use mempalace_config::{
-    FederationRuntimeConfig, LowCpuRuntimeConfig, MempalaceConfig, ResolvedRemote,
-    ResolvedRouteRule, RouteMode, ServerRuntimeConfig, WriteTarget,
+    FederationRuntimeConfig, LowCpuRuntimeConfig, MaintenanceRuntimeConfig, MempalaceConfig,
+    ResolvedRemote, ResolvedRouteRule, RouteMode, ServerRuntimeConfig, WriteTarget,
 };
 use mempalace_core::EmbeddingProfile;
 use mempalace_federation::{DrawerSearchRequest, KgQueryRequest};
@@ -76,6 +76,7 @@ fn server_config(dir: &TempDir) -> MempalaceConfig {
             token_file: dir.path().join("tokens.json"),
             checkouts: std::collections::BTreeMap::new(),
         },
+        maintenance: MaintenanceRuntimeConfig::defaults(),
         federation: FederationRuntimeConfig::default(),
     }
 }
@@ -149,6 +150,7 @@ async fn mcp_server_with_hub(
             token_file: local_dir.path().join("server_tokens.json"),
             checkouts: std::collections::BTreeMap::new(),
         },
+        maintenance: MaintenanceRuntimeConfig::defaults(),
         federation,
     };
 
@@ -570,6 +572,7 @@ async fn different_embedding_profiles_per_side() {
             token_file: local_dir.path().join("server_tokens.json"),
             checkouts: std::collections::BTreeMap::new(),
         },
+        maintenance: MaintenanceRuntimeConfig::defaults(),
         federation,
     };
 
@@ -717,6 +720,7 @@ async fn remote_down_degrades_reads() {
             token_file: local_dir.path().join("server_tokens.json"),
             checkouts: std::collections::BTreeMap::new(),
         },
+        maintenance: MaintenanceRuntimeConfig::defaults(),
         federation,
     };
 
@@ -1180,6 +1184,7 @@ async fn wake_up_with_down_remote_marks_unreachable_and_succeeds() {
             token_file: local_dir.path().join("server_tokens.json"),
             checkouts: std::collections::BTreeMap::new(),
         },
+        maintenance: MaintenanceRuntimeConfig::defaults(),
         federation,
     };
 
@@ -1406,6 +1411,7 @@ async fn diary_events_never_appear_in_remote_changes() {
                     token_file: hub_dir.path().join("server_tokens.json"),
                     checkouts: std::collections::BTreeMap::new(),
                 },
+                maintenance: MaintenanceRuntimeConfig::defaults(),
                 federation: FederationRuntimeConfig::default(),
             },
             DeterministicStubProvider::new(EmbeddingProfile::Balanced),
@@ -1789,6 +1795,7 @@ async fn add_drawer_both_replication_fails_with_remote_rejection() {
             token_file: local_dir.path().join("server_tokens.json"),
             checkouts: std::collections::BTreeMap::new(),
         },
+        maintenance: MaintenanceRuntimeConfig::defaults(),
         federation,
     };
 
@@ -1987,6 +1994,7 @@ async fn add_drawer_both_near_duplicate_same_wing_room_rejected() {
             token_file: local_dir.path().join("server_tokens.json"),
             checkouts: std::collections::BTreeMap::new(),
         },
+        maintenance: MaintenanceRuntimeConfig::defaults(),
         federation,
     };
 
@@ -2112,6 +2120,7 @@ async fn add_drawer_both_retry_reuses_local_drawer_and_replicates() {
             token_file: local_dir.path().join("server_tokens.json"),
             checkouts: std::collections::BTreeMap::new(),
         },
+        maintenance: MaintenanceRuntimeConfig::defaults(),
         federation: federation_a,
     };
     let server_a =
@@ -2195,6 +2204,7 @@ async fn add_drawer_both_retry_reuses_local_drawer_and_replicates() {
             token_file: local_dir.path().join("server_tokens_b.json"),
             checkouts: std::collections::BTreeMap::new(),
         },
+        maintenance: MaintenanceRuntimeConfig::defaults(),
         federation: federation_b,
     };
     let server_b =
@@ -2255,6 +2265,7 @@ async fn add_drawer_both_retry_reuses_local_drawer_and_replicates() {
             token_file: local_dir.path().join("local_only_tokens.json"),
             checkouts: std::collections::BTreeMap::new(),
         },
+        maintenance: MaintenanceRuntimeConfig::defaults(),
         federation: FederationRuntimeConfig::default(),
     };
     let local_only_server =
@@ -2338,6 +2349,7 @@ async fn add_drawer_both_replication_fails_with_down_remote() {
             token_file: local_dir.path().join("server_tokens.json"),
             checkouts: std::collections::BTreeMap::new(),
         },
+        maintenance: MaintenanceRuntimeConfig::defaults(),
         federation,
     };
 
@@ -2515,6 +2527,7 @@ async fn kg_add_both_replication_fails_with_down_remote() {
             token_file: local_dir.path().join("server_tokens.json"),
             checkouts: std::collections::BTreeMap::new(),
         },
+        maintenance: MaintenanceRuntimeConfig::defaults(),
         federation,
     };
 
@@ -2750,6 +2763,7 @@ async fn kg_invalidate_both_replication_fails_with_down_remote() {
             token_file: local_dir.path().join("server_tokens.json"),
             checkouts: std::collections::BTreeMap::new(),
         },
+        maintenance: MaintenanceRuntimeConfig::defaults(),
         federation,
     };
 
@@ -3057,6 +3071,7 @@ async fn kg_add_both_replication_fails_with_remote_rejection() {
             token_file: local_dir.path().join("server_tokens.json"),
             checkouts: std::collections::BTreeMap::new(),
         },
+        maintenance: MaintenanceRuntimeConfig::defaults(),
         federation,
     };
 
@@ -3182,6 +3197,7 @@ async fn kg_invalidate_both_replication_fails_with_remote_rejection() {
             token_file: local_dir.path().join("server_tokens.json"),
             checkouts: std::collections::BTreeMap::new(),
         },
+        maintenance: MaintenanceRuntimeConfig::defaults(),
         federation,
     };
 

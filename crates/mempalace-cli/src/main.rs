@@ -3345,7 +3345,10 @@ mod tests {
 
     /// Build a `MempalaceConfig` pointing at the given palace dir with stub embeddings.
     fn remote_test_config(palace_dir: PathBuf, token_file: PathBuf) -> mempalace_config::MempalaceConfig {
-        use mempalace_config::{FederationRuntimeConfig, LowCpuRuntimeConfig, ServerRuntimeConfig};
+        use mempalace_config::{
+            FederationRuntimeConfig, LowCpuRuntimeConfig, MaintenanceRuntimeConfig,
+            ServerRuntimeConfig,
+        };
         mempalace_config::MempalaceConfig {
             schema_version: 1,
             collection_name: "mempalace_drawers".to_owned(),
@@ -3358,6 +3361,7 @@ mod tests {
                 checkouts: std::collections::BTreeMap::new(),
             },
             federation: FederationRuntimeConfig::default(),
+            maintenance: MaintenanceRuntimeConfig::defaults(),
         }
     }
 

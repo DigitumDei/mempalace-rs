@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use mempalace_config::{FederationRuntimeConfig, LowCpuRuntimeConfig, MempalaceConfig, ServerRuntimeConfig};
+use mempalace_config::{FederationRuntimeConfig, LowCpuRuntimeConfig, MaintenanceRuntimeConfig, MempalaceConfig, ServerRuntimeConfig};
 use mempalace_core::EmbeddingProfile;
 use mempalace_embeddings::DeterministicStubProvider;
 use mempalace_federation::{
@@ -69,6 +69,7 @@ fn test_config(tempdir: &TempDir) -> MempalaceConfig {
             checkouts: std::collections::BTreeMap::new(),
         },
         federation: FederationRuntimeConfig::default(),
+        maintenance: MaintenanceRuntimeConfig::defaults(),
     }
 }
 

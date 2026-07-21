@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 
-use mempalace_config::{FederationRuntimeConfig, LowCpuRuntimeConfig, MempalaceConfig, ServerRuntimeConfig};
+use mempalace_config::{FederationRuntimeConfig, LowCpuRuntimeConfig, MaintenanceRuntimeConfig, MempalaceConfig, ServerRuntimeConfig};
 use mempalace_core::EmbeddingProfile;
 use mempalace_embeddings::DeterministicStubProvider;
 use mempalace_server::{TokenRegistry, build_router};
@@ -60,6 +60,7 @@ fn test_config(tempdir: &TempDir) -> MempalaceConfig {
             checkouts: std::collections::BTreeMap::new(),
         },
         federation: FederationRuntimeConfig::default(),
+        maintenance: MaintenanceRuntimeConfig::defaults(),
     }
 }
 

@@ -29,6 +29,12 @@ Frozen JSON shape:
     "wake_up_drawers_limit": 8,
     "degraded_mode": true,
     "rerank_enabled": false
+  },
+  "maintenance": {
+    "enabled": true,
+    "idle_secs": 300,
+    "version_retention_hours": 24,
+    "tail_threshold_rows": 1024
   }
 }
 ```
@@ -36,6 +42,7 @@ Frozen JSON shape:
 Notes:
 
 - `low_cpu` is optional.
+- `maintenance` is optional.
 - If the config file does not exist, Rust defaults are used and `init` will create the file.
 - `version != 1` is rejected.
 
@@ -85,6 +92,25 @@ Validation:
 - `worker_threads`, `max_blocking_threads`, and `ingest_batch_size` must be greater than `0` when set.
 - Limit fields may be set to `0`; the runtime treats that literally and does not remap it to a default.
 
+### `maintenance`
+
+- Type: object
+- Optional
+- Defaults when absent or unset:
+  - `enabled: true`
+  - `idle_secs: 300`
+  - `version_retention_hours: 24`
+  - `tail_threshold_rows: 1024`
+- Fields:
+  - `enabled`: boolean — whether the maintenance subsystem runs automatically. Default: `true`.
+  - `idle_secs`: positive integer — minimum idle seconds since the last write before maintenance runs. Default: `300`.
+  - `version_retention_hours`: positive integer — maximum age in hours for retained version data. Default: `24`.
+  - `tail_threshold_rows`: positive integer — row count threshold that triggers tail compaction. Default: `1024`.
+
+Validation:
+
+- `idle_secs`, `version_retention_hours`, and `tail_threshold_rows` must be greater than `0` when set in the config file. Zero-valued env overrides are also rejected.
+
 ## Profile Defaults
 
 ### `balanced`
@@ -123,6 +149,14 @@ Supported environment variables:
 - `MEMPAL_PALACE_PATH`
   Legacy alias retained for Python-era compatibility.
 - `MEMPALACE_EMBEDDING_PROFILE`
+- `MEMPALACE_MAINTENANCE_ENABLED`
+  Overrides `maintenance.enabled`. Accepted truthy values: `1`, `true`, `TRUE`, `yes`, `YES`. All other values (including empty string) are treated as `false`.
+- `MEMPALACE_MAINTENANCE_IDLE_SECS`
+  Overrides `maintenance.idle_secs`. Must be a positive integer. Zero is rejected.
+- `MEMPALACE_MAINTENANCE_VERSION_RETENTION_HOURS`
+  Overrides `maintenance.version_retention_hours`. Must be a positive integer. Zero is rejected.
+- `MEMPALACE_MAINTENANCE_TAIL_THRESHOLD_ROWS`
+  Overrides `maintenance.tail_threshold_rows`. Must be a positive integer. Zero is rejected.
 
 Override order:
 

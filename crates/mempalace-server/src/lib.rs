@@ -2098,6 +2098,10 @@ mod tests {
     }
 
     async fn make_harness() -> Harness {
+        make_harness_with_maintenance(true).await
+    }
+
+    async fn make_harness_with_maintenance(maintenance_enabled: bool) -> Harness {
         let tempdir = TempDir::new().unwrap();
         let palace_path = tempdir.path().join("palace");
 
@@ -2126,7 +2130,10 @@ mod tests {
                 checkouts: std::collections::BTreeMap::new(),
             },
             federation: FederationRuntimeConfig::default(),
-            maintenance: MaintenanceRuntimeConfig::defaults(),
+            maintenance: MaintenanceRuntimeConfig {
+                enabled: maintenance_enabled,
+                ..MaintenanceRuntimeConfig::defaults()
+            },
         };
         let tokens = TokenRegistry::load(token_file).unwrap();
         let provider = DeterministicStubProvider::new(EmbeddingProfile::Balanced);
@@ -3368,6 +3375,28 @@ mod tests {
         let caps = body["capabilities"].as_array().unwrap();
         let cap_strings: Vec<&str> = caps.iter().filter_map(|v| v.as_str()).collect();
         assert!(cap_strings.contains(&"ingest"), "capabilities must include 'ingest'");
+    }
+
+    #[tokio::test]
+    async fn info_returns_maintenance_enabled_and_null_last_run() {
+        let harness = make_harness().await;
+        let resp = harness.router.oneshot(authed_get("/v1/info", ALICE_TOKEN)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["maintenance_enabled"], true);
+        assert_eq!(body["maintenance_idle_secs"], 300u64);
+        assert!(body["maintenance_last_run"].is_null());
+    }
+
+    #[tokio::test]
+    async fn info_returns_maintenance_disabled_fields() {
+        let harness = make_harness_with_maintenance(false).await;
+        let resp = harness.router.oneshot(authed_get("/v1/info", ALICE_TOKEN)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["maintenance_enabled"], false);
+        assert_eq!(body["maintenance_idle_secs"], 300u64);
+        assert!(body["maintenance_last_run"].is_null());
     }
 
     // ─── 10. Scheduler ────────────────────────────────────────────────────────

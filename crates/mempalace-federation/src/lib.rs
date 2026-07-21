@@ -29,7 +29,7 @@ pub struct InfoResponse {
     pub maintenance_idle_secs: u64,
     /// JSON-serialized [`MaintenanceRunSummary`] of the last completed
     /// maintenance run, if any.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub maintenance_last_run: Option<serde_json::Value>,
 }
 

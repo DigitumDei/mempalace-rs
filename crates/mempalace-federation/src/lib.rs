@@ -14,12 +14,16 @@ pub const FEDERATION_API_VERSION: u32 = 1;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct InfoResponse {
     /// Semver string of the running MemPalace server binary.
+    #[serde(default)]
     pub server_version: String,
     /// Federation API version (matches [`FEDERATION_API_VERSION`]).
+    #[serde(default)]
     pub federation_api_version: u32,
     /// Name of the embedding profile used by this server (e.g. `"balanced"`).
+    #[serde(default)]
     pub embedding_profile: String,
     /// Feature flags the server supports (e.g. `["drawers", "kg", "changes"]`).
+    #[serde(default)]
     pub capabilities: Vec<String>,
     /// Whether the maintenance subsystem is enabled.
     #[serde(default)]

@@ -9,7 +9,9 @@ mod types;
 
 pub use engine::StorageEngine;
 pub use error::{Result, StorageError};
-pub use lance::LanceDrawerStore;
+pub use lance::{
+    FragmentStats, LanceDrawerStore, OptimizeMetrics, PruneMetrics, VectorIndexStats,
+};
 pub use maintenance::{
     MaintenanceAbortReason, MaintenanceOutcome, MaintenanceRunStatus, MaintenanceRunSummary,
     MaintenanceSettings, MaintenanceSkipReason, MaintenanceTier, MaintenanceTierResult,

@@ -7,8 +7,10 @@ use time::{Duration, OffsetDateTime};
 pub enum MaintenanceTier {
     /// Remove version rows older than the retention window.
     VersionRetention,
-    /// Compact the tail of the drawer table when rows exceed the threshold.
-    TailCompaction,
+    /// Compact LanceDB fragments to reduce storage and improve scan performance.
+    FragmentCompaction,
+    /// Optimize LanceDB vector indices for faster ANN search.
+    VectorIndexOptimization,
 }
 
 /// Why a maintenance tier was skipped entirely.
@@ -140,7 +142,8 @@ mod tests {
     fn maintenance_tier_serde_snake_case() {
         let cases = [
             (MaintenanceTier::VersionRetention, "version_retention"),
-            (MaintenanceTier::TailCompaction, "tail_compaction"),
+            (MaintenanceTier::FragmentCompaction, "fragment_compaction"),
+            (MaintenanceTier::VectorIndexOptimization, "vector_index_optimization"),
         ];
         for (variant, expected) in &cases {
             let json = serde_json::to_string(variant).unwrap();
@@ -250,7 +253,7 @@ mod tests {
                     outcome: MaintenanceOutcome::Completed { items_affected: 100 },
                 },
                 MaintenanceTierResult {
-                    tier: MaintenanceTier::TailCompaction,
+                    tier: MaintenanceTier::FragmentCompaction,
                     started_at: OffsetDateTime::UNIX_EPOCH,
                     duration: Duration::seconds(20),
                     cpu_duration: Duration::milliseconds(750),
@@ -276,7 +279,7 @@ mod tests {
             cpu_duration: Duration::ZERO,
             status: MaintenanceRunStatus::Failure,
             tier_results: vec![MaintenanceTierResult {
-                tier: MaintenanceTier::TailCompaction,
+                tier: MaintenanceTier::FragmentCompaction,
                 started_at: OffsetDateTime::UNIX_EPOCH,
                 duration: Duration::seconds(5),
                 cpu_duration: Duration::milliseconds(200),

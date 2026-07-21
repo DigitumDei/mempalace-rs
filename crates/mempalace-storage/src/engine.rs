@@ -586,6 +586,7 @@ impl StorageEngine {
 
         // Shared lease-lost flag checked after each tier.
         let lease_lost = Arc::new(AtomicBool::new(false));
+        let mut remaining_recorded = false;
         // All tiers in execution order, used by record_remaining.
         let all_tiers = [
             MaintenanceTier::VectorIndexOptimization,
@@ -781,10 +782,11 @@ impl StorageEngine {
         } else {
             final_status = MaintenanceRunStatus::Failure;
             record_remaining(1, &mut tier_results);
+            remaining_recorded = true;
         }
 
         // ── 7. Tier: VersionRetention (cheapest, run last) ──────────────────
-        if !has_activity() && !lease_lost.load(Ordering::Acquire) {
+        if !remaining_recorded && !has_activity() && !lease_lost.load(Ordering::Acquire) {
             let tier_start = Instant::now();
             let tier_cpu_start = process_cpu_time();
             let tier_started_at = OffsetDateTime::now_utc();
@@ -1551,13 +1553,34 @@ mod tests {
         let tempdir = tempdir().unwrap();
         let engine = StorageEngine::open(tempdir.path(), EmbeddingProfile::Balanced).await.unwrap();
 
-        // Insert drawers in multiple batches to create multiple LanceDB versions
-        // and small fragments.  Each put_drawers call creates a new version.
-        for batch in 0..10 {
+        // Insert enough rows to trigger embedding-index creation during
+        // ensure_schema (MIN_VECTOR_INDEX_ROWS = 256), then insert more
+        // rows that go to the tail so optimize_vector_index has work to do.
+        for batch in 0..64 {
             let drawers: Vec<_> = (0..4)
                 .map(|i| {
                     let mut r = record(
                         &format!("wing/room/b{batch}_{i:04}"),
+                        "test.txt",
+                        [0.1, 0.2, 0.3, (batch as f32) * 0.01],
+                    );
+                    r.wing = mempalace_core::WingId::new("wing").unwrap();
+                    r.room = mempalace_core::RoomId::new("room").unwrap();
+                    r
+                })
+                .collect();
+            engine.drawer_store().put_drawers(&drawers, DuplicateStrategy::Error).await.unwrap();
+        }
+
+        // Create the embedding index (only happens when count_rows >= 256).
+        engine.drawer_store().ensure_schema().await.unwrap();
+
+        // Insert more data that lands in the tail (unindexed).
+        for batch in 0..10 {
+            let drawers: Vec<_> = (0..4)
+                .map(|i| {
+                    let mut r = record(
+                        &format!("wing/room/tail_{batch}_{i:04}"),
                         "test.txt",
                         [0.1, 0.2, 0.3, (batch as f32) * 0.01],
                     );

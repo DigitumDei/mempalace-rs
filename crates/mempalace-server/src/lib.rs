@@ -638,6 +638,13 @@ async fn route_info<P>(
 where
     P: EmbeddingProvider + Send + Sync + 'static,
 {
+    let last_run = state
+        .last_maintenance_status
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|s| serde_json::to_value(s).ok());
+
     Ok(Json(InfoResponse {
         server_version: env!("CARGO_PKG_VERSION").to_owned(),
         federation_api_version: FEDERATION_API_VERSION,
@@ -649,6 +656,9 @@ where
             "taxonomy".to_owned(),
             "ingest".to_owned(),
         ],
+        maintenance_enabled: state.config.maintenance.enabled,
+        maintenance_idle_secs: state.config.maintenance.idle_secs as u64,
+        maintenance_last_run: last_run,
     }))
 }
 

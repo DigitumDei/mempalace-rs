@@ -21,6 +21,16 @@ pub struct InfoResponse {
     pub embedding_profile: String,
     /// Feature flags the server supports (e.g. `["drawers", "kg", "changes"]`).
     pub capabilities: Vec<String>,
+    /// Whether the maintenance subsystem is enabled.
+    #[serde(default)]
+    pub maintenance_enabled: bool,
+    /// Minimum idle seconds since last write before maintenance runs.
+    #[serde(default)]
+    pub maintenance_idle_secs: u64,
+    /// JSON-serialized [`MaintenanceRunSummary`] of the last completed
+    /// maintenance run, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maintenance_last_run: Option<serde_json::Value>,
 }
 
 // ─── Drawer search ────────────────────────────────────────────────────────────
@@ -384,6 +394,9 @@ mod tests {
             federation_api_version: FEDERATION_API_VERSION,
             embedding_profile: "balanced".to_owned(),
             capabilities: vec!["drawers".to_owned(), "kg".to_owned()],
+            maintenance_enabled: true,
+            maintenance_idle_secs: 300,
+            maintenance_last_run: None,
         };
         let json = serde_json::to_string(&original).unwrap();
         let decoded: InfoResponse = serde_json::from_str(&json).unwrap();

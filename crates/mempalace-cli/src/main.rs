@@ -3451,6 +3451,9 @@ mod tests {
                     "changes".to_owned(),
                     "taxonomy".to_owned(),
                 ],
+                maintenance_enabled: false,
+                maintenance_idle_secs: 0,
+                maintenance_last_run: None,
             })
         }
 

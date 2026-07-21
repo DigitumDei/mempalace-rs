@@ -1451,7 +1451,22 @@ impl MaintenanceLeaseStore for SqliteOperationalStore {
         let now = OffsetDateTime::now_utc();
         let expires_at = now + ttl;
 
-        let rows = conn.execute(
+        // Use BEGIN IMMEDIATE so that a contended write queue yields
+        // SQLITE_BUSY immediately rather than blocking or deadlocking.
+        // We translate that into a clean Ok(false) (non-error skip).
+        if let Err(e) = conn.execute_batch("BEGIN IMMEDIATE") {
+            return if matches!(
+                e,
+                rusqlite::Error::SqliteFailure(ref f, _)
+                    if f.code == rusqlite::ErrorCode::DatabaseBusy
+            ) {
+                Ok(false)
+            } else {
+                Err(StorageError::from(e))
+            };
+        }
+
+        let result = conn.execute(
             "INSERT INTO maintenance_leases (lease_id, holder, expires_at, updated_at)
              VALUES ('maintenance', ?1, ?2, ?3)
              ON CONFLICT(lease_id) DO UPDATE SET
@@ -1467,9 +1482,21 @@ impl MaintenanceLeaseStore for SqliteOperationalStore {
                 encode_time(now),
                 holder,
             ],
-        )?;
+        );
 
-        Ok(rows > 0)
+        match result {
+            Ok(rows) => {
+                conn.execute_batch("COMMIT").map_err(|e| {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    StorageError::from(e)
+                })?;
+                Ok(rows > 0)
+            }
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(StorageError::from(e))
+            }
+        }
     }
 
     fn renew_lease(&self, holder: &str, ttl: Duration) -> Result<bool> {
@@ -1480,8 +1507,13 @@ impl MaintenanceLeaseStore for SqliteOperationalStore {
         let rows = conn.execute(
             "UPDATE maintenance_leases
              SET expires_at = ?1, updated_at = ?2
-             WHERE lease_id = 'maintenance' AND holder = ?3",
-            params![encode_time(expires_at), encode_time(now), holder],
+             WHERE lease_id = 'maintenance' AND holder = ?3 AND expires_at > ?4",
+            params![
+                encode_time(expires_at),
+                encode_time(now),
+                holder,
+                encode_time(now),
+            ],
         )?;
 
         Ok(rows > 0)
@@ -2572,6 +2604,18 @@ INSERT INTO diary_summaries (entry_id, summary) VALUES ('diary/long', 'x' || 'y'
         assert!(store.try_claim_lease("worker-a", Duration::minutes(5)).unwrap());
         let renewed = store.renew_lease("worker-b", Duration::hours(1)).unwrap();
         assert!(!renewed, "worker-b must not renew a lease held by worker-a");
+    }
+
+    #[test]
+    fn lease_renew_fails_when_expired() {
+        let tempdir = tempdir().unwrap();
+        let store = SqliteOperationalStore::new(tempdir.path().join("storage.sqlite3"));
+        store.ensure_schema().unwrap();
+
+        assert!(store.try_claim_lease("worker-a", Duration::ZERO).unwrap());
+
+        let renewed = store.renew_lease("worker-a", Duration::hours(1)).unwrap();
+        assert!(!renewed, "must not renew an already-expired lease");
     }
 
     #[test]

@@ -201,6 +201,9 @@ impl StorageEngine {
         // stale failed runs.
         let all_for_prune: Vec<_> =
             stale_runs.iter().cloned().chain(stale_failed_diary.iter().cloned()).collect();
+        if all_for_prune.is_empty() {
+            return Ok(());
+        }
         self.prune_orphaned_rows(&all_for_prune).await?;
 
         // Delete diary summaries for every stale chunk_id that is NOT
@@ -323,6 +326,7 @@ mod tests {
 
     use super::StorageEngine;
     use crate::error::StorageError;
+    use crate::lance::LanceDrawerStore;
     use crate::sqlite::{DiaryStore, IngestManifestStore};
     use crate::types::{DrawerFilter, DrawerStore, DuplicateStrategy, IngestCommitRequest};
     use mempalace_core::{DrawerId, DrawerRecord, EmbeddingProfile, RoomId, WingId};
@@ -421,6 +425,21 @@ mod tests {
             .stale_pending_runs(datetime!(2026-04-20 00:00:00 UTC))
             .unwrap();
         assert!(stale_runs.iter().all(|run| run.run.id != created_run.id));
+    }
+
+    #[tokio::test]
+    async fn reconcile_skips_lance_without_stale_runs() {
+        let tempdir = tempdir().unwrap();
+        let mut engine =
+            StorageEngine::open(tempdir.path(), EmbeddingProfile::Balanced).await.unwrap();
+
+        // A missing table makes any accidental Lance access fail.
+        engine.drawer_store = LanceDrawerStore::new(
+            tempdir.path().join("unused_lance"),
+            EmbeddingProfile::Balanced,
+        );
+
+        engine.reconcile().await.unwrap();
     }
 
     #[tokio::test]

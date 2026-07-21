@@ -119,6 +119,9 @@ impl LanceDrawerStore {
             .filter_map(|config| (config.columns.len() == 1).then(|| config.columns[0].clone()))
             .collect::<HashSet<_>>();
 
+        if !indexed_columns.contains("id") {
+            table.create_index(&["id"], Index::Auto).execute().await?;
+        }
         if !indexed_columns.contains("wing") {
             table.create_index(&["wing"], Index::Auto).execute().await?;
         }
@@ -1008,6 +1011,16 @@ mod tests {
 
         let reopened = LanceDrawerStore::new(&root, EmbeddingProfile::Balanced);
         reopened.ensure_schema().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ensure_schema_creates_id_index() {
+        let tempdir = tempdir().unwrap();
+        let store = LanceDrawerStore::new(tempdir.path().join("lance"), EmbeddingProfile::Balanced);
+        store.ensure_schema().await.unwrap();
+
+        let indices = store.table().await.unwrap().list_indices().await.unwrap();
+        assert!(indices.iter().any(|index| index.columns.len() == 1 && index.columns[0] == "id"));
     }
 
     /// Back-compat: an old table (schema without locator columns) must be migrated

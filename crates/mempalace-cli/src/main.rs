@@ -26,7 +26,7 @@ use mempalace_ingest::{
 };
 use mempalace_remote::{RemoteApi, RemoteClient, RemoteEndpoint, RemoteError};
 use mempalace_search::{Layer1Config, SearchRuntime, SearchRuntimePolicy, WakeUpRequest};
-use mempalace_storage::{DrawerFilter, DrawerStore, StorageEngine, StorageLayout};
+use mempalace_storage::{DrawerFilter, DrawerStore, MaintenanceSettings, StorageEngine, StorageLayout};
 use serde_yaml::Mapping;
 use tracing_subscriber::{EnvFilter, fmt};
 
@@ -276,6 +276,8 @@ enum Commands {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// Run a single maintenance pass (compact, prune, optimize) using configured settings.
+    Maintain,
     /// Run the federation HTTP server over this palace.
     Serve {
         #[arg(long, help = "Bind address, e.g. 127.0.0.1:8765 (default: from config)")]
@@ -466,6 +468,7 @@ where
         }
         Commands::Split { .. } => Ok(deferred_command("split")),
         Commands::Compress { .. } => Ok(deferred_command("compress")),
+        Commands::Maintain => execute_maintain(cli.palace.as_deref(), context),
         Commands::Serve { bind, token_file } => execute_serve(
             bind,
             token_file,
@@ -1705,6 +1708,99 @@ fn execute_status(
     lines.push("=".repeat(STATUS_HEADER_WIDTH));
     lines.push(String::new());
     Ok(CliOutput::success(lines.join("\n")))
+}
+
+fn execute_maintain(
+    palace_override: Option<&Path>,
+    context: &CliContext,
+) -> Result<CliOutput, clap::Error> {
+    let config = load_runtime_config(palace_override, context).map_err(config_error)?;
+    if !palace_exists(&config.palace_path) {
+        return Ok(no_palace_error(&config.palace_path));
+    }
+
+    let runtime = build_runtime(&config).map_err(runtime_error)?;
+    let engine = runtime
+        .block_on(StorageEngine::open(&config.palace_path, config.embedding_profile))
+        .map_err(storage_error)?;
+
+    let settings = MaintenanceSettings {
+        enabled: config.maintenance.enabled,
+        idle_secs: config.maintenance.idle_secs as u64,
+        version_retention_hours: config.maintenance.version_retention_hours as u64,
+        tail_threshold_rows: config.maintenance.tail_threshold_rows as u64,
+        small_fragment_threshold: config.maintenance.small_fragment_threshold as u64,
+    };
+
+    let summary = runtime
+        .block_on(engine.run_maintenance(&settings))
+        .map_err(storage_error)?;
+
+    let status_label = match summary.status {
+        mempalace_storage::MaintenanceRunStatus::Success => "SUCCESS",
+        mempalace_storage::MaintenanceRunStatus::Partial => "PARTIAL",
+        mempalace_storage::MaintenanceRunStatus::Failure => "FAILURE",
+    };
+
+    let exit_code = match summary.status {
+        mempalace_storage::MaintenanceRunStatus::Failure => 1,
+        _ => 0,
+    };
+
+    let mut lines = vec![
+        format!("\n{}", "=".repeat(STATUS_HEADER_WIDTH)),
+        format!("  Maintenance Run #{:<8}  [{status_label}]", summary.run_id),
+        "=".repeat(STATUS_HEADER_WIDTH),
+        String::new(),
+        format!("  Started : {}", summary.started_at),
+        format!("  Finished: {}", summary.finished_at),
+        format!("  Duration: {} ms", summary.duration.whole_milliseconds()),
+        format!("  CPU     : {} ms", summary.cpu_duration.whole_milliseconds()),
+        String::new(),
+    ];
+
+    for result in &summary.tier_results {
+        let tier_name = match result.tier {
+            mempalace_storage::MaintenanceTier::VectorIndexOptimization => "Vector Index Optimization",
+            mempalace_storage::MaintenanceTier::FragmentCompaction => "Fragment Compaction",
+            mempalace_storage::MaintenanceTier::VersionRetention => "Version Retention",
+        };
+        let outcome_line = match &result.outcome {
+            mempalace_storage::MaintenanceOutcome::Completed { items_affected } => {
+                format!("  ✓  {tier_name:<30} completed  ({items_affected} items)")
+            }
+            mempalace_storage::MaintenanceOutcome::Skipped { reason } => {
+                let reason_str = match reason {
+                    mempalace_storage::MaintenanceSkipReason::Disabled => "disabled",
+                    mempalace_storage::MaintenanceSkipReason::NotIdle => "not idle",
+                    mempalace_storage::MaintenanceSkipReason::NothingToDo => "nothing to do",
+                };
+                format!("  –  {tier_name:<30} skipped    ({reason_str})")
+            }
+            mempalace_storage::MaintenanceOutcome::Aborted { reason, items_affected } => {
+                let reason_str = match reason {
+                    mempalace_storage::MaintenanceAbortReason::ConcurrentRun => "concurrent run",
+                    mempalace_storage::MaintenanceAbortReason::Shutdown => "shutdown",
+                    mempalace_storage::MaintenanceAbortReason::Timeout => "timeout",
+                };
+                format!("  ✗  {tier_name:<30} aborted    ({reason_str}, {items_affected} items)")
+            }
+            mempalace_storage::MaintenanceOutcome::Failed { message } => {
+                format!("  ✗  {tier_name:<30} failed     ({message})")
+            }
+        };
+        lines.push(outcome_line);
+    }
+
+    lines.push(String::new());
+    lines.push("=".repeat(STATUS_HEADER_WIDTH));
+    lines.push(String::new());
+
+    if exit_code == 0 {
+        Ok(CliOutput::success(lines.join("\n")))
+    } else {
+        Ok(CliOutput::failure(1, lines.join("\n")))
+    }
 }
 
 fn execute_wake_up<F, P>(

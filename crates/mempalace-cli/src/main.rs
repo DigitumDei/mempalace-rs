@@ -1724,9 +1724,14 @@ fn execute_maintain(
         .block_on(StorageEngine::open(&config.palace_path, config.embedding_profile))
         .map_err(storage_error)?;
 
+    // Bypass the process-local idle gate for the one-shot CLI invocation.
+    // StorageEngine::open() initialises last_activity_at to Instant::now(), so
+    // the configured idle_secs (default 300) would always skip.  We set
+    // idle_secs to 0 so the pass runs immediately, while retaining the
+    // configured enablement flag and all other thresholds.
     let settings = MaintenanceSettings {
         enabled: config.maintenance.enabled,
-        idle_secs: config.maintenance.idle_secs as u64,
+        idle_secs: 0,
         version_retention_hours: config.maintenance.version_retention_hours as u64,
         tail_threshold_rows: config.maintenance.tail_threshold_rows as u64,
         small_fragment_threshold: config.maintenance.small_fragment_threshold as u64,
@@ -1758,6 +1763,12 @@ fn execute_maintain(
         format!("  CPU     : {} ms", summary.cpu_duration.whole_milliseconds()),
         String::new(),
     ];
+
+    // When maintenance is disabled the summary has no tier results.
+    // Show an explicit message rather than a bare [PARTIAL].
+    if summary.tier_results.is_empty() {
+        lines.push("  –  Maintenance is disabled by configuration.".to_owned());
+    }
 
     for result in &summary.tier_results {
         let tier_name = match result.tier {
@@ -4684,5 +4695,111 @@ mod tests {
         );
 
         remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn maintain_runs_with_enabled_config() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config_root = tempdir.path().to_path_buf();
+        let palace_path = config_root.join("palace");
+
+        // Write config.json with maintenance enabled.
+        write_file(
+            &config_root.join("config.json"),
+            r#"{"maintenance":{"enabled":true,"idle_secs":300}}"#,
+        );
+
+        // Initialise an empty palace so StorageEngine::open does not fail.
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(mempalace_storage::StorageEngine::open(
+                &palace_path,
+                mempalace_core::EmbeddingProfile::Balanced,
+            ))
+            .unwrap();
+
+        let context = CliContext::for_tests(config_root);
+        let output = run_cli(
+            ["maintain", "--palace", palace_path.to_str().unwrap()],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+
+        assert_eq!(output.exit_code, 0, "maintain should exit 0: {}", output.stderr);
+        assert!(
+            output.stdout.contains("Maintenance Run #"),
+            "output should contain run header: {}",
+            output.stdout
+        );
+        // With an empty palace all tiers should succeed or skip with nothing to do.
+        assert!(
+            output.stdout.contains("[SUCCESS]") || output.stdout.contains("[PARTIAL]"),
+            "output should show SUCCESS or PARTIAL status: {}",
+            output.stdout
+        );
+    }
+
+    #[test]
+    fn maintain_disabled_shows_explicit_message() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config_root = tempdir.path().to_path_buf();
+        let palace_path = config_root.join("palace");
+
+        // Write config.json with maintenance disabled.
+        write_file(
+            &config_root.join("config.json"),
+            r#"{"maintenance":{"enabled":false}}"#,
+        );
+
+        // Initialise an empty palace.
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(mempalace_storage::StorageEngine::open(
+                &palace_path,
+                mempalace_core::EmbeddingProfile::Balanced,
+            ))
+            .unwrap();
+
+        let context = CliContext::for_tests(config_root);
+        let output = run_cli(
+            ["maintain", "--palace", palace_path.to_str().unwrap()],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+
+        assert_eq!(output.exit_code, 0);
+        assert!(
+            output.stdout.contains("disabled by configuration"),
+            "disabled output must mention the reason: {}",
+            output.stdout
+        );
+        assert!(
+            output.stdout.contains("[PARTIAL]"),
+            "disabled output must show PARTIAL status: {}",
+            output.stdout
+        );
+    }
+
+    #[test]
+    fn maintain_no_palace_shows_error() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config_root = tempdir.path().to_path_buf();
+
+        let context = CliContext::for_tests(config_root);
+        let output = run_cli(
+            ["maintain"],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+
+        assert_eq!(output.exit_code, 1);
+        assert!(
+            output.stderr.contains("No palace found"),
+            "no-palace error must mention 'No palace found': {}",
+            output.stderr
+        );
     }
 }

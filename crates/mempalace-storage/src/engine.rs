@@ -857,7 +857,7 @@ impl StorageEngine {
             } else if is_skipped && final_status == MaintenanceRunStatus::Success {
                 final_status = MaintenanceRunStatus::Partial;
             }
-        } else {
+        } else if !remaining_recorded {
             record_remaining(2, &mut tier_results);
         }
 

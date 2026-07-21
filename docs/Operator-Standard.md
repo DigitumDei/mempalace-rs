@@ -134,6 +134,153 @@ Operational notes:
 Full setup, client configuration, and the team mining workflow are in the
 [Federation guide](Federation.md).
 
+## Maintenance
+
+The maintenance subsystem keeps the palace storage healthy by compacting
+fragments, pruning old version data, and optimising vector indices.  It is
+**enabled by default** and runs automatically in the long-lived HTTP hub
+(`mempalace-cli serve`).  A one-shot CLI command (`mempalace-cli maintain`)
+is available for initial backfill and out-of-band runs.
+
+### Maintenance Tiers
+
+Each run executes up to three tiers in order:
+
+1. **Vector Index Optimization** — rebuilds LanceDB vector indices for
+   faster approximate-nearest-neighbour search.
+2. **Fragment Compaction** — merges small LanceDB fragments to reduce
+   storage overhead and improve scan performance.  Triggered when the
+   number of small fragments exceeds `small_fragment_threshold` (default:
+   `10`) or when a tail fragment exceeds `tail_threshold_rows` (default:
+   `1024`).
+3. **Version Retention** — removes version data rows older than
+   `version_retention_hours` (default: `24`).
+
+### Configuration Defaults
+
+| Field | Default | Description |
+|---|---|---|
+| `enabled` | `true` | Whether the subsystem runs automatically. |
+| `idle_secs` | `300` | Minimum wall-clock seconds since the last write before a run starts. |
+| `version_retention_hours` | `24` | Maximum age in hours for retained version rows. |
+| `tail_threshold_rows` | `1024` | Row count that triggers tail-fragment compaction. |
+| `small_fragment_threshold` | `10` | Fragment count that triggers small-fragment compaction. |
+
+### Environment Overrides
+
+All five fields can be overridden at process start via environment
+variables, which take precedence over `config.json`:
+
+- `MEMPALACE_MAINTENANCE_ENABLED` — truthy values: `1`, `true`, `TRUE`,
+  `yes`, `YES`.  All other values (including empty string) are `false`.
+- `MEMPALACE_MAINTENANCE_IDLE_SECS` — positive integer; zero is rejected.
+- `MEMPALACE_MAINTENANCE_VERSION_RETENTION_HOURS` — positive integer;
+  zero is rejected.
+- `MEMPALACE_MAINTENANCE_TAIL_THRESHOLD_ROWS` — positive integer; zero
+  is rejected.
+- `MEMPALACE_MAINTENANCE_SMALL_FRAGMENT_THRESHOLD` — positive integer;
+  zero is rejected.
+
+### Idle-Only Hub Scheduling
+
+The HTTP hub (`mempalace-cli serve`) runs maintenance in a background
+tokio task.  The scheduling rules are:
+
+- **Startup check**: on hub startup, one maintenance run executes
+  immediately (subject to the lease gate — see below).
+- **Loop**: after each run, the task sleeps for `idle_secs` plus a
+  randomised jitter of up to 10% of `idle_secs` to desynchronise
+  concurrent hubs.
+- **Idle reset**: every incoming HTTP request signals activity via the
+  `activity_middleware`.  The middleware calls `signal_activity()` on the
+  storage engine and notifies the background task, which cancels any
+  pending sleep and restarts the idle timer.
+- **Not idle**: if the background task wakes from sleep and detects
+  recent activity (elapsed time < `idle_secs`), it skips the run and
+  goes back to sleep.
+- **Write-path safety**: write operations (add, delete, mine, ingest)
+  also call `signal_activity()`, so maintenance never runs concurrently
+  with active writes from the same process.
+
+The one-shot CLI command (`mempalace-cli maintain`) bypasses the
+process-local idle gate entirely (sets `idle_secs` to `0`) so the pass
+runs immediately.  It still respects the cross-process lease.
+
+### Cross-Process Lease Semantics
+
+Maintenance is coordinated across concurrent processes via a single-row
+SQLite advisory lease stored in the palace's `storage.sqlite3`:
+
+- **Claim**: a process must atomically insert or update the lease row
+  with its holder ID and a 5-minute TTL.  If another process holds a
+  valid (non-expired) lease, the claim is denied.
+- **Renewal**: while a tier is executing, the orchestrator re-asserts
+  the lease every 60 seconds, extending the TTL by 5 minutes.  If
+  renewal fails (e.g. the database connection is interrupted), the
+  `lease_lost` flag is set and subsequent tiers are skipped.
+- **Release**: after all tiers complete, the lease is released so the
+  next contender can proceed immediately.
+- **Expiry**: if the holding process crashes or is killed, the lease
+  expires after 5 minutes and any contender can reclaim it.
+- **`busy_timeout = 0`**: the lease SQLite connection uses a zero
+  busy timeout so lease operations never block on database contention.
+  A denied lease (another process holds it) is returned as a
+  non-error skip, not a retry.
+
+This ensures that multiple hubs, CLI invocations, or a mix of both
+never run maintenance simultaneously on the same palace.
+
+### Observability
+
+The hub exposes maintenance state through two channels:
+
+**`GET /v1/info` (federation API)**
+
+The `InfoResponse` body includes these maintenance fields:
+
+| Field | Type | Description |
+|---|---|---|
+| `maintenance_enabled` | `bool` | Whether the subsystem is enabled. |
+| `maintenance_idle_secs` | `u64` | Configured idle threshold. |
+| `maintenance_last_run` | `serde_json::Value` or `null` | Full JSON-serialized [`MaintenanceRunSummary`] of the last completed run, if any. Contains `run_id`, `started_at`, `finished_at`, `duration`, `cpu_duration`, `status`, and `tier_results`. |
+| `maintenance_status` | `MaintenanceStatus` | Typed status enum: `disabled`, `idle`, `running`, `skipped { reason }`, `aborted { reason }`, `failed { message }`, `completed { status }`. Replaces the ambiguity of a null `maintenance_last_run`. |
+
+**Structured logs**
+
+The storage engine emits `tracing` events (`info`/`warn`/`error`) at key
+points during each run, including structured fields like `tier`,
+`tail_threshold`, `wall_ms`, `cpu_ms`, and `idle_secs`.  These are
+visible in the hub's stderr output and can be ingested by any
+`tracing`-compatible observability pipeline.
+
+### One-Shot CLI for Large Existing Palaces
+
+For a palace that has accumulated significant fragmentation or version
+data before the maintenance subsystem was introduced (e.g. upgrading
+from an older MemPalace release), the recommended procedure is:
+
+1. **Back up** the palace root (`storage.sqlite3` and `lancedb/`
+   together) before running maintenance, in case of unexpected issues.
+2. **Run the one-shot CLI command**:
+   ```bash
+   mempalace-cli maintain --palace /path/to/palace
+   ```
+3. **Inspect the output** for per-tier outcomes.  Tiers report
+   `completed`, `skipped {reason}`, `aborted {reason}`, or `failed`.
+   A `success` or `partial` overall status is expected.
+4. **If you run multiple CLI processes concurrently** (e.g. in a CI
+   matrix), only the first to claim the SQLite lease will execute;
+   the others will report `aborted {concurrent_run}`.
+5. **After the initial one-shot pass**, the hub's background maintenance
+   will handle incremental compaction and pruning automatically during
+   idle periods.  No further manual intervention is required.
+
+The `maintain` command respects the same `enabled`, `version_retention_hours`,
+`tail_threshold_rows`, and `small_fragment_threshold` settings from
+`config.json` (or environment overrides).  The only difference from
+background hub behaviour is that the idle gate is bypassed, so the pass
+starts immediately.
+
 ## Storage Recovery
 
 If the palace is damaged or inconsistent:

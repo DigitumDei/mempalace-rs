@@ -145,6 +145,44 @@ Behavior:
 - JSON merges preserve all other keys and are idempotent (re-running reports "already configured"). If an existing config file is not valid JSON, setup refuses to clobber it and reports a failure for that tool.
 - Tools that are not installed are skipped with a note. The command always exits 0 (best-effort across tools); per-tool status is shown in the summary.
 
+### `maintain`
+
+Purpose:
+- Run a single maintenance pass (compact, prune, optimize) against the current
+  palace using the configured settings.  This is a one-shot CLI invocation
+  intended for initial backfill on large existing palaces and for
+  out-of-band troubleshooting; the HTTP hub (`serve`) runs maintenance
+  automatically in the background.
+
+Flags:
+- (none beyond the global `--palace` flag)
+
+Behavior:
+- When maintenance is **disabled** in configuration, the command prints a
+  message to that effect and exits 0.
+- When maintenance is **enabled**, the command runs all three tiers:
+  1. **Vector Index Optimization** — rebuilds LanceDB vector indices for
+     faster ANN search.
+  2. **Fragment Compaction** — merges small LanceDB fragments to reduce
+     storage and improve scan performance.  Triggered when the number of
+     small fragments exceeds `small_fragment_threshold` (default: 10)
+     or when a tail fragment exceeds `tail_threshold_rows` (default: 1024).
+  3. **Version Retention** — purges version rows older than
+     `version_retention_hours` (default: 24).
+- The one-shot CLI bypasses the process-local idle gate (`idle_secs` is
+  treated as 0) so the pass runs immediately, but respects all other
+  configured thresholds and the `enabled` flag.
+- Cross-process lease coordination applies: the command acquires a SQLite
+  advisory lease with a 5-minute TTL.  If another process (e.g. the hub
+  or another CLI invocation) already holds the lease, the command exits
+  with a "concurrent run" status rather than duplicating work.
+- Prints a formatted summary including run ID, start/end timestamps,
+  wall-clock and CPU duration, per-tier outcomes, and overall status.
+- Exit codes:
+  - `0` — all tiers completed successfully, or at least one tier was
+    skipped (non-critical).  Also `0` when maintenance is disabled.
+  - `1` — at least one tier failed or was aborted.
+
 ### `serve`
 
 Purpose:

@@ -34,7 +34,8 @@ Frozen JSON shape:
     "enabled": true,
     "idle_secs": 300,
     "version_retention_hours": 24,
-    "tail_threshold_rows": 1024
+    "tail_threshold_rows": 1024,
+    "small_fragment_threshold": 10
   }
 }
 ```
@@ -101,15 +102,17 @@ Validation:
   - `idle_secs: 300`
   - `version_retention_hours: 24`
   - `tail_threshold_rows: 1024`
+  - `small_fragment_threshold: 10`
 - Fields:
   - `enabled`: boolean — whether the maintenance subsystem runs automatically. Default: `true`.
   - `idle_secs`: positive integer — minimum idle seconds since the last write before maintenance runs. Default: `300`.
   - `version_retention_hours`: positive integer — maximum age in hours for retained version data. Default: `24`.
   - `tail_threshold_rows`: positive integer — row count threshold that triggers tail compaction. Default: `1024`.
+  - `small_fragment_threshold`: positive integer — number of small LanceDB fragments that trigger fragment compaction. Default: `10`.
 
 Validation:
 
-- `idle_secs`, `version_retention_hours`, and `tail_threshold_rows` must be greater than `0` when set in the config file. Zero-valued env overrides are also rejected.
+- `idle_secs`, `version_retention_hours`, `tail_threshold_rows`, and `small_fragment_threshold` must be greater than `0` when set in the config file. Zero-valued env overrides are also rejected.
 
 ## Profile Defaults
 
@@ -157,6 +160,8 @@ Supported environment variables:
   Overrides `maintenance.version_retention_hours`. Must be a positive integer. Zero is rejected.
 - `MEMPALACE_MAINTENANCE_TAIL_THRESHOLD_ROWS`
   Overrides `maintenance.tail_threshold_rows`. Must be a positive integer. Zero is rejected.
+- `MEMPALACE_MAINTENANCE_SMALL_FRAGMENT_THRESHOLD`
+  Overrides `maintenance.small_fragment_threshold`. Must be a positive integer. Zero is rejected.
 
 Override order:
 

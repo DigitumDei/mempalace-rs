@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
-use time::OffsetDateTime;
+use time::{Duration, OffsetDateTime};
 
 use crate::error::{Result, StorageError};
 use crate::types::{
@@ -161,9 +161,23 @@ CREATE TABLE IF NOT EXISTS diary_summaries_v2 (
 INSERT INTO diary_summaries_v2 (entry_id, summary)
 SELECT entry_id, SUBSTR(summary, 1, 400) FROM diary_summaries;
 
-DROP TABLE diary_summaries;
+        DROP TABLE diary_summaries;
 
 ALTER TABLE diary_summaries_v2 RENAME TO diary_summaries;
+        "#,
+    ),
+    (
+        "0008_maintenance_leases",
+        r#"
+CREATE TABLE IF NOT EXISTS maintenance_leases (
+    lease_id   TEXT PRIMARY KEY,
+    holder     TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+INSERT INTO maintenance_leases (lease_id, holder, expires_at, updated_at)
+VALUES ('maintenance', '', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z');
         "#,
     ),
 ];
@@ -293,6 +307,36 @@ pub trait ChangeLogStore {
     ) -> Result<ChangePage>;
 }
 
+/// Advisory lease for the maintenance subsystem.
+///
+/// A single-row lease table serialises concurrent maintenance-worker
+/// processes so that only one holder runs at a time.  Expired leases can
+/// be reclaimed by any contender.
+pub trait MaintenanceLeaseStore {
+    /// Claim the maintenance lease atomically.
+    ///
+    /// Returns `Ok(true)` when the lease was acquired (either no prior
+    /// lease existed, it had expired, or the caller already held it).
+    /// Returns `Ok(false)` when another process holds a valid lease —
+    /// the caller should treat this as a non-error skip.
+    fn try_claim_lease(&self, holder: &str, ttl: Duration) -> Result<bool>;
+
+    /// Extend the lease TTL.
+    ///
+    /// Returns `Ok(true)` if the lease was extended.  Returns `Ok(false)`
+    /// if the caller no longer holds the lease.
+    fn renew_lease(&self, holder: &str, ttl: Duration) -> Result<bool>;
+
+    /// Release the lease.
+    ///
+    /// Returns `Ok(true)` if the lease was released.  Returns `Ok(false)`
+    /// if the caller did not hold the lease.
+    fn release_lease(&self, holder: &str) -> Result<bool>;
+
+    /// Read the current lease, if one exists.
+    fn lease_status(&self) -> Result<Option<(String, OffsetDateTime)>>;
+}
+
 #[derive(Debug, Clone)]
 pub struct SqliteOperationalStore {
     path: PathBuf,
@@ -312,6 +356,7 @@ impl SqliteOperationalStore {
             "0005_change_log",
             "0006_diary_summaries",
             "0007_diary_summary_length_constraint",
+            "0008_maintenance_leases",
         ]
     }
 
@@ -1400,6 +1445,86 @@ impl ChangeLogStore for SqliteOperationalStore {
     }
 }
 
+impl MaintenanceLeaseStore for SqliteOperationalStore {
+    fn try_claim_lease(&self, holder: &str, ttl: Duration) -> Result<bool> {
+        let conn = self.open_connection()?;
+        let now = OffsetDateTime::now_utc();
+        let expires_at = now + ttl;
+
+        let rows = conn.execute(
+            "INSERT INTO maintenance_leases (lease_id, holder, expires_at, updated_at)
+             VALUES ('maintenance', ?1, ?2, ?3)
+             ON CONFLICT(lease_id) DO UPDATE SET
+                 holder = excluded.holder,
+                 expires_at = excluded.expires_at,
+                 updated_at = excluded.updated_at
+             WHERE maintenance_leases.expires_at < ?4
+                OR maintenance_leases.holder = ?5",
+            params![
+                holder,
+                encode_time(expires_at),
+                encode_time(now),
+                encode_time(now),
+                holder,
+            ],
+        )?;
+
+        Ok(rows > 0)
+    }
+
+    fn renew_lease(&self, holder: &str, ttl: Duration) -> Result<bool> {
+        let conn = self.open_connection()?;
+        let now = OffsetDateTime::now_utc();
+        let expires_at = now + ttl;
+
+        let rows = conn.execute(
+            "UPDATE maintenance_leases
+             SET expires_at = ?1, updated_at = ?2
+             WHERE lease_id = 'maintenance' AND holder = ?3",
+            params![encode_time(expires_at), encode_time(now), holder],
+        )?;
+
+        Ok(rows > 0)
+    }
+
+    fn release_lease(&self, holder: &str) -> Result<bool> {
+        let conn = self.open_connection()?;
+
+        let rows = conn.execute(
+            "UPDATE maintenance_leases
+             SET holder = '', expires_at = '1970-01-01T00:00:00Z', updated_at = ?1
+             WHERE lease_id = 'maintenance' AND holder = ?2",
+            params![encode_time(OffsetDateTime::now_utc()), holder],
+        )?;
+
+        Ok(rows > 0)
+    }
+
+    fn lease_status(&self) -> Result<Option<(String, OffsetDateTime)>> {
+        let conn = self.open_connection()?;
+        let row = conn
+            .query_row(
+                "SELECT holder, expires_at FROM maintenance_leases WHERE lease_id = 'maintenance'",
+                [],
+                |row| {
+                    let holder: String = row.get(0)?;
+                    let expires_at: String = row.get(1)?;
+                    Ok((holder, decode_time(expires_at).map_err(|err| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            1,
+                            rusqlite::types::Type::Text,
+                            Box::new(err),
+                        )
+                    })?))
+                },
+            )
+            .optional()?;
+
+        // Return None when the row is empty (no real holder).
+        Ok(row.filter(|(h, _)| !h.is_empty()))
+    }
+}
+
 fn parse_status(raw: String) -> rusqlite::Result<IngestRunStatus> {
     match raw.as_str() {
         "pending" => Ok(IngestRunStatus::Pending),
@@ -1578,8 +1703,8 @@ mod tests {
 
     use super::{
         ChangeCursor, ChangeEvent, ChangeLogStore, ChangePage, DiaryStore, EntityRegistryStore, GraphStore,
-        IngestManifestStore, KnowledgeGraphStore, MIGRATIONS, SqliteOperationalStore,
-        ToolStateStore,
+        IngestManifestStore, KnowledgeGraphStore, MIGRATIONS, MaintenanceLeaseStore,
+        SqliteOperationalStore, ToolStateStore,
     };
     use crate::types::{
         ConfigEntry, EntityRecord, GraphDocument, IngestManifestEntry, IngestRunStatus,
@@ -1588,6 +1713,7 @@ mod tests {
     use mempalace_core::{DIARY_SUMMARY_MAX_CHARS, DrawerId};
     use serde_json::json;
     use time::macros::date;
+    use time::Duration;
 
     #[test]
     fn change_log_records_and_queries_events() {
@@ -2377,5 +2503,116 @@ INSERT INTO diary_summaries (entry_id, summary) VALUES ('diary/long', 'x' || 'y'
             rusqlite::params!["diary/new-long", &"x".repeat(401)],
         );
         assert!(result.is_err(), "CHECK constraint must reject overlong summaries after migration");
+    }
+
+    #[test]
+    fn lease_claim_succeeds_when_no_lease_exists() {
+        let tempdir = tempdir().unwrap();
+        let store = SqliteOperationalStore::new(tempdir.path().join("storage.sqlite3"));
+        store.ensure_schema().unwrap();
+        assert!(store.lease_status().unwrap().is_none());
+
+        let claimed = store.try_claim_lease("worker-a", Duration::minutes(5)).unwrap();
+        assert!(claimed, "should claim lease when none exists");
+    }
+
+    #[test]
+    fn lease_claim_rejects_concurrent_holder() {
+        let tempdir = tempdir().unwrap();
+        let store = SqliteOperationalStore::new(tempdir.path().join("storage.sqlite3"));
+        store.ensure_schema().unwrap();
+
+        assert!(store.try_claim_lease("worker-a", Duration::minutes(5)).unwrap());
+        let second = store.try_claim_lease("worker-b", Duration::minutes(5)).unwrap();
+        assert!(!second, "worker-b must not claim lease held by worker-a");
+    }
+
+    #[test]
+    fn lease_claim_reclaims_expired_lease() {
+        let tempdir = tempdir().unwrap();
+        let store = SqliteOperationalStore::new(tempdir.path().join("storage.sqlite3"));
+        store.ensure_schema().unwrap();
+
+        assert!(store.try_claim_lease("worker-a", Duration::ZERO).unwrap());
+
+        let reclaimed = store.try_claim_lease("worker-b", Duration::minutes(5)).unwrap();
+        assert!(reclaimed, "worker-b must reclaim expired lease");
+
+        let status = store.lease_status().unwrap().unwrap();
+        assert_eq!(status.0, "worker-b");
+    }
+
+    #[test]
+    fn lease_renew_extends_ttl() {
+        let tempdir = tempdir().unwrap();
+        let store = SqliteOperationalStore::new(tempdir.path().join("storage.sqlite3"));
+        store.ensure_schema().unwrap();
+
+        let short = Duration::seconds(10);
+        assert!(store.try_claim_lease("worker-a", short).unwrap());
+
+        let status_before = store.lease_status().unwrap().unwrap();
+        let renewed = store.renew_lease("worker-a", Duration::hours(1)).unwrap();
+        assert!(renewed, "should renew own lease");
+
+        let status_after = store.lease_status().unwrap().unwrap();
+        assert_eq!(status_after.0, "worker-a");
+        assert!(
+            status_after.1 > status_before.1,
+            "expiry should be extended after renewal"
+        );
+    }
+
+    #[test]
+    fn lease_renew_fails_for_wrong_holder() {
+        let tempdir = tempdir().unwrap();
+        let store = SqliteOperationalStore::new(tempdir.path().join("storage.sqlite3"));
+        store.ensure_schema().unwrap();
+
+        assert!(store.try_claim_lease("worker-a", Duration::minutes(5)).unwrap());
+        let renewed = store.renew_lease("worker-b", Duration::hours(1)).unwrap();
+        assert!(!renewed, "worker-b must not renew a lease held by worker-a");
+    }
+
+    #[test]
+    fn lease_release_clears_lease() {
+        let tempdir = tempdir().unwrap();
+        let store = SqliteOperationalStore::new(tempdir.path().join("storage.sqlite3"));
+        store.ensure_schema().unwrap();
+
+        assert!(store.try_claim_lease("worker-a", Duration::minutes(5)).unwrap());
+        let released = store.release_lease("worker-a").unwrap();
+        assert!(released, "should release own lease");
+        assert!(store.lease_status().unwrap().is_none(), "lease should be empty after release");
+    }
+
+    #[test]
+    fn lease_release_fails_for_wrong_holder() {
+        let tempdir = tempdir().unwrap();
+        let store = SqliteOperationalStore::new(tempdir.path().join("storage.sqlite3"));
+        store.ensure_schema().unwrap();
+
+        assert!(store.try_claim_lease("worker-a", Duration::minutes(5)).unwrap());
+        let released = store.release_lease("worker-b").unwrap();
+        assert!(!released, "worker-b must not release lease held by worker-a");
+
+        let status = store.lease_status().unwrap().unwrap();
+        assert_eq!(status.0, "worker-a", "lease should still be held by worker-a");
+    }
+
+    #[test]
+    fn lease_claim_renews_when_already_held_by_same_holder() {
+        let tempdir = tempdir().unwrap();
+        let store = SqliteOperationalStore::new(tempdir.path().join("storage.sqlite3"));
+        store.ensure_schema().unwrap();
+
+        assert!(store.try_claim_lease("worker-a", Duration::seconds(10)).unwrap());
+        let status_before = store.lease_status().unwrap().unwrap();
+
+        let claimed_again = store.try_claim_lease("worker-a", Duration::hours(1)).unwrap();
+        assert!(claimed_again, "same holder should reclaim/refresh own lease");
+
+        let status_after = store.lease_status().unwrap().unwrap();
+        assert!(status_after.1 > status_before.1, "expiry should be extended");
     }
 }

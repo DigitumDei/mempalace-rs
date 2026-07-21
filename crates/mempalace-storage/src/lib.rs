@@ -16,7 +16,7 @@ pub use maintenance::{
 };
 pub use sqlite::{
     ChangeCursor, ChangeEvent, ChangeLogStore, ChangePage, DiaryStore, EntityRegistryStore, GraphStore,
-    IngestManifestStore, KnowledgeGraphStore, SqliteOperationalStore, ToolStateStore,
+    IngestManifestStore, KnowledgeGraphStore, MaintenanceLeaseStore, SqliteOperationalStore, ToolStateStore,
 };
 pub use types::{
     ConfigEntry, DrawerFilter, DrawerMatch, DrawerStore, DuplicateStrategy, EntityRecord,

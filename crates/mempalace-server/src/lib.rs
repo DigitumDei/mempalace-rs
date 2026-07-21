@@ -3812,4 +3812,55 @@ mod tests {
             body,
         );
     }
+
+    // ─── 11. Hub-only scheduling ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn scheduler_task_spawned_by_build_router_not_by_engine_open() {
+        // The background scheduler is only spawned by build_router (the HTTP
+        // hub path).  Opening StorageEngine directly (CLI/API path) must NOT
+        // start periodic maintenance.
+        let tempdir = TempDir::new().unwrap();
+        let engine = mempalace_storage::StorageEngine::open(
+            tempdir.path().join("palace"),
+            EmbeddingProfile::Balanced,
+        )
+        .await
+        .unwrap();
+
+        // Wait long enough for a scheduler to have run if one were spawned.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        // Run maintenance manually.  If a background scheduler had been
+        // spawned by engine.open(), it would have consumed the lease with
+        // the same holder_id — our manual run would still proceed because
+        // try_claim_lease renews when held by the same holder.  However, we
+        // also check that elapsed_since_last_activity() is zero (the engine
+        // was freshly created), confirming no scheduler ran.
+        let elapsed = engine.elapsed_since_last_activity();
+        assert!(
+            elapsed.as_millis() < 100,
+            "no background task should have reset the idle timer; got {elapsed:?}",
+        );
+
+        // Manual pass works correctly.
+        let settings = mempalace_storage::MaintenanceSettings {
+            enabled: true,
+            idle_secs: 0,
+            ..mempalace_storage::MaintenanceSettings::default()
+        };
+        let summary = engine.run_maintenance(&settings).await.unwrap();
+        assert_eq!(summary.tier_results.len(), 3, "manual maintenance should run all tiers");
+
+        // Now confirm that build_router DOES spawn a scheduler by checking
+        // that the startup maintenance check populates last_maintenance_status.
+        let harness = build_with_maintenance(MaintenanceRuntimeConfig::defaults()).await;
+        for _ in 0..50 {
+            if harness.state.last_maintenance_status.lock().unwrap().is_some() {
+                return; // scheduler ran the startup check
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("build_router should spawn a scheduler that runs the startup check");
+    }
 }

@@ -2349,7 +2349,7 @@ mod tests {
     use mempalace_embeddings::{
         EmbeddingRequest, EmbeddingResponse, StartupValidation, StartupValidationStatus,
     };
-    use mempalace_storage::StorageLayout;
+    use mempalace_storage::{MaintenanceLeaseStore, StorageLayout};
     use tempfile::tempdir;
 
     #[derive(Debug, Clone)]
@@ -4809,11 +4809,12 @@ mod tests {
         let config_root = tempdir.path().to_path_buf();
         let palace_path = config_root.join("palace");
 
-        // Write config.json with maintenance enabled and zero idle_secs
-        // so the CLI's one-shot pass runs immediately.
+        // Write config.json with maintenance enabled and a valid idle_secs.
+        // The CLI command overrides idle_secs to 0 internally so the
+        // one-shot pass runs immediately regardless of the config value.
         write_file(
             &config_root.join("config.json"),
-            r#"{"maintenance":{"enabled":true,"idle_secs":0}}"#,
+            r#"{"maintenance":{"enabled":true,"idle_secs":300}}"#,
         );
 
         // Initialise a palace and insert some drawers so maintenance has
@@ -4894,7 +4895,7 @@ mod tests {
         // Explicit version_retention_hours in config so it appears in output.
         write_file(
             &config_root.join("config.json"),
-            r#"{"maintenance":{"enabled":true,"idle_secs":0,"version_retention_hours":12}}"#,
+            r#"{"maintenance":{"enabled":true,"idle_secs":300,"version_retention_hours":12}}"#,
         );
 
         tokio::runtime::Runtime::new()
@@ -4915,33 +4916,58 @@ mod tests {
 
         assert_eq!(output.exit_code, 0);
         assert!(
-            output.stdout.contains("version_retention"),
-            "output must mention version_retention tier: {}",
+            output.stdout.contains("Version Retention"),
+            "output must mention Version Retention tier: {}",
             output.stdout
         );
     }
 
     #[test]
-    fn maintain_exit_code_1_when_maintenance_fails() {
-        // We cannot trivially simulate a LanceDB failure. This test verifies
-        // that a non-existent palace path causes a graceful error exit.
+    fn maintain_exit_code_1_when_lease_contended() {
+        // Arrange: open the engine, claim the lease from a different holder,
+        // then drop the engine.  The CLI's maintain command opens a new
+        // engine with a different holder_id and tries to claim the lease.
         let tempdir = tempfile::tempdir().unwrap();
         let config_root = tempdir.path().to_path_buf();
-        let bad_palace = config_root.join("nonexistent_palace");
+        let palace_path = config_root.join("palace");
 
         write_file(
             &config_root.join("config.json"),
-            r#"{"maintenance":{"enabled":true,"idle_secs":0}}"#,
+            r#"{"maintenance":{"enabled":true,"idle_secs":300}}"#,
         );
+
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async {
+                let engine = mempalace_storage::StorageEngine::open(
+                    &palace_path,
+                    mempalace_core::EmbeddingProfile::Balanced,
+                )
+                .await
+                .unwrap();
+                // Claim from a different holder so the CLI's own engine
+                // cannot acquire the lease.
+                engine.operational_store()
+                    .try_claim_lease("cli-test-holder", time::Duration::minutes(5))
+                    .unwrap();
+                // Engine is dropped here, closing LanceDB/SQLite handles,
+                // but the lease persists in SQLite.
+            });
 
         let context = CliContext::for_tests(config_root);
         let output = run_cli(
-            ["maintain", "--palace", bad_palace.to_str().unwrap()],
+            ["maintain", "--palace", palace_path.to_str().unwrap()],
             &context,
             stub_provider,
         )
         .unwrap();
 
-        assert_eq!(output.exit_code, 1, "should exit 1 when palace cannot be opened");
+        assert_eq!(output.exit_code, 1, "should exit 1 when lease is contended");
+        assert!(
+            output.stdout.contains("[FAILURE]") || output.stderr.contains("concurrent"),
+            "output should indicate lease contention: {} {}",
+            output.stdout,
+            output.stderr,
+        );
     }
 }

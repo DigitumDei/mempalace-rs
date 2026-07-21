@@ -33,6 +33,10 @@ pub struct StorageEngine {
     activity_signal: Arc<AtomicBool>,
     maintenance_holder_id: String,
     last_activity_at: Arc<Mutex<Instant>>,
+    /// Test-only: sent after tier 1 completes so the test can inject activity
+    /// deterministically between tiers.
+    #[cfg(test)]
+    test_tier_completion_tx: Arc<Mutex<Option<std::sync::mpsc::Sender<()>>>>,
 }
 
 impl StorageEngine {
@@ -46,6 +50,8 @@ impl StorageEngine {
             activity_signal: Arc::new(AtomicBool::new(false)),
             maintenance_holder_id: format!("maintenance-{}", std::process::id()),
             last_activity_at: Arc::new(Mutex::new(Instant::now())),
+            #[cfg(test)]
+            test_tier_completion_tx: Arc::new(Mutex::new(None)),
         };
 
         engine.operational_store.ensure_schema()?;
@@ -680,6 +686,11 @@ impl StorageEngine {
             } else if is_skipped && final_status == MaintenanceRunStatus::Success {
                 final_status = MaintenanceRunStatus::Partial;
             }
+
+            #[cfg(test)]
+            if let Some(tx) = self.test_tier_completion_tx.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
         }
 
         // ── 6. Tier: FragmentCompaction ─────────────────────────────────────
@@ -910,7 +921,7 @@ mod tests {
         MaintenanceAbortReason, MaintenanceOutcome, MaintenanceRunStatus, MaintenanceSettings,
         MaintenanceSkipReason, MaintenanceTier,
     };
-    use crate::sqlite::{DiaryStore, IngestManifestStore};
+    use crate::sqlite::{DiaryStore, IngestManifestStore, MaintenanceLeaseStore};
     use crate::types::{DrawerFilter, DrawerStore, DuplicateStrategy, IngestCommitRequest};
     use mempalace_core::{DrawerId, DrawerRecord, EmbeddingProfile, RoomId, WingId};
 
@@ -1475,6 +1486,11 @@ mod tests {
             StorageEngine::open(tempdir.path(), EmbeddingProfile::Balanced).await.unwrap(),
         );
 
+        // Install a one-shot test hook that fires after tier 1 completes.
+        // This lets us inject activity deterministically before tier 2 checks.
+        let (tier1_done_tx, tier1_done_rx) = std::sync::mpsc::channel();
+        engine.test_tier_completion_tx.lock().unwrap() = Some(tier1_done_tx);
+
         let settings = MaintenanceSettings { idle_secs: 0, ..MaintenanceSettings::default() };
 
         let engine_clone = Arc::clone(&engine);
@@ -1482,10 +1498,8 @@ mod tests {
             engine_clone.run_maintenance(&settings).await
         });
 
-        // Wait just enough for the run to clear the initial activity check and
-        // begin the first tier (or lease claim).  Then signal activity so the
-        // inter-tier check aborts subsequent tiers.
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // Wait for tier 1 to complete, then signal activity.
+        tier1_done_rx.recv().unwrap();
         engine.signal_activity();
 
         let summary = match handle.await.unwrap() {
@@ -1493,13 +1507,22 @@ mod tests {
             Err(e) => panic!("run_maintenance returned error: {e}"),
         };
 
-        // The run either completed (all three tiers) or was aborted between tiers.
-        // With activity signalled mid-run, at least one tier should be a skip or
-        // we should see the aborted-between-tiers pattern.
-        assert!(!summary.tier_results.is_empty(), "must have at least one tier result");
-        if summary.tier_results.len() < 3 {
-            // Activity was detected between tiers — some tiers were skipped.
-            assert_eq!(summary.status, MaintenanceRunStatus::Failure);
+        // Tier 1 (VectorIndexOptimization) ran.  Tiers 2 (FragmentCompaction)
+        // and 3 (VersionRetention) should be skipped due to activity.
+        assert_eq!(summary.tier_results.len(), 3, "all three tiers should have results");
+        assert_eq!(summary.status, MaintenanceRunStatus::Failure, "mid-tier abort yields Failure");
+        assert_eq!(
+            summary.tier_results[0].tier,
+            MaintenanceTier::VectorIndexOptimization,
+            "tier 1 should have run",
+        );
+        // Tier 2 and 3 should be skipped with NotIdle.
+        for result in &summary.tier_results[1..] {
+            assert_eq!(
+                result.outcome,
+                MaintenanceOutcome::Skipped { reason: MaintenanceSkipReason::NotIdle },
+                "remaining tiers should be skipped due to mid-run activity",
+            );
         }
     }
 
@@ -1508,30 +1531,64 @@ mod tests {
         let tempdir = tempdir().unwrap();
         let engine = StorageEngine::open(tempdir.path(), EmbeddingProfile::Balanced).await.unwrap();
 
-        // Insert enough drawers to create data for maintenance to work on.
-        let drawers: Vec<_> = (0..20)
-            .map(|i| {
-                let mut r = record(
-                    &format!("wing/room/{i:04}"),
-                    "test.txt",
-                    [0.1, 0.2, 0.3, 0.4],
-                );
-                r.wing = mempalace_core::WingId::new("wing").unwrap();
-                r.room = mempalace_core::RoomId::new("room").unwrap();
-                r
-            })
-            .collect();
-        engine.drawer_store().put_drawers(&drawers, DuplicateStrategy::Error).await.unwrap();
+        // Insert drawers in multiple batches to create multiple LanceDB versions
+        // (each put_drawers call creates a new version), then run with aggressive
+        // thresholds so tiers have work to do.
+        for batch in 0..10 {
+            let drawers: Vec<_> = (0..4)
+                .map(|i| {
+                    let mut r = record(
+                        &format!("wing/room/b{batch}_{i:04}"),
+                        "test.txt",
+                        [0.1, 0.2, 0.3, (batch as f32) * 0.01],
+                    );
+                    r.wing = mempalace_core::WingId::new("wing").unwrap();
+                    r.room = mempalace_core::RoomId::new("room").unwrap();
+                    r
+                })
+                .collect();
+            engine.drawer_store().put_drawers(&drawers, DuplicateStrategy::Error).await.unwrap();
+        }
 
-        let settings = MaintenanceSettings { idle_secs: 0, ..MaintenanceSettings::default() };
+        let settings = MaintenanceSettings {
+            idle_secs: 0,
+            tail_threshold_rows: 2,
+            small_fragment_threshold: 2,
+            version_retention_hours: 1,
+            ..MaintenanceSettings::default()
+        };
         let summary = engine.run_maintenance(&settings).await.unwrap();
 
-        // With data present, tiers should run (some may skip due to thresholds).
         assert_eq!(summary.tier_results.len(), 3);
+
+        // VectorIndexOptimization should have optimised tail rows.
+        let vio = &summary.tier_results[0];
+        assert_eq!(vio.tier, MaintenanceTier::VectorIndexOptimization);
         assert!(
-            matches!(summary.status, MaintenanceRunStatus::Success | MaintenanceRunStatus::Partial),
-            "expected Success or Partial, got {:?}",
-            summary.status,
+            matches!(vio.outcome, MaintenanceOutcome::Completed { .. })
+                || matches!(vio.outcome, MaintenanceOutcome::Skipped { reason: MaintenanceSkipReason::NothingToDo }),
+            "VectorIndexOptimization outcome unexpected: {:?}",
+            vio.outcome,
+        );
+
+        // FragmentCompaction should have compacted fragments.
+        let fc = &summary.tier_results[1];
+        assert_eq!(fc.tier, MaintenanceTier::FragmentCompaction);
+        assert!(
+            matches!(fc.outcome, MaintenanceOutcome::Completed { .. })
+                || matches!(fc.outcome, MaintenanceOutcome::Skipped { reason: MaintenanceSkipReason::NothingToDo }),
+            "FragmentCompaction outcome unexpected: {:?}",
+            fc.outcome,
+        );
+
+        // VersionRetention should have pruned old versions.
+        let vr = &summary.tier_results[2];
+        assert_eq!(vr.tier, MaintenanceTier::VersionRetention);
+        assert!(
+            matches!(vr.outcome, MaintenanceOutcome::Completed { .. })
+                || matches!(vr.outcome, MaintenanceOutcome::Skipped { reason: MaintenanceSkipReason::NothingToDo }),
+            "VersionRetention outcome unexpected: {:?}",
+            vr.outcome,
         );
     }
 }

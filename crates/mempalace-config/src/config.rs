@@ -24,6 +24,7 @@ const DEFAULT_SERVER_TOKEN_FILE: &str = "server_tokens.json";
 const DEFAULT_MAINTENANCE_IDLE_SECS: usize = 300;
 const DEFAULT_MAINTENANCE_VERSION_RETENTION_HOURS: usize = 24;
 const DEFAULT_MAINTENANCE_TAIL_THRESHOLD_ROWS: usize = 1024;
+const DEFAULT_MAINTENANCE_SMALL_FRAGMENT_THRESHOLD: usize = 10;
 const DEFAULT_LOW_CPU_WORKER_THREADS: usize = 1;
 const DEFAULT_LOW_CPU_MAX_BLOCKING_THREADS: usize = 1;
 const DEFAULT_LOW_CPU_QUEUE_LIMIT: usize = 32;
@@ -240,6 +241,8 @@ pub struct MaintenanceConfigFileV1 {
     pub version_retention_hours: Option<usize>,
     #[serde(default)]
     pub tail_threshold_rows: Option<usize>,
+    #[serde(default)]
+    pub small_fragment_threshold: Option<usize>,
 }
 
 /// Resolved runtime configuration for the maintenance subsystem.
@@ -253,6 +256,8 @@ pub struct MaintenanceRuntimeConfig {
     pub version_retention_hours: usize,
     /// Row count threshold for triggering tail compaction (default: 1024).
     pub tail_threshold_rows: usize,
+    /// Small-fragment count threshold for triggering fragment compaction (default: 10).
+    pub small_fragment_threshold: usize,
 }
 
 impl MaintenanceRuntimeConfig {
@@ -262,6 +267,7 @@ impl MaintenanceRuntimeConfig {
             idle_secs: DEFAULT_MAINTENANCE_IDLE_SECS,
             version_retention_hours: DEFAULT_MAINTENANCE_VERSION_RETENTION_HOURS,
             tail_threshold_rows: DEFAULT_MAINTENANCE_TAIL_THRESHOLD_ROWS,
+            small_fragment_threshold: DEFAULT_MAINTENANCE_SMALL_FRAGMENT_THRESHOLD,
         }
     }
 
@@ -293,6 +299,12 @@ impl MaintenanceRuntimeConfig {
             "maintenance.tail_threshold_rows",
             overrides.tail_threshold_rows,
             self.tail_threshold_rows,
+            config_path,
+        )?;
+        self.small_fragment_threshold = required_positive_override(
+            "maintenance.small_fragment_threshold",
+            overrides.small_fragment_threshold,
+            self.small_fragment_threshold,
             config_path,
         )?;
 
@@ -449,6 +461,7 @@ impl ConfigLoader {
             env::var("MEMPALACE_MAINTENANCE_IDLE_SECS").ok(),
             env::var("MEMPALACE_MAINTENANCE_VERSION_RETENTION_HOURS").ok(),
             env::var("MEMPALACE_MAINTENANCE_TAIL_THRESHOLD_ROWS").ok(),
+            env::var("MEMPALACE_MAINTENANCE_SMALL_FRAGMENT_THRESHOLD").ok(),
         )
     }
 
@@ -460,6 +473,7 @@ impl ConfigLoader {
         maintenance_idle_secs_override: Option<String>,
         maintenance_version_retention_hours_override: Option<String>,
         maintenance_tail_threshold_rows_override: Option<String>,
+        maintenance_small_fragment_threshold_override: Option<String>,
     ) -> Result<MempalaceConfig> {
         let paths = resolve_paths(base_dir_override)?;
         let file = read_config_file(&paths.config_file)?;
@@ -483,6 +497,7 @@ impl ConfigLoader {
             maintenance_idle_secs_override,
             maintenance_version_retention_hours_override,
             maintenance_tail_threshold_rows_override,
+            maintenance_small_fragment_threshold_override,
         )?;
 
         Ok(MempalaceConfig {
@@ -988,6 +1003,7 @@ fn resolve_maintenance_config(
     idle_secs_override: Option<String>,
     version_retention_hours_override: Option<String>,
     tail_threshold_rows_override: Option<String>,
+    small_fragment_threshold_override: Option<String>,
 ) -> Result<MaintenanceRuntimeConfig> {
     let mut config = MaintenanceRuntimeConfig::defaults().with_overrides(file_section, config_path)?;
 
@@ -1037,6 +1053,23 @@ fn resolve_maintenance_config(
                 path: config_path.to_path_buf(),
                 message:
                     "MEMPALACE_MAINTENANCE_TAIL_THRESHOLD_ROWS must be greater than 0".to_owned(),
+            });
+        }
+    }
+    if let Some(val) = small_fragment_threshold_override {
+        config.small_fragment_threshold =
+            val.parse::<usize>().map_err(|_| MempalaceError::ConfigParse {
+                path: config_path.to_path_buf(),
+                message: format!(
+                    "MEMPALACE_MAINTENANCE_SMALL_FRAGMENT_THRESHOLD `{val}` is not a valid positive integer"
+                ),
+            })?;
+        if config.small_fragment_threshold == 0 {
+            return Err(MempalaceError::ConfigParse {
+                path: config_path.to_path_buf(),
+                message:
+                    "MEMPALACE_MAINTENANCE_SMALL_FRAGMENT_THRESHOLD must be greater than 0"
+                        .to_owned(),
             });
         }
     }
@@ -1155,6 +1188,7 @@ mod tests {
         assert_eq!(config.maintenance.idle_secs, 300);
         assert_eq!(config.maintenance.version_retention_hours, 24);
         assert_eq!(config.maintenance.tail_threshold_rows, 1024);
+        assert_eq!(config.maintenance.small_fragment_threshold, 10);
         assert!(paths.palace_dir.is_dir());
 
         fs::remove_dir_all(base).unwrap();
@@ -1169,6 +1203,7 @@ mod tests {
             Some(&base),
             Some("/tmp/custom-palace".to_owned()),
             Some("low_cpu".to_owned()),
+            None,
             None,
             None,
             None,
@@ -1718,6 +1753,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -1735,6 +1771,7 @@ mod tests {
             Some(&base),
             None,
             Some("definitely_not_real".to_owned()),
+            None,
             None,
             None,
             None,
@@ -1910,6 +1947,7 @@ mod tests {
         assert_eq!(config.maintenance.idle_secs, 300);
         assert_eq!(config.maintenance.version_retention_hours, 24);
         assert_eq!(config.maintenance.tail_threshold_rows, 1024);
+        assert_eq!(config.maintenance.small_fragment_threshold, 10);
 
         fs::remove_dir_all(base).unwrap();
     }
@@ -1938,6 +1976,7 @@ mod tests {
         assert_eq!(config.maintenance.idle_secs, 600);
         assert_eq!(config.maintenance.version_retention_hours, 48);
         assert_eq!(config.maintenance.tail_threshold_rows, 2048);
+        assert_eq!(config.maintenance.small_fragment_threshold, 10);
 
         fs::remove_dir_all(base).unwrap();
     }
@@ -1951,6 +1990,7 @@ mod tests {
                     idle_secs: Some(0),
                     version_retention_hours: None,
                     tail_threshold_rows: None,
+                    small_fragment_threshold: None,
                 }),
                 Path::new("config.json"),
             )
@@ -1980,6 +2020,7 @@ mod tests {
             Some("500".to_owned()),
             Some("12".to_owned()),
             Some("256".to_owned()),
+            None,
         )
         .unwrap();
 
@@ -1987,6 +2028,7 @@ mod tests {
         assert_eq!(config.maintenance.idle_secs, 500);
         assert_eq!(config.maintenance.version_retention_hours, 12);
         assert_eq!(config.maintenance.tail_threshold_rows, 256);
+        assert_eq!(config.maintenance.small_fragment_threshold, 10);
 
         fs::remove_dir_all(base).unwrap();
     }

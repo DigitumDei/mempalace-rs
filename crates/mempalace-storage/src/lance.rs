@@ -60,8 +60,10 @@ pub struct OptimizeMetrics {
     pub indexed_rows_before: usize,
     /// Indexed rows (or total fragments) after.
     pub indexed_rows_after: usize,
-    /// Total rows (or total bytes) for context.
-    pub total_rows: usize,
+    /// Total on-disk bytes before the operation.
+    pub bytes_before: usize,
+    /// Total on-disk bytes after the operation.
+    pub bytes_after: usize,
     /// Whether the operation actually ran (vs. being skipped due to threshold).
     pub ran: bool,
 }
@@ -261,13 +263,14 @@ impl LanceDrawerStore {
         tail_threshold: u64,
     ) -> Result<OptimizeMetrics> {
         let before = self.vector_index_stats().await?;
-        if before.tail_rows < tail_threshold as usize {
+        if before.tail_rows <= tail_threshold as usize {
             return Ok(OptimizeMetrics {
                 tail_rows_before: before.tail_rows,
                 tail_rows_after: before.tail_rows,
                 indexed_rows_before: before.indexed_rows,
                 indexed_rows_after: before.indexed_rows,
-                total_rows: before.total_rows,
+                bytes_before: 0,
+                bytes_after: 0,
                 ran: false,
             });
         }
@@ -283,7 +286,8 @@ impl LanceDrawerStore {
             tail_rows_after: after.tail_rows,
             indexed_rows_before: before.indexed_rows,
             indexed_rows_after: after.indexed_rows,
-            total_rows: after.total_rows,
+            bytes_before: 0,
+            bytes_after: 0,
             ran: true,
         })
     }
@@ -296,13 +300,14 @@ impl LanceDrawerStore {
         small_fragment_threshold: usize,
     ) -> Result<OptimizeMetrics> {
         let before = self.fragment_stats().await?;
-        if before.num_small_fragments < small_fragment_threshold {
+        if before.num_small_fragments <= small_fragment_threshold {
             return Ok(OptimizeMetrics {
                 tail_rows_before: before.num_small_fragments,
                 tail_rows_after: before.num_small_fragments,
                 indexed_rows_before: before.num_fragments,
                 indexed_rows_after: before.num_fragments,
-                total_rows: before.total_bytes,
+                bytes_before: before.total_bytes,
+                bytes_after: before.total_bytes,
                 ran: false,
             });
         }
@@ -319,7 +324,8 @@ impl LanceDrawerStore {
             tail_rows_after: after.num_small_fragments,
             indexed_rows_before: before.num_fragments,
             indexed_rows_after: after.num_fragments,
-            total_rows: after.total_bytes,
+            bytes_before: before.total_bytes,
+            bytes_after: after.total_bytes,
             ran: true,
         })
     }
@@ -1642,7 +1648,8 @@ mod tests {
             tail_rows_after: 2,
             indexed_rows_before: 100,
             indexed_rows_after: 108,
-            total_rows: 110,
+            bytes_before: 8192,
+            bytes_after: 4096,
             ran: true,
         };
         let json = serde_json::to_string(&metrics).unwrap();

@@ -516,6 +516,16 @@ where
 
                 tokio::select! {
                     _ = tokio::time::sleep(sleep_dur) => {
+                        // Drain any stale activity signal left by the request that
+                        // reset the timer.  If the system is genuinely idle, proceed;
+                        // otherwise restart the idle timer.
+                        task_state.storage.take_activity_signal();
+                        if task_state.storage.elapsed_since_last_activity()
+                            < Duration::from_secs(settings.idle_secs)
+                        {
+                            continue;
+                        }
+
                         info!("background maintenance check");
                         match task_state.storage.run_maintenance(&settings).await {
                             Ok(summary) => {
@@ -3428,5 +3438,56 @@ mod tests {
         // The activity_middleware calls signal_activity() + notify_one().
         // Verify the storage engine saw the activity signal.
         assert!(harness.state.storage.take_activity_signal(), "activity signal must be set by middleware");
+    }
+
+    #[tokio::test]
+    async fn maintenance_runs_after_one_idle_period() {
+        use mempalace_storage::{MaintenanceOutcome, MaintenanceSkipReason};
+
+        let short_idle = MaintenanceRuntimeConfig {
+            idle_secs: 1,
+            ..MaintenanceRuntimeConfig::defaults()
+        };
+        let harness = build_with_maintenance(short_idle).await;
+
+        // Wait for the startup check to complete.
+        for _ in 0..50 {
+            if harness.state.last_maintenance_status.lock().unwrap().is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        // Clear the startup status so we can detect the next run.
+        *harness.state.last_maintenance_status.lock().unwrap() = None;
+
+        // Send a request through the activity middleware.  This sets the
+        // activity signal and resets the scheduler's idle timer.
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/v1/health")
+            .body(Body::empty())
+            .unwrap();
+        let _ = harness.router.clone().oneshot(request).await.unwrap();
+
+        // Wait for one idle period (1 s + up to 100 ms jitter) plus a small
+        // margin — but less than two idle periods so the old behaviour
+        // (which wastes the first expiry on the stale signal) would not
+        // have recorded a non-NotIdle run yet.
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+        let status = harness.state.last_maintenance_status.lock().unwrap().take();
+        assert!(status.is_some(), "maintenance should have run after one idle period");
+        let summary = status.unwrap();
+        let stale_signal_skipped = summary.tier_results.iter().any(|r| {
+            matches!(
+                r.outcome,
+                MaintenanceOutcome::Skipped { reason: MaintenanceSkipReason::NotIdle }
+            )
+        });
+        assert!(
+            !stale_signal_skipped,
+            "maintenance must not be skipped by a stale activity signal",
+        );
     }
 }

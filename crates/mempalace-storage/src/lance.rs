@@ -1,8 +1,6 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration as StdDuration;
-
 use arrow_array::{
     Array, ArrayRef, Date32Array, FixedSizeListArray, Float32Array, RecordBatch,
     RecordBatchIterator, StringArray, TimestampMicrosecondArray, UInt32Array, UInt64Array,
@@ -209,7 +207,22 @@ impl LanceDrawerStore {
     pub(crate) async fn vector_index_stats(&self) -> Result<VectorIndexStats> {
         let table = self.table().await?;
         let total_rows = table.count_rows(None).await?;
-        let index_stats = table.index_stats("embedding").await?;
+
+        let indices = table.list_indices().await?;
+        let embedding_index = indices.iter().find(|cfg| cfg.columns.contains(&"embedding".into()));
+        let index_name = match embedding_index {
+            Some(cfg) => &cfg.name,
+            None => {
+                return Ok(VectorIndexStats {
+                    indexed_rows: 0,
+                    unindexed_rows: total_rows,
+                    tail_rows: total_rows,
+                    total_rows,
+                });
+            }
+        };
+
+        let index_stats = table.index_stats(index_name).await?;
         match index_stats {
             Some(stats) => Ok(VectorIndexStats {
                 indexed_rows: stats.num_indexed_rows,
@@ -276,9 +289,23 @@ impl LanceDrawerStore {
     }
 
     /// Compact fragmented data in the drawers table.
+    /// Only compacts when `small_fragment_threshold` is exceeded.
     /// Returns before/after fragment metrics.
-    pub(crate) async fn compact_fragments(&self) -> Result<OptimizeMetrics> {
+    pub(crate) async fn compact_fragments(
+        &self,
+        small_fragment_threshold: usize,
+    ) -> Result<OptimizeMetrics> {
         let before = self.fragment_stats().await?;
+        if before.num_small_fragments < small_fragment_threshold {
+            return Ok(OptimizeMetrics {
+                tail_rows_before: before.num_small_fragments,
+                tail_rows_after: before.num_small_fragments,
+                indexed_rows_before: before.num_fragments,
+                indexed_rows_after: before.num_fragments,
+                total_rows: before.total_bytes,
+                ran: false,
+            });
+        }
         let table = self.table().await?;
         let _optimize_stats = table
             .optimize(lancedb::table::OptimizeAction::Compact {
@@ -292,7 +319,7 @@ impl LanceDrawerStore {
             tail_rows_after: after.num_small_fragments,
             indexed_rows_before: before.num_fragments,
             indexed_rows_after: after.num_fragments,
-            total_rows: before.total_bytes,
+            total_rows: after.total_bytes,
             ran: true,
         })
     }
@@ -306,7 +333,10 @@ impl LanceDrawerStore {
         let versions = table.list_versions().await?;
         let versions_before = versions.len();
 
-        let older_than = StdDuration::from_secs(retention_hours * 3600);
+        let older_than = lancedb::table::Duration::try_hours(retention_hours as i64)
+            .ok_or_else(|| {
+                StorageError::Invariant(format!("invalid retention_hours: {retention_hours}"))
+            })?;
         let _optimize_stats = table
             .optimize(lancedb::table::OptimizeAction::Prune {
                 older_than: Some(older_than),
@@ -1521,13 +1551,26 @@ mod tests {
         let drawer = record("wing/room/0001", "wing", "room", "test.txt", [0.1, 0.2, 0.3, 0.4]);
         store.put_drawers(&[drawer], DuplicateStrategy::Error).await.unwrap();
 
-        let metrics = store.compact_fragments().await.unwrap();
-        assert!(metrics.ran, "compaction should run");
+        let metrics = store.compact_fragments(0).await.unwrap();
+        assert!(metrics.ran, "compaction should run with zero threshold");
         // Fragment count should be stable or reduced.
         assert!(
             metrics.indexed_rows_after <= metrics.indexed_rows_before,
             "fragments should not increase after compaction"
         );
+    }
+
+    #[tokio::test]
+    async fn compact_fragments_skips_below_threshold() {
+        let tempdir = tempdir().unwrap();
+        let store = LanceDrawerStore::new(tempdir.path().join("lance"), EmbeddingProfile::Balanced);
+        store.ensure_schema().await.unwrap();
+
+        let drawer = record("wing/room/0001", "wing", "room", "test.txt", [0.1, 0.2, 0.3, 0.4]);
+        store.put_drawers(&[drawer], DuplicateStrategy::Error).await.unwrap();
+
+        let metrics = store.compact_fragments(100).await.unwrap();
+        assert!(!metrics.ran, "compaction should be skipped when below threshold");
     }
 
     #[tokio::test]

@@ -121,6 +121,8 @@ pub struct MaintenanceSettings {
     pub version_retention_hours: u64,
     /// Row count threshold for triggering tail compaction (default: 1024).
     pub tail_threshold_rows: u64,
+    /// Small-fragment count threshold for triggering fragment compaction (default: 10).
+    pub small_fragment_threshold: u64,
 }
 
 impl Default for MaintenanceSettings {
@@ -130,6 +132,7 @@ impl Default for MaintenanceSettings {
             idle_secs: 300,
             version_retention_hours: 24,
             tail_threshold_rows: 1024,
+            small_fragment_threshold: 10,
         }
     }
 }
@@ -303,6 +306,7 @@ mod tests {
         assert_eq!(settings.idle_secs, 300);
         assert_eq!(settings.version_retention_hours, 24);
         assert_eq!(settings.tail_threshold_rows, 1024);
+        assert_eq!(settings.small_fragment_threshold, 10);
     }
 
     #[test]
@@ -312,6 +316,7 @@ mod tests {
             idle_secs: 600,
             version_retention_hours: 48,
             tail_threshold_rows: 2048,
+            small_fragment_threshold: 20,
         };
         let json = serde_json::to_string(&settings).unwrap();
         let deserialized: MaintenanceSettings = serde_json::from_str(&json).unwrap();
@@ -323,6 +328,7 @@ mod tests {
                 idle_secs: 600,
                 version_retention_hours: 48,
                 tail_threshold_rows: 2048,
+                small_fragment_threshold: 20,
             }
         );
     }

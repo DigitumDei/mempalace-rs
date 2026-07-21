@@ -51,14 +51,14 @@ use mempalace_graph::{AddFactRequest, EntityKind, KnowledgeGraphRuntime, QueryDi
 use mempalace_search::{SearchRuntime, SearchRuntimePolicy};
 use mempalace_storage::{
     ChangeCursor, ChangeEvent, ChangeLogStore, DrawerFilter, DrawerStore, DuplicateStrategy,
-    IngestCommitRequest, IngestManifestStore, StorageEngine,
+    IngestCommitRequest, IngestManifestStore, MaintenanceSettings, StorageEngine,
 };
 use serde_json::{Value, json};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 use time::{Date, OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::Mutex;
-use tracing::warn;
+use tracing::{info, warn};
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -456,12 +456,46 @@ where
         provider,
         SearchRuntimePolicy { rerank_enabled: config.low_cpu.effective_rerank_enabled() },
     );
+
+    // Extract maintenance config before moving `config` into state.
+    let maintenance_settings = MaintenanceSettings {
+        enabled: config.maintenance.enabled,
+        idle_secs: config.maintenance.idle_secs as u64,
+        version_retention_hours: config.maintenance.version_retention_hours as u64,
+        tail_threshold_rows: config.maintenance.tail_threshold_rows as u64,
+        small_fragment_threshold: config.maintenance.small_fragment_threshold as u64,
+    };
+
     let state = Arc::new(ServerState {
         config,
         storage,
         search: Mutex::new(search),
         tokens: Arc::new(tokens),
     });
+
+    // ── Background maintenance task ──────────────────────────────────────────
+    //
+    // Runs only in the long-lived HTTP hub.  The loop wakes on the configured
+    // idle interval and calls `run_maintenance` which checks idleness, acquires
+    // a SQLite lease, and executes tiers in cheapest-first order.
+    if maintenance_settings.enabled {
+        let storage = state.storage.clone();
+        let settings = maintenance_settings;
+        tokio::spawn(async move {
+            let check_interval = std::time::Duration::from_secs(settings.idle_secs.max(30));
+            let mut interval = tokio::time::interval(check_interval);
+            // The first tick completes immediately; skip it so we don't run
+            // maintenance right at startup (reconcile already ran in open).
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                info!("background maintenance check");
+                if let Err(e) = storage.run_maintenance(&settings).await {
+                    warn!(error = %e, "background maintenance run failed");
+                }
+            }
+        });
+    }
 
     // Unauthenticated routes
     let public = Router::new().route("/v1/health", get(route_health));

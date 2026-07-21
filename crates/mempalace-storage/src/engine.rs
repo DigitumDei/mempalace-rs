@@ -1,5 +1,6 @@
 use std::collections::{BTreeSet, HashSet};
 use std::fs::File;
+use std::future::Future;
 use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
@@ -358,14 +359,50 @@ impl StorageEngine {
             return Ok(Vec::new());
         }
 
+        self.signal_activity();
         self.drawer_store.delete_drawers(&orphaned).await?;
         Ok(orphaned)
     }
 
+    /// Run a tier operation with concurrent lease renewal.
+    ///
+    /// Periodically renews the SQLite lease while the tier future is in
+    /// progress.  If renewal fails, `lease_lost` is set to `true` so the
+    /// caller can abort subsequent tiers.
+    async fn with_lease_renewal<Fut, T>(
+        &self,
+        holder_id: &str,
+        f: Fut,
+        lease_lost: &AtomicBool,
+    ) -> T
+    where
+        Fut: Future<Output = T>,
+    {
+        let mut f = Box::pin(f);
+        loop {
+            tokio::select! {
+                biased;
+                result = &mut f => return result,
+                _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    match self.operational_store.renew_lease(holder_id, Duration::minutes(5)) {
+                        Ok(true) => {},
+                        _ => {
+                            lease_lost.store(true, Ordering::Release);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Execute a single maintenance run: acquire the SQLite lease, run tiers
-    /// in cheapest-first order (version retention → fragment compaction →
-    /// vector index optimization), check the activity signal before and
-    /// between tiers, and record timing/status in a [`MaintenanceRunSummary`].
+    /// in order (vector index optimization → fragment compaction → version
+    /// pruning), check the activity signal before and between tiers, and
+    /// record timing/status in a [`MaintenanceRunSummary`].
+    ///
+    /// Each tier runs with concurrent lease renewal so that long-running
+    /// operations do not lose their lease.  If the lease is lost, subsequent
+    /// tiers are skipped.
     ///
     /// This is designed to be called from a background task in the HTTP hub
     /// or from a one-shot CLI command.  Regular write paths call
@@ -401,7 +438,7 @@ impl StorageEngine {
         if self.take_activity_signal() {
             info!("maintenance skipped: write activity detected");
             tier_results.push(MaintenanceTierResult {
-                tier: MaintenanceTier::VersionRetention,
+                tier: MaintenanceTier::VectorIndexOptimization,
                 started_at,
                 duration: Duration::ZERO,
                 cpu_duration: Duration::ZERO,
@@ -432,7 +469,7 @@ impl StorageEngine {
                 "maintenance skipped: not idle long enough",
             );
             tier_results.push(MaintenanceTierResult {
-                tier: MaintenanceTier::VersionRetention,
+                tier: MaintenanceTier::VectorIndexOptimization,
                 started_at,
                 duration: Duration::ZERO,
                 cpu_duration: Duration::ZERO,
@@ -460,7 +497,7 @@ impl StorageEngine {
             Ok(false) => {
                 info!("maintenance skipped: concurrent lease held");
                 tier_results.push(MaintenanceTierResult {
-                    tier: MaintenanceTier::VersionRetention,
+                    tier: MaintenanceTier::VectorIndexOptimization,
                     started_at,
                     duration: Duration::ZERO,
                     cpu_duration: Duration::ZERO,
@@ -484,7 +521,7 @@ impl StorageEngine {
             Err(e) => {
                 warn!(error = %e, "maintenance failed to claim lease");
                 tier_results.push(MaintenanceTierResult {
-                    tier: MaintenanceTier::VersionRetention,
+                    tier: MaintenanceTier::VectorIndexOptimization,
                     started_at,
                     duration: Duration::ZERO,
                     cpu_duration: Duration::ZERO,
@@ -510,7 +547,7 @@ impl StorageEngine {
         if self.take_activity_signal() {
             info!("maintenance aborted: write activity detected after lease claim");
             tier_results.push(MaintenanceTierResult {
-                tier: MaintenanceTier::VersionRetention,
+                tier: MaintenanceTier::VectorIndexOptimization,
                 started_at,
                 duration: Duration::ZERO,
                 cpu_duration: Duration::ZERO,
@@ -520,7 +557,6 @@ impl StorageEngine {
                 },
             });
             final_status = MaintenanceRunStatus::Failure;
-            // Release lease before returning.
             let _ = self.operational_store.release_lease(holder_id);
             let elapsed = wall_start.elapsed();
             let cpu_elapsed = process_cpu_time().saturating_sub(cpu_start);
@@ -535,8 +571,17 @@ impl StorageEngine {
             });
         }
 
+        // Shared lease-lost flag checked after each tier.
+        let lease_lost = Arc::new(AtomicBool::new(false));
+        // All tiers in execution order, used by record_remaining.
+        let all_tiers = [
+            MaintenanceTier::VectorIndexOptimization,
+            MaintenanceTier::FragmentCompaction,
+            MaintenanceTier::VersionRetention,
+        ];
+
         // Helper: check activity between tiers.  Returns true when remaining
-        // tiers should be aborted (caller must also record remaining tiers).
+        // tiers should be skipped (caller must also record remaining results).
         let has_activity = || -> bool {
             if self.take_activity_signal() {
                 info!("maintenance inter-tier abort: write activity detected");
@@ -546,24 +591,9 @@ impl StorageEngine {
             }
         };
 
-        // Helper: renew lease, returning false on loss of lease.
-        let renew_lease = || -> bool {
-            match self.operational_store.renew_lease(holder_id, Duration::minutes(5)) {
-                Ok(true) => true,
-                Ok(false) => {
-                    info!("maintenance lost lease on renewal");
-                    false
-                }
-                Err(e) => {
-                    warn!(error = %e, "maintenance lease renewal failed");
-                    false
-                }
-            }
-        };
-
-        // Helper: record aborted results for remaining tiers.
-        let record_remaining_aborted = |remaining: &[MaintenanceTier], results: &mut Vec<MaintenanceTierResult>| {
-            for &tier in remaining {
+        // Helper: record skipped results for tiers from start_idx onward.
+        let record_remaining = |start_idx: usize, results: &mut Vec<MaintenanceTierResult>| {
+            for &tier in &all_tiers[start_idx..] {
                 results.push(MaintenanceTierResult {
                     tier,
                     started_at: OffsetDateTime::now_utc(),
@@ -576,209 +606,233 @@ impl StorageEngine {
             }
         };
 
-        // ── 5. Tier: VersionRetention (cheapest) ────────────────────────────
+        // ── 5. Tier: VectorIndexOptimization (most expensive, run first) ────
         {
             let tier_start = Instant::now();
             let tier_cpu_start = process_cpu_time();
             let tier_started_at = OffsetDateTime::now_utc();
-            let outcome = match self.drawer_store.prune_versions(settings.version_retention_hours).await {
-                Ok(metrics) => {
-                    let tier_wall = tier_start.elapsed();
-                    let tier_cpu = process_cpu_time().saturating_sub(tier_cpu_start);
-                    info!(
-                        tier = "version_retention",
-                        versions_removed = metrics.versions_removed,
-                        bytes_freed = metrics.bytes_freed,
-                        versions_before = metrics.versions_before,
-                        versions_after = metrics.versions_after,
-                        wall_ms = tier_wall.as_millis() as u64,
-                        cpu_ms = tier_cpu.whole_milliseconds() as u64,
-                        "maintenance tier completed",
-                    );
-                    if metrics.versions_removed > 0 {
-                        MaintenanceOutcome::Completed {
-                            items_affected: metrics.versions_removed as u64,
+
+            info!(
+                tier = "vector_index_optimization",
+                tail_threshold = settings.tail_threshold_rows,
+                "maintenance tier starting",
+            );
+
+            let tier_future = async {
+                match self.drawer_store.optimize_vector_index(settings.tail_threshold_rows).await {
+                    Ok(metrics) => {
+                        let tier_wall = tier_start.elapsed();
+                        let tier_cpu = process_cpu_time().saturating_sub(tier_cpu_start);
+                        info!(
+                            tier = "vector_index_optimization",
+                            tail_before = metrics.tail_rows_before,
+                            tail_after = metrics.tail_rows_after,
+                            indexed_before = metrics.indexed_rows_before,
+                            indexed_after = metrics.indexed_rows_after,
+                            bytes_before = metrics.bytes_before,
+                            bytes_after = metrics.bytes_after,
+                            ran = metrics.ran,
+                            wall_ms = tier_wall.as_millis() as u64,
+                            cpu_ms = tier_cpu.whole_milliseconds() as u64,
+                            "maintenance tier completed",
+                        );
+                        let outcome = if metrics.ran {
+                            let items = metrics.indexed_rows_after.saturating_sub(metrics.indexed_rows_before) as u64;
+                            MaintenanceOutcome::Completed { items_affected: items }
+                        } else {
+                            MaintenanceOutcome::Skipped { reason: MaintenanceSkipReason::NothingToDo }
+                        };
+                        MaintenanceTierResult {
+                            tier: MaintenanceTier::VectorIndexOptimization,
+                            started_at: tier_started_at,
+                            duration: Duration::seconds_f64(tier_wall.as_secs_f64()),
+                            cpu_duration: tier_cpu,
+                            outcome,
                         }
-                    } else {
-                        MaintenanceOutcome::Skipped {
-                            reason: MaintenanceSkipReason::NothingToDo,
+                    }
+                    Err(e) => {
+                        let tier_wall = tier_start.elapsed();
+                        let tier_cpu = process_cpu_time().saturating_sub(tier_cpu_start);
+                        info!(
+                            tier = "vector_index_optimization",
+                            error = %e,
+                            wall_ms = tier_wall.as_millis() as u64,
+                            cpu_ms = tier_cpu.whole_milliseconds() as u64,
+                            "maintenance tier failed",
+                        );
+                        MaintenanceTierResult {
+                            tier: MaintenanceTier::VectorIndexOptimization,
+                            started_at: tier_started_at,
+                            duration: Duration::seconds_f64(tier_wall.as_secs_f64()),
+                            cpu_duration: tier_cpu,
+                            outcome: MaintenanceOutcome::Failed { message: e.to_string() },
                         }
                     }
                 }
-                Err(e) => {
-                    warn!(error = %e, tier = "version_retention", "maintenance tier failed");
-                    MaintenanceOutcome::Failed { message: e.to_string() }
-                }
             };
-            let tier_wall = tier_start.elapsed();
-            let tier_cpu = process_cpu_time().saturating_sub(tier_cpu_start);
-            let is_failure = matches!(outcome, MaintenanceOutcome::Failed { .. });
-            let is_skipped = matches!(outcome, MaintenanceOutcome::Skipped { .. });
-            tier_results.push(MaintenanceTierResult {
-                tier: MaintenanceTier::VersionRetention,
-                started_at: tier_started_at,
-                duration: Duration::seconds_f64(tier_wall.as_secs_f64()),
-                cpu_duration: tier_cpu,
-                outcome,
-            });
+
+            let result = self.with_lease_renewal(holder_id, tier_future, &lease_lost).await;
+            let is_failure = matches!(result.outcome, MaintenanceOutcome::Failed { .. });
+            let is_skipped = matches!(result.outcome, MaintenanceOutcome::Skipped { .. });
+            tier_results.push(result);
             if is_failure {
                 final_status = MaintenanceRunStatus::Failure;
             } else if is_skipped && final_status == MaintenanceRunStatus::Success {
                 final_status = MaintenanceRunStatus::Partial;
-            }
-
-            if !renew_lease() {
-                final_status = MaintenanceRunStatus::Failure;
-                record_remaining_aborted(
-                    &[MaintenanceTier::FragmentCompaction, MaintenanceTier::VectorIndexOptimization],
-                    &mut tier_results,
-                );
-                let _ = self.operational_store.release_lease(holder_id);
-                let elapsed = wall_start.elapsed();
-                let cpu_elapsed = process_cpu_time().saturating_sub(cpu_start);
-                return Ok(MaintenanceRunSummary {
-                    run_id,
-                    started_at,
-                    finished_at: OffsetDateTime::now_utc(),
-                    duration: Duration::seconds_f64(elapsed.as_secs_f64()),
-                    cpu_duration: cpu_elapsed,
-                    status: final_status,
-                    tier_results,
-                });
             }
         }
 
         // ── 6. Tier: FragmentCompaction ─────────────────────────────────────
-        if !has_activity() {
+        if !has_activity() && !lease_lost.load(Ordering::Acquire) {
             let tier_start = Instant::now();
             let tier_cpu_start = process_cpu_time();
             let tier_started_at = OffsetDateTime::now_utc();
-            let outcome = match self.drawer_store.compact_fragments(settings.small_fragment_threshold as usize).await {
-                Ok(metrics) => {
-                    let tier_wall = tier_start.elapsed();
-                    let tier_cpu = process_cpu_time().saturating_sub(tier_cpu_start);
-                    info!(
-                        tier = "fragment_compaction",
-                        fragments_before = metrics.tail_rows_before,
-                        fragments_after = metrics.tail_rows_after,
-                        bytes_before = metrics.bytes_before,
-                        bytes_after = metrics.bytes_after,
-                        ran = metrics.ran,
-                        wall_ms = tier_wall.as_millis() as u64,
-                        cpu_ms = tier_cpu.whole_milliseconds() as u64,
-                        "maintenance tier completed",
-                    );
-                    if metrics.ran {
-                        MaintenanceOutcome::Completed {
-                            items_affected: metrics.indexed_rows_before.saturating_sub(metrics.indexed_rows_after) as u64,
+
+            info!(
+                tier = "fragment_compaction",
+                small_fragment_threshold = settings.small_fragment_threshold,
+                "maintenance tier starting",
+            );
+
+            let tier_future = async {
+                match self.drawer_store.compact_fragments(settings.small_fragment_threshold as usize).await {
+                    Ok(metrics) => {
+                        let tier_wall = tier_start.elapsed();
+                        let tier_cpu = process_cpu_time().saturating_sub(tier_cpu_start);
+                        info!(
+                            tier = "fragment_compaction",
+                            fragments_before = metrics.tail_rows_before,
+                            fragments_after = metrics.tail_rows_after,
+                            bytes_before = metrics.bytes_before,
+                            bytes_after = metrics.bytes_after,
+                            ran = metrics.ran,
+                            wall_ms = tier_wall.as_millis() as u64,
+                            cpu_ms = tier_cpu.whole_milliseconds() as u64,
+                            "maintenance tier completed",
+                        );
+                        let outcome = if metrics.ran {
+                            let items = metrics.indexed_rows_before.saturating_sub(metrics.indexed_rows_after) as u64;
+                            MaintenanceOutcome::Completed { items_affected: items }
+                        } else {
+                            MaintenanceOutcome::Skipped { reason: MaintenanceSkipReason::NothingToDo }
+                        };
+                        MaintenanceTierResult {
+                            tier: MaintenanceTier::FragmentCompaction,
+                            started_at: tier_started_at,
+                            duration: Duration::seconds_f64(tier_wall.as_secs_f64()),
+                            cpu_duration: tier_cpu,
+                            outcome,
                         }
-                    } else {
-                        MaintenanceOutcome::Skipped {
-                            reason: MaintenanceSkipReason::NothingToDo,
+                    }
+                    Err(e) => {
+                        let tier_wall = tier_start.elapsed();
+                        let tier_cpu = process_cpu_time().saturating_sub(tier_cpu_start);
+                        info!(
+                            tier = "fragment_compaction",
+                            error = %e,
+                            wall_ms = tier_wall.as_millis() as u64,
+                            cpu_ms = tier_cpu.whole_milliseconds() as u64,
+                            "maintenance tier failed",
+                        );
+                        MaintenanceTierResult {
+                            tier: MaintenanceTier::FragmentCompaction,
+                            started_at: tier_started_at,
+                            duration: Duration::seconds_f64(tier_wall.as_secs_f64()),
+                            cpu_duration: tier_cpu,
+                            outcome: MaintenanceOutcome::Failed { message: e.to_string() },
                         }
                     }
                 }
-                Err(e) => {
-                    warn!(error = %e, tier = "fragment_compaction", "maintenance tier failed");
-                    MaintenanceOutcome::Failed { message: e.to_string() }
-                }
             };
-            let tier_wall = tier_start.elapsed();
-            let tier_cpu = process_cpu_time().saturating_sub(tier_cpu_start);
-            let is_failure = matches!(outcome, MaintenanceOutcome::Failed { .. });
-            let is_skipped = matches!(outcome, MaintenanceOutcome::Skipped { .. });
-            tier_results.push(MaintenanceTierResult {
-                tier: MaintenanceTier::FragmentCompaction,
-                started_at: tier_started_at,
-                duration: Duration::seconds_f64(tier_wall.as_secs_f64()),
-                cpu_duration: tier_cpu,
-                outcome,
-            });
+
+            let result = self.with_lease_renewal(holder_id, tier_future, &lease_lost).await;
+            let is_failure = matches!(result.outcome, MaintenanceOutcome::Failed { .. });
+            let is_skipped = matches!(result.outcome, MaintenanceOutcome::Skipped { .. });
+            tier_results.push(result);
             if is_failure {
                 final_status = MaintenanceRunStatus::Failure;
             } else if is_skipped && final_status == MaintenanceRunStatus::Success {
                 final_status = MaintenanceRunStatus::Partial;
-            }
-
-            if !renew_lease() {
-                final_status = MaintenanceRunStatus::Failure;
-                record_remaining_aborted(
-                    &[MaintenanceTier::VectorIndexOptimization],
-                    &mut tier_results,
-                );
-                let _ = self.operational_store.release_lease(holder_id);
-                let elapsed = wall_start.elapsed();
-                let cpu_elapsed = process_cpu_time().saturating_sub(cpu_start);
-                return Ok(MaintenanceRunSummary {
-                    run_id,
-                    started_at,
-                    finished_at: OffsetDateTime::now_utc(),
-                    duration: Duration::seconds_f64(elapsed.as_secs_f64()),
-                    cpu_duration: cpu_elapsed,
-                    status: final_status,
-                    tier_results,
-                });
             }
         } else {
             final_status = MaintenanceRunStatus::Failure;
-            record_remaining_aborted(
-                &[MaintenanceTier::FragmentCompaction, MaintenanceTier::VectorIndexOptimization],
-                &mut tier_results,
-            );
+            record_remaining(1, &mut tier_results);
         }
 
-        // ── 7. Tier: VectorIndexOptimization (most expensive) ───────────────
-        if !has_activity() && final_status != MaintenanceRunStatus::Failure {
+        // ── 7. Tier: VersionRetention (cheapest, run last) ──────────────────
+        if !has_activity() && !lease_lost.load(Ordering::Acquire) {
             let tier_start = Instant::now();
             let tier_cpu_start = process_cpu_time();
             let tier_started_at = OffsetDateTime::now_utc();
-            let outcome = match self.drawer_store.optimize_vector_index(settings.tail_threshold_rows).await {
-                Ok(metrics) => {
-                    let tier_wall = tier_start.elapsed();
-                    let tier_cpu = process_cpu_time().saturating_sub(tier_cpu_start);
-                    info!(
-                        tier = "vector_index_optimization",
-                        tail_before = metrics.tail_rows_before,
-                        tail_after = metrics.tail_rows_after,
-                        indexed_before = metrics.indexed_rows_before,
-                        indexed_after = metrics.indexed_rows_after,
-                        ran = metrics.ran,
-                        wall_ms = tier_wall.as_millis() as u64,
-                        cpu_ms = tier_cpu.whole_milliseconds() as u64,
-                        "maintenance tier completed",
-                    );
-                    if metrics.ran {
-                        let items = metrics.indexed_rows_after.saturating_sub(metrics.indexed_rows_before) as u64;
-                        MaintenanceOutcome::Completed {
-                            items_affected: items,
+
+            info!(
+                tier = "version_retention",
+                retention_hours = settings.version_retention_hours,
+                "maintenance tier starting",
+            );
+
+            let tier_future = async {
+                match self.drawer_store.prune_versions(settings.version_retention_hours).await {
+                    Ok(metrics) => {
+                        let tier_wall = tier_start.elapsed();
+                        let tier_cpu = process_cpu_time().saturating_sub(tier_cpu_start);
+                        info!(
+                            tier = "version_retention",
+                            versions_removed = metrics.versions_removed,
+                            bytes_freed = metrics.bytes_freed,
+                            versions_before = metrics.versions_before,
+                            versions_after = metrics.versions_after,
+                            total_bytes_before = metrics.total_bytes_before,
+                            total_bytes_after = metrics.total_bytes_after,
+                            wall_ms = tier_wall.as_millis() as u64,
+                            cpu_ms = tier_cpu.whole_milliseconds() as u64,
+                            "maintenance tier completed",
+                        );
+                        let outcome = if metrics.versions_removed > 0 {
+                            MaintenanceOutcome::Completed { items_affected: metrics.versions_removed as u64 }
+                        } else {
+                            MaintenanceOutcome::Skipped { reason: MaintenanceSkipReason::NothingToDo }
+                        };
+                        MaintenanceTierResult {
+                            tier: MaintenanceTier::VersionRetention,
+                            started_at: tier_started_at,
+                            duration: Duration::seconds_f64(tier_wall.as_secs_f64()),
+                            cpu_duration: tier_cpu,
+                            outcome,
                         }
-                    } else {
-                        MaintenanceOutcome::Skipped {
-                            reason: MaintenanceSkipReason::NothingToDo,
+                    }
+                    Err(e) => {
+                        let tier_wall = tier_start.elapsed();
+                        let tier_cpu = process_cpu_time().saturating_sub(tier_cpu_start);
+                        info!(
+                            tier = "version_retention",
+                            error = %e,
+                            wall_ms = tier_wall.as_millis() as u64,
+                            cpu_ms = tier_cpu.whole_milliseconds() as u64,
+                            "maintenance tier failed",
+                        );
+                        MaintenanceTierResult {
+                            tier: MaintenanceTier::VersionRetention,
+                            started_at: tier_started_at,
+                            duration: Duration::seconds_f64(tier_wall.as_secs_f64()),
+                            cpu_duration: tier_cpu,
+                            outcome: MaintenanceOutcome::Failed { message: e.to_string() },
                         }
                     }
                 }
-                Err(e) => {
-                    warn!(error = %e, tier = "vector_index_optimization", "maintenance tier failed");
-                    MaintenanceOutcome::Failed { message: e.to_string() }
-                }
             };
-            let tier_wall = tier_start.elapsed();
-            let tier_cpu = process_cpu_time().saturating_sub(tier_cpu_start);
-            let is_failure = matches!(outcome, MaintenanceOutcome::Failed { .. });
-            let is_skipped = matches!(outcome, MaintenanceOutcome::Skipped { .. });
-            tier_results.push(MaintenanceTierResult {
-                tier: MaintenanceTier::VectorIndexOptimization,
-                started_at: tier_started_at,
-                duration: Duration::seconds_f64(tier_wall.as_secs_f64()),
-                cpu_duration: tier_cpu,
-                outcome,
-            });
+
+            let result = self.with_lease_renewal(holder_id, tier_future, &lease_lost).await;
+            let is_failure = matches!(result.outcome, MaintenanceOutcome::Failed { .. });
+            let is_skipped = matches!(result.outcome, MaintenanceOutcome::Skipped { .. });
+            tier_results.push(result);
             if is_failure {
                 final_status = MaintenanceRunStatus::Failure;
             } else if is_skipped && final_status == MaintenanceRunStatus::Success {
                 final_status = MaintenanceRunStatus::Partial;
             }
+        } else {
+            record_remaining(2, &mut tier_results);
         }
 
         // ── 8. Release lease ─────────────────────────────────────────────────

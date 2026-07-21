@@ -1504,8 +1504,8 @@ mod tests {
         // between the test signalling activity and maintenance checking it.
         let (notify_tx, notify_rx) = tokio::sync::oneshot::channel();
         let (continue_tx, continue_rx) = tokio::sync::oneshot::channel();
-        engine.test_tier_1_notify.lock().unwrap() = Some(notify_tx);
-        engine.test_tier_1_wait.lock().unwrap() = Some(continue_rx);
+        *engine.test_tier_1_notify.lock().unwrap() = Some(notify_tx);
+        *engine.test_tier_1_wait.lock().unwrap() = Some(continue_rx);
 
         let settings = MaintenanceSettings { idle_secs: 0, ..MaintenanceSettings::default() };
 

@@ -12,7 +12,7 @@ pub use error::{Result, StorageError};
 pub use lance::LanceDrawerStore;
 pub use maintenance::{
     MaintenanceAbortReason, MaintenanceOutcome, MaintenanceRunStatus, MaintenanceRunSummary,
-    MaintenanceSkipReason, MaintenanceTier, MaintenanceTierResult,
+    MaintenanceSettings, MaintenanceSkipReason, MaintenanceTier, MaintenanceTierResult,
 };
 pub use sqlite::{
     ChangeCursor, ChangeEvent, ChangeLogStore, ChangePage, DiaryStore, EntityRegistryStore, GraphStore,

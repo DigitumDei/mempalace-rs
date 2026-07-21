@@ -3759,4 +3759,57 @@ mod tests {
             "maintenance must not be skipped by a stale activity signal",
         );
     }
+
+    #[tokio::test]
+    async fn info_shows_maintenance_last_run_after_startup_check() {
+        let harness = make_harness().await;
+        // Wait for the startup check to record a last_maintenance_status.
+        for _ in 0..100 {
+            if harness.state.last_maintenance_status.lock().unwrap().is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let resp = harness.router.oneshot(authed_get("/v1/info", ALICE_TOKEN)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        // After a startup check, maintenance_last_run should be a non-null object.
+        assert!(
+            body["maintenance_last_run"].is_object(),
+            "maintenance_last_run must be an object after startup: {}",
+            body,
+        );
+        assert!(
+            body["maintenance_last_run"]["run_id"].is_number(),
+            "run_id must be present in maintenance_last_run",
+        );
+        assert!(
+            body["maintenance_last_run"]["status"].is_string(),
+            "status must be present in maintenance_last_run",
+        );
+    }
+
+    #[tokio::test]
+    async fn info_shows_maintenance_tier_results_in_last_run() {
+        let harness = make_harness().await;
+        // Wait for the startup check to record a last_maintenance_status.
+        for _ in 0..100 {
+            if harness.state.last_maintenance_status.lock().unwrap().is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let resp = harness.router.oneshot(authed_get("/v1/info", ALICE_TOKEN)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let last_run = &body["maintenance_last_run"];
+        let tier_results = last_run["tier_results"].as_array();
+        assert!(
+            tier_results.is_some() && !tier_results.unwrap().is_empty(),
+            "maintenance_last_run must contain tier_results after startup: {}",
+            body,
+        );
+    }
 }

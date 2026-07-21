@@ -2032,4 +2032,64 @@ mod tests {
 
         fs::remove_dir_all(base).unwrap();
     }
+
+    #[test]
+    fn maintenance_small_fragment_threshold_env_override() {
+        let base = temp_dir();
+        fs::create_dir_all(&base).unwrap();
+        fs::write(
+            base.join("config.json"),
+            r#"{"version":1,"maintenance":{"small_fragment_threshold":99}}"#,
+        )
+        .unwrap();
+
+        // File value + no env override → file value kept
+        let config = ConfigLoader::load_from_sources(
+            Some(&base), None, None, None, None, None, None, None,
+        )
+        .unwrap();
+        assert_eq!(config.maintenance.small_fragment_threshold, 99);
+
+        // File value + env override → env wins
+        let config = ConfigLoader::load_from_sources(
+            Some(&base), None, None, None, None, None, None, Some("50".to_owned()),
+        )
+        .unwrap();
+        assert_eq!(config.maintenance.small_fragment_threshold, 50);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn maintenance_config_all_fields_round_trip_from_file() {
+        let base = temp_dir();
+        fs::create_dir_all(&base).unwrap();
+        fs::write(
+            base.join("config.json"),
+            r#"{
+  "version": 1,
+  "maintenance": {
+    "enabled": false,
+    "idle_secs": 600,
+    "version_retention_hours": 48,
+    "tail_threshold_rows": 2048,
+    "small_fragment_threshold": 20
+  }
+}"#,
+        )
+        .unwrap();
+
+        let config = ConfigLoader::load_from_sources(
+            Some(&base), None, None, None, None, None, None, None,
+        )
+        .unwrap();
+
+        assert!(!config.maintenance.enabled);
+        assert_eq!(config.maintenance.idle_secs, 600);
+        assert_eq!(config.maintenance.version_retention_hours, 48);
+        assert_eq!(config.maintenance.tail_threshold_rows, 2048);
+        assert_eq!(config.maintenance.small_fragment_threshold, 20);
+
+        fs::remove_dir_all(base).unwrap();
+    }
 }

@@ -4802,4 +4802,146 @@ mod tests {
             output.stderr
         );
     }
+
+    #[test]
+    fn maintain_with_data_reports_tier_outcomes() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config_root = tempdir.path().to_path_buf();
+        let palace_path = config_root.join("palace");
+
+        // Write config.json with maintenance enabled and zero idle_secs
+        // so the CLI's one-shot pass runs immediately.
+        write_file(
+            &config_root.join("config.json"),
+            r#"{"maintenance":{"enabled":true,"idle_secs":0}}"#,
+        );
+
+        // Initialise a palace and insert some drawers so maintenance has
+        // data to examine.
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async {
+                let engine = mempalace_storage::StorageEngine::open(
+                    &palace_path,
+                    mempalace_core::EmbeddingProfile::Balanced,
+                )
+                .await
+                .unwrap();
+                let records: Vec<_> = (0..20)
+                    .map(|i| {
+                        let id = mempalace_core::DrawerId::new(&format!("wing/room/{i:04}")).unwrap();
+                        let wing = mempalace_core::WingId::new("wing").unwrap();
+                        let room = mempalace_core::RoomId::new("room").unwrap();
+                        let dim = mempalace_core::EmbeddingProfile::Balanced.metadata().dimensions;
+                        let mut embedding = vec![0.1_f32; dim];
+                        embedding[0] = (i as f32) * 0.01;
+                        mempalace_core::DrawerRecord {
+                            id,
+                            wing,
+                            room,
+                            hall: None,
+                            date: None,
+                            source_file: "test.txt".to_owned(),
+                            chunk_index: i,
+                            ingest_mode: "test".to_owned(),
+                            extract_mode: None,
+                            added_by: "tester".to_owned(),
+                            filed_at: time::OffsetDateTime::UNIX_EPOCH,
+                            importance: None,
+                            emotional_weight: None,
+                            weight: None,
+                            content: format!("payload-{i}"),
+                            content_hash: format!("hash-{i}"),
+                            embedding,
+                            locator: None,
+                        }
+                    })
+                    .collect();
+                engine.drawer_store()
+                    .put_drawers(&records, mempalace_storage::DuplicateStrategy::Error)
+                    .await
+                    .unwrap();
+            });
+
+        let context = CliContext::for_tests(config_root);
+        let output = run_cli(
+            ["maintain", "--palace", palace_path.to_str().unwrap()],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+
+        assert_eq!(output.exit_code, 0, "maintain should exit 0: {}", output.stderr);
+        assert!(
+            output.stdout.contains("Maintenance Run #"),
+            "output should contain run header: {}",
+            output.stdout
+        );
+        // With data present, all three tiers should have results.
+        assert!(
+            output.stdout.contains("[SUCCESS]") || output.stdout.contains("[PARTIAL]"),
+            "output should show SUCCESS or PARTIAL status: {}",
+            output.stdout
+        );
+    }
+
+    #[test]
+    fn maintain_version_retention_shows_in_output() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config_root = tempdir.path().to_path_buf();
+        let palace_path = config_root.join("palace");
+
+        // Explicit version_retention_hours in config so it appears in output.
+        write_file(
+            &config_root.join("config.json"),
+            r#"{"maintenance":{"enabled":true,"idle_secs":0,"version_retention_hours":12}}"#,
+        );
+
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(mempalace_storage::StorageEngine::open(
+                &palace_path,
+                mempalace_core::EmbeddingProfile::Balanced,
+            ))
+            .unwrap();
+
+        let context = CliContext::for_tests(config_root);
+        let output = run_cli(
+            ["maintain", "--palace", palace_path.to_str().unwrap()],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+
+        assert_eq!(output.exit_code, 0);
+        assert!(
+            output.stdout.contains("version_retention"),
+            "output must mention version_retention tier: {}",
+            output.stdout
+        );
+    }
+
+    #[test]
+    fn maintain_exit_code_1_when_maintenance_fails() {
+        // We cannot trivially simulate a LanceDB failure. This test verifies
+        // that a non-existent palace path causes a graceful error exit.
+        let tempdir = tempfile::tempdir().unwrap();
+        let config_root = tempdir.path().to_path_buf();
+        let bad_palace = config_root.join("nonexistent_palace");
+
+        write_file(
+            &config_root.join("config.json"),
+            r#"{"maintenance":{"enabled":true,"idle_secs":0}}"#,
+        );
+
+        let context = CliContext::for_tests(config_root);
+        let output = run_cli(
+            ["maintain", "--palace", bad_palace.to_str().unwrap()],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+
+        assert_eq!(output.exit_code, 1, "should exit 1 when palace cannot be opened");
+    }
 }

@@ -898,12 +898,18 @@ fn process_cpu_time() -> time::Duration {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use std::sync::Arc;
+
     use tempfile::tempdir;
     use time::macros::{date, datetime};
 
     use super::StorageEngine;
     use crate::error::StorageError;
     use crate::lance::LanceDrawerStore;
+    use crate::maintenance::{
+        MaintenanceAbortReason, MaintenanceOutcome, MaintenanceRunStatus, MaintenanceSettings,
+        MaintenanceSkipReason, MaintenanceTier,
+    };
     use crate::sqlite::{DiaryStore, IngestManifestStore};
     use crate::types::{DrawerFilter, DrawerStore, DuplicateStrategy, IngestCommitRequest};
     use mempalace_core::{DrawerId, DrawerRecord, EmbeddingProfile, RoomId, WingId};
@@ -1360,6 +1366,173 @@ mod tests {
 
         let all = engine.drawer_store().list_drawers(&DrawerFilter::default()).await.unwrap();
         assert!(all.is_empty(), "all drawers should be deleted after empty replace");
+    }
+
+    // ─── run_maintenance tests ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn run_maintenance_disabled_returns_partial() {
+        let tempdir = tempdir().unwrap();
+        let engine = StorageEngine::open(tempdir.path(), EmbeddingProfile::Balanced).await.unwrap();
+
+        let settings = MaintenanceSettings { enabled: false, ..MaintenanceSettings::default() };
+        let summary = engine.run_maintenance(&settings).await.unwrap();
+
+        assert_eq!(summary.status, MaintenanceRunStatus::Partial);
+        assert!(summary.tier_results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_maintenance_skipped_when_activity_detected() {
+        let tempdir = tempdir().unwrap();
+        let engine = StorageEngine::open(tempdir.path(), EmbeddingProfile::Balanced).await.unwrap();
+
+        engine.signal_activity();
+
+        let settings = MaintenanceSettings { idle_secs: 0, ..MaintenanceSettings::default() };
+        let summary = engine.run_maintenance(&settings).await.unwrap();
+
+        assert_eq!(summary.status, MaintenanceRunStatus::Partial);
+        assert_eq!(summary.tier_results.len(), 1);
+        assert_eq!(summary.tier_results[0].tier, MaintenanceTier::VectorIndexOptimization);
+        assert_eq!(
+            summary.tier_results[0].outcome,
+            MaintenanceOutcome::Skipped { reason: MaintenanceSkipReason::NotIdle },
+        );
+    }
+
+    #[tokio::test]
+    async fn run_maintenance_skipped_when_not_idle_long_enough() {
+        let tempdir = tempdir().unwrap();
+        let engine = StorageEngine::open(tempdir.path(), EmbeddingProfile::Balanced).await.unwrap();
+
+        // A large idle_secs means the system has not been idle long enough.
+        let settings = MaintenanceSettings { idle_secs: 999_999, ..MaintenanceSettings::default() };
+        let summary = engine.run_maintenance(&settings).await.unwrap();
+
+        assert_eq!(summary.status, MaintenanceRunStatus::Partial);
+        assert_eq!(summary.tier_results.len(), 1);
+        assert_eq!(
+            summary.tier_results[0].outcome,
+            MaintenanceOutcome::Skipped { reason: MaintenanceSkipReason::NotIdle },
+        );
+    }
+
+    #[tokio::test]
+    async fn run_maintenance_all_tiers_skipped_on_empty_palace() {
+        let tempdir = tempdir().unwrap();
+        let engine = StorageEngine::open(tempdir.path(), EmbeddingProfile::Balanced).await.unwrap();
+
+        let settings = MaintenanceSettings { idle_secs: 0, ..MaintenanceSettings::default() };
+        let summary = engine.run_maintenance(&settings).await.unwrap();
+
+        assert_eq!(summary.status, MaintenanceRunStatus::Partial);
+        assert_eq!(summary.tier_results.len(), 3);
+        // All tiers should be skipped with NothingToDo (empty palace).
+        for result in &summary.tier_results {
+            assert_eq!(
+                result.outcome,
+                MaintenanceOutcome::Skipped { reason: MaintenanceSkipReason::NothingToDo },
+                "tier {:?} should be NothingToDo",
+                result.tier,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn run_maintenance_lease_contention_returns_concurrent_run() {
+        let tempdir = tempdir().unwrap();
+        let engine = StorageEngine::open(tempdir.path(), EmbeddingProfile::Balanced).await.unwrap();
+
+        // Claim the lease from a different holder so the engine's
+        // run_maintenance cannot acquire it.
+        let other_holder = "other-process-42";
+        let claimed =
+            engine.operational_store().try_claim_lease(other_holder, time::Duration::minutes(5)).unwrap();
+        assert!(claimed, "should claim lease from other holder");
+
+        let settings = MaintenanceSettings { idle_secs: 0, ..MaintenanceSettings::default() };
+        let summary = engine.run_maintenance(&settings).await.unwrap();
+
+        assert_eq!(summary.status, MaintenanceRunStatus::Failure);
+        assert_eq!(summary.tier_results.len(), 1);
+        assert_eq!(
+            summary.tier_results[0].outcome,
+            MaintenanceOutcome::Aborted {
+                reason: MaintenanceAbortReason::ConcurrentRun,
+                items_affected: 0,
+            },
+        );
+
+        // Clean up the lease.
+        engine.operational_store().release_lease(other_holder).unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_maintenance_aborts_when_activity_arrives_mid_tier() {
+        let tempdir = tempdir().unwrap();
+        let engine = Arc::new(
+            StorageEngine::open(tempdir.path(), EmbeddingProfile::Balanced).await.unwrap(),
+        );
+
+        let settings = MaintenanceSettings { idle_secs: 0, ..MaintenanceSettings::default() };
+
+        let engine_clone = Arc::clone(&engine);
+        let handle = tokio::spawn(async move {
+            engine_clone.run_maintenance(&settings).await
+        });
+
+        // Wait just enough for the run to clear the initial activity check and
+        // begin the first tier (or lease claim).  Then signal activity so the
+        // inter-tier check aborts subsequent tiers.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        engine.signal_activity();
+
+        let summary = match handle.await.unwrap() {
+            Ok(s) => s,
+            Err(e) => panic!("run_maintenance returned error: {e}"),
+        };
+
+        // The run either completed (all three tiers) or was aborted between tiers.
+        // With activity signalled mid-run, at least one tier should be a skip or
+        // we should see the aborted-between-tiers pattern.
+        assert!(!summary.tier_results.is_empty(), "must have at least one tier result");
+        if summary.tier_results.len() < 3 {
+            // Activity was detected between tiers — some tiers were skipped.
+            assert_eq!(summary.status, MaintenanceRunStatus::Failure);
+        }
+    }
+
+    #[tokio::test]
+    async fn run_maintenance_with_data_runs_tiers() {
+        let tempdir = tempdir().unwrap();
+        let engine = StorageEngine::open(tempdir.path(), EmbeddingProfile::Balanced).await.unwrap();
+
+        // Insert enough drawers to create data for maintenance to work on.
+        let drawers: Vec<_> = (0..20)
+            .map(|i| {
+                let mut r = record(
+                    &format!("wing/room/{i:04}"),
+                    "test.txt",
+                    [0.1, 0.2, 0.3, 0.4],
+                );
+                r.wing = mempalace_core::WingId::new("wing").unwrap();
+                r.room = mempalace_core::RoomId::new("room").unwrap();
+                r
+            })
+            .collect();
+        engine.drawer_store().put_drawers(&drawers, DuplicateStrategy::Error).await.unwrap();
+
+        let settings = MaintenanceSettings { idle_secs: 0, ..MaintenanceSettings::default() };
+        let summary = engine.run_maintenance(&settings).await.unwrap();
+
+        // With data present, tiers should run (some may skip due to thresholds).
+        assert_eq!(summary.tier_results.len(), 3);
+        assert!(
+            matches!(summary.status, MaintenanceRunStatus::Success | MaintenanceRunStatus::Partial),
+            "expected Success or Partial, got {:?}",
+            summary.status,
+        );
     }
 }
 

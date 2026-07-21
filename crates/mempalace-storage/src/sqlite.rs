@@ -415,6 +415,17 @@ impl SqliteOperationalStore {
         )?;
         Ok(connection)
     }
+
+    fn open_lease_connection(&self) -> Result<Connection> {
+        let connection = Connection::open(&self.path)?;
+        connection.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = NORMAL;
+             PRAGMA busy_timeout = 0;",
+        )?;
+        Ok(connection)
+    }
 }
 
 /// Persistent summaries for diary entries. Diary content remains in the drawer
@@ -1447,7 +1458,7 @@ impl ChangeLogStore for SqliteOperationalStore {
 
 impl MaintenanceLeaseStore for SqliteOperationalStore {
     fn try_claim_lease(&self, holder: &str, ttl: Duration) -> Result<bool> {
-        let conn = self.open_connection()?;
+        let conn = self.open_lease_connection()?;
         let now = OffsetDateTime::now_utc();
         let expires_at = now + ttl;
 
@@ -2658,5 +2669,38 @@ INSERT INTO diary_summaries (entry_id, summary) VALUES ('diary/long', 'x' || 'y'
 
         let status_after = store.lease_status().unwrap().unwrap();
         assert!(status_after.1 > status_before.1, "expiry should be extended");
+    }
+
+    #[test]
+    fn lease_claim_contention_returns_false_immediately() {
+        let tempdir = tempdir().unwrap();
+        let db_path = tempdir.path().join("storage.sqlite3");
+        let store = SqliteOperationalStore::new(&db_path);
+        store.ensure_schema().unwrap();
+
+        // Prime the lease row so the table exists.
+        assert!(store.try_claim_lease("worker-a", Duration::minutes(5)).unwrap());
+        assert!(store.release_lease("worker-a").unwrap());
+
+        // Open a second raw connection and hold a write transaction.
+        let blocker = rusqlite::Connection::open(&db_path).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        // The contender opens a separate connection with busy_timeout=0, so
+        // BEGIN IMMEDIATE should return SQLITE_BUSY immediately.
+        let result = store.try_claim_lease("contender", Duration::minutes(5));
+        match &result {
+            Ok(false) => {} // expected: non-error skip
+            other => panic!("expected Ok(false) under contention, got: {other:?}"),
+        }
+
+        // Release the blocker so the test teardown isn't racy.
+        blocker.execute_batch("ROLLBACK").unwrap();
+
+        // After contention is resolved, the contender may claim the lease.
+        assert!(
+            store.try_claim_lease("contender", Duration::minutes(5)).unwrap(),
+            "should claim lease after blocker releases"
+        );
     }
 }

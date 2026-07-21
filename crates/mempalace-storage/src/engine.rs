@@ -699,7 +699,8 @@ impl StorageEngine {
                 if let Some(tx) = self.test_tier_1_notify.lock().unwrap().take() {
                     let _ = tx.send(());
                 }
-                if let Some(rx) = self.test_tier_1_wait.lock().unwrap().take() {
+                let wait_rx = self.test_tier_1_wait.lock().unwrap().take();
+                if let Some(rx) = wait_rx {
                     let _ = rx.await;
                 }
             }

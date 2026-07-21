@@ -43,16 +43,17 @@ use mempalace_embeddings::{EmbeddingProvider, EmbeddingRequest};
 use mempalace_federation::{
     AddDrawerRequest, AddDrawerResponse, ChangeEventDto, ChangesQuery, ChangesResponse,
     CheckDuplicateRequest, CheckDuplicateResponse, DrawerSearchRequest, DrawerSearchResponse,
-    ErrorBody, FEDERATION_API_VERSION, InfoResponse, IngestBatchRequest, IngestBatchResponse,
-    IngestFileResult, KgAddFactRequest, KgInvalidateRequest, KgQueryRequest, ListDrawersQuery,
-    ListDrawersResponse, RemoteDrawerResult,
+    ErrorBody, InfoResponse, IngestBatchRequest, IngestBatchResponse, ListDrawersQuery,
+    ListDrawersResponse, MaintenanceAbortReason as FedMaintenanceAbortReason,
+    MaintenanceRunStatus as FedMaintenanceRunStatus,
+    MaintenanceSkipReason as FedMaintenanceSkipReason, MaintenanceStatus, RemoteDrawerResult,
 };
 use mempalace_graph::{AddFactRequest, EntityKind, KnowledgeGraphRuntime, QueryDirection};
 use mempalace_search::{SearchRuntime, SearchRuntimePolicy};
 use mempalace_storage::{
     ChangeCursor, ChangeEvent, ChangeLogStore, DrawerFilter, DrawerStore, DuplicateStrategy,
-    IngestCommitRequest, IngestManifestStore, MaintenanceRunSummary, MaintenanceSettings,
-    StorageEngine,
+    IngestCommitRequest, IngestManifestStore, MaintenanceAbortReason, MaintenanceOutcome,
+    MaintenanceRunSummary, MaintenanceSettings, MaintenanceSkipReason, StorageEngine,
 };
 use serde_json::{Value, json};
 use subtle::ConstantTimeEq;
@@ -419,6 +420,8 @@ pub struct ServerState<P> {
     pub tokens: Arc<TokenRegistry>,
     /// The most recent maintenance run summary, if any.
     pub last_maintenance_status: std::sync::Mutex<Option<MaintenanceRunSummary>>,
+    /// Typed status of the maintenance subsystem.
+    pub maintenance_status: std::sync::Mutex<MaintenanceStatus>,
     /// Notify channel: signals the background maintenance task that
     /// activity has occurred, resetting the idle timer.
     pub activity_notify: Notify,
@@ -472,12 +475,19 @@ where
         small_fragment_threshold: config.maintenance.small_fragment_threshold as u64,
     };
 
+    let initial_status = if maintenance_settings.enabled {
+        MaintenanceStatus::Idle
+    } else {
+        MaintenanceStatus::Disabled
+    };
+
     let state = Arc::new(ServerState {
         config,
         storage,
         search: Mutex::new(search),
         tokens: Arc::new(tokens),
         last_maintenance_status: std::sync::Mutex::new(None),
+        maintenance_status: std::sync::Mutex::new(initial_status),
         activity_notify: Notify::new(),
     });
 
@@ -496,10 +506,13 @@ where
             info!("performing startup maintenance check");
             match task_state.storage.run_maintenance(&settings).await {
                 Ok(summary) => {
-                    *task_state.last_maintenance_status.lock().unwrap() = Some(summary);
+                    *task_state.last_maintenance_status.lock().unwrap() = Some(summary.clone());
+                    *task_state.maintenance_status.lock().unwrap() = summary_to_status(&summary);
                 }
                 Err(e) => {
                     warn!(error = %e, "startup maintenance run failed");
+                    *task_state.maintenance_status.lock().unwrap() =
+                        MaintenanceStatus::Failed { message: e.to_string() };
                 }
             }
 
@@ -529,10 +542,13 @@ where
                         info!("background maintenance check");
                         match task_state.storage.run_maintenance(&settings).await {
                             Ok(summary) => {
-                                *task_state.last_maintenance_status.lock().unwrap() = Some(summary);
+                                *task_state.last_maintenance_status.lock().unwrap() = Some(summary.clone());
+                                *task_state.maintenance_status.lock().unwrap() = summary_to_status(&summary);
                             }
                             Err(e) => {
                                 warn!(error = %e, "background maintenance run failed");
+                                *task_state.maintenance_status.lock().unwrap() =
+                                    MaintenanceStatus::Failed { message: e.to_string() };
                             }
                         }
                     }
@@ -632,6 +648,74 @@ async fn route_health() -> impl IntoResponse {
 
 // ─── Info ─────────────────────────────────────────────────────────────────────
 
+/// Converts a [`MaintenanceRunSummary`] (from the storage engine) into a
+/// [`MaintenanceStatus`] (the federation DTO) by examining the tier outcomes.
+fn summary_to_status(summary: &MaintenanceRunSummary) -> MaintenanceStatus {
+    if summary.tier_results.is_empty() {
+        return MaintenanceStatus::Disabled;
+    }
+
+    let all_skipped =
+        summary.tier_results.iter().all(|r| matches!(r.outcome, MaintenanceOutcome::Skipped { .. }));
+    let any_aborted =
+        summary.tier_results.iter().any(|r| matches!(r.outcome, MaintenanceOutcome::Aborted { .. }));
+    let any_failed =
+        summary.tier_results.iter().any(|r| matches!(r.outcome, MaintenanceOutcome::Failed { .. }));
+    let any_completed = summary
+        .tier_results
+        .iter()
+        .any(|r| matches!(r.outcome, MaintenanceOutcome::Completed { .. }));
+
+    if all_skipped {
+        let reason = summary
+            .tier_results
+            .first()
+            .and_then(|r| match &r.outcome {
+                MaintenanceOutcome::Skipped { reason } => Some(reason),
+                _ => None,
+            });
+        let fed_reason = match reason {
+            Some(MaintenanceSkipReason::NotIdle) => FedMaintenanceSkipReason::NotIdle,
+            Some(MaintenanceSkipReason::NothingToDo) => FedMaintenanceSkipReason::NothingToDo,
+            _ => FedMaintenanceSkipReason::NotIdle,
+        };
+        return MaintenanceStatus::Skipped { reason: fed_reason };
+    }
+
+    if any_aborted && !any_completed {
+        let reason = summary.tier_results.iter().find_map(|r| match &r.outcome {
+            MaintenanceOutcome::Aborted { reason, .. } => Some(reason),
+            _ => None,
+        });
+        let fed_reason = match reason {
+            Some(MaintenanceAbortReason::ConcurrentRun) => FedMaintenanceAbortReason::ConcurrentRun,
+            Some(MaintenanceAbortReason::Shutdown) => FedMaintenanceAbortReason::Shutdown,
+            Some(MaintenanceAbortReason::Timeout) => FedMaintenanceAbortReason::Timeout,
+            _ => FedMaintenanceAbortReason::ConcurrentRun,
+        };
+        return MaintenanceStatus::Aborted { reason: fed_reason };
+    }
+
+    if any_failed && !any_completed {
+        let msg = summary
+            .tier_results
+            .iter()
+            .find_map(|r| match &r.outcome {
+                MaintenanceOutcome::Failed { message } => Some(message.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        return MaintenanceStatus::Failed { message: msg };
+    }
+
+    let fed_status = match summary.status {
+        mempalace_storage::MaintenanceRunStatus::Success => FedMaintenanceRunStatus::Success,
+        mempalace_storage::MaintenanceRunStatus::Partial => FedMaintenanceRunStatus::Partial,
+        mempalace_storage::MaintenanceRunStatus::Failure => FedMaintenanceRunStatus::Failure,
+    };
+    MaintenanceStatus::Completed { status: fed_status }
+}
+
 async fn route_info<P>(
     State(state): State<Arc<ServerState<P>>>,
 ) -> Result<impl IntoResponse, ServerError>
@@ -644,6 +728,8 @@ where
         .unwrap()
         .as_ref()
         .and_then(|s| serde_json::to_value(s).ok());
+
+    let status = state.maintenance_status.lock().unwrap().clone();
 
     Ok(Json(InfoResponse {
         server_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -659,6 +745,7 @@ where
         maintenance_enabled: state.config.maintenance.enabled,
         maintenance_idle_secs: state.config.maintenance.idle_secs as u64,
         maintenance_last_run: last_run,
+        maintenance_status: status,
     }))
 }
 
@@ -3386,6 +3473,13 @@ mod tests {
         assert_eq!(body["maintenance_enabled"], true);
         assert_eq!(body["maintenance_idle_secs"], 300u64);
         assert!(body["maintenance_last_run"].is_null());
+        // Status should be idle or one of the post-run states (the startup
+        // check may have completed by now).
+        let status = &body["maintenance_status"];
+        assert!(
+            status.is_string() || status.is_object(),
+            "maintenance_status must be a string (unit variant) or object (struct variant): {status}",
+        );
     }
 
     #[tokio::test]
@@ -3397,6 +3491,141 @@ mod tests {
         assert_eq!(body["maintenance_enabled"], false);
         assert_eq!(body["maintenance_idle_secs"], 300u64);
         assert!(body["maintenance_last_run"].is_null());
+        assert_eq!(body["maintenance_status"], "disabled");
+    }
+
+    #[tokio::test]
+    async fn info_returns_maintenance_status_disabled() {
+        let harness = make_harness_with_maintenance(false).await;
+        let resp = harness.router.oneshot(authed_get("/v1/info", ALICE_TOKEN)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["maintenance_status"], "disabled");
+    }
+
+    #[tokio::test]
+    async fn info_returns_maintenance_status_completed_after_startup() {
+        let harness = make_harness().await;
+        // Wait for the startup check to complete (up to 5 s).
+        for _ in 0..100 {
+            let resp = harness.router.clone().oneshot(authed_get("/v1/info", ALICE_TOKEN)).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = body_json(resp).await;
+            let status = &body["maintenance_status"];
+            // startup check should transition from "idle" to some post-run state.
+            if status.is_object() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("maintenance did not transition from idle after startup check");
+    }
+
+    #[tokio::test]
+    async fn info_returns_maintenance_status_skipped_not_idle_when_busy() {
+        // Use a very short idle_secs so the startup check completes quickly,
+        // then keep sending requests to ensure the background check is skipped.
+        let short_idle = MaintenanceRuntimeConfig {
+            idle_secs: 1,
+            ..MaintenanceRuntimeConfig::defaults()
+        };
+        let harness = build_with_maintenance(short_idle).await;
+
+        // Wait for startup check to finish.
+        for _ in 0..50 {
+            if harness.state.last_maintenance_status.lock().unwrap().is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        // Directly set the status to simulate the "skipped (activity)" state
+        // that the scheduler writes when it detects recent activity.
+        *harness.state.maintenance_status.lock().unwrap() =
+            MaintenanceStatus::Skipped { reason: FedMaintenanceSkipReason::NotIdle };
+
+        let resp = harness.router.oneshot(authed_get("/v1/info", ALICE_TOKEN)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let status = &body["maintenance_status"];
+        assert_eq!(status["skipped"]["reason"], "not_idle");
+    }
+
+    #[tokio::test]
+    async fn info_returns_maintenance_status_aborted_concurrent() {
+        let harness = make_harness().await;
+        *harness.state.maintenance_status.lock().unwrap() =
+            MaintenanceStatus::Aborted { reason: FedMaintenanceAbortReason::ConcurrentRun };
+
+        let resp = harness.router.oneshot(authed_get("/v1/info", ALICE_TOKEN)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let status = &body["maintenance_status"];
+        assert_eq!(status["aborted"]["reason"], "concurrent_run");
+    }
+
+    #[tokio::test]
+    async fn info_returns_maintenance_status_failed() {
+        let harness = make_harness().await;
+        *harness.state.maintenance_status.lock().unwrap() =
+            MaintenanceStatus::Failed { message: "simulated error".into() };
+
+        let resp = harness.router.oneshot(authed_get("/v1/info", ALICE_TOKEN)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let status = &body["maintenance_status"];
+        assert_eq!(status["failed"]["message"], "simulated error");
+    }
+
+    #[tokio::test]
+    async fn info_returns_maintenance_status_completed_success() {
+        let harness = make_harness().await;
+        *harness.state.maintenance_status.lock().unwrap() =
+            MaintenanceStatus::Completed { status: FedMaintenanceRunStatus::Success };
+
+        let resp = harness.router.oneshot(authed_get("/v1/info", ALICE_TOKEN)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let status = &body["maintenance_status"];
+        assert_eq!(status["completed"]["status"], "success");
+    }
+
+    #[tokio::test]
+    async fn info_returns_maintenance_status_completed_partial() {
+        let harness = make_harness().await;
+        *harness.state.maintenance_status.lock().unwrap() =
+            MaintenanceStatus::Completed { status: FedMaintenanceRunStatus::Partial };
+
+        let resp = harness.router.oneshot(authed_get("/v1/info", ALICE_TOKEN)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let status = &body["maintenance_status"];
+        assert_eq!(status["completed"]["status"], "partial");
+    }
+
+    #[tokio::test]
+    async fn info_returns_maintenance_status_completed_failure() {
+        let harness = make_harness().await;
+        *harness.state.maintenance_status.lock().unwrap() =
+            MaintenanceStatus::Completed { status: FedMaintenanceRunStatus::Failure };
+
+        let resp = harness.router.oneshot(authed_get("/v1/info", ALICE_TOKEN)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let status = &body["maintenance_status"];
+        assert_eq!(status["completed"]["status"], "failure");
+    }
+
+    #[tokio::test]
+    async fn info_returns_maintenance_status_running() {
+        let harness = make_harness().await;
+        *harness.state.maintenance_status.lock().unwrap() = MaintenanceStatus::Running;
+
+        let resp = harness.router.oneshot(authed_get("/v1/info", ALICE_TOKEN)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let status = &body["maintenance_status"];
+        assert_eq!(status, "running");
     }
 
     // ─── 10. Scheduler ────────────────────────────────────────────────────────

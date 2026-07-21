@@ -94,7 +94,7 @@ async fn spawn_server_with_handle(dir: &TempDir) -> (SocketAddr, tokio::task::Jo
     let config = server_config(dir);
     let tokens = TokenRegistry::load(token_file).unwrap();
     let provider = DeterministicStubProvider::new(EmbeddingProfile::Balanced);
-    let router = build_router(config, provider, tokens).await.unwrap();
+    let (router, _state) = build_router(config, provider, tokens).await.unwrap();
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -518,7 +518,7 @@ async fn different_embedding_profiles_per_side() {
     let hub_config = server_config(&hub_dir);
     let tokens = TokenRegistry::load(token_file).unwrap();
     let hub_provider = DeterministicStubProvider::new(EmbeddingProfile::Balanced);
-    let router = build_router(hub_config, hub_provider, tokens).await.unwrap();
+    let (router, _state) = build_router(hub_config, hub_provider, tokens).await.unwrap();
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -2169,7 +2169,7 @@ async fn add_drawer_both_retry_reuses_local_drawer_and_replicates() {
     let config = server_config(&hub_dir);
     let tokens = TokenRegistry::load(write_token_file(&hub_dir)).unwrap();
     let provider = DeterministicStubProvider::new(EmbeddingProfile::Balanced);
-    let router = build_router(config, provider, tokens).await.unwrap();
+    let (router, _state) = build_router(config, provider, tokens).await.unwrap();
     tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });

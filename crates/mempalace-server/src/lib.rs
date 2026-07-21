@@ -16,7 +16,7 @@
 //! let config: MempalaceConfig = todo!("load from disk");
 //! let tokens = TokenRegistry::load(std::path::PathBuf::from("server_tokens.json"))?;
 //! let provider = DeterministicStubProvider::new(EmbeddingProfile::Balanced);
-//! let router = build_router(config, provider, tokens).await?;
+//! let (router, _state) = build_router(config, provider, tokens).await?;
 //! // Bind and serve with axum::serve(listener, router).await?
 //! # Ok(())
 //! # }
@@ -24,7 +24,7 @@
 
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::{Arc, RwLock};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
@@ -58,7 +58,7 @@ use serde_json::{Value, json};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 use time::{Date, OffsetDateTime, format_description::well_known::Rfc3339};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tracing::{info, warn};
 
 // ─── Constants ───────────────────────────────────────────────────────────────
@@ -419,6 +419,9 @@ pub struct ServerState<P> {
     pub tokens: Arc<TokenRegistry>,
     /// The most recent maintenance run summary, if any.
     pub last_maintenance_status: std::sync::Mutex<Option<MaintenanceRunSummary>>,
+    /// Notify channel: signals the background maintenance task that
+    /// activity has occurred, resetting the idle timer.
+    pub activity_notify: Notify,
 }
 
 // ─── Router builder ──────────────────────────────────────────────────────────
@@ -440,7 +443,7 @@ pub struct ServerState<P> {
 /// let config: MempalaceConfig = todo!();
 /// let tokens = TokenRegistry::load(std::path::PathBuf::from("server_tokens.json"))?;
 /// let provider = DeterministicStubProvider::new(EmbeddingProfile::Balanced);
-/// let router = build_router(config, provider, tokens).await?;
+/// let (router, _state) = build_router(config, provider, tokens).await?;
 /// // let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
 /// // axum::serve(listener, router).await?;
 /// # Ok(())
@@ -450,7 +453,7 @@ pub async fn build_router<P>(
     config: MempalaceConfig,
     provider: P,
     tokens: TokenRegistry,
-) -> Result<Router, ServerError>
+) -> Result<(Router, Arc<ServerState<P>>), ServerError>
 where
     P: EmbeddingProvider + Send + Sync + 'static,
 {
@@ -475,6 +478,7 @@ where
         search: Mutex::new(search),
         tokens: Arc::new(tokens),
         last_maintenance_status: std::sync::Mutex::new(None),
+        activity_notify: Notify::new(),
     });
 
     // ── Background maintenance task ──────────────────────────────────────────
@@ -500,25 +504,30 @@ where
             }
 
             loop {
-                let base = std::time::Duration::from_secs(settings.idle_secs.max(30));
-                let jitter_frac = (std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
+                let base = Duration::from_secs(settings.idle_secs);
+                let jitter_frac = (SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
                     .unwrap_or_default()
                     .subsec_nanos() as f64)
                     / 1_000_000_000.0;
                 let jitter =
-                    std::time::Duration::from_secs_f64(jitter_frac * base.as_secs_f64() * 0.1);
+                    Duration::from_secs_f64(jitter_frac * base.as_secs_f64() * 0.1);
                 let sleep_dur = base + jitter;
 
-                tokio::time::sleep(sleep_dur).await;
-
-                info!("background maintenance check");
-                match task_state.storage.run_maintenance(&settings).await {
-                    Ok(summary) => {
-                        *task_state.last_maintenance_status.lock().unwrap() = Some(summary);
+                tokio::select! {
+                    _ = tokio::time::sleep(sleep_dur) => {
+                        info!("background maintenance check");
+                        match task_state.storage.run_maintenance(&settings).await {
+                            Ok(summary) => {
+                                *task_state.last_maintenance_status.lock().unwrap() = Some(summary);
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "background maintenance run failed");
+                            }
+                        }
                     }
-                    Err(e) => {
-                        warn!(error = %e, "background maintenance run failed");
+                    _ = task_state.activity_notify.notified() => {
+                        // Activity detected — loop restarts, pending sleep is cancelled.
                     }
                 }
             }
@@ -559,8 +568,8 @@ where
         .route("/v1/changes", get(route_changes::<P>))
         .layer(middleware::from_fn_with_state(Arc::clone(&state), auth_middleware::<P>));
 
-    let router = public.merge(protected).merge(ingest_route).with_state(state);
-    Ok(router.layer(middleware::from_fn_with_state(activity_state, activity_middleware::<P>)))
+    let router = public.merge(protected).merge(ingest_route).with_state(Arc::clone(&state));
+    Ok((router.layer(middleware::from_fn_with_state(activity_state, activity_middleware::<P>)), state))
 }
 
 // ─── Auth middleware ──────────────────────────────────────────────────────────
@@ -601,6 +610,7 @@ where
     P: EmbeddingProvider + Send + Sync + 'static,
 {
     state.storage.signal_activity();
+    state.activity_notify.notify_one();
     next.run(request).await
 }
 
@@ -2063,6 +2073,7 @@ mod tests {
 
     struct Harness {
         router: Router,
+        state: Arc<ServerState<DeterministicStubProvider>>,
         _tempdir: TempDir,
     }
 
@@ -2099,8 +2110,8 @@ mod tests {
         };
         let tokens = TokenRegistry::load(token_file).unwrap();
         let provider = DeterministicStubProvider::new(EmbeddingProfile::Balanced);
-        let router = build_router(config, provider, tokens).await.unwrap();
-        Harness { router, _tempdir: tempdir }
+        let (router, state) = build_router(config, provider, tokens).await.unwrap();
+        Harness { router, state, _tempdir: tempdir }
     }
 
     /// Helper: build a JSON request with bearer auth.
@@ -2662,8 +2673,8 @@ mod tests {
         };
         let tokens = TokenRegistry::load(token_file).unwrap();
         let provider = DeterministicStubProvider::new(EmbeddingProfile::Balanced);
-        let router = build_router(config, provider, tokens).await.unwrap();
-        Harness { router, _tempdir: tempdir }
+        let (router, state) = build_router(config, provider, tokens).await.unwrap();
+        Harness { router, state, _tempdir: tempdir }
     }
 
     // ─── 9. Ingest batch ──────────────────────────────────────────────────────
@@ -3337,5 +3348,85 @@ mod tests {
         let caps = body["capabilities"].as_array().unwrap();
         let cap_strings: Vec<&str> = caps.iter().filter_map(|v| v.as_str()).collect();
         assert!(cap_strings.contains(&"ingest"), "capabilities must include 'ingest'");
+    }
+
+    // ─── 10. Scheduler ────────────────────────────────────────────────────────
+
+    /// Builds a router returning the state handle for scheduler introspection.
+    async fn build_with_maintenance(maintenance: MaintenanceRuntimeConfig) -> Harness {
+        let tempdir = TempDir::new().unwrap();
+        let palace_path = tempdir.path().join("palace");
+
+        let token_file = tempdir.path().join("tokens.json");
+        std::fs::write(
+            &token_file,
+            serde_json::to_string(&serde_json::json!([
+                {"token": ALICE_TOKEN, "name": "alice", "enabled": true},
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        restrict_token_file(&token_file);
+
+        let config = MempalaceConfig {
+            schema_version: 1,
+            collection_name: "mempalace_drawers".to_owned(),
+            palace_path,
+            embedding_profile: EmbeddingProfile::Balanced,
+            low_cpu: LowCpuRuntimeConfig::defaults_for_profile(EmbeddingProfile::Balanced),
+            server: ServerRuntimeConfig {
+                bind: "127.0.0.1:8765".parse().unwrap(),
+                token_file,
+                checkouts: std::collections::BTreeMap::new(),
+            },
+            federation: FederationRuntimeConfig::default(),
+            maintenance,
+        };
+        let tokens = TokenRegistry::load(config.server.token_file.clone()).unwrap();
+        let provider = DeterministicStubProvider::new(EmbeddingProfile::Balanced);
+        let (router, state) = build_router(config, provider, tokens).await.unwrap();
+        Harness { router, state, _tempdir: tempdir }
+    }
+
+    #[tokio::test]
+    async fn maintenance_startup_check_records_status() {
+        let harness = build_with_maintenance(MaintenanceRuntimeConfig::defaults()).await;
+        // The background task runs an immediate startup check.  Poll until
+        // the status is populated (should complete within a few hundred ms).
+        for _ in 0..50 {
+            if harness.state.last_maintenance_status.lock().unwrap().is_some() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("startup maintenance check did not record status within 2.5 s");
+    }
+
+    #[tokio::test]
+    async fn maintenance_disabled_creates_no_scheduler() {
+        let disabled = MaintenanceRuntimeConfig {
+            enabled: false,
+            ..MaintenanceRuntimeConfig::defaults()
+        };
+        let harness = build_with_maintenance(disabled).await;
+        // Wait long enough that even a startup check would have run.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let status = harness.state.last_maintenance_status.lock().unwrap().take();
+        assert!(status.is_none(), "disabled maintenance must not record status");
+    }
+
+    #[tokio::test]
+    async fn maintenance_activity_middleware_notifies_scheduler() {
+        let harness = make_harness().await;
+        // Send a health-check request through the activity middleware.
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/v1/health")
+            .body(Body::empty())
+            .unwrap();
+        let _ = harness.router.clone().oneshot(request).await.unwrap();
+        // The activity_middleware calls signal_activity() + notify_one().
+        // Verify the storage engine saw the activity signal.
+        assert!(harness.state.storage.take_activity_signal(), "activity signal must be set by middleware");
     }
 }

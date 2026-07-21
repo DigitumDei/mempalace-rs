@@ -1827,7 +1827,7 @@ async fn run_serve<P>(
 where
     P: EmbeddingProvider + Send + Sync + 'static,
 {
-    let router = build_router(config, provider, tokens).await?;
+    let (router, _state) = build_router(config, provider, tokens).await?;
     let listener =
         tokio::net::TcpListener::bind(bind).await.map_err(|source| {
             mempalace_server::ServerError::Io {
@@ -3383,7 +3383,7 @@ mod tests {
 
         let tokens = rt.block_on(async { TokenRegistry::load(token_file).unwrap() });
         let provider = DeterministicStubProvider::new(EmbeddingProfile::Balanced);
-        let router = rt.block_on(build_router(config, provider, tokens)).unwrap();
+        let (router, _state) = rt.block_on(build_router(config, provider, tokens)).unwrap();
 
         let listener =
             rt.block_on(tokio::net::TcpListener::bind("127.0.0.1:0")).unwrap();
@@ -3940,7 +3940,7 @@ mod tests {
             let provider = mempalace_embeddings::DeterministicStubProvider::new(
                 EmbeddingProfile::Balanced,
             );
-            let router = mempalace_server::build_router(config, provider, tokens)
+            let (router, _state) = mempalace_server::build_router(config, provider, tokens)
                 .await
                 .unwrap();
 

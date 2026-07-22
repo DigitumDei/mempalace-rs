@@ -531,6 +531,15 @@ where
                     continue;
                 }
 
+                // Clear only activity that predates the completed idle window.
+                // Re-check elapsed time after taking the flag so a write racing
+                // this transition still postpones the run.
+                if task_state.storage.take_activity_signal()
+                    && task_state.storage.elapsed_since_last_activity()
+                        < Duration::from_secs(settings.idle_secs)
+                {
+                    continue;
+                }
                 info!("background maintenance check");
                 *task_state.maintenance_status.lock().unwrap() = MaintenanceStatus::Running;
                 match task_state.storage.run_maintenance(&settings).await {

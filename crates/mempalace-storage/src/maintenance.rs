@@ -66,6 +66,7 @@ pub struct MaintenanceTierResult {
     /// Which tier this result is for.
     pub tier: MaintenanceTier,
     /// When the tier started.
+    #[serde(with = "time::serde::rfc3339")]
     pub started_at: OffsetDateTime,
     /// Wall-clock duration of the tier operation.
     pub duration: Duration,
@@ -93,8 +94,10 @@ pub struct MaintenanceRunSummary {
     /// Monotonically increasing run identifier.
     pub run_id: u64,
     /// When the run started.
+    #[serde(with = "time::serde::rfc3339")]
     pub started_at: OffsetDateTime,
     /// When the run finished.
+    #[serde(with = "time::serde::rfc3339")]
     pub finished_at: OffsetDateTime,
     /// Wall-clock duration of the entire run.
     pub duration: Duration,
@@ -236,6 +239,7 @@ mod tests {
         let deserialized: MaintenanceTierResult = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized, result);
         assert!(json.contains("cpu_duration"));
+        assert!(json.contains("1970-01-01T00:00:00Z"));
     }
 
     #[test]
@@ -270,6 +274,7 @@ mod tests {
         let deserialized: MaintenanceRunSummary = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized, summary);
         assert!(json.contains("cpu_duration"));
+        assert!(json.contains("1970-01-01T00:00:00Z"));
     }
 
     #[test]

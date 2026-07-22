@@ -1478,19 +1478,15 @@ impl MaintenanceLeaseStore for SqliteOperationalStore {
         }
 
         let result = conn.execute(
-            "INSERT INTO maintenance_leases (lease_id, holder, expires_at, updated_at)
-             VALUES ('maintenance', ?1, ?2, ?3)
-             ON CONFLICT(lease_id) DO UPDATE SET
-                 holder = excluded.holder,
-                 expires_at = excluded.expires_at,
-                 updated_at = excluded.updated_at
-             WHERE maintenance_leases.expires_at < ?4
-                OR maintenance_leases.holder = ?5",
+            "UPDATE maintenance_leases
+             SET holder = ?1, expires_at = ?2, updated_at = ?3
+             WHERE lease_id = 'maintenance'
+               AND (expires_at < ?4 OR holder = ?5)",
             params![
                 holder,
-                encode_time(expires_at),
-                encode_time(now),
-                encode_time(now),
+                encode_lease_time(expires_at),
+                encode_lease_time(now),
+                encode_lease_time(now),
                 holder,
             ],
         );
@@ -1517,13 +1513,13 @@ impl MaintenanceLeaseStore for SqliteOperationalStore {
 
         let rows = conn.execute(
             "UPDATE maintenance_leases
-             SET expires_at = ?1, updated_at = ?2
-             WHERE lease_id = 'maintenance' AND holder = ?3 AND expires_at > ?4",
+              SET expires_at = ?1, updated_at = ?2
+              WHERE lease_id = 'maintenance' AND holder = ?3 AND expires_at > ?4",
             params![
-                encode_time(expires_at),
-                encode_time(now),
+                encode_lease_time(expires_at),
+                encode_lease_time(now),
                 holder,
-                encode_time(now),
+                encode_lease_time(now),
             ],
         )?;
 
@@ -1535,9 +1531,9 @@ impl MaintenanceLeaseStore for SqliteOperationalStore {
 
         let rows = conn.execute(
             "UPDATE maintenance_leases
-             SET holder = '', expires_at = '1970-01-01T00:00:00Z', updated_at = ?1
-             WHERE lease_id = 'maintenance' AND holder = ?2",
-            params![encode_time(OffsetDateTime::now_utc()), holder],
+              SET holder = '', expires_at = ?1, updated_at = ?1
+              WHERE lease_id = 'maintenance' AND holder = ?2",
+            params![encode_lease_time(OffsetDateTime::UNIX_EPOCH), holder],
         )?;
 
         Ok(rows > 0)
@@ -1670,6 +1666,16 @@ fn encode_time(value: OffsetDateTime) -> String {
     value
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_else(|_| value.unix_timestamp().to_string())
+}
+
+/// Encode lease timestamps with a fixed-width fractional component so SQLite's
+/// text comparison preserves their chronological order.
+fn encode_lease_time(value: OffsetDateTime) -> String {
+    value
+        .format(&time::macros::format_description!(
+            "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:9]Z"
+        ))
+        .unwrap_or_else(|_| encode_time(value))
 }
 
 fn decode_time(raw: String) -> Result<OffsetDateTime> {
@@ -2583,6 +2589,37 @@ INSERT INTO diary_summaries (entry_id, summary) VALUES ('diary/long', 'x' || 'y'
 
         let status = store.lease_status().unwrap().unwrap();
         assert_eq!(status.0, "worker-b");
+    }
+
+    #[test]
+    fn lease_timestamp_comparisons_preserve_fractional_order() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let store = SqliteOperationalStore::new(tempdir.path().join("palace.db"));
+        store.ensure_schema().unwrap();
+
+        let conn = store.open_connection().unwrap();
+        let expires_at = OffsetDateTime::from_unix_timestamp(1_767_996_800)
+            .unwrap()
+            + Duration::milliseconds(120);
+        conn.execute(
+            "UPDATE maintenance_leases SET holder = 'worker-a', expires_at = ?1 WHERE lease_id = 'maintenance'",
+            [encode_lease_time(expires_at)],
+        )
+        .unwrap();
+
+        let earlier = OffsetDateTime::from_unix_timestamp(1_767_996_800).unwrap()
+            + Duration::milliseconds(100);
+        let is_expired: bool = conn
+            .query_row(
+                "SELECT expires_at < ?1 FROM maintenance_leases WHERE lease_id = 'maintenance'",
+                [encode_lease_time(earlier)],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        // A 100 ms timestamp must remain earlier than a 120 ms lease expiry.
+        // Variable-width RFC3339 fractions compare incorrectly as SQLite TEXT.
+        assert!(!is_expired);
     }
 
     #[test]

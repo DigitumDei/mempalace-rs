@@ -4,7 +4,7 @@ use std::future::Future;
 use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -23,8 +23,6 @@ use crate::types::{
 };
 use mempalace_core::{DrawerId, DrawerRecord, EmbeddingProfile};
 use time::{Duration, OffsetDateTime};
-
-static MAINTENANCE_RUN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
 pub struct StorageEngine {
@@ -380,14 +378,13 @@ impl StorageEngine {
     /// Run a tier operation with concurrent lease renewal.
     ///
     /// Periodically renews the SQLite lease while the tier future is in
-    /// progress.  If renewal fails, `lease_lost` is set to `true` so the
-    /// caller can abort subsequent tiers.
+    /// progress. If renewal fails, the tier future is dropped immediately so
+    /// another lease holder cannot run the same operation concurrently.
     async fn with_lease_renewal<Fut, T>(
         &self,
         holder_id: &str,
         f: Fut,
-        lease_lost: &AtomicBool,
-    ) -> T
+    ) -> Option<T>
     where
         Fut: Future<Output = T>,
     {
@@ -399,12 +396,12 @@ impl StorageEngine {
         loop {
             tokio::select! {
                 biased;
-                result = &mut f => return result,
+                result = &mut f => return Some(result),
                 _ = renewal.tick() => {
                     match self.operational_store.renew_lease(holder_id, Duration::minutes(5)) {
                         Ok(true) => {},
                         _ => {
-                            lease_lost.store(true, Ordering::Release);
+                            return None;
                         }
                     }
                 }
@@ -587,8 +584,6 @@ impl StorageEngine {
             });
         }
 
-        // Shared lease-lost flag checked after each tier.
-        let lease_lost = Arc::new(AtomicBool::new(false));
         let mut remaining_recorded = false;
         // All tiers in execution order, used by record_remaining.
         let all_tiers = [
@@ -688,7 +683,13 @@ impl StorageEngine {
                 }
             };
 
-            let result = self.with_lease_renewal(&holder_id, tier_future, &lease_lost).await;
+            let Some(result) = self.with_lease_renewal(&holder_id, tier_future).await else {
+                let _ = self.operational_store.release_lease(&holder_id);
+                return Ok(maintenance_lease_lost_summary(
+                    run_id, started_at, wall_start, cpu_start, tier_results,
+                    MaintenanceTier::VectorIndexOptimization,
+                ));
+            };
             let is_failure = matches!(result.outcome, MaintenanceOutcome::Failed { .. });
             let is_skipped = matches!(result.outcome, MaintenanceOutcome::Skipped { .. });
             tier_results.push(result);
@@ -711,7 +712,7 @@ impl StorageEngine {
         }
 
         // ── 6. Tier: FragmentCompaction ─────────────────────────────────────
-        if !has_activity() && !lease_lost.load(Ordering::Acquire) {
+        if !has_activity() {
             let tier_start = Instant::now();
             let tier_cpu_start = process_cpu_time();
             let tier_started_at = OffsetDateTime::now_utc();
@@ -773,7 +774,13 @@ impl StorageEngine {
                 }
             };
 
-            let result = self.with_lease_renewal(&holder_id, tier_future, &lease_lost).await;
+            let Some(result) = self.with_lease_renewal(&holder_id, tier_future).await else {
+                let _ = self.operational_store.release_lease(&holder_id);
+                return Ok(maintenance_lease_lost_summary(
+                    run_id, started_at, wall_start, cpu_start, tier_results,
+                    MaintenanceTier::FragmentCompaction,
+                ));
+            };
             let is_failure = matches!(result.outcome, MaintenanceOutcome::Failed { .. });
             let is_skipped = matches!(result.outcome, MaintenanceOutcome::Skipped { .. });
             tier_results.push(result);
@@ -789,7 +796,7 @@ impl StorageEngine {
         }
 
         // ── 7. Tier: VersionRetention (cheapest, run last) ──────────────────
-        if !remaining_recorded && !has_activity() && !lease_lost.load(Ordering::Acquire) {
+        if !remaining_recorded && !has_activity() {
             let tier_start = Instant::now();
             let tier_cpu_start = process_cpu_time();
             let tier_started_at = OffsetDateTime::now_utc();
@@ -851,7 +858,13 @@ impl StorageEngine {
                 }
             };
 
-            let result = self.with_lease_renewal(&holder_id, tier_future, &lease_lost).await;
+            let Some(result) = self.with_lease_renewal(&holder_id, tier_future).await else {
+                let _ = self.operational_store.release_lease(&holder_id);
+                return Ok(maintenance_lease_lost_summary(
+                    run_id, started_at, wall_start, cpu_start, tier_results,
+                    MaintenanceTier::VersionRetention,
+                ));
+            };
             let is_failure = matches!(result.outcome, MaintenanceOutcome::Failed { .. });
             let is_skipped = matches!(result.outcome, MaintenanceOutcome::Skipped { .. });
             tier_results.push(result);
@@ -889,8 +902,37 @@ impl StorageEngine {
 }
 
 fn next_maintenance_holder_id() -> String {
-    let sequence = MAINTENANCE_RUN_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    format!("maintenance-{}-{sequence}", std::process::id())
+    format!("maintenance-{}", uuid::Uuid::new_v4())
+}
+
+fn maintenance_lease_lost_summary(
+    run_id: u64,
+    started_at: OffsetDateTime,
+    wall_start: Instant,
+    cpu_start: Duration,
+    mut tier_results: Vec<MaintenanceTierResult>,
+    tier: MaintenanceTier,
+) -> MaintenanceRunSummary {
+    tier_results.push(MaintenanceTierResult {
+        tier,
+        started_at: OffsetDateTime::now_utc(),
+        duration: Duration::ZERO,
+        cpu_duration: Duration::ZERO,
+        outcome: MaintenanceOutcome::Aborted {
+            reason: MaintenanceAbortReason::ConcurrentRun,
+            items_affected: 0,
+        },
+    });
+    let elapsed = wall_start.elapsed();
+    MaintenanceRunSummary {
+        run_id,
+        started_at,
+        finished_at: OffsetDateTime::now_utc(),
+        duration: Duration::seconds_f64(elapsed.as_secs_f64()),
+        cpu_duration: process_cpu_time().saturating_sub(cpu_start),
+        status: MaintenanceRunStatus::Failure,
+        tier_results,
+    }
 }
 
 /// Returns the current process CPU time (user + system) as a
@@ -1523,10 +1565,11 @@ mod tests {
         *first.test_tier_1_notify.lock().unwrap() = Some(notify_tx);
         *first.test_tier_1_wait.lock().unwrap() = Some(continue_rx);
         let settings = MaintenanceSettings { idle_secs: 0, ..MaintenanceSettings::default() };
+        let first_settings = settings.clone();
 
         let first_run = {
             let first = Arc::clone(&first);
-            tokio::spawn(async move { first.run_maintenance(&settings).await.unwrap() })
+            tokio::spawn(async move { first.run_maintenance(&first_settings).await.unwrap() })
         };
         notify_rx.await.unwrap();
 

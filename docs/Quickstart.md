@@ -4,7 +4,9 @@ Get MemPalace running and connected to your AI in a few minutes.
 
 ## 1. Install
 
-The installer downloads the latest nightly binaries for your platform, verifies checksums against the published `SHA256SUMS`, installs them to `~/.mempalace/bin`, adds that directory to your PATH, and runs `mempalace-cli setup` to register the MCP server with detected AI tools.
+The installer downloads the latest **stable** release binaries for your platform, verifies the Ed25519 signature over `manifest.json` and `SHA256SUMS` against the [pinned public key](../release/public-key.pem), then verifies asset checksums — all before writing anything to disk. It installs to `~/.mempalace/bin`, adds that directory to your PATH, and runs `mempalace-cli setup` to register the MCP server with detected AI tools.
+
+### Stable (default, recommended)
 
 **macOS (Apple Silicon) / Linux (x86_64, glibc 2.38+):**
 
@@ -18,19 +20,49 @@ curl -fsSL https://raw.githubusercontent.com/DigitumDei/mempalace-rs/main/instal
 irm https://raw.githubusercontent.com/DigitumDei/mempalace-rs/main/install.ps1 | iex
 ```
 
-Options:
+### Candidate / nightly (explicit tag)
+
+Install an immutable candidate prerelease for testing by specifying its full tag:
+
+```bash
+# Shell
+curl -fsSL https://raw.githubusercontent.com/DigitumDei/mempalace-rs/main/install.sh | sh -s -- --channel nightly-<40-hex-commit-sha>
+
+# PowerShell
+$env:MEMPALACE_CHANNEL='nightly-<40-hex-commit-sha>'
+irm https://raw.githubusercontent.com/DigitumDei/mempalace-rs/main/install.ps1 | iex
+```
+
+Find available candidate tags on the [Releases page](https://github.com/DigitumDei/mempalace-rs/releases) — look for tags starting with `nightly-`.
+
+### Options
 
 | sh flag | ps1 parameter | Effect |
 |---|---|---|
+| `--channel <tag>` | `-Channel <tag>` (or `$env:MEMPALACE_CHANNEL`) | install channel: `stable` or explicit candidate tag |
 | `--no-setup` | `-NoSetup` (or `$env:MEMPALACE_NO_SETUP='1'`) | skip MCP registration |
 | `--no-path` | `-NoPath` (or `$env:MEMPALACE_NO_PATH='1'`) | don't touch your PATH |
 | `--install-dir <dir>` | `-InstallDir <dir>` (or `$env:MEMPALACE_INSTALL_DIR`) | install elsewhere |
 
 Pass sh flags through the pipe with `| sh -s -- --no-setup`. For PowerShell parameters, download the script first (`irm ... -OutFile install.ps1`) — env vars work with the piped one-liner.
 
-Nightlies are rolling builds from `main`; re-run the installer any time to update in place.
+### Verification chain
 
-Supported platforms: Linux x86_64 (glibc 2.38+), macOS Apple Silicon, Windows x86_64. Anything else (Intel macOS, ARM Linux, musl) has no prebuilt ONNX Runtime — build from source instead.
+Every release ships:
+- `manifest.json` — structured metadata (version, commit, run, asset digests/sizes)
+- `manifest.json.sig` — Ed25519 signature over raw manifest bytes
+- `SHA256SUMS` — per-file SHA-256 checksums
+- `SHA256SUMS.sig` — Ed25519 signature over raw SHA256SUMS bytes
+
+The installer verifies signatures using the pinned public key embedded in the installer script. The corresponding signing key is stored as a GitHub secret and never committed.
+
+### Supported platforms
+
+- Linux x86_64 (glibc 2.38+)
+- macOS Apple Silicon
+- Windows x86_64
+
+Anything else (Intel macOS, ARM Linux, musl) has no prebuilt ONNX Runtime — build from source instead.
 
 ### 1b. Build from source (alternative)
 

@@ -365,53 +365,131 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-  publish-nightly:
-    name: Publish Nightly Release
+  publish-candidate:
+    name: Publish Candidate Release
     runs-on: ubuntu-latest
     needs:
       - release-host
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     permissions:
       contents: write
+      attestations: write
+      id-token: write
 
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+
+      - name: Install OpenSSL (for signing)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssl
 
       - name: Download release artifacts
         uses: actions/download-artifact@v8
         with:
           pattern: release-*
           merge-multiple: true
-          path: nightly
+          path: candidate
 
-      - name: Stage nightly assets
+      - name: Stage candidate assets and compute metadata
+        id: metadata
+        shell: bash
+        env:
+          SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
         run: |
-          short_sha="${GITHUB_SHA::7}"
-          chmod +x nightly/mempalace-* || true
-          (cd nightly && sha256sum * > SHA256SUMS)
-          echo "SHORT_SHA=$short_sha" >> "$GITHUB_ENV"
+          chmod +x candidate/mempalace-* || true
+          cd candidate
 
-      - name: Publish rolling nightly release
+          SHORT_SHA="${GITHUB_SHA::7}"
+
+          # Build structured manifest
+          ASSETS_JSON="["
+          FIRST=true
+          for f in mempalace-cli-* mempalace-mcp-*; do
+            [ -f "$f" ] || continue
+            DIGEST=$(sha256sum "$f" | cut -d' ' -f1)
+            SIZE=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null || echo 0)
+            NAME="$f"
+            if [ "$FIRST" = true ]; then FIRST=false; else ASSETS_JSON+=","; fi
+            ASSETS_JSON+="{\"name\":\"$NAME\",\"sha256\":\"$DIGEST\",\"size\":$SIZE}"
+          done
+          ASSETS_JSON+="]"
+
+          # Write manifest
+          cat > manifest.json <<MANIFEST_EOF
+          {
+            "version": "0.0.0-nightly.${SHORT_SHA}",
+            "commit": "${GITHUB_SHA}",
+            "run_id": ${GITHUB_RUN_ID},
+            "run_attempt": ${GITHUB_RUN_ATTEMPT},
+            "tag": "nightly-${GITHUB_SHA}",
+            "channel": "nightly",
+            "assets": ${ASSETS_JSON}
+          }
+          MANIFEST_EOF
+
+          # Write SHA256SUMS
+          sha256sum mempalace-cli-* mempalace-mcp-* > SHA256SUMS
+
+          # Sign manifest and SHA256SUMS
+          PRIVKEY_FILE="$(mktemp)"
+          trap 'rm -f "${PRIVKEY_FILE}"' EXIT
+          printf '%s\n' "${SIGNING_KEY}" > "${PRIVKEY_FILE}"
+          openssl dgst -sha256 -sign "${PRIVKEY_FILE}" -out manifest.json.sig manifest.json
+          openssl dgst -sha256 -sign "${PRIVKEY_FILE}" -out SHA256SUMS.sig SHA256SUMS
+          rm -f "${PRIVKEY_FILE}"
+
+          # Compute commit tag
+          echo "CANDIDATE_TAG=nightly-${GITHUB_SHA}" >> "$GITHUB_ENV"
+          echo "CANDIDATE_NAME=Candidate (${GITHUB_SHA})" >> "$GITHUB_ENV"
+
+      - name: Generate artifact attestation
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: |
+            candidate/mempalace-cli-*
+            candidate/mempalace-mcp-*
+            candidate/manifest.json
+            candidate/SHA256SUMS
+            candidate/manifest.json.sig
+            candidate/SHA256SUMS.sig
+
+      - name: Publish immutable candidate release
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: nightly
-          name: Nightly (${{ env.SHORT_SHA }})
+          tag_name: nightly-${{ github.sha }}
+          name: Candidate (${{ github.sha }})
           body: |
-            Rolling nightly build from `main` @ ${{ github.sha }}.
+            Immutable candidate build from `main` @ `${{ github.sha }}`.
 
-            Binaries (each as `mempalace-cli-*` and `mempalace-mcp-*`):
-            - `linux-x86_64` — glibc (requires glibc 2.38+, set by the bundled ONNX Runtime)
+            **Binaries** (each as `mempalace-cli-*` and `mempalace-mcp-*`):
+            - `linux-x86_64` — glibc (requires glibc 2.38+)
             - `macos-arm64` (Apple Silicon)
             - `windows-x86_64.exe`
 
-            Intel macOS, musl, and older-glibc targets are not shipped: `ort` provides
-            no prebuilt ONNX Runtime for them.
+            **Artifacts:**
+            - `manifest.json` — structured metadata (version, commit, run, asset digests/sizes)
+            - `manifest.json.sig` — Ed25519 signature over raw manifest bytes
+            - `SHA256SUMS` — per-file checksums
+            - `SHA256SUMS.sig` — Ed25519 signature over raw SHA256SUMS bytes
 
-            `SHA256SUMS` lists checksums for every asset.
-            Overwritten on every push to `main`. Not a stable release.
+            Verify with the committed public key (`release/public-key.pem`):
+            ```shell
+            openssl dgst -sha256 -verify release/public-key.pem \
+              -signature manifest.json.sig manifest.json
+            ```
+
+            This is a **candidate prerelease** keyed to this exact commit.
+            Promote to stable via the "Promote Release" workflow.
           prerelease: true
           make_latest: false
           target_commitish: ${{ github.sha }}
-          files: nightly/*
+          files: |
+            candidate/mempalace-cli-*
+            candidate/mempalace-mcp-*
+            candidate/manifest.json
+            candidate/manifest.json.sig
+            candidate/SHA256SUMS
+            candidate/SHA256SUMS.sig
           fail_on_unmatched_files: true

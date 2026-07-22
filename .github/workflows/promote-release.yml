@@ -1,0 +1,316 @@
+name: promote-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Semantic version to publish (e.g. 0.1.0). Must not already exist as a tag.'
+        required: true
+        type: string
+      candidate_tag:
+        description: 'Immutable candidate tag to promote (e.g. nightly-<full 40-hex commit SHA>).'
+        required: true
+        type: string
+
+concurrency:
+  group: promote-release-${{ inputs.version }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  promote:
+    name: Promote Candidate to Stable
+    runs-on: ubuntu-latest
+    # Only on main branch with protected environment
+    if: github.ref == 'refs/heads/main'
+    environment: release-promotion
+    permissions:
+      contents: write
+      attestations: write
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install OpenSSL (for signature verification)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssl
+
+      # -----------------------------------------------------------------------
+      # Validate inputs
+      # -----------------------------------------------------------------------
+      - name: Validate semantic version
+        id: validate-version
+        shell: bash
+        run: |
+          VERSION="${{ inputs.version }}"
+          # Must be semver (major.minor.patch with optional prerelease/build)
+          if ! echo "${VERSION}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?(\+[a-zA-Z0-9.]+)?$'; then
+            echo "error: '$VERSION' is not a valid semantic version"
+            exit 1
+          fi
+          echo "VERSION_TAG=v${VERSION}" >> "$GITHUB_ENV"
+
+      - name: Validate candidate tag format
+        shell: bash
+        run: |
+          TAG="${{ inputs.candidate_tag }}"
+          if ! echo "${TAG}" | grep -qE '^nightly-[0-9a-f]{40}$'; then
+            echo "error: candidate tag must be nightly-<40 hex chars>, got '$TAG'"
+            exit 1
+          fi
+          echo "CANDIDATE_TAG=${TAG}" >> "$GITHUB_ENV"
+          # Extract commit SHA from tag (strip nightly- prefix)
+          CANDIDATE_SHA="${TAG#nightly-}"
+          echo "CANDIDATE_SHA=${CANDIDATE_SHA}" >> "$GITHUB_ENV"
+
+      - name: Check stable tag does not already exist
+        shell: bash
+        run: |
+          VERSION_TAG="v${{ inputs.version }}"
+          # Fetch existing tags and check
+          git fetch --tags origin 2>&1 || true
+          if git tag -l | grep -qF "${VERSION_TAG}"; then
+            echo "error: tag '${VERSION_TAG}' already exists. Stable release versions must be unique."
+            exit 1
+          fi
+          echo "STABLE_TAG=${VERSION_TAG}" >> "$GITHUB_ENV"
+
+      # -----------------------------------------------------------------------
+      # Verify the release public key is committed
+      # -----------------------------------------------------------------------
+      - name: Verify release public key exists
+        shell: bash
+        run: |
+          if [ ! -f release/public-key.pem ]; then
+            echo "error: release/public-key.pem not found in repository"
+            exit 1
+          fi
+          echo "Public key found at release/public-key.pem"
+
+      # -----------------------------------------------------------------------
+      # Download candidate assets and verify signatures
+      # -----------------------------------------------------------------------
+      - name: Download candidate release assets
+        shell: bash
+        run: |
+          mkdir -p candidate
+          gh release download "${{ env.CANDIDATE_TAG }}" \
+            --repo "${{ github.repository }}" \
+            --dir candidate \
+            --skip-existing 2>&1
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Verify candidate release signature chain
+        shell: bash
+        run: |
+          cd candidate
+
+          # Verify manifest signature
+          if [ ! -f manifest.json ] || [ ! -f manifest.json.sig ]; then
+            echo "error: manifest.json or manifest.json.sig missing from candidate"
+            exit 1
+          fi
+          if ! openssl dgst -sha256 -verify "../release/public-key.pem" \
+            -signature manifest.json.sig manifest.json 2>&1; then
+            echo "error: manifest.json signature verification FAILED"
+            exit 1
+          fi
+          echo "✓ manifest.json signature verified"
+
+          # Verify SHA256SUMS signature
+          if [ ! -f SHA256SUMS ] || [ ! -f SHA256SUMS.sig ]; then
+            echo "error: SHA256SUMS or SHA256SUMS.sig missing from candidate"
+            exit 1
+          fi
+          if ! openssl dgst -sha256 -verify "../release/public-key.pem" \
+            -signature SHA256SUMS.sig SHA256SUMS 2>&1; then
+            echo "error: SHA256SUMS signature verification FAILED"
+            exit 1
+          fi
+          echo "✓ SHA256SUMS signature verified"
+
+      # -----------------------------------------------------------------------
+      # Validate candidate manifest content
+      # -----------------------------------------------------------------------
+      - name: Validate candidate manifest
+        shell: bash
+        run: |
+          cd candidate
+
+          # Parse manifest
+          MANIFEST_COMMIT=$(jq -r '.commit' manifest.json)
+          MANIFEST_TAG=$(jq -r '.tag' manifest.json)
+          MANIFEST_CHANNEL=$(jq -r '.channel' manifest.json)
+          ASSET_COUNT=$(jq '.assets | length' manifest.json)
+
+          echo "Manifest commit: ${MANIFEST_COMMIT}"
+          echo "Manifest tag: ${MANIFEST_TAG}"
+          echo "Manifest channel: ${MANIFEST_CHANNEL}"
+          echo "Asset count: ${ASSET_COUNT}"
+
+          # Verify candidate/version correspondence
+          if [ "${MANIFEST_CHANNEL}" != "nightly" ]; then
+            echo "error: manifest channel is '${MANIFEST_CHANNEL}', expected 'nightly'"
+            exit 1
+          fi
+
+          # Verify commit matches tag-derived SHA
+          EXPECTED_SHA="${{ env.CANDIDATE_SHA }}"
+          if [ "${MANIFEST_COMMIT}" != "${EXPECTED_SHA}" ]; then
+            echo "error: manifest commit '${MANIFEST_COMMIT}' does not match tag SHA '${EXPECTED_SHA}'"
+            exit 1
+          fi
+          echo "✓ Candidate commit matches tag"
+
+          # Verify expected tag in manifest
+          EXPECTED_TAG="nightly-${EXPECTED_SHA}"
+          if [ "${MANIFEST_TAG}" != "${EXPECTED_TAG}" ]; then
+            echo "error: manifest tag '${MANIFEST_TAG}' does not match expected '${EXPECTED_TAG}'"
+            exit 1
+          fi
+          echo "✓ Manifest tag matches"
+
+          # Verify expected asset inventory
+          EXPECTED_ASSETS=6
+          if [ "${ASSET_COUNT}" -lt 3 ]; then
+            echo "error: expected at least 3 assets (cli + mcp per platform), got ${ASSET_COUNT}"
+            exit 1
+          fi
+          echo "✓ Asset count (${ASSET_COUNT}) is reasonable"
+
+          # Verify each asset in manifest exists on disk and matches checksum
+          for asset_name in $(jq -r '.assets[].name' manifest.json); do
+            if [ ! -f "${asset_name}" ]; then
+              echo "error: asset '${asset_name}' listed in manifest but not found on disk"
+              exit 1
+            fi
+            # Verify checksum from SHA256SUMS
+            EXPECTED_DIGEST=$(grep -F " ${asset_name}" SHA256SUMS | head -1 | awk '{print $1}')
+            if [ -z "${EXPECTED_DIGEST}" ]; then
+              echo "error: asset '${asset_name}' not found in SHA256SUMS"
+              exit 1
+            fi
+            ACTUAL_DIGEST=$(sha256sum "${asset_name}" | awk '{print $1}')
+            if [ "${ACTUAL_DIGEST}" != "${EXPECTED_DIGEST}" ]; then
+              echo "error: checksum mismatch for '${asset_name}'"
+              exit 1
+            fi
+            echo "  ✓ ${asset_name} checksum verified"
+          done
+          echo "✓ All candidate assets verified on disk"
+
+      # -----------------------------------------------------------------------
+      # Build stable manifest (re-signing only stable metadata)
+      # -----------------------------------------------------------------------
+      - name: Build stable manifest and checksums
+        shell: bash
+        env:
+          SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: |
+          # Capture candidate manifest values for the provenance section later
+          CANDIDATE_RUN_ID=$(jq -r '.run_id' ../candidate/manifest.json)
+          echo "CANDIDATE_RUN_ID=${CANDIDATE_RUN_ID}" >> "$GITHUB_ENV"
+
+          mkdir -p stable
+          cd stable
+
+          # Copy binaries from candidate
+          cp ../candidate/mempalace-cli-* .
+          cp ../candidate/mempalace-mcp-* .
+
+          # Write stable manifest
+          STABLE_VERSION="${{ inputs.version }}"
+          cat > manifest.json <<MANIFEST_EOF
+          {
+            "version": "${STABLE_VERSION}",
+            "commit": "${{ env.CANDIDATE_SHA }}",
+            "run_id": ${CANDIDATE_RUN_ID},
+            "run_attempt": $(jq '.run_attempt' ../candidate/manifest.json),
+            "candidate_tag": "${{ env.CANDIDATE_TAG }}",
+            "tag": "v${STABLE_VERSION}",
+            "channel": "stable",
+            "assets": $(jq '.assets' ../candidate/manifest.json)
+          }
+          MANIFEST_EOF
+
+          # Write SHA256SUMS
+          sha256sum mempalace-cli-* mempalace-mcp-* > SHA256SUMS
+
+          # Sign with release key
+          PRIVKEY_FILE="$(mktemp)"
+          trap 'rm -f "${PRIVKEY_FILE}"' EXIT
+          printf '%s\n' "${SIGNING_KEY}" > "${PRIVKEY_FILE}"
+          openssl dgst -sha256 -sign "${PRIVKEY_FILE}" -out manifest.json.sig manifest.json
+          openssl dgst -sha256 -sign "${PRIVKEY_FILE}" -out SHA256SUMS.sig SHA256SUMS
+          rm -f "${PRIVKEY_FILE}"
+
+          echo "✓ Stable manifest and signatures created"
+
+      - name: Generate artifact attestation
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: |
+            stable/mempalace-cli-*
+            stable/mempalace-mcp-*
+            stable/manifest.json
+            stable/SHA256SUMS
+            stable/manifest.json.sig
+            stable/SHA256SUMS.sig
+
+      # -----------------------------------------------------------------------
+      # Publish stable release
+      # -----------------------------------------------------------------------
+      - name: Publish stable release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: v${{ inputs.version }}
+          name: v${{ inputs.version }}
+          body: |
+            ## MemPalace v${{ inputs.version }}
+
+            **Stable release** — promoted from candidate `${{ env.CANDIDATE_TAG }}`.
+
+            ### Binaries
+            - `linux-x86_64` — glibc (requires glibc 2.38+)
+            - `macos-arm64` (Apple Silicon)
+            - `windows-x86_64.exe`
+
+            ### Verification
+            ```shell
+            # Verify manifest signature
+            openssl dgst -sha256 -verify release/public-key.pem \
+              -signature manifest.json.sig manifest.json
+
+            # Verify checksums signature
+            openssl dgst -sha256 -verify release/public-key.pem \
+              -signature SHA256SUMS.sig SHA256SUMS
+
+            # Verify individual asset
+            sha256sum --check SHA256SUMS --ignore-missing
+            ```
+
+            ### Provenance
+            - **Source commit:** `${{ env.CANDIDATE_SHA }}`
+            - **Build run:** ${{ github.repository }}/actions/runs/${{ env.CANDIDATE_RUN_ID }}
+            - **Candidate tag:** `${{ env.CANDIDATE_TAG }}`
+            - **Channel:** stable
+
+            See [Packaging-And-Validation.md](${{ github.server_url }}/${{ github.repository }}/blob/main/docs/Packaging-And-Validation.md) for the full release process and [Quickstart.md](${{ github.server_url }}/${{ github.repository }}/blob/main/docs/Quickstart.md) for installation.
+          prerelease: false
+          make_latest: true
+          target_commitish: ${{ env.CANDIDATE_SHA }}
+          files: |
+            stable/mempalace-cli-*
+            stable/mempalace-mcp-*
+            stable/manifest.json
+            stable/manifest.json.sig
+            stable/SHA256SUMS
+            stable/SHA256SUMS.sig
+          fail_on_unmatched_files: true

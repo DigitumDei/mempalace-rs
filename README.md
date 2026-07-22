@@ -10,7 +10,7 @@ MemPalace stores conversation and project context locally so your AI can search 
 
 ## Quick start
 
-Install the latest nightly build — downloads the binaries for your platform, verifies checksums, installs to `~/.mempalace/bin`, adds it to your PATH, and registers the MCP server with detected AI tools (Claude Code, Codex, Gemini, and more):
+Install the latest **stable** release — downloads the signed binaries for your platform, verifies the Ed25519 signature over the release manifest and checksums against the [pinned public key](release/public-key.pem), installs to `~/.mempalace/bin`, adds it to your PATH, and registers the MCP server with detected AI tools (Claude Code, Codex, Gemini, and more):
 
 **macOS (Apple Silicon) / Linux (x86_64, glibc 2.38+):**
 
@@ -31,9 +31,29 @@ mempalace-cli init /path/to/project
 mempalace-cli mine /path/to/project
 ```
 
-Nightlies are rolling builds from `main`; re-run the installer to update. Other platforms (Intel macOS, ARM Linux, musl) need a [source build](docs/Quickstart.md#1b-build-from-source-alternative).
+The installer defaults to the latest **stable** release, verifies cryptographic signatures, and rejects invalid or unsigned releases. To install a specific **candidate** (immutable nightly prerelease) for testing, pass its tag explicitly:
+
+```bash
+# Shell: install a specific immutable candidate
+curl -fsSL https://raw.githubusercontent.com/DigitumDei/mempalace-rs/main/install.sh | sh -s -- --channel nightly-<40-hex-commit-sha>
+
+# PowerShell: install a specific immutable candidate
+$env:MEMPALACE_CHANNEL='nightly-<40-hex-commit-sha>'
+irm https://raw.githubusercontent.com/DigitumDei/mempalace-rs/main/install.ps1 | iex
+```
+
+Other platforms (Intel macOS, ARM Linux, musl) need a [source build](docs/Quickstart.md#1b-build-from-source-alternative).
 
 See the [Quickstart guide](docs/Quickstart.md) for the full walkthrough — installing, initializing, mining, searching, and connecting to Claude/Cursor/Cline.
+
+## Release Channels
+
+MemPalace uses two distinct distribution channels:
+
+- **Stable** (`v<semver>`) — immutable, cryptographically signed releases promoted from tested candidates. Default installer target. Verifiable via the [committed public key](release/public-key.pem).
+- **Candidate** (`nightly-<40-hex-commit-sha>`) — immutable prerelease for every push to `main`. Install explicitly by tag for pre-release testing. Never used as the default installer target.
+
+Every release ships a signed `manifest.json` and `SHA256SUMS` with Ed25519 signatures. See [Packaging and Validation](docs/Packaging-And-Validation.md) for details.
 
 ## Overview
 

@@ -1751,9 +1751,9 @@ mod tests {
     use time::macros::datetime;
 
     use super::{
-        ChangeCursor, ChangeEvent, ChangeLogStore, ChangePage, DiaryStore, EntityRegistryStore, GraphStore,
-        IngestManifestStore, KnowledgeGraphStore, MIGRATIONS, MaintenanceLeaseStore,
-        SqliteOperationalStore, ToolStateStore,
+        ChangeCursor, ChangeEvent, ChangeLogStore, ChangePage, DiaryStore, EntityRegistryStore,
+        GraphStore, IngestManifestStore, KnowledgeGraphStore, MIGRATIONS, MaintenanceLeaseStore,
+        SqliteOperationalStore, ToolStateStore, encode_lease_time,
     };
     use crate::types::{
         ConfigEntry, EntityRecord, GraphDocument, IngestManifestEntry, IngestRunStatus,
@@ -1762,7 +1762,7 @@ mod tests {
     use mempalace_core::{DIARY_SUMMARY_MAX_CHARS, DrawerId};
     use serde_json::json;
     use time::macros::date;
-    use time::Duration;
+    use time::{Duration, OffsetDateTime};
 
     #[test]
     fn change_log_records_and_queries_events() {

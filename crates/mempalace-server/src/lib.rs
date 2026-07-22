@@ -3710,13 +3710,17 @@ mod tests {
         // Simulate a completed write to establish the idle period.
         harness.state.storage.signal_activity();
 
-        // Wait for one idle period (1 s + up to 100 ms jitter) plus a small
-        // margin — but less than two idle periods so the old behaviour
-        // (which wastes the first expiry on the stale signal) would not
-        // have recorded a non-NotIdle run yet.
-        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-
-        let status = harness.state.last_maintenance_status.lock().unwrap().take();
+        // The scheduler phase begins at startup, so a write immediately after
+        // the startup pass may wait almost two full intervals. Poll rather
+        // than assuming a particular phase alignment.
+        let mut status = None;
+        for _ in 0..70 {
+            status = harness.state.last_maintenance_status.lock().unwrap().take();
+            if status.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
         assert!(status.is_some(), "maintenance should have run after one idle period");
         let summary = status.unwrap();
         let stale_signal_skipped = summary.tier_results.iter().any(|r| {

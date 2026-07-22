@@ -12,7 +12,7 @@
 #   --channel <channel>  stable (default) or explicit nightly candidate
 #   --version <tag>      required immutable nightly-<full-commit-sha> tag for nightly
 
-set -euo pipefail
+set -eu
 
 REPO="DigitumDei/mempalace-rs"
 INSTALL_DIR="${HOME}/.mempalace/bin"

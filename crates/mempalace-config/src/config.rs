@@ -1008,7 +1008,7 @@ fn resolve_maintenance_config(
     let mut config = MaintenanceRuntimeConfig::defaults().with_overrides(file_section, config_path)?;
 
     if let Some(val) = enabled_override {
-        config.enabled = parse_env_flag(&val);
+        config.enabled = parse_env_flag(&val, config_path)?;
     }
     if let Some(val) = idle_secs_override {
         config.idle_secs = val.parse::<usize>().map_err(|_| MempalaceError::ConfigParse {
@@ -1077,8 +1077,17 @@ fn resolve_maintenance_config(
     Ok(config)
 }
 
-fn parse_env_flag(value: &str) -> bool {
-    matches!(value, "1" | "true" | "TRUE" | "yes" | "YES")
+fn parse_env_flag(value: &str, config_path: &Path) -> Result<bool> {
+    match value {
+        "1" | "true" | "TRUE" | "yes" | "YES" => Ok(true),
+        "0" | "false" | "FALSE" | "no" | "NO" => Ok(false),
+        _ => Err(MempalaceError::ConfigParse {
+            path: config_path.to_path_buf(),
+            message: format!(
+                "MEMPALACE_MAINTENANCE_ENABLED `{value}` is not a valid boolean; expected true or false"
+            ),
+        }),
+    }
 }
 
 fn resolve_server_config(
@@ -2030,6 +2039,27 @@ mod tests {
         assert_eq!(config.maintenance.tail_threshold_rows, 256);
         assert_eq!(config.maintenance.small_fragment_threshold, 10);
 
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn invalid_maintenance_enabled_env_override_is_rejected() {
+        let base = temp_dir();
+        ConfigLoader::init_default(Some(&base)).unwrap();
+
+        let err = ConfigLoader::load_from_sources(
+            Some(&base),
+            None,
+            None,
+            Some("ture".to_owned()),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("MEMPALACE_MAINTENANCE_ENABLED `ture`"));
         fs::remove_dir_all(base).unwrap();
     }
 

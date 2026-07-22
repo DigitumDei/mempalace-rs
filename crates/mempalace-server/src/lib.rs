@@ -60,7 +60,7 @@ use serde_json::{Value, json};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 use time::{Date, OffsetDateTime, format_description::well_known::Rfc3339};
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 // ─── Constants ───────────────────────────────────────────────────────────────
@@ -423,9 +423,6 @@ pub struct ServerState<P> {
     pub last_maintenance_status: std::sync::Mutex<Option<MaintenanceRunSummary>>,
     /// Typed status of the maintenance subsystem.
     pub maintenance_status: std::sync::Mutex<MaintenanceStatus>,
-    /// Notify channel: signals the background maintenance task that
-    /// activity has occurred, resetting the idle timer.
-    pub activity_notify: Notify,
 }
 
 // ─── Router builder ──────────────────────────────────────────────────────────
@@ -489,22 +486,21 @@ where
         tokens: Arc::new(tokens),
         last_maintenance_status: std::sync::Mutex::new(None),
         maintenance_status: std::sync::Mutex::new(initial_status),
-        activity_notify: Notify::new(),
     });
 
     // ── Background maintenance task ──────────────────────────────────────────
     //
     // Runs only in the long-lived HTTP hub.  Starts with an immediate startup
     // check, then loops with a jittered sleep so concurrent hubs do not
-    // synchronise their runs.  Every request resets the idle timer via the
-    // activity middleware, so maintenance only fires when the server has been
-    // idle for the configured duration.
+    // synchronise their runs. Storage write paths reset the idle timer, so
+    // maintenance only fires when writes have been idle for the configured duration.
     if maintenance_settings.enabled {
         let task_state = Arc::clone(&state);
         let settings = maintenance_settings;
         tokio::spawn(async move {
             // Startup maintenance check
             info!("performing startup maintenance check");
+            *task_state.maintenance_status.lock().unwrap() = MaintenanceStatus::Running;
             match task_state.storage.run_maintenance(&settings).await {
                 Ok(summary) => {
                     *task_state.last_maintenance_status.lock().unwrap() = Some(summary.clone());
@@ -528,40 +524,29 @@ where
                     Duration::from_secs_f64(jitter_frac * base.as_secs_f64() * 0.1);
                 let sleep_dur = base + jitter;
 
-                tokio::select! {
-                    _ = tokio::time::sleep(sleep_dur) => {
-                        // Drain any stale activity signal left by the request that
-                        // reset the timer.  If the system is genuinely idle, proceed;
-                        // otherwise restart the idle timer.
-                        task_state.storage.take_activity_signal();
-                        if task_state.storage.elapsed_since_last_activity()
-                            < Duration::from_secs(settings.idle_secs)
-                        {
-                            continue;
-                        }
+                tokio::time::sleep(sleep_dur).await;
+                if task_state.storage.elapsed_since_last_activity()
+                    < Duration::from_secs(settings.idle_secs)
+                {
+                    continue;
+                }
 
-                        info!("background maintenance check");
-                        match task_state.storage.run_maintenance(&settings).await {
-                            Ok(summary) => {
-                                *task_state.last_maintenance_status.lock().unwrap() = Some(summary.clone());
-                                *task_state.maintenance_status.lock().unwrap() = summary_to_status(&summary);
-                            }
-                            Err(e) => {
-                                warn!(error = %e, "background maintenance run failed");
-                                *task_state.maintenance_status.lock().unwrap() =
-                                    MaintenanceStatus::Failed { message: e.to_string() };
-                            }
-                        }
+                info!("background maintenance check");
+                *task_state.maintenance_status.lock().unwrap() = MaintenanceStatus::Running;
+                match task_state.storage.run_maintenance(&settings).await {
+                    Ok(summary) => {
+                        *task_state.last_maintenance_status.lock().unwrap() = Some(summary.clone());
+                        *task_state.maintenance_status.lock().unwrap() = summary_to_status(&summary);
                     }
-                    _ = task_state.activity_notify.notified() => {
-                        // Activity detected — loop restarts, pending sleep is cancelled.
+                    Err(e) => {
+                        warn!(error = %e, "background maintenance run failed");
+                        *task_state.maintenance_status.lock().unwrap() =
+                            MaintenanceStatus::Failed { message: e.to_string() };
                     }
                 }
             }
         });
     }
-
-    let activity_state = Arc::clone(&state);
 
     // Unauthenticated routes
     let public = Router::new().route("/v1/health", get(route_health));
@@ -596,7 +581,7 @@ where
         .layer(middleware::from_fn_with_state(Arc::clone(&state), auth_middleware::<P>));
 
     let router = public.merge(protected).merge(ingest_route).with_state(Arc::clone(&state));
-    Ok((router.layer(middleware::from_fn_with_state(activity_state, activity_middleware::<P>)), state))
+    Ok((router, state))
 }
 
 // ─── Auth middleware ──────────────────────────────────────────────────────────
@@ -622,23 +607,6 @@ where
         }
         None => ServerError::Unauthorized.into_response(),
     }
-}
-
-// ─── Activity middleware ───────────────────────────────────────────────────────
-
-/// Signals activity on every incoming request so the background maintenance
-/// scheduler resets its idle timer.
-async fn activity_middleware<P>(
-    State(state): State<Arc<ServerState<P>>>,
-    request: Request<Body>,
-    next: Next,
-) -> Response
-where
-    P: EmbeddingProvider + Send + Sync + 'static,
-{
-    state.storage.signal_activity();
-    state.activity_notify.notify_one();
-    next.run(request).await
 }
 
 // ─── Health ──────────────────────────────────────────────────────────────────
@@ -3695,18 +3663,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn maintenance_activity_middleware_notifies_scheduler() {
+    async fn maintenance_health_check_does_not_signal_write_activity() {
         let harness = make_harness().await;
-        // Send a health-check request through the activity middleware.
         let request = Request::builder()
             .method(Method::GET)
             .uri("/v1/health")
             .body(Body::empty())
             .unwrap();
         let _ = harness.router.clone().oneshot(request).await.unwrap();
-        // The activity_middleware calls signal_activity() + notify_one().
-        // Verify the storage engine saw the activity signal.
-        assert!(harness.state.storage.take_activity_signal(), "activity signal must be set by middleware");
+        assert!(
+            !harness.state.storage.take_activity_signal(),
+            "read-only health checks must not postpone maintenance",
+        );
     }
 
     #[tokio::test]
@@ -3730,14 +3698,8 @@ mod tests {
         // Clear the startup status so we can detect the next run.
         *harness.state.last_maintenance_status.lock().unwrap() = None;
 
-        // Send a request through the activity middleware.  This sets the
-        // activity signal and resets the scheduler's idle timer.
-        let request = Request::builder()
-            .method(Method::GET)
-            .uri("/v1/health")
-            .body(Body::empty())
-            .unwrap();
-        let _ = harness.router.clone().oneshot(request).await.unwrap();
+        // Simulate a completed write to establish the idle period.
+        harness.state.storage.signal_activity();
 
         // Wait for one idle period (1 s + up to 100 ms jitter) plus a small
         // margin — but less than two idle periods so the old behaviour

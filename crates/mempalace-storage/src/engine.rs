@@ -4,7 +4,7 @@ use std::future::Future;
 use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -24,6 +24,8 @@ use crate::types::{
 use mempalace_core::{DrawerId, DrawerRecord, EmbeddingProfile};
 use time::{Duration, OffsetDateTime};
 
+static MAINTENANCE_RUN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
 #[derive(Debug, Clone)]
 pub struct StorageEngine {
     layout: StorageLayout,
@@ -31,7 +33,6 @@ pub struct StorageEngine {
     operational_store: SqliteOperationalStore,
     stale_after: Duration,
     activity_signal: Arc<AtomicBool>,
-    maintenance_holder_id: String,
     last_activity_at: Arc<Mutex<Instant>>,
     /// Test-only: two-way barrier after tier 1 completion.
     /// After tier 1 finishes, the maintenance code notifies the test via
@@ -53,7 +54,6 @@ impl StorageEngine {
             layout,
             stale_after: Duration::hours(1),
             activity_signal: Arc::new(AtomicBool::new(false)),
-            maintenance_holder_id: format!("maintenance-{}", std::process::id()),
             last_activity_at: Arc::new(Mutex::new(Instant::now())),
             #[cfg(test)]
             test_tier_1_notify: Arc::new(Mutex::new(None)),
@@ -392,11 +392,15 @@ impl StorageEngine {
         Fut: Future<Output = T>,
     {
         let mut f = Box::pin(f);
+        let mut renewal = tokio::time::interval_at(
+            tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(60),
+        );
         loop {
             tokio::select! {
                 biased;
                 result = &mut f => return result,
-                _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                _ = renewal.tick() => {
                     match self.operational_store.renew_lease(holder_id, Duration::minutes(5)) {
                         Ok(true) => {},
                         _ => {
@@ -504,8 +508,8 @@ impl StorageEngine {
         }
 
         // ── 3. Claim the maintenance lease ───────────────────────────────────
-        let holder_id = &self.maintenance_holder_id;
-        match self.operational_store.try_claim_lease(holder_id, Duration::minutes(5)) {
+        let holder_id = next_maintenance_holder_id();
+        match self.operational_store.try_claim_lease(&holder_id, Duration::minutes(5)) {
             Ok(true) => {}
             Ok(false) => {
                 info!("maintenance skipped: concurrent lease held");
@@ -564,13 +568,12 @@ impl StorageEngine {
                 started_at,
                 duration: Duration::ZERO,
                 cpu_duration: Duration::ZERO,
-                outcome: MaintenanceOutcome::Aborted {
-                    reason: MaintenanceAbortReason::ConcurrentRun,
-                    items_affected: 0,
+                outcome: MaintenanceOutcome::Skipped {
+                    reason: MaintenanceSkipReason::NotIdle,
                 },
             });
-            final_status = MaintenanceRunStatus::Failure;
-            let _ = self.operational_store.release_lease(holder_id);
+            final_status = MaintenanceRunStatus::Partial;
+            let _ = self.operational_store.release_lease(&holder_id);
             let elapsed = wall_start.elapsed();
             let cpu_elapsed = process_cpu_time().saturating_sub(cpu_start);
             return Ok(MaintenanceRunSummary {
@@ -685,7 +688,7 @@ impl StorageEngine {
                 }
             };
 
-            let result = self.with_lease_renewal(holder_id, tier_future, &lease_lost).await;
+            let result = self.with_lease_renewal(&holder_id, tier_future, &lease_lost).await;
             let is_failure = matches!(result.outcome, MaintenanceOutcome::Failed { .. });
             let is_skipped = matches!(result.outcome, MaintenanceOutcome::Skipped { .. });
             tier_results.push(result);
@@ -770,7 +773,7 @@ impl StorageEngine {
                 }
             };
 
-            let result = self.with_lease_renewal(holder_id, tier_future, &lease_lost).await;
+            let result = self.with_lease_renewal(&holder_id, tier_future, &lease_lost).await;
             let is_failure = matches!(result.outcome, MaintenanceOutcome::Failed { .. });
             let is_skipped = matches!(result.outcome, MaintenanceOutcome::Skipped { .. });
             tier_results.push(result);
@@ -780,7 +783,7 @@ impl StorageEngine {
                 final_status = MaintenanceRunStatus::Partial;
             }
         } else {
-            final_status = MaintenanceRunStatus::Failure;
+            final_status = MaintenanceRunStatus::Partial;
             record_remaining(1, &mut tier_results);
             remaining_recorded = true;
         }
@@ -848,7 +851,7 @@ impl StorageEngine {
                 }
             };
 
-            let result = self.with_lease_renewal(holder_id, tier_future, &lease_lost).await;
+            let result = self.with_lease_renewal(&holder_id, tier_future, &lease_lost).await;
             let is_failure = matches!(result.outcome, MaintenanceOutcome::Failed { .. });
             let is_skipped = matches!(result.outcome, MaintenanceOutcome::Skipped { .. });
             tier_results.push(result);
@@ -862,7 +865,7 @@ impl StorageEngine {
         }
 
         // ── 8. Release lease ─────────────────────────────────────────────────
-        let _ = self.operational_store.release_lease(holder_id);
+        let _ = self.operational_store.release_lease(&holder_id);
 
         let elapsed = wall_start.elapsed();
         let cpu_elapsed = process_cpu_time().saturating_sub(cpu_start);
@@ -883,6 +886,11 @@ impl StorageEngine {
             tier_results,
         })
     }
+}
+
+fn next_maintenance_holder_id() -> String {
+    let sequence = MAINTENANCE_RUN_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!("maintenance-{}-{sequence}", std::process::id())
 }
 
 /// Returns the current process CPU time (user + system) as a
@@ -1494,6 +1502,48 @@ mod tests {
         engine.operational_store().release_lease(other_holder).unwrap();
     }
 
+    #[test]
+    fn maintenance_holders_are_unique_within_a_process() {
+        let first = super::next_maintenance_holder_id();
+        let second = super::next_maintenance_holder_id();
+
+        assert_ne!(first, second);
+        assert!(first.starts_with("maintenance-"));
+    }
+
+    #[tokio::test]
+    async fn maintenance_runs_from_engines_in_one_process_contend_for_the_lease() {
+        let tempdir = tempdir().unwrap();
+        let first = Arc::new(
+            StorageEngine::open(tempdir.path(), EmbeddingProfile::Balanced).await.unwrap(),
+        );
+        let second = StorageEngine::open(tempdir.path(), EmbeddingProfile::Balanced).await.unwrap();
+        let (notify_tx, notify_rx) = tokio::sync::oneshot::channel();
+        let (continue_tx, continue_rx) = tokio::sync::oneshot::channel();
+        *first.test_tier_1_notify.lock().unwrap() = Some(notify_tx);
+        *first.test_tier_1_wait.lock().unwrap() = Some(continue_rx);
+        let settings = MaintenanceSettings { idle_secs: 0, ..MaintenanceSettings::default() };
+
+        let first_run = {
+            let first = Arc::clone(&first);
+            tokio::spawn(async move { first.run_maintenance(&settings).await.unwrap() })
+        };
+        notify_rx.await.unwrap();
+
+        let second_summary = second.run_maintenance(&settings).await.unwrap();
+        assert_eq!(second_summary.status, MaintenanceRunStatus::Failure);
+        assert_eq!(
+            second_summary.tier_results[0].outcome,
+            MaintenanceOutcome::Aborted {
+                reason: MaintenanceAbortReason::ConcurrentRun,
+                items_affected: 0,
+            },
+        );
+
+        continue_tx.send(()).unwrap();
+        first_run.await.unwrap();
+    }
+
     #[tokio::test]
     async fn run_maintenance_aborts_when_activity_arrives_mid_tier() {
         let tempdir = tempdir().unwrap();
@@ -1532,7 +1582,7 @@ mod tests {
         // Tier 1 (VectorIndexOptimization) ran.  Tiers 2 (FragmentCompaction)
         // and 3 (VersionRetention) should be skipped due to activity.
         assert_eq!(summary.tier_results.len(), 3, "all three tiers should have results");
-        assert_eq!(summary.status, MaintenanceRunStatus::Failure, "mid-tier abort yields Failure");
+        assert_eq!(summary.status, MaintenanceRunStatus::Partial, "mid-tier abort yields Partial");
         assert_eq!(
             summary.tier_results[0].tier,
             MaintenanceTier::VectorIndexOptimization,

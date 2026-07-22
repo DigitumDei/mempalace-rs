@@ -1,7 +1,6 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-
 use arrow_array::{
     Array, ArrayRef, Date32Array, FixedSizeListArray, Float32Array, RecordBatch,
     RecordBatchIterator, StringArray, TimestampMicrosecondArray, UInt32Array, UInt64Array,
@@ -15,11 +14,76 @@ use lancedb::database::CreateTableMode;
 use lancedb::index::Index;
 use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::table::NewColumnTransform;
+use serde::{Deserialize, Serialize};
 use time::{Date, OffsetDateTime};
 
 use crate::error::{Result, StorageError};
 use crate::types::{DrawerFilter, DrawerMatch, DrawerStore, DuplicateStrategy, SearchRequest};
 use mempalace_core::{DrawerId, DrawerRecord, EmbeddingProfile};
+
+/// Statistics about vector-index coverage for the embedding column.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VectorIndexStats {
+    /// Number of rows covered by the vector index.
+    pub indexed_rows: usize,
+    /// Number of rows not covered by the vector index.
+    pub unindexed_rows: usize,
+    /// Alias for unindexed_rows — rows that form the "tail" not yet indexed.
+    pub tail_rows: usize,
+    /// Total rows in the table.
+    pub total_rows: usize,
+}
+
+/// Fragment and version state for the drawers table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FragmentStats {
+    /// Total number of data fragments.
+    pub num_fragments: usize,
+    /// Number of fragments small enough to be compaction candidates.
+    pub num_small_fragments: usize,
+    /// Total on-disk bytes for the table.
+    pub total_bytes: usize,
+    /// Number of historical versions.
+    pub num_versions: usize,
+    /// The current (latest) version number.
+    pub current_version: u64,
+}
+
+/// Before/after metrics for a compaction or index-optimisation operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OptimizeMetrics {
+    /// Tail (unindexed/small-fragment) rows before the operation.
+    pub tail_rows_before: usize,
+    /// Tail rows after the operation.
+    pub tail_rows_after: usize,
+    /// Indexed rows (or total fragments) before.
+    pub indexed_rows_before: usize,
+    /// Indexed rows (or total fragments) after.
+    pub indexed_rows_after: usize,
+    /// Total on-disk bytes before the operation.
+    pub bytes_before: usize,
+    /// Total on-disk bytes after the operation.
+    pub bytes_after: usize,
+    /// Whether the operation actually ran (vs. being skipped due to threshold).
+    pub ran: bool,
+}
+
+/// Metrics for a version-prune operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PruneMetrics {
+    /// Number of versions before pruning.
+    pub versions_before: usize,
+    /// Number of versions after pruning.
+    pub versions_after: usize,
+    /// Number of versions removed.
+    pub versions_removed: usize,
+    /// Bytes freed by pruning.
+    pub bytes_freed: usize,
+    /// Total bytes before pruning.
+    pub total_bytes_before: usize,
+    /// Total bytes after pruning.
+    pub total_bytes_after: usize,
+}
 
 const DRAWERS_TABLE: &str = "drawers";
 const DISTANCE_COLUMN: &str = "_distance";
@@ -139,6 +203,165 @@ impl LanceDrawerStore {
         }
 
         Ok(())
+    }
+
+    /// Capture vector-index coverage for the embedding column.
+    pub(crate) async fn vector_index_stats(&self) -> Result<VectorIndexStats> {
+        let table = self.table().await?;
+        let total_rows = table.count_rows(None).await?;
+
+        let indices = table.list_indices().await?;
+        let embedding_index = indices.iter().find(|cfg| cfg.columns.contains(&"embedding".into()));
+        let index_name = match embedding_index {
+            Some(cfg) => &cfg.name,
+            None => {
+                return Ok(VectorIndexStats {
+                    indexed_rows: 0,
+                    unindexed_rows: total_rows,
+                    tail_rows: total_rows,
+                    total_rows,
+                });
+            }
+        };
+
+        let index_stats = table.index_stats(index_name).await?;
+        match index_stats {
+            Some(stats) => Ok(VectorIndexStats {
+                indexed_rows: stats.num_indexed_rows,
+                unindexed_rows: stats.num_unindexed_rows,
+                tail_rows: stats.num_unindexed_rows,
+                total_rows,
+            }),
+            None => Ok(VectorIndexStats {
+                indexed_rows: 0,
+                unindexed_rows: total_rows,
+                tail_rows: total_rows,
+                total_rows,
+            }),
+        }
+    }
+
+    /// Capture fragment and version state for the drawers table.
+    pub(crate) async fn fragment_stats(&self) -> Result<FragmentStats> {
+        let table = self.table().await?;
+        let stats = table.stats().await?;
+        let versions = table.list_versions().await?;
+        let current_version = table.version().await?;
+        Ok(FragmentStats {
+            num_fragments: stats.fragment_stats.num_fragments,
+            num_small_fragments: stats.fragment_stats.num_small_fragments,
+            total_bytes: stats.total_bytes,
+            num_versions: versions.len(),
+            current_version,
+        })
+    }
+
+    /// Incrementally optimise the vector index when the unindexed tail exceeds
+    /// `tail_threshold`.  Returns before/after metrics.
+    pub(crate) async fn optimize_vector_index(
+        &self,
+        tail_threshold: u64,
+    ) -> Result<OptimizeMetrics> {
+        let before = self.vector_index_stats().await?;
+        if before.tail_rows <= tail_threshold as usize {
+            return Ok(OptimizeMetrics {
+                tail_rows_before: before.tail_rows,
+                tail_rows_after: before.tail_rows,
+                indexed_rows_before: before.indexed_rows,
+                indexed_rows_after: before.indexed_rows,
+                bytes_before: 0,
+                bytes_after: 0,
+                ran: false,
+            });
+        }
+        let table = self.table().await?;
+        let _optimize_stats = table
+            .optimize(lancedb::table::OptimizeAction::Index(
+                lancedb::table::OptimizeOptions::default(),
+            ))
+            .await?;
+        let after = self.vector_index_stats().await?;
+        Ok(OptimizeMetrics {
+            tail_rows_before: before.tail_rows,
+            tail_rows_after: after.tail_rows,
+            indexed_rows_before: before.indexed_rows,
+            indexed_rows_after: after.indexed_rows,
+            bytes_before: 0,
+            bytes_after: 0,
+            ran: true,
+        })
+    }
+
+    /// Compact fragmented data in the drawers table.
+    /// Only compacts when `small_fragment_threshold` is exceeded.
+    /// Returns before/after fragment metrics.
+    pub(crate) async fn compact_fragments(
+        &self,
+        small_fragment_threshold: usize,
+    ) -> Result<OptimizeMetrics> {
+        let before = self.fragment_stats().await?;
+        if before.num_small_fragments <= small_fragment_threshold {
+            return Ok(OptimizeMetrics {
+                tail_rows_before: before.num_small_fragments,
+                tail_rows_after: before.num_small_fragments,
+                indexed_rows_before: before.num_fragments,
+                indexed_rows_after: before.num_fragments,
+                bytes_before: before.total_bytes,
+                bytes_after: before.total_bytes,
+                ran: false,
+            });
+        }
+        let table = self.table().await?;
+        let _optimize_stats = table
+            .optimize(lancedb::table::OptimizeAction::Compact {
+                options: lancedb::table::CompactionOptions::default(),
+                remap_options: None,
+            })
+            .await?;
+        let after = self.fragment_stats().await?;
+        Ok(OptimizeMetrics {
+            tail_rows_before: before.num_small_fragments,
+            tail_rows_after: after.num_small_fragments,
+            indexed_rows_before: before.num_fragments,
+            indexed_rows_after: after.num_fragments,
+            bytes_before: before.total_bytes,
+            bytes_after: after.total_bytes,
+            ran: true,
+        })
+    }
+
+    /// Prune historical versions older than `retention_hours`, retaining at
+    /// least one version (the latest).  Never removes all recoverable history.
+    /// Returns the number of versions removed and bytes freed.
+    pub(crate) async fn prune_versions(&self, retention_hours: u64) -> Result<PruneMetrics> {
+        let before = self.fragment_stats().await?;
+        let table = self.table().await?;
+        let versions = table.list_versions().await?;
+        let versions_before = versions.len();
+
+        let older_than = lancedb::table::Duration::try_hours(retention_hours as i64)
+            .ok_or_else(|| {
+                StorageError::Invariant(format!("invalid retention_hours: {retention_hours}"))
+            })?;
+        let _optimize_stats = table
+            .optimize(lancedb::table::OptimizeAction::Prune {
+                older_than: Some(older_than),
+                delete_unverified: Some(false),
+                error_if_tagged_old_versions: Some(false),
+            })
+            .await?;
+
+        let after = self.fragment_stats().await?;
+        let versions_removed = versions_before.saturating_sub(after.num_versions);
+        let bytes_freed = before.total_bytes.saturating_sub(after.total_bytes);
+        Ok(PruneMetrics {
+            versions_before,
+            versions_after: after.num_versions,
+            versions_removed,
+            bytes_freed,
+            total_bytes_before: before.total_bytes,
+            total_bytes_after: after.total_bytes,
+        })
     }
 
     async fn execute_search(
@@ -1225,5 +1448,227 @@ mod tests {
         let loc2 = fetched2.locator.as_ref().unwrap();
         assert_eq!(loc2.commit_hash, None, "commit_hash should round-trip as None");
         assert_eq!(loc2.file_hash, "fff");
+    }
+
+    // ─── Maintenance primitives tests ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn vector_index_stats_returns_zero_for_empty_table() {
+        let tempdir = tempdir().unwrap();
+        let store = LanceDrawerStore::new(tempdir.path().join("lance"), EmbeddingProfile::Balanced);
+        store.ensure_schema().await.unwrap();
+
+        let stats = store.vector_index_stats().await.unwrap();
+        assert_eq!(stats.total_rows, 0);
+        assert_eq!(stats.indexed_rows, 0);
+        assert_eq!(stats.tail_rows, 0);
+    }
+
+    #[tokio::test]
+    async fn vector_index_stats_reports_unindexed_rows_before_optimize() {
+        let tempdir = tempdir().unwrap();
+        let store = LanceDrawerStore::new(tempdir.path().join("lance"), EmbeddingProfile::Balanced);
+        store.ensure_schema().await.unwrap();
+
+        let drawers: Vec<_> = (0..10)
+            .map(|i| {
+                record(
+                    &format!("wing/room/{i:04}"),
+                    "wing",
+                    "room",
+                    "test.txt",
+                    [0.1, 0.2, 0.3, 0.4],
+                )
+            })
+            .collect();
+        store.put_drawers(&drawers, DuplicateStrategy::Error).await.unwrap();
+
+        let stats = store.vector_index_stats().await.unwrap();
+        assert_eq!(stats.total_rows, 10);
+        // All rows are unindexed (no vector index built yet).
+        assert_eq!(stats.unindexed_rows, 10);
+        assert_eq!(stats.tail_rows, 10);
+    }
+
+    #[tokio::test]
+    async fn fragment_stats_returns_valid_state() {
+        let tempdir = tempdir().unwrap();
+        let store = LanceDrawerStore::new(tempdir.path().join("lance"), EmbeddingProfile::Balanced);
+        store.ensure_schema().await.unwrap();
+
+        let drawer = record("wing/room/0001", "wing", "room", "test.txt", [0.1, 0.2, 0.3, 0.4]);
+        store.put_drawers(&[drawer], DuplicateStrategy::Error).await.unwrap();
+
+        let stats = store.fragment_stats().await.unwrap();
+        assert_eq!(stats.num_fragments, 1);
+        assert!(stats.current_version > 0);
+        assert!(stats.num_versions >= 1);
+    }
+
+    #[tokio::test]
+    async fn optimize_vector_index_skips_below_threshold() {
+        let tempdir = tempdir().unwrap();
+        let store = LanceDrawerStore::new(tempdir.path().join("lance"), EmbeddingProfile::Balanced);
+        store.ensure_schema().await.unwrap();
+
+        let drawer = record("wing/room/0001", "wing", "room", "test.txt", [0.1, 0.2, 0.3, 0.4]);
+        store.put_drawers(&[drawer], DuplicateStrategy::Error).await.unwrap();
+
+        // Threshold above the number of unindexed rows → operation is skipped.
+        let metrics = store.optimize_vector_index(10_000).await.unwrap();
+        assert!(!metrics.ran, "optimize should be skipped when tail is below threshold");
+    }
+
+    #[tokio::test]
+    async fn optimize_vector_index_runs_when_threshold_exceeded() {
+        let tempdir = tempdir().unwrap();
+        let store = LanceDrawerStore::new(tempdir.path().join("lance"), EmbeddingProfile::Balanced);
+        store.ensure_schema().await.unwrap();
+
+        let drawers: Vec<_> = (0..10)
+            .map(|i| {
+                record(
+                    &format!("wing/room/{i:04}"),
+                    "wing",
+                    "room",
+                    "test.txt",
+                    [0.1, 0.2, 0.3, 0.4],
+                )
+            })
+            .collect();
+        store.put_drawers(&drawers, DuplicateStrategy::Error).await.unwrap();
+
+        // Threshold of 0 means every row exceeds it → optimise runs.
+        let metrics = store.optimize_vector_index(0).await.unwrap();
+        assert!(metrics.ran, "optimize should run when tail exceeds threshold");
+        // After optimisation the tail should be smaller.
+        assert!(
+            metrics.tail_rows_after <= metrics.tail_rows_before,
+            "tail rows should not increase after optimisation"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_fragments_reduces_small_fragments() {
+        let tempdir = tempdir().unwrap();
+        let store = LanceDrawerStore::new(tempdir.path().join("lance"), EmbeddingProfile::Balanced);
+        store.ensure_schema().await.unwrap();
+
+        let drawer = record("wing/room/0001", "wing", "room", "test.txt", [0.1, 0.2, 0.3, 0.4]);
+        store.put_drawers(&[drawer], DuplicateStrategy::Error).await.unwrap();
+
+        let metrics = store.compact_fragments(0).await.unwrap();
+        assert!(metrics.ran, "compaction should run with zero threshold");
+        // Fragment count should be stable or reduced.
+        assert!(
+            metrics.indexed_rows_after <= metrics.indexed_rows_before,
+            "fragments should not increase after compaction"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_fragments_skips_below_threshold() {
+        let tempdir = tempdir().unwrap();
+        let store = LanceDrawerStore::new(tempdir.path().join("lance"), EmbeddingProfile::Balanced);
+        store.ensure_schema().await.unwrap();
+
+        let drawer = record("wing/room/0001", "wing", "room", "test.txt", [0.1, 0.2, 0.3, 0.4]);
+        store.put_drawers(&[drawer], DuplicateStrategy::Error).await.unwrap();
+
+        let metrics = store.compact_fragments(100).await.unwrap();
+        assert!(!metrics.ran, "compaction should be skipped when below threshold");
+    }
+
+    #[tokio::test]
+    async fn prune_versions_removes_old_versions() {
+        let tempdir = tempdir().unwrap();
+        let store = LanceDrawerStore::new(tempdir.path().join("lance"), EmbeddingProfile::Balanced);
+        store.ensure_schema().await.unwrap();
+
+        let drawer = record("wing/room/0001", "wing", "room", "test.txt", [0.1, 0.2, 0.3, 0.4]);
+        store.put_drawers(&[drawer], DuplicateStrategy::Error).await.unwrap();
+
+        let before = store.fragment_stats().await.unwrap();
+
+        // Prune with a very short retention (0 hours) to exercise the path.
+        let metrics = store.prune_versions(0).await.unwrap();
+        assert_eq!(
+            metrics.versions_before, before.num_versions,
+            "versions_before must match pre-prune count"
+        );
+        // At least the latest version must remain.
+        assert!(metrics.versions_after >= 1, "at least one version must survive pruning");
+    }
+
+    #[tokio::test]
+    async fn prune_versions_never_removes_all_versions() {
+        let tempdir = tempdir().unwrap();
+        let store = LanceDrawerStore::new(tempdir.path().join("lance"), EmbeddingProfile::Balanced);
+        store.ensure_schema().await.unwrap();
+
+        let drawer = record("wing/room/0001", "wing", "room", "test.txt", [0.1, 0.2, 0.3, 0.4]);
+        store.put_drawers(&[drawer], DuplicateStrategy::Error).await.unwrap();
+
+        let metrics = store.prune_versions(0).await.unwrap();
+        // The latest version must always survive.
+        assert!(metrics.versions_after >= 1, "prune must never remove all recoverable history");
+    }
+
+    #[tokio::test]
+    async fn vector_index_stats_serde_round_trip() {
+        let stats = super::VectorIndexStats {
+            indexed_rows: 100,
+            unindexed_rows: 5,
+            tail_rows: 5,
+            total_rows: 105,
+        };
+        let json = serde_json::to_string(&stats).unwrap();
+        let deserialized: super::VectorIndexStats = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized, stats);
+    }
+
+    #[tokio::test]
+    async fn fragment_stats_serde_round_trip() {
+        let stats = super::FragmentStats {
+            num_fragments: 3,
+            num_small_fragments: 1,
+            total_bytes: 4096,
+            num_versions: 5,
+            current_version: 5,
+        };
+        let json = serde_json::to_string(&stats).unwrap();
+        let deserialized: super::FragmentStats = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized, stats);
+    }
+
+    #[tokio::test]
+    async fn optimize_metrics_serde_round_trip() {
+        let metrics = super::OptimizeMetrics {
+            tail_rows_before: 10,
+            tail_rows_after: 2,
+            indexed_rows_before: 100,
+            indexed_rows_after: 108,
+            bytes_before: 8192,
+            bytes_after: 4096,
+            ran: true,
+        };
+        let json = serde_json::to_string(&metrics).unwrap();
+        let deserialized: super::OptimizeMetrics = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized, metrics);
+    }
+
+    #[tokio::test]
+    async fn prune_metrics_serde_round_trip() {
+        let metrics = super::PruneMetrics {
+            versions_before: 10,
+            versions_after: 3,
+            versions_removed: 7,
+            bytes_freed: 8192,
+            total_bytes_before: 16384,
+            total_bytes_after: 8192,
+        };
+        let json = serde_json::to_string(&metrics).unwrap();
+        let deserialized: super::PruneMetrics = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized, metrics);
     }
 }

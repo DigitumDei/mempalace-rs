@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 
-use mempalace_config::{FederationRuntimeConfig, LowCpuRuntimeConfig, MempalaceConfig, ServerRuntimeConfig};
+use mempalace_config::{FederationRuntimeConfig, LowCpuRuntimeConfig, MaintenanceRuntimeConfig, MempalaceConfig, ServerRuntimeConfig};
 use mempalace_core::EmbeddingProfile;
 use mempalace_embeddings::DeterministicStubProvider;
 use mempalace_server::{TokenRegistry, build_router};
@@ -60,6 +60,7 @@ fn test_config(tempdir: &TempDir) -> MempalaceConfig {
             checkouts: std::collections::BTreeMap::new(),
         },
         federation: FederationRuntimeConfig::default(),
+        maintenance: MaintenanceRuntimeConfig::defaults(),
     }
 }
 
@@ -70,7 +71,7 @@ async fn spawn_server(
 ) -> std::net::SocketAddr {
     let tokens = TokenRegistry::load(token_file).unwrap();
     let provider = DeterministicStubProvider::new(EmbeddingProfile::Balanced);
-    let router = build_router(config, provider, tokens).await.unwrap();
+    let (router, _state) = build_router(config, provider, tokens).await.unwrap();
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

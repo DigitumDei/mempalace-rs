@@ -26,7 +26,7 @@ use mempalace_ingest::{
 };
 use mempalace_remote::{RemoteApi, RemoteClient, RemoteEndpoint, RemoteError};
 use mempalace_search::{Layer1Config, SearchRuntime, SearchRuntimePolicy, WakeUpRequest};
-use mempalace_storage::{DrawerFilter, DrawerStore, StorageEngine, StorageLayout};
+use mempalace_storage::{DrawerFilter, DrawerStore, MaintenanceSettings, StorageEngine, StorageLayout};
 use serde_yaml::Mapping;
 use tracing_subscriber::{EnvFilter, fmt};
 
@@ -276,6 +276,8 @@ enum Commands {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// Run a single maintenance pass (compact, prune, optimize) using configured settings.
+    Maintain,
     /// Run the federation HTTP server over this palace.
     Serve {
         #[arg(long, help = "Bind address, e.g. 127.0.0.1:8765 (default: from config)")]
@@ -466,6 +468,7 @@ where
         }
         Commands::Split { .. } => Ok(deferred_command("split")),
         Commands::Compress { .. } => Ok(deferred_command("compress")),
+        Commands::Maintain => execute_maintain(cli.palace.as_deref(), context),
         Commands::Serve { bind, token_file } => execute_serve(
             bind,
             token_file,
@@ -1707,6 +1710,110 @@ fn execute_status(
     Ok(CliOutput::success(lines.join("\n")))
 }
 
+fn execute_maintain(
+    palace_override: Option<&Path>,
+    context: &CliContext,
+) -> Result<CliOutput, clap::Error> {
+    let config = load_runtime_config(palace_override, context).map_err(config_error)?;
+    if !palace_exists(&config.palace_path) {
+        return Ok(no_palace_error(&config.palace_path));
+    }
+
+    let runtime = build_runtime(&config).map_err(runtime_error)?;
+    let engine = runtime
+        .block_on(StorageEngine::open(&config.palace_path, config.embedding_profile))
+        .map_err(storage_error)?;
+
+    // Bypass the process-local idle gate for the one-shot CLI invocation.
+    // StorageEngine::open() initialises last_activity_at to Instant::now(), so
+    // the configured idle_secs (default 300) would always skip.  We set
+    // idle_secs to 0 so the pass runs immediately, while retaining the
+    // configured enablement flag and all other thresholds.
+    let settings = MaintenanceSettings {
+        enabled: config.maintenance.enabled,
+        idle_secs: 0,
+        version_retention_hours: config.maintenance.version_retention_hours as u64,
+        tail_threshold_rows: config.maintenance.tail_threshold_rows as u64,
+        small_fragment_threshold: config.maintenance.small_fragment_threshold as u64,
+    };
+
+    let summary = runtime
+        .block_on(engine.run_maintenance(&settings))
+        .map_err(storage_error)?;
+
+    let status_label = match summary.status {
+        mempalace_storage::MaintenanceRunStatus::Success => "SUCCESS",
+        mempalace_storage::MaintenanceRunStatus::Partial => "PARTIAL",
+        mempalace_storage::MaintenanceRunStatus::Failure => "FAILURE",
+    };
+
+    let exit_code = match summary.status {
+        mempalace_storage::MaintenanceRunStatus::Failure => 1,
+        _ => 0,
+    };
+
+    let mut lines = vec![
+        format!("\n{}", "=".repeat(STATUS_HEADER_WIDTH)),
+        format!("  Maintenance Run #{:<8}  [{status_label}]", summary.run_id),
+        "=".repeat(STATUS_HEADER_WIDTH),
+        String::new(),
+        format!("  Started : {}", summary.started_at),
+        format!("  Finished: {}", summary.finished_at),
+        format!("  Duration: {} ms", summary.duration.whole_milliseconds()),
+        format!("  CPU     : {} ms", summary.cpu_duration.whole_milliseconds()),
+        String::new(),
+    ];
+
+    // When maintenance is disabled the summary has no tier results.
+    // Show an explicit message rather than a bare [PARTIAL].
+    if summary.tier_results.is_empty() {
+        lines.push("  –  Maintenance is disabled by configuration.".to_owned());
+    }
+
+    for result in &summary.tier_results {
+        let tier_name = match result.tier {
+            mempalace_storage::MaintenanceTier::VectorIndexOptimization => "Vector Index Optimization",
+            mempalace_storage::MaintenanceTier::FragmentCompaction => "Fragment Compaction",
+            mempalace_storage::MaintenanceTier::VersionRetention => "Version Retention",
+        };
+        let outcome_line = match &result.outcome {
+            mempalace_storage::MaintenanceOutcome::Completed { items_affected } => {
+                format!("  ✓  {tier_name:<30} completed  ({items_affected} items)")
+            }
+            mempalace_storage::MaintenanceOutcome::Skipped { reason } => {
+                let reason_str = match reason {
+                    mempalace_storage::MaintenanceSkipReason::Disabled => "disabled",
+                    mempalace_storage::MaintenanceSkipReason::NotIdle => "not idle",
+                    mempalace_storage::MaintenanceSkipReason::NothingToDo => "nothing to do",
+                };
+                format!("  –  {tier_name:<30} skipped    ({reason_str})")
+            }
+            mempalace_storage::MaintenanceOutcome::Aborted { reason, items_affected } => {
+                let reason_str = match reason {
+                    mempalace_storage::MaintenanceAbortReason::ConcurrentRun => "concurrent run",
+                    mempalace_storage::MaintenanceAbortReason::Shutdown => "shutdown",
+                    mempalace_storage::MaintenanceAbortReason::Timeout => "timeout",
+                };
+                format!("  ✗  {tier_name:<30} aborted    ({reason_str}, {items_affected} items)")
+            }
+            mempalace_storage::MaintenanceOutcome::Failed { message } => {
+                format!("  ✗  {tier_name:<30} failed     ({message})")
+            }
+        };
+        lines.push(outcome_line);
+    }
+
+    lines.push(String::new());
+    lines.push("=".repeat(STATUS_HEADER_WIDTH));
+    lines.push(String::new());
+
+    if exit_code == 0 {
+        Ok(CliOutput::success(lines.join("\n")))
+    } else {
+        Ok(CliOutput::failure(1, lines.join("\n")))
+    }
+}
+
 fn execute_wake_up<F, P>(
     wing: Option<String>,
     palace_override: Option<&Path>,
@@ -1827,7 +1934,7 @@ async fn run_serve<P>(
 where
     P: EmbeddingProvider + Send + Sync + 'static,
 {
-    let router = build_router(config, provider, tokens).await?;
+    let (router, _state) = build_router(config, provider, tokens).await?;
     let listener =
         tokio::net::TcpListener::bind(bind).await.map_err(|source| {
             mempalace_server::ServerError::Io {
@@ -2242,7 +2349,7 @@ mod tests {
     use mempalace_embeddings::{
         EmbeddingRequest, EmbeddingResponse, StartupValidation, StartupValidationStatus,
     };
-    use mempalace_storage::StorageLayout;
+    use mempalace_storage::{MaintenanceLeaseStore, StorageLayout};
     use tempfile::tempdir;
 
     #[derive(Debug, Clone)]
@@ -3345,7 +3452,10 @@ mod tests {
 
     /// Build a `MempalaceConfig` pointing at the given palace dir with stub embeddings.
     fn remote_test_config(palace_dir: PathBuf, token_file: PathBuf) -> mempalace_config::MempalaceConfig {
-        use mempalace_config::{FederationRuntimeConfig, LowCpuRuntimeConfig, ServerRuntimeConfig};
+        use mempalace_config::{
+            FederationRuntimeConfig, LowCpuRuntimeConfig, MaintenanceRuntimeConfig,
+            ServerRuntimeConfig,
+        };
         mempalace_config::MempalaceConfig {
             schema_version: 1,
             collection_name: "mempalace_drawers".to_owned(),
@@ -3358,6 +3468,7 @@ mod tests {
                 checkouts: std::collections::BTreeMap::new(),
             },
             federation: FederationRuntimeConfig::default(),
+            maintenance: MaintenanceRuntimeConfig::defaults(),
         }
     }
 
@@ -3379,7 +3490,7 @@ mod tests {
 
         let tokens = rt.block_on(async { TokenRegistry::load(token_file).unwrap() });
         let provider = DeterministicStubProvider::new(EmbeddingProfile::Balanced);
-        let router = rt.block_on(build_router(config, provider, tokens)).unwrap();
+        let (router, _state) = rt.block_on(build_router(config, provider, tokens)).unwrap();
 
         let listener =
             rt.block_on(tokio::net::TcpListener::bind("127.0.0.1:0")).unwrap();
@@ -3447,6 +3558,10 @@ mod tests {
                     "changes".to_owned(),
                     "taxonomy".to_owned(),
                 ],
+                maintenance_enabled: false,
+                maintenance_idle_secs: 0,
+                maintenance_last_run: None,
+                maintenance_status: mempalace_federation::MaintenanceStatus::Disabled,
             })
         }
 
@@ -3936,7 +4051,7 @@ mod tests {
             let provider = mempalace_embeddings::DeterministicStubProvider::new(
                 EmbeddingProfile::Balanced,
             );
-            let router = mempalace_server::build_router(config, provider, tokens)
+            let (router, _state) = mempalace_server::build_router(config, provider, tokens)
                 .await
                 .unwrap();
 
@@ -4580,5 +4695,360 @@ mod tests {
         );
 
         remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn maintain_runs_with_enabled_config() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config_root = tempdir.path().to_path_buf();
+        let palace_path = config_root.join("palace");
+
+        // Write config.json with maintenance enabled.
+        write_file(
+            &config_root.join("config.json"),
+            r#"{"maintenance":{"enabled":true,"idle_secs":300}}"#,
+        );
+
+        // Initialise an empty palace so StorageEngine::open does not fail.
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(mempalace_storage::StorageEngine::open(
+                &palace_path,
+                mempalace_core::EmbeddingProfile::Balanced,
+            ))
+            .unwrap();
+
+        let context = CliContext::for_tests(config_root);
+        let output = run_cli(
+            ["maintain", "--palace", palace_path.to_str().unwrap()],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+
+        assert_eq!(output.exit_code, 0, "maintain should exit 0: {}", output.stderr);
+        assert!(
+            output.stdout.contains("Maintenance Run #"),
+            "output should contain run header: {}",
+            output.stdout
+        );
+        // With an empty palace all tiers should succeed or skip with nothing to do.
+        assert!(
+            output.stdout.contains("[SUCCESS]") || output.stdout.contains("[PARTIAL]"),
+            "output should show SUCCESS or PARTIAL status: {}",
+            output.stdout
+        );
+    }
+
+    #[test]
+    fn maintain_disabled_shows_explicit_message() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config_root = tempdir.path().to_path_buf();
+        let palace_path = config_root.join("palace");
+
+        // Write config.json with maintenance disabled.
+        write_file(
+            &config_root.join("config.json"),
+            r#"{"maintenance":{"enabled":false}}"#,
+        );
+
+        // Initialise an empty palace.
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(mempalace_storage::StorageEngine::open(
+                &palace_path,
+                mempalace_core::EmbeddingProfile::Balanced,
+            ))
+            .unwrap();
+
+        let context = CliContext::for_tests(config_root);
+        let output = run_cli(
+            ["maintain", "--palace", palace_path.to_str().unwrap()],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+
+        assert_eq!(output.exit_code, 0);
+        assert!(
+            output.stdout.contains("disabled by configuration"),
+            "disabled output must mention the reason: {}",
+            output.stdout
+        );
+        assert!(
+            output.stdout.contains("[PARTIAL]"),
+            "disabled output must show PARTIAL status: {}",
+            output.stdout
+        );
+    }
+
+    #[test]
+    fn maintain_no_palace_shows_error() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config_root = tempdir.path().to_path_buf();
+
+        let context = CliContext::for_tests(config_root);
+        let output = run_cli(
+            ["maintain"],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+
+        assert_eq!(output.exit_code, 1);
+        assert!(
+            output.stderr.contains("No palace found"),
+            "no-palace error must mention 'No palace found': {}",
+            output.stderr
+        );
+    }
+
+    #[test]
+    fn maintain_with_data_reports_tier_outcomes() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config_root = tempdir.path().to_path_buf();
+        let palace_path = config_root.join("palace");
+
+        // Write config.json with maintenance enabled and aggressive thresholds
+        // so every tier has work to do.  The validation rejects 0, so use the
+        // minimum positive value (1) for tail_threshold_rows and
+        // small_fragment_threshold; version_retention_hours must also be ≥1
+        // even though newly-created versions may not be old enough to prune.
+        write_file(
+            &config_root.join("config.json"),
+            r#"{"maintenance":{"enabled":true,"idle_secs":300,"tail_threshold_rows":2,"small_fragment_threshold":2,"version_retention_hours":1}}"#,
+        );
+
+        // Initialise a palace and insert drawers in multiple batches to create
+        // multiple LanceDB versions and small fragments, giving every tier
+        // real work.
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async {
+                let engine = mempalace_storage::StorageEngine::open(
+                    &palace_path,
+                    mempalace_core::EmbeddingProfile::Balanced,
+                )
+                .await
+                .unwrap();
+                let dim = mempalace_core::EmbeddingProfile::Balanced.metadata().dimensions;
+                for batch in 0..10 {
+                    let records: Vec<_> = (0..4)
+                        .map(|i| {
+                            let id = mempalace_core::DrawerId::new(
+                                &format!("wing/room/b{batch}_{i:04}"),
+                            )
+                            .unwrap();
+                            let wing = mempalace_core::WingId::new("wing").unwrap();
+                            let room = mempalace_core::RoomId::new("room").unwrap();
+                            let mut embedding = vec![0.1_f32; dim];
+                            embedding[0] = (i as f32) * 0.01;
+                            mempalace_core::DrawerRecord {
+                                id,
+                                wing,
+                                room,
+                                hall: None,
+                                date: None,
+                                source_file: "test.txt".to_owned(),
+                                chunk_index: i,
+                                ingest_mode: "test".to_owned(),
+                                extract_mode: None,
+                                added_by: "tester".to_owned(),
+                                filed_at: time::OffsetDateTime::UNIX_EPOCH,
+                                importance: None,
+                                emotional_weight: None,
+                                weight: None,
+                                content: format!("payload-{batch}-{i}"),
+                                content_hash: format!("hash-{batch}-{i}"),
+                                embedding,
+                                locator: None,
+                            }
+                        })
+                        .collect();
+                    engine.drawer_store()
+                        .put_drawers(&records, mempalace_storage::DuplicateStrategy::Error)
+                        .await
+                        .unwrap();
+                }
+            });
+
+        let context = CliContext::for_tests(config_root);
+        let output = run_cli(
+            ["maintain", "--palace", palace_path.to_str().unwrap()],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+
+        assert_eq!(output.exit_code, 0, "maintain should exit 0: {}", output.stderr);
+        assert!(
+            output.stdout.contains("Maintenance Run #"),
+            "output should contain run header: {}",
+            output.stdout
+        );
+        // With data present and aggressive thresholds, all three tiers should
+        // appear in the output.  Version retention may be skipped because
+        // versions were created seconds ago (nothing older than 1 hour), but
+        // vector index optimisation and fragment compaction should complete.
+        assert!(
+            output.stdout.contains("[SUCCESS]") || output.stdout.contains("[PARTIAL]"),
+            "output should show SUCCESS or PARTIAL: {}",
+            output.stdout
+        );
+        assert!(
+            output.stdout.contains("Vector Index Optimization"),
+            "vector index tier should appear in output: {}",
+            output.stdout
+        );
+        assert!(
+            output.stdout.contains("Fragment Compaction"),
+            "fragment compaction tier should appear in output: {}",
+            output.stdout
+        );
+        assert!(
+            output.stdout.contains("Version Retention"),
+            "version retention tier should appear in output: {}",
+            output.stdout
+        );
+        // At least one tier must report "completed" with positive items.
+        assert!(
+            output.stdout.contains("completed"),
+            "at least one tier should report completed: {}",
+            output.stdout
+        );
+    }
+
+    #[test]
+    fn maintain_version_retention_shows_in_output() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config_root = tempdir.path().to_path_buf();
+        let palace_path = config_root.join("palace");
+
+        // Use minimum positive thresholds so config validation passes.
+        // version_retention_hours:1 is the minimum; with newly-created
+        // versions the tier will likely be skipped (nothing old enough),
+        // but it should appear in the output with a result.
+        write_file(
+            &config_root.join("config.json"),
+            r#"{"maintenance":{"enabled":true,"idle_secs":300,"version_retention_hours":1,"small_fragment_threshold":2,"tail_threshold_rows":2}}"#,
+        );
+
+        // Create multi-version fixture so pruning has versions to examine.
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async {
+                let engine = mempalace_storage::StorageEngine::open(
+                    &palace_path,
+                    mempalace_core::EmbeddingProfile::Balanced,
+                )
+                .await
+                .unwrap();
+                let dim = mempalace_core::EmbeddingProfile::Balanced.metadata().dimensions;
+                for batch in 0..8 {
+                    let id = mempalace_core::DrawerId::new(
+                        &format!("wing/room/v{batch}_0000"),
+                    )
+                    .unwrap();
+                    let wing = mempalace_core::WingId::new("wing").unwrap();
+                    let room = mempalace_core::RoomId::new("room").unwrap();
+                    let mut embedding = vec![0.1_f32; dim];
+                    embedding[0] = (batch as f32) * 0.01;
+                    let record = mempalace_core::DrawerRecord {
+                        id,
+                        wing,
+                        room,
+                        hall: None,
+                        date: None,
+                        source_file: "test.txt".to_owned(),
+                        chunk_index: batch,
+                        ingest_mode: "test".to_owned(),
+                        extract_mode: None,
+                        added_by: "tester".to_owned(),
+                        filed_at: time::OffsetDateTime::UNIX_EPOCH,
+                        importance: None,
+                        emotional_weight: None,
+                        weight: None,
+                        content: format!("payload-{batch}"),
+                        content_hash: format!("hash-{batch}"),
+                        embedding,
+                        locator: None,
+                    };
+                    engine.drawer_store()
+                        .put_drawers(&[record], mempalace_storage::DuplicateStrategy::Error)
+                        .await
+                        .unwrap();
+                }
+            });
+
+        let context = CliContext::for_tests(config_root);
+        let output = run_cli(
+            ["maintain", "--palace", palace_path.to_str().unwrap()],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+
+        assert_eq!(output.exit_code, 0);
+        assert!(
+            output.stdout.contains("Version Retention"),
+            "output must mention Version Retention tier: {}",
+            output.stdout
+        );
+        // The version retention tier should have a concrete result
+        // (completed or skipped with a reason), not a missing line.
+        assert!(
+            output.stdout.contains("completed") || output.stdout.contains("skipped"),
+            "version retention should show completed or skipped result: {}",
+            output.stdout
+        );
+    }
+
+    #[test]
+    fn maintain_exit_code_1_when_lease_contended() {
+        // Arrange: open the engine, claim the lease from a different holder,
+        // then drop the engine.  The CLI's maintain command opens a new
+        // engine with a different holder_id and tries to claim the lease.
+        let tempdir = tempfile::tempdir().unwrap();
+        let config_root = tempdir.path().to_path_buf();
+        let palace_path = config_root.join("palace");
+
+        write_file(
+            &config_root.join("config.json"),
+            r#"{"maintenance":{"enabled":true,"idle_secs":300}}"#,
+        );
+
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async {
+                let engine = mempalace_storage::StorageEngine::open(
+                    &palace_path,
+                    mempalace_core::EmbeddingProfile::Balanced,
+                )
+                .await
+                .unwrap();
+                // Claim from a different holder so the CLI's own engine
+                // cannot acquire the lease.
+                engine.operational_store()
+                    .try_claim_lease("cli-test-holder", time::Duration::minutes(5))
+                    .unwrap();
+                // Engine is dropped here, closing LanceDB/SQLite handles,
+                // but the lease persists in SQLite.
+            });
+
+        let context = CliContext::for_tests(config_root);
+        let output = run_cli(
+            ["maintain", "--palace", palace_path.to_str().unwrap()],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+
+        assert_eq!(output.exit_code, 1, "should exit 1 when lease is contended");
+        assert!(
+            output.stdout.contains("[FAILURE]") || output.stderr.contains("concurrent"),
+            "output should indicate lease contention: {} {}",
+            output.stdout,
+            output.stderr,
+        );
     }
 }

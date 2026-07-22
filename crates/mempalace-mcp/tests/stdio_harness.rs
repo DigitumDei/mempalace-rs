@@ -1,7 +1,7 @@
 use std::io::{BufRead, BufReader as StdBufReader, Write};
 use std::process::{Command, Stdio};
 
-use mempalace_config::{FederationRuntimeConfig, LowCpuRuntimeConfig, MempalaceConfig, ServerRuntimeConfig};
+use mempalace_config::{FederationRuntimeConfig, LowCpuRuntimeConfig, MaintenanceRuntimeConfig, MempalaceConfig, ServerRuntimeConfig};
 use mempalace_core::EmbeddingProfile;
 use mempalace_mcp::{DeterministicStubProvider, McpServer, serve_transport};
 use tempfile::TempDir;
@@ -20,6 +20,7 @@ async fn test_server(tempdir: &TempDir) -> McpServer<DeterministicStubProvider> 
             checkouts: std::collections::BTreeMap::new(),
         },
         federation: FederationRuntimeConfig::default(),
+        maintenance: MaintenanceRuntimeConfig::defaults(),
     };
     McpServer::from_parts(config, DeterministicStubProvider::new(EmbeddingProfile::Balanced))
         .await

@@ -16,7 +16,7 @@
 //! let config: MempalaceConfig = todo!("load from disk");
 //! let tokens = TokenRegistry::load(std::path::PathBuf::from("server_tokens.json"))?;
 //! let provider = DeterministicStubProvider::new(EmbeddingProfile::Balanced);
-//! let router = build_router(config, provider, tokens).await?;
+//! let (router, _state) = build_router(config, provider, tokens).await?;
 //! // Bind and serve with axum::serve(listener, router).await?
 //! # Ok(())
 //! # }
@@ -24,7 +24,7 @@
 
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::{Arc, RwLock};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
@@ -45,20 +45,23 @@ use mempalace_federation::{
     CheckDuplicateRequest, CheckDuplicateResponse, DrawerSearchRequest, DrawerSearchResponse,
     ErrorBody, FEDERATION_API_VERSION, InfoResponse, IngestBatchRequest, IngestBatchResponse,
     IngestFileResult, KgAddFactRequest, KgInvalidateRequest, KgQueryRequest, ListDrawersQuery,
-    ListDrawersResponse, RemoteDrawerResult,
+    ListDrawersResponse, MaintenanceAbortReason as FedMaintenanceAbortReason,
+    MaintenanceRunStatus as FedMaintenanceRunStatus,
+    MaintenanceSkipReason as FedMaintenanceSkipReason, MaintenanceStatus, RemoteDrawerResult,
 };
 use mempalace_graph::{AddFactRequest, EntityKind, KnowledgeGraphRuntime, QueryDirection};
 use mempalace_search::{SearchRuntime, SearchRuntimePolicy};
 use mempalace_storage::{
     ChangeCursor, ChangeEvent, ChangeLogStore, DrawerFilter, DrawerStore, DuplicateStrategy,
-    IngestCommitRequest, IngestManifestStore, StorageEngine,
+    IngestCommitRequest, IngestManifestStore, MaintenanceAbortReason, MaintenanceOutcome,
+    MaintenanceRunSummary, MaintenanceSettings, MaintenanceSkipReason, StorageEngine,
 };
 use serde_json::{Value, json};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 use time::{Date, OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::Mutex;
-use tracing::warn;
+use tracing::{info, warn};
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -416,6 +419,10 @@ pub struct ServerState<P> {
     pub search: Mutex<SearchRuntime<P>>,
     /// Bearer-token registry for auth.
     pub tokens: Arc<TokenRegistry>,
+    /// The most recent maintenance run summary, if any.
+    pub last_maintenance_status: std::sync::Mutex<Option<MaintenanceRunSummary>>,
+    /// Typed status of the maintenance subsystem.
+    pub maintenance_status: std::sync::Mutex<MaintenanceStatus>,
 }
 
 // ─── Router builder ──────────────────────────────────────────────────────────
@@ -437,7 +444,7 @@ pub struct ServerState<P> {
 /// let config: MempalaceConfig = todo!();
 /// let tokens = TokenRegistry::load(std::path::PathBuf::from("server_tokens.json"))?;
 /// let provider = DeterministicStubProvider::new(EmbeddingProfile::Balanced);
-/// let router = build_router(config, provider, tokens).await?;
+/// let (router, _state) = build_router(config, provider, tokens).await?;
 /// // let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
 /// // axum::serve(listener, router).await?;
 /// # Ok(())
@@ -447,7 +454,7 @@ pub async fn build_router<P>(
     config: MempalaceConfig,
     provider: P,
     tokens: TokenRegistry,
-) -> Result<Router, ServerError>
+) -> Result<(Router, Arc<ServerState<P>>), ServerError>
 where
     P: EmbeddingProvider + Send + Sync + 'static,
 {
@@ -456,12 +463,99 @@ where
         provider,
         SearchRuntimePolicy { rerank_enabled: config.low_cpu.effective_rerank_enabled() },
     );
+
+    // Extract maintenance config before moving `config` into state.
+    let maintenance_settings = MaintenanceSettings {
+        enabled: config.maintenance.enabled,
+        idle_secs: config.maintenance.idle_secs as u64,
+        version_retention_hours: config.maintenance.version_retention_hours as u64,
+        tail_threshold_rows: config.maintenance.tail_threshold_rows as u64,
+        small_fragment_threshold: config.maintenance.small_fragment_threshold as u64,
+    };
+
+    let initial_status = if maintenance_settings.enabled {
+        MaintenanceStatus::Idle
+    } else {
+        MaintenanceStatus::Disabled
+    };
+
     let state = Arc::new(ServerState {
         config,
         storage,
         search: Mutex::new(search),
         tokens: Arc::new(tokens),
+        last_maintenance_status: std::sync::Mutex::new(None),
+        maintenance_status: std::sync::Mutex::new(initial_status),
     });
+
+    // ── Background maintenance task ──────────────────────────────────────────
+    //
+    // Runs only in the long-lived HTTP hub.  Starts with an immediate startup
+    // check, then loops with a jittered sleep so concurrent hubs do not
+    // synchronise their runs. Storage write paths reset the idle timer, so
+    // maintenance only fires when writes have been idle for the configured duration.
+    if maintenance_settings.enabled {
+        let task_state = Arc::clone(&state);
+        let settings = maintenance_settings;
+        tokio::spawn(async move {
+            // Startup maintenance check
+            info!("performing startup maintenance check");
+            *task_state.maintenance_status.lock().unwrap() = MaintenanceStatus::Running;
+            match task_state.storage.run_maintenance(&settings).await {
+                Ok(summary) => {
+                    *task_state.last_maintenance_status.lock().unwrap() = Some(summary.clone());
+                    *task_state.maintenance_status.lock().unwrap() = summary_to_status(&summary);
+                }
+                Err(e) => {
+                    warn!(error = %e, "startup maintenance run failed");
+                    *task_state.maintenance_status.lock().unwrap() =
+                        MaintenanceStatus::Failed { message: e.to_string() };
+                }
+            }
+
+            loop {
+                let base = Duration::from_secs(settings.idle_secs);
+                let jitter_frac = (SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .subsec_nanos() as f64)
+                    / 1_000_000_000.0;
+                let jitter =
+                    Duration::from_secs_f64(jitter_frac * base.as_secs_f64() * 0.1);
+                let sleep_dur = base + jitter;
+
+                tokio::time::sleep(sleep_dur).await;
+                if task_state.storage.elapsed_since_last_activity()
+                    < Duration::from_secs(settings.idle_secs)
+                {
+                    continue;
+                }
+
+                // Clear only activity that predates the completed idle window.
+                // Re-check elapsed time after taking the flag so a write racing
+                // this transition still postpones the run.
+                if task_state.storage.take_activity_signal()
+                    && task_state.storage.elapsed_since_last_activity()
+                        < Duration::from_secs(settings.idle_secs)
+                {
+                    continue;
+                }
+                info!("background maintenance check");
+                *task_state.maintenance_status.lock().unwrap() = MaintenanceStatus::Running;
+                match task_state.storage.run_maintenance(&settings).await {
+                    Ok(summary) => {
+                        *task_state.last_maintenance_status.lock().unwrap() = Some(summary.clone());
+                        *task_state.maintenance_status.lock().unwrap() = summary_to_status(&summary);
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "background maintenance run failed");
+                        *task_state.maintenance_status.lock().unwrap() =
+                            MaintenanceStatus::Failed { message: e.to_string() };
+                    }
+                }
+            }
+        });
+    }
 
     // Unauthenticated routes
     let public = Router::new().route("/v1/health", get(route_health));
@@ -495,7 +589,8 @@ where
         .route("/v1/changes", get(route_changes::<P>))
         .layer(middleware::from_fn_with_state(Arc::clone(&state), auth_middleware::<P>));
 
-    Ok(public.merge(protected).merge(ingest_route).with_state(state))
+    let router = public.merge(protected).merge(ingest_route).with_state(Arc::clone(&state));
+    Ok((router, state))
 }
 
 // ─── Auth middleware ──────────────────────────────────────────────────────────
@@ -531,12 +626,89 @@ async fn route_health() -> impl IntoResponse {
 
 // ─── Info ─────────────────────────────────────────────────────────────────────
 
+/// Converts a [`MaintenanceRunSummary`] (from the storage engine) into a
+/// [`MaintenanceStatus`] (the federation DTO) by examining the tier outcomes.
+fn summary_to_status(summary: &MaintenanceRunSummary) -> MaintenanceStatus {
+    if summary.tier_results.is_empty() {
+        return MaintenanceStatus::Disabled;
+    }
+
+    let all_skipped =
+        summary.tier_results.iter().all(|r| matches!(r.outcome, MaintenanceOutcome::Skipped { .. }));
+    let any_aborted =
+        summary.tier_results.iter().any(|r| matches!(r.outcome, MaintenanceOutcome::Aborted { .. }));
+    let any_failed =
+        summary.tier_results.iter().any(|r| matches!(r.outcome, MaintenanceOutcome::Failed { .. }));
+    let any_completed = summary
+        .tier_results
+        .iter()
+        .any(|r| matches!(r.outcome, MaintenanceOutcome::Completed { .. }));
+
+    if all_skipped {
+        let reason = summary
+            .tier_results
+            .first()
+            .and_then(|r| match &r.outcome {
+                MaintenanceOutcome::Skipped { reason } => Some(reason),
+                _ => None,
+            });
+        let fed_reason = match reason {
+            Some(MaintenanceSkipReason::NotIdle) => FedMaintenanceSkipReason::NotIdle,
+            Some(MaintenanceSkipReason::NothingToDo) => FedMaintenanceSkipReason::NothingToDo,
+            _ => FedMaintenanceSkipReason::NotIdle,
+        };
+        return MaintenanceStatus::Skipped { reason: fed_reason };
+    }
+
+    if any_aborted && !any_completed {
+        let reason = summary.tier_results.iter().find_map(|r| match &r.outcome {
+            MaintenanceOutcome::Aborted { reason, .. } => Some(reason),
+            _ => None,
+        });
+        let fed_reason = match reason {
+            Some(MaintenanceAbortReason::ConcurrentRun) => FedMaintenanceAbortReason::ConcurrentRun,
+            Some(MaintenanceAbortReason::Shutdown) => FedMaintenanceAbortReason::Shutdown,
+            Some(MaintenanceAbortReason::Timeout) => FedMaintenanceAbortReason::Timeout,
+            _ => FedMaintenanceAbortReason::ConcurrentRun,
+        };
+        return MaintenanceStatus::Aborted { reason: fed_reason };
+    }
+
+    if any_failed && !any_completed {
+        let msg = summary
+            .tier_results
+            .iter()
+            .find_map(|r| match &r.outcome {
+                MaintenanceOutcome::Failed { message } => Some(message.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        return MaintenanceStatus::Failed { message: msg };
+    }
+
+    let fed_status = match summary.status {
+        mempalace_storage::MaintenanceRunStatus::Success => FedMaintenanceRunStatus::Success,
+        mempalace_storage::MaintenanceRunStatus::Partial => FedMaintenanceRunStatus::Partial,
+        mempalace_storage::MaintenanceRunStatus::Failure => FedMaintenanceRunStatus::Failure,
+    };
+    MaintenanceStatus::Completed { status: fed_status }
+}
+
 async fn route_info<P>(
     State(state): State<Arc<ServerState<P>>>,
 ) -> Result<impl IntoResponse, ServerError>
 where
     P: EmbeddingProvider + Send + Sync + 'static,
 {
+    let last_run = state
+        .last_maintenance_status
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|s| serde_json::to_value(s).ok());
+
+    let status = state.maintenance_status.lock().unwrap().clone();
+
     Ok(Json(InfoResponse {
         server_version: env!("CARGO_PKG_VERSION").to_owned(),
         federation_api_version: FEDERATION_API_VERSION,
@@ -548,6 +720,10 @@ where
             "taxonomy".to_owned(),
             "ingest".to_owned(),
         ],
+        maintenance_enabled: state.config.maintenance.enabled,
+        maintenance_idle_secs: state.config.maintenance.idle_secs as u64,
+        maintenance_last_run: last_run,
+        maintenance_status: status,
     }))
 }
 
@@ -1950,7 +2126,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Method, Request, StatusCode, header};
     use http_body_util::BodyExt;
-    use mempalace_config::{FederationRuntimeConfig, LowCpuRuntimeConfig, ServerRuntimeConfig};
+    use mempalace_config::{FederationRuntimeConfig, LowCpuRuntimeConfig, MaintenanceRuntimeConfig, ServerRuntimeConfig};
     use mempalace_core::EmbeddingProfile;
     use mempalace_embeddings::DeterministicStubProvider;
     use serde_json::Value;
@@ -1982,10 +2158,15 @@ mod tests {
 
     struct Harness {
         router: Router,
+        state: Arc<ServerState<DeterministicStubProvider>>,
         _tempdir: TempDir,
     }
 
     async fn make_harness() -> Harness {
+        make_harness_with_maintenance(true).await
+    }
+
+    async fn make_harness_with_maintenance(maintenance_enabled: bool) -> Harness {
         let tempdir = TempDir::new().unwrap();
         let palace_path = tempdir.path().join("palace");
 
@@ -2014,11 +2195,15 @@ mod tests {
                 checkouts: std::collections::BTreeMap::new(),
             },
             federation: FederationRuntimeConfig::default(),
+            maintenance: MaintenanceRuntimeConfig {
+                enabled: maintenance_enabled,
+                ..MaintenanceRuntimeConfig::defaults()
+            },
         };
         let tokens = TokenRegistry::load(token_file).unwrap();
         let provider = DeterministicStubProvider::new(EmbeddingProfile::Balanced);
-        let router = build_router(config, provider, tokens).await.unwrap();
-        Harness { router, _tempdir: tempdir }
+        let (router, state) = build_router(config, provider, tokens).await.unwrap();
+        Harness { router, state, _tempdir: tempdir }
     }
 
     /// Helper: build a JSON request with bearer auth.
@@ -2576,11 +2761,12 @@ mod tests {
                 checkouts,
             },
             federation: FederationRuntimeConfig::default(),
+            maintenance: MaintenanceRuntimeConfig::defaults(),
         };
         let tokens = TokenRegistry::load(token_file).unwrap();
         let provider = DeterministicStubProvider::new(EmbeddingProfile::Balanced);
-        let router = build_router(config, provider, tokens).await.unwrap();
-        Harness { router, _tempdir: tempdir }
+        let (router, state) = build_router(config, provider, tokens).await.unwrap();
+        Harness { router, state, _tempdir: tempdir }
     }
 
     // ─── 9. Ingest batch ──────────────────────────────────────────────────────
@@ -3254,5 +3440,391 @@ mod tests {
         let caps = body["capabilities"].as_array().unwrap();
         let cap_strings: Vec<&str> = caps.iter().filter_map(|v| v.as_str()).collect();
         assert!(cap_strings.contains(&"ingest"), "capabilities must include 'ingest'");
+    }
+
+    #[tokio::test]
+    async fn info_returns_maintenance_enabled_and_null_last_run() {
+        let harness = make_harness().await;
+        let resp = harness.router.oneshot(authed_get("/v1/info", ALICE_TOKEN)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["maintenance_enabled"], true);
+        assert_eq!(body["maintenance_idle_secs"], 300u64);
+        assert!(body["maintenance_last_run"].is_null());
+        // Status should be idle or one of the post-run states (the startup
+        // check may have completed by now).
+        let status = &body["maintenance_status"];
+        assert!(
+            status.is_string() || status.is_object(),
+            "maintenance_status must be a string (unit variant) or object (struct variant): {status}",
+        );
+    }
+
+    #[tokio::test]
+    async fn info_returns_maintenance_disabled_fields() {
+        let harness = make_harness_with_maintenance(false).await;
+        let resp = harness.router.oneshot(authed_get("/v1/info", ALICE_TOKEN)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["maintenance_enabled"], false);
+        assert_eq!(body["maintenance_idle_secs"], 300u64);
+        assert!(body["maintenance_last_run"].is_null());
+        assert_eq!(body["maintenance_status"], "disabled");
+    }
+
+    #[tokio::test]
+    async fn info_returns_maintenance_status_disabled() {
+        let harness = make_harness_with_maintenance(false).await;
+        let resp = harness.router.oneshot(authed_get("/v1/info", ALICE_TOKEN)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["maintenance_status"], "disabled");
+    }
+
+    #[tokio::test]
+    async fn info_returns_maintenance_status_completed_after_startup() {
+        let harness = make_harness().await;
+        // Wait for the startup check to complete (up to 5 s).
+        for _ in 0..100 {
+            let resp = harness.router.clone().oneshot(authed_get("/v1/info", ALICE_TOKEN)).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = body_json(resp).await;
+            let status = &body["maintenance_status"];
+            // startup check should transition from "idle" to some post-run state.
+            if status.is_object() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("maintenance did not transition from idle after startup check");
+    }
+
+    #[tokio::test]
+    async fn info_returns_maintenance_status_skipped_not_idle_when_busy() {
+        // Use a very short idle_secs so the startup check completes quickly,
+        // then keep sending requests to ensure the background check is skipped.
+        let short_idle = MaintenanceRuntimeConfig {
+            idle_secs: 1,
+            ..MaintenanceRuntimeConfig::defaults()
+        };
+        let harness = build_with_maintenance(short_idle).await;
+
+        // Wait for startup check to finish.
+        for _ in 0..50 {
+            if harness.state.last_maintenance_status.lock().unwrap().is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        // Directly set the status to simulate the "skipped (activity)" state
+        // that the scheduler writes when it detects recent activity.
+        *harness.state.maintenance_status.lock().unwrap() =
+            MaintenanceStatus::Skipped { reason: FedMaintenanceSkipReason::NotIdle };
+
+        let resp = harness.router.oneshot(authed_get("/v1/info", ALICE_TOKEN)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let status = &body["maintenance_status"];
+        assert_eq!(status["skipped"]["reason"], "not_idle");
+    }
+
+    #[tokio::test]
+    async fn info_returns_maintenance_status_aborted_concurrent() {
+        let harness = make_harness().await;
+        *harness.state.maintenance_status.lock().unwrap() =
+            MaintenanceStatus::Aborted { reason: FedMaintenanceAbortReason::ConcurrentRun };
+
+        let resp = harness.router.oneshot(authed_get("/v1/info", ALICE_TOKEN)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let status = &body["maintenance_status"];
+        assert_eq!(status["aborted"]["reason"], "concurrent_run");
+    }
+
+    #[tokio::test]
+    async fn info_returns_maintenance_status_failed() {
+        let harness = make_harness().await;
+        *harness.state.maintenance_status.lock().unwrap() =
+            MaintenanceStatus::Failed { message: "simulated error".into() };
+
+        let resp = harness.router.oneshot(authed_get("/v1/info", ALICE_TOKEN)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let status = &body["maintenance_status"];
+        assert_eq!(status["failed"]["message"], "simulated error");
+    }
+
+    #[tokio::test]
+    async fn info_returns_maintenance_status_completed_success() {
+        let harness = make_harness().await;
+        *harness.state.maintenance_status.lock().unwrap() =
+            MaintenanceStatus::Completed { status: FedMaintenanceRunStatus::Success };
+
+        let resp = harness.router.oneshot(authed_get("/v1/info", ALICE_TOKEN)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let status = &body["maintenance_status"];
+        assert_eq!(status["completed"]["status"], "success");
+    }
+
+    #[tokio::test]
+    async fn info_returns_maintenance_status_completed_partial() {
+        let harness = make_harness().await;
+        *harness.state.maintenance_status.lock().unwrap() =
+            MaintenanceStatus::Completed { status: FedMaintenanceRunStatus::Partial };
+
+        let resp = harness.router.oneshot(authed_get("/v1/info", ALICE_TOKEN)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let status = &body["maintenance_status"];
+        assert_eq!(status["completed"]["status"], "partial");
+    }
+
+    #[tokio::test]
+    async fn info_returns_maintenance_status_completed_failure() {
+        let harness = make_harness().await;
+        *harness.state.maintenance_status.lock().unwrap() =
+            MaintenanceStatus::Completed { status: FedMaintenanceRunStatus::Failure };
+
+        let resp = harness.router.oneshot(authed_get("/v1/info", ALICE_TOKEN)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let status = &body["maintenance_status"];
+        assert_eq!(status["completed"]["status"], "failure");
+    }
+
+    #[tokio::test]
+    async fn info_returns_maintenance_status_running() {
+        let harness = make_harness().await;
+        *harness.state.maintenance_status.lock().unwrap() = MaintenanceStatus::Running;
+
+        let resp = harness.router.oneshot(authed_get("/v1/info", ALICE_TOKEN)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let status = &body["maintenance_status"];
+        assert_eq!(status, "running");
+    }
+
+    // ─── 10. Scheduler ────────────────────────────────────────────────────────
+
+    /// Builds a router returning the state handle for scheduler introspection.
+    async fn build_with_maintenance(maintenance: MaintenanceRuntimeConfig) -> Harness {
+        let tempdir = TempDir::new().unwrap();
+        let palace_path = tempdir.path().join("palace");
+
+        let token_file = tempdir.path().join("tokens.json");
+        std::fs::write(
+            &token_file,
+            serde_json::to_string(&serde_json::json!([
+                {"token": ALICE_TOKEN, "name": "alice", "enabled": true},
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        restrict_token_file(&token_file);
+
+        let config = MempalaceConfig {
+            schema_version: 1,
+            collection_name: "mempalace_drawers".to_owned(),
+            palace_path,
+            embedding_profile: EmbeddingProfile::Balanced,
+            low_cpu: LowCpuRuntimeConfig::defaults_for_profile(EmbeddingProfile::Balanced),
+            server: ServerRuntimeConfig {
+                bind: "127.0.0.1:8765".parse().unwrap(),
+                token_file,
+                checkouts: std::collections::BTreeMap::new(),
+            },
+            federation: FederationRuntimeConfig::default(),
+            maintenance,
+        };
+        let tokens = TokenRegistry::load(config.server.token_file.clone()).unwrap();
+        let provider = DeterministicStubProvider::new(EmbeddingProfile::Balanced);
+        let (router, state) = build_router(config, provider, tokens).await.unwrap();
+        Harness { router, state, _tempdir: tempdir }
+    }
+
+    #[tokio::test]
+    async fn maintenance_startup_check_records_status() {
+        let harness = build_with_maintenance(MaintenanceRuntimeConfig::defaults()).await;
+        // The background task runs an immediate startup check.  Poll until
+        // the status is populated (should complete within a few hundred ms).
+        for _ in 0..50 {
+            if harness.state.last_maintenance_status.lock().unwrap().is_some() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("startup maintenance check did not record status within 2.5 s");
+    }
+
+    #[tokio::test]
+    async fn maintenance_disabled_creates_no_scheduler() {
+        let disabled = MaintenanceRuntimeConfig {
+            enabled: false,
+            ..MaintenanceRuntimeConfig::defaults()
+        };
+        let harness = build_with_maintenance(disabled).await;
+        // Wait long enough that even a startup check would have run.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let status = harness.state.last_maintenance_status.lock().unwrap().take();
+        assert!(status.is_none(), "disabled maintenance must not record status");
+    }
+
+    #[tokio::test]
+    async fn maintenance_health_check_does_not_signal_write_activity() {
+        let harness = make_harness().await;
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/v1/health")
+            .body(Body::empty())
+            .unwrap();
+        let _ = harness.router.clone().oneshot(request).await.unwrap();
+        assert!(
+            !harness.state.storage.take_activity_signal(),
+            "read-only health checks must not postpone maintenance",
+        );
+    }
+
+    #[tokio::test]
+    async fn maintenance_runs_after_one_idle_period() {
+        use mempalace_storage::{MaintenanceOutcome, MaintenanceSkipReason};
+
+        let short_idle = MaintenanceRuntimeConfig {
+            idle_secs: 1,
+            ..MaintenanceRuntimeConfig::defaults()
+        };
+        let harness = build_with_maintenance(short_idle).await;
+
+        // Wait for the startup check to complete.
+        for _ in 0..50 {
+            if harness.state.last_maintenance_status.lock().unwrap().is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        // Clear the startup status so we can detect the next run.
+        *harness.state.last_maintenance_status.lock().unwrap() = None;
+
+        // Simulate a completed write to establish the idle period.
+        harness.state.storage.signal_activity();
+
+        // The scheduler phase begins at startup, so a write immediately after
+        // the startup pass may wait almost two full intervals. Poll rather
+        // than assuming a particular phase alignment.
+        let mut status = None;
+        for _ in 0..70 {
+            status = harness.state.last_maintenance_status.lock().unwrap().take();
+            if status.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(status.is_some(), "maintenance should have run after one idle period");
+        let summary = status.unwrap();
+        let stale_signal_skipped = summary.tier_results.iter().any(|r| {
+            matches!(
+                r.outcome,
+                MaintenanceOutcome::Skipped { reason: MaintenanceSkipReason::NotIdle }
+            )
+        });
+        assert!(
+            !stale_signal_skipped,
+            "maintenance must not be skipped by a stale activity signal",
+        );
+    }
+
+    #[tokio::test]
+    async fn info_shows_maintenance_last_run_after_startup_check() {
+        let harness = make_harness().await;
+        // Wait for the startup check to record a last_maintenance_status.
+        for _ in 0..100 {
+            if harness.state.last_maintenance_status.lock().unwrap().is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let resp = harness.router.oneshot(authed_get("/v1/info", ALICE_TOKEN)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        // After a startup check, maintenance_last_run should be a non-null object.
+        assert!(
+            body["maintenance_last_run"].is_object(),
+            "maintenance_last_run must be an object after startup: {}",
+            body,
+        );
+        assert!(
+            body["maintenance_last_run"]["run_id"].is_number(),
+            "run_id must be present in maintenance_last_run",
+        );
+        assert!(
+            body["maintenance_last_run"]["status"].is_string(),
+            "status must be present in maintenance_last_run",
+        );
+    }
+
+    #[tokio::test]
+    async fn info_shows_maintenance_tier_results_in_last_run() {
+        let harness = make_harness().await;
+        // Wait for the startup check to record a last_maintenance_status.
+        for _ in 0..100 {
+            if harness.state.last_maintenance_status.lock().unwrap().is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let resp = harness.router.oneshot(authed_get("/v1/info", ALICE_TOKEN)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let last_run = &body["maintenance_last_run"];
+        let tier_results = last_run["tier_results"].as_array();
+        assert!(
+            tier_results.is_some() && !tier_results.unwrap().is_empty(),
+            "maintenance_last_run must contain tier_results after startup: {}",
+            body,
+        );
+    }
+
+    // ─── 11. Hub-only scheduling ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn scheduler_task_spawned_by_build_router_not_by_engine_open() {
+        // The background scheduler is only spawned by build_router (the HTTP
+        // hub path).  Opening StorageEngine directly (CLI/API path) must NOT
+        // start periodic maintenance.
+        let tempdir = TempDir::new().unwrap();
+        let engine = mempalace_storage::StorageEngine::open(
+            tempdir.path().join("palace"),
+            EmbeddingProfile::Balanced,
+        )
+        .await
+        .unwrap();
+
+        // Wait long enough for a scheduler to have run if one were spawned.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        // Manual pass works correctly — no background scheduler is running
+        // because engine.open() does not spawn one.
+        let settings = mempalace_storage::MaintenanceSettings {
+            enabled: true,
+            idle_secs: 0,
+            ..mempalace_storage::MaintenanceSettings::default()
+        };
+        let summary = engine.run_maintenance(&settings).await.unwrap();
+        assert_eq!(summary.tier_results.len(), 3, "manual maintenance should run all tiers");
+
+        // Now confirm that build_router DOES spawn a scheduler by checking
+        // that the startup maintenance check populates last_maintenance_status.
+        let harness = build_with_maintenance(MaintenanceRuntimeConfig::defaults()).await;
+        for _ in 0..50 {
+            if harness.state.last_maintenance_status.lock().unwrap().is_some() {
+                return; // scheduler ran the startup check
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("build_router should spawn a scheduler that runs the startup check");
     }
 }

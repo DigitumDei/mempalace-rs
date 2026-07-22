@@ -3,15 +3,22 @@
 mod engine;
 mod error;
 mod lance;
+mod maintenance;
 mod sqlite;
 mod types;
 
 pub use engine::StorageEngine;
 pub use error::{Result, StorageError};
-pub use lance::LanceDrawerStore;
+pub use lance::{
+    FragmentStats, LanceDrawerStore, OptimizeMetrics, PruneMetrics, VectorIndexStats,
+};
+pub use maintenance::{
+    MaintenanceAbortReason, MaintenanceOutcome, MaintenanceRunStatus, MaintenanceRunSummary,
+    MaintenanceSettings, MaintenanceSkipReason, MaintenanceTier, MaintenanceTierResult,
+};
 pub use sqlite::{
     ChangeCursor, ChangeEvent, ChangeLogStore, ChangePage, DiaryStore, EntityRegistryStore, GraphStore,
-    IngestManifestStore, KnowledgeGraphStore, SqliteOperationalStore, ToolStateStore,
+    IngestManifestStore, KnowledgeGraphStore, MaintenanceLeaseStore, SqliteOperationalStore, ToolStateStore,
 };
 pub use types::{
     ConfigEntry, DrawerFilter, DrawerMatch, DrawerStore, DuplicateStrategy, EntityRecord,

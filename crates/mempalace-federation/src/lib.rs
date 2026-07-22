@@ -14,13 +14,105 @@ pub const FEDERATION_API_VERSION: u32 = 1;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct InfoResponse {
     /// Semver string of the running MemPalace server binary.
+    #[serde(default)]
     pub server_version: String,
     /// Federation API version (matches [`FEDERATION_API_VERSION`]).
+    #[serde(default)]
     pub federation_api_version: u32,
     /// Name of the embedding profile used by this server (e.g. `"balanced"`).
+    #[serde(default)]
     pub embedding_profile: String,
     /// Feature flags the server supports (e.g. `["drawers", "kg", "changes"]`).
+    #[serde(default)]
     pub capabilities: Vec<String>,
+    /// Whether the maintenance subsystem is enabled.
+    #[serde(default)]
+    pub maintenance_enabled: bool,
+    /// Minimum idle seconds since last write before maintenance runs.
+    #[serde(default)]
+    pub maintenance_idle_secs: u64,
+    /// JSON-serialized [`MaintenanceRunSummary`] of the last completed
+    /// maintenance run, if any.
+    #[serde(default)]
+    pub maintenance_last_run: Option<serde_json::Value>,
+    /// Typed status of the maintenance subsystem.  Replaces the ambiguous
+    /// `null` of `maintenance_last_run` with explicit states.
+    #[serde(default)]
+    pub maintenance_status: MaintenanceStatus,
+}
+
+// ─── Maintenance status ────────────────────────────────────────────────────────
+
+/// Why a maintenance run was skipped (before any tier started).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaintenanceSkipReason {
+    /// The system has not been idle long enough.
+    NotIdle,
+    /// No work was required.
+    NothingToDo,
+}
+
+/// Why a maintenance run was aborted (started but terminated early).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaintenanceAbortReason {
+    /// Another concurrent process holds the maintenance lock.
+    ConcurrentRun,
+    /// The system is shutting down.
+    Shutdown,
+    /// The operation exceeded its time budget.
+    Timeout,
+}
+
+/// Overall run status of a completed maintenance run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaintenanceRunStatus {
+    /// All tiers completed successfully.
+    Success,
+    /// At least one tier was skipped (non-critical).
+    Partial,
+    /// At least one tier failed or was aborted.
+    Failure,
+}
+
+/// Typed status of the maintenance subsystem.
+///
+/// This replaces the ambiguous `null` / opaque-JSON dance of
+/// `maintenance_last_run` with an explicit state that clients can
+/// match on.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaintenanceStatus {
+    /// Maintenance is disabled in configuration.
+    Disabled,
+    /// No maintenance run has completed yet (idle / not-yet-run).
+    Idle,
+    /// A maintenance run is currently in progress.
+    Running,
+    /// The most recent attempt was skipped before any tier started.
+    Skipped {
+        reason: MaintenanceSkipReason,
+    },
+    /// The most recent attempt was aborted mid-run.
+    Aborted {
+        reason: MaintenanceAbortReason,
+    },
+    /// The most recent attempt failed with an error.
+    Failed {
+        message: String,
+    },
+    /// The most recent run completed (possibly with tier-level failures).
+    Completed {
+        status: MaintenanceRunStatus,
+    },
+}
+
+impl Default for MaintenanceStatus {
+    fn default() -> Self {
+        Self::Idle
+    }
 }
 
 // ─── Drawer search ────────────────────────────────────────────────────────────
@@ -384,10 +476,133 @@ mod tests {
             federation_api_version: FEDERATION_API_VERSION,
             embedding_profile: "balanced".to_owned(),
             capabilities: vec!["drawers".to_owned(), "kg".to_owned()],
+            maintenance_enabled: true,
+            maintenance_idle_secs: 300,
+            maintenance_last_run: None,
+            maintenance_status: MaintenanceStatus::Idle,
         };
         let json = serde_json::to_string(&original).unwrap();
         let decoded: InfoResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn maintenance_status_disabled_serde() {
+        let raw = r#"{"maintenance_status":"disabled"}"#;
+        let info: InfoResponse = serde_json::from_str(raw).unwrap();
+        assert_eq!(info.maintenance_status, MaintenanceStatus::Disabled);
+    }
+
+    #[test]
+    fn maintenance_status_idle_serde() {
+        let raw = r#"{"maintenance_status":"idle"}"#;
+        let info: InfoResponse = serde_json::from_str(raw).unwrap();
+        assert_eq!(info.maintenance_status, MaintenanceStatus::Idle);
+    }
+
+    #[test]
+    fn maintenance_status_running_serde() {
+        let raw = r#"{"maintenance_status":"running"}"#;
+        let info: InfoResponse = serde_json::from_str(raw).unwrap();
+        assert_eq!(info.maintenance_status, MaintenanceStatus::Running);
+    }
+
+    #[test]
+    fn maintenance_status_skipped_not_idle() {
+        let raw = r#"{"maintenance_status":{"skipped":{"reason":"not_idle"}}}"#;
+        let info: InfoResponse = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            info.maintenance_status,
+            MaintenanceStatus::Skipped { reason: MaintenanceSkipReason::NotIdle }
+        );
+    }
+
+    #[test]
+    fn maintenance_status_skipped_nothing_to_do() {
+        let raw = r#"{"maintenance_status":{"skipped":{"reason":"nothing_to_do"}}}"#;
+        let info: InfoResponse = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            info.maintenance_status,
+            MaintenanceStatus::Skipped { reason: MaintenanceSkipReason::NothingToDo }
+        );
+    }
+
+    #[test]
+    fn maintenance_status_aborted_concurrent_run() {
+        let raw = r#"{"maintenance_status":{"aborted":{"reason":"concurrent_run"}}}"#;
+        let info: InfoResponse = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            info.maintenance_status,
+            MaintenanceStatus::Aborted { reason: MaintenanceAbortReason::ConcurrentRun }
+        );
+    }
+
+    #[test]
+    fn maintenance_status_aborted_shutdown() {
+        let raw = r#"{"maintenance_status":{"aborted":{"reason":"shutdown"}}}"#;
+        let info: InfoResponse = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            info.maintenance_status,
+            MaintenanceStatus::Aborted { reason: MaintenanceAbortReason::Shutdown }
+        );
+    }
+
+    #[test]
+    fn maintenance_status_aborted_timeout() {
+        let raw = r#"{"maintenance_status":{"aborted":{"reason":"timeout"}}}"#;
+        let info: InfoResponse = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            info.maintenance_status,
+            MaintenanceStatus::Aborted { reason: MaintenanceAbortReason::Timeout }
+        );
+    }
+
+    #[test]
+    fn maintenance_status_failed_with_message() {
+        let raw =
+            r#"{"maintenance_status":{"failed":{"message":"disk full"}}}"#;
+        let info: InfoResponse = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            info.maintenance_status,
+            MaintenanceStatus::Failed { message: "disk full".into() }
+        );
+    }
+
+    #[test]
+    fn maintenance_status_completed_success() {
+        let raw = r#"{"maintenance_status":{"completed":{"status":"success"}}}"#;
+        let info: InfoResponse = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            info.maintenance_status,
+            MaintenanceStatus::Completed { status: MaintenanceRunStatus::Success }
+        );
+    }
+
+    #[test]
+    fn maintenance_status_completed_partial() {
+        let raw = r#"{"maintenance_status":{"completed":{"status":"partial"}}}"#;
+        let info: InfoResponse = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            info.maintenance_status,
+            MaintenanceStatus::Completed { status: MaintenanceRunStatus::Partial }
+        );
+    }
+
+    #[test]
+    fn maintenance_status_completed_failure() {
+        let raw = r#"{"maintenance_status":{"completed":{"status":"failure"}}}"#;
+        let info: InfoResponse = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            info.maintenance_status,
+            MaintenanceStatus::Completed { status: MaintenanceRunStatus::Failure }
+        );
+    }
+
+    #[test]
+    fn maintenance_status_default_is_idle() {
+        let raw = r#"{}"#;
+        let info: InfoResponse = serde_json::from_str(raw).unwrap();
+        assert_eq!(info.maintenance_status, MaintenanceStatus::Idle);
     }
 
     #[test]

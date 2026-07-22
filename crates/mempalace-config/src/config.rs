@@ -21,6 +21,10 @@ const PROJECT_CONFIG_FILE_NAME: &str = "mempalace.yaml";
 const LEGACY_PROJECT_CONFIG_FILE_NAME: &str = "mempal.yaml";
 const DEFAULT_SERVER_BIND: &str = "127.0.0.1:8765";
 const DEFAULT_SERVER_TOKEN_FILE: &str = "server_tokens.json";
+const DEFAULT_MAINTENANCE_IDLE_SECS: usize = 300;
+const DEFAULT_MAINTENANCE_VERSION_RETENTION_HOURS: usize = 24;
+const DEFAULT_MAINTENANCE_TAIL_THRESHOLD_ROWS: usize = 1024;
+const DEFAULT_MAINTENANCE_SMALL_FRAGMENT_THRESHOLD: usize = 10;
 const DEFAULT_LOW_CPU_WORKER_THREADS: usize = 1;
 const DEFAULT_LOW_CPU_MAX_BLOCKING_THREADS: usize = 1;
 const DEFAULT_LOW_CPU_QUEUE_LIMIT: usize = 32;
@@ -226,6 +230,88 @@ impl LowCpuRuntimeConfig {
     }
 }
 
+/// File-level representation of the optional `[maintenance]` config section.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaintenanceConfigFileV1 {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub idle_secs: Option<usize>,
+    #[serde(default)]
+    pub version_retention_hours: Option<usize>,
+    #[serde(default)]
+    pub tail_threshold_rows: Option<usize>,
+    #[serde(default)]
+    pub small_fragment_threshold: Option<usize>,
+}
+
+/// Resolved runtime configuration for the maintenance subsystem.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaintenanceRuntimeConfig {
+    /// Whether the maintenance subsystem is enabled (default: true).
+    pub enabled: bool,
+    /// Minimum idle seconds since last write before maintenance runs (default: 300).
+    pub idle_secs: usize,
+    /// Maximum age in hours for retained version data (default: 24).
+    pub version_retention_hours: usize,
+    /// Row count threshold for triggering tail compaction (default: 1024).
+    pub tail_threshold_rows: usize,
+    /// Small-fragment count threshold for triggering fragment compaction (default: 10).
+    pub small_fragment_threshold: usize,
+}
+
+impl MaintenanceRuntimeConfig {
+    pub fn defaults() -> Self {
+        Self {
+            enabled: true,
+            idle_secs: DEFAULT_MAINTENANCE_IDLE_SECS,
+            version_retention_hours: DEFAULT_MAINTENANCE_VERSION_RETENTION_HOURS,
+            tail_threshold_rows: DEFAULT_MAINTENANCE_TAIL_THRESHOLD_ROWS,
+            small_fragment_threshold: DEFAULT_MAINTENANCE_SMALL_FRAGMENT_THRESHOLD,
+        }
+    }
+
+    fn with_overrides(
+        mut self,
+        overrides: Option<MaintenanceConfigFileV1>,
+        config_path: &Path,
+    ) -> Result<Self> {
+        let Some(overrides) = overrides else {
+            return Ok(self);
+        };
+
+        if let Some(enabled) = overrides.enabled {
+            self.enabled = enabled;
+        }
+        self.idle_secs = required_positive_override(
+            "maintenance.idle_secs",
+            overrides.idle_secs,
+            self.idle_secs,
+            config_path,
+        )?;
+        self.version_retention_hours = required_positive_override(
+            "maintenance.version_retention_hours",
+            overrides.version_retention_hours,
+            self.version_retention_hours,
+            config_path,
+        )?;
+        self.tail_threshold_rows = required_positive_override(
+            "maintenance.tail_threshold_rows",
+            overrides.tail_threshold_rows,
+            self.tail_threshold_rows,
+            config_path,
+        )?;
+        self.small_fragment_threshold = required_positive_override(
+            "maintenance.small_fragment_threshold",
+            overrides.small_fragment_threshold,
+            self.small_fragment_threshold,
+            config_path,
+        )?;
+
+        Ok(self)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigFileV1 {
     #[serde(default = "default_version")]
@@ -243,6 +329,9 @@ pub struct ConfigFileV1 {
     /// Optional federation routing section.
     #[serde(default)]
     pub federation: Option<FederationConfigV1>,
+    /// Optional maintenance subsystem configuration.
+    #[serde(default)]
+    pub maintenance: Option<MaintenanceConfigFileV1>,
 }
 
 impl Default for ConfigFileV1 {
@@ -255,6 +344,7 @@ impl Default for ConfigFileV1 {
             low_cpu: None,
             server: None,
             federation: None,
+            maintenance: None,
         }
     }
 }
@@ -275,6 +365,8 @@ pub struct MempalaceConfig {
     pub server: ServerRuntimeConfig,
     /// Federation routing configuration.
     pub federation: FederationRuntimeConfig,
+    /// Maintenance subsystem configuration.
+    pub maintenance: MaintenanceRuntimeConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -365,6 +457,11 @@ impl ConfigLoader {
             // `MEMPAL_PALACE_PATH` is the legacy Python alias; keep it for upgrade compatibility.
             env::var("MEMPALACE_PALACE_PATH").ok().or_else(|| env::var("MEMPAL_PALACE_PATH").ok()),
             env::var("MEMPALACE_EMBEDDING_PROFILE").ok(),
+            env::var("MEMPALACE_MAINTENANCE_ENABLED").ok(),
+            env::var("MEMPALACE_MAINTENANCE_IDLE_SECS").ok(),
+            env::var("MEMPALACE_MAINTENANCE_VERSION_RETENTION_HOURS").ok(),
+            env::var("MEMPALACE_MAINTENANCE_TAIL_THRESHOLD_ROWS").ok(),
+            env::var("MEMPALACE_MAINTENANCE_SMALL_FRAGMENT_THRESHOLD").ok(),
         )
     }
 
@@ -372,6 +469,11 @@ impl ConfigLoader {
         base_dir_override: Option<&Path>,
         palace_path_override: Option<String>,
         profile_override: Option<String>,
+        maintenance_enabled_override: Option<String>,
+        maintenance_idle_secs_override: Option<String>,
+        maintenance_version_retention_hours_override: Option<String>,
+        maintenance_tail_threshold_rows_override: Option<String>,
+        maintenance_small_fragment_threshold_override: Option<String>,
     ) -> Result<MempalaceConfig> {
         let paths = resolve_paths(base_dir_override)?;
         let file = read_config_file(&paths.config_file)?;
@@ -388,6 +490,15 @@ impl ConfigLoader {
             &paths.config_file,
             |name| env::var(name).ok(),
         )?;
+        let maintenance = resolve_maintenance_config(
+            file.maintenance,
+            &paths.config_file,
+            maintenance_enabled_override,
+            maintenance_idle_secs_override,
+            maintenance_version_retention_hours_override,
+            maintenance_tail_threshold_rows_override,
+            maintenance_small_fragment_threshold_override,
+        )?;
 
         Ok(MempalaceConfig {
             schema_version: file.version,
@@ -398,6 +509,7 @@ impl ConfigLoader {
                 .with_overrides(file.low_cpu, &paths.config_file)?,
             server,
             federation,
+            maintenance,
         })
     }
 
@@ -884,6 +996,100 @@ pub fn build_runtime(config: &MempalaceConfig) -> std::io::Result<Runtime> {
         .build()
 }
 
+fn resolve_maintenance_config(
+    file_section: Option<MaintenanceConfigFileV1>,
+    config_path: &Path,
+    enabled_override: Option<String>,
+    idle_secs_override: Option<String>,
+    version_retention_hours_override: Option<String>,
+    tail_threshold_rows_override: Option<String>,
+    small_fragment_threshold_override: Option<String>,
+) -> Result<MaintenanceRuntimeConfig> {
+    let mut config = MaintenanceRuntimeConfig::defaults().with_overrides(file_section, config_path)?;
+
+    if let Some(val) = enabled_override {
+        config.enabled = parse_env_flag(&val, config_path)?;
+    }
+    if let Some(val) = idle_secs_override {
+        config.idle_secs = val.parse::<usize>().map_err(|_| MempalaceError::ConfigParse {
+            path: config_path.to_path_buf(),
+            message: format!(
+                "MEMPALACE_MAINTENANCE_IDLE_SECS `{val}` is not a valid positive integer"
+            ),
+        })?;
+        if config.idle_secs == 0 {
+            return Err(MempalaceError::ConfigParse {
+                path: config_path.to_path_buf(),
+                message: "MEMPALACE_MAINTENANCE_IDLE_SECS must be greater than 0".to_owned(),
+            });
+        }
+    }
+    if let Some(val) = version_retention_hours_override {
+        config.version_retention_hours =
+            val.parse::<usize>().map_err(|_| MempalaceError::ConfigParse {
+                path: config_path.to_path_buf(),
+                message: format!(
+                    "MEMPALACE_MAINTENANCE_VERSION_RETENTION_HOURS `{val}` is not a valid positive integer"
+                ),
+            })?;
+        if config.version_retention_hours == 0 {
+            return Err(MempalaceError::ConfigParse {
+                path: config_path.to_path_buf(),
+                message:
+                    "MEMPALACE_MAINTENANCE_VERSION_RETENTION_HOURS must be greater than 0".to_owned(),
+            });
+        }
+    }
+    if let Some(val) = tail_threshold_rows_override {
+        config.tail_threshold_rows =
+            val.parse::<usize>().map_err(|_| MempalaceError::ConfigParse {
+                path: config_path.to_path_buf(),
+                message: format!(
+                    "MEMPALACE_MAINTENANCE_TAIL_THRESHOLD_ROWS `{val}` is not a valid positive integer"
+                ),
+            })?;
+        if config.tail_threshold_rows == 0 {
+            return Err(MempalaceError::ConfigParse {
+                path: config_path.to_path_buf(),
+                message:
+                    "MEMPALACE_MAINTENANCE_TAIL_THRESHOLD_ROWS must be greater than 0".to_owned(),
+            });
+        }
+    }
+    if let Some(val) = small_fragment_threshold_override {
+        config.small_fragment_threshold =
+            val.parse::<usize>().map_err(|_| MempalaceError::ConfigParse {
+                path: config_path.to_path_buf(),
+                message: format!(
+                    "MEMPALACE_MAINTENANCE_SMALL_FRAGMENT_THRESHOLD `{val}` is not a valid positive integer"
+                ),
+            })?;
+        if config.small_fragment_threshold == 0 {
+            return Err(MempalaceError::ConfigParse {
+                path: config_path.to_path_buf(),
+                message:
+                    "MEMPALACE_MAINTENANCE_SMALL_FRAGMENT_THRESHOLD must be greater than 0"
+                        .to_owned(),
+            });
+        }
+    }
+
+    Ok(config)
+}
+
+fn parse_env_flag(value: &str, config_path: &Path) -> Result<bool> {
+    match value {
+        "1" | "true" | "TRUE" | "yes" | "YES" => Ok(true),
+        "0" | "false" | "FALSE" | "no" | "NO" => Ok(false),
+        _ => Err(MempalaceError::ConfigParse {
+            path: config_path.to_path_buf(),
+            message: format!(
+                "MEMPALACE_MAINTENANCE_ENABLED `{value}` is not a valid boolean; expected true or false"
+            ),
+        }),
+    }
+}
+
 fn resolve_server_config(
     file_section: Option<ServerConfigFileV1>,
     base_dir: &Path,
@@ -966,8 +1172,8 @@ mod tests {
 
     use super::{
         ConfigLoader, DEFAULT_COLLECTION_NAME, DEFAULT_LOW_CPU_INGEST_BATCH_SIZE,
-        LowCpuConfigFileV1, LowCpuRuntimeConfig, ProjectConfig, ProjectRegistryEntryV1,
-        ProjectRoomConfig,
+        LowCpuConfigFileV1, LowCpuRuntimeConfig, MaintenanceConfigFileV1, MaintenanceRuntimeConfig,
+        ProjectConfig, ProjectRegistryEntryV1, ProjectRoomConfig,
     };
 
     fn temp_dir() -> PathBuf {
@@ -987,6 +1193,11 @@ mod tests {
         assert_eq!(config.embedding_profile, EmbeddingProfile::Balanced);
         assert_eq!(config.palace_path, base.join("palace"));
         assert!(!config.low_cpu.enabled);
+        assert!(config.maintenance.enabled);
+        assert_eq!(config.maintenance.idle_secs, 300);
+        assert_eq!(config.maintenance.version_retention_hours, 24);
+        assert_eq!(config.maintenance.tail_threshold_rows, 1024);
+        assert_eq!(config.maintenance.small_fragment_threshold, 10);
         assert!(paths.palace_dir.is_dir());
 
         fs::remove_dir_all(base).unwrap();
@@ -1001,6 +1212,11 @@ mod tests {
             Some(&base),
             Some("/tmp/custom-palace".to_owned()),
             Some("low_cpu".to_owned()),
+            None,
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
 
@@ -1542,6 +1758,11 @@ mod tests {
             Some(&base),
             Some("/tmp/legacy-palace".to_owned()),
             None,
+            None,
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
 
@@ -1559,6 +1780,11 @@ mod tests {
             Some(&base),
             None,
             Some("definitely_not_real".to_owned()),
+            None,
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap_err();
 
@@ -1708,6 +1934,191 @@ mod tests {
             err.to_string().contains("not-an-address"),
             "error should contain the bad value, got: {err}"
         );
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    // ─── Maintenance config tests ────────────────────────────────────────────
+
+    #[test]
+    fn maintenance_defaults_are_opt_in() {
+        let base = temp_dir();
+        fs::create_dir_all(&base).unwrap();
+        fs::write(
+            base.join("config.json"),
+            r#"{"version":1,"collection_name":"mempalace_drawers"}"#,
+        )
+        .unwrap();
+
+        let config = ConfigLoader::load_with_env(Some(&base)).unwrap();
+
+        assert!(config.maintenance.enabled);
+        assert_eq!(config.maintenance.idle_secs, 300);
+        assert_eq!(config.maintenance.version_retention_hours, 24);
+        assert_eq!(config.maintenance.tail_threshold_rows, 1024);
+        assert_eq!(config.maintenance.small_fragment_threshold, 10);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn maintenance_overrides_are_loaded_from_config() {
+        let base = temp_dir();
+        fs::create_dir_all(&base).unwrap();
+        fs::write(
+            base.join("config.json"),
+            r#"{
+  "version": 1,
+  "maintenance": {
+    "enabled": false,
+    "idle_secs": 600,
+    "version_retention_hours": 48,
+    "tail_threshold_rows": 2048
+  }
+}"#,
+        )
+        .unwrap();
+
+        let config = ConfigLoader::load_with_env(Some(&base)).unwrap();
+
+        assert!(!config.maintenance.enabled);
+        assert_eq!(config.maintenance.idle_secs, 600);
+        assert_eq!(config.maintenance.version_retention_hours, 48);
+        assert_eq!(config.maintenance.tail_threshold_rows, 2048);
+        assert_eq!(config.maintenance.small_fragment_threshold, 10);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn zero_maintenance_values_are_rejected() {
+        let error = MaintenanceRuntimeConfig::defaults()
+            .with_overrides(
+                Some(MaintenanceConfigFileV1 {
+                    enabled: None,
+                    idle_secs: Some(0),
+                    version_retention_hours: None,
+                    tail_threshold_rows: None,
+                    small_fragment_threshold: None,
+                }),
+                Path::new("config.json"),
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "failed to parse config at config.json: maintenance.idle_secs must be greater than 0"
+        );
+    }
+
+    #[test]
+    fn maintenance_env_overrides_take_precedence() {
+        let base = temp_dir();
+        fs::create_dir_all(&base).unwrap();
+        fs::write(
+            base.join("config.json"),
+            r#"{"version":1,"maintenance":{"idle_secs":999}}"#,
+        )
+        .unwrap();
+
+        let config = ConfigLoader::load_from_sources(
+            Some(&base),
+            None,
+            None,
+            Some("false".to_owned()),
+            Some("500".to_owned()),
+            Some("12".to_owned()),
+            Some("256".to_owned()),
+            None,
+        )
+        .unwrap();
+
+        assert!(!config.maintenance.enabled);
+        assert_eq!(config.maintenance.idle_secs, 500);
+        assert_eq!(config.maintenance.version_retention_hours, 12);
+        assert_eq!(config.maintenance.tail_threshold_rows, 256);
+        assert_eq!(config.maintenance.small_fragment_threshold, 10);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn invalid_maintenance_enabled_env_override_is_rejected() {
+        let base = temp_dir();
+        ConfigLoader::init_default(Some(&base)).unwrap();
+
+        let err = ConfigLoader::load_from_sources(
+            Some(&base),
+            None,
+            None,
+            Some("ture".to_owned()),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("MEMPALACE_MAINTENANCE_ENABLED `ture`"));
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn maintenance_small_fragment_threshold_env_override() {
+        let base = temp_dir();
+        fs::create_dir_all(&base).unwrap();
+        fs::write(
+            base.join("config.json"),
+            r#"{"version":1,"maintenance":{"small_fragment_threshold":99}}"#,
+        )
+        .unwrap();
+
+        // File value + no env override → file value kept
+        let config = ConfigLoader::load_from_sources(
+            Some(&base), None, None, None, None, None, None, None,
+        )
+        .unwrap();
+        assert_eq!(config.maintenance.small_fragment_threshold, 99);
+
+        // File value + env override → env wins
+        let config = ConfigLoader::load_from_sources(
+            Some(&base), None, None, None, None, None, None, Some("50".to_owned()),
+        )
+        .unwrap();
+        assert_eq!(config.maintenance.small_fragment_threshold, 50);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn maintenance_config_all_fields_round_trip_from_file() {
+        let base = temp_dir();
+        fs::create_dir_all(&base).unwrap();
+        fs::write(
+            base.join("config.json"),
+            r#"{
+  "version": 1,
+  "maintenance": {
+    "enabled": false,
+    "idle_secs": 600,
+    "version_retention_hours": 48,
+    "tail_threshold_rows": 2048,
+    "small_fragment_threshold": 20
+  }
+}"#,
+        )
+        .unwrap();
+
+        let config = ConfigLoader::load_from_sources(
+            Some(&base), None, None, None, None, None, None, None,
+        )
+        .unwrap();
+
+        assert!(!config.maintenance.enabled);
+        assert_eq!(config.maintenance.idle_secs, 600);
+        assert_eq!(config.maintenance.version_retention_hours, 48);
+        assert_eq!(config.maintenance.tail_threshold_rows, 2048);
+        assert_eq!(config.maintenance.small_fragment_threshold, 20);
 
         fs::remove_dir_all(base).unwrap();
     }

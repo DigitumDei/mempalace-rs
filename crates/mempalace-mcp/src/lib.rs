@@ -2702,8 +2702,8 @@ mod tests {
     use std::sync::mpsc;
 
     use mempalace_config::{
-        FederationRuntimeConfig, LowCpuRuntimeConfig, ResolvedRemote, ResolvedRouteRule, RouteMode,
-        ServerRuntimeConfig, WriteTarget,
+        FederationRuntimeConfig, LowCpuRuntimeConfig, MaintenanceRuntimeConfig, ResolvedRemote,
+        ResolvedRouteRule, RouteMode, ServerRuntimeConfig, WriteTarget,
     };
     use mempalace_embeddings::{StartupValidation, StartupValidationStatus};
     use tempfile::TempDir;
@@ -3151,6 +3151,7 @@ mod tests {
                 checkouts: std::collections::BTreeMap::new(),
             },
             federation: FederationRuntimeConfig::default(),
+            maintenance: MaintenanceRuntimeConfig::defaults(),
         };
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
@@ -6014,6 +6015,7 @@ mod tests {
                 checkouts: std::collections::BTreeMap::new(),
             },
             federation: FederationRuntimeConfig::default(),
+            maintenance: MaintenanceRuntimeConfig::defaults(),
         }
     }
 }

@@ -17,7 +17,7 @@ jobs:
       contents: read
       statuses: write
     steps:
-      - uses: DigitumDei/jules-pr-reviewer@v2.2.0
+      - uses: DigitumDei/jules-pr-reviewer@v2.2.1
         with:
           jules_api_key: ${{ secrets.JULES_API_KEY }}
           github_token: ${{ secrets.GITHUB_TOKEN }}

@@ -66,10 +66,11 @@ try {
         $ProgressPreference = $prevProgress
     }
 
-    $manifest = Get-Content (Join-Path $tmpDir 'release-manifest.json') -Raw
+    $manifestPath = Join-Path $tmpDir 'release-manifest.json'
+    $manifest = Get-Content $manifestPath -Raw
     $publicKey = [Security.Cryptography.RSA]::Create()
     $publicKey.ImportFromPem((Get-Content (Join-Path $tmpDir 'release-public-key.pem') -Raw))
-    if (-not $publicKey.VerifyData([Text.Encoding]::UTF8.GetBytes($manifest), [IO.File]::ReadAllBytes((Join-Path $tmpDir 'release-manifest.sig')), [Security.Cryptography.HashAlgorithmName]::SHA256, [Security.Cryptography.RSASignaturePadding]::Pkcs1)) {
+    if (-not $publicKey.VerifyData([IO.File]::ReadAllBytes($manifestPath), [IO.File]::ReadAllBytes((Join-Path $tmpDir 'release-manifest.sig')), [Security.Cryptography.HashAlgorithmName]::SHA256, [Security.Cryptography.RSASignaturePadding]::Pkcs1)) {
         throw 'Release manifest signature verification FAILED - aborting install'
     }
     if (-not $publicKey.VerifyData([IO.File]::ReadAllBytes((Join-Path $tmpDir 'SHA256SUMS')), [IO.File]::ReadAllBytes((Join-Path $tmpDir 'SHA256SUMS.sig')), [Security.Cryptography.HashAlgorithmName]::SHA256, [Security.Cryptography.RSASignaturePadding]::Pkcs1)) {

@@ -64,7 +64,14 @@ err() { echo "error: $*" >&2; exit 1; }
 
 case "$CHANNEL" in
     stable) [ -z "$VERSION" ] || err "--version is only supported with --channel nightly"; RELEASE_URL="https://github.com/${REPO}/releases/latest/download" ;;
-    nightly) [[ "$VERSION" =~ ^nightly-[0-9a-f]{40}$ ]] || err "nightly updates require --version nightly-<full-commit-sha>"; RELEASE_URL="https://github.com/${REPO}/releases/download/${VERSION}" ;;
+    nightly)
+        NIGHTLY_SHA="${VERSION#nightly-}"
+        [ "${NIGHTLY_SHA}" != "${VERSION}" ] && [ "${#NIGHTLY_SHA}" -eq 40 ] || err "nightly updates require --version nightly-<full-commit-sha>"
+        case "${NIGHTLY_SHA}" in
+            *[!0123456789abcdef]*) err "nightly updates require --version nightly-<full-commit-sha>" ;;
+        esac
+        RELEASE_URL="https://github.com/${REPO}/releases/download/${VERSION}"
+        ;;
     *) err "unsupported channel: $CHANNEL (expected stable or nightly)" ;;
 esac
 

@@ -1,5 +1,5 @@
-# MemPalace installer - downloads the Windows x86_64 nightly build, verifies
-# checksums, installs to ~\.mempalace\bin, and registers the MCP server with
+# MemPalace installer - downloads the Windows x86_64 stable build, verifies its
+# signed manifest and checksums, installs to ~\.mempalace\bin, and registers the MCP server with
 # detected AI tools.
 #
 #   irm https://raw.githubusercontent.com/DigitumDei/mempalace-rs/main/install.ps1 | iex
@@ -14,20 +14,31 @@
 param(
     [switch]$NoSetup,
     [switch]$NoPath,
-    [string]$InstallDir
+    [string]$InstallDir,
+    [ValidateSet('stable', 'nightly')]
+    [string]$Channel = 'stable',
+    [string]$Version
 )
 
 $ErrorActionPreference = 'Stop'
 
 if (-not $NoSetup -and $env:MEMPALACE_NO_SETUP -eq '1') { $NoSetup = $true }
 if (-not $NoPath -and $env:MEMPALACE_NO_PATH -eq '1') { $NoPath = $true }
+if ($Channel -eq 'stable' -and $env:MEMPALACE_CHANNEL) { $Channel = $env:MEMPALACE_CHANNEL }
+if (-not $Version -and $env:MEMPALACE_VERSION) { $Version = $env:MEMPALACE_VERSION }
 if (-not $InstallDir) {
     if ($env:MEMPALACE_INSTALL_DIR) { $InstallDir = $env:MEMPALACE_INSTALL_DIR }
     else { $InstallDir = Join-Path $HOME '.mempalace\bin' }
 }
 
 $repo = 'DigitumDei/mempalace-rs'
-$releaseUrl = "https://github.com/$repo/releases/download/nightly"
+if ($Channel -eq 'stable') {
+    if ($Version) { throw '-Version is only supported with -Channel nightly' }
+    $releaseUrl = "https://github.com/$repo/releases/latest/download"
+} else {
+    if ($Version -notmatch '^nightly-[0-9a-f]{40}$') { throw 'Nightly updates require -Version nightly-<full-commit-sha>' }
+    $releaseUrl = "https://github.com/$repo/releases/download/$Version"
+}
 $assets = @('mempalace-cli-windows-x86_64.exe', 'mempalace-mcp-windows-x86_64.exe')
 
 if ($env:PROCESSOR_ARCHITECTURE -ne 'AMD64' -and $env:PROCESSOR_ARCHITEW6432 -ne 'AMD64') {
@@ -38,19 +49,27 @@ $tmpDir = Join-Path ([System.IO.Path]::GetTempPath()) ("mempalace-install-" + [S
 New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
 
 try {
-    Write-Host 'Downloading MemPalace nightly (windows-x86_64)...'
+    Write-Host "Downloading MemPalace $Channel (windows-x86_64)..."
     # Invoke-WebRequest is dramatically slower with the progress bar on PS 5.1.
     $prevProgress = $ProgressPreference
     $ProgressPreference = 'SilentlyContinue'
     try {
-        foreach ($asset in $assets + 'SHA256SUMS') {
+        foreach ($asset in $assets + 'SHA256SUMS' + 'release-manifest.json' + 'release-manifest.sig') {
             Invoke-WebRequest -Uri "$releaseUrl/$asset" -OutFile (Join-Path $tmpDir $asset) -UseBasicParsing
         }
+        Invoke-WebRequest -Uri "https://raw.githubusercontent.com/$repo/main/release/public-key.pem" -OutFile (Join-Path $tmpDir 'release-public-key.pem') -UseBasicParsing
     } finally {
         $ProgressPreference = $prevProgress
     }
 
-    Write-Host 'Verifying checksums...'
+    $manifest = Get-Content (Join-Path $tmpDir 'release-manifest.json') -Raw
+    $publicKey = [Security.Cryptography.RSA]::Create()
+    $publicKey.ImportFromPem((Get-Content (Join-Path $tmpDir 'release-public-key.pem') -Raw))
+    if (-not $publicKey.VerifyData([Text.Encoding]::UTF8.GetBytes($manifest), [IO.File]::ReadAllBytes((Join-Path $tmpDir 'release-manifest.sig')), [Security.Cryptography.HashAlgorithmName]::SHA256, [Security.Cryptography.RSASignaturePadding]::Pkcs1)) {
+        throw 'Release manifest signature verification FAILED - aborting install'
+    }
+    if (($manifest | ConvertFrom-Json).channel -ne $Channel) { throw 'Release manifest channel does not match requested channel' }
+    Write-Host 'Verifying signed manifest and checksums...'
     $sums = @{}
     foreach ($line in Get-Content (Join-Path $tmpDir 'SHA256SUMS')) {
         if ($line -match '^([0-9a-fA-F]{64})\s+\*?(.+)$') {

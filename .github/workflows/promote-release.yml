@@ -1,0 +1,66 @@
+name: promote-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_tag:
+        description: Immutable nightly-<commit> tag to promote
+        required: true
+        type: string
+      version:
+        description: Stable semantic version (without v)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  promote:
+    name: Promote tested candidate
+    runs-on: ubuntu-latest
+    environment: stable-release
+    steps:
+      - name: Checkout trusted release key
+        uses: actions/checkout@v7
+
+      - name: Validate requested version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]] || { echo "version must be semantic" >&2; exit 1; }
+          gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 && { echo "stable tag already exists" >&2; exit 1; } || true
+
+      - name: Download exact candidate assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_TAG: ${{ inputs.candidate_tag }}
+        run: |
+          [[ "$CANDIDATE_TAG" =~ ^nightly-[0-9a-f]{40}$ ]] || { echo "candidate tag must include a full commit SHA" >&2; exit 1; }
+          mkdir candidate-assets
+          gh release download "$CANDIDATE_TAG" --repo "$GITHUB_REPOSITORY" --dir candidate-assets
+
+      - name: Verify candidate manifest and artifacts
+        run: |
+          openssl dgst -sha256 -verify release/public-key.pem -signature candidate-assets/release-manifest.sig candidate-assets/release-manifest.json
+          jq -e --arg tag "${{ inputs.candidate_tag }}" --arg version "${{ inputs.version }}" '.schema_version == 1 and .channel == "nightly" and .release_tag == $tag and .version == $version and (.assets | length == 6)' candidate-assets/release-manifest.json >/dev/null
+          (cd candidate-assets && sha256sum --strict --check SHA256SUMS)
+
+      - name: Create signed stable manifest
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.MEMPALACE_RELEASE_SIGNING_KEY }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          test -n "$RELEASE_SIGNING_KEY" || { echo "MEMPALACE_RELEASE_SIGNING_KEY is required" >&2; exit 1; }
+          jq --arg version "$VERSION" '.channel = "stable" | .version = $version | .release_tag = ("v" + $version)' candidate-assets/release-manifest.json > candidate-assets/release-manifest.stable.json
+          mv candidate-assets/release-manifest.stable.json candidate-assets/release-manifest.json
+          printf '%s' "$RELEASE_SIGNING_KEY" | base64 --decode > signing-key.pem
+          openssl dgst -sha256 -sign signing-key.pem -out candidate-assets/release-manifest.sig candidate-assets/release-manifest.json
+          rm -f signing-key.pem
+
+      - name: Publish immutable stable release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: gh release create "v$VERSION" candidate-assets/* --repo "$GITHUB_REPOSITORY" --title "v$VERSION" --generate-notes --latest

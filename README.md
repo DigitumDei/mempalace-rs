@@ -10,7 +10,7 @@ MemPalace stores conversation and project context locally so your AI can search 
 
 ## Quick start
 
-Install the latest nightly build — downloads the binaries for your platform, verifies checksums, installs to `~/.mempalace/bin`, adds it to your PATH, and registers the MCP server with detected AI tools (Claude Code, Codex, Gemini, and more):
+Install the latest stable build — downloads the signed release manifest and binaries for your platform, verifies both before installing to `~/.mempalace/bin`, adds it to your PATH, and registers the MCP server with detected AI tools (Claude Code, Codex, Gemini, and more):
 
 **macOS (Apple Silicon) / Linux (x86_64, glibc 2.38+):**
 
@@ -31,7 +31,7 @@ mempalace-cli init /path/to/project
 mempalace-cli mine /path/to/project
 ```
 
-Nightlies are rolling builds from `main`; re-run the installer to update. Other platforms (Intel macOS, ARM Linux, musl) need a [source build](docs/Quickstart.md#1b-build-from-source-alternative).
+Stable releases are immutable. Test a candidate only with the explicit `--channel nightly --version nightly-<full-commit-sha>` installer options. Other platforms (Intel macOS, ARM Linux, musl) need a [source build](docs/Quickstart.md#1b-build-from-source-alternative).
 
 See the [Quickstart guide](docs/Quickstart.md) for the full walkthrough — installing, initializing, mining, searching, and connecting to Claude/Cursor/Cline.
 

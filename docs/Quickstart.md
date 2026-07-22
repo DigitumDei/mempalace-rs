@@ -4,7 +4,7 @@ Get MemPalace running and connected to your AI in a few minutes.
 
 ## 1. Install
 
-The installer downloads the latest nightly binaries for your platform, verifies checksums against the published `SHA256SUMS`, installs them to `~/.mempalace/bin`, adds that directory to your PATH, and runs `mempalace-cli setup` to register the MCP server with detected AI tools.
+The installer downloads the latest stable binaries for your platform, verifies the signed release manifest and the artifact digests, installs them to `~/.mempalace/bin`, adds that directory to your PATH, and runs `mempalace-cli setup` to register the MCP server with detected AI tools.
 
 **macOS (Apple Silicon) / Linux (x86_64, glibc 2.38+):**
 
@@ -25,10 +25,11 @@ Options:
 | `--no-setup` | `-NoSetup` (or `$env:MEMPALACE_NO_SETUP='1'`) | skip MCP registration |
 | `--no-path` | `-NoPath` (or `$env:MEMPALACE_NO_PATH='1'`) | don't touch your PATH |
 | `--install-dir <dir>` | `-InstallDir <dir>` (or `$env:MEMPALACE_INSTALL_DIR`) | install elsewhere |
+| `--channel nightly --version nightly-<full-commit-sha>` | `-Channel nightly -Version nightly-<full-commit-sha>` | explicitly install an immutable test candidate |
 
 Pass sh flags through the pipe with `| sh -s -- --no-setup`. For PowerShell parameters, download the script first (`irm ... -OutFile install.ps1`) — env vars work with the piped one-liner.
 
-Nightlies are rolling builds from `main`; re-run the installer any time to update in place.
+Stable releases are immutable and are the default installer target. Candidates from `main` are immutable `nightly-<full-commit-sha>` prereleases and require the explicit nightly channel and version above.
 
 Supported platforms: Linux x86_64 (glibc 2.38+), macOS Apple Silicon, Windows x86_64. Anything else (Intel macOS, ARM Linux, musl) has no prebuilt ONNX Runtime — build from source instead.
 

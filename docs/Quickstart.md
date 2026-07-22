@@ -12,7 +12,7 @@ The installer downloads the latest stable binaries for your platform, verifies t
 curl -fsSL https://raw.githubusercontent.com/DigitumDei/mempalace-rs/main/install.sh | sh
 ```
 
-**Windows (x86_64, PowerShell 7+):**
+**Windows (x86_64, PowerShell 7.1+):**
 
 ```powershell
 irm https://raw.githubusercontent.com/DigitumDei/mempalace-rs/main/install.ps1 | iex
@@ -31,7 +31,7 @@ Pass sh flags through the pipe with `| sh -s -- --no-setup`. For PowerShell para
 
 Stable releases are immutable and are the default installer target. Candidates from `main` are immutable `nightly-<full-commit-sha>` prereleases and require the explicit nightly channel and version above.
 
-The Windows installer verifies release signatures with the PowerShell 7 cryptography APIs. Install PowerShell 7 before using the Windows command above.
+The Windows installer verifies release signatures with cryptography APIs introduced in PowerShell 7.1. Install PowerShell 7.1 or later before using the Windows command above.
 
 Supported platforms: Linux x86_64 (glibc 2.38+), macOS Apple Silicon, Windows x86_64. Anything else (Intel macOS, ARM Linux, musl) has no prebuilt ONNX Runtime — build from source instead.
 

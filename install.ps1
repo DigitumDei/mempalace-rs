@@ -22,8 +22,8 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-if ($PSVersionTable.PSEdition -ne 'Core' -or $PSVersionTable.PSVersion.Major -lt 7) {
-    throw 'The signed installer requires PowerShell 7 or later. Install it from https://aka.ms/powershell.'
+if ($PSVersionTable.PSEdition -ne 'Core' -or $PSVersionTable.PSVersion -lt [version]'7.1') {
+    throw 'The signed installer requires PowerShell 7.1 or later. Install it from https://aka.ms/powershell.'
 }
 
 if (-not $NoSetup -and $env:MEMPALACE_NO_SETUP -eq '1') { $NoSetup = $true }
@@ -44,6 +44,19 @@ if ($Channel -eq 'stable') {
     $releaseUrl = "https://github.com/$repo/releases/download/$Version"
 }
 $assets = @('mempalace-cli-windows-x86_64.exe', 'mempalace-mcp-windows-x86_64.exe')
+$publicKeyPem = @'
+-----BEGIN PUBLIC KEY-----
+MIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEAsIRfz0Yf8P79QOHVw7pt
+DIf7elx4c4/pbCnl7W4VBrj43uE6iFqExbWOCUImJ9dX1q0Hwj6jZV7mU5j8RGyw
+zYy0lIacu5Qrf7Op5cueaPUCnA09PCVIgHya1U0TDmjvG6IgIDgYuwPiedXN5lvg
+37K3YzYl4wFVES21iaN+6MvQg6U//5vpdCxkuY/zgg4jKOl3sSelcP49vc3d5+fO
+nYhbF9ONYPpqI0/diKjdZkQiQxrnhhzgq4hbyyvekd16j1G9iEMyePVCxdTMeUqS
+/O02do5ppZ1bfybPb3L90FRiq6Bt4eipu5TUxqOro/JFfbbfjHWUtc/9N0aT8lod
+Ofm6iWdW0FDYHYqnSTPXJTxCb3aIntBM2xk3BgQt7Nmg0HzB6bkY9/Eih4w8u355
+kVXeZtycjGDIQB0Q7hbwl1VGYUG5GrClffrz5ucphRiq+LoBYqjuF5RE8m7zQlVN
+Llh6RGEhXrgdAx2smPphk4VXm7XVSmm7ETWkFHMVqdxxAgMBAAE=
+-----END PUBLIC KEY-----
+'@
 
 if ($env:PROCESSOR_ARCHITECTURE -ne 'AMD64' -and $env:PROCESSOR_ARCHITEW6432 -ne 'AMD64') {
     throw "Unsupported architecture: $env:PROCESSOR_ARCHITECTURE. Nightly builds cover Windows x86_64 only. Build from source instead: https://github.com/$repo/blob/main/docs/Quickstart.md"
@@ -61,7 +74,6 @@ try {
         foreach ($asset in $assets + 'SHA256SUMS' + 'SHA256SUMS.sig' + 'release-manifest.json' + 'release-manifest.sig') {
             Invoke-WebRequest -Uri "$releaseUrl/$asset" -OutFile (Join-Path $tmpDir $asset) -UseBasicParsing
         }
-        Invoke-WebRequest -Uri "https://raw.githubusercontent.com/$repo/main/release/public-key.pem" -OutFile (Join-Path $tmpDir 'release-public-key.pem') -UseBasicParsing
     } finally {
         $ProgressPreference = $prevProgress
     }
@@ -69,7 +81,7 @@ try {
     $manifestPath = Join-Path $tmpDir 'release-manifest.json'
     $manifest = Get-Content $manifestPath -Raw
     $publicKey = [Security.Cryptography.RSA]::Create()
-    $publicKey.ImportFromPem((Get-Content (Join-Path $tmpDir 'release-public-key.pem') -Raw))
+    $publicKey.ImportFromPem($publicKeyPem)
     if (-not $publicKey.VerifyData([IO.File]::ReadAllBytes($manifestPath), [IO.File]::ReadAllBytes((Join-Path $tmpDir 'release-manifest.sig')), [Security.Cryptography.HashAlgorithmName]::SHA256, [Security.Cryptography.RSASignaturePadding]::Pkcs1)) {
         throw 'Release manifest signature verification FAILED - aborting install'
     }

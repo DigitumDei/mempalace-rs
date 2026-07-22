@@ -115,6 +115,21 @@ fi
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "${TMP_DIR}"' EXIT
 
+# This public key is the immutable trust root for signed release assets.
+cat > "${TMP_DIR}/release-public-key.pem" <<'EOF'
+-----BEGIN PUBLIC KEY-----
+MIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEAsIRfz0Yf8P79QOHVw7pt
+DIf7elx4c4/pbCnl7W4VBrj43uE6iFqExbWOCUImJ9dX1q0Hwj6jZV7mU5j8RGyw
+zYy0lIacu5Qrf7Op5cueaPUCnA09PCVIgHya1U0TDmjvG6IgIDgYuwPiedXN5lvg
+37K3YzYl4wFVES21iaN+6MvQg6U//5vpdCxkuY/zgg4jKOl3sSelcP49vc3d5+fO
+nYhbF9ONYPpqI0/diKjdZkQiQxrnhhzgq4hbyyvekd16j1G9iEMyePVCxdTMeUqS
+/O02do5ppZ1bfybPb3L90FRiq6Bt4eipu5TUxqOro/JFfbbfjHWUtc/9N0aT8lod
+Ofm6iWdW0FDYHYqnSTPXJTxCb3aIntBM2xk3BgQt7Nmg0HzB6bkY9/Eih4w8u355
+kVXeZtycjGDIQB0Q7hbwl1VGYUG5GrClffrz5ucphRiq+LoBYqjuF5RE8m7zQlVN
+Llh6RGEhXrgdAx2smPphk4VXm7XVSmm7ETWkFHMVqdxxAgMBAAE=
+-----END PUBLIC KEY-----
+EOF
+
 echo "Downloading MemPalace ${CHANNEL} (${PLATFORM})..."
 fetch "${RELEASE_URL}/${CLI_ASSET}" "${TMP_DIR}/${CLI_ASSET}"
 fetch "${RELEASE_URL}/${MCP_ASSET}" "${TMP_DIR}/${MCP_ASSET}"
@@ -122,7 +137,6 @@ fetch "${RELEASE_URL}/SHA256SUMS" "${TMP_DIR}/SHA256SUMS"
 fetch "${RELEASE_URL}/SHA256SUMS.sig" "${TMP_DIR}/SHA256SUMS.sig"
 fetch "${RELEASE_URL}/release-manifest.json" "${TMP_DIR}/release-manifest.json"
 fetch "${RELEASE_URL}/release-manifest.sig" "${TMP_DIR}/release-manifest.sig"
-fetch "https://raw.githubusercontent.com/${REPO}/main/release/public-key.pem" "${TMP_DIR}/release-public-key.pem"
 
 # --- Checksum verification --------------------------------------------------
 command -v openssl >/dev/null 2>&1 || err "openssl is required to verify the signed release manifest"

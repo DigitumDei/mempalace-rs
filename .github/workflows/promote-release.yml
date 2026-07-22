@@ -20,9 +20,12 @@ jobs:
     name: Promote tested candidate
     runs-on: ubuntu-latest
     environment: stable-release
+    if: github.ref == 'refs/heads/main'
     steps:
       - name: Checkout trusted release key
         uses: actions/checkout@v7
+        with:
+          ref: main
 
       - name: Validate requested version
         env:
@@ -44,6 +47,7 @@ jobs:
       - name: Verify candidate manifest and artifacts
         run: |
           openssl dgst -sha256 -verify release/public-key.pem -signature candidate-assets/release-manifest.sig candidate-assets/release-manifest.json
+          openssl dgst -sha256 -verify release/public-key.pem -signature candidate-assets/SHA256SUMS.sig candidate-assets/SHA256SUMS
           jq -e --arg tag "${{ inputs.candidate_tag }}" --arg version "${{ inputs.version }}" '.schema_version == 1 and .channel == "nightly" and .release_tag == $tag and .version == $version and (.assets | length == 6)' candidate-assets/release-manifest.json >/dev/null
           (cd candidate-assets && sha256sum --strict --check SHA256SUMS)
 

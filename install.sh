@@ -112,6 +112,7 @@ echo "Downloading MemPalace ${CHANNEL} (${PLATFORM})..."
 fetch "${RELEASE_URL}/${CLI_ASSET}" "${TMP_DIR}/${CLI_ASSET}"
 fetch "${RELEASE_URL}/${MCP_ASSET}" "${TMP_DIR}/${MCP_ASSET}"
 fetch "${RELEASE_URL}/SHA256SUMS" "${TMP_DIR}/SHA256SUMS"
+fetch "${RELEASE_URL}/SHA256SUMS.sig" "${TMP_DIR}/SHA256SUMS.sig"
 fetch "${RELEASE_URL}/release-manifest.json" "${TMP_DIR}/release-manifest.json"
 fetch "${RELEASE_URL}/release-manifest.sig" "${TMP_DIR}/release-manifest.sig"
 fetch "https://raw.githubusercontent.com/${REPO}/main/release/public-key.pem" "${TMP_DIR}/release-public-key.pem"
@@ -119,6 +120,7 @@ fetch "https://raw.githubusercontent.com/${REPO}/main/release/public-key.pem" "$
 # --- Checksum verification --------------------------------------------------
 command -v openssl >/dev/null 2>&1 || err "openssl is required to verify the signed release manifest"
 openssl dgst -sha256 -verify "${TMP_DIR}/release-public-key.pem" -signature "${TMP_DIR}/release-manifest.sig" "${TMP_DIR}/release-manifest.json" >/dev/null || err "release manifest signature verification FAILED — aborting install"
+openssl dgst -sha256 -verify "${TMP_DIR}/release-public-key.pem" -signature "${TMP_DIR}/SHA256SUMS.sig" "${TMP_DIR}/SHA256SUMS" >/dev/null || err "release checksum signature verification FAILED — aborting install"
 grep -Eq "\"channel\": \"${CHANNEL}\"" "${TMP_DIR}/release-manifest.json" || err "release manifest channel does not match requested channel"
 echo "Verifying signed manifest and checksums..."
 grep -E "^[0-9a-fA-F]{64} [ *](${CLI_ASSET}|${MCP_ASSET})\$" "${TMP_DIR}/SHA256SUMS" \

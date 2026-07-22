@@ -377,6 +377,7 @@ jobs:
   publish-nightly:
     name: Publish Nightly Release
     runs-on: ubuntu-latest
+    environment: stable-release
     needs:
       - release-host
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -414,6 +415,7 @@ jobs:
           jq -n --arg version "$version" --arg commit "$GITHUB_SHA" --arg run "$GITHUB_RUN_ID" --arg tag "$tag" --argjson assets "$assets" '{schema_version: 1, channel: "nightly", version: $version, commit_sha: $commit, run_id: $run, release_tag: $tag, assets: $assets}' > candidate/release-manifest.json
           printf '%s' "$RELEASE_SIGNING_KEY" | base64 --decode > signing-key.pem
           openssl dgst -sha256 -sign signing-key.pem -out candidate/release-manifest.sig candidate/release-manifest.json
+          openssl dgst -sha256 -sign signing-key.pem -out candidate/SHA256SUMS.sig candidate/SHA256SUMS
           rm -f signing-key.pem
           echo "CANDIDATE_TAG=$tag" >> "$GITHUB_ENV"
 

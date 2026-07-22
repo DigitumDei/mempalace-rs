@@ -22,6 +22,10 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+if ($PSVersionTable.PSEdition -ne 'Core' -or $PSVersionTable.PSVersion.Major -lt 7) {
+    throw 'The signed installer requires PowerShell 7 or later. Install it from https://aka.ms/powershell.'
+}
+
 if (-not $NoSetup -and $env:MEMPALACE_NO_SETUP -eq '1') { $NoSetup = $true }
 if (-not $NoPath -and $env:MEMPALACE_NO_PATH -eq '1') { $NoPath = $true }
 if ($Channel -eq 'stable' -and $env:MEMPALACE_CHANNEL) { $Channel = $env:MEMPALACE_CHANNEL }
@@ -54,7 +58,7 @@ try {
     $prevProgress = $ProgressPreference
     $ProgressPreference = 'SilentlyContinue'
     try {
-        foreach ($asset in $assets + 'SHA256SUMS' + 'release-manifest.json' + 'release-manifest.sig') {
+        foreach ($asset in $assets + 'SHA256SUMS' + 'SHA256SUMS.sig' + 'release-manifest.json' + 'release-manifest.sig') {
             Invoke-WebRequest -Uri "$releaseUrl/$asset" -OutFile (Join-Path $tmpDir $asset) -UseBasicParsing
         }
         Invoke-WebRequest -Uri "https://raw.githubusercontent.com/$repo/main/release/public-key.pem" -OutFile (Join-Path $tmpDir 'release-public-key.pem') -UseBasicParsing
@@ -67,6 +71,9 @@ try {
     $publicKey.ImportFromPem((Get-Content (Join-Path $tmpDir 'release-public-key.pem') -Raw))
     if (-not $publicKey.VerifyData([Text.Encoding]::UTF8.GetBytes($manifest), [IO.File]::ReadAllBytes((Join-Path $tmpDir 'release-manifest.sig')), [Security.Cryptography.HashAlgorithmName]::SHA256, [Security.Cryptography.RSASignaturePadding]::Pkcs1)) {
         throw 'Release manifest signature verification FAILED - aborting install'
+    }
+    if (-not $publicKey.VerifyData([IO.File]::ReadAllBytes((Join-Path $tmpDir 'SHA256SUMS')), [IO.File]::ReadAllBytes((Join-Path $tmpDir 'SHA256SUMS.sig')), [Security.Cryptography.HashAlgorithmName]::SHA256, [Security.Cryptography.RSASignaturePadding]::Pkcs1)) {
+        throw 'Release checksum signature verification FAILED - aborting install'
     }
     if (($manifest | ConvertFrom-Json).channel -ne $Channel) { throw 'Release manifest channel does not match requested channel' }
     Write-Host 'Verifying signed manifest and checksums...'

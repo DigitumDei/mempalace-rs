@@ -170,7 +170,7 @@ fn init_tracing(default_filter: &str) {
 #[command(
     name = "mempalace-cli",
     about = "MemPalace — Give your AI a memory. No API key required.",
-    version
+    version = mempalace_core::BUILD_VERSION
 )]
 struct Cli {
     #[arg(
@@ -3549,7 +3549,7 @@ mod tests {
 
         async fn info() -> impl axum::response::IntoResponse {
             axum::Json(mempalace_federation::InfoResponse {
-                server_version: env!("CARGO_PKG_VERSION").to_owned(),
+                server_version: mempalace_core::BUILD_VERSION.to_owned(),
                 federation_api_version: mempalace_federation::FEDERATION_API_VERSION,
                 embedding_profile: "balanced".to_owned(),
                 capabilities: vec![

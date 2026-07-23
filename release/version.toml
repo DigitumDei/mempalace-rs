@@ -1,0 +1,4 @@
+# Manually increment these values for a new release series.
+# The build patch is derived automatically and is never stored here.
+major = 0
+minor = 1

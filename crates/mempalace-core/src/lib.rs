@@ -16,3 +16,12 @@ pub use ids::{DrawerId, IdError, RoomId, WingId};
 pub use locator::{ResolvedSnippet, SourceLocator, resolve_locator, resolve_records};
 pub use profiles::{BALANCED_PROFILE, EmbeddingProfile, EmbeddingProfileMetadata, LOW_CPU_PROFILE};
 pub use search::{DrawerRecord, SearchQuery, SearchResult};
+
+/// Version embedded in release binaries.
+///
+/// Normal local builds use the workspace package version. Release builds set
+/// `MEMPALACE_BUILD_VERSION` from `release/version.toml` and mainline history.
+pub const BUILD_VERSION: &str = match option_env!("MEMPALACE_BUILD_VERSION") {
+    Some(version) => version,
+    None => env!("CARGO_PKG_VERSION"),
+};

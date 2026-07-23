@@ -8,6 +8,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
+bash "$repo_root/release/tests/build-version.sh"
+
 extract_embedded_key() {
     awk '
         /-----BEGIN PUBLIC KEY-----/ { capture = 1 }

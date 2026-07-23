@@ -346,6 +346,16 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Determine release version
+        shell: bash
+        run: |
+          version="$(bash release/build-version.sh)"
+          echo "MEMPALACE_BUILD_VERSION=$version" >> "$GITHUB_ENV"
+          echo "Release version: $version"
 
       - name: Install protobuf compiler (Linux)
         if: runner.os == 'Linux'
@@ -390,6 +400,12 @@ jobs:
           [ "${{ runner.os }}" = "Windows" ] && ext=".exe"
           "dist/mempalace-cli-${{ matrix.asset }}${ext}" --help
           "dist/mempalace-mcp-${{ matrix.asset }}${ext}" --help
+          cli_version="$("dist/mempalace-cli-${{ matrix.asset }}${ext}" --version)"
+          mcp_version="$("dist/mempalace-mcp-${{ matrix.asset }}${ext}" --version)"
+          [ "$cli_version" = "mempalace-cli $MEMPALACE_BUILD_VERSION" ] \
+            || { echo "CLI binary does not report the calculated release version" >&2; exit 1; }
+          [ "$mcp_version" = "mempalace-mcp $MEMPALACE_BUILD_VERSION" ] \
+            || { echo "MCP binary does not report the calculated release version" >&2; exit 1; }
 
       - name: Upload release artifacts
         uses: actions/upload-artifact@v7
@@ -417,11 +433,13 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
 
       - name: Determine candidate identity
         run: |
-          version="$(cargo metadata --no-deps --format-version=1 | jq -r '.packages[] | select(.name == "mempalace-cli") | .version')"
-          test -n "$version" && test "$version" != "null" || { echo "could not determine package version" >&2; exit 1; }
+          version="$(bash release/build-version.sh)"
           echo "CANDIDATE_TAG=nightly-${GITHUB_SHA}" >> "$GITHUB_ENV"
           echo "RELEASE_VERSION=$version" >> "$GITHUB_ENV"
 
@@ -485,14 +503,21 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           mapfile -t release_files < <(bash release/release-files.sh candidate)
+          commit_subject="$(git log -1 --format=%s "$GITHUB_SHA")"
+          short_sha="${GITHUB_SHA:0:7}"
+          title_subject="${commit_subject:0:80}"
           gh release create "$CANDIDATE_TAG" "${release_files[@]}" \
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
-            --title "Candidate $CANDIDATE_TAG" \
+            --title "Candidate v${RELEASE_VERSION} · ${short_sha} · ${title_subject}" \
             --prerelease \
             --latest=false \
-            --notes "$(cat <<'EOF'
-            Immutable candidate build from `main` @ ${{ github.sha }}.
+            --notes "$(cat <<EOF
+            Immutable candidate **v${RELEASE_VERSION}** built from \`main\`.
+
+            - Change: ${commit_subject}
+            - Commit: [\`${GITHUB_SHA}\`](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA})
+            - CI run: [${GITHUB_RUN_ID}](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})
 
             Binaries (each as `mempalace-cli-*` and `mempalace-mcp-*`):
             - `linux-x86_64` — glibc (requires glibc 2.38+, set by the bundled ONNX Runtime)

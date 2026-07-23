@@ -28,8 +28,8 @@ command -v sha256sum >/dev/null 2>&1 || { echo "sha256sum is required" >&2; exit
 
 case "$channel" in
     nightly)
-        [ "$release_tag" = "nightly-$commit_sha" ] \
-            || { echo "nightly release tag must match the commit SHA" >&2; exit 1; }
+        [ "$release_tag" = "v${version}-nightly.${commit_sha}" ] \
+            || { echo "nightly release tag must match the version and commit SHA" >&2; exit 1; }
         ;;
     stable)
         [ "$release_tag" = "v$version" ] \

@@ -440,7 +440,7 @@ jobs:
       - name: Determine candidate identity
         run: |
           version="$(bash release/build-version.sh)"
-          echo "CANDIDATE_TAG=nightly-${GITHUB_SHA}" >> "$GITHUB_ENV"
+          echo "CANDIDATE_TAG=v${version}-nightly.${GITHUB_SHA}" >> "$GITHUB_ENV"
           echo "RELEASE_VERSION=$version" >> "$GITHUB_ENV"
 
       - name: Require verified immutable-release provisioning

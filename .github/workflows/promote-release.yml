@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       candidate_tag:
-        description: Immutable nightly-<commit> tag to promote
+        description: Immutable v<version>-nightly.<commit> tag to promote
         required: true
         type: string
 
@@ -31,8 +31,8 @@ jobs:
           CANDIDATE_TAG: ${{ inputs.candidate_tag }}
           IMMUTABLE_RELEASES_ENABLED: ${{ vars.MEMPALACE_IMMUTABLE_RELEASES_ENABLED }}
         run: |
-          [[ "$CANDIDATE_TAG" =~ ^nightly-[0-9a-f]{40}$ ]] \
-            || { echo "candidate tag must include a full commit SHA" >&2; exit 1; }
+          [[ "$CANDIDATE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-nightly\.[0-9a-f]{40}$ ]] \
+            || { echo "candidate tag must be v<version>-nightly.<full-commit-sha>" >&2; exit 1; }
           [ "$IMMUTABLE_RELEASES_ENABLED" = true ] \
             || { echo "immutable releases must be verified by release/configure-repository.ps1 before promotion" >&2; exit 1; }
 
@@ -70,8 +70,8 @@ jobs:
             candidate-assets nightly "$CANDIDATE_TAG" "$RELEASE_VERSION" release/public-key.pem
 
           manifest_commit="$(jq -r '.commit_sha' candidate-assets/release-manifest.json)"
-          [ "$CANDIDATE_TAG" = "nightly-$manifest_commit" ] \
-            || { echo "candidate tag does not match manifest commit" >&2; exit 1; }
+          [ "$CANDIDATE_TAG" = "v${RELEASE_VERSION}-nightly.${manifest_commit}" ] \
+            || { echo "candidate tag does not match manifest version and commit" >&2; exit 1; }
           tag_commit="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$CANDIDATE_TAG" --jq '.object.sha')"
           [ "$tag_commit" = "$manifest_commit" ] \
             || { echo "candidate Git tag does not target the manifest commit" >&2; exit 1; }

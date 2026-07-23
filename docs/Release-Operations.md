@@ -117,12 +117,19 @@ Every successful push to `main` builds and attests six binaries. After the
 2. creates schema-v2 `release-manifest.json` and `SHA256SUMS`;
 3. checks that the environment key matches the committed public key;
 4. signs and locally re-verifies both files;
-5. publishes `nightly-<full-main-commit-sha>` as a GitHub immutable prerelease;
+5. publishes `v<version>-nightly.<full-main-commit-sha>` as a GitHub immutable
+   prerelease;
 6. verifies the resulting GitHub release and every published asset.
 
-Candidate tags remain bound to the full commit SHA. Their display title includes
-the calculated version, short SHA, and source commit subject so multiple
-immutable candidates are distinguishable in GitHub's release list.
+Candidate tags include the calculated semantic version so GitHub orders builds
+by version instead of the effectively random SHA suffix. They remain bound to
+the full commit SHA. Their display title includes the version, short SHA, and
+source commit subject so multiple immutable candidates are distinguishable in
+GitHub's release list.
+
+Installers retain a narrow compatibility exception for the existing stable
+`v0.1.0` manifest, whose source candidate uses the former `nightly-<sha>` shape.
+New candidates and stable releases must use the versioned candidate tag.
 
 A rerun reuses an already-published immutable candidate only after re-verifying
 the release and project signatures. It never overwrites the release.
@@ -143,8 +150,9 @@ Do not promote a different candidate, even if it has the same release version.
 ## Stable promotion
 
 Dispatch `promote-release` from `main` with `candidate_tag` set to the exact
-signed-off `nightly-<full-sha>` tag. The workflow reads the stable version from
-the verified signed candidate manifest; operators do not enter it separately.
+signed-off `v<version>-nightly.<full-sha>` tag. The workflow reads the stable
+version from the verified signed candidate manifest; operators do not enter it
+separately.
 
 After environment approval, promotion verifies the candidate end to end,
 rewrites only stable-channel manifest fields, re-signs the manifest, publishes

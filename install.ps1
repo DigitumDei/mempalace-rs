@@ -40,7 +40,11 @@ if ($Channel -eq 'stable') {
     if ($Version) { throw '-Version is only supported with -Channel nightly' }
     $releaseUrl = "https://github.com/$repo/releases/latest/download"
 } else {
-    if ($Version -notmatch '^nightly-[0-9a-f]{40}$') { throw 'Nightly updates require -Version nightly-<full-commit-sha>' }
+    if ($Version -notmatch '^v((?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))-nightly\.([0-9a-f]{40})$') {
+        throw 'Nightly updates require -Version v<version>-nightly.<full-commit-sha>'
+    }
+    $nightlyVersion = $Matches[1]
+    $nightlySha = $Matches[2]
     $releaseUrl = "https://github.com/$repo/releases/download/$Version"
 }
 $assets = @('mempalace-cli-windows-x86_64.exe', 'mempalace-mcp-windows-x86_64.exe')
@@ -113,14 +117,26 @@ try {
         if ($manifestObject.release_tag -ne $Version) {
             throw 'Release manifest tag does not match requested candidate'
         }
-        if ($manifestObject.commit_sha -ne ($Version -replace '^nightly-', '')) {
+        if ($manifestObject.version -ne $nightlyVersion) {
+            throw 'Release manifest version does not match requested candidate'
+        }
+        if ($manifestObject.commit_sha -ne $nightlySha) {
             throw 'Release manifest commit does not match requested candidate'
         }
     } else {
         if ($manifestObject.release_tag -ne "v$($manifestObject.version)") {
             throw 'Stable release manifest tag does not match its version'
         }
-        if ($manifestObject.source_candidate_tag -ne "nightly-$($manifestObject.commit_sha)") {
+        $versionedSourceTag = "v$($manifestObject.version)-nightly.$($manifestObject.commit_sha)"
+        $legacySourceTag = "nightly-$($manifestObject.commit_sha)"
+        $isLegacyV010 = (
+            $manifestObject.version -eq '0.1.0' `
+                -and $manifestObject.source_candidate_tag -eq $legacySourceTag
+        )
+        if (
+            $manifestObject.source_candidate_tag -ne $versionedSourceTag `
+                -and -not $isLegacyV010
+        ) {
             throw 'Stable release manifest is not bound to its source candidate'
         }
     }

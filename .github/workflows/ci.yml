@@ -296,6 +296,10 @@ jobs:
     name: Release ${{ matrix.asset }}
     needs: release-gate
     runs-on: ${{ matrix.os }}
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
     strategy:
       fail-fast: false
       matrix:
@@ -365,9 +369,15 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+      - name: Attest release artifacts
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: dist/*
+
   publish-nightly:
     name: Publish Nightly Release
     runs-on: ubuntu-latest
+    environment: stable-release
     needs:
       - release-host
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -383,22 +393,45 @@ jobs:
         with:
           pattern: release-*
           merge-multiple: true
-          path: nightly
+          path: candidate
 
-      - name: Stage nightly assets
+      - name: Create signed candidate manifest
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.MEMPALACE_RELEASE_SIGNING_KEY }}
         run: |
-          short_sha="${GITHUB_SHA::7}"
-          chmod +x nightly/mempalace-* || true
-          (cd nightly && sha256sum * > SHA256SUMS)
-          echo "SHORT_SHA=$short_sha" >> "$GITHUB_ENV"
+          test -n "$RELEASE_SIGNING_KEY" || { echo "MEMPALACE_RELEASE_SIGNING_KEY is required" >&2; exit 1; }
+          tag="nightly-${GITHUB_SHA}"
+          version="$(cargo metadata --no-deps --format-version=1 | jq -r '.packages[] | select(.name == "mempalace-cli") | .version')"
+          test -n "$version" && test "$version" != "null" || { echo "could not determine package version" >&2; exit 1; }
+          chmod +x candidate/mempalace-* || true
+          (cd candidate && sha256sum mempalace-* > SHA256SUMS)
+          assets="$(for asset in candidate/mempalace-*; do
+            name="${asset##*/}"
+            target="${name#mempalace-cli-}"
+            target="${target#mempalace-mcp-}"
+            target="${target%.exe}"
+            jq -n --arg name "$name" --arg target "$target" --arg sha "$(sha256sum "$asset" | cut -d' ' -f1)" --argjson size "$(wc -c < "$asset")" '{name: $name, target: $target, sha256: $sha, size: $size}'
+          done | jq -s .)"
+          jq -n --arg version "$version" --arg commit "$GITHUB_SHA" --arg run "$GITHUB_RUN_ID" --arg tag "$tag" --argjson assets "$assets" '{schema_version: 1, channel: "nightly", version: $version, commit_sha: $commit, run_id: $run, release_tag: $tag, assets: $assets}' > candidate/release-manifest.json
+          printf '%s' "$RELEASE_SIGNING_KEY" | base64 --decode > signing-key.pem
+          openssl dgst -sha256 -sign signing-key.pem -out candidate/release-manifest.sig candidate/release-manifest.json
+          openssl dgst -sha256 -sign signing-key.pem -out candidate/SHA256SUMS.sig candidate/SHA256SUMS
+          rm -f signing-key.pem
+          echo "CANDIDATE_TAG=$tag" >> "$GITHUB_ENV"
 
-      - name: Publish rolling nightly release
+      - name: Refuse to overwrite an existing candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$CANDIDATE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 && { echo "candidate release already exists" >&2; exit 1; } || true
+
+      - name: Publish immutable candidate release
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: nightly
-          name: Nightly (${{ env.SHORT_SHA }})
+          tag_name: ${{ env.CANDIDATE_TAG }}
+          name: Candidate ${{ env.CANDIDATE_TAG }}
           body: |
-            Rolling nightly build from `main` @ ${{ github.sha }}.
+            Immutable candidate build from `main` @ ${{ github.sha }}.
 
             Binaries (each as `mempalace-cli-*` and `mempalace-mcp-*`):
             - `linux-x86_64` — glibc (requires glibc 2.38+, set by the bundled ONNX Runtime)
@@ -408,10 +441,10 @@ jobs:
             Intel macOS, musl, and older-glibc targets are not shipped: `ort` provides
             no prebuilt ONNX Runtime for them.
 
-            `SHA256SUMS` lists checksums for every asset.
-            Overwritten on every push to `main`. Not a stable release.
+            `release-manifest.json` and `SHA256SUMS` are signed by the project
+            release key. This is not a stable release.
           prerelease: true
           make_latest: false
           target_commitish: ${{ github.sha }}
-          files: nightly/*
+          files: candidate/*
           fail_on_unmatched_files: true

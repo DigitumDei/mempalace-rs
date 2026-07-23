@@ -1,5 +1,5 @@
-# MemPalace installer - downloads the Windows x86_64 nightly build, verifies
-# checksums, installs to ~\.mempalace\bin, and registers the MCP server with
+# MemPalace installer - downloads the Windows x86_64 stable build, verifies its
+# signed manifest and checksums, installs to ~\.mempalace\bin, and registers the MCP server with
 # detected AI tools.
 #
 #   irm https://raw.githubusercontent.com/DigitumDei/mempalace-rs/main/install.ps1 | iex
@@ -14,21 +14,49 @@
 param(
     [switch]$NoSetup,
     [switch]$NoPath,
-    [string]$InstallDir
+    [string]$InstallDir,
+    [ValidateSet('stable', 'nightly')]
+    [string]$Channel = 'stable',
+    [string]$Version
 )
 
 $ErrorActionPreference = 'Stop'
 
+if ($PSVersionTable.PSEdition -ne 'Core' -or $PSVersionTable.PSVersion -lt [version]'7.1') {
+    throw 'The signed installer requires PowerShell 7.1 or later. Install it from https://aka.ms/powershell.'
+}
+
 if (-not $NoSetup -and $env:MEMPALACE_NO_SETUP -eq '1') { $NoSetup = $true }
 if (-not $NoPath -and $env:MEMPALACE_NO_PATH -eq '1') { $NoPath = $true }
+if ($Channel -eq 'stable' -and $env:MEMPALACE_CHANNEL) { $Channel = $env:MEMPALACE_CHANNEL }
+if (-not $Version -and $env:MEMPALACE_VERSION) { $Version = $env:MEMPALACE_VERSION }
 if (-not $InstallDir) {
     if ($env:MEMPALACE_INSTALL_DIR) { $InstallDir = $env:MEMPALACE_INSTALL_DIR }
     else { $InstallDir = Join-Path $HOME '.mempalace\bin' }
 }
 
 $repo = 'DigitumDei/mempalace-rs'
-$releaseUrl = "https://github.com/$repo/releases/download/nightly"
+if ($Channel -eq 'stable') {
+    if ($Version) { throw '-Version is only supported with -Channel nightly' }
+    $releaseUrl = "https://github.com/$repo/releases/latest/download"
+} else {
+    if ($Version -notmatch '^nightly-[0-9a-f]{40}$') { throw 'Nightly updates require -Version nightly-<full-commit-sha>' }
+    $releaseUrl = "https://github.com/$repo/releases/download/$Version"
+}
 $assets = @('mempalace-cli-windows-x86_64.exe', 'mempalace-mcp-windows-x86_64.exe')
+$publicKeyPem = @'
+-----BEGIN PUBLIC KEY-----
+MIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEAsIRfz0Yf8P79QOHVw7pt
+DIf7elx4c4/pbCnl7W4VBrj43uE6iFqExbWOCUImJ9dX1q0Hwj6jZV7mU5j8RGyw
+zYy0lIacu5Qrf7Op5cueaPUCnA09PCVIgHya1U0TDmjvG6IgIDgYuwPiedXN5lvg
+37K3YzYl4wFVES21iaN+6MvQg6U//5vpdCxkuY/zgg4jKOl3sSelcP49vc3d5+fO
+nYhbF9ONYPpqI0/diKjdZkQiQxrnhhzgq4hbyyvekd16j1G9iEMyePVCxdTMeUqS
+/O02do5ppZ1bfybPb3L90FRiq6Bt4eipu5TUxqOro/JFfbbfjHWUtc/9N0aT8lod
+Ofm6iWdW0FDYHYqnSTPXJTxCb3aIntBM2xk3BgQt7Nmg0HzB6bkY9/Eih4w8u355
+kVXeZtycjGDIQB0Q7hbwl1VGYUG5GrClffrz5ucphRiq+LoBYqjuF5RE8m7zQlVN
+Llh6RGEhXrgdAx2smPphk4VXm7XVSmm7ETWkFHMVqdxxAgMBAAE=
+-----END PUBLIC KEY-----
+'@
 
 if ($env:PROCESSOR_ARCHITECTURE -ne 'AMD64' -and $env:PROCESSOR_ARCHITEW6432 -ne 'AMD64') {
     throw "Unsupported architecture: $env:PROCESSOR_ARCHITECTURE. Nightly builds cover Windows x86_64 only. Build from source instead: https://github.com/$repo/blob/main/docs/Quickstart.md"
@@ -38,19 +66,30 @@ $tmpDir = Join-Path ([System.IO.Path]::GetTempPath()) ("mempalace-install-" + [S
 New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
 
 try {
-    Write-Host 'Downloading MemPalace nightly (windows-x86_64)...'
+    Write-Host "Downloading MemPalace $Channel (windows-x86_64)..."
     # Invoke-WebRequest is dramatically slower with the progress bar on PS 5.1.
     $prevProgress = $ProgressPreference
     $ProgressPreference = 'SilentlyContinue'
     try {
-        foreach ($asset in $assets + 'SHA256SUMS') {
+        foreach ($asset in $assets + 'SHA256SUMS' + 'SHA256SUMS.sig' + 'release-manifest.json' + 'release-manifest.sig') {
             Invoke-WebRequest -Uri "$releaseUrl/$asset" -OutFile (Join-Path $tmpDir $asset) -UseBasicParsing
         }
     } finally {
         $ProgressPreference = $prevProgress
     }
 
-    Write-Host 'Verifying checksums...'
+    $manifestPath = Join-Path $tmpDir 'release-manifest.json'
+    $manifest = Get-Content $manifestPath -Raw
+    $publicKey = [Security.Cryptography.RSA]::Create()
+    $publicKey.ImportFromPem($publicKeyPem)
+    if (-not $publicKey.VerifyData([IO.File]::ReadAllBytes($manifestPath), [IO.File]::ReadAllBytes((Join-Path $tmpDir 'release-manifest.sig')), [Security.Cryptography.HashAlgorithmName]::SHA256, [Security.Cryptography.RSASignaturePadding]::Pkcs1)) {
+        throw 'Release manifest signature verification FAILED - aborting install'
+    }
+    if (-not $publicKey.VerifyData([IO.File]::ReadAllBytes((Join-Path $tmpDir 'SHA256SUMS')), [IO.File]::ReadAllBytes((Join-Path $tmpDir 'SHA256SUMS.sig')), [Security.Cryptography.HashAlgorithmName]::SHA256, [Security.Cryptography.RSASignaturePadding]::Pkcs1)) {
+        throw 'Release checksum signature verification FAILED - aborting install'
+    }
+    if (($manifest | ConvertFrom-Json).channel -ne $Channel) { throw 'Release manifest channel does not match requested channel' }
+    Write-Host 'Verifying signed manifest and checksums...'
     $sums = @{}
     foreach ($line in Get-Content (Join-Path $tmpDir 'SHA256SUMS')) {
         if ($line -match '^([0-9a-fA-F]{64})\s+\*?(.+)$') {

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# MemPalace installer — downloads the nightly build for this platform,
-# verifies checksums, installs to ~/.mempalace/bin, and registers the MCP
+# MemPalace installer — downloads the stable build for this platform, verifies
+# its signed manifest and checksums, installs to ~/.mempalace/bin, and registers the MCP
 # server with detected AI tools.
 #
 #   curl -fsSL https://raw.githubusercontent.com/DigitumDei/mempalace-rs/main/install.sh | sh
@@ -9,14 +9,17 @@
 #   --no-setup           skip `mempalace-cli setup` (MCP registration)
 #   --no-path            skip adding the install dir to your shell PATH
 #   --install-dir <dir>  install somewhere other than ~/.mempalace/bin
+#   --channel <channel>  stable (default) or explicit nightly candidate
+#   --version <tag>      required immutable nightly-<full-commit-sha> tag for nightly
 
-set -euo pipefail
+set -eu
 
 REPO="DigitumDei/mempalace-rs"
-RELEASE_URL="https://github.com/${REPO}/releases/download/nightly"
 INSTALL_DIR="${HOME}/.mempalace/bin"
 RUN_SETUP=1
 UPDATE_PATH=1
+CHANNEL="stable"
+VERSION=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -27,16 +30,28 @@ while [ $# -gt 0 ]; do
             [ $# -gt 0 ] || { echo "error: --install-dir requires a value" >&2; exit 1; }
             INSTALL_DIR="$1"
             ;;
+        --channel)
+            shift
+            [ $# -gt 0 ] || { echo "error: --channel requires a value" >&2; exit 1; }
+            CHANNEL="$1"
+            ;;
+        --version)
+            shift
+            [ $# -gt 0 ] || { echo "error: --version requires a value" >&2; exit 1; }
+            VERSION="$1"
+            ;;
         -h|--help)
             cat <<'EOF'
-MemPalace installer — downloads the nightly build for this platform,
-verifies checksums, installs to ~/.mempalace/bin, and registers the MCP
+MemPalace installer — downloads the stable build for this platform, verifies
+its signed manifest and checksums, installs to ~/.mempalace/bin, and registers the MCP
 server with detected AI tools.
 
 Options (pass via `sh -s -- <flags>` when piping):
   --no-setup           skip `mempalace-cli setup` (MCP registration)
   --no-path            skip adding the install dir to your shell PATH
   --install-dir <dir>  install somewhere other than ~/.mempalace/bin
+  --channel <channel>  stable (default) or explicit nightly candidate
+  --version <tag>      required immutable nightly-<full-commit-sha> tag for nightly
 EOF
             exit 0
             ;;
@@ -46,6 +61,19 @@ EOF
 done
 
 err() { echo "error: $*" >&2; exit 1; }
+
+case "$CHANNEL" in
+    stable) [ -z "$VERSION" ] || err "--version is only supported with --channel nightly"; RELEASE_URL="https://github.com/${REPO}/releases/latest/download" ;;
+    nightly)
+        NIGHTLY_SHA="${VERSION#nightly-}"
+        [ "${NIGHTLY_SHA}" != "${VERSION}" ] && [ "${#NIGHTLY_SHA}" -eq 40 ] || err "nightly updates require --version nightly-<full-commit-sha>"
+        case "${NIGHTLY_SHA}" in
+            *[!0123456789abcdef]*) err "nightly updates require --version nightly-<full-commit-sha>" ;;
+        esac
+        RELEASE_URL="https://github.com/${REPO}/releases/download/${VERSION}"
+        ;;
+    *) err "unsupported channel: $CHANNEL (expected stable or nightly)" ;;
+esac
 
 # --- Platform detection -----------------------------------------------------
 OS="$(uname -s)"
@@ -87,13 +115,35 @@ fi
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "${TMP_DIR}"' EXIT
 
-echo "Downloading MemPalace nightly (${PLATFORM})..."
+# This public key is the immutable trust root for signed release assets.
+cat > "${TMP_DIR}/release-public-key.pem" <<'EOF'
+-----BEGIN PUBLIC KEY-----
+MIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEAsIRfz0Yf8P79QOHVw7pt
+DIf7elx4c4/pbCnl7W4VBrj43uE6iFqExbWOCUImJ9dX1q0Hwj6jZV7mU5j8RGyw
+zYy0lIacu5Qrf7Op5cueaPUCnA09PCVIgHya1U0TDmjvG6IgIDgYuwPiedXN5lvg
+37K3YzYl4wFVES21iaN+6MvQg6U//5vpdCxkuY/zgg4jKOl3sSelcP49vc3d5+fO
+nYhbF9ONYPpqI0/diKjdZkQiQxrnhhzgq4hbyyvekd16j1G9iEMyePVCxdTMeUqS
+/O02do5ppZ1bfybPb3L90FRiq6Bt4eipu5TUxqOro/JFfbbfjHWUtc/9N0aT8lod
+Ofm6iWdW0FDYHYqnSTPXJTxCb3aIntBM2xk3BgQt7Nmg0HzB6bkY9/Eih4w8u355
+kVXeZtycjGDIQB0Q7hbwl1VGYUG5GrClffrz5ucphRiq+LoBYqjuF5RE8m7zQlVN
+Llh6RGEhXrgdAx2smPphk4VXm7XVSmm7ETWkFHMVqdxxAgMBAAE=
+-----END PUBLIC KEY-----
+EOF
+
+echo "Downloading MemPalace ${CHANNEL} (${PLATFORM})..."
 fetch "${RELEASE_URL}/${CLI_ASSET}" "${TMP_DIR}/${CLI_ASSET}"
 fetch "${RELEASE_URL}/${MCP_ASSET}" "${TMP_DIR}/${MCP_ASSET}"
 fetch "${RELEASE_URL}/SHA256SUMS" "${TMP_DIR}/SHA256SUMS"
+fetch "${RELEASE_URL}/SHA256SUMS.sig" "${TMP_DIR}/SHA256SUMS.sig"
+fetch "${RELEASE_URL}/release-manifest.json" "${TMP_DIR}/release-manifest.json"
+fetch "${RELEASE_URL}/release-manifest.sig" "${TMP_DIR}/release-manifest.sig"
 
 # --- Checksum verification --------------------------------------------------
-echo "Verifying checksums..."
+command -v openssl >/dev/null 2>&1 || err "openssl is required to verify the signed release manifest"
+openssl dgst -sha256 -verify "${TMP_DIR}/release-public-key.pem" -signature "${TMP_DIR}/release-manifest.sig" "${TMP_DIR}/release-manifest.json" >/dev/null || err "release manifest signature verification FAILED — aborting install"
+openssl dgst -sha256 -verify "${TMP_DIR}/release-public-key.pem" -signature "${TMP_DIR}/SHA256SUMS.sig" "${TMP_DIR}/SHA256SUMS" >/dev/null || err "release checksum signature verification FAILED — aborting install"
+grep -Eq "\"channel\": \"${CHANNEL}\"" "${TMP_DIR}/release-manifest.json" || err "release manifest channel does not match requested channel"
+echo "Verifying signed manifest and checksums..."
 grep -E "^[0-9a-fA-F]{64} [ *](${CLI_ASSET}|${MCP_ASSET})\$" "${TMP_DIR}/SHA256SUMS" \
     > "${TMP_DIR}/SHA256SUMS.filtered" || true
 [ "$(wc -l < "${TMP_DIR}/SHA256SUMS.filtered")" -eq 2 ] \

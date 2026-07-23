@@ -35,8 +35,9 @@ Reference packaging job:
 - GitHub Actions workflow: `.github/workflows/ci.yml`
 - Job: `release-host` (matrix: linux glibc, macOS arm64, Windows)
 - Published artifacts: `release-<asset>` (e.g. `release-linux-x86_64`,
-  `release-macos-arm64`), merged into the rolling `nightly` GitHub Release with a
-  `SHA256SUMS` manifest
+  `release-macos-arm64`), promoted into an immutable `nightly-<full-commit-sha>`
+  prerelease with signed `SHA256SUMS` and `release-manifest.json`, and GitHub
+  build provenance attestations
 
 ## Release Gate Rows
 
@@ -130,3 +131,16 @@ Use this directory to freeze the release promise, then attach both of the follow
 
 - evidence from a successful GitHub Actions `release-host` run on the reference GitHub Actions hosts
 - runtime acceptance evidence from the supported small VM using the exact uploaded release binaries
+
+## Promotion
+
+After both rows pass, dispatch `.github/workflows/promote-release.yml` from the
+protected `main` branch with the exact candidate tag and stable semantic version.
+The workflow is bound to the `stable-release` protected environment, re-verifies
+the candidate manifest and checksum signatures, and copies the tested binaries
+without rebuilding them. It creates the immutable `v<version>` release and signs
+a stable-channel manifest. Repository administrators must configure required
+reviewers for that environment, protect `main` and `v*` tags from mutation, and
+store the base64-encoded private release key in the
+`MEMPALACE_RELEASE_SIGNING_KEY` environment secret. The candidate publication
+job also uses this protected environment so it can access the signing key.

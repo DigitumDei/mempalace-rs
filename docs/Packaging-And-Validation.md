@@ -136,11 +136,16 @@ Use this directory to freeze the release promise, then attach both of the follow
 
 After both rows pass, dispatch `.github/workflows/promote-release.yml` from the
 protected `main` branch with the exact candidate tag and stable semantic version.
-The workflow is bound to the `stable-release` protected environment, re-verifies
-the candidate manifest and checksum signatures, and copies the tested binaries
-without rebuilding them. It creates the immutable `v<version>` release and signs
-a stable-channel manifest. Repository administrators must configure required
-reviewers for that environment, protect `main` and `v*` tags from mutation, and
-store the base64-encoded private release key in the
-`MEMPALACE_RELEASE_SIGNING_KEY` environment secret. The candidate publication
-job also uses this protected environment so it can access the signing key.
+The workflow is bound to the `stable-release` protected environment and copies
+the tested binaries without rebuilding them. Before promotion it verifies the
+GitHub immutable-release attestation, every release asset, project signatures,
+the tag and commit relationship, schema-v2 manifest metadata, the checksum-file
+binding, and the original CI build provenance.
+
+Repository administrators must complete the one-time controls in
+[Release Operations](Release-Operations.md): enable GitHub immutable releases,
+configure a required reviewer and protected-branch policy on `stable-release`,
+and store the base64-encoded private key matching `release/public-key.pem` in
+the `MEMPALACE_RELEASE_SIGNING_KEY` environment secret. Candidate signing uses
+the same protected environment so the private key is never exposed without
+release approval.

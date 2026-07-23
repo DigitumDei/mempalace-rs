@@ -1,3 +1,6 @@
 install.sh text eol=lf
 hooks/*.sh text eol=lf
+release/*.sh text eol=lf
+release/tests/*.sh text eol=lf
 install.ps1 text eol=crlf
+release/*.ps1 text eol=crlf

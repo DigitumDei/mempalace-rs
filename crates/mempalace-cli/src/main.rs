@@ -21,8 +21,10 @@ use mempalace_server::{TokenRegistry, build_router};
 use mempalace_federation::{IngestBatchRequest, IngestBatchResponse};
 use mempalace_ingest::{
     ConversationExtractMode, ConversationIngestRequest, IngestError, IngestSummary,
-    ProjectIngestRequest, derive_project_id, ingest_conversations, ingest_project_with_config,
-    prepare_project_batch_with_config, project_root_relative,
+    PROJECTS_BRANCH_INGEST_KIND, PROJECTS_INGEST_KIND, ProjectIngestRequest, derive_project_id,
+    ingest_conversations, ingest_project_with_config, prepare_project_batch_with_config,
+    project_branch_source_prefix, project_canonical_source_prefix, project_root_relative,
+    wing_kind_source_prefix,
 };
 use mempalace_remote::{RemoteApi, RemoteClient, RemoteEndpoint, RemoteError};
 use mempalace_search::{Layer1Config, SearchRuntime, SearchRuntimePolicy, WakeUpRequest};
@@ -230,6 +232,41 @@ enum Commands {
         #[command(subcommand)]
         command: ProjectCommands,
     },
+    /// Delete mined project/source data by scope. Previews by default; pass
+    /// `--yes` to actually delete. Local palace only.
+    Prune {
+        #[arg(
+            long = "project-id",
+            alias = "project",
+            help = "Project to prune, as identified at mine time (explicit --project-id or derived repo id)"
+        )]
+        project_id: Option<String>,
+        #[arg(
+            long,
+            help = "Wing to scope to. Taken from the project registry when --project-id is registered; required otherwise, or when scoping by --wing + --kind"
+        )]
+        wing: Option<String>,
+        #[arg(
+            long,
+            value_enum,
+            help = "Restrict to one ingest kind (default: both project kinds)"
+        )]
+        kind: Option<CliPruneKind>,
+        #[arg(
+            long,
+            help = "Restrict to a single branch view; implies the projects-branch kind. Requires --project-id"
+        )]
+        view: Option<String>,
+        #[arg(
+            long = "source-prefix",
+            help = "Restrict to source paths under this normalized prefix, e.g. .claude/worktrees/. Requires --project-id"
+        )]
+        source_prefix: Option<String>,
+        #[arg(long = "dry-run", help = "Preview only; never delete (the default when --yes is absent)")]
+        dry_run: bool,
+        #[arg(long, help = "Actually delete the matched sources; without this, prune only previews")]
+        yes: bool,
+    },
     /// Find anything, exact words.
     Search {
         query: String,
@@ -297,6 +334,25 @@ enum CliMode {
 enum CliExtractMode {
     Exchange,
     General,
+}
+
+/// Ingest kinds that `prune` is allowed to target. Restricting the CLI surface
+/// to these two project kinds keeps prune from ever selecting diary, narrative,
+/// or conversation drawers by scope. Rendered by clap as `projects` /
+/// `projects-branch`, matching the stored `ingest_kind`.
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+enum CliPruneKind {
+    Projects,
+    ProjectsBranch,
+}
+
+impl CliPruneKind {
+    fn ingest_kind(self) -> &'static str {
+        match self {
+            CliPruneKind::Projects => PROJECTS_INGEST_KIND,
+            CliPruneKind::ProjectsBranch => PROJECTS_BRANCH_INGEST_KIND,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -449,6 +505,19 @@ where
             )
         }
         Commands::Project { command } => execute_project_command(command, context),
+        Commands::Prune { project_id, wing, kind, view, source_prefix, dry_run, yes } => {
+            execute_prune(
+                project_id,
+                wing,
+                kind,
+                view,
+                source_prefix,
+                dry_run,
+                yes,
+                cli.palace.as_deref(),
+                context,
+            )
+        }
         Commands::Search { query, wing, room, results } => execute_search(
             &query,
             wing,
@@ -837,6 +906,221 @@ fn execute_project_command(
             )))
         }
 }
+}
+
+/// Delete mined project/source data selected by a structured scope.
+///
+/// Preview-first: without `--yes` (or with `--dry-run`) it only reports what
+/// would be removed. The scope must be narrow — an identified project, or an
+/// explicit wing paired with a kind — so a bare invocation can never wipe the
+/// whole palace, and only the two project ingest kinds are reachable, so
+/// diary/narrative/conversation drawers are never in scope. Local palace only.
+#[allow(clippy::too_many_arguments)]
+fn execute_prune(
+    project_id: Option<String>,
+    wing: Option<String>,
+    kind: Option<CliPruneKind>,
+    view: Option<String>,
+    source_prefix: Option<String>,
+    dry_run: bool,
+    yes: bool,
+    palace_override: Option<&Path>,
+    context: &CliContext,
+) -> Result<CliOutput, clap::Error> {
+    let source_prefix = source_prefix.filter(|value| !value.is_empty());
+    let mut notes: Vec<String> = Vec::new();
+
+    // ── Resolve the effective wing ───────────────────────────────────────────
+    let effective_wing = match project_id.as_deref() {
+        Some(id) => {
+            let registered =
+                ConfigLoader::load_project_by_id(context.config_base_dir.as_deref(), id)
+                    .map_err(config_error)?;
+            match (wing.clone(), registered.map(|config| config.wing)) {
+                (Some(explicit), _) => explicit,
+                (None, Some(registered_wing)) => registered_wing,
+                (None, None) => {
+                    return Ok(CliOutput::failure(
+                        2,
+                        format!(
+                            "project `{id}` is not registered; pass --wing to name the wing it was mined into\n"
+                        ),
+                    ));
+                }
+            }
+        }
+        None => {
+            // No project scope: require an explicit wing AND kind so the scope
+            // cannot widen to every project or every kind. Path/branch narrowing
+            // needs a project (the branch and path segments follow the project
+            // root key in the source key), so reject them here.
+            if view.is_some() {
+                return Ok(CliOutput::failure(2, "--view requires --project-id\n".to_owned()));
+            }
+            if source_prefix.is_some() {
+                return Ok(CliOutput::failure(
+                    2,
+                    "--source-prefix requires --project-id\n".to_owned(),
+                ));
+            }
+            match (wing.clone(), kind) {
+                (Some(wing), Some(_)) => wing,
+                _ => {
+                    return Ok(CliOutput::failure(
+                        2,
+                        "prune needs a narrow scope: pass --project-id, or both --wing and --kind\n"
+                            .to_owned(),
+                    ));
+                }
+            }
+        }
+    };
+
+    // ── Resolve the concrete source-key prefixes to match ────────────────────
+    let kinds: Vec<CliPruneKind> = match kind {
+        Some(k) => vec![k],
+        None => vec![CliPruneKind::Projects, CliPruneKind::ProjectsBranch],
+    };
+
+    let mut prefixes: Vec<String> = Vec::new();
+    for k in &kinds {
+        match (project_id.as_deref(), k) {
+            (Some(id), CliPruneKind::Projects) => {
+                if view.is_some() {
+                    // --view only narrows branch views; it does not apply to the
+                    // canonical snapshot, so leave canonical out when it is set.
+                    continue;
+                }
+                let mut prefix = project_canonical_source_prefix(&effective_wing, id);
+                if let Some(sp) = source_prefix.as_deref() {
+                    prefix.push_str(sp);
+                }
+                prefixes.push(prefix);
+            }
+            (Some(id), CliPruneKind::ProjectsBranch) => {
+                match (view.as_deref(), source_prefix.as_deref()) {
+                    (Some(branch), sp) => {
+                        let mut prefix =
+                            project_branch_source_prefix(&effective_wing, id, Some(branch));
+                        if let Some(sp) = sp {
+                            prefix.push_str(sp);
+                        }
+                        prefixes.push(prefix);
+                    }
+                    (None, Some(_)) => {
+                        // A path can't be anchored inside branch views without
+                        // naming the branch (the branch segment precedes the
+                        // path). Skip branch views rather than over-match.
+                        notes.push(
+                            "skipped branch views: --source-prefix needs --view to target a path inside a branch"
+                                .to_owned(),
+                        );
+                    }
+                    (None, None) => {
+                        prefixes.push(project_branch_source_prefix(&effective_wing, id, None));
+                    }
+                }
+            }
+            (None, k) => {
+                // Wing + kind scope (validated above).
+                prefixes.push(wing_kind_source_prefix(k.ingest_kind(), &effective_wing));
+            }
+        }
+    }
+
+    prefixes.sort();
+    prefixes.dedup();
+    if prefixes.is_empty() {
+        return Ok(CliOutput::failure(
+            2,
+            "the given options selected nothing to prune; widen or correct the scope\n".to_owned(),
+        ));
+    }
+
+    // ── Open the palace ──────────────────────────────────────────────────────
+    let config = load_runtime_config(palace_override, context).map_err(config_error)?;
+    if !palace_exists(&config.palace_path) {
+        return Ok(no_palace_error(&config.palace_path));
+    }
+    let runtime = build_runtime(&config).map_err(runtime_error)?;
+    let engine = runtime
+        .block_on(StorageEngine::open(&config.palace_path, config.embedding_profile))
+        .map_err(storage_error)?;
+
+    // ── Preview: gather matched (source_key, drawer_count) across prefixes ────
+    let mut matched: BTreeMap<String, i64> = BTreeMap::new();
+    for prefix in &prefixes {
+        for (source_key, count) in
+            engine.ingested_sources_with_prefix(prefix).map_err(storage_error)?
+        {
+            matched.insert(source_key, count);
+        }
+    }
+    let total_sources = matched.len();
+    let total_drawers: i64 = matched.values().copied().sum();
+
+    // ── Render the scope + preview ───────────────────────────────────────────
+    let kind_labels = kinds.iter().map(|k| k.ingest_kind()).collect::<Vec<_>>().join(", ");
+    let mut lines = vec![
+        format!("\n{}", "=".repeat(STATUS_HEADER_WIDTH)),
+        "  MemPalace Prune (local palace only)".to_owned(),
+        "=".repeat(STATUS_HEADER_WIDTH),
+        String::new(),
+        format!("  Wing   : {effective_wing}"),
+        format!("  Kinds  : {kind_labels}"),
+    ];
+    if let Some(id) = project_id.as_deref() {
+        lines.push(format!("  Project: {id}"));
+    }
+    if let Some(branch) = view.as_deref() {
+        lines.push(format!("  View   : {branch}"));
+    }
+    if let Some(sp) = source_prefix.as_deref() {
+        lines.push(format!("  Path   : {sp}*"));
+    }
+    for note in &notes {
+        lines.push(format!("  Note   : {note}"));
+    }
+    lines.push(String::new());
+    lines.push(format!("  Matched: {total_sources} sources, {total_drawers} drawers"));
+
+    const PREVIEW_LIMIT: usize = 20;
+    for (source_key, count) in matched.iter().take(PREVIEW_LIMIT) {
+        lines.push(format!("    {count:>6}  {source_key}"));
+    }
+    if total_sources > PREVIEW_LIMIT {
+        lines.push(format!("    … and {} more", total_sources - PREVIEW_LIMIT));
+    }
+    lines.push(String::new());
+
+    if total_sources == 0 {
+        lines.push("  Nothing matched this scope.".to_owned());
+        lines.push("=".repeat(STATUS_HEADER_WIDTH));
+        lines.push(String::new());
+        return Ok(CliOutput::success(lines.join("\n")));
+    }
+
+    if dry_run || !yes {
+        lines.push("  Preview only — re-run with --yes to delete.".to_owned());
+        lines.push("=".repeat(STATUS_HEADER_WIDTH));
+        lines.push(String::new());
+        return Ok(CliOutput::success(lines.join("\n")));
+    }
+
+    // ── Delete (both-store consistent, batched, idempotent) ──────────────────
+    let mut removed_sources = 0usize;
+    let mut removed_drawers = 0usize;
+    for prefix in &prefixes {
+        let (sources, drawers) =
+            runtime.block_on(engine.remove_source_prefix(prefix)).map_err(storage_error)?;
+        removed_sources += sources;
+        removed_drawers += drawers;
+    }
+
+    lines.push(format!("  Removed: {removed_sources} sources, {removed_drawers} drawers"));
+    lines.push("=".repeat(STATUS_HEADER_WIDTH));
+    lines.push(String::new());
+    Ok(CliOutput::success(lines.join("\n")))
 }
 
 fn execute_mine<F, P>(
@@ -2745,6 +3029,173 @@ mod tests {
         assert_eq!(wake_up.exit_code, 0);
         assert!(wake_up.stdout.contains("Wake-up text"));
         assert!(wake_up.stdout.contains("ESSENTIAL STORY"));
+
+        fs::remove_dir_all(config_root).unwrap();
+    }
+
+    /// Register + mine `project-alpha` (3 canonical files) into a fresh palace,
+    /// returning the test context and the config root for cleanup.
+    fn setup_mined_alpha(prefix: &str) -> (tempfile::TempDir, CliContext, PathBuf) {
+        let workspace = tempdir().unwrap();
+        let project_dir = setup_project_fixture(workspace.path());
+        let config_root = temp_config_root(prefix);
+        let context = CliContext::for_tests(config_root.clone());
+        run_cli(["init", project_dir.to_str().unwrap(), "--yes"], &context, stub_provider).unwrap();
+        run_cli(["mine", project_dir.to_str().unwrap()], &context, stub_provider).unwrap();
+        (workspace, context, config_root)
+    }
+
+    /// Read the centrally-registered project id whose wing matches `wing`.
+    fn registered_project_id(context: &CliContext, wing: &str) -> String {
+        let list = run_cli(["project", "list"], context, stub_provider).unwrap();
+        list.stdout
+            .lines()
+            .filter_map(|line| line.trim().split_once(" -> "))
+            .find(|(_, entry_wing)| *entry_wing == wing)
+            .map(|(id, _)| id.to_owned())
+            .expect("project registered")
+    }
+
+    #[test]
+    fn prune_previews_by_default_without_deleting() {
+        let (_workspace, context, config_root) = setup_mined_alpha("prune-preview");
+
+        let preview = run_cli(
+            ["prune", "--wing", "wing_project_alpha", "--kind", "projects"],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+        assert_eq!(preview.exit_code, 0);
+        assert!(preview.stdout.contains("Matched: 3 sources"), "{}", preview.stdout);
+        assert!(preview.stdout.contains("Preview only"));
+
+        // Nothing was deleted.
+        let status = run_cli(["status"], &context, stub_provider).unwrap();
+        assert!(status.stdout.contains("WING: wing_project_alpha"));
+
+        fs::remove_dir_all(config_root).unwrap();
+    }
+
+    #[test]
+    fn prune_yes_deletes_matched_and_is_idempotent() {
+        let (_workspace, context, config_root) = setup_mined_alpha("prune-delete");
+
+        let removed = run_cli(
+            ["prune", "--wing", "wing_project_alpha", "--kind", "projects", "--yes"],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+        assert_eq!(removed.exit_code, 0);
+        assert!(removed.stdout.contains("Removed: 3 sources"), "{}", removed.stdout);
+
+        // Drawers are gone from the palace.
+        let status = run_cli(["status"], &context, stub_provider).unwrap();
+        assert!(!status.stdout.contains("WING: wing_project_alpha"), "{}", status.stdout);
+
+        // Re-running the same prune is a safe no-op.
+        let again = run_cli(
+            ["prune", "--wing", "wing_project_alpha", "--kind", "projects", "--yes"],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+        assert_eq!(again.exit_code, 0);
+        assert!(again.stdout.contains("Nothing matched this scope"), "{}", again.stdout);
+
+        fs::remove_dir_all(config_root).unwrap();
+    }
+
+    #[test]
+    fn prune_rejects_unsafe_scopes() {
+        let config_root = temp_config_root("prune-unsafe");
+        fs::create_dir_all(&config_root).unwrap();
+        let context = CliContext::for_tests(config_root.clone());
+
+        // No scope at all.
+        let none = run_cli(["prune"], &context, stub_provider).unwrap();
+        assert_eq!(none.exit_code, 2);
+        assert!(none.stderr.contains("narrow scope"), "{}", none.stderr);
+
+        // Wing without a kind is too broad.
+        let wing_only = run_cli(["prune", "--wing", "wing_x"], &context, stub_provider).unwrap();
+        assert_eq!(wing_only.exit_code, 2);
+
+        // Path/branch narrowing needs a project.
+        let view = run_cli(
+            ["prune", "--wing", "wing_x", "--kind", "projects", "--view", "feature"],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+        assert_eq!(view.exit_code, 2);
+        assert!(view.stderr.contains("--view requires --project-id"), "{}", view.stderr);
+
+        let sp = run_cli(
+            ["prune", "--wing", "wing_x", "--kind", "projects", "--source-prefix", "backend/"],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+        assert_eq!(sp.exit_code, 2);
+        assert!(sp.stderr.contains("--source-prefix requires --project-id"), "{}", sp.stderr);
+
+        fs::remove_dir_all(config_root).unwrap();
+    }
+
+    #[test]
+    fn prune_reports_zero_when_scope_matches_nothing() {
+        let (_workspace, context, config_root) = setup_mined_alpha("prune-nomatch");
+
+        let miss = run_cli(
+            ["prune", "--wing", "wing_does_not_exist", "--kind", "projects"],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+        assert_eq!(miss.exit_code, 0);
+        assert!(miss.stdout.contains("Nothing matched this scope"), "{}", miss.stdout);
+
+        fs::remove_dir_all(config_root).unwrap();
+    }
+
+    #[test]
+    fn prune_project_id_scope_resolves_wing_and_removes_project() {
+        let (_workspace, context, config_root) = setup_mined_alpha("prune-project-id");
+        let project_id = registered_project_id(&context, "wing_project_alpha");
+
+        // No --wing: the wing is resolved from the project registry.
+        let removed =
+            run_cli(["prune", "--project-id", &project_id, "--yes"], &context, stub_provider)
+                .unwrap();
+        assert_eq!(removed.exit_code, 0);
+        assert!(removed.stdout.contains("Removed: 3 sources"), "{}", removed.stdout);
+
+        let status = run_cli(["status"], &context, stub_provider).unwrap();
+        assert!(!status.stdout.contains("WING: wing_project_alpha"), "{}", status.stdout);
+
+        fs::remove_dir_all(config_root).unwrap();
+    }
+
+    #[test]
+    fn prune_source_prefix_scopes_to_subtree() {
+        let (_workspace, context, config_root) = setup_mined_alpha("prune-subtree");
+        let project_id = registered_project_id(&context, "wing_project_alpha");
+
+        // Only backend/auth.rs lives under backend/.
+        let removed = run_cli(
+            ["prune", "--project-id", &project_id, "--source-prefix", "backend/", "--yes"],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+        assert_eq!(removed.exit_code, 0);
+        assert!(removed.stdout.contains("Removed: 1 sources"), "{}", removed.stdout);
+
+        // The other two files survive.
+        let status = run_cli(["status"], &context, stub_provider).unwrap();
+        assert!(status.stdout.contains("WING: wing_project_alpha"), "{}", status.stdout);
 
         fs::remove_dir_all(config_root).unwrap();
     }

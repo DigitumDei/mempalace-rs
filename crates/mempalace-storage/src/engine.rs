@@ -352,6 +352,37 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Preview a scoped prune: return `(source_key, drawer_count)` for every
+    /// mined source whose key begins with `prefix`. Read-only — nothing is
+    /// deleted. Callers resolve their structured scope to a prefix first.
+    pub fn ingested_sources_with_prefix(&self, prefix: &str) -> Result<Vec<(String, i64)>> {
+        self.operational_store.ingested_source_counts_with_prefix(prefix)
+    }
+
+    /// Remove every mined source whose key begins with `prefix`, deleting both
+    /// the LanceDB drawers and the SQLite ingest manifests.
+    ///
+    /// LanceDB deletes are batched so a large cleanup does not create one table
+    /// version per source. Idempotent: once the rows are gone a repeat call is a
+    /// no-op. Returns `(sources_removed, drawers_removed)`.
+    pub async fn remove_source_prefix(&self, prefix: &str) -> Result<(usize, usize)> {
+        const DELETE_CHUNK: usize = 512;
+        let sources = self.operational_store.ingested_source_counts_with_prefix(prefix)?;
+        if sources.is_empty() {
+            return Ok((0, 0));
+        }
+        let drawer_ids =
+            self.operational_store.committed_drawer_ids_with_source_prefix(prefix)?;
+        if !drawer_ids.is_empty() {
+            self.signal_activity();
+            for chunk in drawer_ids.chunks(DELETE_CHUNK) {
+                self.drawer_store.delete_drawers(chunk).await?;
+            }
+        }
+        self.operational_store.delete_source_prefix(prefix)?;
+        Ok((sources.len(), drawer_ids.len()))
+    }
+
     async fn prune_orphaned_rows(&self, stale_runs: &[RetryableRun]) -> Result<Vec<DrawerId>> {
         let committed_ids =
             self.operational_store.committed_drawer_ids()?.into_iter().collect::<HashSet<_>>();

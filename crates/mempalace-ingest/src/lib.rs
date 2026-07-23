@@ -1675,7 +1675,7 @@ fn has_shebang(path: &Path) -> bool {
 
 fn discover_project_files(root: &Path) -> Result<DiscoveryReport> {
     let extension_set = PROJECT_READABLE_EXTENSIONS.iter().copied().collect::<BTreeSet<_>>();
-    discover_files(root, |path, file_name| {
+    discover_files(root, true, |path, file_name| {
         // Secrets / lockfile hygiene (includes the .env prefix rule).
         if project_file_skip_by_name(file_name) {
             return false;
@@ -1697,7 +1697,7 @@ fn discover_project_files(root: &Path) -> Result<DiscoveryReport> {
 
 fn discover_conversation_files(root: &Path) -> Result<DiscoveryReport> {
     let extension_set = CONVO_EXTENSIONS.iter().copied().collect::<BTreeSet<_>>();
-    discover_files(root, move |path, _file_name| {
+    discover_files(root, false, move |path, _file_name| {
         let suffix = path.extension().and_then(|value| value.to_str()).unwrap_or_default();
         let normalized_suffix = format!(".{}", suffix.to_ascii_lowercase());
         extension_set.contains(normalized_suffix.as_str())
@@ -1720,17 +1720,56 @@ struct DiscoveryReport {
     ignored_files: usize,
 }
 
+/// Run `git worktree list --porcelain` from `root` and return the canonical
+/// paths of every linked worktree (the main worktree is excluded).  Returns an
+/// empty set when git is unavailable, the root is not inside a git repository,
+/// or there are no linked worktrees.
+fn linked_worktree_paths(root: &Path) -> BTreeSet<PathBuf> {
+    let root_str = root.to_string_lossy();
+    let output = match Command::new("git")
+        .args(["-C", &root_str, "worktree", "list", "--porcelain"])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return BTreeSet::new(),
+    };
+    let body = match std::str::from_utf8(&output.stdout) {
+        Ok(s) => s,
+        Err(_) => return BTreeSet::new(),
+    };
+    let mut paths = BTreeSet::new();
+    let mut is_first = true;
+    for line in body.lines() {
+        if let Some(path_str) = line.strip_prefix("worktree ") {
+            if is_first {
+                // The first "worktree" entry is the main worktree — keep it.
+                is_first = false;
+                continue;
+            }
+            if let Ok(canonical) = Path::new(path_str).canonicalize() {
+                paths.insert(canonical);
+            }
+        }
+    }
+    paths
+}
+
 /// Walk `root` applying ignore rules, accepting files for which `accept_file`
 /// returns `true`. The closure receives the absolute path and the (lossy) file
 /// name; everything it rejects counts toward `ignored_files`.
 fn discover_files(
     root: &Path,
+    skip_linked_worktrees: bool,
     accept_file: impl Fn(&Path, &str) -> bool,
 ) -> Result<DiscoveryReport> {
     let ignore_matcher = IgnoreMatcher::load(root)?;
     let mut ignored_files = 0;
     let mut files = Vec::new();
     let mut stack = vec![root.to_path_buf()];
+    // Pre-compute linked worktree paths so we can skip them during the walk.
+    let worktree_skip = skip_linked_worktrees
+        .then(|| linked_worktree_paths(root))
+        .unwrap_or_default();
 
     while let Some(dir) = stack.pop() {
         let read_dir =
@@ -1746,6 +1785,16 @@ fn discover_files(
                 if ignore_matcher.matches(&relative, true) {
                     ignored_files += 1;
                     continue;
+                }
+                // Skip linked git worktrees: they are duplicate checkouts of the
+                // same repository and would produce redundant drawers.
+                if !worktree_skip.is_empty() {
+                    if let Ok(canonical) = path.canonicalize() {
+                        if worktree_skip.contains(&canonical) {
+                            ignored_files += 1;
+                            continue;
+                        }
+                    }
                 }
                 stack.push(path);
                 continue;
@@ -4872,5 +4921,82 @@ mod tests {
             matches!(result, Err(IngestError::BranchDeltaUnavailable { .. })),
             "expected BranchDeltaUnavailable, got: {result:?}"
         );
+    }
+
+    // ─── Linked worktree skip tests ───────────────────────────────────────────
+
+    #[test]
+    fn linked_worktrees_are_skipped_during_discovery() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path().to_path_buf();
+
+        // Initialise a git repo with a single commit.
+        git_init_with_commit(
+            &root,
+            "main",
+            &[("main.rs", "fn main() {}\n")],
+        );
+
+        let worktree_dir = root.join("worktree");
+        // Create a linked worktree (the directory must not exist beforehand).
+        let status = Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                "-b",
+                "linked",
+                worktree_dir.to_str().unwrap(),
+            ])
+            .current_dir(&root)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git worktree add failed");
+
+        // Drop a file inside the linked worktree.
+        fs::write(worktree_dir.join("extra.rs"), "fn extra() {}\n").unwrap();
+
+        // Also create a sibling directory that is NOT a worktree.
+        fs::create_dir_all(root.join("sibling")).unwrap();
+        fs::write(root.join("sibling").join("sibling.rs"), "fn sibling() {}\n").unwrap();
+
+        let report = discover_project_files(&root).unwrap();
+        let names: Vec<_> = report.files.iter().map(|f| f.relative_path.as_str()).collect();
+
+        // main.rs in the main worktree must be discovered.
+        assert!(
+            names.contains(&"main.rs"),
+            "main.rs should be discovered: {names:?}"
+        );
+        // sibling.rs in a normal subdirectory must be discovered.
+        assert!(
+            names.contains(&"sibling/sibling.rs"),
+            "sibling/sibling.rs should be discovered: {names:?}"
+        );
+        // extra.rs is inside the linked worktree and must not be discovered.
+        assert!(
+            !names.contains(&"worktree/extra.rs"),
+            "worktree/extra.rs must be skipped: {names:?}"
+        );
+
+        // The linked worktree directory itself counts as ignored.
+        assert!(
+            report.ignored_files >= 1,
+            "expected at least 1 ignored file (the linked worktree), got {}",
+            report.ignored_files
+        );
+
+        // Clean up the linked worktree so tempdir removal doesn't trip over it.
+        Command::new("git")
+            .args(["worktree", "remove", "--force", worktree_dir.to_str().unwrap()])
+            .current_dir(&root)
+            .status()
+            .ok();
+    }
+
+    #[test]
+    fn linked_worktree_paths_non_git_dir_returns_empty() {
+        let tempdir = tempdir().unwrap();
+        let paths = linked_worktree_paths(tempdir.path());
+        assert!(paths.is_empty(), "expected empty set for non-git dir");
     }
 }

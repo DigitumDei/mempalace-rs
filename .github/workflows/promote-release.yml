@@ -33,17 +33,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           CANDIDATE_TAG: ${{ inputs.candidate_tag }}
+          IMMUTABLE_RELEASES_ENABLED: ${{ vars.MEMPALACE_IMMUTABLE_RELEASES_ENABLED }}
           VERSION: ${{ inputs.version }}
         run: |
           [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]] \
             || { echo "version must be semantic" >&2; exit 1; }
           [[ "$CANDIDATE_TAG" =~ ^nightly-[0-9a-f]{40}$ ]] \
             || { echo "candidate tag must include a full commit SHA" >&2; exit 1; }
-          gh api \
-            -H "X-GitHub-Api-Version: 2026-03-10" \
-            "repos/$GITHUB_REPOSITORY/immutable-releases" \
-            --jq '.enabled == true' | grep -qx true \
-            || { echo "GitHub immutable releases must be enabled before promotion" >&2; exit 1; }
+          [ "$IMMUTABLE_RELEASES_ENABLED" = true ] \
+            || { echo "immutable releases must be verified by release/configure-repository.ps1 before promotion" >&2; exit 1; }
           if gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "stable release already exists" >&2
             exit 1
@@ -59,6 +57,15 @@ jobs:
           CANDIDATE_TAG: ${{ inputs.candidate_tag }}
         run: |
           mkdir candidate-assets
+          immutable_status="$(
+            gh release view "$CANDIDATE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json isImmutable \
+              --jq '.isImmutable' 2>/dev/null \
+              || echo unknown
+          )"
+          [ "$immutable_status" = true ] \
+            || { echo "candidate is not verifiably immutable" >&2; exit 1; }
           gh release verify "$CANDIDATE_TAG" --repo "$GITHUB_REPOSITORY"
           gh release download "$CANDIDATE_TAG" --repo "$GITHUB_REPOSITORY" --dir candidate-assets
           while IFS= read -r asset; do
@@ -118,6 +125,30 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ inputs.version }}
         run: |
+          immutable_status="$(
+            gh release view "v$VERSION" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json isImmutable \
+              --jq '.isImmutable' 2>/dev/null \
+              || echo unknown
+          )"
+          case "$immutable_status" in
+            true)
+              ;;
+            false)
+              gh release delete "v$VERSION" \
+                --repo "$GITHUB_REPOSITORY" \
+                --cleanup-tag \
+                --yes
+              echo "published stable release was mutable; release and tag were removed" >&2
+              exit 1
+              ;;
+            *)
+              echo "could not determine whether the published stable release is immutable; release left for manual inspection" >&2
+              exit 1
+              ;;
+          esac
+
           verified=false
           for attempt in {1..12}; do
             if gh release verify "v$VERSION" --repo "$GITHUB_REPOSITORY"; then

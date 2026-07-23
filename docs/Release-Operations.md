@@ -57,7 +57,17 @@ The helper:
 - enables GitHub immutable releases;
 - restricts `stable-release` deployments to protected branches and adds the
   required reviewer;
-- stores only the base64-encoded private key in the environment secret.
+- stores only the base64-encoded private key in the environment secret;
+- records `MEMPALACE_IMMUTABLE_RELEASES_ENABLED=true` in the protected
+  environment only after the live admin API confirms that immutability is on.
+
+The workflow's short-lived `GITHUB_TOKEN` cannot read repository Administration
+settings, so release jobs require that protected provisioning marker instead of
+calling the admin-only API. Each published release is then checked through
+ordinary release metadata. If GitHub reports a newly published release as
+mutable, the workflow removes that release and its tag before failing. If the
+metadata request itself is indeterminate, the workflow fails without deleting
+anything so an operator can inspect the release.
 
 Re-run with `-WhatIf` to validate the local key and reviewer without mutating
 repository settings.
@@ -69,6 +79,8 @@ gh api -H "X-GitHub-Api-Version: 2026-03-10" `
   repos/DigitumDei/mempalace-rs/immutable-releases
 gh api repos/DigitumDei/mempalace-rs/environments/stable-release
 gh secret list --repo DigitumDei/mempalace-rs --env stable-release
+gh variable get MEMPALACE_IMMUTABLE_RELEASES_ENABLED `
+  --repo DigitumDei/mempalace-rs --env stable-release
 ```
 
 ## Candidate publication

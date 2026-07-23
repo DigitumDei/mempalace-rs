@@ -110,6 +110,23 @@ try {
         if ($LASTEXITCODE -ne 0 -or $secretList -notmatch '(?m)^MEMPALACE_RELEASE_SIGNING_KEY\s') {
             throw 'The release signing secret is not visible after configuration.'
         }
+
+        & gh variable set `
+            MEMPALACE_IMMUTABLE_RELEASES_ENABLED `
+            --body true `
+            --repo $Repository `
+            --env stable-release
+        if ($LASTEXITCODE -ne 0) {
+            throw 'Could not record verified immutable-release provisioning.'
+        }
+
+        $immutableMarker = & gh variable get `
+            MEMPALACE_IMMUTABLE_RELEASES_ENABLED `
+            --repo $Repository `
+            --env stable-release
+        if ($LASTEXITCODE -ne 0 -or $immutableMarker -ne 'true') {
+            throw 'The immutable-release provisioning marker is not visible after configuration.'
+        }
     }
 
     $resultVerb = if ($WhatIfPreference) { 'validated locally for' } else { 'configured for' }
@@ -117,6 +134,9 @@ try {
     Write-Host "Trusted public-key fingerprint: $trustedFingerprint"
     Write-Host "Required reviewer: $Reviewer"
     Write-Host "Prevent self-review: $([bool]$PreventSelfReview)"
+    if (-not $WhatIfPreference) {
+        Write-Host 'Immutable release marker: true'
+    }
 } finally {
     Remove-Item -LiteralPath $temporaryDirectory -Recurse -Force -ErrorAction SilentlyContinue
 }

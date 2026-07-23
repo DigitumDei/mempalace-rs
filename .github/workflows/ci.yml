@@ -425,15 +425,12 @@ jobs:
           echo "CANDIDATE_TAG=nightly-${GITHUB_SHA}" >> "$GITHUB_ENV"
           echo "RELEASE_VERSION=$version" >> "$GITHUB_ENV"
 
-      - name: Require GitHub immutable releases
+      - name: Require verified immutable-release provisioning
         env:
-          GH_TOKEN: ${{ github.token }}
+          IMMUTABLE_RELEASES_ENABLED: ${{ vars.MEMPALACE_IMMUTABLE_RELEASES_ENABLED }}
         run: |
-          gh api \
-            -H "X-GitHub-Api-Version: 2026-03-10" \
-            "repos/$GITHUB_REPOSITORY/immutable-releases" \
-            --jq '.enabled == true' | grep -qx true \
-            || { echo "GitHub immutable releases must be enabled before publishing" >&2; exit 1; }
+          [ "$IMMUTABLE_RELEASES_ENABLED" = true ] \
+            || { echo "immutable releases must be verified by release/configure-repository.ps1 before publishing" >&2; exit 1; }
 
       - name: Reuse an existing immutable candidate
         env:
@@ -441,6 +438,15 @@ jobs:
         run: |
           if gh release view "$CANDIDATE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             mkdir existing-candidate
+            immutable_status="$(
+              gh release view "$CANDIDATE_TAG" \
+                --repo "$GITHUB_REPOSITORY" \
+                --json isImmutable \
+                --jq '.isImmutable' 2>/dev/null \
+                || echo unknown
+            )"
+            [ "$immutable_status" = true ] \
+              || { echo "existing candidate is not verifiably immutable" >&2; exit 1; }
             gh release download "$CANDIDATE_TAG" --repo "$GITHUB_REPOSITORY" --dir existing-candidate
             gh release verify "$CANDIDATE_TAG" --repo "$GITHUB_REPOSITORY"
             bash release/verify-manifest.sh \
@@ -506,6 +512,30 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          immutable_status="$(
+            gh release view "$CANDIDATE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json isImmutable \
+              --jq '.isImmutable' 2>/dev/null \
+              || echo unknown
+          )"
+          case "$immutable_status" in
+            true)
+              ;;
+            false)
+              gh release delete "$CANDIDATE_TAG" \
+                --repo "$GITHUB_REPOSITORY" \
+                --cleanup-tag \
+                --yes
+              echo "published candidate was mutable; release and tag were removed" >&2
+              exit 1
+              ;;
+            *)
+              echo "could not determine whether the published candidate is immutable; release left for manual inspection" >&2
+              exit 1
+              ;;
+          esac
+
           verified=false
           for attempt in {1..12}; do
             if gh release verify "$CANDIDATE_TAG" --repo "$GITHUB_REPOSITORY"; then

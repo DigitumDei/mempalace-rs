@@ -2,9 +2,10 @@
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsString;
 use std::fs;
 use std::io::Read as _;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStringExt as _;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
@@ -1751,12 +1752,22 @@ fn parse_linked_worktree_paths(output: &[u8]) -> BTreeSet<PathBuf> {
             }
             // Git's -z output preserves filesystem path bytes, including
             // newlines and non-UTF-8 Unix filenames.
-            paths.insert(PathBuf::from(OsString::from_encoded_bytes_unchecked(
-                path_bytes.to_vec(),
-            )));
+            if let Some(path) = path_from_git_bytes(path_bytes) {
+                paths.insert(path);
+            }
         }
     }
     paths
+}
+
+#[cfg(unix)]
+fn path_from_git_bytes(bytes: &[u8]) -> Option<PathBuf> {
+    Some(PathBuf::from(std::ffi::OsString::from_vec(bytes.to_vec())))
+}
+
+#[cfg(not(unix))]
+fn path_from_git_bytes(bytes: &[u8]) -> Option<PathBuf> {
+    String::from_utf8(bytes.to_vec()).ok().map(PathBuf::from)
 }
 
 /// Walk `root` applying ignore rules, accepting files for which `accept_file`

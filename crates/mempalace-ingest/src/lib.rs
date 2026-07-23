@@ -1778,13 +1778,20 @@ fn discover_files(
     skip_linked_worktrees: bool,
     accept_file: impl Fn(&Path, &str) -> bool,
 ) -> Result<DiscoveryReport> {
-    let ignore_matcher = IgnoreMatcher::load(root)?;
+    // Git reports worktree paths as absolute, so use an absolute root when
+    // comparing them during project discovery.
+    let root = if skip_linked_worktrees {
+        root.canonicalize().unwrap_or_else(|_| root.to_path_buf())
+    } else {
+        root.to_path_buf()
+    };
+    let ignore_matcher = IgnoreMatcher::load(&root)?;
     let mut ignored_files = 0;
     let mut files = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     // Pre-compute linked worktree paths so we can skip them during the walk.
     let worktree_skip = skip_linked_worktrees
-        .then(|| linked_worktree_paths(root))
+        .then(|| linked_worktree_paths(&root))
         .unwrap_or_default();
 
     while let Some(dir) = stack.pop() {
@@ -1796,7 +1803,7 @@ fn discover_files(
             let file_type = entry
                 .file_type()
                 .map_err(|source| IngestError::Io { path: path.clone(), source })?;
-            let relative = relative_path(root, &path)?;
+            let relative = relative_path(&root, &path)?;
             if file_type.is_dir() {
                 if ignore_matcher.matches(&relative, true) {
                     ignored_files += 1;
@@ -3053,7 +3060,7 @@ mod tests {
         DrawerFilter, DrawerStore, DuplicateStrategy, IngestCommitRequest,
     };
     use serde_json::json;
-    use tempfile::tempdir;
+    use tempfile::{tempdir, Builder};
 
     use super::*;
 
@@ -4998,6 +5005,44 @@ mod tests {
         );
 
         // Clean up the linked worktree so tempdir removal doesn't trip over it.
+        Command::new("git")
+            .args(["worktree", "remove", "--force", worktree_dir.to_str().unwrap()])
+            .current_dir(&root)
+            .status()
+            .ok();
+    }
+
+    #[test]
+    fn linked_worktrees_are_skipped_from_relative_root() {
+        let tempdir = Builder::new().prefix("mempalace-ingest-").tempdir_in(".").unwrap();
+        let root = tempdir.path().to_path_buf();
+        git_init_with_commit(&root, "main", &[("main.rs", "fn main() {}\n")]);
+
+        let worktree_dir = root.join("worktree");
+        let status = Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                "-b",
+                "linked",
+                worktree_dir.to_str().unwrap(),
+            ])
+            .current_dir(&root)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git worktree add failed");
+        fs::write(worktree_dir.join("extra.rs"), "fn extra() {}\n").unwrap();
+
+        let current_dir = std::env::current_dir().unwrap();
+        let relative_root = root.strip_prefix(current_dir).unwrap();
+        let report = discover_project_files(relative_root).unwrap();
+
+        assert!(
+            !report.files.iter().any(|file| file.relative_path == "worktree/extra.rs"),
+            "linked worktree file must be skipped: {:?}",
+            report.files
+        );
+
         Command::new("git")
             .args(["worktree", "remove", "--force", worktree_dir.to_str().unwrap()])
             .current_dir(&root)

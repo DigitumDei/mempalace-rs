@@ -362,24 +362,35 @@ impl StorageEngine {
     /// Remove every mined source whose key begins with `prefix`, deleting both
     /// the LanceDB drawers and the SQLite ingest manifests.
     ///
-    /// LanceDB deletes are batched so a large cleanup does not create one table
-    /// version per source. Idempotent: once the rows are gone a repeat call is a
-    /// no-op. Returns `(sources_removed, drawers_removed)`.
+    /// The matched source keys are snapshotted once, then every subsequent step
+    /// acts on exactly that set. A source committed concurrently under the same
+    /// prefix (for example an in-flight `mine`) is not in the snapshot, so it is
+    /// left entirely untouched rather than half-deleted; within a captured key
+    /// this keeps the same latest-run semantics as [`remove_source_key`]. Drawer
+    /// ids are gathered across all keys and deleted from LanceDB in batches, so a
+    /// large cleanup does not create one table version per source. Idempotent:
+    /// once the rows are gone a repeat call is a no-op. Returns
+    /// `(sources_removed, drawers_removed)`.
     pub async fn remove_source_prefix(&self, prefix: &str) -> Result<(usize, usize)> {
         const DELETE_CHUNK: usize = 512;
         let sources = self.operational_store.ingested_source_counts_with_prefix(prefix)?;
         if sources.is_empty() {
             return Ok((0, 0));
         }
-        let drawer_ids =
-            self.operational_store.committed_drawer_ids_with_source_prefix(prefix)?;
+        let mut drawer_ids = Vec::new();
+        for (source_key, _) in &sources {
+            drawer_ids
+                .extend(self.operational_store.committed_drawer_ids_for_source_key(source_key)?);
+        }
         if !drawer_ids.is_empty() {
             self.signal_activity();
             for chunk in drawer_ids.chunks(DELETE_CHUNK) {
                 self.drawer_store.delete_drawers(chunk).await?;
             }
         }
-        self.operational_store.delete_source_prefix(prefix)?;
+        for (source_key, _) in &sources {
+            self.operational_store.delete_source_key(source_key)?;
+        }
         Ok((sources.len(), drawer_ids.len()))
     }
 
@@ -1079,6 +1090,50 @@ mod tests {
         assert_eq!(drawers.len(), 1);
         let committed = engine.operational_store().committed_drawer_ids().unwrap();
         assert_eq!(committed.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn remove_source_prefix_is_case_sensitive() {
+        let tempdir = tempdir().unwrap();
+        let engine = StorageEngine::open(tempdir.path(), EmbeddingProfile::Balanced).await.unwrap();
+
+        // Two source keys differing only in ASCII case, as branch views `Feature`
+        // and `feature` would. A case-insensitive prefix match would conflate
+        // them, so pruning one would silently delete the other.
+        for (key, id, seed) in [
+            ("projects-branch:w:r:Feature:a.rs", "case_upper/0001", [1.0, 0.0, 0.0, 0.0]),
+            ("projects-branch:w:r:feature:a.rs", "case_lower/0001", [0.0, 1.0, 0.0, 0.0]),
+        ] {
+            engine
+                .commit_ingest(IngestCommitRequest {
+                    ingest_kind: "projects-branch".to_owned(),
+                    source_key: key.to_owned(),
+                    source_file: "a.rs".to_owned(),
+                    content_hash: format!("hash-{id}"),
+                    drawers: vec![record(id, "a.rs", seed)],
+                    duplicate_strategy: DuplicateStrategy::Error,
+                })
+                .await
+                .unwrap();
+        }
+
+        // Preview matches only the exact-case key.
+        let preview = engine.ingested_sources_with_prefix("projects-branch:w:r:Feature:").unwrap();
+        assert_eq!(preview.len(), 1, "case-insensitive over-match: {preview:?}");
+        assert_eq!(preview[0].0, "projects-branch:w:r:Feature:a.rs");
+
+        // Deletion removes only the exact-case key and its drawer.
+        let (sources, drawers) =
+            engine.remove_source_prefix("projects-branch:w:r:Feature:").await.unwrap();
+        assert_eq!((sources, drawers), (1, 1));
+
+        // The lower-case sibling survives in both stores.
+        let live = engine.drawer_store().list_drawers(&DrawerFilter::default()).await.unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].id, DrawerId::new("case_lower/0001").unwrap());
+        let survivors =
+            engine.ingested_sources_with_prefix("projects-branch:w:r:feature:").unwrap();
+        assert_eq!(survivors.len(), 1);
     }
 
     #[tokio::test]

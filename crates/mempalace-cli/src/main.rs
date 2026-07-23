@@ -927,12 +927,30 @@ fn execute_prune(
     palace_override: Option<&Path>,
     context: &CliContext,
 ) -> Result<CliOutput, clap::Error> {
-    let source_prefix = source_prefix.filter(|value| !value.is_empty());
+    // Reject a present-but-empty scope value. An empty --source-prefix would
+    // otherwise collapse to "no path filter" and silently widen a subtree prune
+    // to the whole project (e.g. an unset shell variable in a script).
+    for (flag, value) in [
+        ("--project-id", &project_id),
+        ("--wing", &wing),
+        ("--view", &view),
+        ("--source-prefix", &source_prefix),
+    ] {
+        if matches!(value.as_deref(), Some(v) if v.trim().is_empty()) {
+            return Ok(CliOutput::failure(2, format!("{flag} must not be empty\n")));
+        }
+    }
     let mut notes: Vec<String> = Vec::new();
 
     // ── Resolve the effective wing ───────────────────────────────────────────
     let effective_wing = match project_id.as_deref() {
         Some(id) => {
+            // NOTE: project data mined before the stable project-id migration is
+            // keyed by a checkout-path hash rather than hash("project:<id>"), so
+            // --project-id does not match those legacy rows. They are migrated by
+            // a re-mine, or can be swept with an explicit --wing/--kind after
+            // confirming the preview. Reconstructing the legacy prefix here is
+            // deferred (it depends on fragile canonical-path matching).
             let registered =
                 ConfigLoader::load_project_by_id(context.config_base_dir.as_deref(), id)
                     .map_err(config_error)?;
@@ -3056,6 +3074,18 @@ mod tests {
             .expect("project registered")
     }
 
+    /// Read the id of the sole centrally-registered project (for fixtures whose
+    /// wing string is not known up front, e.g. a repo-local `mempalace.yaml`).
+    fn sole_registered_project_id(context: &CliContext) -> String {
+        let list = run_cli(["project", "list"], context, stub_provider).unwrap();
+        list.stdout
+            .lines()
+            .filter_map(|line| line.trim().split_once(" -> "))
+            .map(|(id, _)| id.to_owned())
+            .next()
+            .expect("a project is registered")
+    }
+
     #[test]
     fn prune_previews_by_default_without_deleting() {
         let (_workspace, context, config_root) = setup_mined_alpha("prune-preview");
@@ -3141,6 +3171,18 @@ mod tests {
         assert_eq!(sp.exit_code, 2);
         assert!(sp.stderr.contains("--source-prefix requires --project-id"), "{}", sp.stderr);
 
+        // A present-but-empty scope value is rejected rather than silently
+        // widening the scope (an empty --source-prefix would otherwise prune the
+        // whole project).
+        let empty = run_cli(
+            ["prune", "--project-id", "p", "--source-prefix", ""],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+        assert_eq!(empty.exit_code, 2);
+        assert!(empty.stderr.contains("--source-prefix must not be empty"), "{}", empty.stderr);
+
         fs::remove_dir_all(config_root).unwrap();
     }
 
@@ -3198,6 +3240,139 @@ mod tests {
         assert!(status.stdout.contains("WING: wing_project_alpha"), "{}", status.stdout);
 
         fs::remove_dir_all(config_root).unwrap();
+    }
+
+    #[test]
+    fn prune_removes_branch_view_leaving_canonical() {
+        let workspace = tempdir().unwrap();
+        let repo_dir = workspace.path().join("repo");
+        fs::create_dir_all(&repo_dir).unwrap();
+
+        let base_content = "fn base() -> i32 { 42 }\n".repeat(20);
+        git_init_repo(
+            &repo_dir,
+            &[
+                ("mempalace.yaml", "wing: branchprune\nrooms:\n  - name: general\n"),
+                ("base.rs", &base_content),
+                ("stable.rs", "fn stable() -> &str { \"hello\" }\n"),
+            ],
+        );
+        let run_git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo_dir)
+                .status()
+                .unwrap();
+        };
+        run_git(&["checkout", "-b", "feature"]);
+        fs::write(repo_dir.join("base.rs"), "fn base() -> i32 { 99 }\n".repeat(20)).unwrap();
+
+        let config_root = temp_config_root("prune-branch");
+        let context = CliContext::for_tests(config_root.clone());
+
+        run_cli(["init", repo_dir.to_str().unwrap(), "--yes"], &context, stub_provider).unwrap();
+        run_cli(["mine", repo_dir.to_str().unwrap()], &context, stub_provider).unwrap();
+        let branch_mine =
+            run_cli(["mine", repo_dir.to_str().unwrap(), "--branch"], &context, stub_provider)
+                .unwrap();
+        assert!(branch_mine.stdout.contains("Files ingested: 1"), "{}", branch_mine.stdout);
+
+        let project_id = sole_registered_project_id(&context);
+
+        // Prune only the `feature` branch view; canonical must survive.
+        let removed = run_cli(
+            ["prune", "--project-id", &project_id, "--view", "feature", "--yes"],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+        assert_eq!(removed.exit_code, 0, "{}", removed.stderr);
+        assert!(removed.stdout.contains("Removed: 1 sources"), "{}", removed.stdout);
+
+        // The branch view is gone; the canonical snapshot survives.
+        let branch_after = run_cli(
+            ["prune", "--project-id", &project_id, "--kind", "projects-branch"],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+        assert!(branch_after.stdout.contains("Nothing matched"), "{}", branch_after.stdout);
+
+        let canonical = run_cli(
+            ["prune", "--project-id", &project_id, "--kind", "projects"],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+        assert!(!canonical.stdout.contains("Matched: 0 sources"), "{}", canonical.stdout);
+        assert!(canonical.stdout.contains("Matched:"), "{}", canonical.stdout);
+
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn prune_after_remine_leaves_no_orphaned_drawers() {
+        let workspace = tempdir().unwrap();
+        let project_dir = setup_project_fixture(workspace.path());
+        let config_root = temp_config_root("prune-remine");
+        let context = CliContext::for_tests(config_root.clone());
+        run_cli(["init", project_dir.to_str().unwrap(), "--yes"], &context, stub_provider).unwrap();
+        run_cli(["mine", project_dir.to_str().unwrap()], &context, stub_provider).unwrap();
+
+        // Change one file and re-mine: a second committed run for that source
+        // key (the earlier run's drawers are superseded). Prune must delete the
+        // live latest-run drawers, leaving nothing orphaned in LanceDB.
+        write_file(
+            &project_dir.join("backend/auth.rs"),
+            "Totally different auth content after an edit.\n",
+        );
+        run_cli(["mine", project_dir.to_str().unwrap()], &context, stub_provider).unwrap();
+
+        let removed = run_cli(
+            ["prune", "--wing", "wing_project_alpha", "--kind", "projects", "--yes"],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+        assert_eq!(removed.exit_code, 0);
+
+        // No drawers may remain — a stale-run orphan would still list here.
+        let status = run_cli(["status"], &context, stub_provider).unwrap();
+        assert!(
+            !status.stdout.contains("WING: wing_project_alpha"),
+            "orphaned drawers remain after prune: {}",
+            status.stdout
+        );
+
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn prune_explicit_wing_overrides_registry() {
+        let (_workspace, context, config_root) = setup_mined_alpha("prune-wing-override");
+        let project_id = registered_project_id(&context, "wing_project_alpha");
+
+        // An explicit --wing overrides the registered wing: a wrong wing resolves
+        // to that wing (matching nothing), not a silent fallback to the registry.
+        let wrong = run_cli(
+            ["prune", "--project-id", &project_id, "--wing", "wing_not_it", "--kind", "projects"],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+        assert_eq!(wrong.exit_code, 0);
+        assert!(wrong.stdout.contains("Nothing matched"), "{}", wrong.stdout);
+
+        // Without --wing, the registry wing is used and the project is found.
+        let registry = run_cli(
+            ["prune", "--project-id", &project_id, "--kind", "projects"],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+        assert!(registry.stdout.contains("Matched: 3 sources"), "{}", registry.stdout);
+
+        remove_dir_all_if_exists(&config_root);
     }
 
     #[test]

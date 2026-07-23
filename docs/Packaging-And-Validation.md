@@ -135,7 +135,8 @@ Use this directory to freeze the release promise, then attach both of the follow
 ## Promotion
 
 After both rows pass, dispatch `.github/workflows/promote-release.yml` from the
-protected `main` branch with the exact candidate tag and stable semantic version.
+protected `main` branch with the exact candidate tag. The stable semantic
+version is taken from the candidate's verified signed manifest.
 The workflow is bound to the `stable-release` protected environment and copies
 the tested binaries without rebuilding them. Before promotion it verifies the
 GitHub immutable-release attestation, every release asset, project signatures,

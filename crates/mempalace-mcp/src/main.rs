@@ -30,7 +30,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     })
 }
 
-fn early_output<I, S>(args: I) -> Option<&'static str>
+fn early_output<I, S>(args: I) -> Option<String>
 where
     I: IntoIterator<Item = S>,
     S: Into<OsString>,
@@ -47,7 +47,7 @@ where
     }
 
     if saw_help {
-        Some(help_text())
+        Some(help_text().to_owned())
     } else if saw_version {
         Some(version_text())
     } else {
@@ -65,8 +65,8 @@ fn help_text() -> &'static str {
     )
 }
 
-fn version_text() -> &'static str {
-    concat!("mempalace-mcp ", env!("CARGO_PKG_VERSION"), "\n")
+fn version_text() -> String {
+    format!("mempalace-mcp {}\n", mempalace_core::BUILD_VERSION)
 }
 
 #[cfg(test)]
@@ -75,12 +75,18 @@ mod tests {
 
     #[test]
     fn help_and_version_short_circuit_before_startup() {
-        assert_eq!(early_output(["--help"]), Some(help_text()));
-        assert_eq!(early_output(["-h"]), Some(help_text()));
+        assert_eq!(early_output(["--help"]), Some(help_text().to_owned()));
+        assert_eq!(early_output(["-h"]), Some(help_text().to_owned()));
         assert_eq!(early_output(["--version"]), Some(version_text()));
         assert_eq!(early_output(["-V"]), Some(version_text()));
-        assert_eq!(early_output(["--help", "--version"]), Some(help_text()));
-        assert_eq!(early_output(["--version", "--help"]), Some(help_text()));
+        assert_eq!(
+            early_output(["--help", "--version"]),
+            Some(help_text().to_owned())
+        );
+        assert_eq!(
+            early_output(["--version", "--help"]),
+            Some(help_text().to_owned())
+        );
         assert_eq!(early_output(["--version", "--verbose"]), Some(version_text()));
         assert_eq!(early_output(std::iter::empty::<&str>()), None);
         assert_eq!(early_output(["--unknown"]), None);

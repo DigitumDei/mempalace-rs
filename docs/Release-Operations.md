@@ -83,16 +83,46 @@ gh variable get MEMPALACE_IMMUTABLE_RELEASES_ENABLED `
   --repo DigitumDei/mempalace-rs --env stable-release
 ```
 
+## Release versions
+
+`release/version.toml` is the only manually maintained release-version file.
+For a new feature series, increase its `major` or `minor` value in a reviewed
+pull request. The pair must move forward; decreasing or reusing an earlier
+series fails the release build.
+
+The patch is not stored. `release/build-version.sh` derives it from protected
+`main` first-parent history:
+
+- the commit that introduces a higher major or minor is patch `0`;
+- each later distinct `main` build increments the patch by one;
+- rerunning the same commit returns the same version;
+- changing only comments in `release/version.toml` does not reset the patch;
+- after a stable release, counting continues from that stable patch.
+
+When automatic versioning is first introduced into an existing series, its
+first build continues after the highest reachable stable patch. Thus the first
+automatic build after stable `v0.1.0` is `0.1.1`.
+
+Release jobs embed the calculated version in the CLI, MCP server, server-info
+response, signed manifest, release title, and stable tag. Ordinary local Cargo
+builds that do not set `MEMPALACE_BUILD_VERSION` continue to report the
+workspace package version.
+
 ## Candidate publication
 
 Every successful push to `main` builds and attests six binaries. After the
 `stable-release` approval, CI:
 
-1. creates schema-v2 `release-manifest.json` and `SHA256SUMS`;
-2. checks that the environment key matches the committed public key;
-3. signs and locally re-verifies both files;
-4. publishes `nightly-<full-main-commit-sha>` as a GitHub immutable prerelease;
-5. verifies the resulting GitHub release and every published asset.
+1. calculates and embeds the deterministic release version;
+2. creates schema-v2 `release-manifest.json` and `SHA256SUMS`;
+3. checks that the environment key matches the committed public key;
+4. signs and locally re-verifies both files;
+5. publishes `nightly-<full-main-commit-sha>` as a GitHub immutable prerelease;
+6. verifies the resulting GitHub release and every published asset.
+
+Candidate tags remain bound to the full commit SHA. Their display title includes
+the calculated version, short SHA, and source commit subject so multiple
+immutable candidates are distinguishable in GitHub's release list.
 
 A rerun reuses an already-published immutable candidate only after re-verifying
 the release and project signatures. It never overwrites the release.
@@ -108,14 +138,13 @@ gate rows in [Packaging and Validation](Packaging-And-Validation.md). Record:
 - supported small-VM runtime evidence;
 - approver and timestamp.
 
-Do not promote a different candidate, even if it has the same Cargo version.
+Do not promote a different candidate, even if it has the same release version.
 
 ## Stable promotion
 
-Dispatch `promote-release` from `main` with:
-
-- `candidate_tag`: the exact signed-off `nightly-<full-sha>` tag;
-- `version`: the Cargo semantic version without `v`.
+Dispatch `promote-release` from `main` with `candidate_tag` set to the exact
+signed-off `nightly-<full-sha>` tag. The workflow reads the stable version from
+the verified signed candidate manifest; operators do not enter it separately.
 
 After environment approval, promotion verifies the candidate end to end,
 rewrites only stable-channel manifest fields, re-signs the manifest, publishes

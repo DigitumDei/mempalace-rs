@@ -7,10 +7,6 @@ on:
         description: Immutable nightly-<commit> tag to promote
         required: true
         type: string
-      version:
-        description: Stable semantic version (without v)
-        required: true
-        type: string
 
 permissions:
   attestations: read
@@ -34,22 +30,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           CANDIDATE_TAG: ${{ inputs.candidate_tag }}
           IMMUTABLE_RELEASES_ENABLED: ${{ vars.MEMPALACE_IMMUTABLE_RELEASES_ENABLED }}
-          VERSION: ${{ inputs.version }}
         run: |
-          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]] \
-            || { echo "version must be semantic" >&2; exit 1; }
           [[ "$CANDIDATE_TAG" =~ ^nightly-[0-9a-f]{40}$ ]] \
             || { echo "candidate tag must include a full commit SHA" >&2; exit 1; }
           [ "$IMMUTABLE_RELEASES_ENABLED" = true ] \
             || { echo "immutable releases must be verified by release/configure-repository.ps1 before promotion" >&2; exit 1; }
-          if gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "stable release already exists" >&2
-            exit 1
-          fi
-          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/v$VERSION" >/dev/null 2>&1; then
-            echo "stable tag already exists" >&2
-            exit 1
-          fi
 
       - name: Download exact immutable candidate
         env:
@@ -68,6 +53,10 @@ jobs:
             || { echo "candidate is not verifiably immutable" >&2; exit 1; }
           gh release verify "$CANDIDATE_TAG" --repo "$GITHUB_REPOSITORY"
           gh release download "$CANDIDATE_TAG" --repo "$GITHUB_REPOSITORY" --dir candidate-assets
+          candidate_version="$(jq -r '.version // empty' candidate-assets/release-manifest.json)"
+          [[ "$candidate_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+            || { echo "candidate manifest version must be semantic" >&2; exit 1; }
+          echo "RELEASE_VERSION=$candidate_version" >> "$GITHUB_ENV"
           while IFS= read -r asset; do
             gh release verify-asset "$CANDIDATE_TAG" "$asset" --repo "$GITHUB_REPOSITORY"
           done < <(bash release/release-files.sh candidate-assets)
@@ -76,10 +65,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           CANDIDATE_TAG: ${{ inputs.candidate_tag }}
-          VERSION: ${{ inputs.version }}
         run: |
           bash release/verify-manifest.sh \
-            candidate-assets nightly "$CANDIDATE_TAG" "$VERSION" release/public-key.pem
+            candidate-assets nightly "$CANDIDATE_TAG" "$RELEASE_VERSION" release/public-key.pem
 
           manifest_commit="$(jq -r '.commit_sha' candidate-assets/release-manifest.json)"
           [ "$CANDIDATE_TAG" = "nightly-$manifest_commit" ] \
@@ -87,6 +75,15 @@ jobs:
           tag_commit="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$CANDIDATE_TAG" --jq '.object.sha')"
           [ "$tag_commit" = "$manifest_commit" ] \
             || { echo "candidate Git tag does not target the manifest commit" >&2; exit 1; }
+
+          if gh release view "v$RELEASE_VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "stable release already exists" >&2
+            exit 1
+          fi
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/v$RELEASE_VERSION" >/dev/null 2>&1; then
+            echo "stable tag already exists" >&2
+            exit 1
+          fi
 
           for asset in candidate-assets/mempalace-*; do
             gh attestation verify "$asset" \
@@ -100,33 +97,30 @@ jobs:
       - name: Create and verify signed stable manifest
         env:
           RELEASE_SIGNING_KEY: ${{ secrets.MEMPALACE_RELEASE_SIGNING_KEY }}
-          VERSION: ${{ inputs.version }}
         run: |
-          bash release/promote-manifest.sh candidate-assets "$VERSION"
+          bash release/promote-manifest.sh candidate-assets "$RELEASE_VERSION"
           bash release/sign-manifest.sh candidate-assets release/public-key.pem
           bash release/verify-manifest.sh \
-            candidate-assets stable "v$VERSION" "$VERSION" release/public-key.pem
+            candidate-assets stable "v$RELEASE_VERSION" "$RELEASE_VERSION" release/public-key.pem
 
       - name: Publish immutable stable release
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ inputs.version }}
         run: |
           mapfile -t release_files < <(bash release/release-files.sh candidate-assets)
-          gh release create "v$VERSION" "${release_files[@]}" \
+          gh release create "v$RELEASE_VERSION" "${release_files[@]}" \
             --repo "$GITHUB_REPOSITORY" \
             --target "$(jq -r '.commit_sha' candidate-assets/release-manifest.json)" \
-            --title "v$VERSION" \
+            --title "v$RELEASE_VERSION" \
             --generate-notes \
             --latest
 
       - name: Verify published stable release integrity
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ inputs.version }}
         run: |
           immutable_status="$(
-            gh release view "v$VERSION" \
+            gh release view "v$RELEASE_VERSION" \
               --repo "$GITHUB_REPOSITORY" \
               --json isImmutable \
               --jq '.isImmutable' 2>/dev/null \
@@ -136,7 +130,7 @@ jobs:
             true)
               ;;
             false)
-              gh release delete "v$VERSION" \
+              gh release delete "v$RELEASE_VERSION" \
                 --repo "$GITHUB_REPOSITORY" \
                 --cleanup-tag \
                 --yes
@@ -151,7 +145,7 @@ jobs:
 
           verified=false
           for attempt in {1..12}; do
-            if gh release verify "v$VERSION" --repo "$GITHUB_REPOSITORY"; then
+            if gh release verify "v$RELEASE_VERSION" --repo "$GITHUB_REPOSITORY"; then
               verified=true
               break
             fi
@@ -160,5 +154,5 @@ jobs:
           [ "$verified" = true ] \
             || { echo "GitHub release attestation did not become available" >&2; exit 1; }
           while IFS= read -r asset; do
-            gh release verify-asset "v$VERSION" "$asset" --repo "$GITHUB_REPOSITORY"
+            gh release verify-asset "v$RELEASE_VERSION" "$asset" --repo "$GITHUB_REPOSITORY"
           done < <(bash release/release-files.sh candidate-assets)

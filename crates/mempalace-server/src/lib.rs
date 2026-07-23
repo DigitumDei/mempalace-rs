@@ -36,8 +36,9 @@ use axum::{Json, Router};
 use blake3::Hasher;
 use mempalace_config::MempalaceConfig;
 use mempalace_core::{
-    DIARY_ROOM, DIARY_TOPIC_PREFIX, DrawerId, DrawerRecord, RoomId, SHARED_AGENT_DIARY_WING,
-    SearchQuery, SourceLocator, WingId, hash_bytes, mined_drawer_id, resolve_records,
+    BUILD_VERSION, DIARY_ROOM, DIARY_TOPIC_PREFIX, DrawerId, DrawerRecord, RoomId,
+    SHARED_AGENT_DIARY_WING, SearchQuery, SourceLocator, WingId, hash_bytes, mined_drawer_id,
+    resolve_records,
 };
 use mempalace_embeddings::{EmbeddingProvider, EmbeddingRequest};
 use mempalace_federation::{
@@ -710,7 +711,7 @@ where
     let status = state.maintenance_status.lock().unwrap().clone();
 
     Ok(Json(InfoResponse {
-        server_version: env!("CARGO_PKG_VERSION").to_owned(),
+        server_version: BUILD_VERSION.to_owned(),
         federation_api_version: FEDERATION_API_VERSION,
         embedding_profile: state.config.embedding_profile.as_str().to_owned(),
         capabilities: vec![

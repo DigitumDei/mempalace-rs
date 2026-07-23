@@ -10,7 +10,7 @@
 #   --no-path            skip adding the install dir to your shell PATH
 #   --install-dir <dir>  install somewhere other than ~/.mempalace/bin
 #   --channel <channel>  stable (default) or explicit nightly candidate
-#   --version <tag>      required immutable nightly-<full-commit-sha> tag for nightly
+#   --version <tag>      required immutable v<version>-nightly.<full-sha> tag
 
 set -eu
 
@@ -51,7 +51,7 @@ Options (pass via `sh -s -- <flags>` when piping):
   --no-path            skip adding the install dir to your shell PATH
   --install-dir <dir>  install somewhere other than ~/.mempalace/bin
   --channel <channel>  stable (default) or explicit nightly candidate
-  --version <tag>      required immutable nightly-<full-commit-sha> tag for nightly
+  --version <tag>      required immutable v<version>-nightly.<full-sha> tag
 EOF
             exit 0
             ;;
@@ -65,11 +65,12 @@ err() { echo "error: $*" >&2; exit 1; }
 case "$CHANNEL" in
     stable) [ -z "$VERSION" ] || err "--version is only supported with --channel nightly"; RELEASE_URL="https://github.com/${REPO}/releases/latest/download" ;;
     nightly)
-        NIGHTLY_SHA="${VERSION#nightly-}"
-        [ "${NIGHTLY_SHA}" != "${VERSION}" ] && [ "${#NIGHTLY_SHA}" -eq 40 ] || err "nightly updates require --version nightly-<full-commit-sha>"
-        case "${NIGHTLY_SHA}" in
-            *[!0123456789abcdef]*) err "nightly updates require --version nightly-<full-commit-sha>" ;;
-        esac
+        printf '%s\n' "$VERSION" \
+            | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-nightly\.[0-9a-f]{40}$' \
+            || err "nightly updates require --version v<version>-nightly.<full-commit-sha>"
+        NIGHTLY_SHA="${VERSION##*.}"
+        NIGHTLY_VERSION="${VERSION#v}"
+        NIGHTLY_VERSION="${NIGHTLY_VERSION%-nightly.*}"
         RELEASE_URL="https://github.com/${REPO}/releases/download/${VERSION}"
         ;;
     *) err "unsupported channel: $CHANNEL (expected stable or nightly)" ;;
@@ -192,6 +193,8 @@ case "$CHANNEL" in
     nightly)
         [ "$MANIFEST_TAG" = "$VERSION" ] \
             || err "release manifest tag does not match requested candidate"
+        [ "$MANIFEST_VERSION" = "$NIGHTLY_VERSION" ] \
+            || err "release manifest version does not match requested candidate"
         [ "$MANIFEST_COMMIT" = "$NIGHTLY_SHA" ] \
             || err "release manifest commit does not match requested candidate"
         ;;
@@ -199,7 +202,11 @@ case "$CHANNEL" in
         [ "$MANIFEST_TAG" = "v${MANIFEST_VERSION}" ] \
             || err "stable release manifest tag does not match its version"
         MANIFEST_SOURCE_CANDIDATE="$(manifest_string_field source_candidate_tag)"
-        [ "$MANIFEST_SOURCE_CANDIDATE" = "nightly-${MANIFEST_COMMIT}" ] \
+        [ "$MANIFEST_SOURCE_CANDIDATE" = "v${MANIFEST_VERSION}-nightly.${MANIFEST_COMMIT}" ] \
+            || {
+                [ "$MANIFEST_VERSION" = "0.1.0" ] \
+                    && [ "$MANIFEST_SOURCE_CANDIDATE" = "nightly-${MANIFEST_COMMIT}" ]
+            } \
             || err "stable release manifest is not bound to its source candidate"
         ;;
 esac

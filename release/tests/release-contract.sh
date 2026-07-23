@@ -58,7 +58,7 @@ create_and_sign_candidate() {
     local commit_sha="$3"
     make_assets "$directory" "$marker"
     bash "$repo_root/release/create-manifest.sh" \
-        "$directory" nightly 0.1.0 "$commit_sha" 12345 "nightly-$commit_sha"
+        "$directory" nightly 0.1.0 "$commit_sha" 12345 "v0.1.0-nightly.$commit_sha"
     RELEASE_SIGNING_KEY="$(encode_key "$private_key")" \
         bash "$repo_root/release/sign-manifest.sh" "$directory" "$public_key"
 }
@@ -79,14 +79,14 @@ candidate_b="$temporary_root/candidate-b"
 
 create_and_sign_candidate "$candidate_a" "candidate-a" "$commit_a"
 bash "$repo_root/release/verify-manifest.sh" \
-    "$candidate_a" nightly "nightly-$commit_a" 0.1.0 "$public_key"
+    "$candidate_a" nightly "v0.1.0-nightly.$commit_a" 0.1.0 "$public_key"
 
 tampered_binary="$temporary_root/tampered-binary"
 cp -R "$candidate_a" "$tampered_binary"
 printf 'tampered\n' >> "$tampered_binary/mempalace-cli-linux-x86_64"
 expect_failure "tampered binary" \
     bash "$repo_root/release/verify-manifest.sh" \
-    "$tampered_binary" nightly "nightly-$commit_a" 0.1.0 "$public_key"
+    "$tampered_binary" nightly "v0.1.0-nightly.$commit_a" 0.1.0 "$public_key"
 
 create_and_sign_candidate "$candidate_b" "candidate-b" "$commit_b"
 hybrid_bundle="$temporary_root/hybrid-bundle"
@@ -95,16 +95,20 @@ cp "$candidate_a/release-manifest.json" "$hybrid_bundle/release-manifest.json"
 cp "$candidate_a/release-manifest.sig" "$hybrid_bundle/release-manifest.sig"
 expect_failure "manifest replayed with another signed checksum bundle" \
     bash "$repo_root/release/verify-manifest.sh" \
-    "$hybrid_bundle" nightly "nightly-$commit_a" 0.1.0 "$public_key"
+    "$hybrid_bundle" nightly "v0.1.0-nightly.$commit_a" 0.1.0 "$public_key"
 
 expect_failure "nightly tag does not match manifest commit" \
     bash "$repo_root/release/verify-manifest.sh" \
-    "$candidate_a" nightly "nightly-$commit_b" 0.1.0 "$public_key"
+    "$candidate_a" nightly "v0.1.0-nightly.$commit_b" 0.1.0 "$public_key"
+
+expect_failure "nightly tag does not match manifest version" \
+    bash "$repo_root/release/verify-manifest.sh" \
+    "$candidate_a" nightly "v0.1.1-nightly.$commit_a" 0.1.0 "$public_key"
 
 wrong_key_bundle="$temporary_root/wrong-key"
 make_assets "$wrong_key_bundle" "wrong-key"
 bash "$repo_root/release/create-manifest.sh" \
-    "$wrong_key_bundle" nightly 0.1.0 "$commit_a" 12345 "nightly-$commit_a"
+    "$wrong_key_bundle" nightly 0.1.0 "$commit_a" 12345 "v0.1.0-nightly.$commit_a"
 expect_failure "private key does not match trusted public key" \
     env RELEASE_SIGNING_KEY="$(encode_key "$wrong_private_key")" \
     bash "$repo_root/release/sign-manifest.sh" "$wrong_key_bundle" "$public_key"
@@ -116,6 +120,32 @@ RELEASE_SIGNING_KEY="$(encode_key "$private_key")" \
     bash "$repo_root/release/sign-manifest.sh" "$stable_bundle" "$public_key"
 bash "$repo_root/release/verify-manifest.sh" \
     "$stable_bundle" stable v0.1.0 0.1.0 "$public_key"
+
+legacy_stable="$temporary_root/legacy-stable"
+cp -R "$stable_bundle" "$legacy_stable"
+jq --arg source_candidate_tag "nightly-$commit_a" \
+    '.source_candidate_tag = $source_candidate_tag' \
+    "$legacy_stable/release-manifest.json" > "$legacy_stable/release-manifest.legacy.json"
+mv "$legacy_stable/release-manifest.legacy.json" "$legacy_stable/release-manifest.json"
+RELEASE_SIGNING_KEY="$(encode_key "$private_key")" \
+    bash "$repo_root/release/sign-manifest.sh" "$legacy_stable" "$public_key"
+bash "$repo_root/release/verify-manifest.sh" \
+    "$legacy_stable" stable v0.1.0 0.1.0 "$public_key"
+
+future_legacy_stable="$temporary_root/future-legacy-stable"
+cp -R "$legacy_stable" "$future_legacy_stable"
+jq \
+    '.version = "0.2.0" | .release_tag = "v0.2.0"' \
+    "$future_legacy_stable/release-manifest.json" \
+    > "$future_legacy_stable/release-manifest.future.json"
+mv \
+    "$future_legacy_stable/release-manifest.future.json" \
+    "$future_legacy_stable/release-manifest.json"
+RELEASE_SIGNING_KEY="$(encode_key "$private_key")" \
+    bash "$repo_root/release/sign-manifest.sh" "$future_legacy_stable" "$public_key"
+expect_failure "legacy candidate tags are accepted only for stable v0.1.0" \
+    bash "$repo_root/release/verify-manifest.sh" \
+    "$future_legacy_stable" stable v0.2.0 0.2.0 "$public_key"
 
 unexpected_asset="$temporary_root/unexpected-asset"
 cp -R "$stable_bundle" "$unexpected_asset"

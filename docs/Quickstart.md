@@ -25,11 +25,11 @@ Options:
 | `--no-setup` | `-NoSetup` (or `$env:MEMPALACE_NO_SETUP='1'`) | skip MCP registration |
 | `--no-path` | `-NoPath` (or `$env:MEMPALACE_NO_PATH='1'`) | don't touch your PATH |
 | `--install-dir <dir>` | `-InstallDir <dir>` (or `$env:MEMPALACE_INSTALL_DIR`) | install elsewhere |
-| `--channel nightly --version nightly-<full-commit-sha>` | `-Channel nightly -Version nightly-<full-commit-sha>` | explicitly install an immutable test candidate |
+| `--channel nightly --version v<version>-nightly.<full-commit-sha>` | `-Channel nightly -Version v<version>-nightly.<full-commit-sha>` | explicitly install an immutable test candidate |
 
 Pass sh flags through the pipe with `| sh -s -- --no-setup`. For PowerShell parameters, download the script first (`irm ... -OutFile install.ps1`) — env vars work with the piped one-liner.
 
-Stable releases are immutable and are the default installer target. Candidates from `main` are immutable `nightly-<full-commit-sha>` prereleases and require the explicit nightly channel and version above.
+Stable releases are immutable and are the default installer target. Candidates from `main` are immutable `v<version>-nightly.<full-commit-sha>` prereleases and require the explicit nightly channel and version above.
 The installer never falls back to the legacy mutable `nightly` tag. Before the first stable release exists, it exits without changing an existing installation.
 
 The Windows installer verifies release signatures with cryptography APIs introduced in PowerShell 7.1. Install PowerShell 7.1 or later before using the Windows command above.

@@ -84,15 +84,21 @@ commit_sha="$(jq -r '.commit_sha' "$manifest")"
 source_candidate_tag="$(jq -r '.source_candidate_tag // empty' "$manifest")"
 case "$expected_channel" in
     nightly)
-        [ "$expected_tag" = "nightly-$commit_sha" ] \
-            || { echo "candidate tag is not bound to the manifest commit" >&2; exit 1; }
+        [ "$expected_tag" = "v${expected_version}-nightly.${commit_sha}" ] \
+            || { echo "candidate tag is not bound to the manifest version and commit" >&2; exit 1; }
         [ -z "$source_candidate_tag" ] \
             || { echo "candidate manifest must not have a source candidate tag" >&2; exit 1; }
         ;;
     stable)
         [ "$expected_tag" = "v$expected_version" ] \
             || { echo "stable tag is not bound to the manifest version" >&2; exit 1; }
-        [ "$source_candidate_tag" = "nightly-$commit_sha" ] \
+        versioned_source_tag="v${expected_version}-nightly.${commit_sha}"
+        legacy_source_tag="nightly-${commit_sha}"
+        [ "$source_candidate_tag" = "$versioned_source_tag" ] \
+            || {
+                [ "$expected_version" = "0.1.0" ] \
+                    && [ "$source_candidate_tag" = "$legacy_source_tag" ]
+            } \
             || { echo "stable manifest is not bound to its source candidate" >&2; exit 1; }
         ;;
     *)

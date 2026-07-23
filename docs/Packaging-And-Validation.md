@@ -35,7 +35,8 @@ Reference packaging job:
 - GitHub Actions workflow: `.github/workflows/ci.yml`
 - Job: `release-host` (matrix: linux glibc, macOS arm64, Windows)
 - Published artifacts: `release-<asset>` (e.g. `release-linux-x86_64`,
-  `release-macos-arm64`), promoted into an immutable `nightly-<full-commit-sha>`
+  `release-macos-arm64`), promoted into an immutable
+  `v<version>-nightly.<full-commit-sha>`
   prerelease with signed `SHA256SUMS` and `release-manifest.json`, and GitHub
   build provenance attestations
 

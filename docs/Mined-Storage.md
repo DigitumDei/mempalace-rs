@@ -101,7 +101,9 @@ valid UTF-8 always use the legacy stored-content path. Re-mining them with
 under the target directory. `.gitignore` and `.mempalaceignore` files are
 honored throughout, and the following directory names are always skipped:
 `.git`, `node_modules`, `__pycache__`, `.venv`, `venv`, `env`, `dist`, `build`,
-`.next`, `coverage`, `.mempalace`.
+`.next`, `coverage`, `.mempalace`. Linked Git worktrees reported by
+`git worktree list --porcelain` are also skipped, preventing duplicate checkout
+content from being mined.
 
 ### Accepted extensions
 

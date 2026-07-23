@@ -4,6 +4,8 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read as _;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStringExt as _;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
@@ -1675,7 +1677,7 @@ fn has_shebang(path: &Path) -> bool {
 
 fn discover_project_files(root: &Path) -> Result<DiscoveryReport> {
     let extension_set = PROJECT_READABLE_EXTENSIONS.iter().copied().collect::<BTreeSet<_>>();
-    discover_files(root, |path, file_name| {
+    discover_files(root, true, |path, file_name| {
         // Secrets / lockfile hygiene (includes the .env prefix rule).
         if project_file_skip_by_name(file_name) {
             return false;
@@ -1697,7 +1699,7 @@ fn discover_project_files(root: &Path) -> Result<DiscoveryReport> {
 
 fn discover_conversation_files(root: &Path) -> Result<DiscoveryReport> {
     let extension_set = CONVO_EXTENSIONS.iter().copied().collect::<BTreeSet<_>>();
-    discover_files(root, move |path, _file_name| {
+    discover_files(root, false, move |path, _file_name| {
         let suffix = path.extension().and_then(|value| value.to_str()).unwrap_or_default();
         let normalized_suffix = format!(".{}", suffix.to_ascii_lowercase());
         extension_set.contains(normalized_suffix.as_str())
@@ -1720,17 +1722,82 @@ struct DiscoveryReport {
     ignored_files: usize,
 }
 
+/// Run `git worktree list --porcelain -z` from `root` and return the paths of
+/// every linked worktree (the main worktree is excluded). Returns an
+/// empty set when git is unavailable, the root is not inside a git repository,
+/// or there are no linked worktrees.
+fn linked_worktree_paths(root: &Path) -> BTreeSet<PathBuf> {
+    let output = match Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["worktree", "list", "--porcelain", "-z"])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return BTreeSet::new(),
+    };
+
+    parse_linked_worktree_paths(&output.stdout)
+        .into_iter()
+        // Align Git's recorded paths with the canonical walk root, including
+        // worktrees registered through a symlinked path.
+        .map(|path| path.canonicalize().unwrap_or(path))
+        .collect()
+}
+
+fn parse_linked_worktree_paths(output: &[u8]) -> BTreeSet<PathBuf> {
+    let mut paths = BTreeSet::new();
+    let mut is_first = true;
+    for field in output.split(|byte| *byte == b'\0') {
+        if let Some(path_bytes) = field.strip_prefix(b"worktree ") {
+            if is_first {
+                // The first "worktree" entry is the main worktree — keep it.
+                is_first = false;
+                continue;
+            }
+            // Git's -z output preserves filesystem path bytes, including
+            // newlines and non-UTF-8 Unix filenames.
+            if let Some(path) = path_from_git_bytes(path_bytes) {
+                paths.insert(path);
+            }
+        }
+    }
+    paths
+}
+
+#[cfg(unix)]
+fn path_from_git_bytes(bytes: &[u8]) -> Option<PathBuf> {
+    Some(PathBuf::from(std::ffi::OsString::from_vec(bytes.to_vec())))
+}
+
+#[cfg(not(unix))]
+fn path_from_git_bytes(bytes: &[u8]) -> Option<PathBuf> {
+    String::from_utf8(bytes.to_vec()).ok().map(PathBuf::from)
+}
+
 /// Walk `root` applying ignore rules, accepting files for which `accept_file`
 /// returns `true`. The closure receives the absolute path and the (lossy) file
 /// name; everything it rejects counts toward `ignored_files`.
 fn discover_files(
     root: &Path,
+    skip_linked_worktrees: bool,
     accept_file: impl Fn(&Path, &str) -> bool,
 ) -> Result<DiscoveryReport> {
-    let ignore_matcher = IgnoreMatcher::load(root)?;
+    // Git reports worktree paths as absolute, so use an absolute root when
+    // comparing them during project discovery.
+    let root = if skip_linked_worktrees {
+        root.canonicalize().unwrap_or_else(|_| root.to_path_buf())
+    } else {
+        root.to_path_buf()
+    };
+    let ignore_matcher = IgnoreMatcher::load(&root)?;
     let mut ignored_files = 0;
     let mut files = Vec::new();
     let mut stack = vec![root.to_path_buf()];
+    // Pre-compute linked worktree paths so we can skip them during the walk.
+    let worktree_skip = skip_linked_worktrees
+        .then(|| linked_worktree_paths(&root))
+        .unwrap_or_default();
 
     while let Some(dir) = stack.pop() {
         let read_dir =
@@ -1741,9 +1808,15 @@ fn discover_files(
             let file_type = entry
                 .file_type()
                 .map_err(|source| IngestError::Io { path: path.clone(), source })?;
-            let relative = relative_path(root, &path)?;
+            let relative = relative_path(&root, &path)?;
             if file_type.is_dir() {
                 if ignore_matcher.matches(&relative, true) {
+                    ignored_files += 1;
+                    continue;
+                }
+                // Skip linked git worktrees: they are duplicate checkouts of the
+                // same repository and would produce redundant drawers.
+                if worktree_skip.contains(&path) {
                     ignored_files += 1;
                     continue;
                 }
@@ -2992,7 +3065,7 @@ mod tests {
         DrawerFilter, DrawerStore, DuplicateStrategy, IngestCommitRequest,
     };
     use serde_json::json;
-    use tempfile::tempdir;
+    use tempfile::{tempdir, Builder};
 
     use super::*;
 
@@ -4872,5 +4945,158 @@ mod tests {
             matches!(result, Err(IngestError::BranchDeltaUnavailable { .. })),
             "expected BranchDeltaUnavailable, got: {result:?}"
         );
+    }
+
+    // ─── Linked worktree skip tests ───────────────────────────────────────────
+
+    #[test]
+    fn linked_worktrees_are_skipped_during_discovery() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path().to_path_buf();
+
+        // Initialise a git repo with a single commit.
+        git_init_with_commit(
+            &root,
+            "main",
+            &[("main.rs", "fn main() {}\n")],
+        );
+
+        let worktree_dir = root.join("worktree");
+        // Create a linked worktree (the directory must not exist beforehand).
+        let status = Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                "-b",
+                "linked",
+                worktree_dir.to_str().unwrap(),
+            ])
+            .current_dir(&root)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git worktree add failed");
+
+        // Drop a file inside the linked worktree.
+        fs::write(worktree_dir.join("extra.rs"), "fn extra() {}\n").unwrap();
+
+        // Also create a sibling directory that is NOT a worktree.
+        fs::create_dir_all(root.join("sibling")).unwrap();
+        fs::write(root.join("sibling").join("sibling.rs"), "fn sibling() {}\n").unwrap();
+
+        let report = discover_project_files(&root).unwrap();
+        let names: Vec<_> = report.files.iter().map(|f| f.relative_path.as_str()).collect();
+
+        // main.rs in the main worktree must be discovered.
+        assert!(
+            names.contains(&"main.rs"),
+            "main.rs should be discovered: {names:?}"
+        );
+        // sibling.rs in a normal subdirectory must be discovered.
+        assert!(
+            names.contains(&"sibling/sibling.rs"),
+            "sibling/sibling.rs should be discovered: {names:?}"
+        );
+        // extra.rs is inside the linked worktree and must not be discovered.
+        assert!(
+            !names.contains(&"worktree/extra.rs"),
+            "worktree/extra.rs must be skipped: {names:?}"
+        );
+
+        // The linked worktree directory itself counts as ignored.
+        assert!(
+            report.ignored_files >= 1,
+            "expected at least 1 ignored file (the linked worktree), got {}",
+            report.ignored_files
+        );
+
+        // Clean up the linked worktree so tempdir removal doesn't trip over it.
+        Command::new("git")
+            .args(["worktree", "remove", "--force", worktree_dir.to_str().unwrap()])
+            .current_dir(&root)
+            .status()
+            .ok();
+    }
+
+    #[test]
+    fn linked_worktrees_are_skipped_from_relative_root() {
+        let tempdir = Builder::new().prefix("mempalace-ingest-").tempdir_in(".").unwrap();
+        let root = tempdir.path().to_path_buf();
+        git_init_with_commit(&root, "main", &[("main.rs", "fn main() {}\n")]);
+
+        let worktree_dir = root.join("worktree");
+        let status = Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                "-b",
+                "linked",
+                worktree_dir.to_str().unwrap(),
+            ])
+            .current_dir(&root)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git worktree add failed");
+        fs::write(worktree_dir.join("extra.rs"), "fn extra() {}\n").unwrap();
+
+        let current_dir = std::env::current_dir().unwrap();
+        let relative_root = root.strip_prefix(current_dir).unwrap();
+        let report = discover_project_files(relative_root).unwrap();
+
+        assert!(
+            !report.files.iter().any(|file| file.relative_path == "worktree/extra.rs"),
+            "linked worktree file must be skipped: {:?}",
+            report.files
+        );
+
+        Command::new("git")
+            .args(["worktree", "remove", "--force", worktree_dir.to_str().unwrap()])
+            .current_dir(&root)
+            .status()
+            .ok();
+    }
+
+    #[test]
+    fn linked_worktree_paths_non_git_dir_returns_empty() {
+        let tempdir = tempdir().unwrap();
+        let paths = linked_worktree_paths(tempdir.path());
+        assert!(paths.is_empty(), "expected empty set for non-git dir");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn linked_worktree_paths_accept_non_utf8_and_newline_paths() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let output = b"worktree /repo\0HEAD abc\0\0worktree /repo/linked\nbranch-\xff\0HEAD def\0\0";
+        let paths = parse_linked_worktree_paths(output);
+
+        assert_eq!(paths.len(), 1);
+        assert_eq!(
+            paths.first().unwrap().as_os_str().as_bytes(),
+            b"/repo/linked\nbranch-\xff"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn linked_worktree_paths_normalize_symlinked_paths() {
+        use std::os::unix::fs::symlink;
+
+        let tempdir = tempdir().unwrap();
+        let worktree_dir = tempdir.path().join("worktree");
+        fs::create_dir(&worktree_dir).unwrap();
+        let symlinked_worktree = tempdir.path().join("worktree-link");
+        symlink(&worktree_dir, &symlinked_worktree).unwrap();
+
+        let output = format!(
+            "worktree /repo\0HEAD abc\0\0worktree {}\0HEAD def\0\0",
+            symlinked_worktree.display()
+        );
+        let paths = parse_linked_worktree_paths(output.as_bytes())
+            .into_iter()
+            .map(|path| path.canonicalize().unwrap_or(path))
+            .collect::<BTreeSet<_>>();
+
+        assert!(paths.contains(&worktree_dir));
     }
 }

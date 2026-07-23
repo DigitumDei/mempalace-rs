@@ -1738,6 +1738,11 @@ fn linked_worktree_paths(root: &Path) -> BTreeSet<PathBuf> {
     };
 
     parse_linked_worktree_paths(&output.stdout)
+        .into_iter()
+        // Align Git's recorded paths with the canonical walk root, including
+        // worktrees registered through a symlinked path.
+        .map(|path| path.canonicalize().unwrap_or(path))
+        .collect()
 }
 
 fn parse_linked_worktree_paths(output: &[u8]) -> BTreeSet<PathBuf> {
@@ -5070,5 +5075,28 @@ mod tests {
             paths.first().unwrap().as_os_str().as_bytes(),
             b"/repo/linked\nbranch-\xff"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn linked_worktree_paths_normalize_symlinked_paths() {
+        use std::os::unix::fs::symlink;
+
+        let tempdir = tempdir().unwrap();
+        let worktree_dir = tempdir.path().join("worktree");
+        fs::create_dir(&worktree_dir).unwrap();
+        let symlinked_worktree = tempdir.path().join("worktree-link");
+        symlink(&worktree_dir, &symlinked_worktree).unwrap();
+
+        let output = format!(
+            "worktree /repo\0HEAD abc\0\0worktree {}\0HEAD def\0\0",
+            symlinked_worktree.display()
+        );
+        let paths = parse_linked_worktree_paths(output.as_bytes())
+            .into_iter()
+            .map(|path| path.canonicalize().unwrap_or(path))
+            .collect::<BTreeSet<_>>();
+
+        assert!(paths.contains(&worktree_dir));
     }
 }

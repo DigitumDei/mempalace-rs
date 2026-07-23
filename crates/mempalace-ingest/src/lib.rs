@@ -2,6 +2,7 @@
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::fs;
 use std::io::Read as _;
 use std::path::{Component, Path, PathBuf};
@@ -1720,35 +1721,39 @@ struct DiscoveryReport {
     ignored_files: usize,
 }
 
-/// Run `git worktree list --porcelain` from `root` and return the canonical
-/// paths of every linked worktree (the main worktree is excluded).  Returns an
+/// Run `git worktree list --porcelain -z` from `root` and return the paths of
+/// every linked worktree (the main worktree is excluded). Returns an
 /// empty set when git is unavailable, the root is not inside a git repository,
 /// or there are no linked worktrees.
 fn linked_worktree_paths(root: &Path) -> BTreeSet<PathBuf> {
-    let root_str = root.to_string_lossy();
     let output = match Command::new("git")
-        .args(["-C", &root_str, "worktree", "list", "--porcelain"])
+        .arg("-C")
+        .arg(root)
+        .args(["worktree", "list", "--porcelain", "-z"])
         .output()
     {
         Ok(o) if o.status.success() => o,
         _ => return BTreeSet::new(),
     };
-    let body = match std::str::from_utf8(&output.stdout) {
-        Ok(s) => s,
-        Err(_) => return BTreeSet::new(),
-    };
+
+    parse_linked_worktree_paths(&output.stdout)
+}
+
+fn parse_linked_worktree_paths(output: &[u8]) -> BTreeSet<PathBuf> {
     let mut paths = BTreeSet::new();
     let mut is_first = true;
-    for line in body.lines() {
-        if let Some(path_str) = line.strip_prefix("worktree ") {
+    for field in output.split(|byte| *byte == b'\0') {
+        if let Some(path_bytes) = field.strip_prefix(b"worktree ") {
             if is_first {
                 // The first "worktree" entry is the main worktree — keep it.
                 is_first = false;
                 continue;
             }
-            if let Ok(canonical) = Path::new(path_str).canonicalize() {
-                paths.insert(canonical);
-            }
+            // Git's -z output preserves filesystem path bytes, including
+            // newlines and non-UTF-8 Unix filenames.
+            paths.insert(PathBuf::from(OsString::from_encoded_bytes_unchecked(
+                path_bytes.to_vec(),
+            )));
         }
     }
     paths
@@ -1788,13 +1793,9 @@ fn discover_files(
                 }
                 // Skip linked git worktrees: they are duplicate checkouts of the
                 // same repository and would produce redundant drawers.
-                if !worktree_skip.is_empty() {
-                    if let Ok(canonical) = path.canonicalize() {
-                        if worktree_skip.contains(&canonical) {
-                            ignored_files += 1;
-                            continue;
-                        }
-                    }
+                if worktree_skip.contains(&path) {
+                    ignored_files += 1;
+                    continue;
                 }
                 stack.push(path);
                 continue;
@@ -4998,5 +4999,20 @@ mod tests {
         let tempdir = tempdir().unwrap();
         let paths = linked_worktree_paths(tempdir.path());
         assert!(paths.is_empty(), "expected empty set for non-git dir");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn linked_worktree_paths_accept_non_utf8_and_newline_paths() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let output = b"worktree /repo\0HEAD abc\0\0worktree /repo/linked\nbranch-\xff\0HEAD def\0\0";
+        let paths = parse_linked_worktree_paths(output);
+
+        assert_eq!(paths.len(), 1);
+        assert_eq!(
+            paths.first().unwrap().as_os_str().as_bytes(),
+            b"/repo/linked\nbranch-\xff"
+        );
     }
 }

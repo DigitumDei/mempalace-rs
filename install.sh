@@ -95,7 +95,7 @@ if [ "${PLATFORM}" = "linux-x86_64" ] && command -v ldd >/dev/null 2>&1; then
         GLIBC_MAJOR="${GLIBC_VERSION%%.*}"
         GLIBC_MINOR="${GLIBC_VERSION#*.}"
         if [ "${GLIBC_MAJOR}" -lt 2 ] || { [ "${GLIBC_MAJOR}" -eq 2 ] && [ "${GLIBC_MINOR}" -lt 38 ]; }; then
-            echo "warning: glibc ${GLIBC_VERSION} detected; nightly binaries need glibc 2.38+ and may not run." >&2
+            echo "warning: glibc ${GLIBC_VERSION} detected; release binaries need glibc 2.38+ and may not run." >&2
         fi
     fi
 fi
@@ -112,37 +112,102 @@ else
     err "neither curl nor wget found; install one and retry"
 fi
 
+if command -v sha256sum >/dev/null 2>&1; then
+    file_sha256() { sha256sum "$1" | cut -d' ' -f1; }
+elif command -v shasum >/dev/null 2>&1; then
+    file_sha256() { shasum -a 256 "$1" | cut -d' ' -f1; }
+else
+    err "sha256sum or shasum is required to verify release assets"
+fi
+
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "${TMP_DIR}"' EXIT
 
 # This public key is the immutable trust root for signed release assets.
 cat > "${TMP_DIR}/release-public-key.pem" <<'EOF'
 -----BEGIN PUBLIC KEY-----
-MIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEAsIRfz0Yf8P79QOHVw7pt
-DIf7elx4c4/pbCnl7W4VBrj43uE6iFqExbWOCUImJ9dX1q0Hwj6jZV7mU5j8RGyw
-zYy0lIacu5Qrf7Op5cueaPUCnA09PCVIgHya1U0TDmjvG6IgIDgYuwPiedXN5lvg
-37K3YzYl4wFVES21iaN+6MvQg6U//5vpdCxkuY/zgg4jKOl3sSelcP49vc3d5+fO
-nYhbF9ONYPpqI0/diKjdZkQiQxrnhhzgq4hbyyvekd16j1G9iEMyePVCxdTMeUqS
-/O02do5ppZ1bfybPb3L90FRiq6Bt4eipu5TUxqOro/JFfbbfjHWUtc/9N0aT8lod
-Ofm6iWdW0FDYHYqnSTPXJTxCb3aIntBM2xk3BgQt7Nmg0HzB6bkY9/Eih4w8u355
-kVXeZtycjGDIQB0Q7hbwl1VGYUG5GrClffrz5ucphRiq+LoBYqjuF5RE8m7zQlVN
-Llh6RGEhXrgdAx2smPphk4VXm7XVSmm7ETWkFHMVqdxxAgMBAAE=
+MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAqDpP5+PmejB/5RA2bO/K
+qNyoDx06467nK8h0zakY/3ev7YmewAirWA3y4ZmOhR+1qTJMTL82coYTUmr7VTZq
+lGsYaOMWGitcmvBU/8veQPKEORZvSAttOo+Qpaz8e6XYWKya6m2Rtrds9CUYP1vi
+q3v+nJ6kvKHLLjeWdp9Fs1G/jvNDgWYKuvAXJUW0dDHROs6LIviqcevP9flsNiXQ
+GmfZP7vfskSHxszw9JRSxcf5pXhoPuaSmUKikzTR9vPW1/1u4fXpUmWNC6mARszG
+jUf3HkrBFL1RQ3EMGyU6vEUBAk9qis7aohDTXjBOiNdsL4BChAuKUOHYNIIcgyW0
+88s6RiiRrMl23nL0BK+2llUp3tdzVxf7pwfdGEJv9e7GJbBcv2nG0S9jXpl+xPoJ
+hJ0t3mdPzcj0scl6pAYW/8dgww1M1LjDHXrEi1P/JCaAZC4s+k9o3czw89YlQZ5U
+WMXwIoMYztwYF/Yj4Wh26LRuAF5GLRBFwPfRh3WWFocuxV6PLCKdxVDxomsn7o0l
+I6qHiGeOfmejxWGHCA5d8ZOZ/mXMtto43EzP0CFC4++DgHncoMPbTVXPhE06Zasn
+2kE7sDXPmMJYzq6XU2l7t/mAvzmBF/EBixYrnUZwSRje/PfvVPB5ZvMjRsJPxCoA
+dJDS7qZOD9CIIsZX+6HOd48CAwEAAQ==
 -----END PUBLIC KEY-----
 EOF
 
 echo "Downloading MemPalace ${CHANNEL} (${PLATFORM})..."
-fetch "${RELEASE_URL}/${CLI_ASSET}" "${TMP_DIR}/${CLI_ASSET}"
-fetch "${RELEASE_URL}/${MCP_ASSET}" "${TMP_DIR}/${MCP_ASSET}"
-fetch "${RELEASE_URL}/SHA256SUMS" "${TMP_DIR}/SHA256SUMS"
-fetch "${RELEASE_URL}/SHA256SUMS.sig" "${TMP_DIR}/SHA256SUMS.sig"
-fetch "${RELEASE_URL}/release-manifest.json" "${TMP_DIR}/release-manifest.json"
-fetch "${RELEASE_URL}/release-manifest.sig" "${TMP_DIR}/release-manifest.sig"
+download_release_asset() {
+    asset="$1"
+    if ! fetch "${RELEASE_URL}/${asset}" "${TMP_DIR}/${asset}"; then
+        if [ "$CHANNEL" = "stable" ]; then
+            err "no complete stable release is available; retry after the first signed stable release is published"
+        fi
+        err "candidate ${VERSION} is unavailable or incomplete"
+    fi
+}
+download_release_asset "${CLI_ASSET}"
+download_release_asset "${MCP_ASSET}"
+download_release_asset "SHA256SUMS"
+download_release_asset "SHA256SUMS.sig"
+download_release_asset "release-manifest.json"
+download_release_asset "release-manifest.sig"
 
 # --- Checksum verification --------------------------------------------------
 command -v openssl >/dev/null 2>&1 || err "openssl is required to verify the signed release manifest"
 openssl dgst -sha256 -verify "${TMP_DIR}/release-public-key.pem" -signature "${TMP_DIR}/release-manifest.sig" "${TMP_DIR}/release-manifest.json" >/dev/null || err "release manifest signature verification FAILED — aborting install"
 openssl dgst -sha256 -verify "${TMP_DIR}/release-public-key.pem" -signature "${TMP_DIR}/SHA256SUMS.sig" "${TMP_DIR}/SHA256SUMS" >/dev/null || err "release checksum signature verification FAILED — aborting install"
-grep -Eq "\"channel\": \"${CHANNEL}\"" "${TMP_DIR}/release-manifest.json" || err "release manifest channel does not match requested channel"
+
+manifest_string_field() {
+    field="$1"
+    values="$(sed -n "s/^[[:space:]]*\"${field}\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\"[[:space:]]*,\\{0,1\\}[[:space:]]*$/\\1/p" "${TMP_DIR}/release-manifest.json")"
+    [ -n "$values" ] || err "release manifest is missing ${field}"
+    [ "$(printf '%s\n' "$values" | wc -l | tr -d '[:space:]')" -eq 1 ] \
+        || err "release manifest contains duplicate ${field} fields"
+    printf '%s' "$values"
+}
+
+grep -Eq '^[[:space:]]*"schema_version"[[:space:]]*:[[:space:]]*2,' "${TMP_DIR}/release-manifest.json" \
+    || err "unsupported release manifest schema"
+MANIFEST_CHANNEL="$(manifest_string_field channel)"
+MANIFEST_VERSION="$(manifest_string_field version)"
+MANIFEST_COMMIT="$(manifest_string_field commit_sha)"
+MANIFEST_TAG="$(manifest_string_field release_tag)"
+MANIFEST_CHECKSUMS_SHA256="$(manifest_string_field checksums_sha256)"
+
+[ "$MANIFEST_CHANNEL" = "$CHANNEL" ] || err "release manifest channel does not match requested channel"
+printf '%s\n' "$MANIFEST_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$' \
+    || err "release manifest contains an invalid version"
+printf '%s\n' "$MANIFEST_COMMIT" | grep -Eq '^[0-9a-f]{40}$' \
+    || err "release manifest contains an invalid commit SHA"
+printf '%s\n' "$MANIFEST_CHECKSUMS_SHA256" | grep -Eq '^[0-9a-f]{64}$' \
+    || err "release manifest contains an invalid checksum-manifest digest"
+
+case "$CHANNEL" in
+    nightly)
+        [ "$MANIFEST_TAG" = "$VERSION" ] \
+            || err "release manifest tag does not match requested candidate"
+        [ "$MANIFEST_COMMIT" = "$NIGHTLY_SHA" ] \
+            || err "release manifest commit does not match requested candidate"
+        ;;
+    stable)
+        [ "$MANIFEST_TAG" = "v${MANIFEST_VERSION}" ] \
+            || err "stable release manifest tag does not match its version"
+        MANIFEST_SOURCE_CANDIDATE="$(manifest_string_field source_candidate_tag)"
+        [ "$MANIFEST_SOURCE_CANDIDATE" = "nightly-${MANIFEST_COMMIT}" ] \
+            || err "stable release manifest is not bound to its source candidate"
+        ;;
+esac
+
+ACTUAL_CHECKSUMS_SHA256="$(file_sha256 "${TMP_DIR}/SHA256SUMS")"
+[ "$ACTUAL_CHECKSUMS_SHA256" = "$MANIFEST_CHECKSUMS_SHA256" ] \
+    || err "signed release manifest does not match SHA256SUMS"
+
 echo "Verifying signed manifest and checksums..."
 grep -E "^[0-9a-fA-F]{64} [ *](${CLI_ASSET}|${MCP_ASSET})\$" "${TMP_DIR}/SHA256SUMS" \
     > "${TMP_DIR}/SHA256SUMS.filtered" || true

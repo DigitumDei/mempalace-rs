@@ -275,6 +275,34 @@ jobs:
       - name: Run mempalace-cli tests
         run: cargo test -p mempalace-cli --locked -- --nocapture
 
+  release-contract-tests:
+    name: Release Contract Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Validate shell syntax
+        run: bash -n install.sh release/*.sh release/tests/*.sh
+
+      - name: Validate PowerShell installer syntax
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path install.ps1),
+            [ref]$tokens,
+            [ref]$errors
+          )
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Error $_ }
+            exit 1
+          }
+
+      - name: Exercise signed release contract
+        run: bash release/tests/release-contract.sh
+
   release-gate:
     name: Release Gate
     runs-on: ubuntu-latest
@@ -288,6 +316,7 @@ jobs:
       - graph-tests
       - mcp-tests
       - cli-tests
+      - release-contract-tests
     steps:
       - name: Tests green
         run: echo "All workspace tests passed; proceeding to release builds."
@@ -375,20 +404,57 @@ jobs:
           subject-path: dist/*
 
   publish-nightly:
-    name: Publish Nightly Release
+    name: Publish Immutable Candidate
     runs-on: ubuntu-latest
     environment: stable-release
     needs:
       - release-host
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     permissions:
+      attestations: read
       contents: write
 
     steps:
       - name: Checkout
         uses: actions/checkout@v7
 
+      - name: Determine candidate identity
+        run: |
+          version="$(cargo metadata --no-deps --format-version=1 | jq -r '.packages[] | select(.name == "mempalace-cli") | .version')"
+          test -n "$version" && test "$version" != "null" || { echo "could not determine package version" >&2; exit 1; }
+          echo "CANDIDATE_TAG=nightly-${GITHUB_SHA}" >> "$GITHUB_ENV"
+          echo "RELEASE_VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Require GitHub immutable releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            "repos/$GITHUB_REPOSITORY/immutable-releases" \
+            --jq '.enabled == true' | grep -qx true \
+            || { echo "GitHub immutable releases must be enabled before publishing" >&2; exit 1; }
+
+      - name: Reuse an existing immutable candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$CANDIDATE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            mkdir existing-candidate
+            gh release download "$CANDIDATE_TAG" --repo "$GITHUB_REPOSITORY" --dir existing-candidate
+            gh release verify "$CANDIDATE_TAG" --repo "$GITHUB_REPOSITORY"
+            bash release/verify-manifest.sh \
+              existing-candidate nightly "$CANDIDATE_TAG" "$RELEASE_VERSION" release/public-key.pem
+            while IFS= read -r asset; do
+              gh release verify-asset "$CANDIDATE_TAG" "$asset" --repo "$GITHUB_REPOSITORY"
+            done < <(bash release/release-files.sh existing-candidate)
+            echo "CANDIDATE_EXISTS=true" >> "$GITHUB_ENV"
+          else
+            echo "CANDIDATE_EXISTS=false" >> "$GITHUB_ENV"
+          fi
+
       - name: Download release artifacts
+        if: env.CANDIDATE_EXISTS != 'true'
         uses: actions/download-artifact@v8
         with:
           pattern: release-*
@@ -396,41 +462,30 @@ jobs:
           path: candidate
 
       - name: Create signed candidate manifest
+        if: env.CANDIDATE_EXISTS != 'true'
         env:
           RELEASE_SIGNING_KEY: ${{ secrets.MEMPALACE_RELEASE_SIGNING_KEY }}
         run: |
-          test -n "$RELEASE_SIGNING_KEY" || { echo "MEMPALACE_RELEASE_SIGNING_KEY is required" >&2; exit 1; }
-          tag="nightly-${GITHUB_SHA}"
-          version="$(cargo metadata --no-deps --format-version=1 | jq -r '.packages[] | select(.name == "mempalace-cli") | .version')"
-          test -n "$version" && test "$version" != "null" || { echo "could not determine package version" >&2; exit 1; }
           chmod +x candidate/mempalace-* || true
-          (cd candidate && sha256sum mempalace-* > SHA256SUMS)
-          assets="$(for asset in candidate/mempalace-*; do
-            name="${asset##*/}"
-            target="${name#mempalace-cli-}"
-            target="${target#mempalace-mcp-}"
-            target="${target%.exe}"
-            jq -n --arg name "$name" --arg target "$target" --arg sha "$(sha256sum "$asset" | cut -d' ' -f1)" --argjson size "$(wc -c < "$asset")" '{name: $name, target: $target, sha256: $sha, size: $size}'
-          done | jq -s .)"
-          jq -n --arg version "$version" --arg commit "$GITHUB_SHA" --arg run "$GITHUB_RUN_ID" --arg tag "$tag" --argjson assets "$assets" '{schema_version: 1, channel: "nightly", version: $version, commit_sha: $commit, run_id: $run, release_tag: $tag, assets: $assets}' > candidate/release-manifest.json
-          printf '%s' "$RELEASE_SIGNING_KEY" | base64 --decode > signing-key.pem
-          openssl dgst -sha256 -sign signing-key.pem -out candidate/release-manifest.sig candidate/release-manifest.json
-          openssl dgst -sha256 -sign signing-key.pem -out candidate/SHA256SUMS.sig candidate/SHA256SUMS
-          rm -f signing-key.pem
-          echo "CANDIDATE_TAG=$tag" >> "$GITHUB_ENV"
+          bash release/create-manifest.sh \
+            candidate nightly "$RELEASE_VERSION" "$GITHUB_SHA" "$GITHUB_RUN_ID" "$CANDIDATE_TAG"
+          bash release/sign-manifest.sh candidate release/public-key.pem
+          bash release/verify-manifest.sh \
+            candidate nightly "$CANDIDATE_TAG" "$RELEASE_VERSION" release/public-key.pem
 
-      - name: Refuse to overwrite an existing candidate
+      - name: Publish immutable candidate release
+        if: env.CANDIDATE_EXISTS != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release view "$CANDIDATE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 && { echo "candidate release already exists" >&2; exit 1; } || true
-
-      - name: Publish immutable candidate release
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ env.CANDIDATE_TAG }}
-          name: Candidate ${{ env.CANDIDATE_TAG }}
-          body: |
+          mapfile -t release_files < <(bash release/release-files.sh candidate)
+          gh release create "$CANDIDATE_TAG" "${release_files[@]}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Candidate $CANDIDATE_TAG" \
+            --prerelease \
+            --latest=false \
+            --notes "$(cat <<'EOF'
             Immutable candidate build from `main` @ ${{ github.sha }}.
 
             Binaries (each as `mempalace-cli-*` and `mempalace-mcp-*`):
@@ -443,8 +498,24 @@ jobs:
 
             `release-manifest.json` and `SHA256SUMS` are signed by the project
             release key. This is not a stable release.
-          prerelease: true
-          make_latest: false
-          target_commitish: ${{ github.sha }}
-          files: candidate/*
-          fail_on_unmatched_files: true
+          EOF
+          )"
+
+      - name: Verify published release integrity
+        if: env.CANDIDATE_EXISTS != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          verified=false
+          for attempt in {1..12}; do
+            if gh release verify "$CANDIDATE_TAG" --repo "$GITHUB_REPOSITORY"; then
+              verified=true
+              break
+            fi
+            sleep 5
+          done
+          [ "$verified" = true ] \
+            || { echo "GitHub release attestation did not become available" >&2; exit 1; }
+          while IFS= read -r asset; do
+            gh release verify-asset "$CANDIDATE_TAG" "$asset" --repo "$GITHUB_REPOSITORY"
+          done < <(bash release/release-files.sh candidate)

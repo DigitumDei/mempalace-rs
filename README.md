@@ -34,6 +34,7 @@ mempalace-cli mine /path/to/project
 Stable releases are immutable. Test a candidate only with the explicit `--channel nightly --version nightly-<full-commit-sha>` installer options. Other platforms (Intel macOS, ARM Linux, musl) need a [source build](docs/Quickstart.md#1b-build-from-source-alternative).
 
 See the [Quickstart guide](docs/Quickstart.md) for the full walkthrough — installing, initializing, mining, searching, and connecting to Claude/Cursor/Cline.
+Release operators should follow the [signed release runbook](docs/Release-Operations.md).
 
 ## Overview
 

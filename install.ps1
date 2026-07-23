@@ -46,15 +46,18 @@ if ($Channel -eq 'stable') {
 $assets = @('mempalace-cli-windows-x86_64.exe', 'mempalace-mcp-windows-x86_64.exe')
 $publicKeyPem = @'
 -----BEGIN PUBLIC KEY-----
-MIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEAsIRfz0Yf8P79QOHVw7pt
-DIf7elx4c4/pbCnl7W4VBrj43uE6iFqExbWOCUImJ9dX1q0Hwj6jZV7mU5j8RGyw
-zYy0lIacu5Qrf7Op5cueaPUCnA09PCVIgHya1U0TDmjvG6IgIDgYuwPiedXN5lvg
-37K3YzYl4wFVES21iaN+6MvQg6U//5vpdCxkuY/zgg4jKOl3sSelcP49vc3d5+fO
-nYhbF9ONYPpqI0/diKjdZkQiQxrnhhzgq4hbyyvekd16j1G9iEMyePVCxdTMeUqS
-/O02do5ppZ1bfybPb3L90FRiq6Bt4eipu5TUxqOro/JFfbbfjHWUtc/9N0aT8lod
-Ofm6iWdW0FDYHYqnSTPXJTxCb3aIntBM2xk3BgQt7Nmg0HzB6bkY9/Eih4w8u355
-kVXeZtycjGDIQB0Q7hbwl1VGYUG5GrClffrz5ucphRiq+LoBYqjuF5RE8m7zQlVN
-Llh6RGEhXrgdAx2smPphk4VXm7XVSmm7ETWkFHMVqdxxAgMBAAE=
+MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAqDpP5+PmejB/5RA2bO/K
+qNyoDx06467nK8h0zakY/3ev7YmewAirWA3y4ZmOhR+1qTJMTL82coYTUmr7VTZq
+lGsYaOMWGitcmvBU/8veQPKEORZvSAttOo+Qpaz8e6XYWKya6m2Rtrds9CUYP1vi
+q3v+nJ6kvKHLLjeWdp9Fs1G/jvNDgWYKuvAXJUW0dDHROs6LIviqcevP9flsNiXQ
+GmfZP7vfskSHxszw9JRSxcf5pXhoPuaSmUKikzTR9vPW1/1u4fXpUmWNC6mARszG
+jUf3HkrBFL1RQ3EMGyU6vEUBAk9qis7aohDTXjBOiNdsL4BChAuKUOHYNIIcgyW0
+88s6RiiRrMl23nL0BK+2llUp3tdzVxf7pwfdGEJv9e7GJbBcv2nG0S9jXpl+xPoJ
+hJ0t3mdPzcj0scl6pAYW/8dgww1M1LjDHXrEi1P/JCaAZC4s+k9o3czw89YlQZ5U
+WMXwIoMYztwYF/Yj4Wh26LRuAF5GLRBFwPfRh3WWFocuxV6PLCKdxVDxomsn7o0l
+I6qHiGeOfmejxWGHCA5d8ZOZ/mXMtto43EzP0CFC4++DgHncoMPbTVXPhE06Zasn
+2kE7sDXPmMJYzq6XU2l7t/mAvzmBF/EBixYrnUZwSRje/PfvVPB5ZvMjRsJPxCoA
+dJDS7qZOD9CIIsZX+6HOd48CAwEAAQ==
 -----END PUBLIC KEY-----
 '@
 
@@ -67,12 +70,18 @@ New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
 
 try {
     Write-Host "Downloading MemPalace $Channel (windows-x86_64)..."
-    # Invoke-WebRequest is dramatically slower with the progress bar on PS 5.1.
     $prevProgress = $ProgressPreference
     $ProgressPreference = 'SilentlyContinue'
     try {
         foreach ($asset in $assets + 'SHA256SUMS' + 'SHA256SUMS.sig' + 'release-manifest.json' + 'release-manifest.sig') {
-            Invoke-WebRequest -Uri "$releaseUrl/$asset" -OutFile (Join-Path $tmpDir $asset) -UseBasicParsing
+            try {
+                Invoke-WebRequest -Uri "$releaseUrl/$asset" -OutFile (Join-Path $tmpDir $asset) -UseBasicParsing
+            } catch {
+                if ($Channel -eq 'stable') {
+                    throw 'No complete stable release is available. Retry after the first signed stable release is published.'
+                }
+                throw "Candidate $Version is unavailable or incomplete."
+            }
         }
     } finally {
         $ProgressPreference = $prevProgress
@@ -88,10 +97,43 @@ try {
     if (-not $publicKey.VerifyData([IO.File]::ReadAllBytes((Join-Path $tmpDir 'SHA256SUMS')), [IO.File]::ReadAllBytes((Join-Path $tmpDir 'SHA256SUMS.sig')), [Security.Cryptography.HashAlgorithmName]::SHA256, [Security.Cryptography.RSASignaturePadding]::Pkcs1)) {
         throw 'Release checksum signature verification FAILED - aborting install'
     }
-    if (($manifest | ConvertFrom-Json).channel -ne $Channel) { throw 'Release manifest channel does not match requested channel' }
+    $manifestObject = $manifest | ConvertFrom-Json
+    if ($manifestObject.schema_version -ne 2) { throw 'Unsupported release manifest schema' }
+    if ($manifestObject.channel -ne $Channel) { throw 'Release manifest channel does not match requested channel' }
+    if ($manifestObject.version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$') {
+        throw 'Release manifest contains an invalid version'
+    }
+    if ($manifestObject.commit_sha -notmatch '^[0-9a-f]{40}$') {
+        throw 'Release manifest contains an invalid commit SHA'
+    }
+    if ($manifestObject.checksums_sha256 -notmatch '^[0-9a-f]{64}$') {
+        throw 'Release manifest contains an invalid checksum-manifest digest'
+    }
+    if ($Channel -eq 'nightly') {
+        if ($manifestObject.release_tag -ne $Version) {
+            throw 'Release manifest tag does not match requested candidate'
+        }
+        if ($manifestObject.commit_sha -ne ($Version -replace '^nightly-', '')) {
+            throw 'Release manifest commit does not match requested candidate'
+        }
+    } else {
+        if ($manifestObject.release_tag -ne "v$($manifestObject.version)") {
+            throw 'Stable release manifest tag does not match its version'
+        }
+        if ($manifestObject.source_candidate_tag -ne "nightly-$($manifestObject.commit_sha)") {
+            throw 'Stable release manifest is not bound to its source candidate'
+        }
+    }
+
+    $checksumsPath = Join-Path $tmpDir 'SHA256SUMS'
+    $checksumsDigest = (Get-FileHash -Algorithm SHA256 -Path $checksumsPath).Hash.ToLowerInvariant()
+    if ($checksumsDigest -ne $manifestObject.checksums_sha256) {
+        throw 'Signed release manifest does not match SHA256SUMS'
+    }
+
     Write-Host 'Verifying signed manifest and checksums...'
     $sums = @{}
-    foreach ($line in Get-Content (Join-Path $tmpDir 'SHA256SUMS')) {
+    foreach ($line in Get-Content $checksumsPath) {
         if ($line -match '^([0-9a-fA-F]{64})\s+\*?(.+)$') {
             $sums[$Matches[2].Trim()] = $Matches[1].ToLowerInvariant()
         }
@@ -103,6 +145,18 @@ try {
         $actual = (Get-FileHash -Algorithm SHA256 -Path (Join-Path $tmpDir $asset)).Hash.ToLowerInvariant()
         if ($actual -ne $sums[$asset]) {
             throw "Checksum verification FAILED for $asset - aborting install"
+        }
+        $manifestAssets = @($manifestObject.assets | Where-Object { $_.name -eq $asset })
+        if ($manifestAssets.Count -ne 1) {
+            throw "Release manifest is missing a unique entry for $asset"
+        }
+        $manifestAsset = $manifestAssets[0]
+        $expectedComponent = if ($asset.StartsWith('mempalace-cli-')) { 'cli' } else { 'mcp' }
+        if ($manifestAsset.component -ne $expectedComponent -or
+            $manifestAsset.target -ne 'windows-x86_64' -or
+            $manifestAsset.sha256 -ne $actual -or
+            [int64]$manifestAsset.size -ne (Get-Item (Join-Path $tmpDir $asset)).Length) {
+            throw "Release manifest metadata does not match $asset"
         }
     }
 

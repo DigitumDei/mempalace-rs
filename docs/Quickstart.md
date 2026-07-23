@@ -30,6 +30,7 @@ Options:
 Pass sh flags through the pipe with `| sh -s -- --no-setup`. For PowerShell parameters, download the script first (`irm ... -OutFile install.ps1`) — env vars work with the piped one-liner.
 
 Stable releases are immutable and are the default installer target. Candidates from `main` are immutable `nightly-<full-commit-sha>` prereleases and require the explicit nightly channel and version above.
+The installer never falls back to the legacy mutable `nightly` tag. Before the first stable release exists, it exits without changing an existing installation.
 
 The Windows installer verifies release signatures with cryptography APIs introduced in PowerShell 7.1. Install PowerShell 7.1 or later before using the Windows command above.
 

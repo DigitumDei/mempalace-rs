@@ -218,7 +218,7 @@ enum Commands {
         reindex: bool,
         #[arg(long, value_enum, default_value_t = CliExtractMode::Exchange)]
         extract: CliExtractMode,
-        #[arg(long, help = "Mine only files changed vs the merge-base with the default branch (local branch-delta mining)")]
+        #[arg(long, help = "Mine only files changed vs the merge-base with the default branch (local branch-delta mining). When omitted, the checkout type is detected automatically: canonical checkouts perform a full mine, non-canonical checkouts perform a branch-delta mine.")]
         branch: bool,
         #[arg(
             long = "batch-size",
@@ -226,6 +226,10 @@ enum Commands {
             help = "Largest batch to process at once; lower it to bound peak memory/CPU on low-spec machines. Local mine: chunks embedded per batch (default: a file's chunks together). Remote mine: files per request (default: 64). 0 or omitted keeps the default."
         )]
         batch_size: Option<usize>,
+        #[arg(long, help = "Explicit view/ref name for this mine. Overrides automatic detection. Use 'canonical' to force a full canonical mine.")]
+        view: Option<String>,
+        #[arg(long, help = "Force a full canonical mine, ignoring automatic branch detection. Equivalent to --view canonical.")]
+        full: bool,
     },
     /// Inspect and manage centralized project declarations.
     Project {
@@ -486,7 +490,7 @@ where
             context,
             validation_provider_factory,
         ),
-        Commands::Mine { dir, mode, wing, project_id, agent, limit, dry_run, reindex, extract, branch, batch_size } => {
+        Commands::Mine { dir, mode, wing, project_id, agent, limit, dry_run, reindex, extract, branch, batch_size, view, full } => {
             execute_mine(
                 &dir,
                 mode,
@@ -499,6 +503,8 @@ where
                 extract,
                 branch,
                 batch_size,
+                view,
+                full,
                 cli.palace.as_deref(),
                 context,
                 provider_factory,
@@ -1153,6 +1159,8 @@ fn execute_mine<F, P>(
     extract: CliExtractMode,
     branch: bool,
     batch_size: Option<usize>,
+    explicit_view: Option<String>,
+    full: bool,
     palace_override: Option<&Path>,
     context: &CliContext,
     provider_factory: F,
@@ -1170,6 +1178,54 @@ where
 
     let config = load_runtime_config(palace_override, context).map_err(config_error)?;
     let runtime = build_runtime(&config).map_err(runtime_error)?;
+
+    // ── Auto-detect checkout view (projects mode only) ─────────────────────
+    let (effective_branch, effective_view) = if mode == CliMode::Projects {
+        let checkout_view = mempalace_ingest::detect_checkout_view(&source_dir);
+        let (detected_branch, is_auto) = match &checkout_view {
+            mempalace_ingest::CheckoutView::Canonical => (false, true),
+            mempalace_ingest::CheckoutView::Branch { .. } => {
+                (true, true)
+            }
+            mempalace_ingest::CheckoutView::NonGit => (false, false),
+        };
+
+        // Override logic:
+        // --full forces canonical mode
+        // --view overrides automatic detection
+        // --branch flag still works as before
+        let final_branch = if full || explicit_view.as_deref() == Some("canonical") {
+            false
+        } else if branch || explicit_view.is_some() {
+            true
+        } else if is_auto {
+            detected_branch
+        } else {
+            branch
+        };
+
+        // Resolve the effective view name for the ingest request
+        let final_view = if full || final_branch == false {
+            None
+        } else {
+            explicit_view.or_else(|| {
+                if is_auto {
+                    match &checkout_view {
+                        mempalace_ingest::CheckoutView::Branch { view_name, .. } => {
+                            Some(view_name.clone())
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            })
+        };
+
+        (final_branch, final_view)
+    } else {
+        (branch, None)
+    };
 
     // ── Routing decision (projects mode only) ────────────────────────────────
     if mode == CliMode::Projects {
@@ -1232,11 +1288,11 @@ where
             RouteQuery { wing: Some(&wing_name), room: None, source_file: None },
         );
 
-        let use_remote = !branch
+        let use_remote = !effective_branch
             && (rule.mode == RouteMode::Remote
                 || (rule.mode == RouteMode::Combined
                     && rule.write == WriteTarget::Remote));
-        let use_both = !branch
+        let use_both = !effective_branch
             && rule.mode == RouteMode::Combined
             && rule.write == WriteTarget::Both;
 
@@ -1248,6 +1304,7 @@ where
                 limit,
                 dry_run,
                 batch_size,
+                effective_view.clone(),
                 &config,
                 &runtime,
                 &rule,
@@ -1266,7 +1323,8 @@ where
                 dry_run,
                 reindex,
                 batch_size,
-                branch,
+                effective_branch,
+                effective_view.clone(),
                 &config,
                 &runtime,
                 &provider_factory,
@@ -1280,6 +1338,7 @@ where
                 limit,
                 dry_run,
                 batch_size,
+                effective_view.clone(),
                 &config,
                 &runtime,
                 &rule,
@@ -1299,7 +1358,8 @@ where
             dry_run,
             reindex,
             batch_size,
-            branch,
+            effective_branch,
+            effective_view,
             &config,
             &runtime,
             provider_factory,
@@ -1404,6 +1464,7 @@ fn execute_local_project_mine<F, P>(
     reindex: bool,
     batch_size: Option<usize>,
     branch: bool,
+    view: Option<String>,
     config: &MempalaceConfig,
     runtime: &tokio::runtime::Runtime,
     provider_factory: F,
@@ -1444,6 +1505,7 @@ where
                 reindex,
                 max_embed_batch_size,
                 branch,
+                view,
             },
             project_config,
             project_id,
@@ -1491,6 +1553,7 @@ fn execute_remote_mine(
     limit: usize,
     dry_run: bool,
     batch_size: Option<usize>,
+    view: Option<String>,
     config: &MempalaceConfig,
     runtime: &tokio::runtime::Runtime,
     rule: &mempalace_config::ResolvedRouteRule,
@@ -1513,6 +1576,7 @@ fn execute_remote_mine(
         reindex: false,
         max_embed_batch_size: None,
         branch: false,
+        view,
         },
         project_config,
         project_id,
@@ -1954,6 +2018,7 @@ where
                 room: room_id,
                 limit: clamp_search_results(results, &config),
                 profile: config.embedding_profile,
+                view: None,
             },
         ))
         .map_err(search_error)?;
@@ -2292,6 +2357,11 @@ fn render_mine_summary(
         format!("  Drawers written: {}", summary.drawers_written),
         format!("  Files truncated: {}", summary.truncated_files),
     ];
+
+    // Show view info when available.
+    if let Some(ref view_name) = summary.view_name {
+        lines.push(format!("  View: {view_name}"));
+    }
 
     // Only print when non-zero to preserve byte-parity with existing test output.
     if summary.removed_sources > 0 {
@@ -5488,6 +5558,7 @@ mod tests {
                                 content_hash: format!("hash-{batch}-{i}"),
                                 embedding,
                                 locator: None,
+                                view_metadata: None,
                             }
                         })
                         .collect();
@@ -5598,6 +5669,7 @@ mod tests {
                         content_hash: format!("hash-{batch}"),
                         embedding,
                         locator: None,
+                        view_metadata: None,
                     };
                     engine.drawer_store()
                         .put_drawers(&[record], mempalace_storage::DuplicateStrategy::Error)

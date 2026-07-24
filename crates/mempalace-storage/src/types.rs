@@ -30,6 +30,11 @@ pub struct DrawerFilter {
     pub room: Option<RoomId>,
     pub hall: Option<String>,
     pub source_file: Option<String>,
+    /// Optional view/ref name to scope matched drawers.  `None` or empty
+    /// matches all views (legacy behaviour).  Set to `"canonical"` to match
+    /// only canonical snapshots, or to a specific branch name for a single
+    /// branch view.
+    pub view: Option<String>,
     /// Maximum number of drawers to return.  `None` means unlimited.
     pub limit: Option<usize>,
 }

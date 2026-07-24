@@ -15,7 +15,7 @@ pub use hash::{hash_bytes, hash_text, mined_drawer_id};
 pub use ids::{DrawerId, IdError, RoomId, WingId};
 pub use locator::{ResolvedSnippet, SourceLocator, resolve_locator, resolve_records};
 pub use profiles::{BALANCED_PROFILE, EmbeddingProfile, EmbeddingProfileMetadata, LOW_CPU_PROFILE};
-pub use search::{DrawerRecord, SearchQuery, SearchResult};
+pub use search::{DrawerRecord, RepositoryViewMetadata, SearchQuery, SearchResult};
 
 /// Version embedded in release binaries.
 ///

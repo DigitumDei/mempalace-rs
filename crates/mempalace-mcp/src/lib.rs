@@ -382,14 +382,15 @@ impl ToolName {
             },
             Self::Search => ToolDefinition {
                 name: self.as_str(),
-                description: "Semantic search. Returns verbatim drawer content with similarity scores. Results from mined files include `stale: true` when the source file changed since mining.",
+                description: "Semantic search. Returns verbatim drawer content with similarity scores. Results from mined files include `stale: true` when the source file changed since mining. Use `view` to scope to a specific branch view (e.g. 'feature-x') or 'canonical' for the default branch.",
                 input_schema: json!({
                     "type":"object",
                     "properties":{
                         "query":{"type":"string","description":"What to search for"},
                         "limit":{"type":"integer","description":"Max results (default 5)"},
                         "wing":{"type":"string","description":"Filter by wing (optional)"},
-                        "room":{"type":"string","description":"Filter by room (optional)"}
+                        "room":{"type":"string","description":"Filter by room (optional)"},
+                        "view":{"type":"string","description":"Scope to a named branch view or 'canonical' (optional)"}
                     },
                     "required":["query"]
                 }),
@@ -1035,6 +1036,7 @@ where
             optional_string(arguments, "wing")?.map(|value| parse_wing_id(&value)).transpose()?;
         let room =
             optional_string(arguments, "room")?.map(|value| parse_room_id(&value)).transpose()?;
+        let view = optional_string(arguments, "view")?;
 
         // ── Federation path ──
         if let Some(router) = &self.federation {
@@ -1054,6 +1056,7 @@ where
                                 room: room.clone(),
                                 limit,
                                 profile: self.config.embedding_profile,
+                                view: view.clone(),
                             },
                         )
                         .await
@@ -1071,6 +1074,9 @@ where
                             });
                             if result.stale {
                                 obj["stale"] = json!(true);
+                            }
+                            if let Some(ref v) = result.view {
+                                obj["view"] = json!(v);
                             }
                             obj
                         })
@@ -1094,6 +1100,7 @@ where
                     room: room.clone(),
                     limit,
                     profile: self.config.embedding_profile,
+                    view: view.clone(),
                 },
             )
             .await
@@ -1102,8 +1109,9 @@ where
         let payload = json!({
             "query": query,
             "filters": {
-                "wing": wing.map(|value| value.to_string()),
-                "room": room.map(|value| value.to_string()),
+                "wing": wing.as_ref().map(|value| value.to_string()),
+                "room": room.as_ref().map(|value| value.to_string()),
+                "view": view,
             },
             "results": results.into_iter().map(|result| {
                 let mut obj = json!({
@@ -1115,6 +1123,9 @@ where
                 });
                 if result.stale {
                     obj["stale"] = json!(true);
+                }
+                if let Some(ref v) = result.view {
+                    obj["view"] = json!(v);
                 }
                 obj
             }).collect::<Vec<_>>()
@@ -1975,7 +1986,7 @@ where
             room: None,
             limit: DUPLICATE_SEARCH_LIMIT,
             profile: self.config.embedding_profile,
-        };
+                view: None,};
         let results =
             self.search.search_semantic(self.storage.drawer_store(), &query).await.map_tool()?;
         Ok(results
@@ -2038,6 +2049,7 @@ where
             content_hash: hash_text(&content),
             embedding,
             locator: None,
+            view_metadata: None,
         })
     }
 
@@ -2764,6 +2776,7 @@ mod tests {
             content_hash: hash_text(content),
             embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
             locator: None,
+            view_metadata: None,
         }
     }
 
@@ -2829,6 +2842,7 @@ mod tests {
                 ),
                 embedding: vec![1.0; EmbeddingProfile::Balanced.metadata().dimensions],
                 locator: None,
+                view_metadata: None,
             },
             DrawerRecord {
                 id: DrawerId::new("wing_team/auth-migration/0001").unwrap(),
@@ -2851,6 +2865,7 @@ mod tests {
                 ),
                 embedding: vec![1.0; EmbeddingProfile::Balanced.metadata().dimensions],
                 locator: None,
+                view_metadata: None,
             },
         ];
         runtime
@@ -2987,6 +3002,7 @@ mod tests {
                 resolve_root: resolve_root.clone(),
                 commit_hash: None,
             }),
+            view_metadata: None,
         };
 
         let fresh =
@@ -3103,6 +3119,7 @@ mod tests {
                     content_hash: hash_text(content),
                     embedding,
                     locator: None,
+                    view_metadata: None,
                 }],
                 DuplicateStrategy::Error,
             )
@@ -3973,6 +3990,7 @@ mod tests {
             content_hash: hash_text("SESSION:legacy-collapsed"),
             embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
             locator: None,
+            view_metadata: None,
         };
         let runtime = harness.server.runtime.lock().await;
         runtime
@@ -4365,6 +4383,7 @@ mod tests {
             content_hash: hash_text("SESSION:legacy"),
             embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
             locator: None,
+            view_metadata: None,
         };
         let colliding_other_agent_drawer = DrawerRecord {
             id: DrawerId::new("diary_worker_one_colliding_agent").unwrap(),
@@ -4385,6 +4404,7 @@ mod tests {
             content_hash: hash_text("SESSION:other-agent"),
             embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
             locator: None,
+            view_metadata: None,
         };
         let runtime = harness.server.runtime.lock().await;
         runtime
@@ -4435,6 +4455,7 @@ mod tests {
             content_hash: hash_text("Primary wing has non-diary content only."),
             embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
             locator: None,
+            view_metadata: None,
         };
         let legacy_diary_drawer = DrawerRecord {
             id: DrawerId::new("diary_legacy_worker_one_0002").unwrap(),
@@ -4455,6 +4476,7 @@ mod tests {
             content_hash: hash_text("SESSION:legacy-only"),
             embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
             locator: None,
+            view_metadata: None,
         };
 
         let runtime = harness.server.runtime.lock().await;
@@ -4507,6 +4529,7 @@ mod tests {
             content_hash: hash_text("SESSION:space-agent"),
             embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
             locator: None,
+            view_metadata: None,
         };
         let worker_underscore = DrawerRecord {
             id: DrawerId::new("diary_worker_one_primary_0002").unwrap(),
@@ -4527,6 +4550,7 @@ mod tests {
             content_hash: hash_text("SESSION:underscore-agent"),
             embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
             locator: None,
+            view_metadata: None,
         };
 
         let runtime = harness.server.runtime.lock().await;
@@ -4577,6 +4601,7 @@ mod tests {
             content_hash: hash_text("SESSION:matching"),
             embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
             locator: None,
+            view_metadata: None,
         };
         let old = DrawerRecord {
             id: DrawerId::new("diary_filter_old").unwrap(),
@@ -4597,6 +4622,7 @@ mod tests {
             content_hash: hash_text("SESSION:old"),
             embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
             locator: None,
+            view_metadata: None,
         };
         let wrong_topic = DrawerRecord {
             id: DrawerId::new("diary_filter_wrong_topic").unwrap(),
@@ -4617,6 +4643,7 @@ mod tests {
             content_hash: hash_text("SESSION:wrong-topic"),
             embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
             locator: None,
+            view_metadata: None,
         };
         let wrong_agent = DrawerRecord {
             id: DrawerId::new("diary_filter_wrong_agent").unwrap(),
@@ -4637,6 +4664,7 @@ mod tests {
             content_hash: hash_text("SESSION:wrong-agent"),
             embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
             locator: None,
+            view_metadata: None,
         };
 
         let runtime = harness.server.runtime.lock().await;
@@ -5750,6 +5778,7 @@ mod tests {
                     content_hash: mempalace_core::hash_text("test content"),
                     embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
                     locator: None,
+                    view_metadata: None,
                 }],
                 DuplicateStrategy::Error,
             )
@@ -5816,6 +5845,7 @@ mod tests {
                     content_hash: mempalace_core::hash_text("test content"),
                     embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
                     locator: None,
+                    view_metadata: None,
                 }],
                 DuplicateStrategy::Error,
             )

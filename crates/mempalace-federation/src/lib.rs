@@ -128,6 +128,10 @@ pub struct DrawerSearchRequest {
     /// Optional room filter.
     #[serde(default)]
     pub room: Option<String>,
+    /// Optional view/ref name to scope search. `"canonical"` for canonical
+    /// snapshots, or a branch name for a single branch view.
+    #[serde(default)]
+    pub view: Option<String>,
     /// Maximum number of results to return.
     #[serde(default)]
     pub limit: Option<usize>,

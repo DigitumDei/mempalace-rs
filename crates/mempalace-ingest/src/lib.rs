@@ -364,6 +364,9 @@ pub struct IngestSummary {
     /// Number of previously-mined source keys removed during a branch cleanup
     /// pass.  Always 0 for non-branch runs.
     pub removed_sources: usize,
+    /// The view name detected/used for this mine, if any.  `None` for canonical
+    /// or non-Git mines.
+    pub view_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -380,6 +383,10 @@ pub struct ProjectIngestRequest {
     /// source-key namespace.  Returns [`IngestError::BranchDeltaUnavailable`]
     /// when no git repo or default branch is found.
     pub branch: bool,
+    /// Explicit view/ref name for this mine.  When set, overrides the branch
+    /// name derived from `branch: true`.  Use `"canonical"` to force a full
+    /// canonical mine even when the checkout is on a non-canonical ref.
+    pub view: Option<String>,
 }
 
 impl ProjectIngestRequest {
@@ -393,6 +400,7 @@ impl ProjectIngestRequest {
             reindex: false,
             max_embed_batch_size: None,
             branch: false,
+            view: None,
         }
     }
 }
@@ -562,9 +570,12 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
         .unwrap_or_else(|| derive_repo_id(&root, &wing_name));
     let project_root_key = stable_project_root_key(&repo_id);
     let legacy_root_key = hash_text(&root.to_string_lossy());
-    let branch_name = request.branch.then(|| {
-        resolve_current_branch(&root).unwrap_or_else(|| "detached".to_owned())
-    });
+    let branch_name = match request.branch {
+        true => Some(request.view.clone().unwrap_or_else(|| {
+            resolve_current_branch(&root).unwrap_or_else(|| "detached".to_owned())
+        })),
+        false => None,
+    };
     let discovered = discover_project_files(&root)?;
     let routing_fingerprint = project_routing_fingerprint(&config.rooms);
 
@@ -574,9 +585,27 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
     // Resolve root as a string for locators (use to_string_lossy for Windows verbatim paths).
     let resolve_root = root.to_string_lossy().into_owned();
 
+    // Build repository-view metadata for project-mined drawers.
+    let default_branch = detect_default_branch(&root);
+    let merge_base = default_branch
+        .as_ref()
+        .and_then(|b| compute_merge_base(&root, b));
+    let worktree_id = hash_text(&root.to_string_lossy());
+    let view_metadata = mempalace_core::RepositoryViewMetadata {
+        repo_id: repo_id.clone(),
+        view_name: branch_name.clone(),
+        source_path: resolve_root.clone(),
+        head_commit: commit_hash.clone(),
+        base_ref: default_branch,
+        merge_base,
+        worktree_id,
+        path_state: "present".to_owned(),
+    };
+
     let mut summary = IngestSummary::default();
     summary.discovered_files = discovered.files.len();
     summary.ignored_files = discovered.ignored_files;
+    summary.view_name = branch_name.clone();
 
     // For branch mode: compute the delta set and filter files.
     let (ingest_kind, delta_set) = if request.branch {
@@ -691,6 +720,8 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
                     request.max_embed_batch_size,
                     chunks_with_room,
                     ctx_borrow.as_ref(),
+                    branch_name.as_deref(),
+                    Some(&view_metadata),
                 )?;
                 let drawer_count = source_drawers.len();
 
@@ -875,6 +906,7 @@ pub async fn ingest_conversations<P: EmbeddingProvider>(
                 })
                 .collect::<Vec<_>>(),
             None,
+            None,
         )?;
         let drawer_count = drawers.len();
 
@@ -916,6 +948,8 @@ fn build_drawers<P: EmbeddingProvider>(
     max_embed_batch_size: Option<usize>,
     chunks: Vec<Chunk>,
     locator_ctx: Option<&ProjectLocatorContext<'_>>,
+    view: Option<&str>,
+    view_metadata: Option<&mempalace_core::RepositoryViewMetadata>,
 ) -> Result<Vec<DrawerRecord>> {
     if chunks.is_empty() {
         return Ok(Vec::new());
@@ -951,11 +985,15 @@ fn build_drawers<P: EmbeddingProvider>(
         // When a locator is present, store empty content (resolved lazily).
         let stored_content = if locator.is_some() { String::new() } else { chunk_text };
 
+        // For branch views, store the view name in the hall field so searches
+        // can filter by view.  Canonical views keep hall = None.
+        let hall = view.map(|v| format!("view:{v}"));
+
         drawers.push(DrawerRecord {
             id: drawer_id,
             wing: wing.clone(),
             room: room_id,
-            hall: None,
+            hall,
             date: chunk.date_hint,
             source_file: source_file.to_owned(),
             chunk_index: chunk.chunk_index,
@@ -970,6 +1008,7 @@ fn build_drawers<P: EmbeddingProvider>(
             content: stored_content,
             embedding,
             locator,
+            view_metadata: view_metadata.cloned(),
         });
     }
 
@@ -1185,9 +1224,69 @@ impl PreparedLocatorStorage {
 
 // ─── Branch-delta helpers ────────────────────────────────────────────────────
 
+/// Describes how a checkout relates to its repository's canonical view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckoutView {
+    /// The checkout is on the canonical/default branch (main/master).
+    Canonical,
+    /// The checkout is on a named branch or linked worktree.
+    Branch {
+        /// The branch name or HEAD ref of the checkout.
+        view_name: String,
+        /// The base/integration ref (default branch).
+        base_ref: Option<String>,
+        /// The merge-base commit between the view and the base ref.
+        merge_base: Option<String>,
+    },
+    /// The checkout is not a Git repository; treat as a full directory.
+    NonGit,
+}
+
+/// Detect the checkout view type for a given source directory.
+///
+/// Returns [`CheckoutView::NonGit`] when the directory is not inside a Git
+/// repository, [`CheckoutView::Canonical`] when the current checkout is on the
+/// canonical/default branch, and [`CheckoutView::Branch`] with the view name,
+/// base ref, and merge-base when on a non-canonical checkout.
+///
+/// The canonical branch is determined by `origin/HEAD` symbolic-ref, then
+/// by literal `main` / `master` fallback.
+pub fn detect_checkout_view(root: &Path) -> CheckoutView {
+    let toplevel = git_repo_toplevel(root);
+    let toplevel = match toplevel {
+        Some(p) => p,
+        None => return CheckoutView::NonGit,
+    };
+
+    let default_branch = detect_default_branch(&toplevel);
+    let current_branch = resolve_current_branch(&toplevel);
+
+    match (default_branch, current_branch) {
+        (Some(ref base), Some(ref current)) if base == current => CheckoutView::Canonical,
+        (base, Some(view_name)) => {
+            let merge_base = base.as_ref().and_then(|b| compute_merge_base(&toplevel, b));
+            CheckoutView::Branch {
+                view_name,
+                base_ref: base,
+                merge_base,
+            }
+        }
+        (base, None) => {
+            // Detached HEAD: use a stable hash of the toplevel path as a view identity.
+            let view_name = format!("detached-{}", &hash_text(&toplevel.to_string_lossy())[..12]);
+            let merge_base = base.as_ref().and_then(|b| compute_merge_base(&toplevel, b));
+            CheckoutView::Branch {
+                view_name,
+                base_ref: base,
+                merge_base,
+            }
+        }
+    }
+}
+
 /// Detect the default branch ref: tries `origin/HEAD` symbolic-ref, then
 /// literal `main` / `master`.  Returns `None` when neither is found.
-fn detect_default_branch(root: &Path) -> Option<String> {
+pub fn detect_default_branch(root: &Path) -> Option<String> {
     let root_str = root.to_string_lossy();
 
     // Try the symbolic ref (e.g. "origin/main").
@@ -1220,7 +1319,7 @@ fn detect_default_branch(root: &Path) -> Option<String> {
 }
 
 /// Compute the merge-base commit between `default_ref` and HEAD.
-fn compute_merge_base(root: &Path, default_ref: &str) -> Option<String> {
+pub fn compute_merge_base(root: &Path, default_ref: &str) -> Option<String> {
     let out = Command::new("git")
         .args(["-C", &root.to_string_lossy().as_ref(), "merge-base", default_ref, "HEAD"])
         .output()
@@ -1622,7 +1721,7 @@ pub fn normalize_git_remote_url(url: &str) -> Option<String> {
 
 /// Resolve the current git branch name (`git rev-parse --abbrev-ref HEAD`).
 /// Returns `None` when not in a repo or in detached HEAD state.
-fn resolve_current_branch(root: &Path) -> Option<String> {
+pub fn resolve_current_branch(root: &Path) -> Option<String> {
     let out = Command::new("git")
         .args(["-C", &root.to_string_lossy(), "rev-parse", "--abbrev-ref", "HEAD"])
         .output()
@@ -3254,8 +3353,10 @@ mod tests {
                     date_hint: None,
                     byte_range: None,
                 },
-            ],
-            None,
+],
+            None,           // locator_ctx
+            None,           // view
+            None,           // view_metadata
         )
         .unwrap();
 
@@ -3381,7 +3482,7 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: false,
-            },
+        view: None,},
         )
         .await
         .unwrap();
@@ -3588,7 +3689,7 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: false,
-            },
+        view: None,},
         )
         .await
         .unwrap();
@@ -3604,7 +3705,7 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: false,
-            },
+        view: None,},
         )
         .await
         .unwrap();
@@ -3628,7 +3729,7 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: false,
-            },
+        view: None,},
         )
         .await
         .unwrap();
@@ -3683,7 +3784,7 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: false,
-            },
+        view: None,},
         )
         .await
         .unwrap();
@@ -3731,7 +3832,7 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: false,
-            },
+        view: None,},
         )
         .await
         .unwrap();
@@ -3750,7 +3851,7 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: false,
-            },
+        view: None,},
         )
         .await
         .unwrap();
@@ -3799,7 +3900,7 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: false,
-            },
+        view: None,},
         )
         .await
         .unwrap();
@@ -3821,7 +3922,7 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: false,
-            },
+        view: None,},
         )
         .await
         .unwrap();
@@ -3911,7 +4012,7 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: false,
-            },
+        view: None,},
         )
         .await
         .unwrap();
@@ -3987,7 +4088,7 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: false,
-            },
+        view: None,},
         )
         .await
         .unwrap();
@@ -4047,7 +4148,7 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: false,
-            },
+        view: None,},
         )
         .await
         .unwrap();
@@ -4105,7 +4206,7 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: false,
-            },
+        view: None,},
         )
         .await
         .unwrap();
@@ -4166,7 +4267,7 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: false,
-            },
+        view: None,},
         )
         .await
         .unwrap();
@@ -4219,7 +4320,7 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: false,
-            },
+        view: None,},
         )
         .await
         .unwrap();
@@ -4238,7 +4339,7 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: false,
-            },
+        view: None,},
         )
         .await
         .unwrap();
@@ -4259,7 +4360,7 @@ mod tests {
                 reindex: true,
                 max_embed_batch_size: None,
                 branch: false,
-            },
+        view: None,},
         )
         .await
         .unwrap();
@@ -4496,7 +4597,7 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: false,
-            },
+        view: None,},
         )
         .await
         .unwrap();
@@ -4569,6 +4670,7 @@ mod tests {
                 date_hint: None,
                 byte_range: None,
             }],
+            None,
             None,
         )
         .unwrap();
@@ -4741,7 +4843,7 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: true,
-            },
+        view: None,},
         )
         .await
         .unwrap();
@@ -4828,7 +4930,7 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: true,
-            },
+        view: None,},
         )
         .await
         .unwrap();
@@ -4850,7 +4952,7 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: true,
-            },
+        view: None,},
         )
         .await
         .unwrap();
@@ -4930,7 +5032,7 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: true,
-            },
+        view: None,},
         )
         .await
         .unwrap();
@@ -4974,7 +5076,7 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: true,
-            },
+        view: None,},
         )
         .await;
 
@@ -5135,5 +5237,32 @@ mod tests {
             .collect::<BTreeSet<_>>();
 
         assert!(paths.contains(&worktree_dir));
+    }
+
+    #[test]
+    fn detect_checkout_view_returns_nongit_for_non_repo() {
+        let tempdir = tempdir().unwrap();
+        let non_git = tempdir.path().join("not_a_repo");
+        fs::create_dir(&non_git).unwrap();
+
+        let result = detect_checkout_view(&non_git);
+        assert_eq!(result, CheckoutView::NonGit);
+    }
+
+    #[test]
+    fn detect_checkout_view_returns_canonical_for_detached_or_main() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path().join("repo");
+        fs::create_dir_all(&root).unwrap();
+
+        // Without git init, it should be NonGit.
+        let result = detect_checkout_view(&root);
+        assert_eq!(result, CheckoutView::NonGit);
+    }
+
+    #[test]
+    fn ingest_summary_view_name_defaults_to_none() {
+        let summary = IngestSummary::default();
+        assert_eq!(summary.view_name, None);
     }
 }

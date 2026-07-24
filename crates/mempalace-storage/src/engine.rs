@@ -1059,6 +1059,7 @@ mod tests {
             content_hash: format!("hash-{id}"),
             embedding: embedding(seed),
             locator: None,
+            view_metadata: None,
         }
     }
 
@@ -1857,6 +1858,7 @@ mod diary_summary_tests {
             content_hash: format!("hash-{id}"),
             embedding: embedding([0.5, 0.5, 0.5, 0.5]),
             locator: None,
+            view_metadata: None,
         }
     }
 

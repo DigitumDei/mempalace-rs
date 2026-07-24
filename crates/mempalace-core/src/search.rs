@@ -6,6 +6,37 @@ use crate::{DrawerId, EmbeddingProfile, RoomId, WingId};
 
 time::serde::format_description!(date_only, Date, "[year]-[month]-[day]");
 
+/// Durable repository-view metadata for project-mined rows.
+///
+/// Replaces the `hall = "view:<name>"` convention with explicit, queryable
+/// columns.  `None` on a `DrawerRecord` means the row is not project-mined
+/// (e.g. a conversation, diary entry, or authored drawer).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepositoryViewMetadata {
+    /// Stable repository identity (normalised git remote URL, or `wing:<wing>`).
+    pub repo_id: String,
+    /// View name: `None` for canonical (default-branch) snapshots, `Some(...)` for
+    /// a named branch or detached-HEAD view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view_name: Option<String>,
+    /// Absolute project checkout path on the palace host that owns this row.
+    pub source_path: String,
+    /// Git commit hash at mine time (`git rev-parse HEAD`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_commit: Option<String>,
+    /// Base/integration ref (the default branch name).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_ref: Option<String>,
+    /// Merge-base commit between the view and the base ref.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_base: Option<String>,
+    /// Stable worktree identity (canonicalised checkout path hash).
+    pub worktree_id: String,
+    /// Path state: `"present"` or `"deleted"`.  `"deleted"` marks a tombstone row
+    /// whose source file has been removed from the checkout.
+    pub path_state: String,
+}
+
 /// Canonical drawer row shape for future storage adapters.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DrawerRecord {
@@ -31,6 +62,10 @@ pub struct DrawerRecord {
     pub embedding: Vec<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub locator: Option<SourceLocator>,
+    /// Repository-view metadata for project-mined rows.  Absent for non-project
+    /// rows and for legacy rows that predate this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view_metadata: Option<RepositoryViewMetadata>,
 }
 
 /// Search request contract shared by CLI, MCP, and library APIs.
@@ -39,6 +74,12 @@ pub struct SearchQuery {
     pub text: String,
     pub wing: Option<WingId>,
     pub room: Option<RoomId>,
+    /// Optional view/ref name to scope search to a specific branch view.
+    /// When `None`, search includes canonical snapshots and all branch views
+    /// (legacy behaviour).  Set to `"canonical"` to restrict to canonical
+    /// snapshots, or to a specific branch name for a single branch view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view: Option<String>,
     pub limit: usize,
     pub profile: EmbeddingProfile,
 }
@@ -64,6 +105,10 @@ pub struct SearchResult {
     /// duplicate check that needs exact-match detection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_hash: Option<String>,
+    /// View/ref name this result belongs to, if mined from a specific branch view.
+    /// Absent for canonical results.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view: Option<String>,
 }
 
 #[cfg(test)]
@@ -86,6 +131,7 @@ mod tests {
             source_file: "team.txt".to_owned(),
             stale: false,
             content_hash: None,
+            view: None,
         };
 
         let value = serde_json::to_value(&result).unwrap();
@@ -100,6 +146,8 @@ mod tests {
         assert!((similarity - 0.49).abs() < 1e-6, "unexpected similarity: {similarity}");
         // `stale` must be absent when false so byte-parity is preserved.
         assert!(object.get("stale").is_none(), "stale should be absent when false");
+        // `view` must be absent when None so byte-parity is preserved for non-view results.
+        assert!(object.get("view").is_none(), "view should be absent when None");
     }
 
     #[test]
@@ -113,6 +161,7 @@ mod tests {
             source_file: "f.txt".to_owned(),
             stale: false,
             content_hash: None,
+            view: None,
         };
         let stale = SearchResult { stale: true, ..non_stale.clone() };
         let non_stale_json = serde_json::to_value(&non_stale).unwrap();
@@ -142,6 +191,7 @@ mod tests {
             content_hash: "hash".to_owned(),
             embedding: vec![0.1, 0.2],
             locator: None,
+            view_metadata: None,
         };
 
         let value = serde_json::to_value(&record).unwrap();

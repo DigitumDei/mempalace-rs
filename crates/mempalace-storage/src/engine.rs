@@ -2252,4 +2252,23 @@ use crate::sqlite::{IngestManifestStore, SqliteOperationalStore};
             "percent in prefix must not act as a wildcard; got: {results:?}"
         );
     }
+
+    #[test]
+    fn prefix_listing_is_case_sensitive() {
+        let tempdir = tempdir().unwrap();
+        let store = SqliteOperationalStore::new(tempdir.path().join("storage.sqlite3"));
+        store.ensure_schema().unwrap();
+
+        // Two keys differing only in ASCII case, as branch views Feature/feature
+        // would. This method feeds branch-delta cleanup, so a case-insensitive
+        // match here would wipe the wrong branch's drawers.
+        commit_source(&store, "projects-branch:w:r:Feature:a.rs", "case/up-0000");
+        commit_source(&store, "projects-branch:w:r:feature:a.rs", "case/lo-0000");
+
+        let upper = store.ingested_source_keys_with_prefix("projects-branch:w:r:Feature:").unwrap();
+        assert_eq!(upper, vec!["projects-branch:w:r:Feature:a.rs".to_owned()]);
+
+        let lower = store.ingested_source_keys_with_prefix("projects-branch:w:r:feature:").unwrap();
+        assert_eq!(lower, vec!["projects-branch:w:r:feature:a.rs".to_owned()]);
+    }
 }

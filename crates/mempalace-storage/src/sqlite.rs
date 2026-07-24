@@ -593,16 +593,15 @@ impl SqliteOperationalStore {
 /// escaping the LIKE metacharacters (`%`, `_`, `\`) so the caller-supplied
 /// prefix is treated literally. Pair with `ESCAPE '\'` in the query.
 fn like_prefix_pattern(prefix: &str) -> String {
-    let escaped: String = prefix
-        .chars()
-        .flat_map(|ch| match ch {
-            '%' => vec!['\\', '%'],
-            '_' => vec!['\\', '_'],
-            '\\' => vec!['\\', '\\'],
-            other => vec![other],
-        })
-        .collect();
-    format!("{escaped}%")
+    let mut pattern = String::with_capacity(prefix.len() + 1);
+    for ch in prefix.chars() {
+        if matches!(ch, '%' | '_' | '\\') {
+            pattern.push('\\');
+        }
+        pattern.push(ch);
+    }
+    pattern.push('%');
+    pattern
 }
 
 impl IngestManifestStore for SqliteOperationalStore {
@@ -854,7 +853,10 @@ impl IngestManifestStore for SqliteOperationalStore {
 
     fn ingested_source_keys_with_prefix(&self, prefix: &str) -> Result<Vec<String>> {
         let pattern = like_prefix_pattern(prefix);
-        let connection = self.open_connection()?;
+        // Case-sensitive: this feeds branch-delta cleanup, where over-matching a
+        // key that differs only in case (e.g. branch `Feature` vs `feature`)
+        // would wipe the wrong branch's drawers.
+        let connection = self.open_prefix_connection()?;
         let mut statement = connection.prepare(
             "SELECT source_key FROM ingest_files WHERE source_key LIKE ?1 ESCAPE '\\' ORDER BY source_key ASC",
         )?;

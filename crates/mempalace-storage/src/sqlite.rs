@@ -204,10 +204,23 @@ pub trait IngestManifestStore {
     fn mark_run_failed(&self, run_id: i64, reason: &str, failed_at: OffsetDateTime) -> Result<()>;
     fn committed_drawer_ids(&self) -> Result<Vec<DrawerId>>;
     fn committed_drawer_ids_for_source_key(&self, source_key: &str) -> Result<Vec<DrawerId>>;
+    /// Live (latest committed run) drawer ids for every key in `source_keys`,
+    /// gathered over a single connection. Used by scoped prune to avoid a fresh
+    /// connection per source.
+    fn committed_drawer_ids_for_source_keys(
+        &self,
+        source_keys: &[String],
+    ) -> Result<Vec<DrawerId>>;
     fn get_ingested_file(&self, source_key: &str) -> Result<Option<IngestFileRecord>>;
     fn ingested_source_keys_with_prefix(&self, prefix: &str) -> Result<Vec<String>>;
+    /// Return `(source_key, drawer_count)` for every mined source whose key
+    /// begins with `prefix`. Read-only; used to preview a scoped prune.
+    fn ingested_source_counts_with_prefix(&self, prefix: &str) -> Result<Vec<(String, i64)>>;
     /// Remove all ingest metadata for a source key.
     fn delete_source_key(&self, source_key: &str) -> Result<()>;
+    /// Remove all ingest metadata for every key in `source_keys`, in one
+    /// transaction over a single connection. Used by scoped prune.
+    fn delete_source_keys(&self, source_keys: &[String]) -> Result<()>;
 }
 
 pub trait EntityRegistryStore {
@@ -416,6 +429,19 @@ impl SqliteOperationalStore {
         Ok(connection)
     }
 
+    /// Open a connection configured for case-sensitive `LIKE`.
+    ///
+    /// SQLite's default `LIKE` is ASCII case-insensitive, but source-key prefix
+    /// matching must be literal — otherwise pruning branch view `Feature` would
+    /// also match, and delete, view `feature`. The exact-key (`=`) paths already
+    /// compare under the case-sensitive BINARY collation; the prefix queries
+    /// used by prune must agree, so they open through here.
+    fn open_prefix_connection(&self) -> Result<Connection> {
+        let connection = self.open_connection()?;
+        connection.execute_batch("PRAGMA case_sensitive_like = ON;")?;
+        Ok(connection)
+    }
+
     fn open_lease_connection(&self) -> Result<Connection> {
         let connection = Connection::open(&self.path)?;
         connection.execute_batch(
@@ -571,6 +597,21 @@ impl SqliteOperationalStore {
             failed_reason: None,
         }))
     }
+}
+
+/// Build a `LIKE` pattern that matches any string starting with `prefix`,
+/// escaping the LIKE metacharacters (`%`, `_`, `\`) so the caller-supplied
+/// prefix is treated literally. Pair with `ESCAPE '\'` in the query.
+fn like_prefix_pattern(prefix: &str) -> String {
+    let mut pattern = String::with_capacity(prefix.len() + 1);
+    for ch in prefix.chars() {
+        if matches!(ch, '%' | '_' | '\\') {
+            pattern.push('\\');
+        }
+        pattern.push(ch);
+    }
+    pattern.push('%');
+    pattern
 }
 
 impl IngestManifestStore for SqliteOperationalStore {
@@ -806,6 +847,50 @@ impl IngestManifestStore for SqliteOperationalStore {
             .map_err(StorageError::from)
     }
 
+    fn committed_drawer_ids_for_source_keys(
+        &self,
+        source_keys: &[String],
+    ) -> Result<Vec<DrawerId>> {
+        // One connection + one prepared statement reused per key, rather than a
+        // fresh connection per source. Same latest-committed-run semantics as
+        // the single-key variant.
+        let connection = self.open_connection()?;
+        let mut statement = connection.prepare(
+            "SELECT manifest.drawer_id
+             FROM ingest_manifests AS manifest
+             INNER JOIN ingest_runs AS runs ON runs.id = manifest.run_id
+             WHERE runs.source_key = ?1 AND runs.status = ?2 AND manifest.status = ?2
+               AND runs.id = (
+                   SELECT id
+                   FROM ingest_runs
+                   WHERE source_key = ?1 AND status = ?2
+                   ORDER BY id DESC
+                   LIMIT 1
+               )
+             ORDER BY manifest.drawer_id ASC",
+        )?;
+        let mut ids = Vec::new();
+        for source_key in source_keys {
+            let rows = statement.query_map(
+                params![source_key, IngestRunStatus::Committed.as_str()],
+                |row| {
+                    let raw: String = row.get(0)?;
+                    DrawerId::new(raw).map_err(|err| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(err),
+                        )
+                    })
+                },
+            )?;
+            for id in rows {
+                ids.push(id.map_err(StorageError::from)?);
+            }
+        }
+        Ok(ids)
+    }
+
     fn get_ingested_file(&self, source_key: &str) -> Result<Option<IngestFileRecord>> {
         let connection = self.open_connection()?;
         let exact = query_ingested_file(&connection, source_key)?;
@@ -821,23 +906,29 @@ impl IngestManifestStore for SqliteOperationalStore {
     }
 
     fn ingested_source_keys_with_prefix(&self, prefix: &str) -> Result<Vec<String>> {
-        let escaped: String = prefix
-            .chars()
-            .flat_map(|ch| match ch {
-                '%' => vec!['\\', '%'],
-                '_' => vec!['\\', '_'],
-                '\\' => vec!['\\', '\\'],
-                other => vec![other],
-            })
-            .collect();
-        let pattern = format!("{escaped}%");
-
-        let connection = self.open_connection()?;
+        let pattern = like_prefix_pattern(prefix);
+        // Case-sensitive: this feeds branch-delta cleanup, where over-matching a
+        // key that differs only in case (e.g. branch `Feature` vs `feature`)
+        // would wipe the wrong branch's drawers.
+        let connection = self.open_prefix_connection()?;
         let mut statement = connection.prepare(
             "SELECT source_key FROM ingest_files WHERE source_key LIKE ?1 ESCAPE '\\' ORDER BY source_key ASC",
         )?;
         statement
             .query_map([pattern], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
+    }
+
+    fn ingested_source_counts_with_prefix(&self, prefix: &str) -> Result<Vec<(String, i64)>> {
+        let pattern = like_prefix_pattern(prefix);
+        let connection = self.open_prefix_connection()?;
+        let mut statement = connection.prepare(
+            "SELECT source_key, drawer_count FROM ingest_files \
+             WHERE source_key LIKE ?1 ESCAPE '\\' ORDER BY source_key ASC",
+        )?;
+        statement
+            .query_map([pattern], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(StorageError::from)
     }
@@ -855,6 +946,35 @@ impl IngestManifestStore for SqliteOperationalStore {
         }
         transaction.execute("DELETE FROM ingest_runs WHERE source_key = ?1", [source_key])?;
         transaction.execute("DELETE FROM ingest_files WHERE source_key = ?1", [source_key])?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn delete_source_keys(&self, source_keys: &[String]) -> Result<()> {
+        // One connection + one transaction with reused prepared statements,
+        // rather than a fresh connection/transaction per source.
+        let mut connection = self.open_connection()?;
+        let transaction = connection.transaction()?;
+        {
+            let mut select_runs =
+                transaction.prepare("SELECT id FROM ingest_runs WHERE source_key = ?1")?;
+            let mut delete_manifests =
+                transaction.prepare("DELETE FROM ingest_manifests WHERE run_id = ?1")?;
+            let mut delete_runs =
+                transaction.prepare("DELETE FROM ingest_runs WHERE source_key = ?1")?;
+            let mut delete_files =
+                transaction.prepare("DELETE FROM ingest_files WHERE source_key = ?1")?;
+            for source_key in source_keys {
+                let run_ids = select_runs
+                    .query_map([source_key], |row| row.get::<_, i64>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for run_id in run_ids {
+                    delete_manifests.execute([run_id])?;
+                }
+                delete_runs.execute([source_key])?;
+                delete_files.execute([source_key])?;
+            }
+        }
         transaction.commit()?;
         Ok(())
     }

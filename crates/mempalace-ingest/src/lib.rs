@@ -2949,6 +2949,43 @@ fn stable_project_root_key(repo_id: &str) -> String {
     hash_text(&format!("project:{repo_id}"))
 }
 
+/// Ingest kind for full canonical project mines.
+pub const PROJECTS_INGEST_KIND: &str = "projects";
+/// Ingest kind for branch-delta project mines (`mine --branch`).
+pub const PROJECTS_BRANCH_INGEST_KIND: &str = "projects-branch";
+
+/// Source-key prefix selecting every canonical (`projects`) drawer mined for
+/// `project_id` in `wing`.
+///
+/// `project_id` must match the identity used at mine time: an explicit
+/// `--project-id`, otherwise the derived repository identity
+/// ([`derive_project_id`]). This mirrors the key layout produced by
+/// [`project_source_key`], so the two stay in lockstep if the format changes.
+pub fn project_canonical_source_prefix(wing: &str, project_id: &str) -> String {
+    format!("{PROJECTS_INGEST_KIND}:{wing}:{}:", stable_project_root_key(project_id))
+}
+
+/// Source-key prefix selecting branch-delta (`projects-branch`) drawers for
+/// `project_id` in `wing`.
+///
+/// With `branch = Some(name)` the prefix narrows to a single branch view;
+/// `branch = None` matches every branch view of the project. Mirrors
+/// [`project_branch_source_key`].
+pub fn project_branch_source_prefix(wing: &str, project_id: &str, branch: Option<&str>) -> String {
+    let root_key = stable_project_root_key(project_id);
+    match branch {
+        Some(branch) => format!("{PROJECTS_BRANCH_INGEST_KIND}:{wing}:{root_key}:{branch}:"),
+        None => format!("{PROJECTS_BRANCH_INGEST_KIND}:{wing}:{root_key}:"),
+    }
+}
+
+/// Source-key prefix selecting every drawer of `ingest_kind` mined into `wing`,
+/// regardless of project. Broader than the project-scoped prefixes; callers
+/// must pair it with a narrowing scope before using it to delete.
+pub fn wing_kind_source_prefix(ingest_kind: &str, wing: &str) -> String {
+    format!("{ingest_kind}:{wing}:")
+}
+
 fn source_key_with_root_key(
     ingest_kind: &str,
     root_key: &str,

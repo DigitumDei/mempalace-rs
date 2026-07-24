@@ -352,6 +352,46 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Preview a scoped prune: return `(source_key, drawer_count)` for every
+    /// mined source whose key begins with `prefix`. Read-only — nothing is
+    /// deleted. Callers resolve their structured scope to a prefix first.
+    pub fn ingested_sources_with_prefix(&self, prefix: &str) -> Result<Vec<(String, i64)>> {
+        self.operational_store.ingested_source_counts_with_prefix(prefix)
+    }
+
+    /// Remove every mined source whose key begins with `prefix`, deleting both
+    /// the LanceDB drawers and the SQLite ingest manifests.
+    ///
+    /// The matched source keys are snapshotted once, then every subsequent step
+    /// acts on exactly that set. A source committed concurrently under the same
+    /// prefix (for example an in-flight `mine`) is not in the snapshot, so it is
+    /// left entirely untouched rather than half-deleted; within a captured key
+    /// this keeps the same latest-run semantics as [`remove_source_key`]. The
+    /// whole cleanup uses a bounded number of SQLite connections regardless of
+    /// how many sources match — one to snapshot, one to gather drawer ids, one
+    /// transaction to delete metadata — and LanceDB drawers are deleted in
+    /// batches so a large cleanup does not create one table version per source.
+    /// Idempotent: once the rows are gone a repeat call is a no-op. Returns
+    /// `(sources_removed, drawers_removed)`.
+    pub async fn remove_source_prefix(&self, prefix: &str) -> Result<(usize, usize)> {
+        const DELETE_CHUNK: usize = 512;
+        let sources = self.operational_store.ingested_source_counts_with_prefix(prefix)?;
+        if sources.is_empty() {
+            return Ok((0, 0));
+        }
+        let keys = sources.into_iter().map(|(key, _)| key).collect::<Vec<_>>();
+        let drawer_ids =
+            self.operational_store.committed_drawer_ids_for_source_keys(&keys)?;
+        if !drawer_ids.is_empty() {
+            self.signal_activity();
+            for chunk in drawer_ids.chunks(DELETE_CHUNK) {
+                self.drawer_store.delete_drawers(chunk).await?;
+            }
+        }
+        self.operational_store.delete_source_keys(&keys)?;
+        Ok((keys.len(), drawer_ids.len()))
+    }
+
     async fn prune_orphaned_rows(&self, stale_runs: &[RetryableRun]) -> Result<Vec<DrawerId>> {
         let committed_ids =
             self.operational_store.committed_drawer_ids()?.into_iter().collect::<HashSet<_>>();
@@ -1048,6 +1088,50 @@ mod tests {
         assert_eq!(drawers.len(), 1);
         let committed = engine.operational_store().committed_drawer_ids().unwrap();
         assert_eq!(committed.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn remove_source_prefix_is_case_sensitive() {
+        let tempdir = tempdir().unwrap();
+        let engine = StorageEngine::open(tempdir.path(), EmbeddingProfile::Balanced).await.unwrap();
+
+        // Two source keys differing only in ASCII case, as branch views `Feature`
+        // and `feature` would. A case-insensitive prefix match would conflate
+        // them, so pruning one would silently delete the other.
+        for (key, id, seed) in [
+            ("projects-branch:w:r:Feature:a.rs", "case_upper/0001", [1.0, 0.0, 0.0, 0.0]),
+            ("projects-branch:w:r:feature:a.rs", "case_lower/0001", [0.0, 1.0, 0.0, 0.0]),
+        ] {
+            engine
+                .commit_ingest(IngestCommitRequest {
+                    ingest_kind: "projects-branch".to_owned(),
+                    source_key: key.to_owned(),
+                    source_file: "a.rs".to_owned(),
+                    content_hash: format!("hash-{id}"),
+                    drawers: vec![record(id, "a.rs", seed)],
+                    duplicate_strategy: DuplicateStrategy::Error,
+                })
+                .await
+                .unwrap();
+        }
+
+        // Preview matches only the exact-case key.
+        let preview = engine.ingested_sources_with_prefix("projects-branch:w:r:Feature:").unwrap();
+        assert_eq!(preview.len(), 1, "case-insensitive over-match: {preview:?}");
+        assert_eq!(preview[0].0, "projects-branch:w:r:Feature:a.rs");
+
+        // Deletion removes only the exact-case key and its drawer.
+        let (sources, drawers) =
+            engine.remove_source_prefix("projects-branch:w:r:Feature:").await.unwrap();
+        assert_eq!((sources, drawers), (1, 1));
+
+        // The lower-case sibling survives in both stores.
+        let live = engine.drawer_store().list_drawers(&DrawerFilter::default()).await.unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].id, DrawerId::new("case_lower/0001").unwrap());
+        let survivors =
+            engine.ingested_sources_with_prefix("projects-branch:w:r:feature:").unwrap();
+        assert_eq!(survivors.len(), 1);
     }
 
     #[tokio::test]
@@ -2165,5 +2249,24 @@ use crate::sqlite::{IngestManifestStore, SqliteOperationalStore};
             results.is_empty(),
             "percent in prefix must not act as a wildcard; got: {results:?}"
         );
+    }
+
+    #[test]
+    fn prefix_listing_is_case_sensitive() {
+        let tempdir = tempdir().unwrap();
+        let store = SqliteOperationalStore::new(tempdir.path().join("storage.sqlite3"));
+        store.ensure_schema().unwrap();
+
+        // Two keys differing only in ASCII case, as branch views Feature/feature
+        // would. This method feeds branch-delta cleanup, so a case-insensitive
+        // match here would wipe the wrong branch's drawers.
+        commit_source(&store, "projects-branch:w:r:Feature:a.rs", "case/up-0000");
+        commit_source(&store, "projects-branch:w:r:feature:a.rs", "case/lo-0000");
+
+        let upper = store.ingested_source_keys_with_prefix("projects-branch:w:r:Feature:").unwrap();
+        assert_eq!(upper, vec!["projects-branch:w:r:Feature:a.rs".to_owned()]);
+
+        let lower = store.ingested_source_keys_with_prefix("projects-branch:w:r:feature:").unwrap();
+        assert_eq!(lower, vec!["projects-branch:w:r:feature:a.rs".to_owned()]);
     }
 }

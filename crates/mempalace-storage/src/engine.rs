@@ -366,10 +366,12 @@ impl StorageEngine {
     /// acts on exactly that set. A source committed concurrently under the same
     /// prefix (for example an in-flight `mine`) is not in the snapshot, so it is
     /// left entirely untouched rather than half-deleted; within a captured key
-    /// this keeps the same latest-run semantics as [`remove_source_key`]. Drawer
-    /// ids are gathered across all keys and deleted from LanceDB in batches, so a
-    /// large cleanup does not create one table version per source. Idempotent:
-    /// once the rows are gone a repeat call is a no-op. Returns
+    /// this keeps the same latest-run semantics as [`remove_source_key`]. The
+    /// whole cleanup uses a bounded number of SQLite connections regardless of
+    /// how many sources match — one to snapshot, one to gather drawer ids, one
+    /// transaction to delete metadata — and LanceDB drawers are deleted in
+    /// batches so a large cleanup does not create one table version per source.
+    /// Idempotent: once the rows are gone a repeat call is a no-op. Returns
     /// `(sources_removed, drawers_removed)`.
     pub async fn remove_source_prefix(&self, prefix: &str) -> Result<(usize, usize)> {
         const DELETE_CHUNK: usize = 512;
@@ -377,21 +379,17 @@ impl StorageEngine {
         if sources.is_empty() {
             return Ok((0, 0));
         }
-        let mut drawer_ids = Vec::new();
-        for (source_key, _) in &sources {
-            drawer_ids
-                .extend(self.operational_store.committed_drawer_ids_for_source_key(source_key)?);
-        }
+        let keys = sources.into_iter().map(|(key, _)| key).collect::<Vec<_>>();
+        let drawer_ids =
+            self.operational_store.committed_drawer_ids_for_source_keys(&keys)?;
         if !drawer_ids.is_empty() {
             self.signal_activity();
             for chunk in drawer_ids.chunks(DELETE_CHUNK) {
                 self.drawer_store.delete_drawers(chunk).await?;
             }
         }
-        for (source_key, _) in &sources {
-            self.operational_store.delete_source_key(source_key)?;
-        }
-        Ok((sources.len(), drawer_ids.len()))
+        self.operational_store.delete_source_keys(&keys)?;
+        Ok((keys.len(), drawer_ids.len()))
     }
 
     async fn prune_orphaned_rows(&self, stale_runs: &[RetryableRun]) -> Result<Vec<DrawerId>> {

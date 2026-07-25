@@ -176,7 +176,11 @@ impl LanceDrawerStore {
         if ids.is_empty() {
             return Ok(HashSet::new());
         }
-        let filter = DrawerFilter { ids: ids.to_vec(), ..DrawerFilter::default() };
+        let filter = DrawerFilter {
+            ids: ids.to_vec(),
+            include_all_views: true,
+            ..DrawerFilter::default()
+        };
         Ok(self
             .list_drawers(&filter)
             .await?
@@ -553,7 +557,7 @@ impl DrawerStore for LanceDrawerStore {
     }
 
     async fn get_drawer(&self, id: &DrawerId) -> Result<Option<DrawerRecord>> {
-        let mut filter = DrawerFilter::default();
+        let mut filter = DrawerFilter { include_all_views: true, ..DrawerFilter::default() };
         filter.ids.push(id.clone());
         Ok(self.list_drawers(&filter).await?.into_iter().next())
     }
@@ -808,6 +812,9 @@ fn compile_filter(filter: &DrawerFilter) -> String {
     if let Some(source_file) = &filter.source_file {
         parts.push(format!("source_file = '{}'", escape_sql(source_file)));
     }
+    if filter.include_all_views || filter.view.as_deref() == Some("full") {
+        return parts.join(" AND ");
+    }
     match filter.view.as_deref() {
         None | Some("canonical") => {
             // Canonical is the default repository truth. Keep non-project
@@ -818,9 +825,14 @@ fn compile_filter(filter: &DrawerFilter) -> String {
             // Match view_name directly (new columns) with a hall fallback for
             // legacy rows written before the view-metadata migration.
             let escaped = escape_sql(view);
-            parts.push(format!(
-                "(ingest_mode != 'projects-branch' OR (view_name = '{escaped}' OR (view_name IS NULL AND hall = 'view:{escaped}')))"
-            ));
+            let branch_predicate = format!(
+                "(view_name = '{escaped}' OR (view_name IS NULL AND hall = 'view:{escaped}'))"
+            );
+            if filter.branch_view_only {
+                parts.push(branch_predicate);
+            } else {
+                parts.push(format!("(ingest_mode != 'projects-branch' OR {branch_predicate})"));
+            }
         }
     }
 

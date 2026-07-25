@@ -34,6 +34,12 @@ pub struct DrawerFilter {
     /// `"canonical"` exclude branch rows; a branch name includes that branch
     /// alongside the canonical and non-project rows for view composition.
     pub view: Option<String>,
+    /// Include every repository view. This is for storage maintenance and the
+    /// explicit `full` search view; ordinary reads remain canonical by default.
+    pub include_all_views: bool,
+    /// Match only rows belonging to `view`, excluding canonical and unrelated
+    /// branch rows. Used to discover branch overlay keys.
+    pub branch_view_only: bool,
     /// Maximum number of drawers to return.  `None` means unlimited.
     pub limit: Option<usize>,
 }

@@ -251,6 +251,7 @@ impl FederationRouter {
         view: Option<&str>,
         limit: usize,
         remote_targets: &[String],
+        local_override_paths: &std::collections::HashSet<String>,
     ) -> ToolResult<Value> {
         if remote_targets.is_empty() {
             return Ok(search_payload(query, wing, room, local_results, &[]));
@@ -264,6 +265,7 @@ impl FederationRouter {
             let wing_owned = wing.map(|s| s.to_owned());
             let room_owned = room.map(|s| s.to_owned());
             let view_owned = view.map(|s| s.to_owned());
+            let local_override_paths = local_override_paths.clone();
             let api = match self.remotes.get(&name) {
                 Some(a) => Arc::clone(a),
                 None => continue,
@@ -282,6 +284,12 @@ impl FederationRouter {
                             .results
                             .into_iter()
                             .map(|r| drawer_result_to_value(r, &name))
+                            .filter(|result| {
+                                match result["source_file"].as_str() {
+                                    Some(path) => !local_override_paths.contains(path),
+                                    None => true,
+                                }
+                            })
                             .collect();
                         (name, Ok(results))
                     }
@@ -2359,7 +2367,7 @@ mod tests {
         let router = make_router(remotes);
 
         let local = vec![json!({"wing":"w","room":"r1","similarity":0.9,"text":"local hit"})];
-        let result = router.search(local, "test", Some("w"), None, None, 10, &["alpha".to_owned()]).await.unwrap();
+        let result = router.search(local, "test", Some("w"), None, None, 10, &["alpha".to_owned()], &std::collections::HashSet::new()).await.unwrap();
 
         let results = result["results"].as_array().unwrap();
         assert_eq!(results.len(), 2);
@@ -2379,7 +2387,7 @@ mod tests {
         let router = make_router(remotes);
 
         router
-            .search(vec![], "test", Some("w"), None, Some("feature-x"), 10, &["alpha".to_owned()])
+            .search(vec![], "test", Some("w"), None, Some("feature-x"), 10, &["alpha".to_owned()], &std::collections::HashSet::new())
             .await
             .unwrap();
 
@@ -2395,7 +2403,7 @@ mod tests {
         let router = make_router(remotes);
 
         let local = vec![json!({"wing":"w","room":"r1","similarity":0.9,"text":"local only"})];
-        let result = router.search(local, "test", Some("w"), None, None, 10, &["alpha".to_owned()]).await.unwrap();
+        let result = router.search(local, "test", Some("w"), None, None, 10, &["alpha".to_owned()], &std::collections::HashSet::new()).await.unwrap();
 
         let results = result["results"].as_array().unwrap();
         assert_eq!(results.len(), 1);

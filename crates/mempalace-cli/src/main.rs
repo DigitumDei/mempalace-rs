@@ -280,7 +280,7 @@ enum Commands {
         room: Option<String>,
         #[arg(long = "results", default_value_t = 5)]
         results: usize,
-        #[arg(long, help = "Use a branch view composed over canonical data; omit for canonical")]
+        #[arg(long, help = "Use a branch view composed over canonical data; use 'full' to search every stored repository view")]
         view: Option<String>,
     },
     /// Show what's been filed.
@@ -1172,6 +1172,18 @@ where
     F: Fn(EmbeddingProfile, PathBuf) -> Result<P, Box<dyn std::error::Error>>,
     P: EmbeddingProvider,
 {
+    if full && explicit_view.is_some() {
+        return Err(clap::Error::raw(
+            clap::error::ErrorKind::ArgumentConflict,
+            "--full cannot be combined with --view; use one canonical-mode selector",
+        ));
+    }
+    if branch && explicit_view.as_deref() == Some("canonical") {
+        return Err(clap::Error::raw(
+            clap::error::ErrorKind::ArgumentConflict,
+            "--branch cannot be combined with --view canonical",
+        ));
+    }
     let source_dir = dir.canonicalize().map_err(|source| {
         clap::Error::raw(
             clap::error::ErrorKind::Io,
@@ -1183,7 +1195,7 @@ where
     let runtime = build_runtime(&config).map_err(runtime_error)?;
 
     // ── Auto-detect checkout view (projects mode only) ─────────────────────
-    let (effective_branch, effective_view) = if mode == CliMode::Projects {
+    let (effective_branch, effective_view, automatically_detected_branch) = if mode == CliMode::Projects {
         let checkout_view = mempalace_ingest::detect_checkout_view(&source_dir);
         let (detected_branch, is_auto) = match &checkout_view {
             mempalace_ingest::CheckoutView::Canonical => (false, true),
@@ -1225,9 +1237,9 @@ where
             })
         };
 
-        (final_branch, final_view)
+        (final_branch, final_view, is_auto && detected_branch && !branch && explicit_view.is_none() && !full)
     } else {
-        (branch, None)
+        (branch, None, false)
     };
 
     // ── Routing decision (projects mode only) ────────────────────────────────
@@ -1291,13 +1303,29 @@ where
             RouteQuery { wing: Some(&wing_name), room: None, source_file: None },
         );
 
-        let use_remote = !effective_branch
-            && (rule.mode == RouteMode::Remote
+        let use_remote = rule.mode == RouteMode::Remote
                 || (rule.mode == RouteMode::Combined
-                    && rule.write == WriteTarget::Remote));
-        let use_both = !effective_branch
-            && rule.mode == RouteMode::Combined
+                    && rule.write == WriteTarget::Remote);
+        let use_both = rule.mode == RouteMode::Combined
             && rule.write == WriteTarget::Both;
+
+        if automatically_detected_branch && !use_remote && !use_both {
+            let engine = runtime
+                .block_on(StorageEngine::open(&config.palace_path, config.embedding_profile))
+                .map_err(storage_error)?;
+            let prefix = mempalace_ingest::project_canonical_source_prefix(&wing_name, &project_id);
+            if engine
+                .operational_store()
+                .ingested_source_keys_with_prefix(&prefix)
+                .map_err(storage_error)?
+                .is_empty()
+            {
+                return Ok(CliOutput::failure(
+                    1,
+                    "automatic branch mining requires an existing canonical snapshot; mine the canonical checkout first or use --full to intentionally replace it\n",
+                ));
+            }
+        }
 
         if use_remote {
             return execute_remote_mine(

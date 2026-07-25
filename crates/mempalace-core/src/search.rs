@@ -78,6 +78,7 @@ pub struct SearchQuery {
     /// When `None`, search uses canonical snapshots and excludes branch views.
     /// Set to a branch name to compose that branch's changed paths over its
     /// canonical snapshot. `"canonical"` is an explicit equivalent of `None`.
+    /// Set to `"full"` to search every stored repository view independently.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub view: Option<String>,
     pub limit: usize,

@@ -1045,6 +1045,27 @@ where
             let (include_local, remote_targets) =
                 router.plan_search_targets(wing_str, room_str);
             if !remote_targets.is_empty() {
+                let local_override_paths = if let Some(view) = view
+                    .as_deref()
+                    .filter(|view| *view != "canonical" && *view != "full")
+                {
+                    self.storage
+                        .drawer_store()
+                        .list_drawers(&DrawerFilter {
+                            wing: wing.clone(),
+                            room: room.clone(),
+                            view: Some(view.to_owned()),
+                            branch_view_only: true,
+                            ..DrawerFilter::default()
+                        })
+                        .await
+                        .map_tool()?
+                        .into_iter()
+                        .map(|record| record.source_file)
+                        .collect()
+                } else {
+                    std::collections::HashSet::new()
+                };
                 // Fan out: run local search when include_local, then merge with remotes.
                 let local_values: Vec<Value> = if include_local {
                     self.search
@@ -1093,6 +1114,7 @@ where
                         view.as_deref(),
                         limit,
                         &remote_targets,
+                        &local_override_paths,
                     )
                     .await;
             }

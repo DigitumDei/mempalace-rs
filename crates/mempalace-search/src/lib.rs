@@ -11,7 +11,7 @@ pub use mempalace_dialect as dialect;
 pub use mempalace_embeddings as embeddings;
 pub use mempalace_storage as storage;
 
-use mempalace_core::{DrawerRecord, SearchQuery, SearchResult, resolve_records};
+use mempalace_core::{DrawerRecord, SearchQuery, SearchResult, WingId, resolve_records};
 use mempalace_dialect::{Dialect, WakeUpAaaKConfig};
 use mempalace_embeddings::{EmbeddingProvider, EmbeddingRequest};
 use mempalace_storage::{DrawerFilter, DrawerMatch, DrawerStore, SearchRequest};
@@ -224,18 +224,11 @@ where
             view: query.view.clone(),
             ..DrawerFilter::default()
         };
-        let candidate_limit =
-            if rerank_enabled { query.limit.saturating_mul(2) } else { query.limit };
-        let mut matches = store
-            .search_drawers(&SearchRequest {
-                embedding: query_embedding,
-                limit: candidate_limit,
-                include_cutoff_ties: true,
-                filter,
-            })
-            .await?;
-
-        if let Some(view) = query.view.as_deref().filter(|view| *view != "canonical") {
+        let overlay = if let Some(view) = query
+            .view
+            .as_deref()
+            .filter(|view| *view != "canonical" && *view != "full")
+        {
             // A branch is an overlay, not another source of truth. Branch rows
             // (including deleted-path tombstones) shadow canonical rows for the
             // same repository-relative path before ranking.
@@ -245,29 +238,63 @@ where
             let overridden_paths = store
                 .list_drawers(&DrawerFilter {
                     view: Some(view.to_owned()),
+                    wing: query.wing.clone(),
+                    room: query.room.clone(),
+                    branch_view_only: true,
                     ..DrawerFilter::default()
                 })
                 .await?
                 .into_iter()
                 .filter_map(|record| {
-                    let metadata = record.view_metadata?;
-                    (metadata.view_name.as_deref() == Some(view))
-                        .then(|| (metadata.repo_id, record.source_file))
+                    let is_selected_view = record
+                        .view_metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.view_name.as_deref())
+                        .is_some_and(|name| name == view)
+                        || record.hall.as_deref() == Some(&format!("view:{view}"));
+                    is_selected_view.then(|| {
+                        (
+                            record.view_metadata.as_ref().map(|metadata| metadata.repo_id.clone()),
+                            record.wing,
+                            record.source_file,
+                        )
+                    })
                 })
                 .collect::<std::collections::HashSet<_>>();
-            matches.retain(|entry| {
-                let Some(metadata) = entry.record.view_metadata.as_ref() else {
-                    return true;
-                };
-                if metadata.view_name.as_deref() == Some(view)
-                    && metadata.path_state == "deleted"
-                {
-                    return false;
-                }
-                !(entry.record.ingest_mode == "projects"
-                    && overridden_paths
-                        .contains(&(metadata.repo_id.clone(), entry.record.source_file.clone())))
-            });
+            Some((view, overridden_paths))
+        } else {
+            None
+        };
+
+        // Search wider until overlay filtering leaves a complete result window.
+        // A low-scoring branch replacement must shadow its canonical path without
+        // causing unrelated later candidates to disappear from the response.
+        let mut candidate_limit = if rerank_enabled {
+            query.limit.saturating_mul(2)
+        } else {
+            query.limit
+        };
+        let mut matches;
+        loop {
+            matches = store
+                .search_drawers(&SearchRequest {
+                    embedding: query_embedding.clone(),
+                    limit: candidate_limit,
+                    include_cutoff_ties: true,
+                    filter: filter.clone(),
+                })
+                .await?;
+            if let Some((view, overridden_paths)) = &overlay {
+                matches.retain(|entry| visible_in_view(&entry.record, view, overridden_paths));
+            }
+            if matches.len() >= query.limit || matches.len() < candidate_limit {
+                break;
+            }
+            let next_limit = candidate_limit.saturating_mul(2);
+            if next_limit == candidate_limit {
+                break;
+            }
+            candidate_limit = next_limit;
         }
 
         // Resolve locator-backed records in place BEFORE ranking so that
@@ -402,6 +429,40 @@ where
             }
         }
     }
+}
+
+fn visible_in_view(
+    record: &DrawerRecord,
+    view: &str,
+    overridden_paths: &std::collections::HashSet<(Option<String>, WingId, String)>,
+) -> bool {
+    let selected_branch = record
+        .view_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.view_name.as_deref())
+        .is_some_and(|name| name == view)
+        || record.hall.as_deref() == Some(&format!("view:{view}"));
+    if selected_branch
+        && record
+            .view_metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.path_state == "deleted")
+    {
+        return false;
+    }
+    if selected_branch {
+        return true;
+    }
+    if record.ingest_mode != "projects" {
+        return true;
+    }
+    let repo_id = record.view_metadata.as_ref().map(|metadata| metadata.repo_id.clone());
+    overridden_paths.contains(&(repo_id, record.wing.clone(), record.source_file.clone()))
+        || overridden_paths.contains(&(None, record.wing.clone(), record.source_file.clone()))
+        || record.view_metadata.is_none()
+            && overridden_paths.iter().any(|(_, wing, path)| {
+                wing == &record.wing && path == &record.source_file
+            })
 }
 
 fn default_identity_path() -> Option<PathBuf> {

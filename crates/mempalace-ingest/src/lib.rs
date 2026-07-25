@@ -773,7 +773,9 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
             let already_deleted = engine
                 .operational_store()
                 .get_ingested_file(&source_key)?
-                .is_some_and(|existing| existing.content_hash == hash_text("removed"));
+                .is_some_and(|existing| {
+                    existing.content_hash == hash_text("removed") && existing.drawer_count > 0
+                });
             if already_deleted {
                 continue;
             }
@@ -834,6 +836,7 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
     if branch_mode && !request.dry_run {
         let current_rel_paths: BTreeSet<&str> =
             files.iter().map(|f| f.relative_path.as_str()).collect();
+        let deleted_paths = compute_deleted_branch_paths(&root)?;
         let prefix = branch_name.as_deref().map_or_else(
             || format!("{ingest_kind}:{wing_name}:{project_root_key}:"),
             |branch| format!("{ingest_kind}:{wing_name}:{project_root_key}:{branch}:"),
@@ -844,24 +847,11 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
             // Key format: projects-branch:{wing}:{root_key}:{branch}:{rel_path}
             // Split off the first 4 ':'-delimited segments to get rel_path.
             let rel = key.splitn(5, ':').nth(4).unwrap_or("");
-            if !current_rel_paths.contains(rel) {
-                // Only replace if there are committed drawers for this key.
-                if let Some(existing) =
-                    engine.operational_store().get_ingested_file(&key)?
-                {
-                    if existing.content_hash != hash_text("removed") {
-                        replace_source_drawers(
-                            engine,
-                            &key,
-                            rel,
-                            ingest_kind,
-                            hash_text("removed"),
-                            Vec::new(),
-                        )
-                        .await?;
-                        summary.removed_sources += 1;
-                    }
-                }
+            if !current_rel_paths.contains(rel) && !deleted_paths.contains(rel) {
+                // The path no longer differs from canonical. Remove both a
+                // former replacement and a former deletion tombstone.
+                engine.remove_source_key(&key).await?;
+                summary.removed_sources += 1;
             }
         }
     }
@@ -1325,24 +1315,27 @@ pub fn detect_checkout_view(root: &Path) -> CheckoutView {
 
     match (default_branch, current_branch) {
         (Some(ref base), Some(ref current)) if branch_name(base) == current => CheckoutView::Canonical,
-        (base, Some(view_name)) => {
-            let merge_base = base.as_ref().and_then(|b| compute_merge_base(&toplevel, b));
+        (Some(base), Some(view_name)) => {
+            let merge_base = compute_merge_base(&toplevel, &base);
             CheckoutView::Branch {
                 view_name,
-                base_ref: base,
+                base_ref: Some(base),
                 merge_base,
             }
         }
-        (base, None) => {
+        (Some(base), None) => {
             // Detached HEAD: use a stable hash of the toplevel path as a view identity.
             let view_name = format!("detached-{}", &hash_text(&toplevel.to_string_lossy())[..12]);
-            let merge_base = base.as_ref().and_then(|b| compute_merge_base(&toplevel, b));
+            let merge_base = compute_merge_base(&toplevel, &base);
             CheckoutView::Branch {
                 view_name,
-                base_ref: base,
+                base_ref: Some(base),
                 merge_base,
             }
         }
+        // Without a known integration ref there is no safe delta baseline.
+        // Preserve the pre-view behavior and mine the checkout in full.
+        (None, _) => CheckoutView::Canonical,
     }
 }
 
@@ -1351,8 +1344,8 @@ pub fn detect_checkout_view(root: &Path) -> CheckoutView {
 pub fn detect_default_branch(root: &Path) -> Option<String> {
     let root_str = root.to_string_lossy();
 
-    // Try the symbolic ref (e.g. "origin/main") and retain only the branch
-    // name so it can be compared with `rev-parse --abbrev-ref HEAD`.
+    // Keep the symbolic remote ref (e.g. "origin/main") resolvable for
+    // merge-base. `branch_name` performs the short-name comparison separately.
     let out = Command::new("git")
         .args(["-C", &root_str, "symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
         .output()
@@ -1360,7 +1353,7 @@ pub fn detect_default_branch(root: &Path) -> Option<String> {
     if out.status.success() {
         let s = std::str::from_utf8(&out.stdout).ok()?.trim().to_owned();
         if !s.is_empty() {
-            return Some(branch_name(&s).to_owned());
+            return Some(s);
         }
     }
 
@@ -1467,6 +1460,7 @@ fn compute_deleted_branch_paths(root: &Path) -> Result<BTreeSet<String>> {
             root_str.as_ref(),
             "diff",
             "--name-only",
+            "--no-renames",
             "--diff-filter=D",
             "-z",
             &merge_base,

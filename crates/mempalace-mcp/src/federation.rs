@@ -248,6 +248,7 @@ impl FederationRouter {
         query: &str,
         wing: Option<&str>,
         room: Option<&str>,
+        view: Option<&str>,
         limit: usize,
         remote_targets: &[String],
     ) -> ToolResult<Value> {
@@ -262,6 +263,7 @@ impl FederationRouter {
             let query_str = query.to_owned();
             let wing_owned = wing.map(|s| s.to_owned());
             let room_owned = room.map(|s| s.to_owned());
+            let view_owned = view.map(|s| s.to_owned());
             let api = match self.remotes.get(&name) {
                 Some(a) => Arc::clone(a),
                 None => continue,
@@ -272,7 +274,7 @@ impl FederationRouter {
                     wing: wing_owned,
                     room: room_owned,
                     limit: Some(limit),
-                    view: None,
+                    view: view_owned,
                 };
                 match api.search_drawers(req).await {
                     Ok(response) => {

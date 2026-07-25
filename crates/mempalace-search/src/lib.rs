@@ -951,6 +951,17 @@ mod tests {
     }
 
     fn filter_matches(drawer: &DrawerRecord, filter: &DrawerFilter) -> bool {
+        if filter.branch_view_only
+            && !filter.view.as_deref().is_some_and(|view| {
+                drawer
+                    .view_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.view_name.as_deref())
+                    == Some(view)
+            })
+        {
+            return false;
+        }
         (filter.ids.is_empty() || filter.ids.iter().any(|id| id == &drawer.id))
             && filter.wing.as_ref().is_none_or(|wing| wing == &drawer.wing)
             && filter.room.as_ref().is_none_or(|room| room == &drawer.room)
@@ -967,11 +978,7 @@ mod tests {
                             .as_ref()
                             .and_then(|metadata| metadata.view_name.as_deref())
                             == Some(view);
-                    if filter.branch_view_only {
-                        selected
-                    } else {
-                        drawer.ingest_mode != "projects-branch" || selected
-                    }
+                    drawer.ingest_mode != "projects-branch" || selected
                 }
                 }
             }

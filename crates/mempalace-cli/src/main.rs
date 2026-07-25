@@ -1309,7 +1309,8 @@ where
         let use_remote = rule.mode == RouteMode::Remote
                 || (rule.mode == RouteMode::Combined
                     && rule.write == WriteTarget::Remote);
-        let use_both = rule.mode == RouteMode::Combined
+        let use_both = !effective_branch
+            && rule.mode == RouteMode::Combined
             && rule.write == WriteTarget::Both;
 
         if automatically_detected_branch && !use_remote && !use_both {

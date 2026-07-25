@@ -280,6 +280,8 @@ enum Commands {
         room: Option<String>,
         #[arg(long = "results", default_value_t = 5)]
         results: usize,
+        #[arg(long, help = "Use a branch view composed over canonical data; omit for canonical")]
+        view: Option<String>,
     },
     /// Show what's been filed.
     Status,
@@ -524,11 +526,12 @@ where
                 context,
             )
         }
-        Commands::Search { query, wing, room, results } => execute_search(
+        Commands::Search { query, wing, room, results, view } => execute_search(
             &query,
             wing,
             room,
             results,
+            view,
             cli.palace.as_deref(),
             context,
             provider_factory,
@@ -1983,6 +1986,7 @@ fn execute_search<F, P>(
     wing: Option<String>,
     room: Option<String>,
     results: usize,
+    view: Option<String>,
     palace_override: Option<&Path>,
     context: &CliContext,
     provider_factory: F,
@@ -2018,7 +2022,7 @@ where
                 room: room_id,
                 limit: clamp_search_results(results, &config),
                 profile: config.embedding_profile,
-                view: None,
+                view,
             },
         ))
         .map_err(search_error)?;

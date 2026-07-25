@@ -75,9 +75,9 @@ pub struct SearchQuery {
     pub wing: Option<WingId>,
     pub room: Option<RoomId>,
     /// Optional view/ref name to scope search to a specific branch view.
-    /// When `None`, search includes canonical snapshots and all branch views
-    /// (legacy behaviour).  Set to `"canonical"` to restrict to canonical
-    /// snapshots, or to a specific branch name for a single branch view.
+    /// When `None`, search uses canonical snapshots and excludes branch views.
+    /// Set to a branch name to compose that branch's changed paths over its
+    /// canonical snapshot. `"canonical"` is an explicit equivalent of `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub view: Option<String>,
     pub limit: usize,

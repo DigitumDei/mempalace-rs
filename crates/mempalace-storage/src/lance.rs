@@ -808,15 +808,18 @@ fn compile_filter(filter: &DrawerFilter) -> String {
     if let Some(source_file) = &filter.source_file {
         parts.push(format!("source_file = '{}'", escape_sql(source_file)));
     }
-    if let Some(view) = &filter.view {
-        if view == "canonical" {
-            parts.push("ingest_mode = 'projects'".to_owned());
-        } else {
+    match filter.view.as_deref() {
+        None | Some("canonical") => {
+            // Canonical is the default repository truth. Keep non-project
+            // drawers visible while excluding all branch-view rows.
+            parts.push("ingest_mode != 'projects-branch'".to_owned());
+        }
+        Some(view) => {
             // Match view_name directly (new columns) with a hall fallback for
             // legacy rows written before the view-metadata migration.
             let escaped = escape_sql(view);
             parts.push(format!(
-                "ingest_mode = 'projects-branch' AND (view_name = '{escaped}' OR (view_name IS NULL AND hall = 'view:{escaped}'))"
+                "(ingest_mode != 'projects-branch' OR (view_name = '{escaped}' OR (view_name IS NULL AND hall = 'view:{escaped}')))"
             ));
         }
     }

@@ -907,6 +907,7 @@ pub async fn ingest_conversations<P: EmbeddingProvider>(
                 .collect::<Vec<_>>(),
             None,
             None,
+            None,
         )?;
         let drawer_count = drawers.len();
 
@@ -1262,7 +1263,7 @@ pub fn detect_checkout_view(root: &Path) -> CheckoutView {
     let current_branch = resolve_current_branch(&toplevel);
 
     match (default_branch, current_branch) {
-        (Some(ref base), Some(ref current)) if base == current => CheckoutView::Canonical,
+        (Some(ref base), Some(ref current)) if branch_name(base) == current => CheckoutView::Canonical,
         (base, Some(view_name)) => {
             let merge_base = base.as_ref().and_then(|b| compute_merge_base(&toplevel, b));
             CheckoutView::Branch {
@@ -1289,7 +1290,8 @@ pub fn detect_checkout_view(root: &Path) -> CheckoutView {
 pub fn detect_default_branch(root: &Path) -> Option<String> {
     let root_str = root.to_string_lossy();
 
-    // Try the symbolic ref (e.g. "origin/main").
+    // Try the symbolic ref (e.g. "origin/main") and retain only the branch
+    // name so it can be compared with `rev-parse --abbrev-ref HEAD`.
     let out = Command::new("git")
         .args(["-C", &root_str, "symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
         .output()
@@ -1297,7 +1299,7 @@ pub fn detect_default_branch(root: &Path) -> Option<String> {
     if out.status.success() {
         let s = std::str::from_utf8(&out.stdout).ok()?.trim().to_owned();
         if !s.is_empty() {
-            return Some(s);
+            return Some(branch_name(&s).to_owned());
         }
     }
 
@@ -1316,6 +1318,10 @@ pub fn detect_default_branch(root: &Path) -> Option<String> {
         }
     }
     None
+}
+
+fn branch_name(ref_name: &str) -> &str {
+    ref_name.strip_prefix("origin/").unwrap_or(ref_name)
 }
 
 /// Compute the merge-base commit between `default_ref` and HEAD.
@@ -1378,6 +1384,62 @@ fn git_delta_paths(root: &Path, merge_base: &str) -> Option<Vec<String>> {
         }
     }
     Some(paths)
+}
+
+/// Return project-root-relative paths deleted from HEAD since the merge-base.
+fn compute_deleted_branch_paths(root: &Path) -> Result<BTreeSet<String>> {
+    let default_ref = detect_default_branch(root).ok_or_else(|| {
+        IngestError::BranchDeltaUnavailable {
+            reason: "not a git repository or no default branch (origin/HEAD, main, master) found"
+                .to_owned(),
+        }
+    })?;
+    let merge_base = compute_merge_base(root, &default_ref).ok_or_else(|| {
+        IngestError::BranchDeltaUnavailable {
+            reason: format!("could not compute merge-base between '{default_ref}' and HEAD"),
+        }
+    })?;
+    let root_str = root.to_string_lossy();
+    let output = Command::new("git")
+        .args([
+            "-C",
+            root_str.as_ref(),
+            "diff",
+            "--name-only",
+            "--diff-filter=D",
+            "-z",
+            &merge_base,
+        ])
+        .output()
+        .map_err(|source| IngestError::Io { path: root.to_path_buf(), source })?;
+    if !output.status.success() {
+        return Err(IngestError::BranchDeltaUnavailable {
+            reason: "git diff for deleted paths failed".to_owned(),
+        });
+    }
+    let repo_root = git_repo_toplevel(root).ok_or_else(|| IngestError::BranchDeltaUnavailable {
+        reason: "git rev-parse --show-toplevel failed".to_owned(),
+    })?;
+    let repo_root = repo_root.canonicalize().unwrap_or(repo_root);
+    let mut deleted = BTreeSet::new();
+    for path in output.stdout.split(|&byte| byte == 0).filter(|path| !path.is_empty()) {
+        let Ok(path) = std::str::from_utf8(path) else { continue };
+        let absolute = repo_root.join(path.replace('/', std::path::MAIN_SEPARATOR_STR));
+        if let Ok(relative) = absolute.strip_prefix(root) {
+            let relative = relative
+                .components()
+                .filter_map(|component| match component {
+                    Component::Normal(part) => part.to_str(),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("/");
+            if !relative.is_empty() {
+                deleted.insert(relative);
+            }
+        }
+    }
+    Ok(deleted)
 }
 
 /// Get the absolute repo root (via `git rev-parse --show-toplevel`).
@@ -4670,6 +4732,7 @@ mod tests {
                 date_hint: None,
                 byte_range: None,
             }],
+            None,
             None,
             None,
         )

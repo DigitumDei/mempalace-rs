@@ -1732,7 +1732,8 @@ where
             });
         }
 
-        if let Some(err) = build_error {.push(IngestFileResult {
+        if let Some(err) = build_error {
+            file_results.push(IngestFileResult {
                 relative_path: file.relative_path.clone(),
                 status: "failed".to_owned(),
                 drawers_written: 0,

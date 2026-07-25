@@ -235,6 +235,52 @@ where
             })
             .await?;
 
+        if let Some(view) = query.view.as_deref().filter(|view| *view != "canonical") {
+            // A branch is an overlay, not another source of truth. Branch rows
+            // (including deleted-path tombstones) shadow canonical rows for the
+            // same repository-relative path before ranking.
+            let mut overridden_paths = matches
+                .iter()
+                .filter_map(|entry| {
+                    let metadata = entry.record.view_metadata.as_ref()?;
+                    (metadata.view_name.as_deref() == Some(view))
+                        .then(|| (metadata.repo_id.clone(), entry.record.source_file.clone()))
+                })
+                .collect::<std::collections::HashSet<_>>();
+            // Tombstones intentionally have zero embeddings, so they are not
+            // reliable vector-search candidates. Read them directly to retain
+            // their path-shadowing effect regardless of query similarity.
+            for tombstone in store
+                .list_drawers(&DrawerFilter {
+                    view: Some(view.to_owned()),
+                    ..DrawerFilter::default()
+                })
+                .await?
+                .into_iter()
+                .filter_map(|record| {
+                    let metadata = record.view_metadata?;
+                    (metadata.view_name.as_deref() == Some(view)
+                        && metadata.path_state == "deleted")
+                        .then(|| (metadata.repo_id, record.source_file))
+                })
+            {
+                overridden_paths.insert(tombstone);
+            }
+            matches.retain(|entry| {
+                let Some(metadata) = entry.record.view_metadata.as_ref() else {
+                    return true;
+                };
+                if metadata.view_name.as_deref() == Some(view)
+                    && metadata.path_state == "deleted"
+                {
+                    return false;
+                }
+                !(entry.record.ingest_mode == "projects"
+                    && overridden_paths
+                        .contains(&(metadata.repo_id.clone(), entry.record.source_file.clone())))
+            });
+        }
+
         // Resolve locator-backed records in place BEFORE ranking so that
         // rerank's lexical_overlap_score operates on real text.
         let mut records: Vec<DrawerRecord> =

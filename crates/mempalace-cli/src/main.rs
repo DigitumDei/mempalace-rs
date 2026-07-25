@@ -3345,7 +3345,7 @@ mod tests {
         let context = CliContext::for_tests(config_root.clone());
 
         run_cli(["init", repo_dir.to_str().unwrap(), "--yes"], &context, stub_provider).unwrap();
-        run_cli(["mine", repo_dir.to_str().unwrap()], &context, stub_provider).unwrap();
+        run_cli(["mine", repo_dir.to_str().unwrap(), "--full"], &context, stub_provider).unwrap();
         let branch_mine =
             run_cli(["mine", repo_dir.to_str().unwrap(), "--branch"], &context, stub_provider)
                 .unwrap();

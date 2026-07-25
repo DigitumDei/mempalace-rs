@@ -1226,7 +1226,7 @@ where
         let final_view = if full || final_branch == false {
             None
         } else {
-            explicit_view.or_else(|| {
+            explicit_view.clone().or_else(|| {
                 if is_auto {
                     match &checkout_view {
                         mempalace_ingest::CheckoutView::Branch { view_name, .. } => {

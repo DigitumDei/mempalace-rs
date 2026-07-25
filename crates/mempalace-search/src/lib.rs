@@ -239,18 +239,10 @@ where
             // A branch is an overlay, not another source of truth. Branch rows
             // (including deleted-path tombstones) shadow canonical rows for the
             // same repository-relative path before ranking.
-            let mut overridden_paths = matches
-                .iter()
-                .filter_map(|entry| {
-                    let metadata = entry.record.view_metadata.as_ref()?;
-                    (metadata.view_name.as_deref() == Some(view))
-                        .then(|| (metadata.repo_id.clone(), entry.record.source_file.clone()))
-                })
-                .collect::<std::collections::HashSet<_>>();
-            // Tombstones intentionally have zero embeddings, so they are not
-            // reliable vector-search candidates. Read them directly to retain
-            // their path-shadowing effect regardless of query similarity.
-            for tombstone in store
+            // Read the complete branch view before searching results are
+            // composed. A branch replacement may have low semantic similarity,
+            // but it must still shadow the canonical path that it replaces.
+            let overridden_paths = store
                 .list_drawers(&DrawerFilter {
                     view: Some(view.to_owned()),
                     ..DrawerFilter::default()
@@ -259,13 +251,10 @@ where
                 .into_iter()
                 .filter_map(|record| {
                     let metadata = record.view_metadata?;
-                    (metadata.view_name.as_deref() == Some(view)
-                        && metadata.path_state == "deleted")
+                    (metadata.view_name.as_deref() == Some(view))
                         .then(|| (metadata.repo_id, record.source_file))
                 })
-            {
-                overridden_paths.insert(tombstone);
-            }
+                .collect::<std::collections::HashSet<_>>();
             matches.retain(|entry| {
                 let Some(metadata) = entry.record.view_metadata.as_ref() else {
                     return true;
@@ -724,7 +713,10 @@ mod tests {
         render_search_results, trim_similarity,
     };
     use async_trait::async_trait;
-    use mempalace_core::{DrawerId, DrawerRecord, EmbeddingProfile, RoomId, SearchQuery, WingId};
+    use mempalace_core::{
+        DrawerId, DrawerRecord, EmbeddingProfile, RepositoryViewMetadata, RoomId, SearchQuery,
+        WingId,
+    };
     use mempalace_embeddings::{
         EmbeddingProvider, EmbeddingRequest, EmbeddingResponse, StartupValidation,
         StartupValidationStatus,
@@ -772,6 +764,22 @@ mod tests {
             locator: None,
             view_metadata: None,
         }
+    }
+
+    fn project_record(mut record: DrawerRecord, view: Option<&str>, path_state: &str) -> DrawerRecord {
+        record.ingest_mode = if view.is_some() { "projects-branch" } else { "projects" }.to_owned();
+        record.hall = view.map(|view| format!("view:{view}"));
+        record.view_metadata = Some(RepositoryViewMetadata {
+            repo_id: "repo-a".to_owned(),
+            view_name: view.map(str::to_owned),
+            source_path: "/repo".to_owned(),
+            head_commit: None,
+            base_ref: Some("main".to_owned()),
+            merge_base: None,
+            worktree_id: "worktree-a".to_owned(),
+            path_state: path_state.to_owned(),
+        });
+        record
     }
 
     #[derive(Debug, Clone)]
@@ -887,6 +895,17 @@ mod tests {
             && filter.room.as_ref().is_none_or(|room| room == &drawer.room)
             && filter.hall.as_ref().is_none_or(|hall| drawer.hall.as_ref() == Some(hall))
             && filter.source_file.as_ref().is_none_or(|source| source == &drawer.source_file)
+            && match filter.view.as_deref() {
+                None | Some("canonical") => drawer.ingest_mode != "projects-branch",
+                Some(view) => {
+                    drawer.ingest_mode != "projects-branch"
+                        || drawer
+                            .view_metadata
+                            .as_ref()
+                            .and_then(|metadata| metadata.view_name.as_deref())
+                            == Some(view)
+                }
+            }
     }
 
     fn sample_store() -> StubStore {
@@ -1407,7 +1426,7 @@ mod tests {
         let mut runtime = SearchRuntime::new(StubProvider { response: vec![embedding(0.0)] });
         let store = StubStore {
             drawers: vec![
-                record(
+                project_record(record(
                     "wing_a/backend/0001",
                     "wing_a",
                     "backend",
@@ -1415,8 +1434,8 @@ mod tests {
                     "Canonical backend code.",
                     Some(0.5),
                     datetime!(2026-04-11 09:00:00 UTC),
-                ),
-                record(
+                ), None, "present"),
+                project_record(record(
                     "wing_a/backend/0002",
                     "wing_a",
                     "backend",
@@ -1424,15 +1443,10 @@ mod tests {
                     "Branch-specific backend code.",
                     Some(0.5),
                     datetime!(2026-04-11 09:00:00 UTC),
-                ),
+                ), Some("feature-x"), "present"),
             ],
         };
 
-        // The second drawer simulates a branch view via hall field.
-        // We need to modify it to have the branch view hall set.
-        // Since the test uses the StubStore which doesn't support view filtering
-        // at the storage level, we test the DrawerFilter.view logic via compile_filter.
-        // For the runtime test, we create a store where the view filter would work.
         let results = runtime
             .search(
                 &store,
@@ -1448,10 +1462,8 @@ mod tests {
             .await
             .unwrap();
 
-        // The StubStore's filter_matches doesn't support view filtering yet,
-        // so all drawers match. The view filter is applied at the storage layer.
-        // This test verifies the plumbing is correct (no crash).
-        assert_eq!(results.len(), 2);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].content, "Canonical backend code.");
     }
 
     #[tokio::test]
@@ -1459,7 +1471,7 @@ mod tests {
         let mut runtime = SearchRuntime::new(StubProvider { response: vec![embedding(0.0)] });
         let store = StubStore {
             drawers: vec![
-                record(
+                project_record(record(
                     "wing_a/backend/0001",
                     "wing_a",
                     "backend",
@@ -1467,8 +1479,8 @@ mod tests {
                     "Canonical backend code.",
                     Some(0.5),
                     datetime!(2026-04-11 09:00:00 UTC),
-                ),
-                record(
+                ), None, "present"),
+                project_record(record(
                     "wing_a/backend/0002",
                     "wing_a",
                     "backend",
@@ -1476,7 +1488,7 @@ mod tests {
                     "Branch-specific backend code.",
                     Some(0.5),
                     datetime!(2026-04-11 09:00:00 UTC),
-                ),
+                ), Some("feature-x"), "present"),
             ],
         };
 
@@ -1495,9 +1507,96 @@ mod tests {
             .await
             .unwrap();
 
-        // The StubStore's filter_matches doesn't support view filtering,
-        // so this validates the plumbing is correct.
-        assert_eq!(results.len(), 2);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].content, "Branch-specific backend code.");
+    }
+
+    #[tokio::test]
+    async fn branch_override_shadows_canonical_outside_search_candidates() {
+        let mut runtime = SearchRuntime::new(StubProvider { response: vec![embedding(0.0)] });
+        let store = StubStore {
+            drawers: vec![
+                project_record(record(
+                    "wing_a/backend/0001",
+                    "wing_a",
+                    "backend",
+                    "main.rs",
+                    "Canonical backend code.",
+                    Some(0.1),
+                    datetime!(2026-04-11 09:00:00 UTC),
+                ), None, "present"),
+                project_record(record(
+                    "wing_a/backend/0002",
+                    "wing_a",
+                    "backend",
+                    "main.rs",
+                    "Unrelated branch replacement.",
+                    Some(0.9),
+                    datetime!(2026-04-11 09:00:00 UTC),
+                ), Some("feature-x"), "present"),
+            ],
+        };
+
+        let results = runtime
+            .search(
+                &store,
+                &SearchQuery {
+                    text: "code".to_owned(),
+                    wing: None,
+                    room: None,
+                    limit: 1,
+                    profile: EmbeddingProfile::Balanced,
+                    view: Some("feature-x".to_owned()),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(results.is_empty(), "canonical content must not leak through an override");
+    }
+
+    #[tokio::test]
+    async fn branch_tombstone_shadows_canonical_content() {
+        let mut runtime = SearchRuntime::new(StubProvider { response: vec![embedding(0.0)] });
+        let store = StubStore {
+            drawers: vec![
+                project_record(record(
+                    "wing_a/backend/0001",
+                    "wing_a",
+                    "backend",
+                    "deleted.rs",
+                    "Canonical deleted file.",
+                    Some(0.1),
+                    datetime!(2026-04-11 09:00:00 UTC),
+                ), None, "present"),
+                project_record(record(
+                    "wing_a/general/0002",
+                    "wing_a",
+                    "general",
+                    "deleted.rs",
+                    "Deleted branch path tombstone",
+                    Some(0.9),
+                    datetime!(2026-04-11 09:00:00 UTC),
+                ), Some("feature-x"), "deleted"),
+            ],
+        };
+
+        let results = runtime
+            .search(
+                &store,
+                &SearchQuery {
+                    text: "deleted".to_owned(),
+                    wing: None,
+                    room: None,
+                    limit: 1,
+                    profile: EmbeddingProfile::Balanced,
+                    view: Some("feature-x".to_owned()),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(results.is_empty());
     }
 
     #[test]

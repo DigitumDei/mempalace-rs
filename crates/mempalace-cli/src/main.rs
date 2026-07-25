@@ -218,7 +218,7 @@ enum Commands {
         reindex: bool,
         #[arg(long, value_enum, default_value_t = CliExtractMode::Exchange)]
         extract: CliExtractMode,
-        #[arg(long, help = "Mine only files changed vs the merge-base with the default branch (local branch-delta mining). When omitted, the checkout type is detected automatically: canonical checkouts perform a full mine, non-canonical checkouts perform a branch-delta mine.")]
+        #[arg(long, conflicts_with = "full", help = "Mine only files changed vs the merge-base with the default branch (local branch-delta mining). When omitted, the checkout type is detected automatically: canonical checkouts perform a full mine, non-canonical checkouts perform a branch-delta mine.")]
         branch: bool,
         #[arg(
             long = "batch-size",

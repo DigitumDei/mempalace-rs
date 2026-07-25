@@ -1873,6 +1873,7 @@ mod tests {
         changes_next_cursor: Option<String>,
         /// When set, the `changes` call records the incoming cursor here.
         received_cursor: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+        received_search_view: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     }
 
     impl Default for MockRemote {
@@ -1901,6 +1902,7 @@ mod tests {
                 changes_events: vec![],
                 changes_next_cursor: None,
                 received_cursor: std::sync::Arc::new(std::sync::Mutex::new(None)),
+                received_search_view: std::sync::Arc::new(std::sync::Mutex::new(None)),
             }
         }
     }
@@ -1914,9 +1916,10 @@ mod tests {
 
         async fn search_drawers(
             &self,
-            _req: DrawerSearchRequest,
+            req: DrawerSearchRequest,
         ) -> mempalace_remote::Result<DrawerSearchResponse> {
             self.check_fail("search")?;
+            *self.received_search_view.lock().unwrap() = req.view;
             let results = self
                 .search_results
                 .iter()
@@ -2354,7 +2357,7 @@ mod tests {
         let router = make_router(remotes);
 
         let local = vec![json!({"wing":"w","room":"r1","similarity":0.9,"text":"local hit"})];
-        let result = router.search(local, "test", Some("w"), None, 10, &["alpha".to_owned()]).await.unwrap();
+        let result = router.search(local, "test", Some("w"), None, None, 10, &["alpha".to_owned()]).await.unwrap();
 
         let results = result["results"].as_array().unwrap();
         assert_eq!(results.len(), 2);
@@ -2366,6 +2369,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_forwards_view_to_remote() {
+        let mock = MockRemote::default();
+        let received_search_view = Arc::clone(&mock.received_search_view);
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+
+        router
+            .search(vec![], "test", Some("w"), None, Some("feature-x"), 10, &["alpha".to_owned()])
+            .await
+            .unwrap();
+
+        assert_eq!(*received_search_view.lock().unwrap(), Some("feature-x".to_owned()));
+    }
+
+    #[tokio::test]
     async fn e2e_search_degradable_on_remote_outage() {
         let mut mock = MockRemote::default();
         mock.fail_on = Some("search".to_owned());
@@ -2374,7 +2393,7 @@ mod tests {
         let router = make_router(remotes);
 
         let local = vec![json!({"wing":"w","room":"r1","similarity":0.9,"text":"local only"})];
-        let result = router.search(local, "test", Some("w"), None, 10, &["alpha".to_owned()]).await.unwrap();
+        let result = router.search(local, "test", Some("w"), None, None, 10, &["alpha".to_owned()]).await.unwrap();
 
         let results = result["results"].as_array().unwrap();
         assert_eq!(results.len(), 1);

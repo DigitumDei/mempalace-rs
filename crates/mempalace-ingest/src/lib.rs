@@ -570,7 +570,10 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
         .unwrap_or_else(|| derive_repo_id(&root, &wing_name));
     let project_root_key = stable_project_root_key(&repo_id);
     let legacy_root_key = hash_text(&root.to_string_lossy());
-    let branch_name = match request.branch {
+    // An explicit canonical view always wins, including for direct library
+    // callers that did not pass through the CLI's flag normalization.
+    let branch_mode = request.branch && request.view.as_deref() != Some("canonical");
+    let branch_name = match branch_mode {
         true => Some(request.view.clone().unwrap_or_else(|| {
             resolve_current_branch(&root).unwrap_or_else(|| "detached".to_owned())
         })),
@@ -608,7 +611,7 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
     summary.view_name = branch_name.clone();
 
     // For branch mode: compute the delta set and filter files.
-    let (ingest_kind, delta_set) = if request.branch {
+    let (ingest_kind, delta_set) = if branch_mode {
         let delta = compute_branch_delta(&root)?;
         let set: BTreeSet<String> = delta.into_iter().collect();
         ("projects-branch", Some(set))
@@ -751,6 +754,64 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
         }
     }
 
+    // Deleted paths are not discovered from the worktree, so record a durable
+    // branch row for each one. These rows shadow the corresponding canonical
+    // path during branch-view composition without depending on vector ranking.
+    if branch_mode && !request.dry_run {
+        let deleted_paths = compute_deleted_branch_paths(&root)?;
+        let mut tombstone_metadata = view_metadata.clone();
+        tombstone_metadata.path_state = "deleted".to_owned();
+        for relative_path in deleted_paths {
+            let branch = branch_name.as_deref().expect("branch mode has a view name");
+            let source_key = project_branch_source_key(
+                ingest_kind,
+                &project_root_key,
+                &wing_name,
+                branch,
+                &relative_path,
+            );
+            let already_deleted = engine
+                .operational_store()
+                .get_ingested_file(&source_key)?
+                .is_some_and(|existing| existing.content_hash == hash_text("removed"));
+            if already_deleted {
+                continue;
+            }
+            let drawers = build_drawers(
+                provider,
+                &wing_id,
+                &source_key,
+                &relative_path,
+                ingest_kind,
+                None,
+                &request.agent,
+                request.max_embed_batch_size,
+                vec![Chunk {
+                    content: "Deleted branch path tombstone".to_owned(),
+                    date_hint: None,
+                    room_hint: Some("general".to_owned()),
+                    byte_range: None,
+                    chunk_index: 0,
+                }],
+                None,
+                branch_name.as_deref(),
+                Some(&tombstone_metadata),
+            )?;
+            let drawer_count = drawers.len();
+            replace_source_drawers(
+                engine,
+                &source_key,
+                &relative_path,
+                ingest_kind,
+                hash_text("removed"),
+                drawers,
+            )
+            .await?;
+            summary.removed_sources += 1;
+            summary.drawers_written += drawer_count;
+        }
+    }
+
     // Remove path-hash source rows that were not present in this mine.  This
     // catches files deleted before the stable project-id migration ran.
     if branch_name.is_none() && request.limit.is_none() && !request.dry_run {
@@ -770,7 +831,7 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
 
     // Branch cleanup pass: remove source keys whose relative paths are no longer
     // in the current delta (files reverted to base or deleted from the branch).
-    if request.branch && !request.dry_run {
+    if branch_mode && !request.dry_run {
         let current_rel_paths: BTreeSet<&str> =
             files.iter().map(|f| f.relative_path.as_str()).collect();
         let prefix = branch_name.as_deref().map_or_else(
@@ -5000,8 +5061,9 @@ mod tests {
         assert_eq!(first.ingested_files, 2);
         assert_eq!(first.removed_sources, 0);
 
-        // Revert base.rs to original content (it is no longer in the delta).
+        // Revert base.rs to original content and delete a canonical file.
         fs::write(repo_dir.join("base.rs"), &base_content).unwrap();
+        fs::remove_file(repo_dir.join("stable.rs")).unwrap();
 
         let second = ingest_project(
             &engine,
@@ -5020,8 +5082,9 @@ mod tests {
         .await
         .unwrap();
 
-        // base.rs is no longer in the delta (reverted); untracked.rs still is.
-        assert_eq!(second.removed_sources, 1, "reverted file must be counted as removed");
+        // base.rs is no longer in the delta (reverted), stable.rs is a durable
+        // tombstone, and untracked.rs still is part of the branch delta.
+        assert_eq!(second.removed_sources, 2);
 
         // base.rs drawers must be cleared.
         let root = repo_dir.canonicalize().unwrap();
@@ -5041,6 +5104,35 @@ mod tests {
             stored.map(|s| s.content_hash == hash_text("removed")).unwrap_or(false),
             "reverted file's stored content_hash must be hash_text(\"removed\")"
         );
+
+        let sk_stable = project_branch_source_key(
+            "projects-branch",
+            &stable_project_root_key(&repo_id),
+            wing_name,
+            "feature",
+            "stable.rs",
+        );
+        let tombstone = engine.operational_store().get_ingested_file(&sk_stable).unwrap();
+        assert_eq!(tombstone.map(|record| record.content_hash), Some(hash_text("removed")));
+
+        let third = ingest_project(
+            &engine,
+            &mut provider,
+            &ProjectIngestRequest {
+                project_dir: repo_dir.clone(),
+                wing: None,
+                agent: "tester".to_owned(),
+                limit: None,
+                dry_run: false,
+                reindex: false,
+                max_embed_batch_size: None,
+                branch: true,
+                view: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(third.removed_sources, 0, "an unchanged tombstone remains durable");
     }
 
     #[tokio::test]

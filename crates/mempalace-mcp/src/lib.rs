@@ -1085,7 +1085,15 @@ where
                     vec![]
                 };
                 return router
-                    .search(local_values, &query, wing_str, room_str, limit, &remote_targets)
+                    .search(
+                        local_values,
+                        &query,
+                        wing_str,
+                        room_str,
+                        view.as_deref(),
+                        limit,
+                        &remote_targets,
+                    )
                     .await;
             }
         }

@@ -2953,7 +2953,7 @@ mod tests {
             .await;
         let payload = decode_tool_payload(&response).unwrap();
         assert_eq!(payload["query"], "auth migration parity");
-        assert_eq!(payload["filters"], json!({"wing":null,"room":null}));
+        assert_eq!(payload["filters"], json!({"wing":null,"room":null,"view":null}));
         assert!(
             payload["results"]
                 .as_array()

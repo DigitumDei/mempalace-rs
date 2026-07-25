@@ -354,7 +354,7 @@
     }
   },
   "mempalace_search": {
-    "description": "Semantic search. Returns verbatim drawer content with similarity scores. Results from mined files include `stale: true` when the source file changed since mining.",
+    "description": "Semantic search. Returns verbatim drawer content with similarity scores. Results from mined files include `stale: true` when the source file changed since mining. Use `view` to scope to a specific branch view (e.g. 'feature-x') or 'canonical' for the default branch.",
     "input_schema": {
       "properties": {
         "limit": {
@@ -367,6 +367,10 @@
         },
         "room": {
           "description": "Filter by room (optional)",
+          "type": "string"
+        },
+        "view": {
+          "description": "Scope to a named branch view or 'canonical' (optional)",
           "type": "string"
         },
         "wing": {

@@ -163,7 +163,6 @@ async fn round_trip_drawers_and_changes() {
             wing: Some("wing_rt".to_owned()),
             room: None,
             limit: None,
-            view: None,
             cursor: None,
         })
         .await
@@ -398,6 +397,7 @@ async fn version_skew_is_hard_error() {
             wing: None,
             room: None,
             limit: None,
+            view: None,
         })
         .await;
     match second {

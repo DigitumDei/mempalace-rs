@@ -5080,7 +5080,8 @@ mod tests {
         // tombstone, and untracked.rs still is part of the branch delta.
         assert_eq!(second.removed_sources, 2);
 
-        // base.rs drawers must be cleared.
+        // Reverting a branch replacement removes the branch state entirely so
+        // a later deletion can create a fresh durable tombstone.
         let root = repo_dir.canonicalize().unwrap();
         let wing_name = "cleanuptest";
         let repo_id = derive_repo_id(&root, wing_name);
@@ -5091,13 +5092,7 @@ mod tests {
             "feature",
             "base.rs",
         );
-        let stored = engine.operational_store().get_ingested_file(&sk_base).unwrap();
-        // After cleanup the key exists but with zero drawers (replace-with-empty).
-        // The content_hash is now hash_text("removed").
-        assert!(
-            stored.map(|s| s.content_hash == hash_text("removed")).unwrap_or(false),
-            "reverted file's stored content_hash must be hash_text(\"removed\")"
-        );
+        assert!(engine.operational_store().get_ingested_file(&sk_base).unwrap().is_none());
 
         let sk_stable = project_branch_source_key(
             "projects-branch",

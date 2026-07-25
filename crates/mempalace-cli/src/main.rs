@@ -28,7 +28,10 @@ use mempalace_ingest::{
 };
 use mempalace_remote::{RemoteApi, RemoteClient, RemoteEndpoint, RemoteError};
 use mempalace_search::{Layer1Config, SearchRuntime, SearchRuntimePolicy, WakeUpRequest};
-use mempalace_storage::{DrawerFilter, DrawerStore, MaintenanceSettings, StorageEngine, StorageLayout};
+use mempalace_storage::{
+    DrawerFilter, DrawerStore, IngestManifestStore, MaintenanceSettings, StorageEngine,
+    StorageLayout,
+};
 use serde_yaml::Mapping;
 use tracing_subscriber::{EnvFilter, fmt};
 

@@ -956,15 +956,23 @@ mod tests {
             && filter.room.as_ref().is_none_or(|room| room == &drawer.room)
             && filter.hall.as_ref().is_none_or(|hall| drawer.hall.as_ref() == Some(hall))
             && filter.source_file.as_ref().is_none_or(|source| source == &drawer.source_file)
-            && match filter.view.as_deref() {
+            && if filter.include_all_views || filter.view.as_deref() == Some("full") {
+                true
+            } else {
+                match filter.view.as_deref() {
                 None | Some("canonical") => drawer.ingest_mode != "projects-branch",
                 Some(view) => {
-                    drawer.ingest_mode != "projects-branch"
-                        || drawer
+                    let selected = drawer
                             .view_metadata
                             .as_ref()
                             .and_then(|metadata| metadata.view_name.as_deref())
-                            == Some(view)
+                            == Some(view);
+                    if filter.branch_view_only {
+                        selected
+                    } else {
+                        drawer.ingest_mode != "projects-branch" || selected
+                    }
+                }
                 }
             }
     }

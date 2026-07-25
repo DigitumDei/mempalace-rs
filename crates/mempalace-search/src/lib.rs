@@ -1515,6 +1515,7 @@ mod tests {
                     source_file: "team.txt".to_owned(),
                     stale: false,
                     content_hash: None,
+                    view: None,
                 },
                 mempalace_core::SearchResult {
                     drawer_id: None,
@@ -1526,6 +1527,7 @@ mod tests {
                     source_file: "code.txt".to_owned(),
                     stale: false,
                     content_hash: None,
+                    view: None,
                 },
             ],
             None,

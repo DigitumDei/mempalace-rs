@@ -272,6 +272,7 @@ impl FederationRouter {
                     wing: wing_owned,
                     room: room_owned,
                     limit: Some(limit),
+                    view: None,
                 };
                 match api.search_drawers(req).await {
                     Ok(response) => {

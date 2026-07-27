@@ -15,7 +15,7 @@ use mempalace_embeddings::{EmbeddingProvider, EmbeddingRequest};
 pub use mempalace_federation;
 use mempalace_federation::{IngestChunkDto, IngestFileDto};
 use mempalace_storage::core::MempalaceError;
-use mempalace_storage::{IngestManifestStore, StorageEngine};
+use mempalace_storage::{DrawerFilter, DrawerStore, IngestManifestStore, StorageEngine};
 use serde_json::Value;
 use thiserror::Error;
 use time::{Date, OffsetDateTime};

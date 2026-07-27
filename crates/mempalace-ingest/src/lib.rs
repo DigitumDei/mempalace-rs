@@ -754,11 +754,16 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
         }
     }
 
+    let deleted_paths = if branch_mode && !request.dry_run {
+        compute_deleted_branch_paths(&root)?
+    } else {
+        BTreeSet::new()
+    };
+
     // Deleted paths are not discovered from the worktree, so record a durable
     // branch row for each one. These rows shadow the corresponding canonical
     // path during branch-view composition without depending on vector ranking.
     if branch_mode && !request.dry_run {
-        let deleted_paths = compute_deleted_branch_paths(&root)?;
         let mut tombstone_metadata = view_metadata.clone();
         tombstone_metadata.path_state = "deleted".to_owned();
         let branch = branch_name.as_deref().expect("branch mode has a view name");
@@ -793,7 +798,10 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
             }
             tombstones
         };
-        let tombstone_embedding = if existing_tombstones.len() < deleted_paths.len() {
+        let tombstone_embedding = if deleted_paths
+            .iter()
+            .any(|path| !existing_tombstones.contains(path))
+        {
             embed_chunks(
                 provider,
                 &[Chunk {
@@ -808,21 +816,21 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
         } else {
             Ok(Vec::new())
         }?;
-        for relative_path in deleted_paths {
+        for relative_path in &deleted_paths {
             let source_key = project_branch_source_key(
                 ingest_kind,
                 &project_root_key,
                 &wing_name,
                 branch,
-                &relative_path,
+                relative_path,
             );
-            if existing_tombstones.contains(&relative_path) {
+            if existing_tombstones.contains(relative_path) {
                 continue;
             }
             let drawers = build_drawers_from_embeddings(
                 &wing_id,
                 &source_key,
-                &relative_path,
+                relative_path,
                 ingest_kind,
                 None,
                 &request.agent,
@@ -875,7 +883,6 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
     if branch_mode && !request.dry_run {
         let current_rel_paths: BTreeSet<&str> =
             files.iter().map(|f| f.relative_path.as_str()).collect();
-        let deleted_paths = compute_deleted_branch_paths(&root)?;
         let prefix = branch_name.as_deref().map_or_else(
             || format!("{ingest_kind}:{wing_name}:{project_root_key}:"),
             |branch| format!("{ingest_kind}:{wing_name}:{project_root_key}:{branch}:"),
@@ -5501,14 +5508,49 @@ mod tests {
     }
 
     #[test]
-    fn detect_checkout_view_returns_canonical_for_detached_or_main() {
+    fn detect_checkout_view_detects_canonical_branch_and_unknown_default() {
         let tempdir = tempdir().unwrap();
-        let root = tempdir.path().join("repo");
-        fs::create_dir_all(&root).unwrap();
+        let canonical = tempdir.path().join("canonical");
+        fs::create_dir(&canonical).unwrap();
+        git_init_with_commit(&canonical, "main", &[("file.txt", "contents")]);
+        assert_eq!(detect_checkout_view(&canonical), CheckoutView::Canonical);
 
-        // Without git init, it should be NonGit.
-        let result = detect_checkout_view(&root);
-        assert_eq!(result, CheckoutView::NonGit);
+        let unknown_default = tempdir.path().join("unknown-default");
+        fs::create_dir(&unknown_default).unwrap();
+        git_init_with_commit(&unknown_default, "trunk", &[("file.txt", "contents")]);
+        assert_eq!(detect_checkout_view(&unknown_default), CheckoutView::Canonical);
+    }
+
+    #[test]
+    fn detect_checkout_view_detects_feature_and_detached_head() {
+        let tempdir = tempdir().unwrap();
+        let repo = tempdir.path().join("repo");
+        fs::create_dir(&repo).unwrap();
+        git_init_with_commit(&repo, "main", &[("file.txt", "contents")]);
+
+        let run = |args: &[&str]| {
+            let status = Command::new("git").args(args).current_dir(&repo).status().unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run(&["checkout", "-b", "feature"]);
+        assert!(matches!(
+            detect_checkout_view(&repo),
+            CheckoutView::Branch {
+                view_name,
+                base_ref: Some(base_ref),
+                merge_base: Some(_),
+            } if view_name == "feature" && base_ref == "main"
+        ));
+
+        run(&["checkout", "--detach"]);
+        assert!(matches!(
+            detect_checkout_view(&repo),
+            CheckoutView::Branch {
+                view_name,
+                base_ref: Some(base_ref),
+                merge_base: Some(_),
+            } if view_name.starts_with("detached-") && base_ref == "main"
+        ));
     }
 
     #[test]

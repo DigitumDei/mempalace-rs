@@ -395,7 +395,11 @@ impl StorageEngine {
     async fn prune_orphaned_rows(&self, stale_runs: &[RetryableRun]) -> Result<Vec<DrawerId>> {
         let committed_ids =
             self.operational_store.committed_drawer_ids()?.into_iter().collect::<HashSet<_>>();
-        let all_drawers = self.drawer_store.list_drawers(&DrawerFilter::default()).await?;
+        // Reconciliation operates on physical storage rows, including branch views.
+        let all_drawers = self
+            .drawer_store
+            .list_drawers(&DrawerFilter { include_all_views: true, ..DrawerFilter::default() })
+            .await?;
 
         let stale_ids =
             stale_runs.iter().flat_map(|run| run.chunk_ids.iter().cloned()).collect::<HashSet<_>>();
@@ -1169,6 +1173,40 @@ mod tests {
             .stale_pending_runs(datetime!(2026-04-20 00:00:00 UTC))
             .unwrap();
         assert!(stale_runs.iter().all(|run| run.run.id != created_run.id));
+    }
+
+    #[tokio::test]
+    async fn prunes_orphaned_rows_from_branch_views() {
+        let tempdir = tempdir().unwrap();
+        let engine = StorageEngine::open(tempdir.path(), EmbeddingProfile::Balanced).await.unwrap();
+        let mut stale_drawer = record("project_alpha/backend/branch-0001", "auth.py", [1.0, 0.0, 0.0, 0.0]);
+        stale_drawer.ingest_mode = "projects-branch".to_owned();
+        let drawer_id = stale_drawer.id.clone();
+        engine
+            .operational_store()
+            .create_pending_run(
+                "projects-branch",
+                "project_alpha",
+                &[crate::types::IngestManifestEntry {
+                    run_id: 0,
+                    drawer_id,
+                    source_file: "auth.py".to_owned(),
+                    content_hash: stale_drawer.content_hash.clone(),
+                    status: crate::types::IngestRunStatus::Pending,
+                }],
+                datetime!(2026-04-01 00:00:00 UTC),
+            )
+            .unwrap();
+        engine.drawer_store().put_drawers(&[stale_drawer], DuplicateStrategy::Error).await.unwrap();
+
+        engine.reconcile().await.unwrap();
+
+        let drawers = engine
+            .drawer_store()
+            .list_drawers(&DrawerFilter { include_all_views: true, ..DrawerFilter::default() })
+            .await
+            .unwrap();
+        assert!(drawers.is_empty());
     }
 
     #[tokio::test]

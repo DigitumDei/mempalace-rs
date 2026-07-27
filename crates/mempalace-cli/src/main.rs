@@ -1223,7 +1223,7 @@ where
         };
 
         // Resolve the effective view name for the ingest request
-        let final_view = if full || final_branch == false {
+        let final_view = if full || !final_branch {
             None
         } else {
             explicit_view.clone().or_else(|| {
@@ -1306,9 +1306,12 @@ where
             RouteQuery { wing: Some(&wing_name), room: None, source_file: None },
         );
 
-        let use_remote = rule.mode == RouteMode::Remote
+        // Federated batch ingestion is canonical-only. Keep branch views local
+        // until the batch protocol can carry their metadata end to end.
+        let use_remote = !effective_branch
+            && (rule.mode == RouteMode::Remote
                 || (rule.mode == RouteMode::Combined
-                    && rule.write == WriteTarget::Remote);
+                    && rule.write == WriteTarget::Remote));
         let use_both = !effective_branch
             && rule.mode == RouteMode::Combined
             && rule.write == WriteTarget::Both;

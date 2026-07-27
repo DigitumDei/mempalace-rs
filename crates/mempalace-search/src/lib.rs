@@ -241,6 +241,8 @@ where
         .min(max_candidate_limit);
         let mut matches;
         loop {
+            // LanceDB has no offset paging for vector queries, so each bounded
+            // expansion deliberately reissues the search with a wider window.
             matches = store
                 .search_drawers(&SearchRequest {
                     embedding: query_embedding.clone(),

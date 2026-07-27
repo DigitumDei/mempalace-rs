@@ -382,7 +382,7 @@ impl ToolName {
             },
             Self::Search => ToolDefinition {
                 name: self.as_str(),
-                description: "Semantic search. Returns verbatim drawer content with similarity scores. Results from mined files include `stale: true` when the source file changed since mining. Use `view` to scope to a specific branch view (e.g. 'feature-x') or 'canonical' for the default branch.",
+                description: "Semantic search. Returns verbatim drawer content with similarity scores. Results from mined files include `stale: true` when the source file changed since mining. Use `view` to scope to a specific branch view (e.g. 'feature-x'), 'canonical' for the default branch, or 'full' for every stored repository view.",
                 input_schema: json!({
                     "type":"object",
                     "properties":{
@@ -1045,59 +1045,79 @@ where
             let (include_local, remote_targets) =
                 router.plan_search_targets(wing_str, room_str);
             if !remote_targets.is_empty() {
-                // Fan out: run local search when include_local, then merge with remotes.
-                let local_values: Vec<Value> = if include_local {
-                    self.search
+                let overlay = view
+                    .as_deref()
+                    .is_some_and(|view| view != "canonical" && view != "full");
+                let max_candidate_limit = limit.saturating_mul(10).max(limit);
+                let mut candidate_limit = limit;
+                loop {
+                    // Fan out with a wider bounded window when local branch rows
+                    // shadow remote candidates, matching local overlay semantics.
+                    let local_values: Vec<Value> = if include_local {
+                        self.search
+                            .search(
+                                self.storage.drawer_store(),
+                                &SearchQuery {
+                                    text: query.clone(),
+                                    wing: wing.clone(),
+                                    room: room.clone(),
+                                    limit: candidate_limit,
+                                    profile: self.config.embedding_profile,
+                                    view: view.clone(),
+                                },
+                            )
+                            .await
+                            .map_tool()?
+                            .into_iter()
+                            .map(|result| {
+                                let mut obj = json!({
+                                    "wing": result.wing,
+                                    "room": result.room,
+                                    "similarity": round_similarity(result.score),
+                                    "text": result.content,
+                                    "source_file": result.source_file,
+                                    "content_hash": hash_text(&result.content),
+                                    "origin": "local",
+                                });
+                                if result.stale {
+                                    obj["stale"] = json!(true);
+                                }
+                                if let Some(ref v) = result.view {
+                                    obj["view"] = json!(v);
+                                }
+                                obj
+                            })
+                            .collect()
+                    } else {
+                        vec![]
+                    };
+                    let mut payload = router
                         .search(
-                            self.storage.drawer_store(),
-                            &SearchQuery {
-                                text: query.clone(),
-                                wing: wing.clone(),
-                                room: room.clone(),
-                                limit,
-                                profile: self.config.embedding_profile,
-                                view: view.clone(),
-                            },
+                            local_values,
+                            &query,
+                            wing_str,
+                            room_str,
+                            view.as_deref(),
+                            candidate_limit,
+                            &remote_targets,
                         )
-                        .await
-                        .map_tool()?
-                        .into_iter()
-                        .map(|result| {
-                            let mut obj = json!({
-                                "wing": result.wing,
-                                "room": result.room,
-                                "similarity": round_similarity(result.score),
-                                "text": result.content,
-                                "source_file": result.source_file,
-                                "content_hash": hash_text(&result.content),
-                                "origin": "local",
-                            });
-                            if result.stale {
-                                obj["stale"] = json!(true);
-                            }
-                            if let Some(ref v) = result.view {
-                                obj["view"] = json!(v);
-                            }
-                            obj
-                        })
-                        .collect()
-                } else {
-                    vec![]
-                };
-                let mut payload = router
-                    .search(
-                        local_values,
-                        &query,
-                        wing_str,
-                        room_str,
-                        view.as_deref(),
-                        limit,
-                        &remote_targets,
-                    )
-                    .await?;
-                self.filter_federated_view_overrides(&mut payload, &view, &wing)
-                    .await?;
-                return Ok(payload);
+                        .await?;
+                    let candidate_count = payload["results"].as_array().map_or(0, Vec::len);
+                    self.filter_federated_view_overrides(&mut payload, &view, &wing)
+                        .await?;
+                    let result_count = payload["results"].as_array().map_or(0, Vec::len);
+                    if !overlay
+                        || result_count >= limit
+                        || candidate_count < candidate_limit
+                        || candidate_limit == max_candidate_limit
+                    {
+                        if let Some(results) = payload["results"].as_array_mut() {
+                            results.truncate(limit);
+                        }
+                        return Ok(payload);
+                    }
+                    candidate_limit = candidate_limit.saturating_mul(2).min(max_candidate_limit);
+                }
             }
         }
 
@@ -2940,6 +2960,57 @@ mod tests {
             .put_drawers(&drawers, DuplicateStrategy::Error)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn federated_branch_overrides_suppress_only_matching_wing_and_path() {
+        let harness = test_harness().await;
+        let mut runtime = harness.server.runtime.lock().await;
+        let now = datetime!(2026-04-11 09:00:00 UTC);
+        for (id, source_file, path_state) in [
+            ("wing_code/general/tombstone", "deleted.md", "deleted"),
+            ("wing_code/general/replacement", "changed.md", "present"),
+        ] {
+            let mut override_row = test_diary_drawer(id, "branch overlay", now);
+            override_row.wing = WingId::new("wing_code").unwrap();
+            override_row.room = RoomId::new("general").unwrap();
+            override_row.source_file = source_file.to_owned();
+            override_row.ingest_mode = "projects-branch".to_owned();
+            override_row.view_metadata = Some(mempalace_core::RepositoryViewMetadata {
+                repo_id: "repo".to_owned(),
+                view_name: Some("feature-x".to_owned()),
+                source_path: "/repo".to_owned(),
+                head_commit: Some("head".to_owned()),
+                base_ref: Some("main".to_owned()),
+                merge_base: Some("base".to_owned()),
+                worktree_id: "worktree".to_owned(),
+                path_state: path_state.to_owned(),
+            });
+            runtime
+                .storage
+                .drawer_store()
+                .put_drawers(&[override_row], DuplicateStrategy::Error)
+                .await
+                .unwrap();
+        }
+
+        let mut payload = json!({"results": [
+            {"origin": "alpha", "wing": "wing_code", "source_file": "deleted.md"},
+            {"origin": "alpha", "wing": "wing_code", "source_file": "changed.md"},
+            {"origin": "alpha", "wing": "wing_team", "source_file": "changed.md"}
+        ]});
+        runtime
+            .filter_federated_view_overrides(
+                &mut payload,
+                &Some("feature-x".to_owned()),
+                &None,
+            )
+            .await
+            .unwrap();
+
+        let results = payload["results"].as_array().unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["wing"], "wing_team");
     }
 
     async fn seed_knowledge_graph(server: &McpServer<DeterministicStubProvider>) {

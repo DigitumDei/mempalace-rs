@@ -354,7 +354,7 @@
     }
   },
   "mempalace_search": {
-    "description": "Semantic search. Returns verbatim drawer content with similarity scores. Results from mined files include `stale: true` when the source file changed since mining. Use `view` to scope to a specific branch view (e.g. 'feature-x') or 'canonical' for the default branch.",
+    "description": "Semantic search. Returns verbatim drawer content with similarity scores. Results from mined files include `stale: true` when the source file changed since mining. Use `view` to scope to a specific branch view (e.g. 'feature-x'), 'canonical' for the default branch, or 'full' for every stored repository view.",
     "input_schema": {
       "properties": {
         "limit": {

@@ -761,8 +761,27 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
         let deleted_paths = compute_deleted_branch_paths(&root)?;
         let mut tombstone_metadata = view_metadata.clone();
         tombstone_metadata.path_state = "deleted".to_owned();
+        let branch = branch_name.as_deref().expect("branch mode has a view name");
+        // Fetch all existing tombstones at once. A deletion-heavy branch must
+        // not turn one mine into a sequential storage query per path.
+        let existing_tombstones = engine
+            .drawer_store()
+            .list_drawers(&DrawerFilter {
+                wing: Some(wing_id.clone()),
+                source_files: deleted_paths.iter().cloned().collect(),
+                view: Some(branch.to_owned()),
+                branch_view_only: true,
+                ..DrawerFilter::default()
+            })
+            .await?
+            .into_iter()
+            .filter_map(|drawer| {
+                drawer.view_metadata.as_ref().is_some_and(|metadata| {
+                    metadata.repo_id == view_metadata.repo_id && metadata.path_state == "deleted"
+                }).then_some(drawer.source_file)
+            })
+            .collect::<BTreeSet<_>>();
         for relative_path in deleted_paths {
-            let branch = branch_name.as_deref().expect("branch mode has a view name");
             let source_key = project_branch_source_key(
                 ingest_kind,
                 &project_root_key,
@@ -770,27 +789,7 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
                 branch,
                 &relative_path,
             );
-            let already_deleted = engine
-                .drawer_store()
-                .list_drawers(&DrawerFilter {
-                    wing: Some(wing_id.clone()),
-                    source_file: Some(relative_path.clone()),
-                    view: Some(branch.to_owned()),
-                    branch_view_only: true,
-                    ..DrawerFilter::default()
-                })
-                .await?
-                .iter()
-                .any(|drawer| {
-                    drawer
-                        .view_metadata
-                        .as_ref()
-                        .is_some_and(|metadata| {
-                            metadata.repo_id == view_metadata.repo_id
-                                && metadata.path_state == "deleted"
-                        })
-                });
-            if already_deleted {
+            if existing_tombstones.contains(&relative_path) {
                 continue;
             }
             let drawers = build_drawers(
@@ -819,7 +818,7 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
                 &source_key,
                 &relative_path,
                 ingest_kind,
-                hash_text("removed"),
+                hash_text("Deleted branch path tombstone"),
                 drawers,
             )
             .await?;
@@ -5059,7 +5058,7 @@ mod tests {
         run_git(&["checkout", "-b", "feature"]);
 
         // First mine: modify base.rs and stable.rs + add untracked.rs.  The
-        // stable.rs content deliberately aliases the old tombstone hash sentinel.
+        // stable.rs content deliberately aliases the legacy tombstone hash.
         let changed_content = "fn base() -> i32 { 99 }\n".repeat(5);
         fs::write(repo_dir.join("base.rs"), &changed_content).unwrap();
         fs::write(repo_dir.join("stable.rs"), "removed").unwrap();
@@ -5136,7 +5135,10 @@ mod tests {
             "stable.rs",
         );
         let tombstone = engine.operational_store().get_ingested_file(&sk_stable).unwrap();
-        assert_eq!(tombstone.map(|record| record.content_hash), Some(hash_text("removed")));
+        assert_eq!(
+            tombstone.map(|record| record.content_hash),
+            Some(hash_text("Deleted branch path tombstone"))
+        );
         let tombstone_drawers = engine
             .drawer_store()
             .list_drawers(&DrawerFilter {

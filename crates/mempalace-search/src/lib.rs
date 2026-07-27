@@ -258,6 +258,12 @@ where
                     .collect::<std::collections::HashSet<_>>()
                     .into_iter()
                     .collect();
+                // An empty source-file filter means no filter at the storage
+                // layer, which would load the entire branch view.
+                if source_files.is_empty() {
+                    break;
+                }
+                let view_hall = format!("view:{view}");
                 let overridden_paths = store
                 .list_drawers(&DrawerFilter {
                     view: Some(view.to_owned()),
@@ -275,7 +281,7 @@ where
                         .as_ref()
                         .and_then(|metadata| metadata.view_name.as_deref())
                         .is_some_and(|name| name == view)
-                        || record.hall.as_deref() == Some(&format!("view:{view}"));
+                        || record.hall.as_deref() == Some(view_hall.as_str());
                     is_selected_view.then(|| {
                         (
                             record.view_metadata.as_ref().map(|metadata| metadata.repo_id.clone()),
@@ -285,7 +291,9 @@ where
                     })
                 })
                 .collect::<std::collections::HashSet<_>>();
-                matches.retain(|entry| visible_in_view(&entry.record, view, &overridden_paths));
+                matches.retain(|entry| {
+                    visible_in_view(&entry.record, view, &view_hall, &overridden_paths)
+                });
             }
             if matches.len() >= query.limit || candidate_count < candidate_limit {
                 break;
@@ -434,6 +442,7 @@ where
 fn visible_in_view(
     record: &DrawerRecord,
     view: &str,
+    view_hall: &str,
     overridden_paths: &std::collections::HashSet<(Option<String>, WingId, String)>,
 ) -> bool {
     let selected_branch = record
@@ -441,7 +450,7 @@ fn visible_in_view(
         .as_ref()
         .and_then(|metadata| metadata.view_name.as_deref())
         .is_some_and(|name| name == view)
-        || record.hall.as_deref() == Some(&format!("view:{view}"));
+        || record.hall.as_deref() == Some(view_hall);
     if selected_branch
         && record
             .view_metadata

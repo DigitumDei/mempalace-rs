@@ -856,7 +856,6 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
                 drawers,
             )
             .await?;
-            summary.removed_sources += 1;
             summary.drawers_written += drawer_count;
         }
     }
@@ -5170,9 +5169,9 @@ mod tests {
         .await
         .unwrap();
 
-        // base.rs is no longer in the delta (reverted), stable.rs is a durable
+        // base.rs is no longer in the delta (reverted), stable.rs gains a durable
         // tombstone, and untracked.rs still is part of the branch delta.
-        assert_eq!(second.removed_sources, 2);
+        assert_eq!(second.removed_sources, 1);
 
         // Reverting a branch replacement removes the branch state entirely so
         // a later deletion can create a fresh durable tombstone.

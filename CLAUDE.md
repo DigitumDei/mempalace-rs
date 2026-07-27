@@ -12,7 +12,7 @@ cargo check --workspace --all-targets --locked
 
 Requires `protoc` (`protobuf-compiler`) — `mempalace-storage` pulls it in via `lancedb`.
 `rusqlite` uses the `bundled` feature, so a C toolchain is needed too. On a cold box, run
-`scripts/cloud-setup.sh`; see [docs/Cloud-Environment.md](docs/Cloud-Environment.md).
+`bash scripts/cloud-setup.sh`; see [docs/Cloud-Environment.md](docs/Cloud-Environment.md).
 
 ## Test
 

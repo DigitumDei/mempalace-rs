@@ -3,8 +3,13 @@
 Everything needed to stand up a cloud sandbox — Claude Code on the web, a CI runner, or any
 fresh Linux box — that can build and test this workspace.
 
-The short version: run [`scripts/cloud-setup.sh`](../scripts/cloud-setup.sh) on Ubuntu 24.04
-with the required domains reachable. The rest of this page explains what that script assumes.
+The short version — on Ubuntu 24.04, with the domains below reachable:
+
+```bash
+bash scripts/cloud-setup.sh
+```
+
+The rest of this page explains what that script assumes.
 
 ## Base image
 
@@ -101,7 +106,7 @@ it for that command and add the HuggingFace domains for that environment.
 
 ## Setting up Claude Code on the web
 
-1. Point the environment's setup script at [`scripts/cloud-setup.sh`](../scripts/cloud-setup.sh).
+1. Set the environment's setup command to `bash scripts/cloud-setup.sh`.
 2. Add the "Yes" domains from the allowlist above to the environment's firewall configuration.
 3. Set the environment variables above.
 4. Take the snapshot **after** the setup script completes, so `~/.cargo/registry`,

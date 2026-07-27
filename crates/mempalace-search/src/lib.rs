@@ -232,11 +232,13 @@ where
         // Search wider until overlay filtering leaves a complete result window.
         // A low-scoring branch replacement must shadow its canonical path without
         // causing unrelated later candidates to disappear from the response.
+        let max_candidate_limit = query.limit.saturating_mul(10).max(query.limit);
         let mut candidate_limit = if rerank_enabled {
             query.limit.saturating_mul(2)
         } else {
             query.limit
-        };
+        }
+        .min(max_candidate_limit);
         let mut matches;
         loop {
             matches = store
@@ -265,33 +267,30 @@ where
                 }
                 let view_hall = format!("view:{view}");
                 let overridden_paths = store
-                .list_drawers(&DrawerFilter {
-                    view: Some(view.to_owned()),
-                    wing: query.wing.clone(),
-                    // Tombstones live in `general`, but shadow their path in every room.
-                    room: None,
-                    branch_view_only: true,
-                    source_files,
-                    ..DrawerFilter::default()
-                })
-                .await?
-                .into_iter()
-                .filter_map(|record| {
-                    let is_selected_view = record
-                        .view_metadata
-                        .as_ref()
-                        .and_then(|metadata| metadata.view_name.as_deref())
-                        .is_some_and(|name| name == view)
-                        || record.hall.as_deref() == Some(view_hall.as_str());
-                    is_selected_view.then(|| {
-                        (
-                            record.view_metadata.as_ref().map(|metadata| metadata.repo_id.clone()),
-                            record.wing,
-                            record.source_file,
-                        )
+                    .list_drawers(&DrawerFilter {
+                        view: Some(view.to_owned()),
+                        wing: query.wing.clone(),
+                        // Tombstones live in `general`, but shadow their path in every room.
+                        room: None,
+                        branch_view_only: true,
+                        source_files,
+                        ..DrawerFilter::default()
                     })
-                })
-                .collect::<std::collections::HashSet<_>>();
+                    .await?
+                    .into_iter()
+                    .filter_map(|record| {
+                        let is_selected_view = record
+                            .view_metadata
+                            .as_ref()
+                            .and_then(|metadata| metadata.view_name.as_deref())
+                            .is_some_and(|name| name == view)
+                            || record.hall.as_deref() == Some(view_hall.as_str());
+                        // Mixed-version replicas may not share a durable repository ID.
+                        // The wing and project-relative source path are the stable
+                        // compatibility key for overlay composition.
+                        is_selected_view.then(|| (record.wing, record.source_file))
+                    })
+                    .collect::<std::collections::HashSet<_>>();
                 matches.retain(|entry| {
                     visible_in_view(&entry.record, view, &view_hall, &overridden_paths)
                 });
@@ -300,10 +299,10 @@ where
                 break;
             }
             let next_limit = candidate_limit.saturating_mul(2);
-            if next_limit == candidate_limit {
+            if next_limit == candidate_limit || candidate_limit == max_candidate_limit {
                 break;
             }
-            candidate_limit = next_limit;
+            candidate_limit = next_limit.min(max_candidate_limit);
         }
 
         // Resolve locator-backed records in place BEFORE ranking so that
@@ -444,7 +443,7 @@ fn visible_in_view(
     record: &DrawerRecord,
     view: &str,
     view_hall: &str,
-    overridden_paths: &std::collections::HashSet<(Option<String>, WingId, String)>,
+    overridden_paths: &std::collections::HashSet<(WingId, String)>,
 ) -> bool {
     let selected_branch = record
         .view_metadata
@@ -466,15 +465,7 @@ fn visible_in_view(
     if record.ingest_mode != "projects" {
         return true;
     }
-    let repo_id = record.view_metadata.as_ref().map(|metadata| metadata.repo_id.clone());
-    !overridden_paths.contains(&(repo_id, record.wing.clone(), record.source_file.clone()))
-        && !overridden_paths.contains(&(None, record.wing.clone(), record.source_file.clone()))
-        // Legacy rows and mixed-version replicas may not share a durable
-        // repository ID yet. Within a wing, the project-relative source path
-        // remains the compatibility key for overlay composition.
-        && !overridden_paths.iter().any(|(_, wing, path)| {
-            wing == &record.wing && path == &record.source_file
-        })
+    !overridden_paths.contains(&(record.wing.clone(), record.source_file.clone()))
 }
 
 fn default_identity_path() -> Option<PathBuf> {

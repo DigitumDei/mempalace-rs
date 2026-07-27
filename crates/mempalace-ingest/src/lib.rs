@@ -767,24 +767,47 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
         let existing_tombstones = if deleted_paths.is_empty() {
             BTreeSet::new()
         } else {
-            engine
-                .drawer_store()
-                .list_drawers(&DrawerFilter {
-                    wing: Some(wing_id.clone()),
-                    source_files: deleted_paths.iter().cloned().collect(),
-                    view: Some(branch.to_owned()),
-                    branch_view_only: true,
-                    ..DrawerFilter::default()
-                })
-                .await?
-                .into_iter()
-                .filter_map(|drawer| {
-                    drawer.view_metadata.as_ref().is_some_and(|metadata| {
-                        metadata.repo_id == view_metadata.repo_id && metadata.path_state == "deleted"
-                    }).then_some(drawer.source_file)
-                })
-                .collect::<BTreeSet<_>>()
+            let mut tombstones = BTreeSet::new();
+            // Bound SQL `IN` predicates so deletion-heavy branches do not exceed
+            // the storage backend's query limits.
+            for paths in deleted_paths.iter().collect::<Vec<_>>().chunks(500) {
+                tombstones.extend(
+                    engine
+                        .drawer_store()
+                        .list_drawers(&DrawerFilter {
+                            wing: Some(wing_id.clone()),
+                            source_files: paths.iter().map(|path| (*path).clone()).collect(),
+                            view: Some(branch.to_owned()),
+                            branch_view_only: true,
+                            ..DrawerFilter::default()
+                        })
+                        .await?
+                        .into_iter()
+                        .filter_map(|drawer| {
+                            drawer.view_metadata.as_ref().is_some_and(|metadata| {
+                                metadata.repo_id == view_metadata.repo_id
+                                    && metadata.path_state == "deleted"
+                            }).then_some(drawer.source_file)
+                        }),
+                );
+            }
+            tombstones
         };
+        let tombstone_embedding = if existing_tombstones.len() < deleted_paths.len() {
+            embed_chunks(
+                provider,
+                &[Chunk {
+                    content: "Deleted branch path tombstone".to_owned(),
+                    date_hint: None,
+                    room_hint: Some("general".to_owned()),
+                    byte_range: None,
+                    chunk_index: 0,
+                }],
+                request.max_embed_batch_size,
+            )
+        } else {
+            Ok(Vec::new())
+        }?;
         for relative_path in deleted_paths {
             let source_key = project_branch_source_key(
                 ingest_kind,
@@ -796,15 +819,13 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
             if existing_tombstones.contains(&relative_path) {
                 continue;
             }
-            let drawers = build_drawers(
-                provider,
+            let drawers = build_drawers_from_embeddings(
                 &wing_id,
                 &source_key,
                 &relative_path,
                 ingest_kind,
                 None,
                 &request.agent,
-                request.max_embed_batch_size,
                 vec![Chunk {
                     content: "Deleted branch path tombstone".to_owned(),
                     date_hint: None,
@@ -815,6 +836,7 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
                 None,
                 branch_name.as_deref(),
                 Some(&tombstone_metadata),
+                tombstone_embedding.clone(),
             )?;
             let drawer_count = drawers.len();
             replace_source_drawers(
@@ -1026,6 +1048,34 @@ fn build_drawers<P: EmbeddingProvider>(
     // Embed using the real chunk text.
     let embeddings = embed_chunks(provider, &chunks, max_embed_batch_size)?;
 
+    build_drawers_from_embeddings(
+        wing,
+        source_key,
+        source_file,
+        ingest_mode,
+        extract_mode,
+        agent,
+        chunks,
+        locator_ctx,
+        view,
+        view_metadata,
+        embeddings,
+    )
+}
+
+fn build_drawers_from_embeddings(
+    wing: &WingId,
+    source_key: &str,
+    source_file: &str,
+    ingest_mode: &str,
+    extract_mode: Option<&str>,
+    agent: &str,
+    chunks: Vec<Chunk>,
+    locator_ctx: Option<&ProjectLocatorContext<'_>>,
+    view: Option<&str>,
+    view_metadata: Option<&mempalace_core::RepositoryViewMetadata>,
+    embeddings: Vec<Vec<f32>>,
+) -> Result<Vec<DrawerRecord>> {
     let mut drawers = Vec::with_capacity(chunks.len());
     for (i, (chunk, embedding)) in chunks.into_iter().zip(embeddings.into_iter()).enumerate() {
         let room_name = chunk.room_hint.unwrap_or_else(|| "general".to_owned());

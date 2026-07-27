@@ -39,15 +39,19 @@ extra target triples, so give the box headroom rather than the minimum.
 ## System packages
 
 ```
-build-essential ca-certificates curl git pkg-config protobuf-compiler
+build-essential ca-certificates curl git libssl-dev pkg-config protobuf-compiler
 ```
 
-Two of these are load-bearing in ways the crate names don't advertise:
+Three of these are load-bearing in ways the crate names don't advertise:
 
 - **`protobuf-compiler`** (`protoc`) — required by `mempalace-storage` through
   `lancedb` → `lance`. Without it `cargo check --workspace` fails outright.
 - **`build-essential`** — `rusqlite` uses the `bundled` feature, so SQLite is compiled from
   C source on every fresh machine.
+- **`libssl-dev`** — `openssl-sys` is *not* vendored (there is no `openssl-src` in
+  `Cargo.lock`), so it links the system OpenSSL through `pkg-config`. A minimal image that
+  ships only the OpenSSL runtime has neither the headers nor the `.pc` file, and neither
+  `build-essential` nor `pkg-config` supplies them.
 
 ## Toolchain
 
@@ -64,10 +68,23 @@ git-sourced dependencies** in `Cargo.lock`, so the build needs nothing beyond th
 |---|---|---|
 | `crates.io`, `index.crates.io`, `static.crates.io` | Cargo registry index and crate downloads | Yes |
 | `cdn.pyke.io` | Prebuilt ONNX Runtime, fetched by the `ort-sys` build script | **Yes — the build fails without it** |
-| `archive.ubuntu.com`, `security.ubuntu.com` (`ports.ubuntu.com` on arm64) | `apt-get install` of the packages above | Yes, unless baked into the image |
+| Your image's APT mirror — see below | `apt-get install` of the packages above | Yes, unless baked into the image |
 | `static.rust-lang.org`, `sh.rustup.rs` | rustup and toolchain downloads | Only if Rust is absent or needs pinning |
 | `github.com`, `api.github.com`, `objects.githubusercontent.com` | `gh` CLI — PRs, CI logs | Only if the session uses `gh` |
 | `huggingface.co`, `cdn-lfs.huggingface.co`, `cdn-lfs-us-1.hf.co` | Embedding model weights, at runtime | **No** — see below |
+
+**Don't assume the canonical Ubuntu mirrors.** Cloud images usually point APT at a provider or
+regional mirror — `azure.archive.ubuntu.com`, `<region>.ec2.archive.ubuntu.com`,
+`ports.ubuntu.com` on arm64, and so on. Read the actual hosts off the image rather than
+allowlisting `archive.ubuntu.com` and hoping:
+
+```bash
+grep -rhoE 'https?://[^ ]+' /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null \
+  | sed -E 's|https?://([^/]+).*|\1|' | sort -u
+```
+
+Allow every host that prints. (Alternatively, rewrite the image's sources to the canonical
+hosts, or bake the packages into the image and skip APT egress entirely.)
 
 `cdn.pyke.io` is the one people miss. `ort-sys` downloads a hash-verified ONNX Runtime tarball
 from there (e.g.

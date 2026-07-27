@@ -1,8 +1,16 @@
 # mempalace-rs — instructions for Claude
 
 A Rust workspace of 14 crates implementing MemPalace, a local-first memory store for LLM
-agents. Everything runs on the local machine — there are no external API calls in the product
-path, and changes should keep it that way.
+agents.
+
+**The invariant to protect:** memory never leaves the user's control by default. Embeddings,
+search, and the knowledge graph run locally — no third-party model or inference APIs, no
+telemetry, no analytics. Don't introduce one.
+
+Federation is the deliberate exception and is a supported product path: `mempalace-remote`
+(`RemoteClient`, reqwest-backed) and `mempalace-server` speak HTTP to a palace endpoint the
+user configured themselves, opt-in per wing via `local`/`remote`/`combined` routing. Work on
+that path is normal work — see [docs/Federation.md](docs/Federation.md).
 
 ## Build
 

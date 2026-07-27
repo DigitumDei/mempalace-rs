@@ -19,6 +19,10 @@ fi
 #    protobuf-compiler: required by mempalace-storage via lancedb/lance.
 #    build-essential:   rusqlite uses the `bundled` feature, so SQLite is
 #                       compiled from source.
+#    libssl-dev:        openssl-sys is not vendored (no openssl-src in
+#                       Cargo.lock), so it links the system OpenSSL via
+#                       pkg-config and needs the headers, which a minimal
+#                       image carrying only the runtime does not have.
 log "Installing system packages"
 $SUDO apt-get update
 $SUDO apt-get install -y --no-install-recommends \
@@ -26,6 +30,7 @@ $SUDO apt-get install -y --no-install-recommends \
 	ca-certificates \
 	curl \
 	git \
+	libssl-dev \
 	pkg-config \
 	protobuf-compiler
 

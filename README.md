@@ -102,9 +102,11 @@ If you don't have the PEM path, open `certmgr.msc`, find your proxy's root certi
 
 ### 2. ONNX Runtime (downloaded by the embeddings layer's build script)
 
-The `ort-sys` build script downloads a prebuilt ONNX Runtime binary. The embeddings crate enables fastembed's `ort-download-binaries-native-tls` feature, so this download uses the OS **native TLS** stack (Windows Schannel) and trusts your proxy's CA from the system certificate store. As long as that root certificate is installed (which Netskope and Zscaler both do by default), **no configuration is needed** — the default rustls-based variant, which ignores the system store and fails behind such a proxy, is not used.
+The `ort-sys` build script downloads a prebuilt ONNX Runtime binary from `cdn.pyke.io` (for example `https://cdn.pyke.io/0/pyke:ort-rs/ms@1.23.2/x86_64-pc-windows-msvc.tar.lzma2`), verifies its hash, and caches it under your local cache directory in `ort.pyke.io/dfbin`. The embeddings crate enables fastembed's `ort-download-binaries-native-tls` feature, so this download uses the OS **native TLS** stack (Windows Schannel) and trusts your proxy's CA from the system certificate store. As long as that root certificate is installed (which Netskope and Zscaler both do by default), **no configuration is needed** — the default rustls-based variant, which ignores the system store and fails behind such a proxy, is not used.
 
-**Offline / air-gapped fallback.** If the build can't reach GitHub at all (rather than a TLS-trust problem), download ONNX Runtime once and point the build at it. Using PowerShell:
+If your firewall filters by domain rather than inspecting TLS, allow `cdn.pyke.io` — the build cannot complete without it.
+
+**Offline / air-gapped fallback.** If the build can't reach `cdn.pyke.io` at all (rather than a TLS-trust problem), download a matching ONNX Runtime release once and point the build at it. Using PowerShell:
 
 ```powershell
 Invoke-WebRequest -Uri "https://github.com/microsoft/onnxruntime/releases/download/v1.23.2/onnxruntime-win-x64-1.23.2.zip" -OutFile "$env:TEMP\onnxruntime.zip"
@@ -136,6 +138,7 @@ Both are already configured in the workspace — no additional setup is needed a
 - [CLI surface](docs/CLI-Surface.md) — all commands
 - [Config schema](docs/Config-Schema.md) — `~/.mempalace/config.json`
 - [Low-CPU mode](docs/Operator-Low-CPU.md) — constrained environments
+- [Cloud environment](docs/Cloud-Environment.md) — building and testing in a cloud sandbox or CI runner
 - [Mined storage](docs/Mined-Storage.md) — locator model, stale semantics, discovery rules
 - [Federation](docs/Federation.md) — running a server, client routing, federated & branch-aware mining
 - [Hook setup](hooks/README.md) — auto-save for Claude Code

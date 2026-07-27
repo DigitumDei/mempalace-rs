@@ -283,7 +283,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Validate shell syntax
-        run: bash -n install.sh release/*.sh release/tests/*.sh
+        run: bash -n install.sh release/*.sh release/tests/*.sh scripts/*.sh
 
       - name: Validate PowerShell installer syntax
         shell: pwsh

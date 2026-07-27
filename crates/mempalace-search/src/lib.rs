@@ -252,7 +252,7 @@ where
                 // Discover only branch paths represented in this candidate window.
                 // Their branch rows may rank poorly, but must still shadow the
                 // matching canonical candidate without loading the whole branch.
-                let source_files = matches
+                let source_files: Vec<String> = matches
                     .iter()
                     .map(|entry| entry.record.source_file.clone())
                     .collect::<std::collections::HashSet<_>>()

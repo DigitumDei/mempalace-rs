@@ -1592,7 +1592,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn branch_override_shadows_canonical_outside_search_candidates() {
+    async fn branch_override_replaces_canonical_outside_search_candidates() {
         let mut runtime = SearchRuntime::new(StubProvider { response: vec![embedding(0.0)] });
         let store = StubStore {
             drawers: vec![
@@ -1632,7 +1632,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(results.is_empty(), "canonical content must not leak through an override");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].content, "Unrelated branch replacement.");
     }
 
     #[tokio::test]

@@ -771,10 +771,24 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
                 &relative_path,
             );
             let already_deleted = engine
-                .operational_store()
-                .get_ingested_file(&source_key)?
-                .is_some_and(|existing| {
-                    existing.content_hash == hash_text("removed") && existing.drawer_count > 0
+                .drawer_store()
+                .list_drawers(&DrawerFilter {
+                    wing: Some(wing_id.clone()),
+                    source_file: Some(relative_path.clone()),
+                    view: Some(branch.to_owned()),
+                    branch_view_only: true,
+                    ..DrawerFilter::default()
+                })
+                .await?
+                .iter()
+                .any(|drawer| {
+                    drawer
+                        .view_metadata
+                        .as_ref()
+                        .is_some_and(|metadata| {
+                            metadata.repo_id == view_metadata.repo_id
+                                && metadata.path_state == "deleted"
+                        })
                 });
             if already_deleted {
                 continue;
@@ -5044,9 +5058,11 @@ mod tests {
         };
         run_git(&["checkout", "-b", "feature"]);
 
-        // First mine: modify base.rs + add untracked.rs
+        // First mine: modify base.rs and stable.rs + add untracked.rs.  The
+        // stable.rs content deliberately aliases the old tombstone hash sentinel.
         let changed_content = "fn base() -> i32 { 99 }\n".repeat(5);
         fs::write(repo_dir.join("base.rs"), &changed_content).unwrap();
+        fs::write(repo_dir.join("stable.rs"), "removed").unwrap();
         let new_content = "fn new_func() -> bool { true }\n".repeat(5);
         fs::write(repo_dir.join("untracked.rs"), &new_content).unwrap();
 
@@ -5070,7 +5086,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(first.ingested_files, 2);
+        assert_eq!(first.ingested_files, 3);
         assert_eq!(first.removed_sources, 0);
 
         // Revert base.rs to original content and delete a canonical file.
@@ -5121,6 +5137,23 @@ mod tests {
         );
         let tombstone = engine.operational_store().get_ingested_file(&sk_stable).unwrap();
         assert_eq!(tombstone.map(|record| record.content_hash), Some(hash_text("removed")));
+        let tombstone_drawers = engine
+            .drawer_store()
+            .list_drawers(&DrawerFilter {
+                view: Some("feature".to_owned()),
+                branch_view_only: true,
+                source_file: Some("stable.rs".to_owned()),
+                ..DrawerFilter::default()
+            })
+            .await
+            .unwrap();
+        assert!(!tombstone_drawers.is_empty());
+        assert!(tombstone_drawers.iter().all(|drawer| {
+            drawer
+                .view_metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.path_state == "deleted")
+        }));
 
         let third = ingest_project(
             &engine,

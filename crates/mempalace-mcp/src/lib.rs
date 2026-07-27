@@ -2,7 +2,7 @@
 
 mod federation;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1045,27 +1045,6 @@ where
             let (include_local, remote_targets) =
                 router.plan_search_targets(wing_str, room_str);
             if !remote_targets.is_empty() {
-                let local_override_paths = if let Some(view) = view
-                    .as_deref()
-                    .filter(|view| *view != "canonical" && *view != "full")
-                {
-                    self.storage
-                        .drawer_store()
-                        .list_drawers(&DrawerFilter {
-                            wing: wing.clone(),
-                            room: room.clone(),
-                            view: Some(view.to_owned()),
-                            branch_view_only: true,
-                            ..DrawerFilter::default()
-                        })
-                        .await
-                        .map_tool()?
-                        .into_iter()
-                        .map(|record| (record.wing.as_str().to_owned(), record.source_file))
-                        .collect()
-                } else {
-                    std::collections::HashSet::new()
-                };
                 // Fan out: run local search when include_local, then merge with remotes.
                 let local_values: Vec<Value> = if include_local {
                     self.search
@@ -1105,7 +1084,7 @@ where
                 } else {
                     vec![]
                 };
-                return router
+                let mut payload = router
                     .search(
                         local_values,
                         &query,
@@ -1114,9 +1093,11 @@ where
                         view.as_deref(),
                         limit,
                         &remote_targets,
-                        &local_override_paths,
                     )
-                    .await;
+                    .await?;
+                self.filter_federated_view_overrides(&mut payload, &view, &wing)
+                    .await?;
+                return Ok(payload);
             }
         }
 
@@ -1161,6 +1142,61 @@ where
             }).collect::<Vec<_>>()
         });
         Ok(payload)
+    }
+
+    /// Branch rows only need to be loaded for paths returned by remote search.
+    /// Loading the entire branch view here would materialize every embedding and
+    /// chunk merely to discover paths that could not affect this response.
+    async fn filter_federated_view_overrides(
+        &self,
+        payload: &mut Value,
+        view: &Option<String>,
+        wing: &Option<WingId>,
+    ) -> ToolResult<()> {
+        let Some(view) = view
+            .as_deref()
+            .filter(|view| *view != "canonical" && *view != "full")
+        else {
+            return Ok(());
+        };
+        let Some(results) = payload["results"].as_array() else {
+            return Ok(());
+        };
+        let remote_paths: HashSet<String> = results
+            .iter()
+            .filter(|result| result["origin"].as_str() != Some("local"))
+            .filter_map(|result| result["source_file"].as_str().map(str::to_owned))
+            .collect();
+        if remote_paths.is_empty() {
+            return Ok(());
+        }
+        let local_override_paths: HashSet<(String, String)> = self
+            .storage
+            .drawer_store()
+            .list_drawers(&DrawerFilter {
+                wing: wing.clone(),
+                source_files: remote_paths.into_iter().collect(),
+                view: Some(view.to_owned()),
+                branch_view_only: true,
+                ..DrawerFilter::default()
+            })
+            .await
+            .map_tool()?
+            .into_iter()
+            .map(|record| (record.wing.as_str().to_owned(), record.source_file))
+            .collect();
+        if let Some(results) = payload["results"].as_array_mut() {
+            results.retain(|result| {
+                result["origin"].as_str() == Some("local")
+                    || !matches!(
+                        (result["wing"].as_str(), result["source_file"].as_str()),
+                        (Some(wing), Some(path))
+                            if local_override_paths
+                                .contains(&(wing.to_owned(), path.to_owned()))
+                    )
+            });
+        }
+        Ok(())
     }
 
     async fn tool_check_duplicate(&mut self, arguments: &Value) -> ToolResult<Value> {

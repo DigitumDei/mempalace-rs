@@ -69,9 +69,16 @@ git-sourced dependencies** in `Cargo.lock`, so the build needs nothing beyond th
 | `crates.io`, `index.crates.io`, `static.crates.io` | Cargo registry index and crate downloads | Yes |
 | `cdn.pyke.io` | Prebuilt ONNX Runtime, fetched by the `ort-sys` build script | **Yes — the build fails without it** |
 | Your image's APT mirror — see below | `apt-get install` of the packages above | Yes, unless baked into the image |
-| `static.rust-lang.org`, `sh.rustup.rs` | rustup and toolchain downloads | Only if Rust is absent or needs pinning |
+| `static.rust-lang.org`, `sh.rustup.rs` | rustup, the stable toolchain, and the `clippy`/`rustfmt` components | Yes, for the documented workflow — see below |
 | `github.com`, `api.github.com`, `objects.githubusercontent.com` | `gh` CLI — PRs, CI logs | Only if the session uses `gh` |
 | `huggingface.co`, `cdn-lfs.huggingface.co`, `cdn-lfs-us-1.hf.co` | Embedding model weights, at runtime | **No** — see below |
+
+**The Rust hosts are needed even when the image ships Rust.** `scripts/cloud-setup.sh` installs
+rustup only if it is missing, but it *always* runs `rustup toolchain install stable`, which
+contacts `static.rust-lang.org` for the channel manifest and for the `clippy`/`rustfmt`
+components a preinstalled toolchain often lacks. `sh.rustup.rs` is needed only on an image with
+no rustup at all. You can drop both hosts only if the image already provides stable ≥ 1.88 with
+both components and you skip the toolchain section of the script.
 
 **Don't assume the canonical Ubuntu mirrors.** Cloud images usually point APT at a provider or
 regional mirror — `azure.archive.ubuntu.com`, `<region>.ec2.archive.ubuntu.com`,
@@ -124,7 +131,17 @@ it for that command and add the HuggingFace domains for that environment.
 ## Setting up Claude Code on the web
 
 1. Set the environment's setup command to `bash scripts/cloud-setup.sh`.
-2. Add the "Yes" domains from the allowlist above to the environment's firewall configuration.
+2. Add these to the environment's firewall configuration:
+
+   ```
+   crates.io  index.crates.io  static.crates.io
+   cdn.pyke.io
+   static.rust-lang.org  sh.rustup.rs
+   ```
+
+   …plus your image's APT mirror hosts, and `github.com`/`api.github.com`/
+   `objects.githubusercontent.com` if the session should use `gh`. See the allowlist above for
+   what each one is for and when it can be dropped.
 3. Set the environment variables above.
 4. Take the snapshot **after** the setup script completes, so `~/.cargo/registry`,
    `~/.cache/ort.pyke.io`, and `target/` are baked in. Without this, every session pays the

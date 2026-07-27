@@ -457,12 +457,14 @@ fn visible_in_view(
         return true;
     }
     let repo_id = record.view_metadata.as_ref().map(|metadata| metadata.repo_id.clone());
-    overridden_paths.contains(&(repo_id, record.wing.clone(), record.source_file.clone()))
-        || overridden_paths.contains(&(None, record.wing.clone(), record.source_file.clone()))
-        || record.view_metadata.is_none()
-            && overridden_paths.iter().any(|(_, wing, path)| {
-                wing == &record.wing && path == &record.source_file
-            })
+    !overridden_paths.contains(&(repo_id, record.wing.clone(), record.source_file.clone()))
+        && !overridden_paths.contains(&(None, record.wing.clone(), record.source_file.clone()))
+        // Legacy rows and mixed-version replicas may not share a durable
+        // repository ID yet. Within a wing, the project-relative source path
+        // remains the compatibility key for overlay composition.
+        && !overridden_paths.iter().any(|(_, wing, path)| {
+            wing == &record.wing && path == &record.source_file
+        })
 }
 
 fn default_identity_path() -> Option<PathBuf> {

@@ -1462,6 +1462,7 @@ fn compute_deleted_branch_paths(root: &Path) -> Result<BTreeSet<String>> {
             "--name-only",
             "--no-renames",
             "--diff-filter=D",
+            "--relative",
             "-z",
             &merge_base,
         ])
@@ -1472,26 +1473,19 @@ fn compute_deleted_branch_paths(root: &Path) -> Result<BTreeSet<String>> {
             reason: "git diff for deleted paths failed".to_owned(),
         });
     }
-    let repo_root = git_repo_toplevel(root).ok_or_else(|| IngestError::BranchDeltaUnavailable {
-        reason: "git rev-parse --show-toplevel failed".to_owned(),
-    })?;
-    let repo_root = repo_root.canonicalize().unwrap_or(repo_root);
     let mut deleted = BTreeSet::new();
     for path in output.stdout.split(|&byte| byte == 0).filter(|path| !path.is_empty()) {
         let Ok(path) = std::str::from_utf8(path) else { continue };
-        let absolute = repo_root.join(path.replace('/', std::path::MAIN_SEPARATOR_STR));
-        if let Ok(relative) = absolute.strip_prefix(root) {
-            let relative = relative
-                .components()
-                .filter_map(|component| match component {
-                    Component::Normal(part) => part.to_str(),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("/");
-            if !relative.is_empty() {
-                deleted.insert(relative);
-            }
+        let relative = Path::new(path)
+            .components()
+            .filter_map(|component| match component {
+                Component::Normal(part) => part.to_str(),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("/");
+        if !relative.is_empty() {
+            deleted.insert(relative);
         }
     }
     Ok(deleted)

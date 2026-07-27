@@ -1061,7 +1061,7 @@ where
                         .await
                         .map_tool()?
                         .into_iter()
-                        .map(|record| record.source_file)
+                        .map(|record| (record.wing.as_str().to_owned(), record.source_file))
                         .collect()
                 } else {
                     std::collections::HashSet::new()

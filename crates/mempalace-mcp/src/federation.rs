@@ -251,7 +251,7 @@ impl FederationRouter {
         view: Option<&str>,
         limit: usize,
         remote_targets: &[String],
-        local_override_paths: &std::collections::HashSet<String>,
+        local_override_paths: &std::collections::HashSet<(String, String)>,
     ) -> ToolResult<Value> {
         if remote_targets.is_empty() {
             return Ok(search_payload(query, wing, room, local_results, &[]));
@@ -285,9 +285,13 @@ impl FederationRouter {
                             .into_iter()
                             .map(|r| drawer_result_to_value(r, &name))
                             .filter(|result| {
-                                match result["source_file"].as_str() {
-                                    Some(path) => !local_override_paths.contains(path),
-                                    None => true,
+                                match (
+                                    result["wing"].as_str(),
+                                    result["source_file"].as_str(),
+                                ) {
+                                    (Some(wing), Some(path)) => !local_override_paths
+                                        .contains(&(wing.to_owned(), path.to_owned())),
+                                    _ => true,
                                 }
                             })
                             .collect();
@@ -2392,6 +2396,40 @@ mod tests {
             .unwrap();
 
         assert_eq!(*received_search_view.lock().unwrap(), Some("feature-x".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn search_keeps_remote_path_from_another_wing() {
+        let mut mock = MockRemote::default();
+        mock.search_results = vec![json!({
+            "wing":"remote_wing",
+            "room":"r",
+            "source_file":"README.md",
+            "similarity":0.8,
+            "text":"remote hit"
+        })];
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+        let local_overrides = [("local_wing".to_owned(), "README.md".to_owned())]
+            .into_iter()
+            .collect();
+
+        let result = router
+            .search(
+                vec![],
+                "test",
+                None,
+                None,
+                Some("feature-x"),
+                10,
+                &["alpha".to_owned()],
+                &local_overrides,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result["results"].as_array().unwrap().len(), 1);
     }
 
     #[tokio::test]

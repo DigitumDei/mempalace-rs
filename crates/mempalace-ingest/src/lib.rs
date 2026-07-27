@@ -764,23 +764,27 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
         let branch = branch_name.as_deref().expect("branch mode has a view name");
         // Fetch all existing tombstones at once. A deletion-heavy branch must
         // not turn one mine into a sequential storage query per path.
-        let existing_tombstones = engine
-            .drawer_store()
-            .list_drawers(&DrawerFilter {
-                wing: Some(wing_id.clone()),
-                source_files: deleted_paths.iter().cloned().collect(),
-                view: Some(branch.to_owned()),
-                branch_view_only: true,
-                ..DrawerFilter::default()
-            })
-            .await?
-            .into_iter()
-            .filter_map(|drawer| {
-                drawer.view_metadata.as_ref().is_some_and(|metadata| {
-                    metadata.repo_id == view_metadata.repo_id && metadata.path_state == "deleted"
-                }).then_some(drawer.source_file)
-            })
-            .collect::<BTreeSet<_>>();
+        let existing_tombstones = if deleted_paths.is_empty() {
+            BTreeSet::new()
+        } else {
+            engine
+                .drawer_store()
+                .list_drawers(&DrawerFilter {
+                    wing: Some(wing_id.clone()),
+                    source_files: deleted_paths.iter().cloned().collect(),
+                    view: Some(branch.to_owned()),
+                    branch_view_only: true,
+                    ..DrawerFilter::default()
+                })
+                .await?
+                .into_iter()
+                .filter_map(|drawer| {
+                    drawer.view_metadata.as_ref().is_some_and(|metadata| {
+                        metadata.repo_id == view_metadata.repo_id && metadata.path_state == "deleted"
+                    }).then_some(drawer.source_file)
+                })
+                .collect::<BTreeSet<_>>()
+        };
         for relative_path in deleted_paths {
             let source_key = project_branch_source_key(
                 ingest_kind,

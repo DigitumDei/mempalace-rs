@@ -268,7 +268,8 @@ where
                 .list_drawers(&DrawerFilter {
                     view: Some(view.to_owned()),
                     wing: query.wing.clone(),
-                    room: query.room.clone(),
+                    // Tombstones live in `general`, but shadow their path in every room.
+                    room: None,
                     branch_view_only: true,
                     source_files,
                     ..DrawerFilter::default()
@@ -1757,7 +1758,7 @@ mod tests {
                 &SearchQuery {
                     text: "deleted".to_owned(),
                     wing: None,
-                    room: None,
+                    room: Some(RoomId::new("backend").unwrap()),
                     limit: 1,
                     profile: EmbeddingProfile::Balanced,
                     view: Some("feature-x".to_owned()),

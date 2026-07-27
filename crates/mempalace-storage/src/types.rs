@@ -30,6 +30,9 @@ pub struct DrawerFilter {
     pub room: Option<RoomId>,
     pub hall: Option<String>,
     pub source_file: Option<String>,
+    /// Optional source-file set to match. Used for bounded branch-overlay
+    /// discovery while composing semantic-search candidates.
+    pub source_files: Vec<String>,
     /// Optional view/ref name to scope matched drawers. `None` and
     /// `"canonical"` exclude branch rows; a branch name includes that branch
     /// alongside the canonical and non-project rows for view composition.

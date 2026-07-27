@@ -224,23 +224,47 @@ where
             view: query.view.clone(),
             ..DrawerFilter::default()
         };
-        let overlay = if let Some(view) = query
+        let overlay = query
             .view
             .as_deref()
-            .filter(|view| *view != "canonical" && *view != "full")
-        {
-            // A branch is an overlay, not another source of truth. Branch rows
-            // (including deleted-path tombstones) shadow canonical rows for the
-            // same repository-relative path before ranking.
-            // Read the complete branch view before searching results are
-            // composed. A branch replacement may have low semantic similarity,
-            // but it must still shadow the canonical path that it replaces.
-            let overridden_paths = store
+            .filter(|view| *view != "canonical" && *view != "full");
+
+        // Search wider until overlay filtering leaves a complete result window.
+        // A low-scoring branch replacement must shadow its canonical path without
+        // causing unrelated later candidates to disappear from the response.
+        let mut candidate_limit = if rerank_enabled {
+            query.limit.saturating_mul(2)
+        } else {
+            query.limit
+        };
+        let mut matches;
+        loop {
+            matches = store
+                .search_drawers(&SearchRequest {
+                    embedding: query_embedding.clone(),
+                    limit: candidate_limit,
+                    include_cutoff_ties: true,
+                    filter: filter.clone(),
+                })
+                .await?;
+            let candidate_count = matches.len();
+            if let Some(view) = overlay {
+                // Discover only branch paths represented in this candidate window.
+                // Their branch rows may rank poorly, but must still shadow the
+                // matching canonical candidate without loading the whole branch.
+                let source_files = matches
+                    .iter()
+                    .map(|entry| entry.record.source_file.clone())
+                    .collect::<std::collections::HashSet<_>>()
+                    .into_iter()
+                    .collect();
+                let overridden_paths = store
                 .list_drawers(&DrawerFilter {
                     view: Some(view.to_owned()),
                     wing: query.wing.clone(),
                     room: query.room.clone(),
                     branch_view_only: true,
+                    source_files,
                     ..DrawerFilter::default()
                 })
                 .await?
@@ -261,33 +285,9 @@ where
                     })
                 })
                 .collect::<std::collections::HashSet<_>>();
-            Some((view, overridden_paths))
-        } else {
-            None
-        };
-
-        // Search wider until overlay filtering leaves a complete result window.
-        // A low-scoring branch replacement must shadow its canonical path without
-        // causing unrelated later candidates to disappear from the response.
-        let mut candidate_limit = if rerank_enabled {
-            query.limit.saturating_mul(2)
-        } else {
-            query.limit
-        };
-        let mut matches;
-        loop {
-            matches = store
-                .search_drawers(&SearchRequest {
-                    embedding: query_embedding.clone(),
-                    limit: candidate_limit,
-                    include_cutoff_ties: true,
-                    filter: filter.clone(),
-                })
-                .await?;
-            if let Some((view, overridden_paths)) = &overlay {
-                matches.retain(|entry| visible_in_view(&entry.record, view, overridden_paths));
+                matches.retain(|entry| visible_in_view(&entry.record, view, &overridden_paths));
             }
-            if matches.len() >= query.limit || matches.len() < candidate_limit {
+            if matches.len() >= query.limit || candidate_count < candidate_limit {
                 break;
             }
             let next_limit = candidate_limit.saturating_mul(2);
@@ -969,6 +969,8 @@ mod tests {
             && filter.room.as_ref().is_none_or(|room| room == &drawer.room)
             && filter.hall.as_ref().is_none_or(|hall| drawer.hall.as_ref() == Some(hall))
             && filter.source_file.as_ref().is_none_or(|source| source == &drawer.source_file)
+            && (filter.source_files.is_empty()
+                || filter.source_files.iter().any(|source| source == &drawer.source_file))
             && if filter.include_all_views || filter.view.as_deref() == Some("full") {
                 true
             } else {
@@ -1631,6 +1633,86 @@ mod tests {
             .unwrap();
 
         assert!(results.is_empty(), "canonical content must not leak through an override");
+    }
+
+    #[tokio::test]
+    async fn branch_filtering_expands_past_a_full_shadowed_candidate_window() {
+        let mut runtime = SearchRuntime::new(StubProvider { response: vec![embedding(0.0)] });
+        let store = StubStore {
+            drawers: vec![
+                project_record(
+                    record(
+                        "wing_a/general/0001",
+                        "wing_a",
+                        "general",
+                        "hidden.rs",
+                        "Deleted branch path tombstone",
+                        Some(0.0),
+                        datetime!(2026-04-11 09:00:00 UTC),
+                    ),
+                    Some("feature-x"),
+                    "deleted",
+                ),
+                project_record(
+                    record(
+                        "wing_a/backend/0002",
+                        "wing_a",
+                        "backend",
+                        "hidden.rs",
+                        "Canonical hidden code.",
+                        Some(0.1),
+                        datetime!(2026-04-11 09:00:00 UTC),
+                    ),
+                    None,
+                    "present",
+                ),
+                project_record(
+                    record(
+                        "wing_a/backend/0003",
+                        "wing_a",
+                        "backend",
+                        "visible-one.rs",
+                        "First visible canonical code.",
+                        Some(0.2),
+                        datetime!(2026-04-11 09:00:00 UTC),
+                    ),
+                    None,
+                    "present",
+                ),
+                project_record(
+                    record(
+                        "wing_a/backend/0004",
+                        "wing_a",
+                        "backend",
+                        "visible-two.rs",
+                        "Second visible canonical code.",
+                        Some(0.3),
+                        datetime!(2026-04-11 09:00:00 UTC),
+                    ),
+                    None,
+                    "present",
+                ),
+            ],
+        };
+
+        let results = runtime
+            .search(
+                &store,
+                &SearchQuery {
+                    text: "code".to_owned(),
+                    wing: None,
+                    room: None,
+                    limit: 2,
+                    profile: EmbeddingProfile::Balanced,
+                    view: Some("feature-x".to_owned()),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].source_file, "visible-one.rs");
+        assert_eq!(results[1].source_file, "visible-two.rs");
     }
 
     #[tokio::test]

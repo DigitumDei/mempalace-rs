@@ -812,6 +812,9 @@ fn compile_filter(filter: &DrawerFilter) -> String {
     if let Some(source_file) = &filter.source_file {
         parts.push(format!("source_file = '{}'", escape_sql(source_file)));
     }
+    if !filter.source_files.is_empty() {
+        parts.push(format!("source_file IN ({})", quote_strings(&filter.source_files)));
+    }
     if filter.include_all_views || filter.view.as_deref() == Some("full") {
         return parts.join(" AND ");
     }
@@ -841,6 +844,10 @@ fn compile_filter(filter: &DrawerFilter) -> String {
 
 fn quote_ids(ids: &[DrawerId]) -> String {
     ids.iter().map(|id| format!("'{}'", escape_sql(id.as_str()))).collect::<Vec<_>>().join(", ")
+}
+
+fn quote_strings(values: &[String]) -> String {
+    values.iter().map(|value| format!("'{}'", escape_sql(value))).collect::<Vec<_>>().join(", ")
 }
 
 fn escape_sql(value: &str) -> String {

@@ -877,7 +877,6 @@ pub async fn ingest_conversations<P: EmbeddingProvider>(
     let mut summary = IngestSummary::default();
     summary.discovered_files = discovered.files.len();
     summary.ignored_files = discovered.ignored_files;
-
     let files = apply_limit(discovered.files, request.limit);
 
     for file in files {
@@ -1656,6 +1655,13 @@ pub fn prepare_project_batch_with_config(
     let mut summary = IngestSummary::default();
     summary.discovered_files = discovered.files.len();
     summary.ignored_files = discovered.ignored_files;
+    // Remote mine callers resolve the checkout view before preparing the batch.
+    // Preserve it so their summaries match local mine output.
+    summary.view_name = request
+        .view
+        .as_deref()
+        .filter(|view| *view != "canonical")
+        .map(str::to_owned);
 
     let files_to_process: Vec<DiscoveredSource> =
         apply_limit(discovered.files, request.limit).collect();
@@ -4870,6 +4876,24 @@ mod tests {
         // The tiny file must not appear in files (zero chunks → excluded in v1).
         let found = prepared.files.iter().any(|f| f.relative_path == "tiny.rs");
         assert!(!found, "zero-chunk file must be excluded from prepare_project_batch files");
+    }
+
+    #[test]
+    fn prepare_batch_preserves_requested_view_in_summary() {
+        let tempdir = tempdir().unwrap();
+        let project_dir = tempdir.path().join("project");
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::write(
+            project_dir.join("mempalace.yaml"),
+            "wing: testbatch\nrooms:\n  - name: general\n",
+        )
+        .unwrap();
+
+        let mut request = ProjectIngestRequest::new(&project_dir);
+        request.view = Some("feature-x".to_owned());
+
+        let prepared = prepare_project_batch(&request).unwrap();
+        assert_eq!(prepared.summary.view_name.as_deref(), Some("feature-x"));
     }
 
     // ─── Branch delta tests ───────────────────────────────────────────────────

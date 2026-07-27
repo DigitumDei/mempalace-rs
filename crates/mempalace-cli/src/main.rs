@@ -1684,6 +1684,9 @@ fn execute_remote_mine(
             format!("  Total chunks: {total_chunks}"),
             format!("  Max files/batch: {max_files_per_batch}"),
         ];
+        if let Some(view_name) = &prepared.summary.view_name {
+            lines.push(format!("  View: {view_name}"));
+        }
         if let Some(ref warning) = branch_warning {
             lines.push(format!("  {}", warning.trim()));
         }
@@ -1776,6 +1779,7 @@ fn execute_remote_mine(
     let wing = prepared.wing.clone();
     let repo_id = prepared.repo_id.clone();
     let commit_hash = prepared.commit_hash.clone();
+    let view_name = prepared.summary.view_name.clone();
     let agent_owned = agent.to_owned();
 
     // Split files into batches.
@@ -1822,6 +1826,7 @@ fn execute_remote_mine(
                             &all_warnings,
                             &failed_files,
                             branch_warning.as_deref(),
+                            view_name.as_deref(),
                             true,
                             true,
                         );
@@ -1894,6 +1899,7 @@ fn execute_remote_mine(
         &all_warnings,
         &failed_files,
         branch_warning.as_deref(),
+        view_name.as_deref(),
         dual_write,
         false,
     );
@@ -1953,6 +1959,7 @@ fn render_remote_mine_summary(
     warnings: &[String],
     failed_files: &[(String, String)],
     branch_warning: Option<&str>,
+    view_name: Option<&str>,
     dual_write: bool,
     replication_incomplete: bool,
 ) -> String {
@@ -1995,6 +2002,10 @@ fn render_remote_mine_summary(
 
     if let Some(bw) = branch_warning {
         lines.push(format!("  {}", bw.trim()));
+    }
+
+    if let Some(view_name) = view_name {
+        lines.push(format!("  View: {view_name}"));
     }
 
     if !failed_files.is_empty() {
@@ -3548,7 +3559,7 @@ mod tests {
         // No per-file failures, but replication_incomplete=true → "partial — transport interrupted".
         let output = render_remote_mine_summary(
             src, "hub", "http://example.com", "wing_test", "repo-1",
-            5, 0, 0, 5, &[], &[], None, true, true,
+            5, 0, 0, 5, &[], &[], None, Some("feature-x"), true, true,
         );
         assert!(
             output.contains("replication: partial"),
@@ -3566,7 +3577,7 @@ mod tests {
         // No per-file failures, replication_incomplete=false → "succeeded".
         let output = render_remote_mine_summary(
             src, "hub", "http://example.com", "wing_test", "repo-1",
-            5, 0, 0, 5, &[], &[], None, true, false,
+            5, 0, 0, 5, &[], &[], None, None, true, false,
         );
         assert!(
             output.contains("replication: succeeded"),
@@ -3576,7 +3587,7 @@ mod tests {
         // Per-file failures, replication_incomplete=false → "partial — some files had errors".
         let output = render_remote_mine_summary(
             src, "hub", "http://example.com", "wing_test", "repo-1",
-            3, 0, 2, 3, &[], &[("bad.rs".into(), "err".into())], None, true, false,
+            3, 0, 2, 3, &[], &[("bad.rs".into(), "err".into())], None, None, true, false,
         );
         assert!(
             output.contains("replication: partial"),
@@ -3590,7 +3601,7 @@ mod tests {
         // Both incomplete AND per-file failures → "partial — transport interrupted".
         let output = render_remote_mine_summary(
             src, "hub", "http://example.com", "wing_test", "repo-1",
-            3, 0, 2, 3, &[], &[("bad.rs".into(), "err".into())], None, true, true,
+            3, 0, 2, 3, &[], &[("bad.rs".into(), "err".into())], None, None, true, true,
         );
         assert!(
             output.contains("replication: partial"),
@@ -3612,11 +3623,18 @@ mod tests {
         // Non dual_write: no replication label at all.
         let output = render_remote_mine_summary(
             src, "hub", "http://example.com", "wing_test", "repo-1",
-            5, 0, 0, 5, &[], &[], None, false, false,
+            5, 0, 0, 5, &[], &[], None, None, false, false,
         );
         assert!(
             !output.contains("replication:"),
             "non-dual-write must not contain 'replication:', got: {output}",
+        );
+        assert!(
+            render_remote_mine_summary(
+                src, "hub", "http://example.com", "wing_test", "repo-1",
+                5, 0, 0, 5, &[], &[], None, Some("feature-x"), false, false,
+            )
+            .contains("View: feature-x"),
         );
     }
 

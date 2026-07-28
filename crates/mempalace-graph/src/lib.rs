@@ -2043,6 +2043,7 @@ mod tests {
             content_hash: "hash".to_owned(),
             embedding: Vec::new(),
             locator: None,
+            view_metadata: None,
         }
     }
 }

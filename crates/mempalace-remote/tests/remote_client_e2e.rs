@@ -137,6 +137,7 @@ async fn round_trip_drawers_and_changes() {
             wing: Some("wing_rt".to_owned()),
             room: None,
             limit: Some(5),
+            view: None,
         })
         .await
         .unwrap();
@@ -381,6 +382,7 @@ async fn version_skew_is_hard_error() {
             wing: None,
             room: None,
             limit: None,
+            view: None,
         })
         .await;
     match first {
@@ -395,6 +397,7 @@ async fn version_skew_is_hard_error() {
             wing: None,
             room: None,
             limit: None,
+            view: None,
         })
         .await;
     match second {
@@ -507,6 +510,7 @@ async fn ingest_batch_round_trip() {
             wing: Some("wing_ingest".to_owned()),
             room: None,
             limit: Some(5),
+            view: None,
         })
         .await
         .unwrap();

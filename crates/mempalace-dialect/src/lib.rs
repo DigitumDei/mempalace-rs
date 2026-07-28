@@ -736,6 +736,7 @@ mod tests {
             content_hash: format!("hash-{id}"),
             embedding: vec![0.0; 384],
             locator: None,
+            view_metadata: None,
         }
     }
 

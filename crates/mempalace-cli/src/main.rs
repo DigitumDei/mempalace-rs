@@ -28,7 +28,10 @@ use mempalace_ingest::{
 };
 use mempalace_remote::{RemoteApi, RemoteClient, RemoteEndpoint, RemoteError};
 use mempalace_search::{Layer1Config, SearchRuntime, SearchRuntimePolicy, WakeUpRequest};
-use mempalace_storage::{DrawerFilter, DrawerStore, MaintenanceSettings, StorageEngine, StorageLayout};
+use mempalace_storage::{
+    DrawerFilter, DrawerStore, IngestManifestStore, MaintenanceSettings, StorageEngine,
+    StorageLayout,
+};
 use serde_yaml::Mapping;
 use tracing_subscriber::{EnvFilter, fmt};
 
@@ -218,7 +221,7 @@ enum Commands {
         reindex: bool,
         #[arg(long, value_enum, default_value_t = CliExtractMode::Exchange)]
         extract: CliExtractMode,
-        #[arg(long, help = "Mine only files changed vs the merge-base with the default branch (local branch-delta mining)")]
+        #[arg(long, conflicts_with = "full", help = "Mine only files changed vs the merge-base with the default branch (local branch-delta mining). When omitted, the checkout type is detected automatically: canonical checkouts perform a full mine, non-canonical checkouts perform a branch-delta mine.")]
         branch: bool,
         #[arg(
             long = "batch-size",
@@ -226,6 +229,10 @@ enum Commands {
             help = "Largest batch to process at once; lower it to bound peak memory/CPU on low-spec machines. Local mine: chunks embedded per batch (default: a file's chunks together). Remote mine: files per request (default: 64). 0 or omitted keeps the default."
         )]
         batch_size: Option<usize>,
+        #[arg(long, help = "Explicit view/ref name for this mine. Overrides automatic detection. Use 'canonical' to force a full canonical mine.")]
+        view: Option<String>,
+        #[arg(long, help = "Force a full canonical mine, ignoring automatic branch detection. Equivalent to --view canonical.")]
+        full: bool,
     },
     /// Inspect and manage centralized project declarations.
     Project {
@@ -276,6 +283,8 @@ enum Commands {
         room: Option<String>,
         #[arg(long = "results", default_value_t = 5)]
         results: usize,
+        #[arg(long, help = "Use a branch view composed over canonical data; use 'full' to search every stored repository view")]
+        view: Option<String>,
     },
     /// Show what's been filed.
     Status,
@@ -486,7 +495,7 @@ where
             context,
             validation_provider_factory,
         ),
-        Commands::Mine { dir, mode, wing, project_id, agent, limit, dry_run, reindex, extract, branch, batch_size } => {
+        Commands::Mine { dir, mode, wing, project_id, agent, limit, dry_run, reindex, extract, branch, batch_size, view, full } => {
             execute_mine(
                 &dir,
                 mode,
@@ -499,6 +508,8 @@ where
                 extract,
                 branch,
                 batch_size,
+                view,
+                full,
                 cli.palace.as_deref(),
                 context,
                 provider_factory,
@@ -518,11 +529,12 @@ where
                 context,
             )
         }
-        Commands::Search { query, wing, room, results } => execute_search(
+        Commands::Search { query, wing, room, results, view } => execute_search(
             &query,
             wing,
             room,
             results,
+            view,
             cli.palace.as_deref(),
             context,
             provider_factory,
@@ -1153,6 +1165,8 @@ fn execute_mine<F, P>(
     extract: CliExtractMode,
     branch: bool,
     batch_size: Option<usize>,
+    explicit_view: Option<String>,
+    full: bool,
     palace_override: Option<&Path>,
     context: &CliContext,
     provider_factory: F,
@@ -1161,6 +1175,18 @@ where
     F: Fn(EmbeddingProfile, PathBuf) -> Result<P, Box<dyn std::error::Error>>,
     P: EmbeddingProvider,
 {
+    if full && explicit_view.is_some() {
+        return Err(clap::Error::raw(
+            clap::error::ErrorKind::ArgumentConflict,
+            "--full cannot be combined with --view; use one canonical-mode selector",
+        ));
+    }
+    if branch && explicit_view.as_deref() == Some("canonical") {
+        return Err(clap::Error::raw(
+            clap::error::ErrorKind::ArgumentConflict,
+            "--branch cannot be combined with --view canonical",
+        ));
+    }
     let source_dir = dir.canonicalize().map_err(|source| {
         clap::Error::raw(
             clap::error::ErrorKind::Io,
@@ -1170,6 +1196,58 @@ where
 
     let config = load_runtime_config(palace_override, context).map_err(config_error)?;
     let runtime = build_runtime(&config).map_err(runtime_error)?;
+
+    // ── Auto-detect checkout view (projects mode only) ─────────────────────
+    let (effective_branch, effective_view, automatically_detected_branch) = if mode == CliMode::Projects {
+        let checkout_view = mempalace_ingest::detect_checkout_view(&source_dir);
+        let (detected_branch, is_auto) = match &checkout_view {
+            mempalace_ingest::CheckoutView::Canonical => (false, true),
+            mempalace_ingest::CheckoutView::Branch { .. } => {
+                (true, true)
+            }
+            mempalace_ingest::CheckoutView::NonGit => (false, false),
+        };
+
+        // Override logic:
+        // --full forces canonical mode
+        // --view overrides automatic detection
+        // --branch flag still works as before
+        let final_branch = if full || explicit_view.as_deref() == Some("canonical") {
+            false
+        } else if branch || explicit_view.is_some() {
+            true
+        } else if is_auto {
+            detected_branch
+        } else {
+            branch
+        };
+
+        // Resolve the effective view name for the ingest request
+        let final_view = if full || !final_branch {
+            None
+        } else {
+            explicit_view.clone().or_else(|| {
+                if is_auto {
+                    match &checkout_view {
+                        mempalace_ingest::CheckoutView::Branch { view_name, .. } => {
+                            Some(view_name.clone())
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            })
+        };
+
+        (
+            final_branch,
+            final_view,
+            is_auto && detected_branch && !branch && explicit_view.is_none() && !full,
+        )
+    } else {
+        (branch, None, false)
+    };
 
     // ── Routing decision (projects mode only) ────────────────────────────────
     if mode == CliMode::Projects {
@@ -1232,13 +1310,33 @@ where
             RouteQuery { wing: Some(&wing_name), room: None, source_file: None },
         );
 
-        let use_remote = !branch
+        // Federated batch ingestion is canonical-only. Keep branch views local
+        // until the batch protocol can carry their metadata end to end.
+        let use_remote = !effective_branch
             && (rule.mode == RouteMode::Remote
                 || (rule.mode == RouteMode::Combined
                     && rule.write == WriteTarget::Remote));
-        let use_both = !branch
+        let use_both = !effective_branch
             && rule.mode == RouteMode::Combined
             && rule.write == WriteTarget::Both;
+
+        if automatically_detected_branch && !use_remote && !use_both {
+            let engine = runtime
+                .block_on(StorageEngine::open(&config.palace_path, config.embedding_profile))
+                .map_err(storage_error)?;
+            let prefix = mempalace_ingest::project_canonical_source_prefix(&wing_name, &project_id);
+            if engine
+                .operational_store()
+                .ingested_source_keys_with_prefix(&prefix)
+                .map_err(storage_error)?
+                .is_empty()
+            {
+                return Ok(CliOutput::failure(
+                    1,
+                    "automatic branch mining requires an existing canonical snapshot; mine the canonical checkout first or use --full to intentionally replace it\n",
+                ));
+            }
+        }
 
         if use_remote {
             return execute_remote_mine(
@@ -1248,6 +1346,7 @@ where
                 limit,
                 dry_run,
                 batch_size,
+                effective_view.clone(),
                 &config,
                 &runtime,
                 &rule,
@@ -1266,7 +1365,8 @@ where
                 dry_run,
                 reindex,
                 batch_size,
-                branch,
+                effective_branch,
+                effective_view.clone(),
                 &config,
                 &runtime,
                 &provider_factory,
@@ -1280,6 +1380,7 @@ where
                 limit,
                 dry_run,
                 batch_size,
+                effective_view.clone(),
                 &config,
                 &runtime,
                 &rule,
@@ -1299,7 +1400,8 @@ where
             dry_run,
             reindex,
             batch_size,
-            branch,
+            effective_branch,
+            effective_view,
             &config,
             &runtime,
             provider_factory,
@@ -1404,6 +1506,7 @@ fn execute_local_project_mine<F, P>(
     reindex: bool,
     batch_size: Option<usize>,
     branch: bool,
+    view: Option<String>,
     config: &MempalaceConfig,
     runtime: &tokio::runtime::Runtime,
     provider_factory: F,
@@ -1444,6 +1547,7 @@ where
                 reindex,
                 max_embed_batch_size,
                 branch,
+                view,
             },
             project_config,
             project_id,
@@ -1491,6 +1595,7 @@ fn execute_remote_mine(
     limit: usize,
     dry_run: bool,
     batch_size: Option<usize>,
+    view: Option<String>,
     config: &MempalaceConfig,
     runtime: &tokio::runtime::Runtime,
     rule: &mempalace_config::ResolvedRouteRule,
@@ -1513,6 +1618,7 @@ fn execute_remote_mine(
         reindex: false,
         max_embed_batch_size: None,
         branch: false,
+        view,
         },
         project_config,
         project_id,
@@ -1585,6 +1691,9 @@ fn execute_remote_mine(
             format!("  Total chunks: {total_chunks}"),
             format!("  Max files/batch: {max_files_per_batch}"),
         ];
+        if let Some(view_name) = &prepared.summary.view_name {
+            lines.push(format!("  View: {view_name}"));
+        }
         if let Some(ref warning) = branch_warning {
             lines.push(format!("  {}", warning.trim()));
         }
@@ -1677,6 +1786,7 @@ fn execute_remote_mine(
     let wing = prepared.wing.clone();
     let repo_id = prepared.repo_id.clone();
     let commit_hash = prepared.commit_hash.clone();
+    let view_name = prepared.summary.view_name.clone();
     let agent_owned = agent.to_owned();
 
     // Split files into batches.
@@ -1723,6 +1833,7 @@ fn execute_remote_mine(
                             &all_warnings,
                             &failed_files,
                             branch_warning.as_deref(),
+                            view_name.as_deref(),
                             true,
                             true,
                         );
@@ -1795,6 +1906,7 @@ fn execute_remote_mine(
         &all_warnings,
         &failed_files,
         branch_warning.as_deref(),
+        view_name.as_deref(),
         dual_write,
         false,
     );
@@ -1854,6 +1966,7 @@ fn render_remote_mine_summary(
     warnings: &[String],
     failed_files: &[(String, String)],
     branch_warning: Option<&str>,
+    view_name: Option<&str>,
     dual_write: bool,
     replication_incomplete: bool,
 ) -> String {
@@ -1898,6 +2011,10 @@ fn render_remote_mine_summary(
         lines.push(format!("  {}", bw.trim()));
     }
 
+    if let Some(view_name) = view_name {
+        lines.push(format!("  View: {view_name}"));
+    }
+
     if !failed_files.is_empty() {
         lines.push(String::new());
         lines.push("  Failed files:".to_owned());
@@ -1919,6 +2036,7 @@ fn execute_search<F, P>(
     wing: Option<String>,
     room: Option<String>,
     results: usize,
+    view: Option<String>,
     palace_override: Option<&Path>,
     context: &CliContext,
     provider_factory: F,
@@ -1954,6 +2072,7 @@ where
                 room: room_id,
                 limit: clamp_search_results(results, &config),
                 profile: config.embedding_profile,
+                view,
             },
         ))
         .map_err(search_error)?;
@@ -2292,6 +2411,11 @@ fn render_mine_summary(
         format!("  Drawers written: {}", summary.drawers_written),
         format!("  Files truncated: {}", summary.truncated_files),
     ];
+
+    // Show view info when available.
+    if let Some(ref view_name) = summary.view_name {
+        lines.push(format!("  View: {view_name}"));
+    }
 
     // Only print when non-zero to preserve byte-parity with existing test output.
     if summary.removed_sources > 0 {
@@ -3271,7 +3395,7 @@ mod tests {
         let context = CliContext::for_tests(config_root.clone());
 
         run_cli(["init", repo_dir.to_str().unwrap(), "--yes"], &context, stub_provider).unwrap();
-        run_cli(["mine", repo_dir.to_str().unwrap()], &context, stub_provider).unwrap();
+        run_cli(["mine", repo_dir.to_str().unwrap(), "--full"], &context, stub_provider).unwrap();
         let branch_mine =
             run_cli(["mine", repo_dir.to_str().unwrap(), "--branch"], &context, stub_provider)
                 .unwrap();
@@ -3442,7 +3566,7 @@ mod tests {
         // No per-file failures, but replication_incomplete=true → "partial — transport interrupted".
         let output = render_remote_mine_summary(
             src, "hub", "http://example.com", "wing_test", "repo-1",
-            5, 0, 0, 5, &[], &[], None, true, true,
+            5, 0, 0, 5, &[], &[], None, Some("feature-x"), true, true,
         );
         assert!(
             output.contains("replication: partial"),
@@ -3460,7 +3584,7 @@ mod tests {
         // No per-file failures, replication_incomplete=false → "succeeded".
         let output = render_remote_mine_summary(
             src, "hub", "http://example.com", "wing_test", "repo-1",
-            5, 0, 0, 5, &[], &[], None, true, false,
+            5, 0, 0, 5, &[], &[], None, None, true, false,
         );
         assert!(
             output.contains("replication: succeeded"),
@@ -3470,7 +3594,7 @@ mod tests {
         // Per-file failures, replication_incomplete=false → "partial — some files had errors".
         let output = render_remote_mine_summary(
             src, "hub", "http://example.com", "wing_test", "repo-1",
-            3, 0, 2, 3, &[], &[("bad.rs".into(), "err".into())], None, true, false,
+            3, 0, 2, 3, &[], &[("bad.rs".into(), "err".into())], None, None, true, false,
         );
         assert!(
             output.contains("replication: partial"),
@@ -3484,7 +3608,7 @@ mod tests {
         // Both incomplete AND per-file failures → "partial — transport interrupted".
         let output = render_remote_mine_summary(
             src, "hub", "http://example.com", "wing_test", "repo-1",
-            3, 0, 2, 3, &[], &[("bad.rs".into(), "err".into())], None, true, true,
+            3, 0, 2, 3, &[], &[("bad.rs".into(), "err".into())], None, None, true, true,
         );
         assert!(
             output.contains("replication: partial"),
@@ -3506,11 +3630,18 @@ mod tests {
         // Non dual_write: no replication label at all.
         let output = render_remote_mine_summary(
             src, "hub", "http://example.com", "wing_test", "repo-1",
-            5, 0, 0, 5, &[], &[], None, false, false,
+            5, 0, 0, 5, &[], &[], None, None, false, false,
         );
         assert!(
             !output.contains("replication:"),
             "non-dual-write must not contain 'replication:', got: {output}",
+        );
+        assert!(
+            render_remote_mine_summary(
+                src, "hub", "http://example.com", "wing_test", "repo-1",
+                5, 0, 0, 5, &[], &[], None, Some("feature-x"), false, false,
+            )
+            .contains("View: feature-x"),
         );
     }
 
@@ -5488,6 +5619,7 @@ mod tests {
                                 content_hash: format!("hash-{batch}-{i}"),
                                 embedding,
                                 locator: None,
+                                view_metadata: None,
                             }
                         })
                         .collect();
@@ -5598,6 +5730,7 @@ mod tests {
                         content_hash: format!("hash-{batch}"),
                         embedding,
                         locator: None,
+                        view_metadata: None,
                     };
                     engine.drawer_store()
                         .put_drawers(&[record], mempalace_storage::DuplicateStrategy::Error)

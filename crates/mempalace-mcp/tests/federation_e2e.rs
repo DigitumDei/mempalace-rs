@@ -1733,6 +1733,7 @@ async fn add_drawer_both_replicates_successfully() {
             wing: Some("wing_both".to_owned()),
             room: Some("both-room".to_owned()),
             limit: Some(5),
+            view: None,
         })
         .await
         .expect("hub search must succeed");

@@ -748,6 +748,7 @@ where
 
     let wing = body.wing.as_deref().map(WingId::new).transpose()?;
     let room = body.room.as_deref().map(RoomId::new).transpose()?;
+    let view = body.view.clone();
 
     let results = {
         let mut search = state.search.lock().await;
@@ -760,6 +761,7 @@ where
                     room,
                     limit,
                     profile: state.config.embedding_profile,
+                    view,
                 },
             )
             .await?
@@ -1398,6 +1400,18 @@ where
     let wing_str = wing.as_str().to_owned();
     let repo_id_hash = hash_text(&body.repo_id);
 
+    // Build repository-view metadata for federated batch.
+    let view_metadata = mempalace_core::RepositoryViewMetadata {
+        repo_id: body.repo_id.clone(),
+        view_name: None, // federated batches are always canonical
+        source_path: resolve_root.clone(),
+        head_commit: body.commit_hash.clone(),
+        base_ref: None,
+        merge_base: None,
+        worktree_id: hash_text(&resolve_root),
+        path_state: "present".to_owned(),
+    };
+
     let mut file_results: Vec<IngestFileResult> = Vec::with_capacity(body.files.len());
     let mut files_ingested: usize = 0;
     let mut files_skipped: usize = 0;
@@ -1714,6 +1728,7 @@ where
                 content_hash: hash_text(&chunk.text),
                 embedding,
                 locator,
+                view_metadata: Some(view_metadata.clone()),
             });
         }
 
@@ -1952,7 +1967,7 @@ where
         room: None,
         limit: DUPLICATE_SEARCH_LIMIT,
         profile: state.config.embedding_profile,
-    };
+                view: None,};
     let results = {
         let mut search = state.search.lock().await;
         search.search_semantic(state.storage.drawer_store(), &query).await?
@@ -2022,6 +2037,7 @@ where
         content_hash: hash_text(&content),
         embedding,
         locator: None,
+        view_metadata: None,
     })
 }
 

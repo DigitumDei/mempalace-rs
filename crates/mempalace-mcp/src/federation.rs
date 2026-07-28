@@ -248,6 +248,7 @@ impl FederationRouter {
         query: &str,
         wing: Option<&str>,
         room: Option<&str>,
+        view: Option<&str>,
         limit: usize,
         remote_targets: &[String],
     ) -> ToolResult<Value> {
@@ -262,6 +263,7 @@ impl FederationRouter {
             let query_str = query.to_owned();
             let wing_owned = wing.map(|s| s.to_owned());
             let room_owned = room.map(|s| s.to_owned());
+            let view_owned = view.map(|s| s.to_owned());
             let api = match self.remotes.get(&name) {
                 Some(a) => Arc::clone(a),
                 None => continue,
@@ -272,6 +274,7 @@ impl FederationRouter {
                     wing: wing_owned,
                     room: room_owned,
                     limit: Some(limit),
+                    view: view_owned,
                 };
                 match api.search_drawers(req).await {
                     Ok(response) => {
@@ -1872,6 +1875,7 @@ mod tests {
         changes_next_cursor: Option<String>,
         /// When set, the `changes` call records the incoming cursor here.
         received_cursor: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+        received_search_view: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     }
 
     impl Default for MockRemote {
@@ -1900,6 +1904,7 @@ mod tests {
                 changes_events: vec![],
                 changes_next_cursor: None,
                 received_cursor: std::sync::Arc::new(std::sync::Mutex::new(None)),
+                received_search_view: std::sync::Arc::new(std::sync::Mutex::new(None)),
             }
         }
     }
@@ -1913,9 +1918,10 @@ mod tests {
 
         async fn search_drawers(
             &self,
-            _req: DrawerSearchRequest,
+            req: DrawerSearchRequest,
         ) -> mempalace_remote::Result<DrawerSearchResponse> {
             self.check_fail("search")?;
+            *self.received_search_view.lock().unwrap() = req.view;
             let results = self
                 .search_results
                 .iter()
@@ -2353,7 +2359,7 @@ mod tests {
         let router = make_router(remotes);
 
         let local = vec![json!({"wing":"w","room":"r1","similarity":0.9,"text":"local hit"})];
-        let result = router.search(local, "test", Some("w"), None, 10, &["alpha".to_owned()]).await.unwrap();
+        let result = router.search(local, "test", Some("w"), None, None, 10, &["alpha".to_owned()]).await.unwrap();
 
         let results = result["results"].as_array().unwrap();
         assert_eq!(results.len(), 2);
@@ -2365,6 +2371,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_forwards_view_to_remote() {
+        let mock = MockRemote::default();
+        let received_search_view = Arc::clone(&mock.received_search_view);
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+
+        router
+            .search(vec![], "test", Some("w"), None, Some("feature-x"), 10, &["alpha".to_owned()])
+            .await
+            .unwrap();
+
+        assert_eq!(*received_search_view.lock().unwrap(), Some("feature-x".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn search_returns_remote_path_for_local_overlay_filtering() {
+        let mut mock = MockRemote::default();
+        mock.search_results = vec![json!({
+            "wing":"remote_wing",
+            "room":"r",
+            "source_file":"README.md",
+            "similarity":0.8,
+            "text":"remote hit"
+        })];
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+        let result = router
+            .search(
+                vec![],
+                "test",
+                None,
+                None,
+                Some("feature-x"),
+                10,
+                &["alpha".to_owned()],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result["results"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn e2e_search_degradable_on_remote_outage() {
         let mut mock = MockRemote::default();
         mock.fail_on = Some("search".to_owned());
@@ -2373,7 +2424,7 @@ mod tests {
         let router = make_router(remotes);
 
         let local = vec![json!({"wing":"w","room":"r1","similarity":0.9,"text":"local only"})];
-        let result = router.search(local, "test", Some("w"), None, 10, &["alpha".to_owned()]).await.unwrap();
+        let result = router.search(local, "test", Some("w"), None, None, 10, &["alpha".to_owned()]).await.unwrap();
 
         let results = result["results"].as_array().unwrap();
         assert_eq!(results.len(), 1);

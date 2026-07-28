@@ -143,7 +143,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Search.
         let t_search = Instant::now();
-        let query = SearchQuery { text: question, wing: None, room: None, limit: 10, profile };
+        let query = SearchQuery { text: question, wing: None, room: None, limit: 10, profile, view: None,};
         let search_results =
             rt.block_on(search_rt.search(engine.drawer_store(), &query)).unwrap_or_default();
         let search_ms = t_search.elapsed().as_millis();

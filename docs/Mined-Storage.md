@@ -71,10 +71,22 @@ after upgrade. The migration uses `add_columns` with `CAST(NULL AS …)`
 expressions — it is idempotent, requires no data rewrite, and completes without
 downtime.
 
+Tables also gain eight new nullable view-metadata columns (`view_repo_id`,
+`view_name`, `view_source_path`, `view_head_commit`, `view_base_ref`,
+`view_merge_base`, `view_worktree_id`, `view_path_state`) via the same
+migration mechanism. These are populated on new project mines. Old rows read
+back with `view_metadata: None` and continue to use the legacy `hall = "view:<name>"` convention for view scoping.
+
 ### Old rows keep working
 
 Rows written before the locator upgrade read back with `locator: None` and their
 stored `content` intact. No data is lost and no manual step is required.
+
+Rows written before the view-metadata upgrade read back with
+`view_metadata: None`. View-scoped search filters (`--view <name>` or
+`view: "branch_name"` in the API) still match legacy rows via a
+`view_name IS NULL AND hall = 'view:<name>'` fallback in the SQL filter, so
+existing branch-delta mines remain searchable without re-mining.
 
 ### Converting old rows to locator rows
 
@@ -88,6 +100,13 @@ mempalace-cli mine /path/to/project --reindex
 `--reindex` bypasses the unchanged-content skip that would normally leave
 already-ingested files alone. After re-mining, chunks for valid-UTF-8 files
 store empty content and a full locator.
+
+### Populating view-metadata on legacy branch rows
+
+Run `mine --branch --reindex <dir>` to re-mine a branch delta and populate the
+`view_*` columns on the re-ingested drawers. The `hall = "view:<name>"` field
+remains set on legacy rows that are not re-mined; the new columns are preferred
+when present.
 
 ### Non-UTF-8 fallback
 

@@ -204,6 +204,7 @@ mod tests {
             content_hash: "hash".to_owned(),
             embedding: vec![],
             locator,
+            view_metadata: None,
         }
     }
 

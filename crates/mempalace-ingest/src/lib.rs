@@ -15,7 +15,7 @@ use mempalace_embeddings::{EmbeddingProvider, EmbeddingRequest};
 pub use mempalace_federation;
 use mempalace_federation::{IngestChunkDto, IngestFileDto};
 use mempalace_storage::core::MempalaceError;
-use mempalace_storage::{IngestManifestStore, StorageEngine};
+use mempalace_storage::{DrawerFilter, DrawerStore, IngestManifestStore, StorageEngine};
 use serde_json::Value;
 use thiserror::Error;
 use time::{Date, OffsetDateTime};
@@ -364,6 +364,9 @@ pub struct IngestSummary {
     /// Number of previously-mined source keys removed during a branch cleanup
     /// pass.  Always 0 for non-branch runs.
     pub removed_sources: usize,
+    /// The view name detected/used for this mine, if any.  `None` for canonical
+    /// or non-Git mines.
+    pub view_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -380,6 +383,10 @@ pub struct ProjectIngestRequest {
     /// source-key namespace.  Returns [`IngestError::BranchDeltaUnavailable`]
     /// when no git repo or default branch is found.
     pub branch: bool,
+    /// Explicit view/ref name for this mine.  When set, overrides the branch
+    /// name derived from `branch: true`.  Use `"canonical"` to force a full
+    /// canonical mine even when the checkout is on a non-canonical ref.
+    pub view: Option<String>,
 }
 
 impl ProjectIngestRequest {
@@ -393,6 +400,7 @@ impl ProjectIngestRequest {
             reindex: false,
             max_embed_batch_size: None,
             branch: false,
+            view: None,
         }
     }
 }
@@ -562,9 +570,15 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
         .unwrap_or_else(|| derive_repo_id(&root, &wing_name));
     let project_root_key = stable_project_root_key(&repo_id);
     let legacy_root_key = hash_text(&root.to_string_lossy());
-    let branch_name = request.branch.then(|| {
-        resolve_current_branch(&root).unwrap_or_else(|| "detached".to_owned())
-    });
+    // An explicit canonical view always wins, including for direct library
+    // callers that did not pass through the CLI's flag normalization.
+    let branch_mode = request.branch && request.view.as_deref() != Some("canonical");
+    let branch_name = match branch_mode {
+        true => Some(request.view.clone().unwrap_or_else(|| {
+            resolve_current_branch(&root).unwrap_or_else(|| "detached".to_owned())
+        })),
+        false => None,
+    };
     let discovered = discover_project_files(&root)?;
     let routing_fingerprint = project_routing_fingerprint(&config.rooms);
 
@@ -574,12 +588,30 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
     // Resolve root as a string for locators (use to_string_lossy for Windows verbatim paths).
     let resolve_root = root.to_string_lossy().into_owned();
 
+    // Build repository-view metadata for project-mined drawers.
+    let default_branch = detect_default_branch(&root);
+    let merge_base = default_branch
+        .as_ref()
+        .and_then(|b| compute_merge_base(&root, b));
+    let worktree_id = hash_text(&root.to_string_lossy());
+    let view_metadata = mempalace_core::RepositoryViewMetadata {
+        repo_id: repo_id.clone(),
+        view_name: branch_name.clone(),
+        source_path: resolve_root.clone(),
+        head_commit: commit_hash.clone(),
+        base_ref: default_branch,
+        merge_base,
+        worktree_id,
+        path_state: "present".to_owned(),
+    };
+
     let mut summary = IngestSummary::default();
     summary.discovered_files = discovered.files.len();
     summary.ignored_files = discovered.ignored_files;
+    summary.view_name = branch_name.clone();
 
     // For branch mode: compute the delta set and filter files.
-    let (ingest_kind, delta_set) = if request.branch {
+    let (ingest_kind, delta_set) = if branch_mode {
         let delta = compute_branch_delta(&root)?;
         let set: BTreeSet<String> = delta.into_iter().collect();
         ("projects-branch", Some(set))
@@ -691,6 +723,8 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
                     request.max_embed_batch_size,
                     chunks_with_room,
                     ctx_borrow.as_ref(),
+                    branch_name.as_deref(),
+                    Some(&view_metadata),
                 )?;
                 let drawer_count = source_drawers.len();
 
@@ -720,6 +754,112 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
         }
     }
 
+    let deleted_paths = if branch_mode && !request.dry_run {
+        compute_deleted_branch_paths(&root)?
+    } else {
+        BTreeSet::new()
+    };
+
+    // Deleted paths are not discovered from the worktree, so record a durable
+    // branch row for each one. These rows shadow the corresponding canonical
+    // path during branch-view composition without depending on vector ranking.
+    if branch_mode && !request.dry_run {
+        let mut tombstone_metadata = view_metadata.clone();
+        tombstone_metadata.path_state = "deleted".to_owned();
+        let branch = branch_name.as_deref().expect("branch mode has a view name");
+        // Fetch all existing tombstones at once. A deletion-heavy branch must
+        // not turn one mine into a sequential storage query per path.
+        let existing_tombstones = if deleted_paths.is_empty() {
+            BTreeSet::new()
+        } else {
+            let mut tombstones = BTreeSet::new();
+            // Bound SQL `IN` predicates so deletion-heavy branches do not exceed
+            // the storage backend's query limits.
+            for paths in deleted_paths.iter().collect::<Vec<_>>().chunks(500) {
+                tombstones.extend(
+                    engine
+                        .drawer_store()
+                        .list_drawers(&DrawerFilter {
+                            wing: Some(wing_id.clone()),
+                            source_files: paths.iter().map(|path| (*path).clone()).collect(),
+                            view: Some(branch.to_owned()),
+                            branch_view_only: true,
+                            ..DrawerFilter::default()
+                        })
+                        .await?
+                        .into_iter()
+                        .filter_map(|drawer| {
+                            drawer.view_metadata.as_ref().is_some_and(|metadata| {
+                                metadata.repo_id == view_metadata.repo_id
+                                    && metadata.path_state == "deleted"
+                            }).then_some(drawer.source_file)
+                        }),
+                );
+            }
+            tombstones
+        };
+        let tombstone_embedding = if deleted_paths
+            .iter()
+            .any(|path| !existing_tombstones.contains(path))
+        {
+            embed_chunks(
+                provider,
+                &[Chunk {
+                    content: "Deleted branch path tombstone".to_owned(),
+                    date_hint: None,
+                    room_hint: Some("general".to_owned()),
+                    byte_range: None,
+                    chunk_index: 0,
+                }],
+                request.max_embed_batch_size,
+            )
+        } else {
+            Ok(Vec::new())
+        }?;
+        for relative_path in &deleted_paths {
+            let source_key = project_branch_source_key(
+                ingest_kind,
+                &project_root_key,
+                &wing_name,
+                branch,
+                relative_path,
+            );
+            if existing_tombstones.contains(relative_path) {
+                continue;
+            }
+            let drawers = build_drawers_from_embeddings(
+                &wing_id,
+                &source_key,
+                relative_path,
+                ingest_kind,
+                None,
+                &request.agent,
+                vec![Chunk {
+                    content: "Deleted branch path tombstone".to_owned(),
+                    date_hint: None,
+                    room_hint: Some("general".to_owned()),
+                    byte_range: None,
+                    chunk_index: 0,
+                }],
+                None,
+                branch_name.as_deref(),
+                Some(&tombstone_metadata),
+                tombstone_embedding.clone(),
+            )?;
+            let drawer_count = drawers.len();
+            replace_source_drawers(
+                engine,
+                &source_key,
+                &relative_path,
+                ingest_kind,
+                hash_text("Deleted branch path tombstone"),
+                drawers,
+            )
+            .await?;
+            summary.drawers_written += drawer_count;
+        }
+    }
+
     // Remove path-hash source rows that were not present in this mine.  This
     // catches files deleted before the stable project-id migration ran.
     if branch_name.is_none() && request.limit.is_none() && !request.dry_run {
@@ -739,7 +879,7 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
 
     // Branch cleanup pass: remove source keys whose relative paths are no longer
     // in the current delta (files reverted to base or deleted from the branch).
-    if request.branch && !request.dry_run {
+    if branch_mode && !request.dry_run {
         let current_rel_paths: BTreeSet<&str> =
             files.iter().map(|f| f.relative_path.as_str()).collect();
         let prefix = branch_name.as_deref().map_or_else(
@@ -752,24 +892,11 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
             // Key format: projects-branch:{wing}:{root_key}:{branch}:{rel_path}
             // Split off the first 4 ':'-delimited segments to get rel_path.
             let rel = key.splitn(5, ':').nth(4).unwrap_or("");
-            if !current_rel_paths.contains(rel) {
-                // Only replace if there are committed drawers for this key.
-                if let Some(existing) =
-                    engine.operational_store().get_ingested_file(&key)?
-                {
-                    if existing.content_hash != hash_text("removed") {
-                        replace_source_drawers(
-                            engine,
-                            &key,
-                            rel,
-                            ingest_kind,
-                            hash_text("removed"),
-                            Vec::new(),
-                        )
-                        .await?;
-                        summary.removed_sources += 1;
-                    }
-                }
+            if !current_rel_paths.contains(rel) && !deleted_paths.contains(rel) {
+                // The path no longer differs from canonical. Remove both a
+                // former replacement and a former deletion tombstone.
+                engine.remove_source_key(&key).await?;
+                summary.removed_sources += 1;
             }
         }
     }
@@ -795,7 +922,6 @@ pub async fn ingest_conversations<P: EmbeddingProvider>(
     let mut summary = IngestSummary::default();
     summary.discovered_files = discovered.files.len();
     summary.ignored_files = discovered.ignored_files;
-
     let files = apply_limit(discovered.files, request.limit);
 
     for file in files {
@@ -875,6 +1001,8 @@ pub async fn ingest_conversations<P: EmbeddingProvider>(
                 })
                 .collect::<Vec<_>>(),
             None,
+            None,
+            None,
         )?;
         let drawer_count = drawers.len();
 
@@ -916,6 +1044,8 @@ fn build_drawers<P: EmbeddingProvider>(
     max_embed_batch_size: Option<usize>,
     chunks: Vec<Chunk>,
     locator_ctx: Option<&ProjectLocatorContext<'_>>,
+    view: Option<&str>,
+    view_metadata: Option<&mempalace_core::RepositoryViewMetadata>,
 ) -> Result<Vec<DrawerRecord>> {
     if chunks.is_empty() {
         return Ok(Vec::new());
@@ -924,6 +1054,34 @@ fn build_drawers<P: EmbeddingProvider>(
     // Embed using the real chunk text.
     let embeddings = embed_chunks(provider, &chunks, max_embed_batch_size)?;
 
+    build_drawers_from_embeddings(
+        wing,
+        source_key,
+        source_file,
+        ingest_mode,
+        extract_mode,
+        agent,
+        chunks,
+        locator_ctx,
+        view,
+        view_metadata,
+        embeddings,
+    )
+}
+
+fn build_drawers_from_embeddings(
+    wing: &WingId,
+    source_key: &str,
+    source_file: &str,
+    ingest_mode: &str,
+    extract_mode: Option<&str>,
+    agent: &str,
+    chunks: Vec<Chunk>,
+    locator_ctx: Option<&ProjectLocatorContext<'_>>,
+    view: Option<&str>,
+    view_metadata: Option<&mempalace_core::RepositoryViewMetadata>,
+    embeddings: Vec<Vec<f32>>,
+) -> Result<Vec<DrawerRecord>> {
     let mut drawers = Vec::with_capacity(chunks.len());
     for (i, (chunk, embedding)) in chunks.into_iter().zip(embeddings.into_iter()).enumerate() {
         let room_name = chunk.room_hint.unwrap_or_else(|| "general".to_owned());
@@ -951,11 +1109,15 @@ fn build_drawers<P: EmbeddingProvider>(
         // When a locator is present, store empty content (resolved lazily).
         let stored_content = if locator.is_some() { String::new() } else { chunk_text };
 
+        // For branch views, store the view name in the hall field so searches
+        // can filter by view.  Canonical views keep hall = None.
+        let hall = view.map(|v| format!("view:{v}"));
+
         drawers.push(DrawerRecord {
             id: drawer_id,
             wing: wing.clone(),
             room: room_id,
-            hall: None,
+            hall,
             date: chunk.date_hint,
             source_file: source_file.to_owned(),
             chunk_index: chunk.chunk_index,
@@ -970,6 +1132,7 @@ fn build_drawers<P: EmbeddingProvider>(
             content: stored_content,
             embedding,
             locator,
+            view_metadata: view_metadata.cloned(),
         });
     }
 
@@ -1185,12 +1348,76 @@ impl PreparedLocatorStorage {
 
 // ─── Branch-delta helpers ────────────────────────────────────────────────────
 
+/// Describes how a checkout relates to its repository's canonical view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckoutView {
+    /// The checkout is on the canonical/default branch (main/master).
+    Canonical,
+    /// The checkout is on a named branch or linked worktree.
+    Branch {
+        /// The branch name or HEAD ref of the checkout.
+        view_name: String,
+        /// The base/integration ref (default branch).
+        base_ref: Option<String>,
+        /// The merge-base commit between the view and the base ref.
+        merge_base: Option<String>,
+    },
+    /// The checkout is not a Git repository; treat as a full directory.
+    NonGit,
+}
+
+/// Detect the checkout view type for a given source directory.
+///
+/// Returns [`CheckoutView::NonGit`] when the directory is not inside a Git
+/// repository, [`CheckoutView::Canonical`] when the current checkout is on the
+/// canonical/default branch, and [`CheckoutView::Branch`] with the view name,
+/// base ref, and merge-base when on a non-canonical checkout.
+///
+/// The canonical branch is determined by `origin/HEAD` symbolic-ref, then
+/// by literal `main` / `master` fallback.
+pub fn detect_checkout_view(root: &Path) -> CheckoutView {
+    let toplevel = git_repo_toplevel(root);
+    let toplevel = match toplevel {
+        Some(p) => p,
+        None => return CheckoutView::NonGit,
+    };
+
+    let default_branch = detect_default_branch(&toplevel);
+    let current_branch = resolve_current_branch(&toplevel);
+
+    match (default_branch, current_branch) {
+        (Some(ref base), Some(ref current)) if branch_name(base) == current => CheckoutView::Canonical,
+        (Some(base), Some(view_name)) => {
+            let merge_base = compute_merge_base(&toplevel, &base);
+            CheckoutView::Branch {
+                view_name,
+                base_ref: Some(base),
+                merge_base,
+            }
+        }
+        (Some(base), None) => {
+            // Detached HEAD: use a stable hash of the toplevel path as a view identity.
+            let view_name = format!("detached-{}", &hash_text(&toplevel.to_string_lossy())[..12]);
+            let merge_base = compute_merge_base(&toplevel, &base);
+            CheckoutView::Branch {
+                view_name,
+                base_ref: Some(base),
+                merge_base,
+            }
+        }
+        // Without a known integration ref there is no safe delta baseline.
+        // Preserve the pre-view behavior and mine the checkout in full.
+        (None, _) => CheckoutView::Canonical,
+    }
+}
+
 /// Detect the default branch ref: tries `origin/HEAD` symbolic-ref, then
 /// literal `main` / `master`.  Returns `None` when neither is found.
-fn detect_default_branch(root: &Path) -> Option<String> {
+pub fn detect_default_branch(root: &Path) -> Option<String> {
     let root_str = root.to_string_lossy();
 
-    // Try the symbolic ref (e.g. "origin/main").
+    // Keep the symbolic remote ref (e.g. "origin/main") resolvable for
+    // merge-base. `branch_name` performs the short-name comparison separately.
     let out = Command::new("git")
         .args(["-C", &root_str, "symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
         .output()
@@ -1219,8 +1446,12 @@ fn detect_default_branch(root: &Path) -> Option<String> {
     None
 }
 
+fn branch_name(ref_name: &str) -> &str {
+    ref_name.strip_prefix("origin/").unwrap_or(ref_name)
+}
+
 /// Compute the merge-base commit between `default_ref` and HEAD.
-fn compute_merge_base(root: &Path, default_ref: &str) -> Option<String> {
+pub fn compute_merge_base(root: &Path, default_ref: &str) -> Option<String> {
     let out = Command::new("git")
         .args(["-C", &root.to_string_lossy().as_ref(), "merge-base", default_ref, "HEAD"])
         .output()
@@ -1279,6 +1510,57 @@ fn git_delta_paths(root: &Path, merge_base: &str) -> Option<Vec<String>> {
         }
     }
     Some(paths)
+}
+
+/// Return project-root-relative paths deleted from HEAD since the merge-base.
+fn compute_deleted_branch_paths(root: &Path) -> Result<BTreeSet<String>> {
+    let default_ref = detect_default_branch(root).ok_or_else(|| {
+        IngestError::BranchDeltaUnavailable {
+            reason: "not a git repository or no default branch (origin/HEAD, main, master) found"
+                .to_owned(),
+        }
+    })?;
+    let merge_base = compute_merge_base(root, &default_ref).ok_or_else(|| {
+        IngestError::BranchDeltaUnavailable {
+            reason: format!("could not compute merge-base between '{default_ref}' and HEAD"),
+        }
+    })?;
+    let root_str = root.to_string_lossy();
+    let output = Command::new("git")
+        .args([
+            "-C",
+            root_str.as_ref(),
+            "diff",
+            "--name-only",
+            "--no-renames",
+            "--diff-filter=D",
+            "--relative",
+            "-z",
+            &merge_base,
+        ])
+        .output()
+        .map_err(|source| IngestError::Io { path: root.to_path_buf(), source })?;
+    if !output.status.success() {
+        return Err(IngestError::BranchDeltaUnavailable {
+            reason: "git diff for deleted paths failed".to_owned(),
+        });
+    }
+    let mut deleted = BTreeSet::new();
+    for path in output.stdout.split(|&byte| byte == 0).filter(|path| !path.is_empty()) {
+        let Ok(path) = std::str::from_utf8(path) else { continue };
+        let relative = Path::new(path)
+            .components()
+            .filter_map(|component| match component {
+                Component::Normal(part) => part.to_str(),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("/");
+        if !relative.is_empty() {
+            deleted.insert(relative);
+        }
+    }
+    Ok(deleted)
 }
 
 /// Get the absolute repo root (via `git rev-parse --show-toplevel`).
@@ -1446,6 +1728,13 @@ pub fn prepare_project_batch_with_config(
     let mut summary = IngestSummary::default();
     summary.discovered_files = discovered.files.len();
     summary.ignored_files = discovered.ignored_files;
+    // Remote mine callers resolve the checkout view before preparing the batch.
+    // Preserve it so their summaries match local mine output.
+    summary.view_name = request
+        .view
+        .as_deref()
+        .filter(|view| *view != "canonical")
+        .map(str::to_owned);
 
     let files_to_process: Vec<DiscoveredSource> =
         apply_limit(discovered.files, request.limit).collect();
@@ -1622,7 +1911,7 @@ pub fn normalize_git_remote_url(url: &str) -> Option<String> {
 
 /// Resolve the current git branch name (`git rev-parse --abbrev-ref HEAD`).
 /// Returns `None` when not in a repo or in detached HEAD state.
-fn resolve_current_branch(root: &Path) -> Option<String> {
+pub fn resolve_current_branch(root: &Path) -> Option<String> {
     let out = Command::new("git")
         .args(["-C", &root.to_string_lossy(), "rev-parse", "--abbrev-ref", "HEAD"])
         .output()
@@ -3254,8 +3543,10 @@ mod tests {
                     date_hint: None,
                     byte_range: None,
                 },
-            ],
-            None,
+],
+            None,           // locator_ctx
+            None,           // view
+            None,           // view_metadata
         )
         .unwrap();
 
@@ -3381,7 +3672,7 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: false,
-            },
+        view: None,},
         )
         .await
         .unwrap();
@@ -3588,7 +3879,7 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: false,
-            },
+        view: None,},
         )
         .await
         .unwrap();
@@ -3604,7 +3895,7 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: false,
-            },
+        view: None,},
         )
         .await
         .unwrap();
@@ -3628,7 +3919,7 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: false,
-            },
+        view: None,},
         )
         .await
         .unwrap();
@@ -3683,7 +3974,7 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: false,
-            },
+        view: None,},
         )
         .await
         .unwrap();
@@ -3731,7 +4022,7 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: false,
-            },
+        view: None,},
         )
         .await
         .unwrap();
@@ -3750,7 +4041,7 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: false,
-            },
+        view: None,},
         )
         .await
         .unwrap();
@@ -3799,7 +4090,7 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: false,
-            },
+        view: None,},
         )
         .await
         .unwrap();
@@ -3821,7 +4112,7 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: false,
-            },
+        view: None,},
         )
         .await
         .unwrap();
@@ -3911,7 +4202,7 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: false,
-            },
+        view: None,},
         )
         .await
         .unwrap();
@@ -3987,7 +4278,7 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: false,
-            },
+        view: None,},
         )
         .await
         .unwrap();
@@ -4047,7 +4338,7 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: false,
-            },
+        view: None,},
         )
         .await
         .unwrap();
@@ -4105,7 +4396,7 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: false,
-            },
+        view: None,},
         )
         .await
         .unwrap();
@@ -4166,7 +4457,7 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: false,
-            },
+        view: None,},
         )
         .await
         .unwrap();
@@ -4219,7 +4510,7 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: false,
-            },
+        view: None,},
         )
         .await
         .unwrap();
@@ -4238,7 +4529,7 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: false,
-            },
+        view: None,},
         )
         .await
         .unwrap();
@@ -4259,7 +4550,7 @@ mod tests {
                 reindex: true,
                 max_embed_batch_size: None,
                 branch: false,
-            },
+        view: None,},
         )
         .await
         .unwrap();
@@ -4496,7 +4787,7 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: false,
-            },
+        view: None,},
         )
         .await
         .unwrap();
@@ -4569,6 +4860,8 @@ mod tests {
                 date_hint: None,
                 byte_range: None,
             }],
+            None,
+            None,
             None,
         )
         .unwrap();
@@ -4658,6 +4951,24 @@ mod tests {
         assert!(!found, "zero-chunk file must be excluded from prepare_project_batch files");
     }
 
+    #[test]
+    fn prepare_batch_preserves_requested_view_in_summary() {
+        let tempdir = tempdir().unwrap();
+        let project_dir = tempdir.path().join("project");
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::write(
+            project_dir.join("mempalace.yaml"),
+            "wing: testbatch\nrooms:\n  - name: general\n",
+        )
+        .unwrap();
+
+        let mut request = ProjectIngestRequest::new(&project_dir);
+        request.view = Some("feature-x".to_owned());
+
+        let prepared = prepare_project_batch(&request).unwrap();
+        assert_eq!(prepared.summary.view_name.as_deref(), Some("feature-x"));
+    }
+
     // ─── Branch delta tests ───────────────────────────────────────────────────
 
     /// Initialize a git repo at `dir` with a single commit on branch `main`.
@@ -4741,7 +5052,7 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: true,
-            },
+        view: None,},
         )
         .await
         .unwrap();
@@ -4806,9 +5117,11 @@ mod tests {
         };
         run_git(&["checkout", "-b", "feature"]);
 
-        // First mine: modify base.rs + add untracked.rs
+        // First mine: modify base.rs and stable.rs + add untracked.rs.  The
+        // stable.rs content deliberately aliases the legacy tombstone hash.
         let changed_content = "fn base() -> i32 { 99 }\n".repeat(5);
         fs::write(repo_dir.join("base.rs"), &changed_content).unwrap();
+        fs::write(repo_dir.join("stable.rs"), "removed").unwrap();
         let new_content = "fn new_func() -> bool { true }\n".repeat(5);
         fs::write(repo_dir.join("untracked.rs"), &new_content).unwrap();
 
@@ -4828,15 +5141,16 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: true,
-            },
+        view: None,},
         )
         .await
         .unwrap();
-        assert_eq!(first.ingested_files, 2);
+        assert_eq!(first.ingested_files, 3);
         assert_eq!(first.removed_sources, 0);
 
-        // Revert base.rs to original content (it is no longer in the delta).
+        // Revert base.rs to original content and delete a canonical file.
         fs::write(repo_dir.join("base.rs"), &base_content).unwrap();
+        fs::remove_file(repo_dir.join("stable.rs")).unwrap();
 
         let second = ingest_project(
             &engine,
@@ -4850,15 +5164,17 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: true,
-            },
+        view: None,},
         )
         .await
         .unwrap();
 
-        // base.rs is no longer in the delta (reverted); untracked.rs still is.
-        assert_eq!(second.removed_sources, 1, "reverted file must be counted as removed");
+        // base.rs is no longer in the delta (reverted), stable.rs gains a durable
+        // tombstone, and untracked.rs still is part of the branch delta.
+        assert_eq!(second.removed_sources, 1);
 
-        // base.rs drawers must be cleared.
+        // Reverting a branch replacement removes the branch state entirely so
+        // a later deletion can create a fresh durable tombstone.
         let root = repo_dir.canonicalize().unwrap();
         let wing_name = "cleanuptest";
         let repo_id = derive_repo_id(&root, wing_name);
@@ -4869,13 +5185,56 @@ mod tests {
             "feature",
             "base.rs",
         );
-        let stored = engine.operational_store().get_ingested_file(&sk_base).unwrap();
-        // After cleanup the key exists but with zero drawers (replace-with-empty).
-        // The content_hash is now hash_text("removed").
-        assert!(
-            stored.map(|s| s.content_hash == hash_text("removed")).unwrap_or(false),
-            "reverted file's stored content_hash must be hash_text(\"removed\")"
+        assert!(engine.operational_store().get_ingested_file(&sk_base).unwrap().is_none());
+
+        let sk_stable = project_branch_source_key(
+            "projects-branch",
+            &stable_project_root_key(&repo_id),
+            wing_name,
+            "feature",
+            "stable.rs",
         );
+        let tombstone = engine.operational_store().get_ingested_file(&sk_stable).unwrap();
+        assert_eq!(
+            tombstone.map(|record| record.content_hash),
+            Some(hash_text("Deleted branch path tombstone"))
+        );
+        let tombstone_drawers = engine
+            .drawer_store()
+            .list_drawers(&DrawerFilter {
+                view: Some("feature".to_owned()),
+                branch_view_only: true,
+                source_file: Some("stable.rs".to_owned()),
+                ..DrawerFilter::default()
+            })
+            .await
+            .unwrap();
+        assert!(!tombstone_drawers.is_empty());
+        assert!(tombstone_drawers.iter().all(|drawer| {
+            drawer
+                .view_metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.path_state == "deleted")
+        }));
+
+        let third = ingest_project(
+            &engine,
+            &mut provider,
+            &ProjectIngestRequest {
+                project_dir: repo_dir.clone(),
+                wing: None,
+                agent: "tester".to_owned(),
+                limit: None,
+                dry_run: false,
+                reindex: false,
+                max_embed_batch_size: None,
+                branch: true,
+                view: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(third.removed_sources, 0, "an unchanged tombstone remains durable");
     }
 
     #[tokio::test]
@@ -4930,7 +5289,7 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: true,
-            },
+        view: None,},
         )
         .await
         .unwrap();
@@ -4974,7 +5333,7 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: true,
-            },
+        view: None,},
         )
         .await;
 
@@ -5135,5 +5494,67 @@ mod tests {
             .collect::<BTreeSet<_>>();
 
         assert!(paths.contains(&worktree_dir));
+    }
+
+    #[test]
+    fn detect_checkout_view_returns_nongit_for_non_repo() {
+        let tempdir = tempdir().unwrap();
+        let non_git = tempdir.path().join("not_a_repo");
+        fs::create_dir(&non_git).unwrap();
+
+        let result = detect_checkout_view(&non_git);
+        assert_eq!(result, CheckoutView::NonGit);
+    }
+
+    #[test]
+    fn detect_checkout_view_detects_canonical_branch_and_unknown_default() {
+        let tempdir = tempdir().unwrap();
+        let canonical = tempdir.path().join("canonical");
+        fs::create_dir(&canonical).unwrap();
+        git_init_with_commit(&canonical, "main", &[("file.txt", "contents")]);
+        assert_eq!(detect_checkout_view(&canonical), CheckoutView::Canonical);
+
+        let unknown_default = tempdir.path().join("unknown-default");
+        fs::create_dir(&unknown_default).unwrap();
+        git_init_with_commit(&unknown_default, "trunk", &[("file.txt", "contents")]);
+        assert_eq!(detect_checkout_view(&unknown_default), CheckoutView::Canonical);
+    }
+
+    #[test]
+    fn detect_checkout_view_detects_feature_and_detached_head() {
+        let tempdir = tempdir().unwrap();
+        let repo = tempdir.path().join("repo");
+        fs::create_dir(&repo).unwrap();
+        git_init_with_commit(&repo, "main", &[("file.txt", "contents")]);
+
+        let run = |args: &[&str]| {
+            let status = Command::new("git").args(args).current_dir(&repo).status().unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run(&["checkout", "-b", "feature"]);
+        assert!(matches!(
+            detect_checkout_view(&repo),
+            CheckoutView::Branch {
+                view_name,
+                base_ref: Some(base_ref),
+                merge_base: Some(_),
+            } if view_name == "feature" && base_ref == "main"
+        ));
+
+        run(&["checkout", "--detach"]);
+        assert!(matches!(
+            detect_checkout_view(&repo),
+            CheckoutView::Branch {
+                view_name,
+                base_ref: Some(base_ref),
+                merge_base: Some(_),
+            } if view_name.starts_with("detached-") && base_ref == "main"
+        ));
+    }
+
+    #[test]
+    fn ingest_summary_view_name_defaults_to_none() {
+        let summary = IngestSummary::default();
+        assert_eq!(summary.view_name, None);
     }
 }

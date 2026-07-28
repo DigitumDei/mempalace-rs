@@ -147,6 +147,15 @@ impl LanceDrawerStore {
             Field::new("locator_file_hash", DataType::Utf8, true),
             Field::new("locator_resolve_root", DataType::Utf8, true),
             Field::new("locator_commit", DataType::Utf8, true),
+            // View-metadata columns (nullable; absent in old tables — migrated by ensure_schema).
+            Field::new("view_repo_id", DataType::Utf8, true),
+            Field::new("view_name", DataType::Utf8, true),
+            Field::new("view_source_path", DataType::Utf8, true),
+            Field::new("view_head_commit", DataType::Utf8, true),
+            Field::new("view_base_ref", DataType::Utf8, true),
+            Field::new("view_merge_base", DataType::Utf8, true),
+            Field::new("view_worktree_id", DataType::Utf8, true),
+            Field::new("view_path_state", DataType::Utf8, true),
             Field::new(
                 "embedding",
                 DataType::FixedSizeList(
@@ -167,7 +176,11 @@ impl LanceDrawerStore {
         if ids.is_empty() {
             return Ok(HashSet::new());
         }
-        let filter = DrawerFilter { ids: ids.to_vec(), ..DrawerFilter::default() };
+        let filter = DrawerFilter {
+            ids: ids.to_vec(),
+            include_all_views: true,
+            ..DrawerFilter::default()
+        };
         Ok(self
             .list_drawers(&filter)
             .await?
@@ -544,7 +557,7 @@ impl DrawerStore for LanceDrawerStore {
     }
 
     async fn get_drawer(&self, id: &DrawerId) -> Result<Option<DrawerRecord>> {
-        let mut filter = DrawerFilter::default();
+        let mut filter = DrawerFilter { include_all_views: true, ..DrawerFilter::default() };
         filter.ids.push(id.clone());
         Ok(self.list_drawers(&filter).await?.into_iter().next())
     }
@@ -714,6 +727,61 @@ fn drawers_to_reader(
                     })
                     .collect::<Vec<_>>(),
             )),
+            // View-metadata columns.
+            Arc::new(StringArray::from(
+                drawers
+                    .iter()
+                    .map(|drawer| drawer.view_metadata.as_ref().map(|vm| vm.repo_id.as_str()))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                drawers
+                    .iter()
+                    .map(|drawer| drawer.view_metadata.as_ref().and_then(|vm| vm.view_name.as_deref()))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                drawers
+                    .iter()
+                    .map(|drawer| drawer.view_metadata.as_ref().map(|vm| vm.source_path.as_str()))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                drawers
+                    .iter()
+                    .map(|drawer| {
+                        drawer.view_metadata.as_ref().and_then(|vm| vm.head_commit.as_deref())
+                    })
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                drawers
+                    .iter()
+                    .map(|drawer| {
+                        drawer.view_metadata.as_ref().and_then(|vm| vm.base_ref.as_deref())
+                    })
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                drawers
+                    .iter()
+                    .map(|drawer| {
+                        drawer.view_metadata.as_ref().and_then(|vm| vm.merge_base.as_deref())
+                    })
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                drawers
+                    .iter()
+                    .map(|drawer| drawer.view_metadata.as_ref().map(|vm| vm.worktree_id.as_str()))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                drawers
+                    .iter()
+                    .map(|drawer| drawer.view_metadata.as_ref().map(|vm| vm.path_state.as_str()))
+                    .collect::<Vec<_>>(),
+            )),
             Arc::new(FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
                 drawers.iter().map(|drawer| {
                     Some(drawer.embedding.iter().copied().map(Some).collect::<Vec<_>>())
@@ -744,12 +812,42 @@ fn compile_filter(filter: &DrawerFilter) -> String {
     if let Some(source_file) = &filter.source_file {
         parts.push(format!("source_file = '{}'", escape_sql(source_file)));
     }
+    if !filter.source_files.is_empty() {
+        parts.push(format!("source_file IN ({})", quote_strings(&filter.source_files)));
+    }
+    if filter.include_all_views || filter.view.as_deref() == Some("full") {
+        return parts.join(" AND ");
+    }
+    match filter.view.as_deref() {
+        None | Some("canonical") => {
+            // Canonical is the default repository truth. Keep non-project
+            // drawers visible while excluding all branch-view rows.
+            parts.push("ingest_mode != 'projects-branch'".to_owned());
+        }
+        Some(view) => {
+            // Match view_name directly (new columns) with a hall fallback for
+            // legacy rows written before the view-metadata migration.
+            let escaped = escape_sql(view);
+            let branch_predicate = format!(
+                "(view_name = '{escaped}' OR (view_name IS NULL AND hall = 'view:{escaped}'))"
+            );
+            if filter.branch_view_only {
+                parts.push(branch_predicate);
+            } else {
+                parts.push(format!("(ingest_mode != 'projects-branch' OR {branch_predicate})"));
+            }
+        }
+    }
 
     parts.join(" AND ")
 }
 
 fn quote_ids(ids: &[DrawerId]) -> String {
     ids.iter().map(|id| format!("'{}'", escape_sql(id.as_str()))).collect::<Vec<_>>().join(", ")
+}
+
+fn quote_strings(values: &[String]) -> String {
+    values.iter().map(|value| format!("'{}'", escape_sql(value))).collect::<Vec<_>>().join(", ")
 }
 
 fn escape_sql(value: &str) -> String {
@@ -847,6 +945,23 @@ fn records_from_batches(batches: &[RecordBatch]) -> Result<Vec<DrawerRecord>> {
             batch.column_by_name("locator_resolve_root").map(|col| col.as_string::<i32>());
         let locator_commit =
             batch.column_by_name("locator_commit").map(|col| col.as_string::<i32>());
+        // View-metadata columns are optional (absent from tables created before schema migration).
+        let view_repo_id =
+            batch.column_by_name("view_repo_id").map(|col| col.as_string::<i32>());
+        let view_name =
+            batch.column_by_name("view_name").map(|col| col.as_string::<i32>());
+        let view_source_path =
+            batch.column_by_name("view_source_path").map(|col| col.as_string::<i32>());
+        let view_head_commit =
+            batch.column_by_name("view_head_commit").map(|col| col.as_string::<i32>());
+        let view_base_ref =
+            batch.column_by_name("view_base_ref").map(|col| col.as_string::<i32>());
+        let view_merge_base =
+            batch.column_by_name("view_merge_base").map(|col| col.as_string::<i32>());
+        let view_worktree_id =
+            batch.column_by_name("view_worktree_id").map(|col| col.as_string::<i32>());
+        let view_path_state =
+            batch.column_by_name("view_path_state").map(|col| col.as_string::<i32>());
         let embedding = batch
             .column_by_name("embedding")
             .ok_or_else(|| StorageError::Invariant("missing `embedding` column".to_owned()))?
@@ -888,6 +1003,17 @@ fn records_from_batches(batches: &[RecordBatch]) -> Result<Vec<DrawerRecord>> {
                     locator_file_hash,
                     locator_resolve_root,
                     locator_commit,
+                ),
+                view_metadata: build_view_metadata(
+                    row,
+                    view_repo_id,
+                    view_name,
+                    view_source_path,
+                    view_head_commit,
+                    view_base_ref,
+                    view_merge_base,
+                    view_worktree_id,
+                    view_path_state,
                 ),
             });
         }
@@ -932,6 +1058,50 @@ fn build_locator(
         file_hash: fh,
         resolve_root: rr,
         commit_hash: ch,
+    })
+}
+
+/// Reconstruct [`RepositoryViewMetadata`] from optional column arrays at the
+/// given row index.  Returns `None` when the view_* columns are entirely absent
+/// (old table, pre-migration) or when `view_repo_id` is null.
+fn build_view_metadata(
+    row: usize,
+    repo_id: Option<&arrow_array::StringArray>,
+    view_name: Option<&arrow_array::StringArray>,
+    source_path: Option<&arrow_array::StringArray>,
+    head_commit: Option<&arrow_array::StringArray>,
+    base_ref: Option<&arrow_array::StringArray>,
+    merge_base: Option<&arrow_array::StringArray>,
+    worktree_id: Option<&arrow_array::StringArray>,
+    path_state: Option<&arrow_array::StringArray>,
+) -> Option<mempalace_core::RepositoryViewMetadata> {
+    let rid = repo_id.filter(|col| !col.is_null(row)).map(|col| col.value(row).to_owned())?;
+    let sp = source_path
+        .filter(|col| !col.is_null(row))
+        .map(|col| col.value(row).to_owned())?;
+    let wtid = worktree_id
+        .filter(|col| !col.is_null(row))
+        .map(|col| col.value(row).to_owned())?;
+    let ps = path_state
+        .filter(|col| !col.is_null(row))
+        .map(|col| col.value(row).to_owned())?;
+    Some(mempalace_core::RepositoryViewMetadata {
+        repo_id: rid,
+        view_name: view_name
+            .filter(|col| !col.is_null(row))
+            .map(|col| col.value(row).to_owned()),
+        source_path: sp,
+        head_commit: head_commit
+            .filter(|col| !col.is_null(row))
+            .map(|col| col.value(row).to_owned()),
+        base_ref: base_ref
+            .filter(|col| !col.is_null(row))
+            .map(|col| col.value(row).to_owned()),
+        merge_base: merge_base
+            .filter(|col| !col.is_null(row))
+            .map(|col| col.value(row).to_owned()),
+        worktree_id: wtid,
+        path_state: ps,
     })
 }
 
@@ -1020,6 +1190,7 @@ mod tests {
             content_hash: format!("hash-{id}"),
             embedding: embedding(seed),
             locator: None,
+            view_metadata: None,
         }
     }
 
@@ -1391,6 +1562,7 @@ mod tests {
             content_hash: "newhash".to_owned(),
             embedding: embedding([0.1, 0.2, 0.3, 0.4]),
             locator: Some(locator_with_commit.clone()),
+            view_metadata: None,
         };
         store.put_drawers(&[new_row], DuplicateStrategy::Error).await.unwrap();
 
@@ -1437,6 +1609,7 @@ mod tests {
             content_hash: "otherhash".to_owned(),
             embedding: embedding([0.2, 0.3, 0.4, 0.5]),
             locator: Some(locator_no_commit),
+            view_metadata: None,
         };
         store.put_drawers(&[row_no_commit], DuplicateStrategy::Error).await.unwrap();
 

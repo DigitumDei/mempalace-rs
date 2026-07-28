@@ -1103,8 +1103,10 @@ where
                         )
                         .await?;
                     let candidate_count = payload["results"].as_array().map_or(0, Vec::len);
-                    self.filter_federated_view_overrides(&mut payload, &view, &wing)
-                        .await?;
+                    if include_local {
+                        self.filter_federated_view_overrides(&mut payload, &view, &wing)
+                            .await?;
+                    }
                     let result_count = payload["results"].as_array().map_or(0, Vec::len);
                     if !overlay
                         || result_count >= limit
@@ -5274,12 +5276,18 @@ mod tests {
     struct LibMockRemote {
         changes_events: Vec<mempalace_federation::ChangeEventDto>,
         changes_next_cursor: Option<String>,
+        search_results: Vec<mempalace_federation::RemoteDrawerResult>,
         fail: bool,
     }
 
     impl Default for LibMockRemote {
         fn default() -> Self {
-            Self { changes_events: vec![], changes_next_cursor: None, fail: false }
+            Self {
+                changes_events: vec![],
+                changes_next_cursor: None,
+                search_results: vec![],
+                fail: false,
+            }
         }
     }
 
@@ -5295,7 +5303,9 @@ mod tests {
             &self,
             _req: mempalace_federation::DrawerSearchRequest,
         ) -> mempalace_remote::Result<mempalace_federation::DrawerSearchResponse> {
-            Ok(mempalace_federation::DrawerSearchResponse { results: vec![] })
+            Ok(mempalace_federation::DrawerSearchResponse {
+                results: self.search_results.clone(),
+            })
         }
         async fn check_duplicate(
             &self,
@@ -5440,6 +5450,73 @@ mod tests {
         };
         seed_drawers(&server).await;
         TestHarness { _tempdir: tempdir, server }
+    }
+
+    #[tokio::test]
+    async fn remote_only_view_search_keeps_remote_results_despite_local_branch_rows() {
+        let mut remote = LibMockRemote::default();
+        remote.search_results = vec![mempalace_federation::RemoteDrawerResult {
+            drawer_id: "remote-1".to_owned(),
+            wing: "wing_code".to_owned(),
+            room: "general".to_owned(),
+            rank: 1,
+            score: 0.9,
+            content: "remote canonical content".to_owned(),
+            source_file: Some("changed.md".to_owned()),
+            content_hash: None,
+            filed_at: None,
+            added_by: None,
+            stale: false,
+        }];
+        let mut remotes: BTreeMap<String, Arc<dyn mempalace_remote::RemoteApi>> = BTreeMap::new();
+        remotes.insert("hub".to_owned(), Arc::new(remote));
+        let mut router = make_lib_router(remotes);
+        router.rules.wings.insert(
+            "wing_code".to_owned(),
+            ResolvedRouteRule {
+                mode: RouteMode::Remote,
+                remote: Some("hub".to_owned()),
+                write: WriteTarget::Remote,
+            },
+        );
+        let harness = test_harness_with_mock_router(router).await;
+
+        let runtime = harness.server.runtime.lock().await;
+        let now = datetime!(2026-04-11 09:00:00 UTC);
+        let mut local_branch_row = test_diary_drawer("wing_code/general/branch", "local branch", now);
+        local_branch_row.wing = WingId::new("wing_code").unwrap();
+        local_branch_row.room = RoomId::new("general").unwrap();
+        local_branch_row.source_file = "changed.md".to_owned();
+        local_branch_row.ingest_mode = "projects-branch".to_owned();
+        local_branch_row.view_metadata = Some(mempalace_core::RepositoryViewMetadata {
+            repo_id: "repo".to_owned(),
+            view_name: Some("feature-x".to_owned()),
+            source_path: "/repo".to_owned(),
+            head_commit: Some("head".to_owned()),
+            base_ref: Some("main".to_owned()),
+            merge_base: Some("base".to_owned()),
+            worktree_id: "worktree".to_owned(),
+            path_state: "present".to_owned(),
+        });
+        runtime
+            .storage
+            .drawer_store()
+            .put_drawers(&[local_branch_row], DuplicateStrategy::Error)
+            .await
+            .unwrap();
+        drop(runtime);
+
+        let response = harness
+            .server
+            .handle_request(tool_call(
+                9002,
+                "mempalace_search",
+                json!({"query": "canonical", "wing": "wing_code", "view": "feature-x"}),
+            ))
+            .await;
+        let payload = decode_tool_payload(&response).unwrap();
+        assert_eq!(payload["results"].as_array().unwrap().len(), 1);
+        assert_eq!(payload["results"][0]["origin"], "hub");
     }
 
     fn make_dto_event(event_type: &str, occurred_at: &str, entity_id: &str)

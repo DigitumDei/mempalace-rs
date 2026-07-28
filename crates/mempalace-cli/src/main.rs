@@ -1198,7 +1198,7 @@ where
     let runtime = build_runtime(&config).map_err(runtime_error)?;
 
     // ── Auto-detect checkout view (projects mode only) ─────────────────────
-    let (effective_branch, effective_view, automatically_detected_branch) = if mode == CliMode::Projects {
+    let (effective_branch, effective_view) = if mode == CliMode::Projects {
         let checkout_view = mempalace_ingest::detect_checkout_view(&source_dir);
         let (detected_branch, is_auto) = match &checkout_view {
             mempalace_ingest::CheckoutView::Canonical => (false, true),
@@ -1240,9 +1240,9 @@ where
             })
         };
 
-        (final_branch, final_view, is_auto && detected_branch && !branch && explicit_view.is_none() && !full)
+        (final_branch, final_view)
     } else {
-        (branch, None, false)
+        (branch, None)
     };
 
     // ── Routing decision (projects mode only) ────────────────────────────────
@@ -1316,7 +1316,7 @@ where
             && rule.mode == RouteMode::Combined
             && rule.write == WriteTarget::Both;
 
-        if automatically_detected_branch && !use_remote && !use_both {
+        if effective_branch && !use_remote && !use_both {
             let engine = runtime
                 .block_on(StorageEngine::open(&config.palace_path, config.embedding_profile))
                 .map_err(storage_error)?;
@@ -1329,7 +1329,7 @@ where
             {
                 return Ok(CliOutput::failure(
                     1,
-                    "automatic branch mining requires an existing canonical snapshot; mine the canonical checkout first or use --full to intentionally replace it\n",
+                    "branch mining requires an existing local canonical snapshot; mine the canonical checkout locally first or use --full to intentionally replace it\n",
                 ));
             }
         }
@@ -4134,6 +4134,50 @@ mod tests {
                 );
             }
         }
+
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn mine_explicit_branch_on_remote_route_requires_local_canonical_snapshot() {
+        let workspace = tempdir().unwrap();
+        let repo_dir = workspace.path().join("repo");
+        fs::create_dir_all(&repo_dir).unwrap();
+        git_init_repo(
+            &repo_dir,
+            &[("code.rs", &"fn base() {}\n".repeat(20))],
+        );
+        let status = std::process::Command::new("git")
+            .args(["checkout", "-b", "feature"])
+            .current_dir(&repo_dir)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        fs::write(repo_dir.join("code.rs"), "fn branch() {}\n".repeat(20)).unwrap();
+
+        let config_root = temp_config_root("remote-branch-snapshot");
+        let context = CliContext::for_tests(config_root.clone());
+        write_remote_cli_config(
+            &config_root,
+            "hub",
+            "http://127.0.0.1:9",
+            "unused-token",
+            "branchtest",
+            &repo_dir,
+        );
+
+        let output = run_cli(
+            ["mine", repo_dir.to_str().unwrap(), "--branch"],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+        assert_ne!(output.exit_code, 0);
+        assert!(
+            output.stderr.contains("existing local canonical snapshot"),
+            "unexpected error: {}",
+            output.stderr
+        );
 
         remove_dir_all_if_exists(&config_root);
     }

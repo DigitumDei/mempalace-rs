@@ -363,6 +363,14 @@ mempalace-cli mine /path/to/project --full     # force a full canonical mine
 - An **auto-detected** branch mine requires an existing canonical snapshot for the
   project; without one it fails and tells you to mine the canonical checkout first
   or pass `--full`. Explicit `--branch` / `--view` bypasses that guard.
+
+> **Federated wings must bypass the guard explicitly.** The check queries the **local**
+> palace only. On a wing routed `remote` (or `combined` with `write: remote`) the canonical
+> snapshot lives on the hub, so the local lookup finds nothing and an auto-detected branch
+> mine fails — even though the canonical data exists. The error's `--full` suggestion does
+> not help here either: `--full` is a canonical mine, so it routes straight back to the
+> remote and never creates the local snapshot the guard wants. Pass `--branch` or
+> `--view <name>` explicitly instead; that marks the mine as deliberate and skips the guard.
 - **Branch views are always local**, even for a `remote`/`combined` wing. That is
   the point: they are the local side of a combined wing.
 
@@ -371,15 +379,22 @@ detection rules, source-key layout, tombstones, and search-time overlay composit
 
 ### Searching a view
 
-`view` is a first-class search parameter on both the CLI and the federation wire
-(`SearchRequest.view`), so a combined wing can be queried per view:
+`view` is a first-class search parameter in three places — the MCP `mempalace_search`
+tool, the federation wire (`SearchRequest.view`, forwarded to remotes), and the CLI
+(`mempalace-cli search --view`). All three take the same values:
 
 - omitted or `"canonical"` — canonical snapshots only
 - `"<branch>"` — that branch composed over the canonical snapshot
 - `"full"` — every stored repository view, searched independently
 
-The MCP `mempalace_search` tool takes the same `view` argument, and each result
-carries its own `view` field (absent for canonical rows).
+Each result carries its own `view` field, absent for canonical rows.
+
+> **Only `mempalace_search` composes a view across a combined wing.** The CLI's
+> `search --view` opens the local `StorageEngine` and never performs federation routing
+> (see [Part 5](#part-5--federated-reads-wake-up-and-changes)). On the combined-wing setup
+> below — canonical on the hub, branch delta local — `mempalace-cli search --view <branch>`
+> returns only the local branch rows, because the canonical rows it would overlay live on
+> the remote and the CLI never fetches them. Use the MCP tool for that query.
 
 ### The combined-wing team workflow
 

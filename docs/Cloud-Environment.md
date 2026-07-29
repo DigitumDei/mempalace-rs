@@ -113,6 +113,11 @@ Add them only if you intend to run the embedding benchmarks.
 | `MEMPALACE_EMBED_CACHE` | `$HOME/.cache/mempalace/embeddings` | Matches the CI layout |
 | `MEMPALACE_STUB_EMBEDDINGS` | `1` | Deterministic stub vectors, so MCP/CLI/server tests run fully offline |
 
+**`MEMPALACE_STUB_EMBEDDINGS` is presence-based.** The binaries check only whether it is set,
+not what it is set to, so `=0` and `=false` still enable stub vectors — unset the variable to
+turn it off. That is fine for a sandbox, but don't carry the variable into an environment
+where you want real embeddings: the stub's vectors are not comparable with real ones.
+
 **Do not set `MEMPALACE_EMBED_ALLOW_DOWNLOADS`.** Both binaries default to offline and refuse to
 fetch model assets without it, and the test suite is green in that state — CI's
 `embeddings-tests` job never sets it, and only the separate `embedding-baselines` job does.

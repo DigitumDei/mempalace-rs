@@ -79,6 +79,11 @@ Automatic view detection (`--mode projects` only):
   project. If none exists, the command exits non-zero with
   `automatic branch mining requires an existing canonical snapshot; mine the canonical checkout first or use --full to intentionally replace it`.
   This guard does not apply when `--branch` or `--view` was passed explicitly.
+  The lookup queries the **local** palace only, so a wing routed to a remote fails the
+  guard even when the hub holds the canonical snapshot — and the suggested `--full` routes
+  the canonical mine back to that remote rather than creating a local snapshot. On a
+  federated wing, pass `--branch` or `--view <name>` explicitly. See
+  [Federation guide](Federation.md#part-4--branch-aware-mining).
 - The resolved view name is echoed in the mine summary as `View: <name>`; canonical mines
   print no `View` line.
 

@@ -297,8 +297,9 @@ mempalace-cli prune --project-id github.com/acme/repo
 # drop a single stale branch view
 mempalace-cli prune --project-id github.com/acme/repo --view old-feature --yes
 
-# drop worktree copies mined under a path prefix
-mempalace-cli prune --project-id github.com/acme/repo --source-prefix .claude/worktrees/ --yes
+# drop one subtree of a branch view
+mempalace-cli prune --project-id github.com/acme/repo --view old-feature \
+  --source-prefix crates/legacy/ --yes
 ```
 
 Operational notes:
@@ -311,6 +312,26 @@ Operational notes:
 - Data mined before the stable project-id migration is keyed by checkout path and will not
   match `--project-id`; re-mine to migrate, or sweep with `--wing` + `--kind` after checking
   the preview.
+
+### `--source-prefix` matches project-root-relative paths
+
+The prefix is matched against the stored source key, whose trailing segment is the file
+path **relative to the project root that was mined** — `crates/legacy/foo.rs`, not an
+absolute or repo-parent-relative path. Two consequences worth knowing before you reach for
+it:
+
+- **Without `--view` it only touches the canonical snapshot.** Branch views are skipped
+  (the view name precedes the path in the key), and the skip is reported as a `Note` line.
+  Pair it with `--view` to prune inside a branch.
+- **It will not clean up linked Git worktrees mined as their own project.** Those files are
+  stored relative to the worktree root, so their paths look like `src/lib.rs` — a
+  `--source-prefix .claude/worktrees/` scope matches nothing. Prune them by their own
+  `--project-id`/`--wing` instead. A prefix like that only matches a palace mined *before*
+  discovery began skipping linked worktrees, where the parent checkout's mine pulled the
+  worktree in as ordinary subdirectories.
+
+Always read the `Matched: N sources` preview before adding `--yes`; a scope that matches
+nothing prints `Nothing matched this scope.` rather than failing.
 
 Full flag reference: [CLI Surface → `prune`](CLI-Surface.md#prune).
 

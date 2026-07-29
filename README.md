@@ -46,7 +46,9 @@ MemPalace provides a palace-style memory store with:
 - An MCP server (`mempalace-mcp`) for agent integration (23 tools)
 - A CLI (`mempalace-cli`) for direct palace management
 - Locator-based mined storage: project file chunks store byte/line ranges instead of duplicated text; snippets are resolved lazily from the checkout at read time with stale detection
-- Branch-delta mining (`mine --branch`): mines only files changed vs the merge-base with the default branch, plus untracked files — keeps the local palace in sync with ongoing branch work without re-ingesting the whole repo
+- Repository views: `mine` detects the checkout automatically — a full canonical snapshot on the default branch, a branch delta everywhere else — and `search --view <branch>` composes that delta over the canonical snapshot, tombstones included. Force either side with `--full` / `--branch`
+- Scoped pruning (`mine`'s inverse): `prune` previews and then deletes mined project data by project, wing, ingest kind, branch view, or path prefix, local palace only
+- Background maintenance: fragment compaction, version retention, and vector-index optimization, run automatically by the hub and on demand via `mempalace-cli maintain`
 - Federated project mining: when a wing's route targets a remote palace, `mine` prepares chunks locally and pushes them to the remote server via `POST /v1/ingest/batch`; the server embeds and stores them, so teams can share a single mined index without distributing embedding workload to every client
 - Federation: an HTTP server (`mempalace-cli serve`) shares a palace with other clients; per-wing `local`/`remote`/`combined` routing merges remote and local results, with bearer-token auth and `write: both` local-first dual-write support — see the [Federation guide](docs/Federation.md)
 
@@ -54,7 +56,7 @@ MemPalace provides a palace-style memory store with:
 
 | Crate | Purpose |
 |---|---|
-| `mempalace-cli` | Command-line interface (`init`, `mine`, `search`, `status`, `wake-up`, `setup`, `serve`) |
+| `mempalace-cli` | Command-line interface (`init`, `mine`, `project`, `prune`, `search`, `status`, `wake-up`, `setup`, `maintain`, `serve`) |
 | `mempalace-mcp` | MCP server for agent tool integration |
 | `mempalace-core` | Core types and traits |
 | `mempalace-storage` | Palace persistence layer |
@@ -133,15 +135,22 @@ Both are already configured in the workspace — no additional setup is needed a
 
 ## Documentation
 
+Full index: [docs/README.md](docs/README.md).
+
 - [Quickstart](docs/Quickstart.md) — 5-minute setup
-- [Operator guide](docs/Operator-Standard.md) — deployment, troubleshooting, storage recovery
-- [CLI surface](docs/CLI-Surface.md) — all commands
+- [Operator guide](docs/Operator-Standard.md) — deployment, maintenance, troubleshooting, storage recovery
+- [CLI surface](docs/CLI-Surface.md) — all commands and flags
 - [Config schema](docs/Config-Schema.md) — `~/.mempalace/config.json`
+- [Release scope](docs/Release-Scope.md) — what ships, what's deferred, the 23 MCP tools
 - [Low-CPU mode](docs/Operator-Low-CPU.md) — constrained environments
 - [Cloud environment](docs/Cloud-Environment.md) — building and testing in a cloud sandbox or CI runner
-- [Mined storage](docs/Mined-Storage.md) — locator model, stale semantics, discovery rules
+- [Mined storage](docs/Mined-Storage.md) — locator model, repository views, stale semantics, discovery rules
 - [Federation](docs/Federation.md) — running a server, client routing, federated & branch-aware mining
+- [Release operations](docs/Release-Operations.md) — signed candidate and stable release runbook
 - [Hook setup](hooks/README.md) — auto-save for Claude Code
+
+Contributors: documentation is updated in the same change as the behaviour it describes — see
+[CLAUDE.md](CLAUDE.md#documentation-must-stay-current).
 
 ## License
 

@@ -12,16 +12,33 @@ This document defines the first Rust release surface for `mempalace-rs`.
 ### CLI commands frozen for v1
 
 - `init`
-- `mine` (including `--branch` branch-delta mining and remote-routed mining; see Federation)
-- `search`
+- `mine` — canonical, branch-delta (`--branch` / `--view` / automatic detection), and
+  remote-routed mining; see Federation
+- `project` — `register`, `show`, `list`, `remove`, `export` against the central registry
+- `prune` — scoped deletion of mined project data from the local palace
+- `search` — including `--view` scoping over repository views
 - `status`
 - `wake-up`
+- `setup` — register the MCP server with detected AI coding tools
+- `maintain` — one-shot maintenance pass (compact, prune, optimize)
 - `serve` (federation HTTP server; see Federation below)
+
+Full flag reference: [CLI Surface](CLI-Surface.md).
 
 ### Storage shape frozen for v1
 
 - Palace root contains `storage.sqlite3` for operational state.
 - Palace root contains `lancedb/` for drawer vectors and retrieval data.
+- Mined project files are stored as **locator rows** (byte/line ranges resolved lazily from
+  the checkout), tagged with **repository-view metadata** so canonical snapshots and branch
+  deltas coexist and compose at search time. See [Mined Storage](Mined-Storage.md).
+
+### Maintenance
+
+- Enabled by default; runs in the background of the HTTP hub (`serve`) and on demand via
+  `mempalace-cli maintain`. Three tiers — vector-index optimization, fragment compaction,
+  version retention — coordinated by a cross-process SQLite advisory lease. See
+  [Operator guide](Operator-Standard.md#maintenance).
 
 ### Runtime profiles frozen for v1
 
@@ -76,8 +93,11 @@ See [Federation](Federation.md) for the full guide.
 
 ## Explicitly Deferred Or Out Of Scope
 
-- CLI `split` is deferred. It remains visible in help and fails with an explicit deferral message.
-- CLI `compress` is deferred. It remains visible in help and fails with an explicit deferral message.
+- CLI `split` is deferred. It remains visible in help and fails with an explicit deferral
+  message pointing at a Phase 9 decision record that is not published in this repository.
+- CLI `compress` is deferred, on the same terms as `split`.
+- Federated **branch views**. `POST /v1/ingest/batch` is canonical-only; the batch DTOs carry
+  no view metadata, so branch deltas stay in the client's local palace.
 - AAAK reverse parsing is deferred for Rust v1.
 - Automatic Wikipedia or other networked entity enrichment is out of scope.
 - Python-era state inspection and import are not part of the default Rust release scope unless Phase 10 is explicitly reopened.

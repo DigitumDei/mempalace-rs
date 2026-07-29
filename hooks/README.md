@@ -125,11 +125,17 @@ Edit `mempal_save_hook.sh` to change:
 The relevant commands are:
 
 ```bash
-mempalace mine <dir>               # Mine all files in a directory
-mempalace mine <dir> --mode convos # Mine conversation transcripts only
+mempalace-cli mine <dir>               # Mine all files in a directory
+mempalace-cli mine <dir> --mode convos # Mine conversation transcripts only
 ```
 
 The hooks resolve the repo root automatically from their own path, so they work regardless of where you install the repo.
+
+> **Known issue:** the optional `MEMPAL_DIR` auto-ingest branch in
+> `mempal_save_hook.sh` still shells out to the Python-era `python3 -m mempalace mine`,
+> which does not exist in this repository. `MEMPAL_DIR` is empty by default, so the
+> default configuration is unaffected — the AI does the filing via the block-reason
+> message. Set `MEMPAL_DIR` only after changing that line to `mempalace-cli mine`.
 
 ## How It Works (Technical)
 

@@ -1,6 +1,13 @@
 # Validation Evidence
 
-This document records the Phase 12 runtime-validation evidence gathered on branch `ask/558-1776710642523` on 2026-04-20 and 2026-04-21. It is the small-VM runtime row from [Packaging-And-Validation.md](Packaging-And-Validation.md). It does not replace the GitHub Actions `build-and-package` row.
+> **This is a dated record, not current reference documentation.** It captures one
+> validation pass as it was run; the measurements are deliberately left as recorded. Several
+> of its findings have since been resolved and the CI job names it references have changed —
+> see [Subsequent changes](#subsequent-changes) at the end. For the current surface, use
+> [CLI Surface](CLI-Surface.md), [Release Scope](Release-Scope.md), and
+> [Packaging And Validation](Packaging-And-Validation.md).
+
+This document records the Phase 12 runtime-validation evidence gathered on branch `ask/558-1776710642523` on 2026-04-20 and 2026-04-21. It is the small-VM runtime row from [Packaging-And-Validation.md](Packaging-And-Validation.md). It does not replace the GitHub Actions packaging row (then named `build-and-package`, now the `release-host` matrix).
 
 ## Environment
 
@@ -73,7 +80,7 @@ Against an isolated palace root and a three-file fixture (`notes/welcome.md`, `n
 | 6 | `mempalace-cli --palace <root> wake-up` | 0 |
 | 7 | `mempalace-mcp` receives `initialize` + `tools/list` on stdio | 0 |
 
-The MCP response advertised `protocolVersion: 2024-11-05` and all 19 frozen v1 tools listed in [Release-Scope.md](Release-Scope.md): `mempalace_status`, `mempalace_list_wings`, `mempalace_list_rooms`, `mempalace_get_taxonomy`, `mempalace_get_aaak_spec`, `mempalace_kg_query`, `mempalace_kg_add`, `mempalace_kg_invalidate`, `mempalace_kg_timeline`, `mempalace_kg_stats`, `mempalace_traverse`, `mempalace_find_tunnels`, `mempalace_graph_stats`, `mempalace_search`, `mempalace_check_duplicate`, `mempalace_add_drawer`, `mempalace_delete_drawer`, `mempalace_diary_write`, `mempalace_diary_read`.
+The MCP response advertised `protocolVersion: 2024-11-05` and the 19 tools frozen at that time (the surface has since grown to 23 — see [Release-Scope.md](Release-Scope.md)): `mempalace_status`, `mempalace_list_wings`, `mempalace_list_rooms`, `mempalace_get_taxonomy`, `mempalace_get_aaak_spec`, `mempalace_kg_query`, `mempalace_kg_add`, `mempalace_kg_invalidate`, `mempalace_kg_timeline`, `mempalace_kg_stats`, `mempalace_traverse`, `mempalace_find_tunnels`, `mempalace_graph_stats`, `mempalace_search`, `mempalace_check_duplicate`, `mempalace_add_drawer`, `mempalace_delete_drawer`, `mempalace_diary_write`, `mempalace_diary_read`.
 
 ### Indicative benchmark (not signoff)
 
@@ -176,10 +183,29 @@ Windows-native is usable for the dev/test loop (check + all tests). Release buil
 
 Per [Packaging-And-Validation.md](Packaging-And-Validation.md), the following remain outstanding and must be captured in addition to this document:
 
-- Successful GitHub Actions `build-and-package` output for the candidate revision.
-- Artifact-based runtime rerun on this small VM using `mempalace-release-binaries`.
+- Successful GitHub Actions packaging output for the candidate revision (the job named
+  `build-and-package` at the time; today the `release-host` matrix).
+- Artifact-based runtime rerun on this small VM using the published release artifacts.
 - Full low-CPU signoff against RSS and latency ceilings.
 - Optional Python interop validation, applicable only if that feature ships.
+
+## Subsequent changes
+
+Recorded here so the dated evidence above is not mistaken for current state:
+
+| Item as recorded | Current state |
+|---|---|
+| Finding 1 — `rust-version = "1.85"` is stale | Resolved. The workspace declares `rust-version = "1.88"`. |
+| Finding 4 — `mempalace-rs-storage.yml` did not run | Obsolete. That workflow no longer exists; [`ci.yml`](../.github/workflows/ci.yml) runs on every PR with no `paths:` filter. |
+| `build-and-package` job | Renamed and split. Package tests fan out per crate into `release-gate`, which gates the `release-host` build matrix. |
+| 19 MCP tools | 23 tools. See [Release Scope](Release-Scope.md#mcp-tool-surface-23-tools). |
+| 6 crates under test | 14 crates. See the package list in [CLAUDE.md](../CLAUDE.md#test). |
+| CLI surface (`init`/`mine`/`search`/`status`/`wake-up`) | Also `project`, `prune`, `setup`, `maintain`, and `serve`. See [CLI Surface](CLI-Surface.md). |
+
+Finding 3 (offline-by-default embeddings with an explicit
+`MEMPALACE_EMBED_ALLOW_DOWNLOADS` override) still describes current behaviour. Finding 2's
+premise holds — `missing_docs` is still `warn`, not `deny`, in `[workspace.lints]` — but its
+per-crate warning counts are from that run and have not been re-measured.
 
 ## Release decision
 

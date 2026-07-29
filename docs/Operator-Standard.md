@@ -285,6 +285,35 @@ The `maintain` command respects the same `enabled`, `version_retention_hours`,
 background hub behaviour is that the idle gate is bypassed, so the pass
 starts immediately.
 
+## Reclaiming Space From Mined Data
+
+`mempalace-cli prune` deletes mined project data from the **local** palace by scope. It
+previews by default and only deletes with `--yes`:
+
+```bash
+# preview everything mined for one project
+mempalace-cli prune --project-id github.com/acme/repo
+
+# drop a single stale branch view
+mempalace-cli prune --project-id github.com/acme/repo --view old-feature --yes
+
+# drop worktree copies mined under a path prefix
+mempalace-cli prune --project-id github.com/acme/repo --source-prefix .claude/worktrees/ --yes
+```
+
+Operational notes:
+
+- Prune refuses to run without a narrow scope: pass `--project-id`, or both `--wing` and
+  `--kind`. This is deliberate — there is no "prune everything" form.
+- Only the two project ingest kinds (`projects`, `projects-branch`) are reachable. Diary,
+  narrative, and authored drawers cannot be pruned by this command.
+- It never touches a remote palace, even for a wing routed remote.
+- Data mined before the stable project-id migration is keyed by checkout path and will not
+  match `--project-id`; re-mine to migrate, or sweep with `--wing` + `--kind` after checking
+  the preview.
+
+Full flag reference: [CLI Surface → `prune`](CLI-Surface.md#prune).
+
 ## Storage Recovery
 
 If the palace is damaged or inconsistent:

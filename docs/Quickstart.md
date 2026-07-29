@@ -67,7 +67,7 @@ For a repository without a Git `origin`, provide a durable identity explicitly
 so another checkout can resolve the same declaration:
 
 ```bash
-./target/release/mempalace-cli init /path/to/your/project --project-id local/my-project
+mempalace-cli init /path/to/your/project --project-id local/my-project
 ```
 
 On first run, you'll see a startup validation status. If it's not `ready`, set `MEMPALACE_EMBED_ALLOW_DOWNLOADS=1` to download embedding assets, then re-run `init`.
@@ -82,22 +82,32 @@ mempalace-cli mine /path/to/your/project
 mempalace-cli mine /path/to/chats/ --mode convos --wing project_name
 ```
 
+`mine` reads the checkout it is pointed at. On the repository's default branch it takes a
+full **canonical** snapshot; on any other branch it mines only the delta against that
+branch as a named **view**, which then composes over the canonical snapshot at search time.
+So mine the default branch first, then just re-run `mine` as you work on a feature branch.
+`--full` forces a canonical mine, `--branch` forces a delta — see
+[Mined Storage](Mined-Storage.md#repository-views).
+
 ## 4. Verify it works
 
 ```bash
 mempalace-cli status
 mempalace-cli search "your query"
+mempalace-cli search "your query" --view my-feature-branch
 mempalace-cli wake-up
 ```
 
-A working `status` shows wings and rooms with drawer counts. `search` returns matching results with similarity scores. `wake-up` renders your L0 + L1 context.
+A working `status` shows wings and rooms with drawer counts. `search` returns matching results with similarity scores — canonical rows by default, or a branch view composed over them with `--view`. `wake-up` renders your L0 + L1 context.
 
 ## 5. Connect your AI (MCP)
 
 If you used the installer, this already happened: it ran `mempalace-cli setup`, which detects installed AI tools (Claude Code, Codex, Gemini, opencode, Copilot, Antigravity) and registers the `mempalace` MCP server with each. Re-run it any time — it's idempotent:
 
 ```bash
-mempalace-cli setup            # add --dry-run to preview, --only claude to restrict
+mempalace-cli setup                     # register with every detected tool
+mempalace-cli setup --dry-run           # preview without writing anything
+mempalace-cli setup --tools claude      # restrict to a comma-separated subset
 ```
 
 For tools `setup` doesn't cover, point them at `~/.mempalace/bin/mempalace-mcp` manually:
@@ -126,7 +136,7 @@ claude mcp add mempalace -- ~/.mempalace/bin/mempalace-mcp
 
 Point your MCP client at the `mempalace-mcp` binary. No arguments needed — the server speaks stdio MCP and exposes all 23 tools on `initialize`.
 
-Your AI now has access to `mempalace_search`, `mempalace_add_drawer`, `mempalace_kg_query`, and 16 more tools. Ask it anything about your project — it can search your palace on demand.
+Your AI now has access to `mempalace_search`, `mempalace_add_drawer`, `mempalace_kg_query`, and 20 more tools. Ask it anything about your project — it can search your palace on demand. The full list is in [Release Scope](Release-Scope.md#mcp-tool-surface-23-tools).
 
 ## Next steps
 

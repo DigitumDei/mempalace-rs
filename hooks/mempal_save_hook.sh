@@ -45,8 +45,8 @@
 # stop_hook_active=true so we let it through. No infinite loop.
 #
 # === MEMPALACE CLI ===
-# This repo uses: mempalace mine <dir>
-# or:            mempalace mine <dir> --mode convos
+# This repo uses: mempalace-cli mine <dir>
+# or:            mempalace-cli mine <dir> --mode convos
 # Set MEMPAL_DIR below if you want the hook to auto-ingest after blocking.
 # Leave blank to rely on the AI's own save instructions.
 #
@@ -60,6 +60,28 @@ mkdir -p "$STATE_DIR"
 # Example: MEMPAL_DIR="$HOME/conversations"
 # Leave empty to skip auto-ingest (AI handles saving via the block reason).
 MEMPAL_DIR=""
+
+# Mine mode for the optional auto-ingest above: `convos` for chat transcripts
+# (the usual MEMPAL_DIR contents), `projects` for source files.
+MEMPAL_MINE_MODE="convos"
+
+# Locate the mempalace-cli binary. Hooks run in a non-interactive shell that may
+# not have the installer's PATH additions, so fall back to the default install
+# location before giving up.
+resolve_mempalace_cli() {
+    if command -v mempalace-cli >/dev/null 2>&1; then
+        command -v mempalace-cli
+        return 0
+    fi
+    for candidate in "$HOME/.mempalace/bin/mempalace-cli" \
+                     "$HOME/.mempalace/bin/mempalace-cli.exe"; do
+        if [ -x "$candidate" ]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
 
 # Read JSON input from stdin
 INPUT=$(cat)
@@ -124,9 +146,13 @@ if [ "$SINCE_LAST" -ge "$SAVE_INTERVAL" ] && [ "$EXCHANGE_COUNT" -gt 0 ]; then
 
     # Optional: run mempalace ingest in background if MEMPAL_DIR is set
     if [ -n "$MEMPAL_DIR" ] && [ -d "$MEMPAL_DIR" ]; then
-        SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-        REPO_DIR="$(dirname "$SCRIPT_DIR")"
-        python3 -m mempalace mine "$MEMPAL_DIR" >> "$STATE_DIR/hook.log" 2>&1 &
+        if MEMPALACE_CLI="$(resolve_mempalace_cli)"; then
+            "$MEMPALACE_CLI" mine "$MEMPAL_DIR" --mode "$MEMPAL_MINE_MODE" \
+                >> "$STATE_DIR/hook.log" 2>&1 &
+        else
+            echo "[$(date '+%H:%M:%S')] mempalace-cli not found on PATH or in ~/.mempalace/bin; skipping auto-ingest" \
+                >> "$STATE_DIR/hook.log"
+        fi
     fi
 
     # Block the AI and tell it to save

@@ -76,14 +76,21 @@ Automatic view detection (`--mode projects` only):
 - `--full` / `--view canonical` force canonical; `--branch` / `--view <name>` force a branch
   delta. An explicit selector always wins over detection.
 - An **automatically** detected branch mine requires an existing canonical snapshot for the
-  project. If none exists, the command exits non-zero with
-  `automatic branch mining requires an existing canonical snapshot; mine the canonical checkout first or use --full to intentionally replace it`.
-  This guard does not apply when `--branch` or `--view` was passed explicitly.
-  The lookup queries the **local** palace only, so a wing routed to a remote fails the
-  guard even when the hub holds the canonical snapshot — and the suggested `--full` routes
-  the canonical mine back to that remote rather than creating a local snapshot. On a
-  federated wing, pass `--branch` or `--view <name>` explicitly. See
-  [Federation guide](Federation.md#part-4--branch-aware-mining).
+  project, and the lookup queries the **local** palace only. This guard does not apply when
+  `--branch` or `--view` was passed explicitly. If no local snapshot exists the command
+  exits non-zero with `automatic branch mining requires an existing canonical snapshot`,
+  followed by recovery advice that depends on the wing's route:
+  - **Local wing** — `mine the canonical checkout first or use --full to intentionally
+    replace it`.
+  - **Wing whose canonical mines route to a remote** (`mode: remote`, or `combined` with
+    `write: remote`) — ``wing `<name>` routes canonical mines to a remote, so --full cannot
+    create the local snapshot this check needs; pass --branch or --view <name> to mine the
+    branch delta deliberately``. `--full` is not a fix there: it is a canonical mine, so it
+    would push to the remote and never create the local snapshot the guard wants.
+  - `combined` with `write: both` gets the local-wing message, because that route still
+    performs the full local mine and so does leave a local snapshot behind.
+
+  See [Federation guide](Federation.md#part-4--branch-aware-mining).
 - The resolved view name is echoed in the mine summary as `View: <name>`; canonical mines
   print no `View` line.
 
@@ -160,8 +167,9 @@ Flags:
   Restrict to a single branch view; implies the `projects-branch` kind and excludes the
   canonical snapshot. Requires `--project-id`.
 - `--source-prefix <PREFIX>`
-  Restrict to source paths under this normalized prefix, e.g. `.claude/worktrees/`.
-  Requires `--project-id`.
+  Restrict to source paths under this normalized prefix, matched against paths relative to
+  the mined project root, e.g. `crates/legacy/`. Without `--view` this narrows the canonical
+  snapshot only. Requires `--project-id`.
 - `--dry-run`
   Preview only; never delete. This is already the behavior when `--yes` is absent.
 - `--yes`

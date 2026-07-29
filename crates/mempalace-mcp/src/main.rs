@@ -3,6 +3,7 @@
 use std::ffi::OsString;
 
 use mempalace_config::{ConfigLoader, build_runtime};
+use mempalace_embeddings::env_flag;
 use mempalace_mcp::{DeterministicStubProvider, McpServer, default_provider, serve_transport};
 use tokio::io::{self, BufReader};
 
@@ -14,7 +15,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = ConfigLoader::load_with_env(None)?;
     build_runtime(&config)?.block_on(async move {
-        if std::env::var_os("MEMPALACE_STUB_EMBEDDINGS").is_some() {
+        if env_flag("MEMPALACE_STUB_EMBEDDINGS") {
             let server = McpServer::from_parts(
                 config.clone(),
                 DeterministicStubProvider::new(config.embedding_profile),

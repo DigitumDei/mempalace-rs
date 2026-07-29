@@ -177,16 +177,17 @@ counterpart, so they are not part of the override chain above:
 
 | Variable | Read by | Effect |
 |---|---|---|
-| `MEMPALACE_EMBED_ALLOW_DOWNLOADS` | `mempalace-cli`, `mempalace-mcp`, `mempalace-cli serve` | Permits downloading missing embedding assets. Parsed for an explicit truthy value — `1`, `true`, `TRUE`, `yes`, `YES`; anything else, including unset, means offline. Offline is the default. |
-| `MEMPALACE_STUB_EMBEDDINGS` | `mempalace-mcp`, `mempalace-cli serve` | Selects a deterministic stub embedding provider for offline dev and testing. **Presence-based, not truthy-parsed** — see the caution below. |
+| `MEMPALACE_EMBED_ALLOW_DOWNLOADS` | `mempalace-cli`, `mempalace-mcp`, `mempalace-cli serve` | Permits downloading missing embedding assets. Offline is the default. |
+| `MEMPALACE_STUB_EMBEDDINGS` | `mempalace-mcp`, `mempalace-cli serve` | Selects a deterministic stub embedding provider for offline dev and testing. |
 
-> **`MEMPALACE_STUB_EMBEDDINGS` is checked with `var_os(...).is_some()`, not the truthy
-> parser.** Any value enables stub vectors, including `MEMPALACE_STUB_EMBEDDINGS=0`,
-> `=false`, and `=` (empty). To disable it you must **unset** the variable, not set it to a
-> falsey value. This is deliberate to document, not to imitate: it differs from
-> `MEMPALACE_EMBED_ALLOW_DOWNLOADS` above, which does parse its value. Leaving it
-> accidentally set produces stub vectors that are not comparable with real embeddings, so a
-> palace written that way will return misleading search results.
+Both are parsed by the same helper (`env_flag`) and accept only an explicit truthy value —
+`1`, `true`, `TRUE`, `yes`, `YES`. Every other value is false, including `0`, `false`, and
+the empty string, so `MEMPALACE_STUB_EMBEDDINGS=0` disables stub vectors rather than
+enabling them.
+
+> **Don't leave `MEMPALACE_STUB_EMBEDDINGS` set in an environment that expects real
+> embeddings.** Stub vectors are deterministic placeholders and are not comparable with
+> model output, so a palace written while it is enabled returns misleading search results.
 | `MEMPALACE_BUILD_VERSION` | build script | Embeds the calculated release version in both binaries and in `GET /v1/info`. Unset falls back to the workspace package version. See [Release Operations](Release-Operations.md#release-versions). |
 | `MEMPALACE_EMBED_CACHE` | `embedding_bench` / `lme_bench` examples | Overrides the embedding cache root for benchmark runs only. |
 | `MEMPALACE_EMBED_PROFILE`, `MEMPALACE_EMBED_ITERATIONS` | `embedding_bench` example | Benchmark profile selection and iteration count. |

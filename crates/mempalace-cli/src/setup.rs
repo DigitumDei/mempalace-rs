@@ -519,11 +519,15 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
     lookup_in_paths(name, &path, cfg!(windows))
 }
 
-/// PATH lookup split out for testing (no env access). On Windows, also tries the
-/// common executable extensions so npm shims (`claude.cmd`, `gemini.cmd`) resolve.
+/// PATH lookup split out for testing (no env access). On Windows, only the
+/// directly launchable extensions are tried, so npm shims (`claude.cmd`,
+/// `gemini.cmd`) resolve. npm installs an extensionless Bourne-shell shim
+/// alongside the `.cmd` one, and a `.ps1` next to it; neither is a PE image, so
+/// `CreateProcess` rejects them with "%1 is not a valid Win32 application"
+/// (os error 193). Trying `""` first would therefore shadow the usable `.cmd`.
 fn lookup_in_paths(name: &str, path_var: &OsStr, windows: bool) -> Option<PathBuf> {
     let exts: &[&str] = if windows {
-        &["", ".exe", ".cmd", ".bat", ".ps1"]
+        &[".exe", ".cmd", ".bat"]
     } else {
         &[""]
     };
@@ -644,6 +648,32 @@ mod tests {
         // Bare name has no match on unix-semantics, but windows-semantics finds the .cmd shim.
         assert!(lookup_in_paths("gemini", &path_var, false).is_none());
         assert_eq!(lookup_in_paths("gemini", &path_var, true).as_deref(), Some(shim.as_path()));
+    }
+
+    /// npm lays down `codex`, `codex.cmd` and `codex.ps1` side by side. Only the
+    /// `.cmd` is launchable via `CreateProcess`, so the lookup must not return
+    /// the extensionless sh shim just because it is tried first.
+    #[test]
+    fn lookup_skips_unlaunchable_npm_shims_on_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh_shim = dir.path().join("codex");
+        let cmd_shim = dir.path().join("codex.cmd");
+        let ps_shim = dir.path().join("codex.ps1");
+        std::fs::write(&sh_shim, b"#!/bin/sh\n").unwrap();
+        std::fs::write(&cmd_shim, b"@echo off\n").unwrap();
+        std::fs::write(&ps_shim, b"#!/usr/bin/env pwsh\n").unwrap();
+        let path_var = OsString::from(dir.path());
+        assert_eq!(lookup_in_paths("codex", &path_var, true).as_deref(), Some(cmd_shim.as_path()));
+    }
+
+    /// A lone `.ps1` is not launchable either: reporting "not installed" beats
+    /// resolving a path that can only fail with os error 193.
+    #[test]
+    fn lookup_ignores_lone_powershell_shim_on_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("gemini.ps1"), b"#!/usr/bin/env pwsh\n").unwrap();
+        let path_var = OsString::from(dir.path());
+        assert!(lookup_in_paths("gemini", &path_var, true).is_none());
     }
 
     #[test]

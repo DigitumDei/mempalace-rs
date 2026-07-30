@@ -170,6 +170,33 @@ Override order:
 3. `config.json`
 4. Built-in default
 
+### Other environment variables
+
+These are read directly by the runtime or by examples and have no `config.json`
+counterpart, so they are not part of the override chain above:
+
+| Variable | Read by | Effect |
+|---|---|---|
+| `MEMPALACE_EMBED_ALLOW_DOWNLOADS` | `mempalace-cli`, `mempalace-mcp`, `mempalace-cli serve` | Permits downloading missing embedding assets. Offline is the default. |
+| `MEMPALACE_STUB_EMBEDDINGS` | `mempalace-mcp`, `mempalace-cli serve` — **only** | Selects a deterministic stub embedding provider for offline dev and testing. |
+| `MEMPALACE_BUILD_VERSION` | build script | Embeds the calculated release version in both binaries and in `GET /v1/info`. Unset falls back to the workspace package version. See [Release Operations](Release-Operations.md#release-versions). |
+| `MEMPALACE_EMBED_CACHE` | `embedding_bench` / `lme_bench` examples | Overrides the embedding cache root for benchmark runs only. |
+| `MEMPALACE_EMBED_PROFILE`, `MEMPALACE_EMBED_ITERATIONS` | `embedding_bench` example | Benchmark profile selection and iteration count. |
+
+The two embedding flags are parsed by the same helper (`env_flag`) and accept only an
+explicit truthy value — `1`, `true`, `TRUE`, `yes`, `YES`. Every other value is false,
+including `0`, `false`, and the empty string, so `MEMPALACE_STUB_EMBEDDINGS=0` disables stub
+vectors rather than enabling them.
+
+> **`MEMPALACE_STUB_EMBEDDINGS` reaches only the two long-running servers.** The CLI consults
+> it inside `serve` alone; `init`, `mine`, and `search` always construct the real
+> `FastembedProvider`, so on a host with no model cache they still fail with missing assets
+> however the variable is set.
+
+> **Don't leave `MEMPALACE_STUB_EMBEDDINGS` set in an environment that expects real
+> embeddings.** Stub vectors are deterministic placeholders and are not comparable with
+> model output, so a palace written while it is enabled returns misleading search results.
+
 ## Project Config File
 
 Repository-local compatibility path:

@@ -53,9 +53,46 @@ Flags:
 - `--reindex`
   Re-process files that were previously ingested and are unchanged on disk by bypassing the unchanged-content skip. In `projects` mode this converts existing content rows to locator rows — use it as the one-time migration step after upgrading a palace from pre-locator storage.
 - `--branch`
-  Mine only files changed vs the merge-base with the default branch (plus untracked files). Always writes to the local palace regardless of federation routing. Uses the `projects-branch` source-key namespace so branch rows never collide with a full mine; keys include stable project identity and branch name. Unsupported for `--mode convos`.
+  Force a branch-delta mine: only files changed vs the merge-base with the default branch (plus untracked files). Always writes to the local palace regardless of federation routing. Uses the `projects-branch` source-key namespace so branch rows never collide with a canonical mine; keys include stable project identity and the view name. Unsupported for `--mode convos`. Conflicts with `--full` and with `--view canonical`.
+- `--view <NAME>`
+  Explicit view/ref name for this mine, overriding automatic detection. `--view canonical`
+  forces a full canonical mine and is equivalent to `--full`. Any other value mines a branch
+  delta stored under that view name.
+- `--full`
+  Force a full canonical mine, ignoring automatic branch detection. Equivalent to
+  `--view canonical`. Conflicts with `--view`.
 - `--batch-size <N>` default: unset
   Largest batch to process at once; lower it to bound peak memory and CPU on low-spec machines. For a local mine it caps the number of chunks embedded per batch (default: a file's chunks are embedded together). For a remote-routed mine it caps the number of files per `POST /v1/ingest/batch` request (default: `64`); the ~4 MiB per-request byte cap still applies as an independent guardrail. `0` or omitted keeps the defaults.
+
+Automatic view detection (`--mode projects` only):
+
+- The checkout is classified before mining:
+  - **Canonical** — HEAD is on the repository's default branch → full canonical mine.
+  - **Branch** — HEAD is on any other branch, or detached (view name
+    `detached-<12-hex>` derived from the repository toplevel path) → branch-delta mine
+    under that view name.
+  - **Non-Git**, or a repository with no resolvable default branch → full mine, preserving
+    pre-view behaviour.
+- `--full` / `--view canonical` force canonical; `--branch` / `--view <name>` force a branch
+  delta. An explicit selector always wins over detection.
+- An **automatically** detected branch mine requires an existing canonical snapshot for the
+  project, and the lookup queries the **local** palace only. This guard does not apply when
+  `--branch` or `--view` was passed explicitly. If no local snapshot exists the command
+  exits non-zero with `automatic branch mining requires an existing canonical snapshot`,
+  followed by recovery advice that depends on the wing's route:
+  - **Local wing** — `mine the canonical checkout first or use --full to intentionally
+    replace it`.
+  - **Wing whose canonical mines route to a remote** (`mode: remote`, or `combined` with
+    `write: remote`) — ``wing `<name>` routes canonical mines to a remote, so --full cannot
+    create the local snapshot this check needs; pass --branch or --view <name> to mine the
+    branch delta deliberately``. `--full` is not a fix there: it is a canonical mine, so it
+    would push to the remote and never create the local snapshot the guard wants.
+  - `combined` with `write: both` gets the local-wing message, because that route still
+    performs the full local mine and so does leave a local snapshot behind.
+
+  See [Federation guide](Federation.md#part-4--branch-aware-mining).
+- The resolved view name is echoed in the mine summary as `View: <name>`; canonical mines
+  print no `View` line.
 
 Behavior:
 - `projects` uses the project ingest path.
@@ -67,7 +104,7 @@ Behavior:
 - `--reindex` bypasses the unchanged-content skip in both `projects` and `convos` modes.
 - When the wing's federation route targets a remote palace (mode `remote`, or mode `combined` with `write: remote`) and `--branch` is not set, the CLI prepares chunks locally and pushes them to `POST /v1/ingest/batch` on the remote server. The remote must advertise the `"ingest"` capability in `GET /v1/info`; older servers that lack this endpoint return a 404, which surfaces as a `RemoteRejected` error with a prompt to upgrade.
 - When the wing's federation route is `combined` with `write: both` and `--branch` is not set, the CLI performs a **local-first dual-write**: the full local mine (embedding, storage, summary) runs first, then a best-effort remote push is attempted. The remote result is appended to the mine output; a remote failure is reported without rolling back the local mine. See [Federation guide](Federation.md#write-both--local-first-dual-write-semantics) for the full semantics.
-- `--branch` overrides any remote route for the wing — branch-delta mining is always local.
+- Branch-delta mining is always local. Any resolved branch view — whether from `--branch`, `--view <name>`, or automatic detection — overrides a remote route for the wing. Only canonical mines are eligible for federated batch ingest.
 
 ### `project <register|show|list|remove|export>`
 
@@ -97,10 +134,74 @@ Flags:
 - `--wing <STRING>`
 - `--room <STRING>`
 - `--results <N>` default: `5`
+- `--view <NAME>`
+  Scope the search to a repository view. Omitted (or `canonical`) searches canonical
+  snapshots and excludes branch views. A branch name composes that branch's changed paths
+  over the canonical snapshot. `full` searches every stored repository view independently.
 
 Behavior:
 - In low-CPU mode, the requested result count is clamped to the effective low-CPU search limit.
 - Search fails with a non-zero result if no palace exists at the resolved palace path.
+- With a branch view selected, each canonical row whose `(wing, source_file)` is also present
+  in the branch view is replaced by the branch row, and branch tombstones (`path_state:
+  "deleted"`) hide the canonical row entirely. Overlay composition runs over the candidate
+  window and widens the vector query (up to 10× the requested limit) so a low-scoring branch
+  replacement shadows its canonical path without dropping unrelated results.
+
+### `prune`
+
+Purpose:
+- Delete mined project/source data from the **local** palace by scope. Previews by default;
+  deletes only with `--yes`. Never touches a remote palace, and never targets diary,
+  narrative, or authored drawers — only the two project ingest kinds.
+
+Flags:
+- `--project-id <STRING>` (alias `--project`)
+  The project as identified at mine time (explicit `--project-id` or the derived repo id).
+- `--wing <STRING>`
+  Wing to scope to. Taken from the project registry when `--project-id` is registered;
+  required otherwise, and required when scoping by `--wing` + `--kind`.
+- `--kind <projects|projects-branch>`
+  Restrict to one ingest kind. Default: both project kinds.
+- `--view <NAME>`
+  Restrict to a single branch view; implies the `projects-branch` kind and excludes the
+  canonical snapshot. Requires `--project-id`.
+- `--source-prefix <PREFIX>`
+  Restrict to source paths under this normalized prefix, matched against paths relative to
+  the mined project root, e.g. `crates/legacy/`. Without `--view` this narrows the canonical
+  snapshot only. Requires `--project-id`.
+- `--dry-run`
+  Preview only; never delete. This is already the behavior when `--yes` is absent.
+- `--yes`
+  Actually delete the matched sources.
+
+Scope rules (prune refuses to run without a narrow scope):
+- Pass `--project-id`, **or** both `--wing` and `--kind`. A bare `--wing` (or a bare `--kind`)
+  is rejected, so the scope can never widen to every project or every kind.
+- `--view` and `--source-prefix` both require `--project-id`, because the branch and path
+  segments follow the project root key inside the source key.
+- `--source-prefix` without `--view` skips branch views rather than over-matching (the branch
+  segment precedes the path); the skip is reported as a `Note` line in the output.
+
+Behavior:
+- Prints the resolved scope (wing, kinds, project, view, path prefix, notes), the matched
+  source count and drawer count, and up to 20 matched source keys followed by
+  `… and N more`.
+- Without `--yes`, ends with `Preview only — re-run with --yes to delete.` and exits `0`.
+- With `--yes`, deletes each resolved source-key prefix across both stores and reports
+  `Removed: N sources, M drawers`.
+- Exit codes: `0` on success (including "nothing matched"); `2` for a scope that is too broad,
+  invalid, or selects nothing; `1` when no palace exists at the resolved path.
+
+Known limitation:
+- Project data mined **before** the stable project-id migration is keyed by a checkout-path
+  hash rather than `hash("project:<id>")`, so `--project-id` does not match those legacy
+  rows. Re-mining migrates the **canonical** ones. Legacy `projects-branch` rows are never
+  migrated or cleaned — ingest's legacy handling is canonical-only and the branch cleanup
+  pass scans the stable prefix — so they persist and still appear in `view: "full"`
+  searches. Sweep those with an explicit `--wing` + `--kind projects-branch` scope after
+  confirming the preview. See
+  [Mined Storage → Source keys](Mined-Storage.md#source-keys).
 
 ### `status`
 
@@ -216,7 +317,9 @@ These commands are intentionally visible but not shipped as working Rust v1 func
 - `split`
 - `compress`
 
-Each returns a non-zero result and points at [Phase09-Deferred-Commands](../rust-phase-plans/Phase09-Deferred-Commands.md).
+Each returns a non-zero result and prints a pointer to the Phase 9 deferral decision record
+(`docs/rust-phase-plans/Phase09-Deferred-Commands.md`). That record is not published in this
+repository — the deferral itself is recorded in [Release Scope](Release-Scope.md).
 
 ## Exit Behavior
 

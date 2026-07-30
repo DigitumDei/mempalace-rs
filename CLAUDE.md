@@ -61,6 +61,40 @@ cargo clippy --workspace --all-targets --locked
 
 Prefer `?`, `expect` with a real justification, or explicit error types over `unwrap`.
 
+## Documentation must stay current
+
+**Docs are part of the change, not a follow-up.** Every change that alters observable
+behaviour ships with the matching documentation update in the *same* commit or PR. A PR that
+changes behaviour and leaves the docs describing the old behaviour is incomplete — treat a
+stale doc the same way you would treat a failing test.
+
+What counts as observable behaviour, and where it is documented:
+
+| You changed | Update |
+|---|---|
+| A CLI command, subcommand, flag, default, or exit code | [docs/CLI-Surface.md](docs/CLI-Surface.md) |
+| An MCP tool name, argument, or response shape | [docs/Release-Scope.md](docs/Release-Scope.md) (tool list) and the tool's own `description`/`input_schema` |
+| A config field, env var, default, or validation rule | [docs/Config-Schema.md](docs/Config-Schema.md) |
+| A REST route, wire DTO, or capability string | [docs/Federation.md](docs/Federation.md) |
+| Storage layout, source-key format, locator/view metadata, discovery rules | [docs/Mined-Storage.md](docs/Mined-Storage.md) |
+| Deployment, maintenance, or recovery behaviour | [docs/Operator-Standard.md](docs/Operator-Standard.md) |
+| Build/toolchain/network requirements | [docs/Cloud-Environment.md](docs/Cloud-Environment.md), [README.md](README.md) |
+| The release or signing pipeline | [docs/Release-Operations.md](docs/Release-Operations.md), [docs/Packaging-And-Validation.md](docs/Packaging-And-Validation.md) |
+| A new crate, or a crate's purpose | [README.md](README.md) crates table, and this file's package list |
+
+Rules:
+
+- **Verify against the code, not against the existing prose.** Before editing a doc, read the
+  current implementation. Copied-forward text is the main way these files rot.
+- **No invented surface.** Don't document a flag, field, or endpoint that does not exist, and
+  don't leave links pointing at files that aren't in the repo.
+- **Keep counts and lists honest.** The MCP tool count, the crate list, and the accepted-
+  extension tables are all asserted in prose; update them when the code changes.
+- **Dated evidence is historical.** [docs/Validation-Evidence.md](docs/Validation-Evidence.md)
+  records a specific run — annotate it when its findings are resolved rather than rewriting
+  the measurements.
+- If a change deliberately leaves a doc gap, say so explicitly in the PR description.
+
 ## Git
 
 - Never commit or push unless explicitly asked.

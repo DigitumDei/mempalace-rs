@@ -77,6 +77,32 @@ Tables also gain eight new nullable view-metadata columns (`view_repo_id`,
 migration mechanism. These are populated on new project mines. Old rows read
 back with `view_metadata: None` and continue to use the legacy `hall = "view:<name>"` convention for view scoping.
 
+### View-metadata fields
+
+| Field | Type | Description |
+|---|---|---|
+| `repo_id` | `String` | The project identity resolved at mine time — see below. |
+| `view_name` | `Option<String>` | `None` for a canonical (default-branch) snapshot; the branch or detached-HEAD view name otherwise. |
+| `source_path` | `String` | Absolute project checkout path on the palace host that owns the row. |
+| `head_commit` | `Option<String>` | `git rev-parse HEAD` at mine time. |
+| `base_ref` | `Option<String>` | Base/integration ref — the default branch name. |
+| `merge_base` | `Option<String>` | Merge-base commit between the view and `base_ref`. |
+| `worktree_id` | `String` | Stable worktree identity (hash of the canonicalized checkout path). |
+| `path_state` | `String` | `"present"`, or `"deleted"` for a tombstone row whose source file was removed on the branch. |
+
+`repo_id` is whatever project identity the mine resolved, stored verbatim — it is **not**
+always a normalized remote URL:
+
+| How the project was identified | `repo_id` value |
+|---|---|
+| Explicit `--project-id <id>` (or a registered project selected by one) | that string, exactly as given — e.g. `local/my-project` |
+| Derived, repository root, `origin` present | normalized remote URL — `github.com/acme/repo` |
+| Derived, project root is a repo subdirectory (monorepo) | `<normalized-origin>#<project-root>` — e.g. `github.com/acme/repo#services/api` |
+| Derived, no usable `origin` | `wing:<wing>` |
+
+Anything correlating view metadata back to a project must accept all four shapes; assuming
+a bare remote URL computes the wrong identity for explicit-ID and monorepo projects.
+
 ### Old rows keep working
 
 Rows written before the locator upgrade read back with `locator: None` and their
@@ -187,11 +213,15 @@ The following files are never discovered regardless of extension:
 
 ## Federated mining
 
-When a wing's federation route resolves to `mode: remote` (or `mode: combined`
+When a **canonical** mine's wing routes to `mode: remote` (or `mode: combined`
 with `write: remote`), running `mine <dir>` routes to the remote palace instead
 of writing locally. When the route resolves to `mode: combined` with
 `write: both`, the mine runs locally first, then a best-effort remote push is
 attempted (see [Federation guide](Federation.md#write-both--local-first-dual-write-semantics)).
+
+A mine that resolves to a **branch view** — via `--branch`, `--view <name>`, or
+automatic detection on a non-canonical checkout — never routes remote. It always
+writes to the local palace, whatever the wing's route says.
 
 ### Flow
 
@@ -311,9 +341,17 @@ The server computes the source key for each file as:
 projects:{wing}:{blake3_hex(repo_id)}:{relative_path}
 ```
 
-This is the same shape as the local `projects:{wing}:{blake3_hex(root_path)}:{relative_path}` key, with the machine-local checkout path hash replaced
-by the repo-identity hash. Two clients pushing the same repository to the same
-remote wing converge on identical source keys and identical drawer ids.
+This is the same shape as the local canonical key
+(`projects:{wing}:{blake3_hex("project:" + repo_id)}:{relative_path}`, see
+[Source keys](#source-keys)); the hash input differs because the two keyspaces
+live in separate palaces and are never compared directly. What matters is that
+both are derived from repository identity rather than a machine-local checkout
+path: two clients pushing the same repository to the same remote wing converge on
+identical source keys and identical drawer ids.
+
+Federated batches are **always canonical**. The server stamps
+`view_name: None` on every row it ingests through this endpoint, and the batch
+DTOs carry no view metadata — branch views stay in the client's local palace.
 
 Drawer ids follow the same formula as local mining:
 
@@ -386,10 +424,122 @@ The server rejects any request targeting the diary wing (`wing_agents`) or any
 chunk whose room is the diary room (`diary`) with HTTP 422 and error code
 `diary_not_federated`. Diary entries are always palace-local.
 
+## Repository views
+
+Every project mine writes into exactly one **view** of the repository:
+
+- The **canonical** view is the default-branch snapshot. It uses the `projects`
+  ingest kind and carries `view_name: None`.
+- A **branch** view is a delta against the canonical snapshot. It uses the
+  `projects-branch` ingest kind and carries `view_name: Some(<name>)`.
+
+### Automatic view detection
+
+`mine --mode projects` classifies the checkout before ingesting, via
+`detect_checkout_view`:
+
+| Checkout | Detected view | Result |
+|---|---|---|
+| HEAD is on the repository's default branch | `Canonical` | full canonical mine |
+| HEAD is on any other branch | `Branch { view_name: <branch> }` | branch-delta mine |
+| Detached HEAD | `Branch { view_name: "detached-<12-hex>" }` | branch-delta mine; the hex is a hash of the repository toplevel path |
+| Not a Git repository, or no resolvable default branch | `NonGit` / `Canonical` | full mine (pre-view behaviour preserved) |
+
+The default branch is resolved by trying `git symbolic-ref --short
+refs/remotes/origin/HEAD`, then the literal `main`, then `master` — the first
+reference `git rev-parse --verify` accepts wins.
+
+> **No resolvable default branch means every checkout looks canonical.** A repository
+> whose integration branch is named something else (`trunk`, `develop`) and which has no
+> `origin` falls into the `(None, _)` arm, which returns `Canonical` deliberately: without
+> an integration ref there is no safe delta baseline, so the pre-view behaviour of mining
+> the checkout in full is preserved. The consequence is that a plain `mine` on a feature
+> branch of such a repository **overwrites the canonical snapshot** with that branch's
+> contents rather than storing a view. Pass `--branch` or `--view <name>` explicitly on
+> those repositories.
+
+Explicit selectors override detection: `--full` and `--view canonical` force a
+canonical mine; `--branch` and `--view <name>` force a branch-delta mine.
+`--full` conflicts with `--view`, and `--branch` conflicts with `--view canonical`.
+
+An **automatically** detected branch mine additionally requires that a canonical
+snapshot already exists for the project. Without one the run fails rather than
+silently storing a delta with nothing to overlay; pass `--full` to mine the whole
+checkout instead. Explicit `--branch` / `--view` bypasses this guard.
+
+### Source keys
+
+Canonical rows:
+
+```
+projects:{wing}:{blake3_hex("project:" + repo_id)}:{relative_path}
+```
+
+Branch rows add the view name as its own segment, so branch views neither collide
+with the canonical snapshot nor with each other:
+
+```
+projects-branch:{wing}:{blake3_hex("project:" + repo_id)}:{view_name}:{relative_path}
+```
+
+The root key is derived from the **stable project identity** (`repo_id` — the
+normalized git origin, an explicit `--project-id`, or `wing:<wing>`), not from the
+local checkout path. Two checkouts of the same repository on the same machine
+therefore converge on the same keys.
+
+> **Legacy keys, and the limits of the migration.** Rows mined before the stable
+> project-id migration used `blake3_hex(<absolute checkout path>)` as the root key.
+>
+> **Canonical legacy rows migrate on the next mine.** Ingest computes the legacy key
+> alongside the stable one, removes the old row when it replaces it, and sweeps the
+> remaining legacy prefix for paths no longer present.
+>
+> **Branch legacy rows do not.** That whole path is gated on `branch_name.is_none()`, and
+> the branch cleanup pass scans only the stable-project prefix, so legacy
+> `projects-branch` rows are neither migrated nor removed by re-mining. They stay in the
+> palace and can still surface in `view: "full"` searches. Remove them explicitly with a
+> `--wing` + `--kind projects-branch` prune after checking the preview —
+> `prune --project-id` cannot select them, because it builds the stable-identity prefix
+> these rows were never keyed under. See [CLI Surface → `prune`](CLI-Surface.md#prune).
+
+### Overlay composition at search time
+
+Search is view-scoped rather than view-blind:
+
+- No `view` (or `view: "canonical"`) — canonical rows only; branch views are
+  excluded.
+- `view: "<branch>"` — the branch view is composed **over** the canonical
+  snapshot. For each `(wing, source_file)` present in the branch view, the branch
+  row replaces the canonical row. A branch row with `path_state: "deleted"` (a
+  tombstone) removes the path from the result set entirely.
+- `view: "full"` — every stored repository view is searched independently, with no
+  composition.
+
+`(wing, source_file)` is the composition key rather than `repo_id`, so mixed-version
+replicas that do not share durable repository IDs still compose correctly.
+
+Because a branch replacement can score lower than the canonical row it shadows,
+search widens the candidate window (doubling up to 10× the requested limit) and
+re-composes until a full result page survives filtering. Overlay lookups are bounded
+to the source files present in the current candidate window, so composing a view never
+loads the whole branch.
+
+### Tombstones
+
+On a branch-delta mine, files deleted on the branch relative to the merge-base are
+recorded as tombstone rows: a drawer under the branch source key with
+`path_state: "deleted"` and the fixed content `Deleted branch path tombstone`. A
+tombstone hides its path in **every** room of the view, not just the room it is
+stored in.
+
+Tombstones are durable and idempotent — an unchanged tombstone is left in place
+across runs and is not counted in `Sources removed`.
+
 ## Branch-delta mining
 
 `mine --branch` mines only the files that differ from the repository's default
-branch, making it efficient for ongoing branch work.
+branch, making it efficient for ongoing branch work. Automatic detection produces
+the same result on a non-canonical checkout without the flag.
 
 ### Delta computation
 
@@ -417,24 +567,24 @@ branch, making it efficient for ongoing branch work.
 
 ### Source-key namespace
 
-Branch runs use the namespace `projects-branch` instead of `projects`:
-
-```
-projects-branch:{wing}:{blake3_hex(root_path)}:{relative_path}
-```
-
-This ensures branch rows never collide with a full local mine of the same wing,
-allowing both to coexist in the same palace and be merged at search time via the
-combined-wing overlay.
+Branch runs use the `projects-branch` namespace and carry the view name as a key
+segment — see [Source keys](#source-keys) above. This ensures branch rows never
+collide with a canonical mine of the same wing, nor with another branch view,
+allowing all of them to coexist in one palace and be composed at search time.
 
 ### Cleanup pass
 
-On every `mine --branch` run, after ingesting the delta, the CLI lists all
-source keys under `projects-branch:{wing}:{root_key}:` and replaces drawers for
-any file whose key is **not** in the current delta (file reverted to base or
-deleted from the branch). The replacement is an empty commit — it removes stale
-drawers without leaving orphaned rows. The count of removed sources is reported
-as "Sources removed: N" in the mine summary.
+On every branch-delta run, after ingesting the delta, the CLI lists all source
+keys under `projects-branch:{wing}:{root_key}:{view_name}:` and replaces drawers
+for any file whose key is **not** in the current delta and is **not** a live
+tombstone (file reverted to base). The replacement is an empty commit — it
+removes stale drawers without leaving orphaned rows. The count of removed sources
+is reported as `Sources removed: N` in the mine summary.
+
+Files deleted on the branch are not simply dropped: they are replaced by
+tombstone rows (see [Tombstones](#tombstones)) so they keep shadowing the
+canonical snapshot. An unchanged tombstone is left in place and does not count
+towards `Sources removed`.
 
 This means the branch store is always consistent with the current delta: rebase,
 merge, or reverting a file immediately cleans up the previously mined drawers on
@@ -442,9 +592,11 @@ the next run.
 
 ### Branch-delta is always local
 
-`--branch` overrides the wing's federation route. Even if the wing is configured
-as `mode: remote` or `mode: combined` with `write: remote`, a branch mine always
-writes to the local palace. The intended workflow is:
+A resolved branch view overrides the wing's federation route — whether it came
+from `--branch`, `--view <name>`, or automatic detection. Even if the wing is
+configured as `mode: remote` or `mode: combined` with `write: remote`, a branch
+mine always writes to the local palace; only canonical mines are eligible for
+federated batch ingest. The intended workflow is:
 
 - Team or CI mines the full repository into the **remote** shared palace via
   the normal `mine` command (remote route).

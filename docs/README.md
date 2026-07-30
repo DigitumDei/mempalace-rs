@@ -1,17 +1,32 @@
-# Rust Release Readiness
+# Documentation
 
-This directory freezes the Rust v1 release surface that exists in `mempalace-rs/` today.
+This directory documents the Rust release surface that exists in `mempalace-rs/` today.
 
-Artifacts in this set:
+### Getting started
 
-- [Release Scope](Release-Scope.md)
-- [CLI Surface](CLI-Surface.md)
-- [Config Schema](Config-Schema.md)
-- [Standard Operator Guide](Operator-Standard.md)
-- [Low-CPU Operator Guide](Operator-Low-CPU.md)
-- [Mined Storage](Mined-Storage.md)
-- [Federation](Federation.md)
-- [Packaging And Validation](Packaging-And-Validation.md)
-- [Validation Evidence](Validation-Evidence.md)
+- [Quickstart](Quickstart.md) — install, initialize, mine, search, connect an MCP client
 
-These documents are intentionally derived from the current Rust implementation rather than from the broader migration wish list. Anything not listed here should be treated as out of scope for the first Rust release unless the release docs are updated explicitly.
+### Reference
+
+- [Release Scope](Release-Scope.md) — what is in and out of the shipped surface
+- [CLI Surface](CLI-Surface.md) — every `mempalace-cli` command and flag
+- [Config Schema](Config-Schema.md) — `config.json`, `projects.json`, `mempalace.yaml`, env overrides
+- [Mined Storage](Mined-Storage.md) — locator model, repository views, stale semantics, discovery rules
+- [Federation](Federation.md) — server, client routing, federated and branch-aware mining
+
+### Operations
+
+- [Standard Operator Guide](Operator-Standard.md) — deployment, maintenance, recovery, troubleshooting
+- [Low-CPU Operator Guide](Operator-Low-CPU.md) — constrained environments
+- [Cloud Environment](Cloud-Environment.md) — building and testing in a cloud sandbox or CI runner
+- [Release Operations](Release-Operations.md) — signed candidate and stable release runbook
+- [Packaging And Validation](Packaging-And-Validation.md) — release artifacts and gate rows
+
+### Historical
+
+- [Validation Evidence](Validation-Evidence.md) — a dated record of one validation pass, kept as evidence rather than as current reference
+
+These documents are derived from the current implementation rather than from a migration wish
+list. Anything not documented here should be treated as out of scope unless the docs are
+updated explicitly — and per [CLAUDE.md](../CLAUDE.md), a behaviour change and its
+documentation update belong in the same change.

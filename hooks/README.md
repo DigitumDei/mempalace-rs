@@ -118,18 +118,26 @@ Edit `mempal_save_hook.sh` to change:
 
 - **`SAVE_INTERVAL=15`** — How many human messages between saves. Lower = more frequent saves, higher = less interruption.
 - **`STATE_DIR`** — Where hook state is stored (defaults to `~/.mempalace/hook_state/`)
-- **`MEMPAL_DIR`** — Optional. Set to a conversations directory to auto-run `mempalace mine <dir>` on each save trigger. Leave blank (default) to let the AI handle saving via the block reason message.
+- **`MEMPAL_DIR`** — Optional. Set to a conversations directory to auto-run `mempalace-cli mine <dir>` on each save trigger. Leave blank (default) to let the AI handle saving via the block reason message.
+- **`MEMPAL_MINE_MODE`** — Mine mode used for that auto-ingest. Defaults to `convos` (chat transcripts); set to `projects` if `MEMPAL_DIR` holds source files instead.
+
+The same two settings exist in `mempal_precompact_hook.sh`; the save hook runs the ingest in the background, the precompact hook runs it synchronously so the data lands before compaction.
 
 ### mempalace CLI
 
 The relevant commands are:
 
 ```bash
-mempalace mine <dir>               # Mine all files in a directory
-mempalace mine <dir> --mode convos # Mine conversation transcripts only
+mempalace-cli mine <dir>               # Mine all files in a directory
+mempalace-cli mine <dir> --mode convos # Mine conversation transcripts only
 ```
 
-The hooks resolve the repo root automatically from their own path, so they work regardless of where you install the repo.
+Auto-ingest is off unless you set `MEMPAL_DIR`. When it is set, the hooks locate
+`mempalace-cli` themselves — first on `PATH`, then at the installer's default
+`~/.mempalace/bin/mempalace-cli` (`.exe` on Windows). Hooks run in a non-interactive shell
+that often doesn't inherit the installer's PATH changes, which is why the fallback exists.
+If neither lookup finds the binary, the hook logs a line to `hook.log` and skips the
+ingest — it never blocks your session over a missing binary.
 
 ## How It Works (Technical)
 

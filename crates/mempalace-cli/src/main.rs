@@ -266,7 +266,7 @@ enum Commands {
         view: Option<String>,
         #[arg(
             long = "source-prefix",
-            help = "Restrict to source paths under this normalized prefix, e.g. .claude/worktrees/. Requires --project-id"
+            help = "Restrict to source paths under this normalized prefix, matched against paths relative to the mined project root, e.g. crates/legacy/. Without --view this narrows the canonical snapshot only. Requires --project-id"
         )]
         source_prefix: Option<String>,
         #[arg(long = "dry-run", help = "Preview only; never delete (the default when --yes is absent)")]
@@ -1310,12 +1310,15 @@ where
             RouteQuery { wing: Some(&wing_name), room: None, source_file: None },
         );
 
+        // Whether a *canonical* mine of this wing would be pushed to a remote rather
+        // than stored locally. `write: both` is excluded: it still runs the full local
+        // mine, so it does leave a local canonical snapshot behind.
+        let canonical_routes_remote = rule.mode == RouteMode::Remote
+            || (rule.mode == RouteMode::Combined && rule.write == WriteTarget::Remote);
+
         // Federated batch ingestion is canonical-only. Keep branch views local
         // until the batch protocol can carry their metadata end to end.
-        let use_remote = !effective_branch
-            && (rule.mode == RouteMode::Remote
-                || (rule.mode == RouteMode::Combined
-                    && rule.write == WriteTarget::Remote));
+        let use_remote = !effective_branch && canonical_routes_remote;
         let use_both = !effective_branch
             && rule.mode == RouteMode::Combined
             && rule.write == WriteTarget::Both;
@@ -1331,9 +1334,22 @@ where
                 .map_err(storage_error)?
                 .is_empty()
             {
+                // The check is local-only. On a wing whose canonical mines route to a
+                // remote, `--full` would push there too and never satisfy it, so point
+                // those users at the selector that actually bypasses the guard.
+                let recovery = if canonical_routes_remote {
+                    format!(
+                        "wing `{wing_name}` routes canonical mines to a remote, so --full cannot create the local snapshot this check needs; pass --branch or --view <name> to mine the branch delta deliberately"
+                    )
+                } else {
+                    "mine the canonical checkout first or use --full to intentionally replace it"
+                        .to_owned()
+                };
                 return Ok(CliOutput::failure(
                     1,
-                    "automatic branch mining requires an existing canonical snapshot; mine the canonical checkout first or use --full to intentionally replace it\n",
+                    format!(
+                        "automatic branch mining requires an existing canonical snapshot; {recovery}\n"
+                    ),
                 ));
             }
         }
@@ -2330,8 +2346,9 @@ where
 
     let runtime = build_runtime(&config).map_err(runtime_error)?;
 
-    // Use MEMPALACE_STUB_EMBEDDINGS if set, mirroring the MCP binary.
-    let serve_result = if std::env::var_os("MEMPALACE_STUB_EMBEDDINGS").is_some() {
+    // Use MEMPALACE_STUB_EMBEDDINGS if set, mirroring the MCP binary. Parsed for an
+    // explicit truthy value so `=0`/`=false` disable stubs rather than enabling them.
+    let serve_result = if env_flag("MEMPALACE_STUB_EMBEDDINGS") {
         let provider = DeterministicStubProvider::new(config.embedding_profile);
         runtime.block_on(run_serve(config, provider, tokens, bind))
     } else {
@@ -4094,6 +4111,106 @@ mod tests {
             second.stdout.contains("Sources removed: 1"),
             "expected 'Sources removed: 1' after revert: {}",
             second.stdout
+        );
+
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    /// An auto-detected branch mine with no canonical snapshot fails, and on a
+    /// purely local wing the recovery advice is to mine canonically.
+    #[test]
+    fn auto_branch_mine_without_canonical_snapshot_suggests_full() {
+        let workspace = tempdir().unwrap();
+        let repo_dir = workspace.path().join("repo");
+        fs::create_dir_all(&repo_dir).unwrap();
+        git_init_repo(
+            &repo_dir,
+            &[
+                ("mempalace.yaml", "wing: guardtest\nrooms:\n  - name: general\n"),
+                ("base.rs", &"fn base() -> i32 { 42 }\n".repeat(20)),
+            ],
+        );
+        // Move off the default branch so detection resolves a branch view.
+        std::process::Command::new("git")
+            .args(["checkout", "-b", "feature"])
+            .current_dir(&repo_dir)
+            .status()
+            .unwrap();
+        fs::write(repo_dir.join("base.rs"), "fn base() -> i32 { 99 }\n".repeat(20)).unwrap();
+
+        let config_root = temp_config_root("guard-local");
+        let context = CliContext::for_tests(config_root.clone());
+
+        // No --branch/--view/--full: the branch view is detected automatically.
+        let output =
+            run_cli(["mine", repo_dir.to_str().unwrap()], &context, stub_provider).unwrap();
+
+        assert_eq!(output.exit_code, 1, "expected the guard to fire: {output:?}");
+        assert!(
+            output.stderr.contains("automatic branch mining requires an existing canonical snapshot"),
+            "unexpected stderr: {}",
+            output.stderr
+        );
+        assert!(
+            output.stderr.contains("use --full to intentionally replace it"),
+            "a local wing should still be told to use --full: {}",
+            output.stderr
+        );
+
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    /// On a wing whose canonical mines route to a remote, `--full` cannot satisfy
+    /// the local-only guard, so the error must point at --branch/--view instead.
+    #[test]
+    fn auto_branch_mine_on_remote_wing_suggests_explicit_branch_selector() {
+        let workspace = tempdir().unwrap();
+        let repo_dir = workspace.path().join("repo");
+        fs::create_dir_all(&repo_dir).unwrap();
+        git_init_repo(
+            &repo_dir,
+            &[
+                ("mempalace.yaml", "wing: guardremote\nrooms:\n  - name: general\n"),
+                ("base.rs", &"fn base() -> i32 { 42 }\n".repeat(20)),
+            ],
+        );
+        std::process::Command::new("git")
+            .args(["checkout", "-b", "feature"])
+            .current_dir(&repo_dir)
+            .status()
+            .unwrap();
+        fs::write(repo_dir.join("base.rs"), "fn base() -> i32 { 99 }\n".repeat(20)).unwrap();
+
+        let config_root = temp_config_root("guard-remote");
+        // The guard runs before any remote call, so this URL is never dialed.
+        write_remote_cli_config(
+            &config_root,
+            "hub",
+            "http://127.0.0.1:1",
+            "unused-token",
+            "wing_guardremote",
+            &repo_dir,
+        );
+        let context = CliContext::for_tests(config_root.clone());
+
+        let output =
+            run_cli(["mine", repo_dir.to_str().unwrap()], &context, stub_provider).unwrap();
+
+        assert_eq!(output.exit_code, 1, "expected the guard to fire: {output:?}");
+        assert!(
+            output.stderr.contains("routes canonical mines to a remote"),
+            "expected federated recovery advice: {}",
+            output.stderr
+        );
+        assert!(
+            output.stderr.contains("pass --branch or --view"),
+            "expected the selector that bypasses the guard: {}",
+            output.stderr
+        );
+        assert!(
+            !output.stderr.contains("use --full to intentionally replace it"),
+            "--full is dead-end advice on a remote-routed wing: {}",
+            output.stderr
         );
 
         remove_dir_all_if_exists(&config_root);

@@ -48,15 +48,20 @@ Rust v1 release signoff is split across two required rows:
 
 Host:
 
-- GitHub Actions `ubuntu-latest`, `macos-latest`, and `windows-latest` runners
+- GitHub Actions `ubuntu-latest`, `macos-15`, and `windows-latest` runners (the
+  `release-host` matrix in [`.github/workflows/ci.yml`](../.github/workflows/ci.yml))
 
 Required outcomes:
 
-- Workspace build passes.
-- In-scope crate test jobs pass.
-- Embedding baseline job passes.
+- `workspace-build` passes (`cargo check --workspace --all-targets --locked`).
+- Every per-package test job passes. `release-gate` aggregates them and is the single
+  required predecessor of the release builds.
+- `embedding-baselines` passes.
+- `release-contract-tests` passes (shell/PowerShell installer syntax plus the signed
+  release contract).
 - `release-host` (all matrix legs) completes.
-- One `release-<asset>` artifact per platform is uploaded.
+- One `release-<asset>` artifact per platform is uploaded, with a build-provenance
+  attestation.
 
 This row is the source of truth for compilation, packaging, and the exact binaries promoted to runtime validation.
 
@@ -105,24 +110,21 @@ Minimum install validation for a candidate release:
 - final signoff on warm-cache behavior and resource ceilings
 - optional Python interop validation only if that feature is explicitly shipped
 
-## Current Phase 12 Status
+## Status
 
-Completed in this branch:
+Documented and automated:
 
-- CLI surface freeze documented
-- config schema freeze documented
-- release scope and known limitations documented
-- standard deployment operator guidance written
-- low-CPU operator guidance written
-- packaging artifact definition documented
-- GitHub Actions `release-host` release matrix defined
+- CLI surface, config schema, release scope, and operator guidance are documented in this
+  directory
+- the GitHub Actions `release-host` release matrix is defined and gated behind `release-gate`
+- candidate publication is automated: signed schema-v2 manifest, `SHA256SUMS`, immutable
+  `v<version>-nightly.<full-commit-sha>` prerelease, and release attestation verification
+  (see [Release Operations](Release-Operations.md))
 
-Still environment-dependent:
+Still environment-dependent, and required per-candidate:
 
-- successful `release-host` run on GitHub Actions for the candidate revision
 - runtime acceptance pass on the supported small VM using the uploaded artifact
 - full low-CPU signoff
-- any optional Python interop validation
 
 ## Release Decision Rule
 

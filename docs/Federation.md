@@ -320,6 +320,10 @@ remote is configured. Because the key is derived from repo identity rather than 
 local checkout path, **two clients mining the same repo converge on identical
 source keys and drawer ids** — no disjoint histories, and re-pushes dedupe cleanly.
 
+Federated batches are always **canonical**: the hub stamps `view_name: None` on
+every row it ingests, and the batch DTOs carry no view metadata. Branch views are
+a purely local concept — see [Part 4](#part-4--branch-aware-mining).
+
 ### Failure behavior
 
 - Remote unreachable (and mode is `remote` or `combined` with `write: remote`)
@@ -333,11 +337,15 @@ source keys and drawer ids** — no disjoint histories, and re-pushes dedupe cle
 
 ## Part 4 — Branch-aware mining
 
-`mine --branch` mines only the files that differ from the default branch, keeping
-the local palace in sync with ongoing branch work without re-ingesting the repo.
+A branch-delta mine ingests only the files that differ from the default branch,
+keeping the local palace in sync with ongoing branch work without re-ingesting the
+repo. On a non-canonical checkout this is now the **automatic** behaviour — the
+flag only forces it:
 
 ```bash
-mempalace-cli mine /path/to/project --branch
+mempalace-cli mine /path/to/project            # auto: canonical on main, branch delta elsewhere
+mempalace-cli mine /path/to/project --branch   # force a branch delta
+mempalace-cli mine /path/to/project --full     # force a full canonical mine
 ```
 
 - **Delta** = files changed vs the merge-base with the default branch
@@ -345,12 +353,53 @@ mempalace-cli mine /path/to/project --branch
   files. Uncommitted edits are included by design.
 - Subdirectory project roots are re-relativized; files outside the project root
   are dropped.
-- Branch rows use the `projects-branch` source-key namespace so they never collide
-  with a full mine of the same wing.
+- Branch rows use the `projects-branch` source-key namespace, with the view name as
+  its own key segment, so they never collide with a canonical mine of the same wing
+  or with another branch view.
 - Every run reconciles: drawers for files that have left the delta (reverted,
-  merged, rebased away) are removed and reported as `Sources removed: N`.
-- **`--branch` is always local**, even for a `remote`/`combined` wing. That is the
-  point: it is the local side of a combined wing.
+  merged, rebased away) are removed and reported as `Sources removed: N`. Files
+  *deleted* on the branch become tombstones instead, so they keep shadowing the
+  canonical snapshot.
+- An **auto-detected** branch mine requires an existing canonical snapshot for the
+  project; without one it fails and tells you to mine the canonical checkout first
+  or pass `--full`. Explicit `--branch` / `--view` bypasses that guard.
+
+> **Federated wings must bypass the guard explicitly.** The check queries the **local**
+> palace only. On a wing routed `remote` (or `combined` with `write: remote`) the canonical
+> snapshot lives on the hub, so the local lookup finds nothing and an auto-detected branch
+> mine fails — even though the canonical data exists. The error's `--full` suggestion does
+> not help here either: `--full` is a canonical mine, so it routes straight back to the
+> remote and never creates the local snapshot the guard wants. Pass `--branch` or
+> `--view <name>` explicitly instead; that marks the mine as deliberate and skips the guard.
+- **Branch views are always local**, even for a `remote`/`combined` wing. That is
+  the point: they are the local side of a combined wing.
+
+See [Mined Storage → Repository views](Mined-Storage.md#repository-views) for the
+detection rules, source-key layout, tombstones, and search-time overlay composition.
+
+### Searching a view
+
+`view` is a first-class search parameter in three places — the MCP `mempalace_search`
+tool, the federation wire (`SearchRequest.view`, forwarded to remotes), and the CLI
+(`mempalace-cli search --view`). All three take the same values:
+
+- omitted or `"canonical"` — canonical snapshots only
+- `"<branch>"` — that branch composed over the canonical snapshot
+- `"full"` — every stored repository view, searched independently
+
+In the MCP and REST responses each result carries its own `view` field, absent for canonical
+rows. **The CLI does not print it** — `render_search_results` shows wing, room, source,
+score, and content only. That matters most for `search --view full`, where rows from
+different views can share a source path and the terminal output gives you no way to tell
+them apart; use `mempalace_search` or the REST endpoint when you need to attribute a result
+to a view.
+
+> **Only `mempalace_search` composes a view across a combined wing.** The CLI's
+> `search --view` opens the local `StorageEngine` and never performs federation routing
+> (see [Part 5](#part-5--federated-reads-wake-up-and-changes)). On the combined-wing setup
+> below — canonical on the hub, branch delta local — `mempalace-cli search --view <branch>`
+> returns only the local branch rows, because the canonical rows it would overlay live on
+> the remote and the CLI never fetches them. Use the MCP tool for that query.
 
 ### The combined-wing team workflow
 
@@ -362,7 +411,8 @@ This is the intended end state of federation + locator storage + branch mining:
    (`mine --branch`).
 3. The wing is configured `combined`. Search merges both sides; `content_hash`
    deduplication means chunks identical between remote-main and local-branch are
-   not double-counted, while branch-local changes overlay the shared main index.
+   not double-counted. Pass `view: "<branch>"` to compose the local branch delta
+   over the canonical index; without it, search returns canonical rows only.
 4. With `write: both`, any additional writes (e.g. authored drawers or
    knowledge-graph facts) land in the local palace and are best-effort
    replicated to the shared remote, keeping both sides in sync without blocking

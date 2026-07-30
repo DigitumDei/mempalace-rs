@@ -285,6 +285,76 @@ The `maintain` command respects the same `enabled`, `version_retention_hours`,
 background hub behaviour is that the idle gate is bypassed, so the pass
 starts immediately.
 
+## Reclaiming Space From Mined Data
+
+`mempalace-cli prune` deletes mined project data from the **local** palace by scope. It
+previews by default and only deletes with `--yes`:
+
+```bash
+# preview everything mined for one project
+mempalace-cli prune --project-id github.com/acme/repo
+
+# drop a single stale branch view
+mempalace-cli prune --project-id github.com/acme/repo --view old-feature --yes
+
+# drop one subtree of a branch view
+mempalace-cli prune --project-id github.com/acme/repo --view old-feature \
+  --source-prefix crates/legacy/ --yes
+```
+
+Operational notes:
+
+- Prune refuses to run without a narrow scope: pass `--project-id`, or both `--wing` and
+  `--kind`. This is deliberate — there is no "prune everything" form.
+- Only the two project ingest kinds (`projects`, `projects-branch`) are reachable. Diary,
+  narrative, and authored drawers cannot be pruned by this command.
+- It never touches a remote palace, even for a wing routed remote.
+- Data mined before the stable project-id migration is keyed by checkout path and will not
+  match `--project-id`. Re-mining migrates the **canonical** rows; legacy `projects-branch`
+  rows are not migrated or cleaned by any mine, so sweep those with `--wing` +
+  `--kind projects-branch` after checking the preview.
+
+### `--source-prefix` matches project-root-relative paths
+
+The prefix is matched against the stored source key, whose trailing segment is the file
+path **relative to the project root that was mined** — `crates/legacy/foo.rs`, not an
+absolute or repo-parent-relative path. Two consequences worth knowing before you reach for
+it:
+
+- **Without `--view` it only touches the canonical snapshot.** Branch views are skipped
+  (the view name precedes the path in the key), and the skip is reported as a `Note` line.
+  Pair it with `--view` to prune inside a branch.
+- **It will not clean up linked Git worktrees mined as their own project.** Those files are
+  stored relative to the worktree root, so their paths look like `src/lib.rs` — a
+  `--source-prefix .claude/worktrees/` scope matches nothing. A prefix like that only
+  matches a palace mined *before* discovery began skipping linked worktrees, where the
+  parent checkout's mine pulled the worktree in as ordinary subdirectories.
+
+### Pruning a linked worktree
+
+A linked worktree does **not** get its own project identity by default.
+`derive_project_id` reads `origin` from the worktree, which is the repository's origin, and
+`project_root_relative` resolves against the worktree's own toplevel — so the derived ID is
+byte-identical to the main checkout's.
+
+That makes `prune --project-id <repo-id> --yes` the wrong tool: it matches the whole
+repository, deleting the canonical snapshot and **every** branch view along with the
+worktree's rows. Scope it instead by what actually distinguishes the worktree's data:
+
+```bash
+# a worktree mined on its own branch is a branch view — prune that view
+mempalace-cli prune --project-id github.com/acme/repo --view worktree-branch --yes
+```
+
+If you need worktrees to be independently prunable, give them a distinct identity **at mine
+time** with an explicit `--project-id`; only then does a project-scoped prune isolate them.
+`--wing` plus `--kind` is broader still and will cross projects sharing that wing.
+
+Always read the `Matched: N sources` preview before adding `--yes`; a scope that matches
+nothing prints `Nothing matched this scope.` rather than failing.
+
+Full flag reference: [CLI Surface → `prune`](CLI-Surface.md#prune).
+
 ## Storage Recovery
 
 If the palace is damaged or inconsistent:

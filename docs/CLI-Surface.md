@@ -195,9 +195,13 @@ Behavior:
 
 Known limitation:
 - Project data mined **before** the stable project-id migration is keyed by a checkout-path
-  hash rather than `hash("project:<id>")`, so `--project-id` does not match those legacy rows.
-  Re-mine to migrate them, or sweep them with an explicit `--wing` + `--kind` scope after
-  confirming the preview.
+  hash rather than `hash("project:<id>")`, so `--project-id` does not match those legacy
+  rows. Re-mining migrates the **canonical** ones. Legacy `projects-branch` rows are never
+  migrated or cleaned — ingest's legacy handling is canonical-only and the branch cleanup
+  pass scans the stable prefix — so they persist and still appear in `view: "full"`
+  searches. Sweep those with an explicit `--wing` + `--kind projects-branch` scope after
+  confirming the preview. See
+  [Mined Storage → Source keys](Mined-Storage.md#source-keys).
 
 ### `status`
 

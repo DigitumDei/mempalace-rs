@@ -89,6 +89,13 @@ So mine the default branch first, then just re-run `mine` as you work on a featu
 `--full` forces a canonical mine, `--branch` forces a delta — see
 [Mined Storage](Mined-Storage.md#repository-views).
 
+> **If your integration branch isn't `main` or `master`, pass `--branch` explicitly.**
+> Detection resolves the default branch from `origin/HEAD`, then literal `main`, then
+> `master`. When none of those resolve — a local repo whose integration branch is `trunk`,
+> say, with no `origin` — there is no safe delta baseline, so every checkout is treated as
+> canonical. Plain `mine` on a feature branch would then overwrite the canonical snapshot
+> with that branch's contents instead of storing a view.
+
 ## 4. Verify it works
 
 ```bash

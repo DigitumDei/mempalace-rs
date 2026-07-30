@@ -81,7 +81,7 @@ back with `view_metadata: None` and continue to use the legacy `hall = "view:<na
 
 | Field | Type | Description |
 |---|---|---|
-| `repo_id` | `String` | Stable repository identity — the normalized git remote URL, or `wing:<wing>` when no `origin` exists. |
+| `repo_id` | `String` | The project identity resolved at mine time — see below. |
 | `view_name` | `Option<String>` | `None` for a canonical (default-branch) snapshot; the branch or detached-HEAD view name otherwise. |
 | `source_path` | `String` | Absolute project checkout path on the palace host that owns the row. |
 | `head_commit` | `Option<String>` | `git rev-parse HEAD` at mine time. |
@@ -89,6 +89,19 @@ back with `view_metadata: None` and continue to use the legacy `hall = "view:<na
 | `merge_base` | `Option<String>` | Merge-base commit between the view and `base_ref`. |
 | `worktree_id` | `String` | Stable worktree identity (hash of the canonicalized checkout path). |
 | `path_state` | `String` | `"present"`, or `"deleted"` for a tombstone row whose source file was removed on the branch. |
+
+`repo_id` is whatever project identity the mine resolved, stored verbatim — it is **not**
+always a normalized remote URL:
+
+| How the project was identified | `repo_id` value |
+|---|---|
+| Explicit `--project-id <id>` (or a registered project selected by one) | that string, exactly as given — e.g. `local/my-project` |
+| Derived, repository root, `origin` present | normalized remote URL — `github.com/acme/repo` |
+| Derived, project root is a repo subdirectory (monorepo) | `<normalized-origin>#<project-root>` — e.g. `github.com/acme/repo#services/api` |
+| Derived, no usable `origin` | `wing:<wing>` |
+
+Anything correlating view metadata back to a project must accept all four shapes; assuming
+a bare remote URL computes the wrong identity for explicit-ID and monorepo projects.
 
 ### Old rows keep working
 
@@ -436,6 +449,15 @@ The default branch is resolved by trying `git symbolic-ref --short
 refs/remotes/origin/HEAD`, then the literal `main`, then `master` — the first
 reference `git rev-parse --verify` accepts wins.
 
+> **No resolvable default branch means every checkout looks canonical.** A repository
+> whose integration branch is named something else (`trunk`, `develop`) and which has no
+> `origin` falls into the `(None, _)` arm, which returns `Canonical` deliberately: without
+> an integration ref there is no safe delta baseline, so the pre-view behaviour of mining
+> the checkout in full is preserved. The consequence is that a plain `mine` on a feature
+> branch of such a repository **overwrites the canonical snapshot** with that branch's
+> contents rather than storing a view. Pass `--branch` or `--view <name>` explicitly on
+> those repositories.
+
 Explicit selectors override detection: `--full` and `--view canonical` force a
 canonical mine; `--branch` and `--view <name>` force a branch-delta mine.
 `--full` conflicts with `--view`, and `--branch` conflicts with `--view canonical`.
@@ -465,10 +487,20 @@ normalized git origin, an explicit `--project-id`, or `wing:<wing>`), not from t
 local checkout path. Two checkouts of the same repository on the same machine
 therefore converge on the same keys.
 
-> **Legacy keys.** Rows mined before the stable project-id migration used
-> `blake3_hex(<absolute checkout path>)` as the root key. Ingest still recognizes
-> those keys and replaces them on the next mine, but `prune --project-id` cannot
-> select them — see [CLI Surface → `prune`](CLI-Surface.md#prune).
+> **Legacy keys, and the limits of the migration.** Rows mined before the stable
+> project-id migration used `blake3_hex(<absolute checkout path>)` as the root key.
+>
+> **Canonical legacy rows migrate on the next mine.** Ingest computes the legacy key
+> alongside the stable one, removes the old row when it replaces it, and sweeps the
+> remaining legacy prefix for paths no longer present.
+>
+> **Branch legacy rows do not.** That whole path is gated on `branch_name.is_none()`, and
+> the branch cleanup pass scans only the stable-project prefix, so legacy
+> `projects-branch` rows are neither migrated nor removed by re-mining. They stay in the
+> palace and can still surface in `view: "full"` searches. Remove them explicitly with a
+> `--wing` + `--kind projects-branch` prune after checking the preview —
+> `prune --project-id` cannot select them, because it builds the stable-identity prefix
+> these rows were never keyed under. See [CLI Surface → `prune`](CLI-Surface.md#prune).
 
 ### Overlay composition at search time
 

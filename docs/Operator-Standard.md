@@ -310,8 +310,9 @@ Operational notes:
   narrative, and authored drawers cannot be pruned by this command.
 - It never touches a remote palace, even for a wing routed remote.
 - Data mined before the stable project-id migration is keyed by checkout path and will not
-  match `--project-id`; re-mine to migrate, or sweep with `--wing` + `--kind` after checking
-  the preview.
+  match `--project-id`. Re-mining migrates the **canonical** rows; legacy `projects-branch`
+  rows are not migrated or cleaned by any mine, so sweep those with `--wing` +
+  `--kind projects-branch` after checking the preview.
 
 ### `--source-prefix` matches project-root-relative paths
 
@@ -325,10 +326,29 @@ it:
   Pair it with `--view` to prune inside a branch.
 - **It will not clean up linked Git worktrees mined as their own project.** Those files are
   stored relative to the worktree root, so their paths look like `src/lib.rs` — a
-  `--source-prefix .claude/worktrees/` scope matches nothing. Prune them by their own
-  `--project-id`/`--wing` instead. A prefix like that only matches a palace mined *before*
-  discovery began skipping linked worktrees, where the parent checkout's mine pulled the
-  worktree in as ordinary subdirectories.
+  `--source-prefix .claude/worktrees/` scope matches nothing. A prefix like that only
+  matches a palace mined *before* discovery began skipping linked worktrees, where the
+  parent checkout's mine pulled the worktree in as ordinary subdirectories.
+
+### Pruning a linked worktree
+
+A linked worktree does **not** get its own project identity by default.
+`derive_project_id` reads `origin` from the worktree, which is the repository's origin, and
+`project_root_relative` resolves against the worktree's own toplevel — so the derived ID is
+byte-identical to the main checkout's.
+
+That makes `prune --project-id <repo-id> --yes` the wrong tool: it matches the whole
+repository, deleting the canonical snapshot and **every** branch view along with the
+worktree's rows. Scope it instead by what actually distinguishes the worktree's data:
+
+```bash
+# a worktree mined on its own branch is a branch view — prune that view
+mempalace-cli prune --project-id github.com/acme/repo --view worktree-branch --yes
+```
+
+If you need worktrees to be independently prunable, give them a distinct identity **at mine
+time** with an explicit `--project-id`; only then does a project-scoped prune isolate them.
+`--wing` plus `--kind` is broader still and will cross projects sharing that wing.
 
 Always read the `Matched: N sources` preview before adding `--yes`; a scope that matches
 nothing prints `Nothing matched this scope.` rather than failing.

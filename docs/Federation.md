@@ -387,7 +387,12 @@ tool, the federation wire (`SearchRequest.view`, forwarded to remotes), and the 
 - `"<branch>"` — that branch composed over the canonical snapshot
 - `"full"` — every stored repository view, searched independently
 
-Each result carries its own `view` field, absent for canonical rows.
+In the MCP and REST responses each result carries its own `view` field, absent for canonical
+rows. **The CLI does not print it** — `render_search_results` shows wing, room, source,
+score, and content only. That matters most for `search --view full`, where rows from
+different views can share a source path and the terminal output gives you no way to tell
+them apart; use `mempalace_search` or the REST endpoint when you need to attribute a result
+to a view.
 
 > **Only `mempalace_search` composes a view across a combined wing.** The CLI's
 > `search --view` opens the local `StorageEngine` and never performs federation routing

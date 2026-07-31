@@ -72,6 +72,9 @@ compaction, vector-index optimization, and version retention without generating
 background storage I/O. It does not reduce the I/O required by an individual ingest or
 search request; scope those requests to a wing or room where possible.
 
+Keep `maintenance.enabled` set to `true`: setting it to `false` disables both the
+background scheduler and the `mempalace-cli maintain` command.
+
 ## Warm Cache Expectations
 
 Low-CPU mode still depends on local model assets.

@@ -467,6 +467,7 @@ impl ConfigLoader {
             env::var("MEMPALACE_PALACE_PATH").ok().or_else(|| env::var("MEMPAL_PALACE_PATH").ok()),
             env::var("MEMPALACE_EMBEDDING_PROFILE").ok(),
             env::var("MEMPALACE_MAINTENANCE_ENABLED").ok(),
+            env::var("MEMPALACE_MAINTENANCE_BACKGROUND_ENABLED").ok(),
             env::var("MEMPALACE_MAINTENANCE_IDLE_SECS").ok(),
             env::var("MEMPALACE_MAINTENANCE_VERSION_RETENTION_HOURS").ok(),
             env::var("MEMPALACE_MAINTENANCE_TAIL_THRESHOLD_ROWS").ok(),
@@ -479,6 +480,7 @@ impl ConfigLoader {
         palace_path_override: Option<String>,
         profile_override: Option<String>,
         maintenance_enabled_override: Option<String>,
+        maintenance_background_enabled_override: Option<String>,
         maintenance_idle_secs_override: Option<String>,
         maintenance_version_retention_hours_override: Option<String>,
         maintenance_tail_threshold_rows_override: Option<String>,
@@ -503,6 +505,7 @@ impl ConfigLoader {
             file.maintenance,
             &paths.config_file,
             maintenance_enabled_override,
+            maintenance_background_enabled_override,
             maintenance_idle_secs_override,
             maintenance_version_retention_hours_override,
             maintenance_tail_threshold_rows_override,
@@ -1009,6 +1012,7 @@ fn resolve_maintenance_config(
     file_section: Option<MaintenanceConfigFileV1>,
     config_path: &Path,
     enabled_override: Option<String>,
+    background_enabled_override: Option<String>,
     idle_secs_override: Option<String>,
     version_retention_hours_override: Option<String>,
     tail_threshold_rows_override: Option<String>,
@@ -1017,7 +1021,11 @@ fn resolve_maintenance_config(
     let mut config = MaintenanceRuntimeConfig::defaults().with_overrides(file_section, config_path)?;
 
     if let Some(val) = enabled_override {
-        config.enabled = parse_env_flag(&val, config_path)?;
+        config.enabled = parse_env_flag(&val, config_path, "MEMPALACE_MAINTENANCE_ENABLED")?;
+    }
+    if let Some(val) = background_enabled_override {
+        config.background_enabled =
+            parse_env_flag(&val, config_path, "MEMPALACE_MAINTENANCE_BACKGROUND_ENABLED")?;
     }
     if let Some(val) = idle_secs_override {
         config.idle_secs = val.parse::<usize>().map_err(|_| MempalaceError::ConfigParse {
@@ -1086,14 +1094,14 @@ fn resolve_maintenance_config(
     Ok(config)
 }
 
-fn parse_env_flag(value: &str, config_path: &Path) -> Result<bool> {
+fn parse_env_flag(value: &str, config_path: &Path, variable: &str) -> Result<bool> {
     match value {
         "1" | "true" | "TRUE" | "yes" | "YES" => Ok(true),
         "0" | "false" | "FALSE" | "no" | "NO" => Ok(false),
         _ => Err(MempalaceError::ConfigParse {
             path: config_path.to_path_buf(),
             message: format!(
-                "MEMPALACE_MAINTENANCE_ENABLED `{value}` is not a valid boolean; expected true or false"
+                "{variable} `{value}` is not a valid boolean; expected true or false"
             ),
         }),
     }
@@ -1222,6 +1230,7 @@ mod tests {
             Some(&base),
             Some("/tmp/custom-palace".to_owned()),
             Some("low_cpu".to_owned()),
+            None,
             None,
             None,
             None,
@@ -1773,6 +1782,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -1790,6 +1800,7 @@ mod tests {
             Some(&base),
             None,
             Some("definitely_not_real".to_owned()),
+            None,
             None,
             None,
             None,
@@ -2037,6 +2048,7 @@ mod tests {
             None,
             None,
             Some("false".to_owned()),
+            Some("false".to_owned()),
             Some("500".to_owned()),
             Some("12".to_owned()),
             Some("256".to_owned()),
@@ -2045,6 +2057,7 @@ mod tests {
         .unwrap();
 
         assert!(!config.maintenance.enabled);
+        assert!(!config.maintenance.background_enabled);
         assert_eq!(config.maintenance.idle_secs, 500);
         assert_eq!(config.maintenance.version_retention_hours, 12);
         assert_eq!(config.maintenance.tail_threshold_rows, 256);
@@ -2063,6 +2076,7 @@ mod tests {
             None,
             None,
             Some("ture".to_owned()),
+            None,
             None,
             None,
             None,
@@ -2086,14 +2100,14 @@ mod tests {
 
         // File value + no env override → file value kept
         let config = ConfigLoader::load_from_sources(
-            Some(&base), None, None, None, None, None, None, None,
+            Some(&base), None, None, None, None, None, None, None, None,
         )
         .unwrap();
         assert_eq!(config.maintenance.small_fragment_threshold, 99);
 
         // File value + env override → env wins
         let config = ConfigLoader::load_from_sources(
-            Some(&base), None, None, None, None, None, None, Some("50".to_owned()),
+            Some(&base), None, None, None, None, None, None, None, Some("50".to_owned()),
         )
         .unwrap();
         assert_eq!(config.maintenance.small_fragment_threshold, 50);
@@ -2122,7 +2136,7 @@ mod tests {
         .unwrap();
 
         let config = ConfigLoader::load_from_sources(
-            Some(&base), None, None, None, None, None, None, None,
+            Some(&base), None, None, None, None, None, None, None, None,
         )
         .unwrap();
 

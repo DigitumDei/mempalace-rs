@@ -137,10 +137,11 @@ Full setup, client configuration, and the team mining workflow are in the
 ## Maintenance
 
 The maintenance subsystem keeps the palace storage healthy by compacting
-fragments, pruning old version data, and optimising vector indices.  It is
-**enabled by default** and runs automatically in the long-lived HTTP hub
-(`mempalace-cli serve`).  A one-shot CLI command (`mempalace-cli maintain`)
-is available for initial backfill and out-of-band runs.
+fragments, pruning old version data, and optimising vector indices. It is
+**enabled by default** and the long-lived HTTP hub (`mempalace-cli serve`)
+schedules it automatically by default. Set `background_enabled: false` to
+use manual-only maintenance; the one-shot CLI command (`mempalace-cli maintain`)
+remains available while `enabled` is `true`.
 
 ### Maintenance Tiers
 
@@ -159,7 +160,8 @@ Each run executes up to three tiers in order:
 
 | Field | Default | Description |
 |---|---|---|
-| `enabled` | `true` | Whether the subsystem runs automatically. |
+| `enabled` | `true` | Master switch for all maintenance, including `mempalace-cli maintain`. |
+| `background_enabled` | `true` | Whether the HTTP hub schedules maintenance automatically. |
 | `idle_secs` | `300` | Minimum wall-clock seconds since the last write before a run starts. |
 | `version_retention_hours` | `24` | Maximum age in hours for retained version rows. |
 | `tail_threshold_rows` | `1024` | Row count that triggers incremental vector-index optimization. |
@@ -167,11 +169,13 @@ Each run executes up to three tiers in order:
 
 ### Environment Overrides
 
-All five fields can be overridden at process start via environment
+All six fields can be overridden at process start via environment
 variables, which take precedence over `config.json`:
 
-- `MEMPALACE_MAINTENANCE_ENABLED` — truthy values: `1`, `true`, `TRUE`,
-  `yes`, `YES`.  All other values (including empty string) are `false`.
+- `MEMPALACE_MAINTENANCE_ENABLED` — true values: `1`, `true`, `TRUE`, `yes`,
+  `YES`; false values: `0`, `false`, `FALSE`, `no`, `NO`. Other values are rejected.
+- `MEMPALACE_MAINTENANCE_BACKGROUND_ENABLED` — same boolean values; set it to
+  `false` for manual-only maintenance while retaining `mempalace-cli maintain`.
 - `MEMPALACE_MAINTENANCE_IDLE_SECS` — positive integer; zero is rejected.
 - `MEMPALACE_MAINTENANCE_VERSION_RETENTION_HOURS` — positive integer;
   zero is rejected.
@@ -182,8 +186,8 @@ variables, which take precedence over `config.json`:
 
 ### Idle-Only Hub Scheduling
 
-The HTTP hub (`mempalace-cli serve`) runs maintenance in a background
-tokio task.  The scheduling rules are:
+When `background_enabled` is `true`, the HTTP hub (`mempalace-cli serve`) runs
+maintenance in a background tokio task. The scheduling rules are:
 
 - **Startup eligibility check**: on hub startup, one maintenance
   eligibility check runs immediately.  The storage engine initialises its
@@ -245,6 +249,7 @@ The `InfoResponse` body includes these maintenance fields:
 | Field | Type | Description |
 |---|---|---|
 | `maintenance_enabled` | `bool` | Whether the subsystem is enabled. |
+| `maintenance_background_enabled` | `bool` | Whether the HTTP hub schedules maintenance automatically. `false` indicates manual-only maintenance when `maintenance_enabled` is `true`. |
 | `maintenance_idle_secs` | `u64` | Configured idle threshold. |
 | `maintenance_last_run` | `serde_json::Value` or `null` | Full JSON-serialized [`MaintenanceRunSummary`] of the last maintenance attempt/run summary. Contains `run_id`, `started_at`, `finished_at`, `duration`, `cpu_duration`, `status`, and `tier_results`. |
 | `maintenance_status` | `MaintenanceStatus` | Typed status enum: `disabled`, `idle`, `running`, `skipped { reason }`, `aborted { reason }`, `failed { message }`, `completed { status }`. Replaces the ambiguity of a null `maintenance_last_run`. |
@@ -277,7 +282,8 @@ from an older MemPalace release), the recommended procedure is:
    the others will report `aborted {concurrent_run}`.
 5. **After the initial one-shot pass**, the hub's background maintenance
    will handle incremental compaction and pruning automatically during
-   idle periods.  No further manual intervention is required.
+   idle periods when `background_enabled` is `true`. When it is `false`,
+   schedule further `mempalace-cli maintain` runs yourself.
 
 The `maintain` command respects the same `enabled`, `version_retention_hours`,
 `tail_threshold_rows`, and `small_fragment_threshold` settings from

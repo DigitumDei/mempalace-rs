@@ -183,10 +183,7 @@ impl LanceDrawerStore {
         };
         let table = self.table().await?;
         let mut query = table.query().select(Select::Columns(vec!["id".to_owned()]));
-        let filter_sql = compile_filter(&filter);
-        if !filter_sql.is_empty() {
-            query = query.only_if(filter_sql);
-        }
+        query = query.only_if(compile_filter(&filter));
         let batches = query.execute().await?.try_collect::<Vec<_>>().await?;
         ids_from_batches(&batches)
     }
@@ -1136,9 +1133,12 @@ fn ids_from_batches(batches: &[RecordBatch]) -> Result<HashSet<String>> {
         })?;
         let values = column.as_string::<i32>();
         for row in 0..values.len() {
-            if !values.is_null(row) {
-                ids.insert(values.value(row).to_owned());
+            if values.is_null(row) {
+                return Err(StorageError::Invariant(
+                    "LanceDB ID projection contained a null ID".to_owned(),
+                ));
             }
+            ids.insert(values.value(row).to_owned());
         }
     }
     Ok(ids)

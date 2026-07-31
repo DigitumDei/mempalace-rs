@@ -28,6 +28,9 @@ pub struct InfoResponse {
     /// Whether the maintenance subsystem is enabled.
     #[serde(default)]
     pub maintenance_enabled: bool,
+    /// Whether the HTTP server schedules maintenance automatically.
+    #[serde(default)]
+    pub maintenance_background_enabled: bool,
     /// Minimum idle seconds since last write before maintenance runs.
     #[serde(default)]
     pub maintenance_idle_secs: u64,
@@ -481,6 +484,7 @@ mod tests {
             embedding_profile: "balanced".to_owned(),
             capabilities: vec!["drawers".to_owned(), "kg".to_owned()],
             maintenance_enabled: true,
+            maintenance_background_enabled: true,
             maintenance_idle_secs: 300,
             maintenance_last_run: None,
             maintenance_status: MaintenanceStatus::Idle,

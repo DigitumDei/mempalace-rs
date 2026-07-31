@@ -4433,6 +4433,7 @@ mod tests {
                     "taxonomy".to_owned(),
                 ],
                 maintenance_enabled: false,
+                maintenance_background_enabled: false,
                 maintenance_idle_secs: 0,
                 maintenance_last_run: None,
                 maintenance_status: mempalace_federation::MaintenanceStatus::Disabled,

@@ -52,6 +52,29 @@ Default effective degraded limits:
 3. Prefer smaller, more frequent ingest runs over large one-shot bulk imports.
 4. Validate `search` and `wake-up` output quality on the actual host after enabling the profile.
 
+## Low-I/O Operation
+
+Low CPU and low I/O are independent constraints. On a storage-constrained VM, leave
+maintenance enabled but disable its background scheduler so normal reads and writes do
+not compete with periodic LanceDB metadata scans, compaction, or version pruning:
+
+```json
+{
+  "version": 1,
+  "maintenance": {
+    "background_enabled": false
+  }
+}
+```
+
+Run `mempalace-cli maintain` during an explicit maintenance window. This preserves
+compaction, vector-index optimization, and version retention without generating
+background storage I/O. It does not reduce the I/O required by an individual ingest or
+search request; scope those requests to a wing or room where possible.
+
+Keep `maintenance.enabled` set to `true`: setting it to `false` disables both the
+background scheduler and the `mempalace-cli maintain` command.
+
 ## Warm Cache Expectations
 
 Low-CPU mode still depends on local model assets.

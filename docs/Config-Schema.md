@@ -32,6 +32,7 @@ Frozen JSON shape:
   },
   "maintenance": {
     "enabled": true,
+    "background_enabled": true,
     "idle_secs": 300,
     "version_retention_hours": 24,
     "tail_threshold_rows": 1024,
@@ -99,12 +100,14 @@ Validation:
 - Optional
 - Defaults when absent or unset:
   - `enabled: true`
+  - `background_enabled: true`
   - `idle_secs: 300`
   - `version_retention_hours: 24`
   - `tail_threshold_rows: 1024`
   - `small_fragment_threshold: 10`
 - Fields:
-  - `enabled`: boolean — whether the maintenance subsystem runs automatically. Default: `true`.
+  - `enabled`: boolean — master switch for all maintenance. When `false`, both the HTTP scheduler and `mempalace-cli maintain` are disabled. Default: `true`.
+  - `background_enabled`: boolean — whether the HTTP server schedules maintenance automatically. Default: `true`. Set to `false` for low-I/O operation; `mempalace-cli maintain` remains available for a planned maintenance window when `enabled` remains `true`.
   - `idle_secs`: positive integer — minimum idle seconds since the last write before maintenance runs. Default: `300`.
   - `version_retention_hours`: positive integer — maximum age in hours for retained version data. Default: `24`.
   - `tail_threshold_rows`: positive integer — row count threshold that triggers incremental vector-index optimization. Default: `1024`.
@@ -153,7 +156,9 @@ Supported environment variables:
   Legacy alias retained for Python-era compatibility.
 - `MEMPALACE_EMBEDDING_PROFILE`
 - `MEMPALACE_MAINTENANCE_ENABLED`
-  Overrides `maintenance.enabled`. Accepted truthy values: `1`, `true`, `TRUE`, `yes`, `YES`. All other values (including empty string) are treated as `false`.
+  Overrides `maintenance.enabled`. Accepted true values: `1`, `true`, `TRUE`, `yes`, `YES`. Accepted false values: `0`, `false`, `FALSE`, `no`, `NO`. Other values are rejected.
+- `MEMPALACE_MAINTENANCE_BACKGROUND_ENABLED`
+  Overrides `maintenance.background_enabled`. It accepts the same true and false values as `MEMPALACE_MAINTENANCE_ENABLED`.
 - `MEMPALACE_MAINTENANCE_IDLE_SECS`
   Overrides `maintenance.idle_secs`. Must be a positive integer. Zero is rejected.
 - `MEMPALACE_MAINTENANCE_VERSION_RETENTION_HOURS`

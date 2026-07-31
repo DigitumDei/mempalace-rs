@@ -12,7 +12,7 @@ use futures::TryStreamExt;
 use lancedb::connection::Connection;
 use lancedb::database::CreateTableMode;
 use lancedb::index::Index;
-use lancedb::query::{ExecutableQuery, QueryBase};
+use lancedb::query::{ExecutableQuery, QueryBase, Select};
 use lancedb::table::NewColumnTransform;
 use serde::{Deserialize, Serialize};
 use time::{Date, OffsetDateTime};
@@ -181,12 +181,11 @@ impl LanceDrawerStore {
             include_all_views: true,
             ..DrawerFilter::default()
         };
-        Ok(self
-            .list_drawers(&filter)
-            .await?
-            .into_iter()
-            .map(|record| record.id.as_str().to_owned())
-            .collect())
+        let table = self.table().await?;
+        let mut query = table.query().select(Select::Columns(vec!["id".to_owned()]));
+        query = query.only_if(compile_filter(&filter));
+        let batches = query.execute().await?.try_collect::<Vec<_>>().await?;
+        ids_from_batches(&batches)
     }
 
     async fn ensure_indices(&self, table: &lancedb::Table) -> Result<()> {
@@ -1124,6 +1123,25 @@ fn matches_from_batches(batches: &[RecordBatch]) -> Result<Vec<DrawerMatch>> {
         .zip(distances)
         .map(|(record, distance)| DrawerMatch { record, distance })
         .collect())
+}
+
+fn ids_from_batches(batches: &[RecordBatch]) -> Result<HashSet<String>> {
+    let mut ids = HashSet::new();
+    for batch in batches {
+        let column = batch.column_by_name("id").ok_or_else(|| {
+            StorageError::Invariant("LanceDB ID projection omitted `id` column".to_owned())
+        })?;
+        let values = column.as_string::<i32>();
+        for row in 0..values.len() {
+            if values.is_null(row) {
+                return Err(StorageError::Invariant(
+                    "LanceDB ID projection contained a null ID".to_owned(),
+                ));
+            }
+            ids.insert(values.value(row).to_owned());
+        }
+    }
+    Ok(ids)
 }
 
 fn truncate_to_cutoff_ties(matches: &mut Vec<DrawerMatch>, limit: usize) {

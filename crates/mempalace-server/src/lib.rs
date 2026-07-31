@@ -473,6 +473,7 @@ where
         tail_threshold_rows: config.maintenance.tail_threshold_rows as u64,
         small_fragment_threshold: config.maintenance.small_fragment_threshold as u64,
     };
+    let background_maintenance_enabled = config.maintenance.background_enabled;
 
     let initial_status = if maintenance_settings.enabled {
         MaintenanceStatus::Idle
@@ -495,7 +496,7 @@ where
     // check, then loops with a jittered sleep so concurrent hubs do not
     // synchronise their runs. Storage write paths reset the idle timer, so
     // maintenance only fires when writes have been idle for the configured duration.
-    if maintenance_settings.enabled {
+    if maintenance_settings.enabled && background_maintenance_enabled {
         let task_state = Arc::clone(&state);
         let settings = maintenance_settings;
         tokio::spawn(async move {
@@ -722,6 +723,7 @@ where
             "ingest".to_owned(),
         ],
         maintenance_enabled: state.config.maintenance.enabled,
+        maintenance_background_enabled: state.config.maintenance.background_enabled,
         maintenance_idle_secs: state.config.maintenance.idle_secs as u64,
         maintenance_last_run: last_run,
         maintenance_status: status,
@@ -2184,6 +2186,13 @@ mod tests {
     }
 
     async fn make_harness_with_maintenance(maintenance_enabled: bool) -> Harness {
+        make_harness_with_maintenance_config(maintenance_enabled, true).await
+    }
+
+    async fn make_harness_with_maintenance_config(
+        maintenance_enabled: bool,
+        background_maintenance_enabled: bool,
+    ) -> Harness {
         let tempdir = TempDir::new().unwrap();
         let palace_path = tempdir.path().join("palace");
 
@@ -2214,6 +2223,7 @@ mod tests {
             federation: FederationRuntimeConfig::default(),
             maintenance: MaintenanceRuntimeConfig {
                 enabled: maintenance_enabled,
+                background_enabled: background_maintenance_enabled,
                 ..MaintenanceRuntimeConfig::defaults()
             },
         };
@@ -3466,6 +3476,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp).await;
         assert_eq!(body["maintenance_enabled"], true);
+        assert_eq!(body["maintenance_background_enabled"], true);
         assert_eq!(body["maintenance_idle_secs"], 300u64);
         assert!(body["maintenance_last_run"].is_null());
         // Status should be idle or one of the post-run states (the startup
@@ -3484,9 +3495,21 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp).await;
         assert_eq!(body["maintenance_enabled"], false);
+        assert_eq!(body["maintenance_background_enabled"], true);
         assert_eq!(body["maintenance_idle_secs"], 300u64);
         assert!(body["maintenance_last_run"].is_null());
         assert_eq!(body["maintenance_status"], "disabled");
+    }
+
+    #[tokio::test]
+    async fn info_reports_manual_only_maintenance() {
+        let harness = make_harness_with_maintenance_config(true, false).await;
+        let resp = harness.router.oneshot(authed_get("/v1/info", ALICE_TOKEN)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["maintenance_enabled"], true);
+        assert_eq!(body["maintenance_background_enabled"], false);
+        assert_eq!(body["maintenance_status"], "idle");
     }
 
     #[tokio::test]
@@ -3686,6 +3709,19 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         let status = harness.state.last_maintenance_status.lock().unwrap().take();
         assert!(status.is_none(), "disabled maintenance must not record status");
+    }
+
+    #[tokio::test]
+    async fn manual_maintenance_creates_no_scheduler() {
+        let manual = MaintenanceRuntimeConfig {
+            background_enabled: false,
+            ..MaintenanceRuntimeConfig::defaults()
+        };
+        let harness = build_with_maintenance(manual).await;
+        // A manual-only configuration must not perform the startup check.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let status = harness.state.last_maintenance_status.lock().unwrap().take();
+        assert!(status.is_none(), "manual maintenance must not record status");
     }
 
     #[tokio::test]

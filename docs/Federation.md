@@ -136,7 +136,7 @@ requires `Authorization: Bearer <token>`.
 | Method & path | Purpose |
 |---|---|
 | `GET /v1/health` | Liveness probe (no auth) |
-| `GET /v1/info` | Server version, `federation_api_version`, embedding profile, capabilities |
+| `GET /v1/info` | Server version, `federation_api_version`, embedding profile, capabilities, and maintenance configuration/state |
 | `POST /v1/drawers/search` | Semantic search (server embeds the query text) |
 | `POST /v1/drawers/check_duplicate` | Near-duplicate check |
 | `POST /v1/drawers` | Add a drawer |

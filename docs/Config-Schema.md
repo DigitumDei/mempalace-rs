@@ -32,6 +32,7 @@ Frozen JSON shape:
   },
   "maintenance": {
     "enabled": true,
+    "background_enabled": true,
     "idle_secs": 300,
     "version_retention_hours": 24,
     "tail_threshold_rows": 1024,
@@ -104,7 +105,8 @@ Validation:
   - `tail_threshold_rows: 1024`
   - `small_fragment_threshold: 10`
 - Fields:
-  - `enabled`: boolean — whether the maintenance subsystem runs automatically. Default: `true`.
+- `enabled`: boolean — whether the maintenance subsystem is available. Default: `true`.
+- `background_enabled`: boolean — whether the HTTP server schedules maintenance automatically. Default: `true`. Set to `false` for low-I/O operation; `mempalace-cli maintain` remains available for a planned maintenance window.
   - `idle_secs`: positive integer — minimum idle seconds since the last write before maintenance runs. Default: `300`.
   - `version_retention_hours`: positive integer — maximum age in hours for retained version data. Default: `24`.
   - `tail_threshold_rows`: positive integer — row count threshold that triggers incremental vector-index optimization. Default: `1024`.

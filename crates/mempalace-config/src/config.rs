@@ -235,6 +235,9 @@ impl LowCpuRuntimeConfig {
 pub struct MaintenanceConfigFileV1 {
     #[serde(default)]
     pub enabled: Option<bool>,
+    /// Whether the HTTP server schedules maintenance in the background.
+    #[serde(default)]
+    pub background_enabled: Option<bool>,
     #[serde(default)]
     pub idle_secs: Option<usize>,
     #[serde(default)]
@@ -250,6 +253,8 @@ pub struct MaintenanceConfigFileV1 {
 pub struct MaintenanceRuntimeConfig {
     /// Whether the maintenance subsystem is enabled (default: true).
     pub enabled: bool,
+    /// Whether the HTTP server schedules maintenance automatically (default: true).
+    pub background_enabled: bool,
     /// Minimum idle seconds since last write before maintenance runs (default: 300).
     pub idle_secs: usize,
     /// Maximum age in hours for retained version data (default: 24).
@@ -264,6 +269,7 @@ impl MaintenanceRuntimeConfig {
     pub fn defaults() -> Self {
         Self {
             enabled: true,
+            background_enabled: true,
             idle_secs: DEFAULT_MAINTENANCE_IDLE_SECS,
             version_retention_hours: DEFAULT_MAINTENANCE_VERSION_RETENTION_HOURS,
             tail_threshold_rows: DEFAULT_MAINTENANCE_TAIL_THRESHOLD_ROWS,
@@ -282,6 +288,9 @@ impl MaintenanceRuntimeConfig {
 
         if let Some(enabled) = overrides.enabled {
             self.enabled = enabled;
+        }
+        if let Some(background_enabled) = overrides.background_enabled {
+            self.background_enabled = background_enabled;
         }
         self.idle_secs = required_positive_override(
             "maintenance.idle_secs",
@@ -1194,6 +1203,7 @@ mod tests {
         assert_eq!(config.palace_path, base.join("palace"));
         assert!(!config.low_cpu.enabled);
         assert!(config.maintenance.enabled);
+        assert!(config.maintenance.background_enabled);
         assert_eq!(config.maintenance.idle_secs, 300);
         assert_eq!(config.maintenance.version_retention_hours, 24);
         assert_eq!(config.maintenance.tail_threshold_rows, 1024);
@@ -1996,6 +2006,7 @@ mod tests {
             .with_overrides(
                 Some(MaintenanceConfigFileV1 {
                     enabled: None,
+                    background_enabled: None,
                     idle_secs: Some(0),
                     version_retention_hours: None,
                     tail_threshold_rows: None,
@@ -2100,6 +2111,7 @@ mod tests {
   "version": 1,
   "maintenance": {
     "enabled": false,
+    "background_enabled": false,
     "idle_secs": 600,
     "version_retention_hours": 48,
     "tail_threshold_rows": 2048,
@@ -2115,6 +2127,7 @@ mod tests {
         .unwrap();
 
         assert!(!config.maintenance.enabled);
+        assert!(!config.maintenance.background_enabled);
         assert_eq!(config.maintenance.idle_secs, 600);
         assert_eq!(config.maintenance.version_retention_hours, 48);
         assert_eq!(config.maintenance.tail_threshold_rows, 2048);

@@ -4888,6 +4888,7 @@ mod tests {
     async fn admin_token_can_write() {
         let harness = make_harness().await;
 
+        // Drawer add
         let add_resp = harness
             .router
             .clone()
@@ -4906,7 +4907,9 @@ mod tests {
         assert_eq!(add_resp.status(), StatusCode::OK);
         let add_body = body_json(add_resp).await;
         assert_eq!(add_body["success"], true);
+        let drawer_id = add_body["drawer_id"].as_str().unwrap().to_owned();
 
+        // KG fact add
         let kg_resp = harness
             .router
             .clone()
@@ -4923,6 +4926,102 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(kg_resp.status(), StatusCode::OK);
+
+        // Drawer delete — and the drawer is really gone afterwards
+        let del_req = Request::builder()
+            .method(Method::DELETE)
+            .uri(format!("/v1/drawers/{drawer_id}"))
+            .header(header::AUTHORIZATION, format!("Bearer {ADMIN_TOKEN}"))
+            .body(Body::empty())
+            .unwrap();
+        let del_resp = harness.router.clone().oneshot(del_req).await.unwrap();
+        assert_eq!(del_resp.status(), StatusCode::OK);
+        let del_body = body_json(del_resp).await;
+        assert_eq!(del_body["success"], true);
+
+        let get_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_get(&format!("/v1/drawers/{drawer_id}"), ADMIN_TOKEN))
+            .await
+            .unwrap();
+        assert_eq!(get_resp.status(), StatusCode::NOT_FOUND);
+
+        // KG fact invalidation — the fact stops showing up after the end date
+        let inv_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/kg/facts/invalidate",
+                ADMIN_TOKEN,
+                json!({
+                    "subject": "Bob",
+                    "predicate": "maintains",
+                    "object": "Palace",
+                    "ended": "2026-06-01",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(inv_resp.status(), StatusCode::OK);
+        let inv_body = body_json(inv_resp).await;
+        assert!(inv_body["invalidated"].as_u64().unwrap() > 0);
+
+        let query_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/kg/query",
+                ADMIN_TOKEN,
+                json!({"entity": "Bob", "as_of": "2026-07-01", "direction": "outgoing"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(query_resp.status(), StatusCode::OK);
+        let query_body = body_json(query_resp).await;
+        assert_eq!(query_body["count"], 0u64);
+
+        // Batch ingest — the ingested chunk becomes a real drawer row
+        let ingest_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/ingest/batch",
+                ADMIN_TOKEN,
+                json!({
+                    "wing": "wing_project",
+                    "repo_id": "github.com/acme/admin-repo",
+                    "files": [
+                        {
+                            "relative_path": "src/lib.rs",
+                            "content_hash": "ch-admin-v1",
+                            "chunks": [
+                                {"chunk_index": 0, "room": "backend", "text": "admin token batch ingest"}
+                            ]
+                        }
+                    ]
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(ingest_resp.status(), StatusCode::OK);
+        let ingest_body = body_json(ingest_resp).await;
+        assert_eq!(ingest_body["files"][0]["status"], "ingested");
+        assert_eq!(ingest_body["files"][0]["drawers_written"], 1u64);
+
+        let list_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_get("/v1/drawers?wing=wing_project", ADMIN_TOKEN))
+            .await
+            .unwrap();
+        assert_eq!(list_resp.status(), StatusCode::OK);
+        let list_body = body_json(list_resp).await;
+        let drawers = list_body["drawers"].as_array().unwrap();
+        assert_eq!(drawers.len(), 1);
     }
 
     #[tokio::test]

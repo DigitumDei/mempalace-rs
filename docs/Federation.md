@@ -68,8 +68,9 @@ Authentication is bearer-token based. The token file is a JSON array of entries:
 
 ```json
 [
-  { "token": "alice-secret-token", "name": "alice", "enabled": true },
-  { "token": "bob-secret-token",   "name": "bob",   "enabled": false }
+  { "token": "alice-secret-token", "name": "alice", "enabled": true, "level": "write" },
+  { "token": "bob-secret-token",   "name": "bob",   "enabled": false },
+  { "token": "ci-reader-token",    "name": "ci",    "enabled": true, "level": "read" }
 ]
 ```
 

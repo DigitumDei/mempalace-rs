@@ -120,12 +120,17 @@ Operational notes:
 
 - Create the token file first — a JSON array of objects, each with `token`,
   `name`, and `enabled` keys and an optional `level` key (`read`, `write`, or
-  `admin`; default `write`). It is hot-reloaded, so revoking a token (set
+  `admin`; default `write`). Issue `read`-level tokens for CI/CD pipelines or
+  monitoring that only need to query the palace; issue `write`-level (or
+  `admin`) tokens for interactive agents that also add drawers, KG facts, or
+  ingest mined data. The token file is hot-reloaded, so revoking a token (set
   `enabled: false`) takes effect on the next request without a restart.
 - Access levels gate the API: `read` tokens may call read routes only and get
   `403 forbidden` on write routes (drawer add/delete, KG add/invalidate, ingest);
   `write` and `admin` may call everything. There is no per-user or per-wing
-  policy — the level is a whole-token gate.
+  policy — the level is a whole-token gate. The `GET /v1/whoami` endpoint
+  returns the authenticated token's `level` so a client can inspect its own
+  access without attempting a write.
 - The server speaks **plain HTTP**. On any untrusted network, run it behind a
   TLS-terminating reverse proxy; never expose raw bearer tokens over the wire.
 - `GET /v1/health` is unauthenticated and suitable as a liveness probe; all other

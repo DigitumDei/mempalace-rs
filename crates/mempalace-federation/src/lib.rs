@@ -489,8 +489,8 @@ pub struct WhoamiResponse {
     /// The delegated principal, if any.
     #[serde(default)]
     pub on_behalf_of: Option<String>,
-    /// The composed identity: `token_name` or `token_name:on_behalf_of`.
-    pub composed_identity: String,
+    /// The composed principal: `token_name` or `token_name:on_behalf_of`.
+    pub identity: String,
     /// The authenticated token's access level.
     pub level: String,
 }
@@ -860,26 +860,29 @@ mod tests {
         let plain = WhoamiResponse {
             token_name: "alice".to_owned(),
             on_behalf_of: None,
-            composed_identity: "alice".to_owned(),
+            identity: "alice".to_owned(),
             level: "write".to_owned(),
         };
         let json = serde_json::to_string(&plain).unwrap();
         let decoded: WhoamiResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(plain, decoded);
         assert!(json.contains(r#""token_name":"alice""#));
-        assert!(json.contains(r#""composed_identity":"alice""#));
+        assert!(json.contains(r#""identity":"alice""#));
+        assert!(!json.contains("composed_identity"));
         assert!(json.contains(r#""level":"write""#));
 
         let delegated = WhoamiResponse {
             token_name: "alice".to_owned(),
             on_behalf_of: Some("dion@corp.com".to_owned()),
-            composed_identity: "alice:dion@corp.com".to_owned(),
+            identity: "alice:dion@corp.com".to_owned(),
             level: "admin".to_owned(),
         };
         let json = serde_json::to_string(&delegated).unwrap();
         let decoded: WhoamiResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(delegated, decoded);
         assert!(json.contains(r#""on_behalf_of":"dion@corp.com""#));
+        assert!(json.contains(r#""identity":"alice:dion@corp.com""#));
+        assert!(!json.contains("composed_identity"));
     }
 
     #[test]

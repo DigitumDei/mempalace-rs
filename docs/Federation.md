@@ -175,7 +175,7 @@ requires `Authorization: Bearer <token>`.
 |---|---|---|
 | `GET /v1/health` | none | Liveness probe (no auth) |
 | `GET /v1/info` | read | Server version, `federation_api_version`, embedding profile, capabilities, and maintenance configuration/state |
-| `GET /v1/whoami` | read | Authenticated identity: `token_name`, `on_behalf_of`, `composed_identity`, and `level` |
+| `GET /v1/whoami` | read | Authenticated identity: `token_name`, `on_behalf_of`, `identity` (the composed principal, `token_name` or `token_name:on_behalf_of`), and `level` |
 | `POST /v1/drawers/search` | read | Semantic search (server embeds the query text) |
 | `POST /v1/drawers/check_duplicate` | read | Near-duplicate check |
 | `POST /v1/drawers` | write | Add a drawer |

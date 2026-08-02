@@ -909,7 +909,7 @@ async fn route_whoami(
     Json(WhoamiResponse {
         token_name: auth.token_name.clone(),
         on_behalf_of: auth.on_behalf_of.clone(),
-        composed_identity: auth.principal(),
+        identity: auth.principal(),
         level,
     })
 }
@@ -4955,7 +4955,8 @@ mod tests {
         let body = body_json(resp).await;
         assert_eq!(body["token_name"], "alice");
         assert_eq!(body["on_behalf_of"], serde_json::Value::Null);
-        assert_eq!(body["composed_identity"], "alice");
+        assert_eq!(body["identity"], "alice");
+        assert!(body.get("composed_identity").is_none());
         assert_eq!(body["level"], "write");
     }
 
@@ -4978,7 +4979,8 @@ mod tests {
         let body = body_json(resp).await;
         assert_eq!(body["token_name"], "alice");
         assert_eq!(body["on_behalf_of"], "dion@corp.com");
-        assert_eq!(body["composed_identity"], "alice:dion@corp.com");
+        assert_eq!(body["identity"], "alice:dion@corp.com");
+        assert!(body.get("composed_identity").is_none());
         assert_eq!(body["level"], "write");
     }
 

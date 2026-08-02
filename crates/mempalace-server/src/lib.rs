@@ -438,13 +438,31 @@ impl TokenRegistry {
 }
 
 /// Extension type inserted into axum request extensions by the auth middleware.
+///
+/// Carries the authenticated token name, an optional delegated principal resolved
+/// from the `X-MemPalace-On-Behalf-Of` header, and the token's access level. The
+/// vouching token name is always kept separate from the delegated principal so
+/// callers can only ever claim to be `<their-own-token>:<person>`.
 #[derive(Debug, Clone)]
-pub struct AuthIdentity(
-    /// The authenticated identity name.
-    pub String,
+pub struct AuthIdentity {
+    /// The authenticated token's name. Always the prefix of any composed principal.
+    pub token_name: String,
+    /// The delegated principal from the `X-MemPalace-On-Behalf-Of` header, if any.
+    pub on_behalf_of: Option<String>,
     /// The authenticated identity's access level.
-    pub AccessLevel,
-);
+    pub level: AccessLevel,
+}
+
+impl AuthIdentity {
+    /// Returns the composed principal: the bare `token_name`, or
+    /// `token_name:on_behalf_of` when a delegated principal was supplied.
+    pub fn principal(&self) -> String {
+        match &self.on_behalf_of {
+            Some(claimed) => format!("{}:{claimed}", self.token_name),
+            None => self.token_name.clone(),
+        }
+    }
+}
 
 // ─── Server state ─────────────────────────────────────────────────────────────
 
@@ -638,6 +656,46 @@ where
 
 // ─── Auth middleware ──────────────────────────────────────────────────────────
 
+/// Maximum byte length of the `X-MemPalace-On-Behalf-Of` header value.
+const MAX_ON_BEHALF_OF_BYTES: usize = 128;
+
+/// Delegated-identity request header.
+const ON_BEHALF_OF_HEADER: &str = "x-mempalace-on-behalf-of";
+
+/// Resolves and validates the `X-MemPalace-On-Behalf-Of` header.
+///
+/// Returns `Ok(None)` when the header is absent, `Ok(Some(trimmed))` when a
+/// valid value is present, and `Err(message)` — to be surfaced as `400
+/// invalid_params` — when the value is empty after trimming, longer than 128
+/// bytes, contains `:` (the principal composition separator), or contains
+/// control or newline characters (the value lands in stored rows and logs).
+fn resolve_on_behalf_of(headers: &axum::http::HeaderMap) -> Result<Option<String>, String> {
+    let Some(raw) = headers.get(ON_BEHALF_OF_HEADER) else {
+        return Ok(None);
+    };
+    let raw = raw
+        .to_str()
+        .map_err(|_| "X-MemPalace-On-Behalf-Of must be a valid UTF-8 string".to_owned())?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("X-MemPalace-On-Behalf-Of must not be empty after trimming".to_owned());
+    }
+    if trimmed.len() > MAX_ON_BEHALF_OF_BYTES {
+        return Err(format!(
+            "X-MemPalace-On-Behalf-Of must be at most {MAX_ON_BEHALF_OF_BYTES} bytes"
+        ));
+    }
+    if trimmed.contains(':') {
+        return Err("X-MemPalace-On-Behalf-Of must not contain ':'".to_owned());
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Err(
+            "X-MemPalace-On-Behalf-Of must not contain control or newline characters".to_owned(),
+        );
+    }
+    Ok(Some(trimmed.to_owned()))
+}
+
 async fn auth_middleware<P>(
     State(state): State<Arc<ServerState<P>>>,
     mut request: Request<Body>,
@@ -653,8 +711,16 @@ where
         .and_then(|value| value.strip_prefix("Bearer "));
 
     match token.and_then(|t| state.tokens.authenticate(t)) {
-        Some((identity, level)) => {
-            request.extensions_mut().insert(AuthIdentity(identity, level));
+        Some((token_name, level)) => {
+            let on_behalf_of = match resolve_on_behalf_of(request.headers()) {
+                Ok(claimed) => claimed,
+                Err(msg) => return ServerError::InvalidParams(msg).into_response(),
+            };
+            request.extensions_mut().insert(AuthIdentity {
+                token_name,
+                on_behalf_of,
+                level,
+            });
             next.run(request).await
         }
         None => ServerError::Unauthorized.into_response(),
@@ -846,7 +912,6 @@ async fn route_drawers_add<P>(
 where
     P: EmbeddingProvider + Send + Sync + 'static,
 {
-    let identity = auth.0.0;
     if body.content.len() > MAX_DRAWER_CONTENT_BYTES {
         return Err(ServerError::InvalidParams(format!(
             "content must be at most {MAX_DRAWER_CONTENT_BYTES} bytes"
@@ -874,10 +939,16 @@ where
         ));
     }
 
-    // Determine added_by: identity[:claimed]
-    let added_by = match &body.added_by {
-        Some(claimed) if claimed != &identity => format!("{identity}:{claimed}"),
-        _ => identity.clone(),
+    // Determine added_by: a header-delegated principal wins; the body
+    // `added_by` field is a fallback only when the header is absent.
+    let added_by = match &auth.on_behalf_of {
+        Some(_) => auth.principal(),
+        None => match &body.added_by {
+            Some(claimed) if claimed != &auth.token_name => {
+                format!("{}:{claimed}", auth.token_name)
+            }
+            _ => auth.token_name.clone(),
+        },
     };
 
     let now = OffsetDateTime::now_utc();
@@ -913,7 +984,7 @@ where
         event_type: "drawer_added".to_owned(),
         occurred_at: now,
         entity_id: drawer_id.as_str().to_owned(),
-        actor: Some(identity),
+        actor: Some(auth.principal()),
         details_json: Some(json!({"wing": wing.as_str(), "room": room.as_str()}).to_string()),
     })?;
 
@@ -993,7 +1064,6 @@ async fn route_drawers_delete<P>(
 where
     P: EmbeddingProvider + Send + Sync + 'static,
 {
-    let identity = auth.0.0;
     let drawer_id = DrawerId::new(&id)?;
 
     // Check the drawer exists and is not a diary drawer
@@ -1019,7 +1089,7 @@ where
         event_type: "drawer_deleted".to_owned(),
         occurred_at: OffsetDateTime::now_utc(),
         entity_id: id,
-        actor: Some(identity),
+        actor: Some(auth.principal()),
         details_json: None,
     })?;
 
@@ -1117,7 +1187,6 @@ async fn route_kg_add<P>(
 where
     P: EmbeddingProvider + Send + Sync + 'static,
 {
-    let identity = auth.0.0;
     validate_kg_field("subject", &body.subject)?;
     validate_kg_field("predicate", &body.predicate)?;
     validate_kg_field("object", &body.object)?;
@@ -1144,7 +1213,7 @@ where
         event_type: "kg_fact_added".to_owned(),
         occurred_at: now,
         entity_id: triple_id.clone(),
-        actor: Some(identity),
+        actor: Some(auth.principal()),
         details_json: Some(
             json!({"subject": body.subject, "predicate": body.predicate, "object": body.object})
                 .to_string(),
@@ -1168,7 +1237,6 @@ async fn route_kg_invalidate<P>(
 where
     P: EmbeddingProvider + Send + Sync + 'static,
 {
-    let identity = auth.0.0;
     validate_kg_field("subject", &body.subject)?;
     validate_kg_field("predicate", &body.predicate)?;
     validate_kg_field("object", &body.object)?;
@@ -1188,7 +1256,7 @@ where
             event_type: "kg_fact_invalidated".to_owned(),
             occurred_at: now,
             entity_id: format!("{} → {} → {}", body.subject, body.predicate, body.object),
-            actor: Some(identity),
+            actor: Some(auth.principal()),
             details_json: Some(
                 json!({"subject": body.subject, "predicate": body.predicate, "object": body.object,
                        "ended": format_date(ended)})
@@ -1383,8 +1451,6 @@ async fn route_ingest_batch<P>(
 where
     P: EmbeddingProvider + Send + Sync + 'static,
 {
-    let identity = auth.0.0;
-
     // ── Validate wing ──────────────────────────────────────────────────────────
     let wing = WingId::new(&body.wing)?;
 
@@ -1429,9 +1495,14 @@ where
     }
 
     // ── Determine added_by ────────────────────────────────────────────────────
-    let added_by = match &body.agent {
-        Some(agent) if agent != &identity => format!("{identity}:{agent}"),
-        _ => identity.clone(),
+    // A header-delegated principal wins; the body `agent` field is a fallback
+    // only when the header is absent.
+    let added_by = match &auth.on_behalf_of {
+        Some(_) => auth.principal(),
+        None => match &body.agent {
+            Some(agent) if agent != &auth.token_name => format!("{}:{agent}", auth.token_name),
+            _ => auth.token_name.clone(),
+        },
     };
 
     // ── resolve_root for this wing (may be empty) ─────────────────────────────
@@ -1841,7 +1912,7 @@ where
             event_type: "mine_batch".to_owned(),
             occurred_at: now,
             entity_id: format!("mine_batch:{wing_str}"),
-            actor: Some(identity),
+            actor: Some(auth.principal()),
             details_json: Some(
                 json!({
                     "repo_id": body.repo_id,
@@ -2283,6 +2354,25 @@ mod tests {
             .header(header::AUTHORIZATION, format!("Bearer {token}"))
             .body(Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap()
+    }
+
+    /// Helper: build a JSON request with bearer auth and a delegation header.
+    fn delegated_json_request(
+        method: Method,
+        uri: &str,
+        token: &str,
+        on_behalf_of: Option<&str>,
+        body: Value,
+    ) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"));
+        if let Some(principal) = on_behalf_of {
+            builder = builder.header(ON_BEHALF_OF_HEADER, principal);
+        }
+        builder.body(Body::from(serde_json::to_vec(&body).unwrap())).unwrap()
     }
 
     /// Helper: build a GET request with bearer auth.
@@ -4034,5 +4124,375 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         panic!("build_router should spawn a scheduler that runs the startup check");
+    }
+
+    // ─── 12. Delegated principals ────────────────────────────────────────────
+
+    #[test]
+    fn auth_identity_principal_composes_token_and_claimed() {
+        let plain = AuthIdentity {
+            token_name: "alice".to_owned(),
+            on_behalf_of: None,
+            level: AccessLevel::Write,
+        };
+        assert_eq!(plain.principal(), "alice");
+
+        let delegated = AuthIdentity {
+            token_name: "alice".to_owned(),
+            on_behalf_of: Some("dion@corp.com".to_owned()),
+            level: AccessLevel::Write,
+        };
+        assert_eq!(delegated.principal(), "alice:dion@corp.com");
+    }
+
+    #[tokio::test]
+    async fn on_behalf_of_header_rejects_empty_after_trim() {
+        let harness = make_harness().await;
+        let resp = harness
+            .router
+            .clone()
+            .oneshot(delegated_json_request(
+                Method::POST,
+                "/v1/drawers/search",
+                ALICE_TOKEN,
+                Some("   "),
+                json!({"query": "delegation", "limit": 5}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(resp).await;
+        assert_eq!(body["code"], "invalid_params");
+    }
+
+    #[tokio::test]
+    async fn on_behalf_of_header_rejects_too_long() {
+        let harness = make_harness().await;
+        let too_long = "a".repeat(129);
+        let resp = harness
+            .router
+            .clone()
+            .oneshot(delegated_json_request(
+                Method::POST,
+                "/v1/drawers/search",
+                ALICE_TOKEN,
+                Some(too_long.as_str()),
+                json!({"query": "delegation", "limit": 5}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(resp).await;
+        assert_eq!(body["code"], "invalid_params");
+    }
+
+    #[tokio::test]
+    async fn on_behalf_of_header_rejects_colon() {
+        let harness = make_harness().await;
+        let resp = harness
+            .router
+            .clone()
+            .oneshot(delegated_json_request(
+                Method::POST,
+                "/v1/drawers/search",
+                ALICE_TOKEN,
+                Some("dion:corp"),
+                json!({"query": "delegation", "limit": 5}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(resp).await;
+        assert_eq!(body["code"], "invalid_params");
+    }
+
+    #[tokio::test]
+    async fn on_behalf_of_header_rejects_control_characters() {
+        let harness = make_harness().await;
+        let resp = harness
+            .router
+            .clone()
+            .oneshot(delegated_json_request(
+                Method::POST,
+                "/v1/drawers/search",
+                ALICE_TOKEN,
+                Some("dion\u{1}corp"),
+                json!({"query": "delegation", "limit": 5}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(resp).await;
+        assert_eq!(body["code"], "invalid_params");
+    }
+
+    #[tokio::test]
+    async fn delegated_drawer_add_uses_composed_principal() {
+        let harness = make_harness().await;
+        let add_resp = harness
+            .router
+            .clone()
+            .oneshot(delegated_json_request(
+                Method::POST,
+                "/v1/drawers",
+                ALICE_TOKEN,
+                Some("dion@corp.com"),
+                json!({
+                    "wing": "wing_code",
+                    "room": "delegation",
+                    "content": "delegated drawer attribution content",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(add_resp.status(), StatusCode::OK);
+        let add_body = body_json(add_resp).await;
+        let drawer_id = add_body["drawer_id"].as_str().unwrap().to_owned();
+
+        // The stored drawer reports the composed principal as added_by.
+        let get_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_get(&format!("/v1/drawers/{drawer_id}"), ALICE_TOKEN))
+            .await
+            .unwrap();
+        assert_eq!(get_resp.status(), StatusCode::OK);
+        let get_body = body_json(get_resp).await;
+        assert_eq!(get_body["added_by"], "alice:dion@corp.com");
+
+        // The change feed records the composed principal as the actor.
+        let changes_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_get("/v1/changes?limit=5", ALICE_TOKEN))
+            .await
+            .unwrap();
+        assert_eq!(changes_resp.status(), StatusCode::OK);
+        let changes_body = body_json(changes_resp).await;
+        let events = changes_body["events"].as_array().unwrap();
+        let added = events
+            .iter()
+            .find(|ev| ev["event_type"] == "drawer_added")
+            .expect("expected a drawer_added event");
+        assert_eq!(added["actor"], "alice:dion@corp.com");
+    }
+
+    #[tokio::test]
+    async fn delegated_delete_records_composed_actor() {
+        let harness = make_harness().await;
+
+        // Add a drawer as the plain token first.
+        let add_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/drawers",
+                ALICE_TOKEN,
+                json!({
+                    "wing": "wing_code",
+                    "room": "delegated-delete",
+                    "content": "drawer to delete via a delegated principal",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(add_resp.status(), StatusCode::OK);
+        let add_body = body_json(add_resp).await;
+        let drawer_id = add_body["drawer_id"].as_str().unwrap().to_owned();
+
+        // Delete with a delegation header — currently the only way a delete is
+        // attributable to a person.
+        let del_req = Request::builder()
+            .method(Method::DELETE)
+            .uri(format!("/v1/drawers/{drawer_id}"))
+            .header(header::AUTHORIZATION, format!("Bearer {ALICE_TOKEN}"))
+            .header(ON_BEHALF_OF_HEADER, "dion@corp.com")
+            .body(Body::empty())
+            .unwrap();
+        let del_resp = harness.router.clone().oneshot(del_req).await.unwrap();
+        assert_eq!(del_resp.status(), StatusCode::OK);
+
+        let changes_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_get("/v1/changes?limit=5", ALICE_TOKEN))
+            .await
+            .unwrap();
+        assert_eq!(changes_resp.status(), StatusCode::OK);
+        let changes_body = body_json(changes_resp).await;
+        let events = changes_body["events"].as_array().unwrap();
+        let deleted = events
+            .iter()
+            .find(|ev| ev["event_type"] == "drawer_deleted")
+            .expect("expected a drawer_deleted event");
+        assert_eq!(deleted["actor"], "alice:dion@corp.com");
+    }
+
+    #[tokio::test]
+    async fn on_behalf_of_header_wins_over_body_added_by() {
+        let harness = make_harness().await;
+        let add_resp = harness
+            .router
+            .clone()
+            .oneshot(delegated_json_request(
+                Method::POST,
+                "/v1/drawers",
+                ALICE_TOKEN,
+                Some("dion@corp.com"),
+                json!({
+                    "wing": "wing_code",
+                    "room": "header-wins",
+                    "content": "header takes precedence over body fallback",
+                    "added_by": "carol",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(add_resp.status(), StatusCode::OK);
+        let add_body = body_json(add_resp).await;
+        let drawer_id = add_body["drawer_id"].as_str().unwrap().to_owned();
+
+        let get_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_get(&format!("/v1/drawers/{drawer_id}"), ALICE_TOKEN))
+            .await
+            .unwrap();
+        let get_body = body_json(get_resp).await;
+        assert_eq!(get_body["added_by"], "alice:dion@corp.com");
+    }
+
+    #[tokio::test]
+    async fn body_added_by_fallback_works_without_header() {
+        let harness = make_harness().await;
+        let add_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/drawers",
+                ALICE_TOKEN,
+                json!({
+                    "wing": "wing_code",
+                    "room": "fallback",
+                    "content": "body added_by fallback still works",
+                    "added_by": "carol",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(add_resp.status(), StatusCode::OK);
+        let add_body = body_json(add_resp).await;
+        let drawer_id = add_body["drawer_id"].as_str().unwrap().to_owned();
+
+        let get_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_get(&format!("/v1/drawers/{drawer_id}"), ALICE_TOKEN))
+            .await
+            .unwrap();
+        let get_body = body_json(get_resp).await;
+        assert_eq!(get_body["added_by"], "alice:carol");
+    }
+
+    #[tokio::test]
+    async fn delegated_ingest_uses_composed_principal() {
+        let harness = make_harness().await;
+        let resp = harness
+            .router
+            .clone()
+            .oneshot(delegated_json_request(
+                Method::POST,
+                "/v1/ingest/batch",
+                ALICE_TOKEN,
+                Some("dion@corp.com"),
+                json!({
+                    "wing": "wing_delegated",
+                    "repo_id": "github.com/acme/delegated",
+                    "files": [
+                        {
+                            "relative_path": "src/lib.rs",
+                            "content_hash": "ch-delegated",
+                            "chunks": [
+                                {"chunk_index": 0, "room": "backend",
+                                 "text": "delegated ingest attribution content"}
+                            ]
+                        }
+                    ]
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // The ingested drawer must carry the composed principal.
+        let list_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_get("/v1/drawers?wing=wing_delegated", ALICE_TOKEN))
+            .await
+            .unwrap();
+        let list_body = body_json(list_resp).await;
+        let drawers = list_body["drawers"].as_array().unwrap();
+        assert_eq!(drawers.len(), 1);
+        assert_eq!(drawers[0]["added_by"], "alice:dion@corp.com");
+
+        // The mine_batch event records the composed principal as the actor.
+        let changes_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_get("/v1/changes?limit=5", ALICE_TOKEN))
+            .await
+            .unwrap();
+        let changes_body = body_json(changes_resp).await;
+        let events = changes_body["events"].as_array().unwrap();
+        let mined = events
+            .iter()
+            .find(|ev| ev["event_type"] == "mine_batch")
+            .expect("expected a mine_batch event");
+        assert_eq!(mined["actor"], "alice:dion@corp.com");
+    }
+
+    #[tokio::test]
+    async fn ingest_agent_fallback_works_without_header() {
+        let harness = make_harness().await;
+        let resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/ingest/batch",
+                ALICE_TOKEN,
+                json!({
+                    "wing": "wing_agent_fallback",
+                    "repo_id": "github.com/acme/agent",
+                    "agent": "miner",
+                    "files": [
+                        {
+                            "relative_path": "src/lib.rs",
+                            "content_hash": "ch-agent",
+                            "chunks": [
+                                {"chunk_index": 0, "room": "backend",
+                                 "text": "ingest agent fallback attribution content"}
+                            ]
+                        }
+                    ]
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let list_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_get("/v1/drawers?wing=wing_agent_fallback", ALICE_TOKEN))
+            .await
+            .unwrap();
+        let list_body = body_json(list_resp).await;
+        let drawers = list_body["drawers"].as_array().unwrap();
+        assert_eq!(drawers.len(), 1);
+        assert_eq!(drawers[0]["added_by"], "alice:miner");
     }
 }

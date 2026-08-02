@@ -84,6 +84,34 @@ is hot-reloaded — editing it (e.g. flipping `enabled`) takes effect on the nex
 request without restarting the server. The default path is
 `~/.mempalace/server_tokens.json`.
 
+### 1.1.1 Delegated identity (`X-MemPalace-On-Behalf-Of`)
+
+A fronting authentication hub may carry the end user's identity through to the
+palace via the `X-MemPalace-On-Behalf-Of` request header, resolved once per
+request in the auth middleware. The composed principal stored on drawers and
+change events takes the shape `<token_name>:<claimed>`, for example
+`hub:dion@corp.com`.
+
+**Security property:** the vouching token name is always the prefix of the
+composed principal and can never be forged away. A caller claims to be a person,
+but only ever as `<their-own-token>:<person>` — never as another token's
+identity. This is the same property the existing `added_by` (drawer add) and
+`agent` (ingest) body fields already rely on.
+
+**Precedence:** the header wins over the respective body fields. The body
+`added_by` (drawer add) and `agent` (ingest batch) fields remain as a fallback
+when the header is absent, so existing clients are unaffected.
+
+**Header validation** — the server rejects the request with `400 invalid_params`
+when the value is:
+
+- empty after trimming
+- longer than 128 bytes
+- contains `:` — the principal composition separator, so allowing it would make
+  the principal ambiguous
+- contains control characters or newlines — the value lands in stored rows and
+  log lines
+
 ### 1.2 Configure the server section (optional but recommended)
 
 In `~/.mempalace/config.json`:

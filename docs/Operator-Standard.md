@@ -119,7 +119,8 @@ target/release/mempalace-cli serve --bind 127.0.0.1:8765 \
 Operational notes:
 
 - Create the token file first — a JSON array of objects, each with `token`,
-  `name`, and `enabled` keys. It is hot-reloaded, so revoking a token (set
+  `name`, and `enabled` keys and an optional `level` key (`read`, `write`, or
+  `admin`; default `write`). It is hot-reloaded, so revoking a token (set
   `enabled: false`) takes effect on the next request without a restart.
 - The server speaks **plain HTTP**. On any untrusted network, run it behind a
   TLS-terminating reverse proxy; never expose raw bearer tokens over the wire.

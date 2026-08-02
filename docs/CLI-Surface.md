@@ -300,7 +300,8 @@ Flags:
 
 Behavior:
 - The token file is a JSON array of objects, each with `token`, `name`, and
-  `enabled` keys; it is hot-reloaded on each request, and tokens are hashed in
+  `enabled` keys and an optional `level` key (`read`, `write`, or `admin`;
+  default `write`); it is hot-reloaded on each request, and tokens are hashed in
   memory.
 - `GET /v1/health` is unauthenticated; all other `/v1` routes require
   `Authorization: Bearer <token>`.

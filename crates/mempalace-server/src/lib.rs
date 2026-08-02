@@ -234,6 +234,36 @@ impl IntoResponse for ServerError {
 
 // ─── Token auth ──────────────────────────────────────────────────────────────
 
+/// Access level for a bearer token.
+///
+/// Ordering is `Read < Write < Admin` (increasing privilege).
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum AccessLevel {
+    /// Read-only access: search, query, list, get.
+    Read,
+    /// Read + write access: add drawers, add KG facts, ingest.
+    Write,
+    /// Unrestricted access within the palace.
+    Admin,
+}
+
+impl AccessLevel {
+    fn default_write() -> Self {
+        AccessLevel::Write
+    }
+}
+
 /// A single entry in the bearer-token file as stored on disk.
 #[derive(Debug, Clone, serde::Deserialize)]
 struct TokenEntry {
@@ -243,6 +273,9 @@ struct TokenEntry {
     name: String,
     /// If `false`, the token is treated as non-existent during auth.
     enabled: bool,
+    /// Access level; defaults to `write` for backward compatibility.
+    #[serde(default = "AccessLevel::default_write")]
+    level: AccessLevel,
 }
 
 /// An in-memory token entry with its bearer token pre-hashed.
@@ -255,6 +288,8 @@ struct TokenRegistryEntry {
     name: String,
     /// If `false`, the token is treated as non-existent during auth.
     enabled: bool,
+    /// Access level for this token.
+    level: AccessLevel,
     /// BLAKE3 hash of the bearer token.
     token_hash: blake3::Hash,
 }
@@ -277,8 +312,10 @@ struct TokenRegistryInner {
 impl TokenRegistry {
     /// Loads the token registry from `path`.
     ///
-    /// The file must be a JSON array of `{"token","name","enabled"}` objects.
-    /// Returns `Err` if the file exists but cannot be parsed.
+    /// The file must be a JSON array of `{"token","name","enabled","level"}`
+    /// objects; `level` is optional and defaults to `write`. Unknown `level`
+    /// values fail the load. Returns `Err` if the file exists but cannot be
+    /// parsed.
     pub fn load(path: PathBuf) -> Result<Self, ServerError> {
         let inner = Self::read_file(&path)?;
         Ok(Self { path, inner: RwLock::new(inner) })
@@ -306,6 +343,7 @@ impl TokenRegistry {
             entries.push(TokenRegistryEntry {
                 name: entry.name,
                 enabled: entry.enabled,
+                level: entry.level,
                 token_hash: blake3::hash(entry.token.as_bytes()),
             });
         }
@@ -377,8 +415,9 @@ impl TokenRegistry {
     }
 
     /// Authenticates `presented` token using constant-time comparison on BLAKE3
-    /// hashes. Returns `Some(name)` for an enabled, matching token; `None` otherwise.
-    pub fn authenticate(&self, presented: &str) -> Option<String> {
+    /// hashes. Returns `Some((name, level))` for an enabled, matching token;
+    /// `None` otherwise.
+    pub fn authenticate(&self, presented: &str) -> Option<(String, AccessLevel)> {
         if presented.trim().is_empty() {
             return None;
         }
@@ -391,7 +430,7 @@ impl TokenRegistry {
             }
             let eq: bool = presented_hash.as_bytes().ct_eq(entry.token_hash.as_bytes()).into();
             if eq {
-                return Some(entry.name.clone());
+                return Some((entry.name.clone(), entry.level));
             }
         }
         None
@@ -403,6 +442,8 @@ impl TokenRegistry {
 pub struct AuthIdentity(
     /// The authenticated identity name.
     pub String,
+    /// The authenticated identity's access level.
+    pub AccessLevel,
 );
 
 // ─── Server state ─────────────────────────────────────────────────────────────
@@ -612,8 +653,8 @@ where
         .and_then(|value| value.strip_prefix("Bearer "));
 
     match token.and_then(|t| state.tokens.authenticate(t)) {
-        Some(identity) => {
-            request.extensions_mut().insert(AuthIdentity(identity));
+        Some((identity, level)) => {
+            request.extensions_mut().insert(AuthIdentity(identity, level));
             next.run(request).await
         }
         None => ServerError::Unauthorized.into_response(),
@@ -2326,6 +2367,111 @@ mod tests {
     }
 
     #[test]
+    fn token_entry_defaults_level_to_write() {
+        let tempdir = TempDir::new().unwrap();
+        let token_file = tempdir.path().join("tokens.json");
+        std::fs::write(
+            &token_file,
+            serde_json::to_string(&serde_json::json!([
+                {"token": "legacy-token", "name": "legacy", "enabled": true},
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        restrict_token_file(&token_file);
+
+        let registry = TokenRegistry::load(token_file).unwrap();
+        assert_eq!(
+            registry.authenticate("legacy-token"),
+            Some(("legacy".to_owned(), AccessLevel::Write)),
+            "tokens without an explicit level must default to write",
+        );
+    }
+
+    #[test]
+    fn token_entry_explicit_levels_are_preserved() {
+        let tempdir = TempDir::new().unwrap();
+        let token_file = tempdir.path().join("tokens.json");
+        std::fs::write(
+            &token_file,
+            serde_json::to_string(&serde_json::json!([
+                {"token": "read-token", "name": "reader", "enabled": true, "level": "read"},
+                {"token": "write-token", "name": "writer", "enabled": true, "level": "write"},
+                {"token": "admin-token", "name": "admin", "enabled": true, "level": "admin"},
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        restrict_token_file(&token_file);
+
+        let registry = TokenRegistry::load(token_file).unwrap();
+        assert_eq!(
+            registry.authenticate("read-token"),
+            Some(("reader".to_owned(), AccessLevel::Read)),
+        );
+        assert_eq!(
+            registry.authenticate("write-token"),
+            Some(("writer".to_owned(), AccessLevel::Write)),
+        );
+        assert_eq!(
+            registry.authenticate("admin-token"),
+            Some(("admin".to_owned(), AccessLevel::Admin)),
+        );
+    }
+
+    #[test]
+    fn token_registry_rejects_unknown_level() {
+        let tempdir = TempDir::new().unwrap();
+        let token_file = tempdir.path().join("tokens.json");
+        std::fs::write(
+            &token_file,
+            serde_json::to_string(&serde_json::json!([
+                {"token": "x", "name": "bad", "enabled": true, "level": "superadmin"},
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        restrict_token_file(&token_file);
+
+        let err = TokenRegistry::load(token_file).unwrap_err();
+        match err {
+            ServerError::TokenFile(msg) => {
+                assert!(
+                    msg.contains("superadmin"),
+                    "expected unknown-level detail in error: {msg}"
+                );
+            }
+            other => panic!("expected TokenFile error, got {other}"),
+        }
+    }
+
+    #[test]
+    fn access_level_serde_uses_lowercase() {
+        assert_eq!(serde_json::to_value(AccessLevel::Read).unwrap(), "read");
+        assert_eq!(serde_json::to_value(AccessLevel::Write).unwrap(), "write");
+        assert_eq!(serde_json::to_value(AccessLevel::Admin).unwrap(), "admin");
+        assert_eq!(
+            serde_json::from_value::<AccessLevel>(json!("read")).unwrap(),
+            AccessLevel::Read
+        );
+        assert_eq!(
+            serde_json::from_value::<AccessLevel>(json!("write")).unwrap(),
+            AccessLevel::Write
+        );
+        assert_eq!(
+            serde_json::from_value::<AccessLevel>(json!("admin")).unwrap(),
+            AccessLevel::Admin
+        );
+    }
+
+    #[test]
+    fn access_level_orders_read_before_write_before_admin() {
+        assert!(AccessLevel::Read < AccessLevel::Write);
+        assert!(AccessLevel::Write < AccessLevel::Admin);
+        assert!(AccessLevel::Read < AccessLevel::Admin);
+    }
+
+    #[test]
     fn token_reload_parse_error_fails_closed() {
         let tempdir = TempDir::new().unwrap();
         let token_file = tempdir.path().join("tokens.json");
@@ -2339,7 +2485,10 @@ mod tests {
         .unwrap();
         restrict_token_file(&token_file);
         let registry = TokenRegistry::load(token_file.clone()).unwrap();
-        assert_eq!(registry.authenticate(ALICE_TOKEN).as_deref(), Some("alice"));
+        assert_eq!(
+            registry.authenticate(ALICE_TOKEN),
+            Some(("alice".to_owned(), AccessLevel::Write))
+        );
         assert_eq!(registry.authenticate(""), None);
 
         std::thread::sleep(std::time::Duration::from_millis(1100));
@@ -2361,7 +2510,10 @@ mod tests {
         .unwrap();
         restrict_token_file(&token_file);
         let registry = TokenRegistry::load(token_file.clone()).unwrap();
-        assert_eq!(registry.authenticate(ALICE_TOKEN).as_deref(), Some("alice"));
+        assert_eq!(
+            registry.authenticate(ALICE_TOKEN),
+            Some(("alice".to_owned(), AccessLevel::Write))
+        );
 
         std::thread::sleep(std::time::Duration::from_millis(1100));
         std::fs::remove_file(&token_file).unwrap();
@@ -2384,7 +2536,10 @@ mod tests {
         )
         .unwrap();
         restrict_token_file(&token_file);
-        assert_eq!(registry.authenticate(ALICE_TOKEN).as_deref(), Some("alice"));
+        assert_eq!(
+            registry.authenticate(ALICE_TOKEN),
+            Some(("alice".to_owned(), AccessLevel::Write))
+        );
     }
 
     // ─── 3. Add + search + get ────────────────────────────────────────────────

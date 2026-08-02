@@ -76,6 +76,8 @@ Authentication is bearer-token based. The token file is a JSON array of entries:
 - `token` — the bearer secret a client must present.
 - `name` — the identity recorded as `added_by` on writes from that token.
 - `enabled` — `false` treats the entry as if it did not exist (instant revoke).
+- `level` — optional access level: `read`, `write`, or `admin`. Defaults to
+  `write` when omitted (backward compatible). Unknown values fail server start.
 
 Tokens are hashed in memory; the raw secret is not retained after load. The file
 is hot-reloaded — editing it (e.g. flipping `enabled`) takes effect on the next

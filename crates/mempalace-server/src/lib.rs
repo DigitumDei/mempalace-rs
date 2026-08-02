@@ -683,6 +683,14 @@ fn resolve_on_behalf_of(headers: &axum::http::HeaderMap) -> Result<Option<String
 /// contain `:` (the principal composition separator), or contain control or
 /// newline characters (the value lands in stored rows and logs).
 fn validate_on_behalf_of_value(raw: &str) -> Result<Option<String>, String> {
+    // Reject control and newline characters on the raw value before trimming:
+    // a tab or newline at the edges would otherwise be stripped and silently
+    // accepted. HTTP permits tabs inside header values, so this is reachable.
+    if raw.chars().any(char::is_control) {
+        return Err(
+            "X-MemPalace-On-Behalf-Of must not contain control or newline characters".to_owned(),
+        );
+    }
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err("X-MemPalace-On-Behalf-Of must not be empty after trimming".to_owned());
@@ -694,11 +702,6 @@ fn validate_on_behalf_of_value(raw: &str) -> Result<Option<String>, String> {
     }
     if trimmed.contains(':') {
         return Err("X-MemPalace-On-Behalf-Of must not contain ':'".to_owned());
-    }
-    if trimmed.chars().any(char::is_control) {
-        return Err(
-            "X-MemPalace-On-Behalf-Of must not contain control or newline characters".to_owned(),
-        );
     }
     Ok(Some(trimmed.to_owned()))
 }
@@ -4154,10 +4157,22 @@ mod tests {
 
     #[test]
     fn validate_on_behalf_of_rejects_control_and_newline() {
-        // Control characters and newlines cannot be carried in an http
-        // `HeaderValue` (the transport rejects them at construction), but the
-        // validator must reject them defensively if they ever arrive.
-        for value in ["dion\u{1}corp", "dion\rcorp", "dion\ncorp", "dion\tcorp"] {
+        // The `http` `HeaderValue` transport rejects most control characters
+        // and newlines at construction, but it permits tabs — so the validator
+        // must reject them all defensively, including edge tabs and newlines
+        // that `trim()` would otherwise silently strip away.
+        for value in [
+            "dion\u{1}corp",
+            "dion\rcorp",
+            "dion\ncorp",
+            "dion\tcorp",
+            "\tdion@corp.com",
+            "dion@corp.com\t",
+            "\ndion@corp.com",
+            "dion@corp.com\n",
+            "\rdion@corp.com",
+            "dion@corp.com\r",
+        ] {
             assert!(
                 validate_on_behalf_of_value(value).is_err(),
                 "value `{value:?}` must be rejected",
@@ -4238,6 +4253,29 @@ mod tests {
                 "/v1/drawers/search",
                 ALICE_TOKEN,
                 Some("dion:corp"),
+                json!({"query": "delegation", "limit": 5}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(resp).await;
+        assert_eq!(body["code"], "invalid_params");
+    }
+
+    #[tokio::test]
+    async fn on_behalf_of_header_rejects_edge_tab() {
+        let harness = make_harness().await;
+        // HTTP permits tabs inside header values, so a trailing tab survives
+        // `HeaderValue` construction and must be rejected rather than silently
+        // trimmed away.
+        let resp = harness
+            .router
+            .clone()
+            .oneshot(delegated_json_request(
+                Method::POST,
+                "/v1/drawers/search",
+                ALICE_TOKEN,
+                Some("dion@corp.com\t"),
                 json!({"query": "delegation", "limit": 5}),
             ))
             .await

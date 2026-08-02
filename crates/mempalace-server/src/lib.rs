@@ -2348,6 +2348,7 @@ mod tests {
     const BAD_TOKEN: &str = "bad-token-xyz";
     const READ_TOKEN: &str = "reader-secret-token";
     const ADMIN_TOKEN: &str = "admin-secret-token";
+    const LEGACY_TOKEN: &str = "legacy-secret-token";
 
     fn restrict_token_file(path: &std::path::Path) {
         #[cfg(unix)]
@@ -2396,6 +2397,7 @@ mod tests {
                 {"token": BOB_TOKEN, "name": "bob", "enabled": false},
                 {"token": READ_TOKEN, "name": "reader", "enabled": true, "level": "read"},
                 {"token": ADMIN_TOKEN, "name": "admin", "enabled": true, "level": "admin"},
+                {"token": LEGACY_TOKEN, "name": "legacy", "enabled": true},
             ]))
             .unwrap(),
         )
@@ -3098,6 +3100,7 @@ mod tests {
                 {"token": BOB_TOKEN, "name": "bob", "enabled": false},
                 {"token": READ_TOKEN, "name": "reader", "enabled": true, "level": "read"},
                 {"token": ADMIN_TOKEN, "name": "admin", "enabled": true, "level": "admin"},
+                {"token": LEGACY_TOKEN, "name": "legacy", "enabled": true},
             ]))
             .unwrap(),
         )
@@ -4943,6 +4946,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn legacy_token_without_level_can_write_and_delete() {
+        let harness = make_harness().await;
+
+        let add_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/drawers",
+                LEGACY_TOKEN,
+                json!({
+                    "wing": "wing_code",
+                    "room": "legacy-write",
+                    "content": "written by a token entry without a level field",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(add_resp.status(), StatusCode::OK);
+        let add_body = body_json(add_resp).await;
+        assert_eq!(add_body["success"], true);
+        let drawer_id = add_body["drawer_id"].as_str().unwrap().to_owned();
+
+        let del_req = Request::builder()
+            .method(Method::DELETE)
+            .uri(format!("/v1/drawers/{drawer_id}"))
+            .header(header::AUTHORIZATION, format!("Bearer {LEGACY_TOKEN}"))
+            .body(Body::empty())
+            .unwrap();
+        let del_resp = harness.router.clone().oneshot(del_req).await.unwrap();
+        assert_eq!(del_resp.status(), StatusCode::OK);
+        let del_body = body_json(del_resp).await;
+        assert_eq!(del_body["success"], true);
     }
 
     // ─── 14. Whoami and identity in info ─────────────────────────────────────

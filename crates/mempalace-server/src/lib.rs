@@ -695,7 +695,7 @@ fn validate_on_behalf_of_value(raw: &str) -> Result<Option<String>, String> {
     if trimmed.is_empty() {
         return Err("X-MemPalace-On-Behalf-Of must not be empty after trimming".to_owned());
     }
-    if trimmed.len() > MAX_ON_BEHALF_OF_BYTES {
+    if raw.len() > MAX_ON_BEHALF_OF_BYTES {
         return Err(format!(
             "X-MemPalace-On-Behalf-Of must be at most {MAX_ON_BEHALF_OF_BYTES} bytes"
         ));
@@ -4194,6 +4194,11 @@ mod tests {
             "values over 128 bytes must be rejected",
         );
         assert!(validate_on_behalf_of_value("dion:corp").is_err(), "colons must be rejected");
+        // A raw value exceeding 128 bytes after trimming whitespace is rejected.
+        assert!(
+            validate_on_behalf_of_value(&format!(" {} ", "a".repeat(128))).is_err(),
+            "raw value over 128 bytes padded with whitespace must be rejected",
+        );
         // 128 bytes is the boundary and passes.
         assert_eq!(
             validate_on_behalf_of_value(&"a".repeat(128)).unwrap(),
@@ -4233,6 +4238,29 @@ mod tests {
                 "/v1/drawers/search",
                 ALICE_TOKEN,
                 Some(too_long.as_str()),
+                json!({"query": "delegation", "limit": 5}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(resp).await;
+        assert_eq!(body["code"], "invalid_params");
+    }
+
+    #[tokio::test]
+    async fn on_behalf_of_header_rejects_whitespace_padded_too_long() {
+        let harness = make_harness().await;
+        // 128 content bytes + 1 leading space = 129 raw bytes, which exceeds the
+        // 128-byte limit even though the trimmed value is exactly 128 bytes.
+        let padded = format!(" {}", "a".repeat(128));
+        let resp = harness
+            .router
+            .clone()
+            .oneshot(delegated_json_request(
+                Method::POST,
+                "/v1/drawers/search",
+                ALICE_TOKEN,
+                Some(padded.as_str()),
                 json!({"query": "delegation", "limit": 5}),
             ))
             .await

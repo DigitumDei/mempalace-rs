@@ -49,6 +49,7 @@ use mempalace_federation::{
     ListDrawersResponse, MaintenanceAbortReason as FedMaintenanceAbortReason,
     MaintenanceRunStatus as FedMaintenanceRunStatus,
     MaintenanceSkipReason as FedMaintenanceSkipReason, MaintenanceStatus, RemoteDrawerResult,
+    WhoamiResponse,
 };
 use mempalace_graph::{AddFactRequest, EntityKind, KnowledgeGraphRuntime, QueryDirection};
 use mempalace_search::{SearchRuntime, SearchRuntimePolicy};
@@ -649,6 +650,7 @@ where
 
     let protected_read = Router::new()
         .route("/v1/info", get(route_info::<P>))
+        .route("/v1/whoami", get(route_whoami))
         .route("/v1/drawers/search", post(route_drawers_search::<P>))
         .route("/v1/drawers/check_duplicate", post(route_drawers_check_duplicate::<P>))
         .route("/v1/drawers", get(route_drawers_list::<P>))
@@ -852,6 +854,7 @@ fn summary_to_status(summary: &MaintenanceRunSummary) -> MaintenanceStatus {
 
 async fn route_info<P>(
     State(state): State<Arc<ServerState<P>>>,
+    auth: axum::extract::Extension<AuthIdentity>,
 ) -> Result<impl IntoResponse, ServerError>
 where
     P: EmbeddingProvider + Send + Sync + 'static,
@@ -864,6 +867,10 @@ where
         .and_then(|s| serde_json::to_value(s).ok());
 
     let status = state.maintenance_status.lock().unwrap().clone();
+
+    let level = serde_json::to_value(&auth.level)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned));
 
     Ok(Json(InfoResponse {
         server_version: BUILD_VERSION.to_owned(),
@@ -881,7 +888,29 @@ where
         maintenance_idle_secs: state.config.maintenance.idle_secs as u64,
         maintenance_last_run: last_run,
         maintenance_status: status,
+        authenticated_token: Some(auth.token_name.clone()),
+        authenticated_level: level,
+        on_behalf_of: auth.on_behalf_of.clone(),
+        composed_identity: Some(auth.principal()),
     }))
+}
+
+// ─── Whoami ───────────────────────────────────────────────────────────────────
+
+async fn route_whoami(
+    auth: axum::extract::Extension<AuthIdentity>,
+) -> impl IntoResponse {
+    let level = serde_json::to_value(&auth.level)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "unknown".to_owned());
+
+    Json(WhoamiResponse {
+        token_name: auth.token_name.clone(),
+        on_behalf_of: auth.on_behalf_of.clone(),
+        composed_identity: auth.principal(),
+        level,
+    })
 }
 
 // ─── Drawers: search ─────────────────────────────────────────────────────────
@@ -4901,5 +4930,133 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // ─── 14. Whoami and identity in info ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn whoami_returns_identity_for_authenticated_token() {
+        let harness = make_harness().await;
+        let resp = harness.router.oneshot(authed_get("/v1/whoami", ALICE_TOKEN)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["token_name"], "alice");
+        assert_eq!(body["on_behalf_of"], serde_json::Value::Null);
+        assert_eq!(body["composed_identity"], "alice");
+        assert_eq!(body["level"], "write");
+    }
+
+    #[tokio::test]
+    async fn whoami_returns_delegated_identity() {
+        let harness = make_harness().await;
+        let resp = harness
+            .router
+            .clone()
+            .oneshot(delegated_json_request(
+                Method::GET,
+                "/v1/whoami",
+                ALICE_TOKEN,
+                Some("dion@corp.com"),
+                json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["token_name"], "alice");
+        assert_eq!(body["on_behalf_of"], "dion@corp.com");
+        assert_eq!(body["composed_identity"], "alice:dion@corp.com");
+        assert_eq!(body["level"], "write");
+    }
+
+    #[tokio::test]
+    async fn whoami_returns_admin_level() {
+        let harness = make_harness().await;
+        let resp = harness.router.oneshot(authed_get("/v1/whoami", ADMIN_TOKEN)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["token_name"], "admin");
+        assert_eq!(body["level"], "admin");
+    }
+
+    #[tokio::test]
+    async fn whoami_returns_read_level() {
+        let harness = make_harness().await;
+        let resp = harness.router.oneshot(authed_get("/v1/whoami", READ_TOKEN)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["token_name"], "reader");
+        assert_eq!(body["level"], "read");
+    }
+
+    #[tokio::test]
+    async fn whoami_without_token_returns_401() {
+        let harness = make_harness().await;
+        let request =
+            Request::builder().method(Method::GET).uri("/v1/whoami").body(Body::empty()).unwrap();
+        let resp = harness.router.oneshot(request).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn whoami_with_bad_token_returns_401() {
+        let harness = make_harness().await;
+        let resp = harness.router.oneshot(authed_get("/v1/whoami", BAD_TOKEN)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn info_returns_authenticated_identity() {
+        let harness = make_harness().await;
+        let resp = harness.router.oneshot(authed_get("/v1/info", ALICE_TOKEN)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["authenticated_token"], "alice");
+        assert_eq!(body["authenticated_level"], "write");
+        assert_eq!(body["on_behalf_of"], serde_json::Value::Null);
+        assert_eq!(body["composed_identity"], "alice");
+    }
+
+    #[tokio::test]
+    async fn info_returns_delegated_identity() {
+        let harness = make_harness().await;
+        let resp = harness
+            .router
+            .clone()
+            .oneshot(delegated_json_request(
+                Method::GET,
+                "/v1/info",
+                ALICE_TOKEN,
+                Some("dion@corp.com"),
+                json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["authenticated_token"], "alice");
+        assert_eq!(body["authenticated_level"], "write");
+        assert_eq!(body["on_behalf_of"], "dion@corp.com");
+        assert_eq!(body["composed_identity"], "alice:dion@corp.com");
+    }
+
+    #[tokio::test]
+    async fn info_returns_admin_level() {
+        let harness = make_harness().await;
+        let resp = harness.router.oneshot(authed_get("/v1/info", ADMIN_TOKEN)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["authenticated_token"], "admin");
+        assert_eq!(body["authenticated_level"], "admin");
+    }
+
+    #[tokio::test]
+    async fn info_returns_read_level() {
+        let harness = make_harness().await;
+        let resp = harness.router.oneshot(authed_get("/v1/info", READ_TOKEN)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["authenticated_token"], "reader");
+        assert_eq!(body["authenticated_level"], "read");
     }
 }

@@ -42,6 +42,18 @@ pub struct InfoResponse {
     /// `null` of `maintenance_last_run` with explicit states.
     #[serde(default)]
     pub maintenance_status: MaintenanceStatus,
+    /// The authenticated token's name, if the caller authenticated.
+    #[serde(default)]
+    pub authenticated_token: Option<String>,
+    /// The authenticated token's access level, if the caller authenticated.
+    #[serde(default)]
+    pub authenticated_level: Option<String>,
+    /// The delegated principal, if the caller provided a delegation header.
+    #[serde(default)]
+    pub on_behalf_of: Option<String>,
+    /// The composed identity: `token_name` or `token_name:on_behalf_of`.
+    #[serde(default)]
+    pub composed_identity: Option<String>,
 }
 
 // ─── Maintenance status ────────────────────────────────────────────────────────
@@ -467,6 +479,22 @@ pub struct ErrorBody {
     pub message: String,
 }
 
+// ─── Whoami ──────────────────────────────────────────────────────────────────
+
+/// Response body for `GET /v1/whoami`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WhoamiResponse {
+    /// The authenticated token's name.
+    pub token_name: String,
+    /// The delegated principal, if any.
+    #[serde(default)]
+    pub on_behalf_of: Option<String>,
+    /// The composed identity: `token_name` or `token_name:on_behalf_of`.
+    pub composed_identity: String,
+    /// The authenticated token's access level.
+    pub level: String,
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -488,6 +516,10 @@ mod tests {
             maintenance_idle_secs: 300,
             maintenance_last_run: None,
             maintenance_status: MaintenanceStatus::Idle,
+            authenticated_token: None,
+            authenticated_level: None,
+            on_behalf_of: None,
+            composed_identity: None,
         };
         let json = serde_json::to_string(&original).unwrap();
         let decoded: InfoResponse = serde_json::from_str(&json).unwrap();
@@ -821,5 +853,67 @@ mod tests {
         assert_eq!(resp.files[0].drawers_written, 0);
         assert!(resp.files[0].error.is_none());
         assert!(resp.warnings.is_empty());
+    }
+
+    #[test]
+    fn whoami_response_round_trips() {
+        let plain = WhoamiResponse {
+            token_name: "alice".to_owned(),
+            on_behalf_of: None,
+            composed_identity: "alice".to_owned(),
+            level: "write".to_owned(),
+        };
+        let json = serde_json::to_string(&plain).unwrap();
+        let decoded: WhoamiResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(plain, decoded);
+        assert!(json.contains(r#""token_name":"alice""#));
+        assert!(json.contains(r#""composed_identity":"alice""#));
+        assert!(json.contains(r#""level":"write""#));
+
+        let delegated = WhoamiResponse {
+            token_name: "alice".to_owned(),
+            on_behalf_of: Some("dion@corp.com".to_owned()),
+            composed_identity: "alice:dion@corp.com".to_owned(),
+            level: "admin".to_owned(),
+        };
+        let json = serde_json::to_string(&delegated).unwrap();
+        let decoded: WhoamiResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(delegated, decoded);
+        assert!(json.contains(r#""on_behalf_of":"dion@corp.com""#));
+    }
+
+    #[test]
+    fn info_response_with_identity_round_trips() {
+        let original = InfoResponse {
+            server_version: "2.0.0".to_owned(),
+            federation_api_version: FEDERATION_API_VERSION,
+            embedding_profile: "balanced".to_owned(),
+            capabilities: vec!["drawers".to_owned(), "kg".to_owned()],
+            maintenance_enabled: true,
+            maintenance_background_enabled: true,
+            maintenance_idle_secs: 300,
+            maintenance_last_run: None,
+            maintenance_status: MaintenanceStatus::Idle,
+            authenticated_token: Some("alice".to_owned()),
+            authenticated_level: Some("write".to_owned()),
+            on_behalf_of: Some("dion@corp.com".to_owned()),
+            composed_identity: Some("alice:dion@corp.com".to_owned()),
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let decoded: InfoResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(original, decoded);
+        assert!(json.contains(r#""authenticated_token":"alice""#));
+        assert!(json.contains(r#""composed_identity":"alice:dion@corp.com""#));
+    }
+
+    #[test]
+    fn info_response_without_identity_backward_compatible() {
+        // Legacy JSON without identity fields must deserialize with defaults.
+        let raw = r#"{"server_version":"1.0","federation_api_version":1}"#;
+        let info: InfoResponse = serde_json::from_str(raw).unwrap();
+        assert!(info.authenticated_token.is_none());
+        assert!(info.authenticated_level.is_none());
+        assert!(info.on_behalf_of.is_none());
+        assert!(info.composed_identity.is_none());
     }
 }

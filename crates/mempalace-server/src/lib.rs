@@ -100,6 +100,9 @@ pub enum ServerError {
     /// Bearer token was missing, unrecognised, or disabled.
     #[error("unauthorized")]
     Unauthorized,
+    /// The authenticated token's access level does not permit the operation.
+    #[error("forbidden")]
+    Forbidden,
     /// The requested resource was not found.
     #[error("not found: {0}")]
     NotFound(String),
@@ -167,6 +170,11 @@ impl IntoResponse for ServerError {
             Self::Unauthorized => {
                 (StatusCode::UNAUTHORIZED, "unauthorized", "missing or invalid token".to_owned())
             }
+            Self::Forbidden => (
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "token does not have write access".to_owned(),
+            ),
             Self::NotFound(msg) => (StatusCode::NOT_FOUND, "not_found", msg.clone()),
             Self::DiaryNotFederated => (
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -623,25 +631,29 @@ where
 
     // Authenticated routes — wrapped with the auth middleware.
     //
+    // Routes are split into a read group and a write group. The auth middleware
+    // stays outermost on both, and the write group additionally enforces that
+    // the token's access level is `write` or higher via `require_write`. Read
+    // tokens (and above) can reach every route in the read group, including
+    // `POST /v1/drawers/check_duplicate`.
+    //
     // The ingest/batch route gets a 16 MiB body limit (vs axum's 2 MiB default)
     // and is merged in as a separate sub-router so the limit is scoped to it
-    // only; all other routes keep the default.
+    // only; all other routes keep the default. It is a write route, so it also
+    // carries `require_write`.
     let ingest_route = Router::new()
         .route("/v1/ingest/batch", post(route_ingest_batch::<P>))
         .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
+        .layer(middleware::from_fn(require_write))
         .layer(middleware::from_fn_with_state(Arc::clone(&state), auth_middleware::<P>));
 
-    let protected = Router::new()
+    let protected_read = Router::new()
         .route("/v1/info", get(route_info::<P>))
         .route("/v1/drawers/search", post(route_drawers_search::<P>))
         .route("/v1/drawers/check_duplicate", post(route_drawers_check_duplicate::<P>))
-        .route("/v1/drawers", post(route_drawers_add::<P>))
         .route("/v1/drawers", get(route_drawers_list::<P>))
         .route("/v1/drawers/{id}", get(route_drawers_get::<P>))
-        .route("/v1/drawers/{id}", delete(route_drawers_delete::<P>))
         .route("/v1/kg/query", post(route_kg_query::<P>))
-        .route("/v1/kg/facts", post(route_kg_add::<P>))
-        .route("/v1/kg/facts/invalidate", post(route_kg_invalidate::<P>))
         .route("/v1/kg/timeline", get(route_kg_timeline::<P>))
         .route("/v1/kg/stats", get(route_kg_stats::<P>))
         .route("/v1/taxonomy", get(route_taxonomy::<P>))
@@ -650,7 +662,19 @@ where
         .route("/v1/changes", get(route_changes::<P>))
         .layer(middleware::from_fn_with_state(Arc::clone(&state), auth_middleware::<P>));
 
-    let router = public.merge(protected).merge(ingest_route).with_state(Arc::clone(&state));
+    let protected_write = Router::new()
+        .route("/v1/drawers", post(route_drawers_add::<P>))
+        .route("/v1/drawers/{id}", delete(route_drawers_delete::<P>))
+        .route("/v1/kg/facts", post(route_kg_add::<P>))
+        .route("/v1/kg/facts/invalidate", post(route_kg_invalidate::<P>))
+        .layer(middleware::from_fn(require_write))
+        .layer(middleware::from_fn_with_state(Arc::clone(&state), auth_middleware::<P>));
+
+    let router = public
+        .merge(protected_read)
+        .merge(protected_write)
+        .merge(ingest_route)
+        .with_state(Arc::clone(&state));
     Ok((router, state))
 }
 
@@ -734,6 +758,19 @@ where
             next.run(request).await
         }
         None => ServerError::Unauthorized.into_response(),
+    }
+}
+
+/// Middleware enforcing write-level access on write routes.
+///
+/// Runs inside the auth middleware, so the [`AuthIdentity`] extension is always
+/// present when a request reaches it. Rejects requests whose token level is
+/// below `write` with `403 forbidden`; `admin` is treated as write for the
+/// current route set.
+async fn require_write(request: Request<Body>, next: Next) -> Response {
+    match request.extensions().get::<AuthIdentity>() {
+        Some(identity) if identity.level >= AccessLevel::Write => next.run(request).await,
+        _ => ServerError::Forbidden.into_response(),
     }
 }
 
@@ -2279,6 +2316,8 @@ mod tests {
     const ALICE_TOKEN: &str = "alice-secret-token";
     const BOB_TOKEN: &str = "bob-secret-token";
     const BAD_TOKEN: &str = "bad-token-xyz";
+    const READ_TOKEN: &str = "reader-secret-token";
+    const ADMIN_TOKEN: &str = "admin-secret-token";
 
     fn restrict_token_file(path: &std::path::Path) {
         #[cfg(unix)]
@@ -2325,6 +2364,8 @@ mod tests {
             serde_json::to_string(&serde_json::json!([
                 {"token": ALICE_TOKEN, "name": "alice", "enabled": true},
                 {"token": BOB_TOKEN, "name": "bob", "enabled": false},
+                {"token": READ_TOKEN, "name": "reader", "enabled": true, "level": "read"},
+                {"token": ADMIN_TOKEN, "name": "admin", "enabled": true, "level": "admin"},
             ]))
             .unwrap(),
         )
@@ -3025,6 +3066,8 @@ mod tests {
             serde_json::to_string(&serde_json::json!([
                 {"token": ALICE_TOKEN, "name": "alice", "enabled": true},
                 {"token": BOB_TOKEN, "name": "bob", "enabled": false},
+                {"token": READ_TOKEN, "name": "reader", "enabled": true, "level": "read"},
+                {"token": ADMIN_TOKEN, "name": "admin", "enabled": true, "level": "admin"},
             ]))
             .unwrap(),
         )
@@ -3913,6 +3956,8 @@ mod tests {
             &token_file,
             serde_json::to_string(&serde_json::json!([
                 {"token": ALICE_TOKEN, "name": "alice", "enabled": true},
+                {"token": READ_TOKEN, "name": "reader", "enabled": true, "level": "read"},
+                {"token": ADMIN_TOKEN, "name": "admin", "enabled": true, "level": "admin"},
             ]))
             .unwrap(),
         )
@@ -4581,5 +4626,280 @@ mod tests {
         let drawers = list_body["drawers"].as_array().unwrap();
         assert_eq!(drawers.len(), 1);
         assert_eq!(drawers[0]["added_by"], "alice:miner");
+    }
+
+    // ─── 13. Write-route authorization ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn read_token_can_access_read_routes() {
+        let harness = make_harness().await;
+
+        // info
+        let info = harness.router.clone().oneshot(authed_get("/v1/info", READ_TOKEN)).await.unwrap();
+        assert_eq!(info.status(), StatusCode::OK);
+
+        // search
+        let search = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/drawers/search",
+                READ_TOKEN,
+                json!({"query": "read token search", "limit": 5}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(search.status(), StatusCode::OK);
+
+        // check_duplicate stays available to read tokens
+        let check = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/drawers/check_duplicate",
+                READ_TOKEN,
+                json!({"content": "some content to check for duplicates"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(check.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn read_token_can_read_kg_list_and_changes() {
+        let harness = make_harness().await;
+
+        let kg = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/kg/query",
+                READ_TOKEN,
+                json!({"entity": "Alice", "direction": "both"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(kg.status(), StatusCode::OK);
+
+        let list =
+            harness.router.clone().oneshot(authed_get("/v1/drawers", READ_TOKEN)).await.unwrap();
+        assert_eq!(list.status(), StatusCode::OK);
+
+        let changes =
+            harness.router.clone().oneshot(authed_get("/v1/changes", READ_TOKEN)).await.unwrap();
+        assert_eq!(changes.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn read_token_rejected_on_drawer_add_with_403() {
+        let harness = make_harness().await;
+        let resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/drawers",
+                READ_TOKEN,
+                json!({
+                    "wing": "wing_code",
+                    "room": "forbidden-add",
+                    "content": "read token must not add drawers",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = body_json(resp).await;
+        assert_eq!(body["code"], "forbidden");
+    }
+
+    #[tokio::test]
+    async fn read_token_rejected_on_drawer_delete_with_403() {
+        let harness = make_harness().await;
+
+        // Add a drawer with a write token first.
+        let add_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/drawers",
+                ALICE_TOKEN,
+                json!({
+                    "wing": "wing_code",
+                    "room": "forbidden-delete",
+                    "content": "drawer a read token must not delete",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(add_resp.status(), StatusCode::OK);
+        let add_body = body_json(add_resp).await;
+        let drawer_id = add_body["drawer_id"].as_str().unwrap().to_owned();
+
+        // Read-token DELETE → 403
+        let del_req = Request::builder()
+            .method(Method::DELETE)
+            .uri(format!("/v1/drawers/{drawer_id}"))
+            .header(header::AUTHORIZATION, format!("Bearer {READ_TOKEN}"))
+            .body(Body::empty())
+            .unwrap();
+        let del_resp = harness.router.clone().oneshot(del_req).await.unwrap();
+        assert_eq!(del_resp.status(), StatusCode::FORBIDDEN);
+        let body = body_json(del_resp).await;
+        assert_eq!(body["code"], "forbidden");
+
+        // The drawer must still exist — the forbidden delete wrote nothing.
+        let get_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_get(&format!("/v1/drawers/{drawer_id}"), ALICE_TOKEN))
+            .await
+            .unwrap();
+        assert_eq!(get_resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn read_token_rejected_on_kg_add_with_403() {
+        let harness = make_harness().await;
+        let resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/kg/facts",
+                READ_TOKEN,
+                json!({
+                    "subject": "Alice",
+                    "predicate": "works_on",
+                    "object": "MemPalace",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = body_json(resp).await;
+        assert_eq!(body["code"], "forbidden");
+    }
+
+    #[tokio::test]
+    async fn read_token_rejected_on_kg_invalidate_with_403() {
+        let harness = make_harness().await;
+        let resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/kg/facts/invalidate",
+                READ_TOKEN,
+                json!({
+                    "subject": "Alice",
+                    "predicate": "works_on",
+                    "object": "MemPalace",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = body_json(resp).await;
+        assert_eq!(body["code"], "forbidden");
+    }
+
+    #[tokio::test]
+    async fn read_token_rejected_on_ingest_with_403() {
+        let harness = make_harness().await;
+        let resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/ingest/batch",
+                READ_TOKEN,
+                json!({
+                    "wing": "wing_project",
+                    "repo_id": "github.com/acme/repo",
+                    "files": [
+                        {
+                            "relative_path": "src/lib.rs",
+                            "content_hash": "ch",
+                            "chunks": [
+                                {"chunk_index": 0, "room": "backend", "text": "some text"}
+                            ]
+                        }
+                    ]
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = body_json(resp).await;
+        assert_eq!(body["code"], "forbidden");
+    }
+
+    #[tokio::test]
+    async fn admin_token_can_write() {
+        let harness = make_harness().await;
+
+        let add_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/drawers",
+                ADMIN_TOKEN,
+                json!({
+                    "wing": "wing_code",
+                    "room": "admin-write",
+                    "content": "admin token can add drawers",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(add_resp.status(), StatusCode::OK);
+        let add_body = body_json(add_resp).await;
+        assert_eq!(add_body["success"], true);
+
+        let kg_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/kg/facts",
+                ADMIN_TOKEN,
+                json!({
+                    "subject": "Bob",
+                    "predicate": "maintains",
+                    "object": "Palace",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(kg_resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn invalid_token_on_write_route_stays_401() {
+        // Auth is outermost, so a bad token is rejected as 401 before the
+        // write-level check can see it — never 403.
+        let harness = make_harness().await;
+        let resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/drawers",
+                BAD_TOKEN,
+                json!({
+                    "wing": "wing_code",
+                    "room": "bad-token",
+                    "content": "should be rejected as unauthorized",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 }

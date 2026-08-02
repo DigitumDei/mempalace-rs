@@ -122,6 +122,10 @@ Operational notes:
   `name`, and `enabled` keys and an optional `level` key (`read`, `write`, or
   `admin`; default `write`). It is hot-reloaded, so revoking a token (set
   `enabled: false`) takes effect on the next request without a restart.
+- Access levels gate the API: `read` tokens may call read routes only and get
+  `403 forbidden` on write routes (drawer add/delete, KG add/invalidate, ingest);
+  `write` and `admin` may call everything. There is no per-user or per-wing
+  policy — the level is a whole-token gate.
 - The server speaks **plain HTTP**. On any untrusted network, run it behind a
   TLS-terminating reverse proxy; never expose raw bearer tokens over the wire.
 - `GET /v1/health` is unauthenticated and suitable as a liveness probe; all other

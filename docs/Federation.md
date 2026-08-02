@@ -79,6 +79,13 @@ Authentication is bearer-token based. The token file is a JSON array of entries:
 - `level` — optional access level: `read`, `write`, or `admin`. Defaults to
   `write` when omitted (backward compatible). Unknown values fail server start.
 
+Access is enforced per route. A `read` token can call every read route
+(including `POST /v1/drawers/check_duplicate`) but is rejected with `403
+forbidden` on write routes — drawer add/delete, KG fact add/invalidate, and
+`POST /v1/ingest/batch`. `write` (the default) and `admin` are equivalent for
+the current route set; the level is a whole-token gate, not a per-user or
+per-wing policy.
+
 Tokens are hashed in memory; the raw secret is not retained after load. The file
 is hot-reloaded — editing it (e.g. flipping `enabled`) takes effect on the next
 request without restarting the server. The default path is
@@ -163,26 +170,30 @@ On start it prints the palace path, bind address, and token file, then logs
 All routes are under `/v1`. `GET /v1/health` is unauthenticated; everything else
 requires `Authorization: Bearer <token>`.
 
-| Method & path | Purpose |
-|---|---|
-| `GET /v1/health` | Liveness probe (no auth) |
-| `GET /v1/info` | Server version, `federation_api_version`, embedding profile, capabilities, and maintenance configuration/state |
-| `POST /v1/drawers/search` | Semantic search (server embeds the query text) |
-| `POST /v1/drawers/check_duplicate` | Near-duplicate check |
-| `POST /v1/drawers` | Add a drawer |
-| `GET /v1/drawers` | List drawers (paginated) |
-| `GET /v1/drawers/{id}` | Get one drawer |
-| `DELETE /v1/drawers/{id}` | Delete a drawer |
-| `POST /v1/kg/query` | Knowledge-graph query |
-| `POST /v1/kg/facts` | Add a KG fact |
-| `POST /v1/kg/facts/invalidate` | Invalidate a KG fact |
-| `GET /v1/kg/timeline` | KG timeline |
-| `GET /v1/kg/stats` | KG statistics |
-| `GET /v1/taxonomy` | Wing/room taxonomy |
-| `GET /v1/wings` | List wings |
-| `GET /v1/rooms` | List rooms |
-| `GET /v1/changes` | Change-event feed (cursor-paginated) |
-| `POST /v1/ingest/batch` | Bulk mined-chunk ingest (16 MiB body limit) |
+| Method & path | Access | Purpose |
+|---|---|---|
+| `GET /v1/health` | none | Liveness probe (no auth) |
+| `GET /v1/info` | read | Server version, `federation_api_version`, embedding profile, capabilities, and maintenance configuration/state |
+| `POST /v1/drawers/search` | read | Semantic search (server embeds the query text) |
+| `POST /v1/drawers/check_duplicate` | read | Near-duplicate check |
+| `POST /v1/drawers` | write | Add a drawer |
+| `GET /v1/drawers` | read | List drawers (paginated) |
+| `GET /v1/drawers/{id}` | read | Get one drawer |
+| `DELETE /v1/drawers/{id}` | write | Delete a drawer |
+| `POST /v1/kg/query` | read | Knowledge-graph query |
+| `POST /v1/kg/facts` | write | Add a KG fact |
+| `POST /v1/kg/facts/invalidate` | write | Invalidate a KG fact |
+| `GET /v1/kg/timeline` | read | KG timeline |
+| `GET /v1/kg/stats` | read | KG statistics |
+| `GET /v1/taxonomy` | read | Wing/room taxonomy |
+| `GET /v1/wings` | read | List wings |
+| `GET /v1/rooms` | read | List rooms |
+| `GET /v1/changes` | read | Change-event feed (cursor-paginated) |
+| `POST /v1/ingest/batch` | write | Bulk mined-chunk ingest (16 MiB body limit) |
+
+Routes marked `write` require a token with `write` or `admin` level; a `read`
+token receives `403` with code `forbidden`. Routes marked `read` accept any
+valid token.
 
 `GET /v1/info` advertises a `capabilities` list; the `"ingest"` capability is what
 a client checks before attempting federated mining. The wire DTOs live in the

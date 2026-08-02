@@ -302,7 +302,8 @@ Behavior:
 - The token file is a JSON array of objects, each with `token`, `name`, and
   `enabled` keys and an optional `level` key (`read`, `write`, or `admin`;
   default `write`); it is hot-reloaded on each request, and tokens are hashed in
-  memory.
+  memory. A `read` token can call read routes only and receives `403 forbidden`
+  on write routes; `write` and `admin` can call everything.
 - `GET /v1/health` is unauthenticated; all other `/v1` routes require
   `Authorization: Bearer <token>`.
 - The server speaks plain HTTP and prints a warning to that effect — front it with

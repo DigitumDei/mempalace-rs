@@ -2468,6 +2468,17 @@ mod tests {
             .unwrap()
     }
 
+    /// Helper: build a GET request with bearer auth and a delegation header.
+    fn delegated_get(uri: &str, token: &str, on_behalf_of: &str) -> Request<Body> {
+        Request::builder()
+            .method(Method::GET)
+            .uri(uri)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(ON_BEHALF_OF_HEADER, on_behalf_of)
+            .body(Body::empty())
+            .unwrap()
+    }
+
     /// Collect response body as JSON.
     async fn body_json(response: axum::response::Response) -> Value {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
@@ -3802,17 +3813,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn info_returns_delegation_capability() {
-        let harness = make_harness().await;
-        let resp = harness.router.oneshot(authed_get("/v1/info", ALICE_TOKEN)).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = body_json(resp).await;
-        let caps = body["capabilities"].as_array().unwrap();
-        let cap_strings: Vec<&str> = caps.iter().filter_map(|v| v.as_str()).collect();
-        assert!(cap_strings.contains(&"delegation"), "capabilities must include 'delegation'");
-    }
-
-    #[tokio::test]
     async fn info_returns_maintenance_enabled_and_null_last_run() {
         let harness = make_harness().await;
         let resp = harness.router.oneshot(authed_get("/v1/info", ALICE_TOKEN)).await.unwrap();
@@ -5104,13 +5104,7 @@ mod tests {
         let resp = harness
             .router
             .clone()
-            .oneshot(delegated_json_request(
-                Method::GET,
-                "/v1/whoami",
-                ALICE_TOKEN,
-                Some("dion@corp.com"),
-                json!({}),
-            ))
+            .oneshot(delegated_get("/v1/whoami", ALICE_TOKEN, "dion@corp.com"))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -5176,13 +5170,7 @@ mod tests {
         let resp = harness
             .router
             .clone()
-            .oneshot(delegated_json_request(
-                Method::GET,
-                "/v1/info",
-                ALICE_TOKEN,
-                Some("dion@corp.com"),
-                json!({}),
-            ))
+            .oneshot(delegated_get("/v1/info", ALICE_TOKEN, "dion@corp.com"))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);

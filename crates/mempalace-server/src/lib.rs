@@ -882,6 +882,7 @@ where
             "changes".to_owned(),
             "taxonomy".to_owned(),
             "ingest".to_owned(),
+            "delegation".to_owned(),
         ],
         maintenance_enabled: state.config.maintenance.enabled,
         maintenance_background_enabled: state.config.maintenance.background_enabled,
@@ -3784,7 +3785,7 @@ mod tests {
         assert!(body["files"][0]["error"].as_str().unwrap().contains("duplicate chunk_index"));
     }
 
-    /// info endpoint now includes "ingest" capability.
+    /// info endpoint now includes "ingest" and "delegation" capabilities.
     #[tokio::test]
     async fn info_includes_ingest_capability() {
         let harness = make_harness().await;
@@ -3794,6 +3795,18 @@ mod tests {
         let caps = body["capabilities"].as_array().unwrap();
         let cap_strings: Vec<&str> = caps.iter().filter_map(|v| v.as_str()).collect();
         assert!(cap_strings.contains(&"ingest"), "capabilities must include 'ingest'");
+        assert!(cap_strings.contains(&"delegation"), "capabilities must include 'delegation'");
+    }
+
+    #[tokio::test]
+    async fn info_returns_delegation_capability() {
+        let harness = make_harness().await;
+        let resp = harness.router.oneshot(authed_get("/v1/info", ALICE_TOKEN)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let caps = body["capabilities"].as_array().unwrap();
+        let cap_strings: Vec<&str> = caps.iter().filter_map(|v| v.as_str()).collect();
+        assert!(cap_strings.contains(&"delegation"), "capabilities must include 'delegation'");
     }
 
     #[tokio::test]

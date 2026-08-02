@@ -174,6 +174,7 @@ requires `Authorization: Bearer <token>`.
 |---|---|---|
 | `GET /v1/health` | none | Liveness probe (no auth) |
 | `GET /v1/info` | read | Server version, `federation_api_version`, embedding profile, capabilities, and maintenance configuration/state |
+| `GET /v1/whoami` | read | Authenticated identity: `token_name`, `on_behalf_of`, `composed_identity`, and `level` |
 | `POST /v1/drawers/search` | read | Semantic search (server embeds the query text) |
 | `POST /v1/drawers/check_duplicate` | read | Near-duplicate check |
 | `POST /v1/drawers` | write | Add a drawer |
@@ -196,8 +197,10 @@ token receives `403` with code `forbidden`. Routes marked `read` accept any
 valid token.
 
 `GET /v1/info` advertises a `capabilities` list; the `"ingest"` capability is what
-a client checks before attempting federated mining. The wire DTOs live in the
-`mempalace-federation` crate and are shared verbatim by server and client.
+a client checks before attempting federated mining, and the `"delegation"` capability
+indicates the server supports delegated identity via `X-MemPalace-On-Behalf-Of`.
+The wire DTOs live in the `mempalace-federation` crate and are shared verbatim by
+server and client.
 
 ## Part 2 — Configuring a client
 

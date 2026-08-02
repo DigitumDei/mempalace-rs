@@ -666,9 +666,7 @@ const ON_BEHALF_OF_HEADER: &str = "x-mempalace-on-behalf-of";
 ///
 /// Returns `Ok(None)` when the header is absent, `Ok(Some(trimmed))` when a
 /// valid value is present, and `Err(message)` — to be surfaced as `400
-/// invalid_params` — when the value is empty after trimming, longer than 128
-/// bytes, contains `:` (the principal composition separator), or contains
-/// control or newline characters (the value lands in stored rows and logs).
+/// invalid_params` — when the value is invalid.
 fn resolve_on_behalf_of(headers: &axum::http::HeaderMap) -> Result<Option<String>, String> {
     let Some(raw) = headers.get(ON_BEHALF_OF_HEADER) else {
         return Ok(None);
@@ -676,6 +674,15 @@ fn resolve_on_behalf_of(headers: &axum::http::HeaderMap) -> Result<Option<String
     let raw = raw
         .to_str()
         .map_err(|_| "X-MemPalace-On-Behalf-Of must be a valid UTF-8 string".to_owned())?;
+    validate_on_behalf_of_value(raw)
+}
+
+/// Validates a raw `X-MemPalace-On-Behalf-Of` header value.
+///
+/// Rejects values that are empty after trimming, longer than 128 bytes,
+/// contain `:` (the principal composition separator), or contain control or
+/// newline characters (the value lands in stored rows and logs).
+fn validate_on_behalf_of_value(raw: &str) -> Result<Option<String>, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err("X-MemPalace-On-Behalf-Of must not be empty after trimming".to_owned());
@@ -4145,6 +4152,40 @@ mod tests {
         assert_eq!(delegated.principal(), "alice:dion@corp.com");
     }
 
+    #[test]
+    fn validate_on_behalf_of_rejects_control_and_newline() {
+        // Control characters and newlines cannot be carried in an http
+        // `HeaderValue` (the transport rejects them at construction), but the
+        // validator must reject them defensively if they ever arrive.
+        for value in ["dion\u{1}corp", "dion\rcorp", "dion\ncorp", "dion\tcorp"] {
+            assert!(
+                validate_on_behalf_of_value(value).is_err(),
+                "value `{value:?}` must be rejected",
+            );
+        }
+        // Valid values pass through trimmed.
+        assert_eq!(
+            validate_on_behalf_of_value(" dion@corp.com ").unwrap(),
+            Some("dion@corp.com".to_owned()),
+        );
+        assert_eq!(validate_on_behalf_of_value("hub").unwrap(), Some("hub".to_owned()));
+    }
+
+    #[test]
+    fn validate_on_behalf_of_rejects_empty_too_long_and_colon() {
+        assert!(validate_on_behalf_of_value("   ").is_err(), "empty-after-trim must be rejected");
+        assert!(
+            validate_on_behalf_of_value(&"a".repeat(129)).is_err(),
+            "values over 128 bytes must be rejected",
+        );
+        assert!(validate_on_behalf_of_value("dion:corp").is_err(), "colons must be rejected");
+        // 128 bytes is the boundary and passes.
+        assert_eq!(
+            validate_on_behalf_of_value(&"a".repeat(128)).unwrap(),
+            Some("a".repeat(128)),
+        );
+    }
+
     #[tokio::test]
     async fn on_behalf_of_header_rejects_empty_after_trim() {
         let harness = make_harness().await;
@@ -4197,26 +4238,6 @@ mod tests {
                 "/v1/drawers/search",
                 ALICE_TOKEN,
                 Some("dion:corp"),
-                json!({"query": "delegation", "limit": 5}),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let body = body_json(resp).await;
-        assert_eq!(body["code"], "invalid_params");
-    }
-
-    #[tokio::test]
-    async fn on_behalf_of_header_rejects_control_characters() {
-        let harness = make_harness().await;
-        let resp = harness
-            .router
-            .clone()
-            .oneshot(delegated_json_request(
-                Method::POST,
-                "/v1/drawers/search",
-                ALICE_TOKEN,
-                Some("dion\u{1}corp"),
                 json!({"query": "delegation", "limit": 5}),
             ))
             .await

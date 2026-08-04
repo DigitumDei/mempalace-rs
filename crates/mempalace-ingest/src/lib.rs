@@ -332,6 +332,8 @@ pub enum IngestError {
         "branch-delta mining requires a git repository with a detectable default branch: {reason}"
     )]
     BranchDeltaUnavailable { reason: String },
+    #[error("could not enumerate the tracked index for `{path}`: {reason}")]
+    GitIndexUnavailable { path: PathBuf, reason: String },
 }
 
 pub type Result<T> = std::result::Result<T, IngestError>;
@@ -2040,9 +2042,19 @@ fn discover_git_index_sources(root: &Path) -> Result<ProjectSourceDiscovery> {
         .output()
         .map_err(|source| IngestError::Io { path: root.to_path_buf(), source })?;
     if !output.status.success() {
-        // `ls-files` failed despite `rev-parse` succeeding — fall back to a
-        // filesystem walk rather than aborting the mine.
-        return discover_filesystem_sources(root);
+        // The root was confirmed Git-backed but the index cannot be enumerated.
+        // Falling back to a filesystem walk here could ingest untracked and
+        // ignored working-tree files, violating the tracked-index-only source
+        // guarantee — surface the failure instead.
+        let reason = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        return Err(IngestError::GitIndexUnavailable {
+            path: root.to_path_buf(),
+            reason: if reason.is_empty() {
+                "git ls-files exited unsuccessfully".to_owned()
+            } else {
+                reason
+            },
+        });
     }
 
     let ignore_matcher = IgnoreMatcher::load(root)?;
@@ -5779,6 +5791,7 @@ mod tests {
         fs::write(tempdir.path().join(".gitignore"), "ignored/\n").unwrap();
         fs::create_dir_all(tempdir.path().join("ignored")).unwrap();
         fs::write(tempdir.path().join("ignored").join("secret.md"), "hidden").unwrap();
+        fs::create_dir_all(tempdir.path().join("keep")).unwrap();
         fs::write(tempdir.path().join("keep").join("visible.md"), "visible").unwrap();
 
         let discovery = discover_project_sources(tempdir.path()).unwrap();

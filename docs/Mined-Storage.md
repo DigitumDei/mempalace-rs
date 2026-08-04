@@ -145,7 +145,9 @@ valid UTF-8 always use the legacy stored-content path. Re-mining them with
 `mine --mode projects` discovers eligible sources in one of two ways:
 
 - **Git-backed roots** enumerate the tracked index (`git ls-files`): only
-  committed files are mined. Ignored and untracked working-tree content
+  tracked index files are mined (this includes staged, uncommitted entries,
+  but never untracked or ignored working-tree content). Ignored and untracked
+  working-tree content
   (`.gitignore`d files such as `.env`, local editor overrides like
   `*.local.json`, and build output) never enters the source set. Branch-delta
   mines (`--branch` / `--view <name>`) are the deliberate exception: they also

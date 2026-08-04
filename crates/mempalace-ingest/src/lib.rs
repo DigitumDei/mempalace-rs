@@ -6639,7 +6639,7 @@ mod tests {
             "main",
             &[
                 ("mempalace.yaml", "wing: symlinktest\nrooms:\n  - name: general\n"),
-                ("tracked.md", "tracked content\n".repeat(10)),
+                ("tracked.md", "tracked content\n"),
             ],
         );
 

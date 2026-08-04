@@ -107,6 +107,14 @@ Automatic view detection (`--mode projects` only):
 Behavior:
 - `projects` uses the project ingest path.
 - `convos` uses the conversation ingest path.
+- In `convos` mode, discovery walks the conversation directory honouring only
+  the worktree ignore files (nested `.gitignore`/`.mempalaceignore` and the
+  built-in skip directories), then applies the `.txt`/`.md`/`.json`/`.jsonl`
+  extension filter. It deliberately does **not** load the repository-level
+  exclude sources (`$GIT_DIR/info/exclude`, `core.excludesFile`) and does not
+  apply the project secret-path denylist, so conversation discovery never
+  depends on git state or spawns git subprocesses. See
+  [Mined-Storage.md#conversation-discovery](Mined-Storage.md#conversation-discovery).
 - In `projects` mode, source discovery honours git: a Git-backed root mines the
   tracked index only (`git ls-files`), so ignored and untracked working-tree
   files (e.g. `.env`, `*.local.json`, build output) are never ingested. A

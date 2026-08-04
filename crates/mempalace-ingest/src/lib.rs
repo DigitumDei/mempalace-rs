@@ -2421,7 +2421,7 @@ fn discover_git_index_sources(root: &Path) -> Result<ProjectSourceDiscovery> {
 /// subset. Used for non-Git roots; the `core.excludesFile` global excludes file
 /// still applies, but `$GIT_DIR/info/exclude` does not (no git work tree).
 fn discover_filesystem_sources(root: &Path) -> Result<ProjectSourceDiscovery> {
-    let report = discover_files(root, true, project_eligibility)?;
+    let report = discover_files(root, true, true, project_eligibility)?;
     Ok(ProjectSourceDiscovery {
         sources: report.files,
         basis: ProjectSourceBasis::Filesystem,
@@ -2471,12 +2471,20 @@ fn discover_project_files(root: &Path) -> Result<DiscoveryReport> {
 /// `$GIT_DIR/info/exclude` for Git-backed roots and the `core.excludesFile`
 /// global file); linked Git worktrees are still skipped.
 fn discover_project_files_with_untracked(root: &Path) -> Result<DiscoveryReport> {
-    discover_files(root, true, project_eligibility)
+    discover_files(root, true, true, project_eligibility)
 }
 
+/// Conversation discovery is deliberately scoped: it walks the filesystem and
+/// honors worktree ignore files — nested `.gitignore`/`.mempalaceignore` files
+/// with git-compatible semantics plus the built-in skip directories — but it
+/// does **not** load the repository-level exclude sources
+/// (`$GIT_DIR/info/exclude` and the `core.excludesFile` global file), and it
+/// does not apply the project secret-path denylist. Conversation exports are
+/// not code: user-level git exclusion config must not silently filter them,
+/// and discovery should not depend on git state or spawn git subprocesses.
 fn discover_conversation_files(root: &Path) -> Result<DiscoveryReport> {
     let extension_set = CONVO_EXTENSIONS.iter().copied().collect::<BTreeSet<_>>();
-    discover_files(root, false, move |path, _file_name| {
+    discover_files(root, false, false, move |path, _file_name| {
         let suffix = path.extension().and_then(|value| value.to_str()).unwrap_or_default();
         let normalized_suffix = format!(".{}", suffix.to_ascii_lowercase());
         if extension_set.contains(normalized_suffix.as_str()) {
@@ -2557,16 +2565,22 @@ fn path_from_git_bytes(bytes: &[u8]) -> Option<PathBuf> {
     String::from_utf8(bytes.to_vec()).ok().map(PathBuf::from)
 }
 
-/// Walk `root` applying ignore rules (worktree `.gitignore`/`.mempalaceignore`
-/// plus `$GIT_DIR/info/exclude` for Git-backed roots and the
-/// `core.excludesFile` global file for any walk), accepting files for which
-/// `accept_file` returns [`Eligibility::Eligible`]. The closure receives the
-/// absolute path and the (lossy) file name; everything it rejects counts toward
+/// Walk `root` applying worktree ignore rules (nested `.gitignore`/
+/// `.mempalaceignore` files) and accepting files for which `accept_file`
+/// returns [`Eligibility::Eligible`]. The closure receives the absolute path
+/// and the (lossy) file name; everything it rejects counts toward
 /// `ignored_files`, and secret-denylist rejections are also recorded as skip
 /// records.
+///
+/// When `load_repo_excludes` is set, the repository-level sources are also
+/// loaded before the walk (`$GIT_DIR/info/exclude` for Git-backed roots and
+/// the `core.excludesFile` global file for any walk), and their rules apply at
+/// every depth. Project-source walks set this; conversation discovery does
+/// not, so it never consults git state or spawns git subprocesses.
 fn discover_files(
     root: &Path,
     skip_linked_worktrees: bool,
+    load_repo_excludes: bool,
     accept_file: impl Fn(&Path, &str) -> Eligibility,
 ) -> Result<DiscoveryReport> {
     // Git reports worktree paths as absolute, so use an absolute root when
@@ -2581,8 +2595,11 @@ fn discover_files(
     let mut files = Vec::new();
     let mut skips = Vec::new();
     // Repository-level excludes (`$GIT_DIR/info/exclude` for Git-backed roots,
-    // `core.excludesFile` for any walk) apply at every depth.
-    ignore_matcher.load_repo_excludes()?;
+    // `core.excludesFile` for any walk) apply at every depth, but only for
+    // walks that opt into them.
+    if load_repo_excludes {
+        ignore_matcher.load_repo_excludes()?;
+    }
     let mut stack = vec![root.to_path_buf()];
     // Pre-compute linked worktree paths so we can skip them during the walk.
     let worktree_skip = skip_linked_worktrees
@@ -2716,13 +2733,16 @@ impl IgnoreMatcher {
     }
 
     /// Parse the patterns in an absolute exclude file (root-scoped) into rules
-    /// at `tier`. A missing file is not an error, matching git's behaviour of
-    /// treating unreadable/missing exclude files as empty.
+    /// at `tier`. A missing file is not an error, as in git. An unreadable file
+    /// — a permission failure or a path that is not a regular file (a
+    /// directory, a broken link) — is also treated as empty: these sources
+    /// (`$GIT_DIR/info/exclude` and the `core.excludesFile` global file) are
+    /// optional, and discovery must not abort because one cannot be read. This
+    /// is an intentional robustness divergence from git, which exits fatally
+    /// when an exclude file it reads cannot be opened.
     fn load_pattern_file(&mut self, path: &Path, tier: IgnoreTier) -> Result<()> {
-        let body = match fs::read_to_string(path) {
-            Ok(body) => body,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(source) => return Err(IngestError::Io { path: path.to_path_buf(), source }),
+        let Ok(body) = fs::read_to_string(path) else {
+            return Ok(());
         };
         for line in body.lines() {
             let Some(pattern) = parse_ignore_pattern(line) else { continue };
@@ -6633,6 +6653,211 @@ mod tests {
         let names: Vec<_> = discovery.sources.iter().map(|s| s.relative_path.as_str()).collect();
         assert_eq!(names, vec!["docs/notes.md"]);
         assert_eq!(discovery.skipped, 1);
+    }
+
+    // ─── Conversation-discovery scope tests ──────────────────────────────────
+
+    /// Conversation discovery is deliberately scoped to worktree ignore files:
+    /// nested `.gitignore`/`.mempalaceignore` rules (git-compatible semantics)
+    /// and the built-in skip directories still apply, matching the historical
+    /// root-level behaviour.
+    #[test]
+    fn conversation_discovery_honors_worktree_ignore_files() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path().to_path_buf();
+        fs::write(root.join(".mempalaceignore"), "private/\n").unwrap();
+        fs::create_dir_all(root.join("private")).unwrap();
+        fs::create_dir_all(root.join("chat")).unwrap();
+        fs::write(root.join("private").join("secret.md"), "hidden\n").unwrap();
+        fs::write(root.join("chat").join(".gitignore"), "draft.md\n").unwrap();
+        fs::write(root.join("chat").join("draft.md"), "ignored\n").unwrap();
+        fs::write(root.join("chat").join("keep.md"), "kept\n").unwrap();
+
+        let report = discover_conversation_files(&root).unwrap();
+        let names: Vec<_> = report.files.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["chat/keep.md"]);
+        assert!(report.ignored_files >= 2);
+    }
+
+    /// The secret-path denylist is scoped to project discovery: conversation
+    /// mining applies only the conversation-extension filter, so a
+    /// secret-shaped file with an accepted conversation extension
+    /// (`.env.json`) is still discovered and produces no skip record.
+    #[test]
+    fn conversation_discovery_does_not_apply_secret_denylist() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path().to_path_buf();
+        fs::write(root.join(".env.json"), "{\"TOKEN\": \"x\"}\n").unwrap();
+        fs::write(root.join("notes.md"), "hi\n").unwrap();
+
+        let report = discover_conversation_files(&root).unwrap();
+        let names: Vec<_> = report.files.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec![".env.json", "notes.md"]);
+        assert!(report.skips.is_empty());
+    }
+
+    /// Conversation discovery does not consult `$GIT_DIR/info/exclude`: a
+    /// conversation file named by an `info/exclude` pattern is still
+    /// discovered, and no git subprocess is spawned to resolve it.
+    #[test]
+    fn conversation_discovery_does_not_apply_git_info_exclude() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path().to_path_buf();
+        git_init_with_commit(&root, "main", &[("tracked.md", "tracked\n")]);
+        fs::create_dir_all(root.join(".git").join("info")).unwrap();
+        fs::write(root.join(".git").join("info").join("exclude"), "chats.md\n").unwrap();
+        fs::write(root.join("chats.md"), "conversation\n").unwrap();
+
+        let report = discover_conversation_files(&root).unwrap();
+        let names: Vec<_> = report.files.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["chats.md", "tracked.md"]);
+    }
+
+    /// Conversation discovery never loads the `core.excludesFile` global file:
+    /// user-level git exclusion config must not silently filter conversation
+    /// exports. Runs under a temp HOME so the configured global excludes are
+    /// deterministic.
+    #[test]
+    fn conversation_discovery_does_not_apply_global_excludes() {
+        const TEST_NAME: &str = "tests::conversation_discovery_does_not_apply_global_excludes";
+        // Child mode: the temp HOME is active, so run the real assertions.
+        if std::env::var_os("MEMPALACE_TEST_TEMP_HOME").is_some() {
+            let tempdir = tempdir().unwrap();
+            let root = tempdir.path();
+            fs::write(root.join("notes.bak.md"), "would be globally excluded\n").unwrap();
+            fs::write(root.join("notes.md"), "kept\n").unwrap();
+
+            let report = discover_conversation_files(root).unwrap();
+            let names: Vec<_> = report.files.iter().map(|s| s.relative_path.as_str()).collect();
+            assert_eq!(names, vec!["notes.bak.md", "notes.md"]);
+            return;
+        }
+
+        // Parent mode: write a global excludes file and a `.gitconfig` that
+        // points at it, then re-run this test under a temp HOME.
+        let tempdir = tempdir().unwrap();
+        let home = tempdir.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let global = tempdir.path().join("global-excludes");
+        fs::write(&global, "*.bak.md\n").unwrap();
+        fs::write(
+            home.join(".gitconfig"),
+            format!("[core]\n\texcludesFile = {}\n", global.display()),
+        )
+        .unwrap();
+
+        let output = Command::new(std::env::current_exe().unwrap())
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("MEMPALACE_TEST_TEMP_HOME", "1")
+            .env_remove("GIT_CONFIG_GLOBAL")
+            .args(["--exact", TEST_NAME])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child run of {TEST_NAME} failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    // ─── Unreadable exclude sources ──────────────────────────────────────────
+
+    /// An unreadable `$GIT_DIR/info/exclude` (here: a directory where the file
+    /// is expected) is treated as empty — an optional exclude file that cannot
+    /// be read must not abort discovery. This is an intentional robustness
+    /// divergence from git, which exits fatally when an exclude file cannot be
+    /// opened.
+    #[test]
+    fn unreadable_git_info_exclude_does_not_abort_discovery() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path().to_path_buf();
+        git_init_with_commit(&root, "main", &[("tracked.md", "tracked\n")]);
+        pin_absent_global_excludes(&root);
+        // `git init` already created `.git/info/exclude` as a regular file;
+        // replace it with a directory so reading it as a file fails.
+        let exclude = root.join(".git").join("info").join("exclude");
+        fs::remove_file(&exclude).unwrap();
+        fs::create_dir_all(&exclude).unwrap();
+        fs::write(root.join("local.md"), "untracked\n").unwrap();
+
+        let report = discover_project_files_with_untracked(&root).unwrap();
+        let names: Vec<_> = report.files.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["local.md", "tracked.md"]);
+    }
+
+    /// An unreadable global excludes file (here: a directory in place of
+    /// `$XDG_CONFIG_HOME/git/ignore`) is treated as empty rather than aborting
+    /// discovery. Runs under a temp HOME so the default global-excludes path
+    /// is deterministic.
+    #[test]
+    fn unreadable_global_excludes_does_not_abort_discovery() {
+        const TEST_NAME: &str = "tests::unreadable_global_excludes_does_not_abort_discovery";
+        // Child mode: the temp HOME is active, so run the real assertions.
+        if std::env::var_os("MEMPALACE_TEST_TEMP_HOME").is_some() {
+            let tempdir = tempdir().unwrap();
+            let root = tempdir.path();
+            fs::write(root.join("notes.md"), "kept\n").unwrap();
+            fs::write(root.join("notes.bak.md"), "kept\n").unwrap();
+
+            let discovery = discover_project_sources(root).unwrap();
+            assert_eq!(discovery.basis, ProjectSourceBasis::Filesystem);
+            let names: Vec<_> =
+                discovery.sources.iter().map(|s| s.relative_path.as_str()).collect();
+            assert_eq!(names, vec!["notes.bak.md", "notes.md"]);
+            return;
+        }
+
+        // Parent mode: make the default global-excludes location a directory
+        // (so reading it as a file fails), then re-run this test under a temp
+        // HOME with no configured core.excludesFile.
+        let tempdir = tempdir().unwrap();
+        let home = tempdir.path().join("home");
+        let xdg = home.join(".config");
+        fs::create_dir_all(xdg.join("git").join("ignore")).unwrap();
+
+        let output = Command::new(std::env::current_exe().unwrap())
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &xdg)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("MEMPALACE_TEST_TEMP_HOME", "1")
+            .env_remove("GIT_CONFIG_GLOBAL")
+            .args(["--exact", TEST_NAME])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child run of {TEST_NAME} failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    /// An explicitly configured `core.excludesFile` that points at an
+    /// unreadable path (here: a directory) is treated as empty rather than
+    /// aborting discovery. Git exits fatally in exactly this case; tolerating
+    /// it is the intentional robustness divergence.
+    #[test]
+    fn unreadable_configured_global_excludes_does_not_abort_discovery() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path().to_path_buf();
+        git_init_with_commit(&root, "main", &[("tracked.md", "tracked\n")]);
+        let global = tempdir.path().join("global-excludes");
+        fs::create_dir_all(&global).unwrap();
+        let status = Command::new("git")
+            .args(["config", "core.excludesFile", global.to_str().unwrap()])
+            .current_dir(&root)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git config core.excludesFile failed");
+        fs::write(root.join("notes.bak.md"), "kept\n").unwrap();
+        fs::write(root.join("notes.md"), "kept\n").unwrap();
+
+        let report = discover_project_files_with_untracked(&root).unwrap();
+        let names: Vec<_> = report.files.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["notes.bak.md", "notes.md", "tracked.md"]);
     }
 
     /// A tracked symlink is rejected before any eligibility check or file read:

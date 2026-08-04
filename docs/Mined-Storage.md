@@ -188,15 +188,45 @@ valid UTF-8 always use the legacy stored-content path. Re-mining them with
   ending in a space). The global excludes file (`core.excludesFile`, defaulting
   to `$XDG_CONFIG_HOME/git/ignore`, or `~/.config/git/ignore`) also applies,
   since it is user-level git configuration rather than a repository concept.
+  A missing global excludes file is treated as empty, as in git. An unreadable
+  one — a permission failure or a path that is not a regular file — is also
+  treated as empty rather than aborting discovery; this is an intentional
+  robustness divergence from git, which exits fatally when an exclude file
+  cannot be opened.
 
 The repository-level exclude sources are honored at git's precedence:
 `$GIT_DIR/info/exclude` (Git-backed roots only) and the global excludes file
 (`core.excludesFile`) for every filesystem walk, including non-Git roots. As in
 git, per-directory `.gitignore` patterns outrank `info/exclude`, which outranks
 the global excludes file; these two repository-level sources are purely
-additive and never override the `.mempalaceignore` local protection.
-Repository-level excludes never apply to tracked index files: a tracked path
-stays eligible even when an exclude file names it.
+additive and never override the `.mempalaceignore` local protection. Both are
+optional files: a missing `info/exclude` or global excludes file is treated as
+empty, as in git; one that exists but cannot be read (a permission failure or
+a directory in place of the file) is treated as empty too, rather than failing
+discovery — an intentional robustness divergence from git, which exits
+fatally when an exclude file cannot be opened. Repository-level excludes never
+apply to tracked index files: a tracked path stays eligible even when an
+exclude file names it.
+
+### Conversation discovery
+
+`mine --mode convos` walks the conversation directory with the same worktree
+ignore handling as the non-Git project walk: nested `.gitignore`/
+`.mempalaceignore` files (git-compatible semantics) and the built-in skip
+directories apply, so an export can exclude files explicitly. The scope is
+deliberately narrower than project discovery:
+
+- The repository-level exclude sources (`$GIT_DIR/info/exclude` and the
+  `core.excludesFile` global file) are **not** loaded. Conversation exports are
+  not code, so user-level git exclusion config never silently filters them, and
+  conversation discovery does not depend on git state or spawn git
+  subprocesses.
+- The project secret-path denylist is **not** applied. Conversation discovery
+  keeps its extension-only filter, so a secret-shaped file with an accepted
+  conversation extension (for example `.env.json`) is still discovered.
+- Linked Git worktrees are not consulted (conversation directories are not
+  checkouts). The `.txt` `.md` `.json` `.jsonl` extension filter is applied
+  after the worktree ignore rules.
 
 The following directory names are always skipped: `.git`, `node_modules`,
 `__pycache__`, `.venv`, `venv`, `env`, `dist`, `build`, `.next`, `coverage`,

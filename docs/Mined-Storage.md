@@ -155,7 +155,10 @@ valid UTF-8 always use the legacy stored-content path. Re-mining them with
   applies to tracked files, including nested files at any depth. Independently
   of git, the secret-path denylist still applies to tracked index paths: a
   secret-shaped file that was committed (e.g. a tracked `.env`) is withheld and
-  reported, never mined. Branch-delta
+  reported, never mined. Tracked **symlinks are rejected outright**, before any
+  eligibility check or file read: a symlink can point outside the discovery
+  root, and its target's content must never be mined under an in-repo path.
+  Branch-delta
   mines (`--branch` / `--view <name>`) are the deliberate exception: they also
   include untracked, non-ignored files so that new branch work is captured
   before it is committed.
@@ -200,8 +203,8 @@ skipped, preventing duplicate checkout content from being mined.
 
 Room detection during `init` and `project register` uses the same safe source
 set: rooms are derived from the directories that hold eligible sources, so
-ignored, untracked, secret-shaped, and linked-worktree files never produce
-rooms. Both commands also report the same eligible source count — the number of
+ignored, untracked, secret-shaped, tracked-symlink, and linked-worktree files
+never produce rooms. Both commands also report the same eligible source count — the number of
 files in that safe set — which matches the `Files discovered` line of a
 canonical `mine` (branch-delta mines deliberately add untracked, non-ignored
 files and so report a larger set).

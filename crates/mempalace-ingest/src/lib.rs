@@ -540,7 +540,8 @@ pub struct ProjectSource {
 pub enum ProjectSourceBasis {
     /// Git-backed root: the eligible subset of tracked index paths
     /// (`git ls-files`). Untracked and ignored working-tree files are never
-    /// eligible.
+    /// eligible, and tracked symlinks are rejected outright so discovery can
+    /// never pull content from outside the root.
     GitIndex,
     /// Non-Git root: a filesystem walk honouring git-compatible ignore rules.
     Filesystem,
@@ -2281,7 +2282,9 @@ fn default_global_excludes_path(xdg_config_home: Option<&str>, home: Option<&Pat
 }
 
 /// Enumerate the tracked index paths under `root` and keep the project-eligible
-/// subset.
+/// subset. Tracked symlinks are rejected before eligibility checks or file
+/// reads: a symlink can escape the discovery root, and its target's content
+/// must never be mined under an in-repo path.
 fn discover_git_index_sources(root: &Path) -> Result<ProjectSourceDiscovery> {
     let output = Command::new("git")
         .arg("-C")
@@ -2352,7 +2355,14 @@ fn discover_git_index_sources(root: &Path) -> Result<ProjectSourceDiscovery> {
     for (relative, relative_str) in entries {
         let absolute = root.join(&relative);
 
-        let file_type = match fs::metadata(&absolute) {
+        // `symlink_metadata` (lstat) inspects the entry itself instead of
+        // following it, unlike `fs::metadata`. Tracked symlinks are rejected
+        // outright before any eligibility check or file read: a symlink can
+        // target a path outside the discovery root, and following it would
+        // let an external file's content into the palace under an in-repo
+        // path. Submodules (gitlinks) and other non-file index entries are
+        // rejected the same way.
+        let file_type = match fs::symlink_metadata(&absolute) {
             Ok(metadata) => metadata,
             // The index can still name a file that has been deleted from the
             // working tree since it was staged.
@@ -2361,8 +2371,7 @@ fn discover_git_index_sources(root: &Path) -> Result<ProjectSourceDiscovery> {
                 continue;
             }
         };
-        if !file_type.is_file() {
-            // Submodules (gitlinks) and other non-file index entries.
+        if file_type.is_symlink() || !file_type.is_file() {
             skipped += 1;
             continue;
         }
@@ -6563,6 +6572,137 @@ mod tests {
         let names: Vec<_> = discovery.sources.iter().map(|s| s.relative_path.as_str()).collect();
         assert_eq!(names, vec!["docs/notes.md"]);
         assert_eq!(discovery.skipped, 1);
+    }
+
+    /// A tracked symlink is rejected before any eligibility check or file read:
+    /// it can point outside the discovery root, and following it (as
+    /// `fs::metadata` does) would pull an external file's content into the
+    /// palace under an in-repo path. The symlink is neither discovered nor —
+    /// since discovery is the sole gate before reading — ever read.
+    #[test]
+    #[cfg(unix)]
+    fn git_index_discovery_rejects_tracked_symlink_escaping_root() {
+        use std::os::unix::fs::symlink;
+
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path().join("repo");
+        fs::create_dir_all(&root).unwrap();
+        git_init_with_commit(
+            &root,
+            "main",
+            &[
+                ("tracked.md", "tracked\n"),
+                ("notes.md", "notes\n"),
+            ],
+        );
+
+        // The tracked symlink points at an eligible file outside the repo. If
+        // it were followed, that external content would be mined as `link.md`.
+        let external_dir = tempdir.path().join("external");
+        fs::create_dir_all(&external_dir).unwrap();
+        let external = external_dir.join("credentials.md");
+        fs::write(&external, "TOP-SECRET-EXTERNAL\n".repeat(5)).unwrap();
+        symlink(&external, root.join("link.md")).unwrap();
+
+        let run = |args: &[&str]| {
+            let status = Command::new("git").args(args).current_dir(&root).status().unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run(&["add", "-f", "link.md"]);
+
+        let discovery = discover_project_sources(&root).unwrap();
+        assert_eq!(discovery.basis, ProjectSourceBasis::GitIndex);
+        let names: Vec<_> = discovery.sources.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["notes.md", "tracked.md"]);
+        assert!(
+            !discovery.sources.iter().any(|s| s.relative_path == "link.md"),
+            "tracked symlink must not be discovered: {names:?}"
+        );
+        // The symlink is a skipped candidate, exactly like any other ineligible
+        // index entry, and never becomes a source so its target is never read.
+        assert_eq!(discovery.skipped, 1);
+    }
+
+    /// A full canonical mine never reads the target of a tracked symlink that
+    /// escapes the root: the external file produces no ingested-file record and
+    /// no drawer under the link's in-repo path.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn git_index_mine_does_not_read_tracked_symlink_target() {
+        use std::os::unix::fs::symlink;
+
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path().join("repo");
+        fs::create_dir_all(&root).unwrap();
+        git_init_with_commit(
+            &root,
+            "main",
+            &[
+                ("mempalace.yaml", "wing: symlinktest\nrooms:\n  - name: general\n"),
+                ("tracked.md", "tracked content\n".repeat(10)),
+            ],
+        );
+
+        // The external target is eligible and long enough to be chunked, so a
+        // regression that followed the link would ingest it as `link.md`.
+        let secret = "TOP-SECRET-EXTERNAL-CONTENT\n".repeat(10);
+        let external_dir = tempdir.path().join("external");
+        fs::create_dir_all(&external_dir).unwrap();
+        fs::write(external_dir.join("credentials.md"), &secret).unwrap();
+        symlink(external_dir.join("credentials.md"), root.join("link.md")).unwrap();
+        let status = Command::new("git")
+            .args(["add", "-f", "link.md"])
+            .current_dir(&root)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git add symlink failed");
+
+        let engine = open_engine(&tempdir.path().join("palace")).await;
+        let mut provider =
+            FakeEmbeddingProvider::new(EmbeddingProfile::Balanced.metadata().dimensions);
+        let summary = ingest_project(
+            &engine,
+            &mut provider,
+            &ProjectIngestRequest {
+                project_dir: root.clone(),
+                wing: None,
+                agent: "tester".to_owned(),
+                limit: None,
+                dry_run: false,
+                reindex: false,
+                max_embed_batch_size: None,
+                branch: false,
+                view: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // The escaping symlink never becomes a source, so its target is never
+        // read: the tracked regular file is the only discovered/ingested file.
+        assert_eq!(summary.discovered_files, 1);
+        assert_eq!(summary.ingested_files, 1);
+
+        // No ingested-file record exists under the link's in-repo path.
+        let canonical_root = root.canonicalize().unwrap();
+        let repo_id = derive_repo_id(&canonical_root, "symlinktest");
+        let project_root_key = stable_project_root_key(&repo_id);
+        let link_key = project_source_key("projects", &project_root_key, "symlinktest", "link.md");
+        assert!(
+            engine.operational_store().get_ingested_file(&link_key).unwrap().is_none(),
+            "no ingested-file record may exist for the tracked symlink path"
+        );
+
+        // And no drawer references the link path or holds the external content.
+        let drawers = engine
+            .drawer_store()
+            .list_drawers(&DrawerFilter {
+                source_file: Some("link.md".to_owned()),
+                ..DrawerFilter::default()
+            })
+            .await
+            .unwrap();
+        assert!(drawers.is_empty(), "no drawer may reference the tracked symlink path");
     }
 
     /// Nested `.mempalaceignore` files apply to tracked files in their scope.

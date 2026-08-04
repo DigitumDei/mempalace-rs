@@ -32,8 +32,9 @@ Notes:
 - Wing name is derived from the directory name, lowercased with spaces and hyphens normalized to underscores.
 - Room detection derives from the same safe source set mining uses: Git-backed
   checkouts use the tracked index, and non-Git directories use the
-  ignore-aware filesystem walk, so ignored, untracked, secret-shaped, and
-  linked-worktree files never produce rooms. A Git-backed root whose index
+  ignore-aware filesystem walk, so ignored, untracked, secret-shaped,
+  tracked-symlink, and linked-worktree files never produce rooms. A Git-backed
+  root whose index
   cannot be enumerated fails discovery rather than silently falling back to a
   filesystem walk. A `general` room is always included.
 - The summary's file count reports the number of eligible project sources in
@@ -110,7 +111,10 @@ Behavior:
   tracked index only (`git ls-files`), so ignored and untracked working-tree
   files (e.g. `.env`, `*.local.json`, build output) are never ingested. A
   `.gitignore` never suppresses a tracked file; `.mempalaceignore` is the
-  explicit additional exclusion. Independently of git, a path-based **secret
+  explicit additional exclusion. Tracked symlinks are rejected outright before
+  any eligibility check or file read, so a link that escapes the discovery
+  root can never pull its target's content into the palace. Independently of
+  git, a path-based **secret
   denylist** (issue #95) withholds secret-shaped paths — `.env`/`*.env`,
   `*.kubeconfig*`, SSH private keys (`id_rsa*`, `id_ed25519`, `id_ecdsa`,
   `id_dsa`), keystores (`*.pfx`/`*.p12`/`*.jks`), `.npmrc`/`.netrc`,
@@ -167,8 +171,8 @@ Commands:
 canonical mine use (tracked index for Git-backed roots, the ignore-aware
 filesystem walk otherwise), and its output reports the same eligible source
 count as `init`'s summary — the files a canonical mine would actually ingest —
-so ignored, untracked, secret-shaped, and linked-worktree files are neither
-counted nor turned into rooms.
+so ignored, untracked, secret-shaped, tracked-symlink, and linked-worktree
+files are neither counted nor turned into rooms.
 
 ### `search <query>`
 

@@ -258,7 +258,9 @@ The following files are never discovered regardless of extension:
   - `.env` / `.env.*` — process-environment files (any name starting with
     `.env`) and `*.env` (any name ending in `.env`)
   - `*.kubeconfig*` — Kubernetes configuration files
-  - `id_rsa*`, `id_ed25519`, `id_ecdsa`, `id_dsa` — SSH private keys
+  - `id_rsa`, `id_ed25519`, `id_ecdsa`, `id_dsa` — SSH private keys (matched
+    on the exact name, case-insensitively; public keys such as `id_ed25519.pub`
+    and unrelated names such as `id_dsa_notes.md` are not withheld)
   - `*.pfx`, `*.p12`, `*.jks` — keystores and truststores
   - `.npmrc`, `.netrc` — package/registry credential files
   - `*.tfstate`, `*.tfvars` — Terraform state and variable files

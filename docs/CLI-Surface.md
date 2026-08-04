@@ -116,8 +116,9 @@ Behavior:
   root can never pull its target's content into the palace. Independently of
   git, a path-based **secret
   denylist** (issue #95) withholds secret-shaped paths — `.env`/`*.env`,
-  `*.kubeconfig*`, SSH private keys (`id_rsa*`, `id_ed25519`, `id_ecdsa`,
-  `id_dsa`), keystores (`*.pfx`/`*.p12`/`*.jks`), `.npmrc`/`.netrc`,
+  `*.kubeconfig*`, SSH private keys (`id_rsa`, `id_ed25519`, `id_ecdsa`,
+  `id_dsa` — exact name, so public keys and prefix collisions stay
+  discoverable), keystores (`*.pfx`/`*.p12`/`*.jks`), `.npmrc`/`.netrc`,
   `*.tfstate`/`*.tfvars`, `secrets*.json`, `*.local.json` — before any content
   is read, in both Git-index and filesystem discovery. These are counted like
   any skipped candidate and shown in the mine summary as `Secrets withheld: N`

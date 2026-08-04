@@ -568,7 +568,8 @@ pub enum SecretPathKind {
     DotEnv,
     /// `*.kubeconfig*` Kubernetes configuration files.
     Kubeconfig,
-    /// SSH private keys: `id_rsa*`, `id_ed25519`, `id_ecdsa`, `id_dsa`.
+    /// SSH private keys: `id_rsa`, `id_ed25519`, `id_ecdsa`, `id_dsa` (exact
+    /// name match, so public keys and prefix collisions are not withheld).
     SshPrivateKey,
     /// Keystores and truststores: `*.pfx`, `*.p12`, `*.jks`.
     Keystore,
@@ -590,7 +591,7 @@ impl SecretPathKind {
         match self {
             Self::DotEnv => ".env / *.env",
             Self::Kubeconfig => "*.kubeconfig*",
-            Self::SshPrivateKey => "id_rsa* / id_ed25519 / id_ecdsa / id_dsa (SSH private key)",
+            Self::SshPrivateKey => "id_rsa / id_ed25519 / id_ecdsa / id_dsa (SSH private key)",
             Self::Keystore => "*.pfx / *.p12 / *.jks (keystore)",
             Self::Netrc => ".npmrc / .netrc",
             Self::TerraformSecret => "*.tfstate / *.tfvars",
@@ -2066,6 +2067,11 @@ pub fn resolve_current_branch(root: &Path) -> Option<String> {
     if s.is_empty() || s == "HEAD" { None } else { Some(s) }
 }
 
+/// Canonical OpenSSH private-key file names, matched exactly (case-
+/// insensitively). Public keys (`id_ed25519.pub`) and unrelated prefix
+/// collisions (`id_dsa_notes.md`) are not private keys and are not withheld.
+const SSH_PRIVATE_KEY_NAMES: [&str; 4] = ["id_rsa", "id_ed25519", "id_ecdsa", "id_dsa"];
+
 /// Returns the secret-denylist category for `file_name` (matched
 /// case-insensitively), or `None` when the name is not secret-shaped.
 ///
@@ -2079,10 +2085,7 @@ fn secret_path_kind(file_name: &str) -> Option<SecretPathKind> {
     if name.contains("kubeconfig") {
         return Some(SecretPathKind::Kubeconfig);
     }
-    if ["id_rsa", "id_ed25519", "id_ecdsa", "id_dsa"]
-        .iter()
-        .any(|prefix| name.starts_with(*prefix))
-    {
+    if SSH_PRIVATE_KEY_NAMES.contains(&name.as_str()) {
         return Some(SecretPathKind::SshPrivateKey);
     }
     if [".pfx", ".p12", ".jks"].iter().any(|ext| name.ends_with(*ext)) {
@@ -5476,8 +5479,13 @@ mod tests {
             ("kubeconfig.yaml", Some(SecretPathKind::Kubeconfig)),
             (".kubeconfig", Some(SecretPathKind::Kubeconfig)),
             ("id_rsa", Some(SecretPathKind::SshPrivateKey)),
-            ("id_rsa.pub", Some(SecretPathKind::SshPrivateKey)),
+            ("id_rsa.pub", None),
             ("id_ed25519", Some(SecretPathKind::SshPrivateKey)),
+            ("id_ed25519.pub", None),
+            ("id_ecdsa", Some(SecretPathKind::SshPrivateKey)),
+            ("id_dsa", Some(SecretPathKind::SshPrivateKey)),
+            ("id_dsa_notes.md", None),
+            ("id_rsa_notes.md", None),
             ("cert.pfx", Some(SecretPathKind::Keystore)),
             ("keystore.p12", Some(SecretPathKind::Keystore)),
             ("truststore.jks", Some(SecretPathKind::Keystore)),
@@ -5496,6 +5504,53 @@ mod tests {
         ];
         for (name, expected) in cases {
             assert_eq!(secret_path_kind(name), *expected, "secret_path_kind({name:?}) mismatch");
+        }
+    }
+
+    /// SSH private-key names are matched exactly (case-insensitively): public
+    /// keys (`id_ed25519.pub`) and unrelated prefix collisions
+    /// (`id_dsa_notes.md`) are not withheld, while the canonical private-key
+    /// names stay protected.
+    #[test]
+    fn ssh_private_key_denylist_is_exact_name_match() {
+        let withheld: &[&str] = &[
+            "id_rsa",
+            "id_ed25519",
+            "id_ecdsa",
+            "id_dsa",
+            "ID_RSA",
+            "Id_Ed25519",
+            "ID_ECDSA",
+            "id_DSA",
+        ];
+        let allowed: &[&str] = &[
+            "id_rsa.pub",
+            "id_ed25519.pub",
+            "id_ecdsa.pub",
+            "id_dsa.pub",
+            "id_rsa-cert.pub",
+            "id_ed25519_cert.pub",
+            "id_rsa_notes.md",
+            "id_dsa_notes.md",
+            "id_ed25519_notes.md",
+            "id_rsa_backup",
+            "id_dsa.txt",
+            "my_private_key",
+            "github_rsa",
+        ];
+        for name in withheld {
+            assert_eq!(
+                secret_path_kind(name),
+                Some(SecretPathKind::SshPrivateKey),
+                "private key {name:?} must be withheld"
+            );
+        }
+        for name in allowed {
+            assert_eq!(
+                secret_path_kind(name),
+                None,
+                "non-secret name {name:?} must not be withheld"
+            );
         }
     }
 

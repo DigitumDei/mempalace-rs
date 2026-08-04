@@ -2577,7 +2577,7 @@ fn discover_files(
         // ignored are never descended into, so their ignore files never load —
         // matching git's behaviour.
         let dir_rel = relative_path(&root, &dir)?;
-        ignore_matcher.load_directory(&dir_rel, true)?;
+        ignore_matcher.load_directory(Path::new(&dir_rel), true)?;
 
         let read_dir =
             fs::read_dir(&dir).map_err(|source| IngestError::Io { path: dir.clone(), source })?;

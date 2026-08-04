@@ -4060,10 +4060,10 @@ mod tests {
 
         let detection = detect_rooms(&repo).unwrap();
         let names: Vec<_> = detection.rooms.iter().map(|room| room.name.clone()).collect();
-        assert!(names.contains(&"documentation"), "documentation room missing: {names:?}");
-        assert!(names.contains(&"src"), "src room missing: {names:?}");
-        assert!(!names.contains(&"ignored"), "ignored room must not be derived: {names:?}");
-        assert!(!names.contains(&"untracked"), "untracked room must not be derived: {names:?}");
+        assert!(names.iter().any(|name| name == &"documentation"), "documentation room missing: {names:?}");
+        assert!(names.iter().any(|name| name == &"src"), "src room missing: {names:?}");
+        assert!(!names.iter().any(|name| name == &"ignored"), "ignored room must not be derived: {names:?}");
+        assert!(!names.iter().any(|name| name == &"untracked"), "untracked room must not be derived: {names:?}");
         assert_eq!(detection.file_count, 2, "count must cover only eligible tracked sources");
     }
 
@@ -4088,9 +4088,9 @@ mod tests {
 
         let detection = detect_rooms(&repo).unwrap();
         let names: Vec<_> = detection.rooms.iter().map(|room| room.name.clone()).collect();
-        assert!(names.contains(&"documentation"), "documentation room missing: {names:?}");
-        assert!(!names.contains(&"linked_wt"), "linked worktree room must not be derived: {names:?}");
-        assert!(!names.contains(&"planning"), "worktree content room must not be derived: {names:?}");
+        assert!(names.iter().any(|name| name == &"documentation"), "documentation room missing: {names:?}");
+        assert!(!names.iter().any(|name| name == &"linked_wt"), "linked worktree room must not be derived: {names:?}");
+        assert!(!names.iter().any(|name| name == &"planning"), "worktree content room must not be derived: {names:?}");
         assert_eq!(detection.file_count, 1, "linked-worktree files must not be counted");
     }
 
@@ -4105,8 +4105,8 @@ mod tests {
 
         let detection = detect_rooms(root).unwrap();
         let names: Vec<_> = detection.rooms.iter().map(|room| room.name.clone()).collect();
-        assert!(names.contains(&"src"), "src room missing: {names:?}");
-        assert!(!names.contains(&"ignored"), "ignored room must not be derived: {names:?}");
+        assert!(names.iter().any(|name| name == &"src"), "src room missing: {names:?}");
+        assert!(!names.iter().any(|name| name == &"ignored"), "ignored room must not be derived: {names:?}");
         assert_eq!(detection.file_count, 1, "ignored files must not be counted");
     }
 

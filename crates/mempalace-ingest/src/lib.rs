@@ -6689,7 +6689,7 @@ mod tests {
             "doc/*.md\n**/cache/tmp?.md\na/**/b/m.md\n",
         )
         .unwrap();
-        fs::create_dir_all(root.join("doc")).unwrap();
+        fs::create_dir_all(root.join("doc").join("nested")).unwrap();
         fs::write(root.join("doc").join("readme.md"), "r").unwrap();
         fs::write(root.join("doc").join("nested").join("readme.md"), "r2").unwrap();
         fs::create_dir_all(root.join("x").join("cache")).unwrap();

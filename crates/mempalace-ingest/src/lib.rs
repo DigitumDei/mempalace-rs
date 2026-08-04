@@ -482,13 +482,31 @@ struct IgnoreRule {
     scope: String,
     /// Number of path components in `scope` (0 for the root).
     scope_depth: usize,
+    /// Source precedence of the rule; later (higher-precedence) sources can
+    /// override earlier ones.
+    tier: IgnoreTier,
     /// Load order within the same scope; later rules take precedence.
     order: usize,
 }
 
+/// Source precedence of an ignore rule, mirroring git's precedence order
+/// (gitignore(5)): worktree `.gitignore`/`.mempalaceignore` files override
+/// `$GIT_DIR/info/exclude`, which overrides the `core.excludesFile` global
+/// file. Lower-tier rules sort first so that a matching higher-tier rule wins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum IgnoreTier {
+    /// `core.excludesFile` (default `$XDG_CONFIG_HOME/git/ignore`).
+    GlobalExclude,
+    /// `$GIT_DIR/info/exclude`.
+    RepoExclude,
+    /// Per-directory `.gitignore` / `.mempalaceignore`.
+    Worktree,
+}
+
 /// Git-compatible ignore matcher: `.gitignore`/`.mempalaceignore` patterns
-/// with nested-file scoping, negation, and glob/anchoring semantics, plus the
-/// built-in always-skipped directories.
+/// with nested-file scoping, negation, and glob/anchoring semantics, plus
+/// `$GIT_DIR/info/exclude` and the `core.excludesFile` global file at the
+/// correct precedence, and the built-in always-skipped directories.
 #[derive(Debug, Clone)]
 struct IgnoreMatcher {
     /// Absolute root all relative paths are resolved against.
@@ -2031,7 +2049,9 @@ fn has_shebang(path: &Path) -> bool {
 /// `.mempalaceignore` is the explicit additional exclusion. For non-Git
 /// directories a filesystem walk with git-compatible ignore handling
 /// (nested `.gitignore`/`.mempalaceignore` files, `!` negation, anchoring, and
-/// globs) is used. Sources are sorted by relative path (deterministic order),
+/// globs) is used. Git-backed filesystem walks — the branch-delta mine — also
+/// honour `$GIT_DIR/info/exclude` and the `core.excludesFile` global file at
+/// git's precedence. Sources are sorted by relative path (deterministic order),
 /// are relative to `root`, and linked Git worktrees are always excluded.
 pub fn discover_project_sources(root: &Path) -> Result<ProjectSourceDiscovery> {
     let root = root
@@ -2056,6 +2076,78 @@ fn git_is_backed(root: &Path) -> bool {
         .is_some_and(|output| {
             output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "true"
         })
+}
+
+/// Absolute path to `$GIT_DIR/info/exclude` for `root`, resolved via
+/// `git rev-parse --git-path` (handles `GIT_DIR`, linked worktrees, and
+/// gitdir files), falling back to `<root>/.git/info/exclude`. Returns `None`
+/// when git cannot report a path.
+fn repo_info_exclude_path(root: &Path) -> Option<PathBuf> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--git-path", "info/exclude"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if text.is_empty() {
+        return Some(root.join(".git").join("info").join("exclude"));
+    }
+    let path = PathBuf::from(text);
+    if path.is_absolute() {
+        Some(path)
+    } else {
+        // git prints paths relative to the directory `-C` ran in.
+        Some(root.join(path))
+    }
+}
+
+/// Absolute path to the global excludes file for `root`: the value of
+/// `core.excludesFile` (with `~/` expanded against `HOME`), or the XDG default
+/// when the option is not configured.
+fn global_excludes_path(root: &Path) -> Option<PathBuf> {
+    let configured = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["config", "--get", "core.excludesFile"])
+        .output()
+        .ok();
+    if let Some(output) = configured {
+        if output.status.success() {
+            let text = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            if !text.is_empty() {
+                let path = PathBuf::from(&text);
+                if path.is_absolute() {
+                    return Some(path);
+                }
+                if let Some(home) = std::env::var_os("HOME") {
+                    if let Some(stripped) = text.strip_prefix("~/") {
+                        return Some(PathBuf::from(home).join(stripped));
+                    }
+                }
+                // git resolves a relative core.excludesFile against the
+                // directory it runs in, which is the repository root here.
+                return Some(root.join(path));
+            }
+        }
+    }
+    let xdg_config_home = std::env::var("XDG_CONFIG_HOME").ok();
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    Some(default_global_excludes_path(xdg_config_home.as_deref(), home.as_deref()))
+}
+
+/// The XDG default location for global excludes when `core.excludesFile` is
+/// unset: `$XDG_CONFIG_HOME/git/ignore`, or `~/.config/git/ignore` when
+/// `XDG_CONFIG_HOME` is unset.
+fn default_global_excludes_path(xdg_config_home: Option<&str>, home: Option<&Path>) -> PathBuf {
+    let base = match xdg_config_home {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => home.unwrap_or(Path::new("~")).join(".config"),
+    };
+    base.join("git").join("ignore")
 }
 
 /// Enumerate the tracked index paths under `root` and keep the project-eligible
@@ -2170,7 +2262,7 @@ fn discover_git_index_sources(root: &Path) -> Result<ProjectSourceDiscovery> {
 }
 
 /// Walk `root` with git-compatible ignore handling, keeping the project-eligible
-/// subset. Used for non-Git roots.
+/// subset. Used for non-Git roots (repository-level git excludes do not apply).
 fn discover_filesystem_sources(root: &Path) -> Result<ProjectSourceDiscovery> {
     let report = discover_files(root, true, is_project_eligible)?;
     Ok(ProjectSourceDiscovery {
@@ -2207,8 +2299,9 @@ fn discover_project_files(root: &Path) -> Result<DiscoveryReport> {
 
 /// Discovery used by branch-delta mining, which deliberately mines untracked
 /// (non-ignored) working-tree files in addition to changed tracked files.
-/// Keeps the filesystem walk with git-compatible ignore handling; linked Git
-/// worktrees are still skipped.
+/// Keeps the filesystem walk with git-compatible ignore handling (including
+/// `$GIT_DIR/info/exclude` and `core.excludesFile` for Git-backed roots);
+/// linked Git worktrees are still skipped.
 fn discover_project_files_with_untracked(root: &Path) -> Result<DiscoveryReport> {
     discover_files(root, true, is_project_eligible)
 }
@@ -2291,7 +2384,9 @@ fn path_from_git_bytes(bytes: &[u8]) -> Option<PathBuf> {
     String::from_utf8(bytes.to_vec()).ok().map(PathBuf::from)
 }
 
-/// Walk `root` applying ignore rules, accepting files for which `accept_file`
+/// Walk `root` applying ignore rules (worktree `.gitignore`/`.mempalaceignore`
+/// plus, for Git-backed roots, `$GIT_DIR/info/exclude` and the
+/// `core.excludesFile` global file), accepting files for which `accept_file`
 /// returns `true`. The closure receives the absolute path and the (lossy) file
 /// name; everything it rejects counts toward `ignored_files`.
 fn discover_files(
@@ -2309,6 +2404,9 @@ fn discover_files(
     let mut ignore_matcher = IgnoreMatcher::new(&root);
     let mut ignored_files = 0;
     let mut files = Vec::new();
+    // Repository-level excludes (`$GIT_DIR/info/exclude`, `core.excludesFile`)
+    // apply at every depth of a Git-backed root's walk.
+    ignore_matcher.load_repo_excludes()?;
     let mut stack = vec![root.to_path_buf()];
     // Pre-compute linked worktree paths so we can skip them during the walk.
     let worktree_skip = skip_linked_worktrees
@@ -2409,17 +2507,68 @@ impl IgnoreMatcher {
                     pattern,
                     scope: scope.clone(),
                     scope_depth,
+                    tier: IgnoreTier::Worktree,
                     order: self.next_order,
                 });
                 self.next_order += 1;
             }
         }
-        // Deeper scopes override shallower ones; within a scope, later rules
-        // override earlier ones. The last matching rule wins during `matches`.
-        self.rules.sort_by(|left, right| {
-            (left.scope_depth, left.order).cmp(&(right.scope_depth, right.order))
-        });
+        self.sort_rules();
         Ok(())
+    }
+
+    /// Parse the repository-level ignore sources — `$GIT_DIR/info/exclude` and
+    /// the `core.excludesFile` global file — whose patterns are anchored at the
+    /// repository root and have lower precedence than any `.gitignore`. These
+    /// are git concepts, so they only apply when `root` is inside a Git work
+    /// tree. This runs before the walk so the rules apply at every depth.
+    fn load_repo_excludes(&mut self) -> Result<()> {
+        if !git_is_backed(&self.root) {
+            return Ok(());
+        }
+        if let Some(path) = repo_info_exclude_path(&self.root) {
+            self.load_pattern_file(&path, IgnoreTier::RepoExclude)?;
+        }
+        if let Some(path) = global_excludes_path(&self.root) {
+            self.load_pattern_file(&path, IgnoreTier::GlobalExclude)?;
+        }
+        Ok(())
+    }
+
+    /// Parse the patterns in an absolute exclude file (root-scoped) into rules
+    /// at `tier`. A missing file is not an error, matching git's behaviour of
+    /// treating unreadable/missing exclude files as empty.
+    fn load_pattern_file(&mut self, path: &Path, tier: IgnoreTier) -> Result<()> {
+        let body = match fs::read_to_string(path) {
+            Ok(body) => body,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(source) => return Err(IngestError::Io { path: path.to_path_buf(), source }),
+        };
+        for line in body.lines() {
+            let Some(pattern) = parse_ignore_pattern(line) else { continue };
+            self.rules.push(IgnoreRule {
+                pattern,
+                scope: String::new(),
+                scope_depth: 0,
+                tier,
+                order: self.next_order,
+            });
+            self.next_order += 1;
+        }
+        self.sort_rules();
+        Ok(())
+    }
+
+    /// Sort rules so that higher-precedence sources and scopes come last: the
+    /// last matching rule wins, so later elements override earlier ones.
+    fn sort_rules(&mut self) {
+        // Deeper scopes override shallower ones; within a scope, later rules
+        // override earlier ones. Cross-source, worktree files beat
+        // `info/exclude`, which beats the global excludes file.
+        self.rules.sort_by(|left, right| {
+            (left.tier, left.scope_depth, left.order)
+                .cmp(&(right.tier, right.scope_depth, right.order))
+        });
     }
 
     /// Returns `true` when `relative_path` (relative to the root) is ignored:
@@ -5451,6 +5600,8 @@ mod tests {
                 ("stable.rs", &stable_content),
             ],
         );
+        // A host-global excludes file must not silently drop the delta files.
+        pin_absent_global_excludes(&repo_dir);
 
         // Create and switch to feature branch.
         let run_git = |args: &[&str]| {
@@ -6220,6 +6371,143 @@ mod tests {
         assert_eq!(discovery.basis, ProjectSourceBasis::Filesystem);
         let names: Vec<_> = discovery.sources.iter().map(|s| s.relative_path.as_str()).collect();
         assert_eq!(names, vec!["a/b/n.md", "doc/nested/readme.md", "x/cache/tmp12.md"]);
+    }
+
+    /// Pin this repo's `core.excludesFile` to a path that does not exist so
+    /// global excludes are deterministic regardless of the host's git config.
+    fn pin_absent_global_excludes(root: &Path) {
+        let status = Command::new("git")
+            .args(["config", "core.excludesFile", "absent-global-excludes"])
+            .current_dir(root)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git config core.excludesFile failed");
+    }
+
+    /// `$GIT_DIR/info/exclude` excludes untracked files in a Git-backed
+    /// filesystem walk (branch-delta mining), with patterns anchored at the
+    /// repository root.
+    #[test]
+    fn filesystem_walk_honors_git_info_exclude() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path().to_path_buf();
+        git_init_with_commit(&root, "main", &[("tracked.md", "tracked\n")]);
+        pin_absent_global_excludes(&root);
+        fs::create_dir_all(root.join(".git").join("info")).unwrap();
+        fs::write(root.join(".git").join("info").join("exclude"), "local.md\n").unwrap();
+        fs::write(root.join("local.md"), "ignored\n").unwrap();
+        fs::write(root.join("keep.md"), "kept\n").unwrap();
+
+        let report = discover_project_files_with_untracked(&root).unwrap();
+        let names: Vec<_> = report.files.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["keep.md", "tracked.md"]);
+    }
+
+    /// The `core.excludesFile` global excludes file excludes untracked files
+    /// in a Git-backed filesystem walk.
+    #[test]
+    fn filesystem_walk_honors_core_excludes_file() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path().to_path_buf();
+        git_init_with_commit(&root, "main", &[("tracked.md", "tracked\n")]);
+        let global = tempdir.path().join("global-excludes");
+        fs::write(&global, "*.bak.md\n").unwrap();
+        let status = Command::new("git")
+            .args(["config", "core.excludesFile", global.to_str().unwrap()])
+            .current_dir(&root)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git config core.excludesFile failed");
+        fs::write(root.join("notes.bak.md"), "ignored\n").unwrap();
+        fs::write(root.join("notes.md"), "kept\n").unwrap();
+
+        let report = discover_project_files_with_untracked(&root).unwrap();
+        let names: Vec<_> = report.files.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["notes.md", "tracked.md"]);
+    }
+
+    /// Worktree `.gitignore` patterns outrank `$GIT_DIR/info/exclude`: an
+    /// `info/exclude` negation cannot re-include a file a `.gitignore`
+    /// (higher-precedence) rule excludes.
+    #[test]
+    fn filesystem_walk_precedence_gitignore_beats_info_exclude() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path().to_path_buf();
+        git_init_with_commit(&root, "main", &[("tracked.rs", "fn tracked() {}\n")]);
+        pin_absent_global_excludes(&root);
+        fs::write(root.join(".gitignore"), "*.md\n").unwrap();
+        fs::create_dir_all(root.join(".git").join("info")).unwrap();
+        fs::write(root.join(".git").join("info").join("exclude"), "!keep.md\n").unwrap();
+        fs::write(root.join("keep.md"), "ignored\n").unwrap();
+
+        let report = discover_project_files_with_untracked(&root).unwrap();
+        let names: Vec<_> = report.files.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["tracked.rs"]);
+    }
+
+    /// `$GIT_DIR/info/exclude` outranks the global excludes file: an
+    /// `info/exclude` negation re-includes a file a global rule excludes.
+    #[test]
+    fn filesystem_walk_precedence_info_exclude_beats_global() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path().to_path_buf();
+        git_init_with_commit(&root, "main", &[("tracked.rs", "fn tracked() {}\n")]);
+        let global = tempdir.path().join("global-excludes");
+        fs::write(&global, "*.md\n").unwrap();
+        let status = Command::new("git")
+            .args(["config", "core.excludesFile", global.to_str().unwrap()])
+            .current_dir(&root)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git config core.excludesFile failed");
+        fs::create_dir_all(root.join(".git").join("info")).unwrap();
+        fs::write(root.join(".git").join("info").join("exclude"), "!keep.md\n").unwrap();
+        fs::write(root.join("keep.md"), "kept\n").unwrap();
+        fs::write(root.join("skip.md"), "ignored\n").unwrap();
+
+        let report = discover_project_files_with_untracked(&root).unwrap();
+        let names: Vec<_> = report.files.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["keep.md", "tracked.rs"]);
+    }
+
+    /// Git-index discovery never consults repository-level excludes: a tracked
+    /// file stays eligible even when `$GIT_DIR/info/exclude` names it, exactly
+    /// as git keeps tracked paths tracked.
+    #[test]
+    fn git_index_discovery_ignores_repo_excludes_for_tracked_files() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path().to_path_buf();
+        git_init_with_commit(
+            &root,
+            "main",
+            &[("tracked.md", "tracked\n"), ("docs/notes.md", "notes\n")],
+        );
+        fs::create_dir_all(root.join(".git").join("info")).unwrap();
+        fs::write(root.join(".git").join("info").join("exclude"), "tracked.md\n").unwrap();
+
+        let discovery = discover_project_sources(&root).unwrap();
+        assert_eq!(discovery.basis, ProjectSourceBasis::GitIndex);
+        let names: Vec<_> = discovery.sources.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["docs/notes.md", "tracked.md"]);
+        assert_eq!(discovery.skipped, 0);
+    }
+
+    /// The XDG fallback location for global excludes follows git's default
+    /// (`$XDG_CONFIG_HOME/git/ignore`, else `~/.config/git/ignore`).
+    #[test]
+    fn default_global_excludes_path_follows_xdg_then_home() {
+        assert_eq!(
+            default_global_excludes_path(Some("/custom/xdg"), Some(Path::new("/home/u"))),
+            PathBuf::from("/custom/xdg/git/ignore")
+        );
+        assert_eq!(
+            default_global_excludes_path(None, Some(Path::new("/home/u"))),
+            PathBuf::from("/home/u/.config/git/ignore")
+        );
+        assert_eq!(
+            default_global_excludes_path(Some(""), Some(Path::new("/home/u"))),
+            PathBuf::from("/home/u/.config/git/ignore")
+        );
     }
 
     #[test]

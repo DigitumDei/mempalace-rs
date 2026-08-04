@@ -161,10 +161,21 @@ valid UTF-8 always use the legacy stored-content path. Re-mining them with
   semantics: nested files are scoped to their own directory, `!` patterns
   re-include previously excluded paths, patterns containing a `/` are anchored
   to the ignore file's directory (unanchored patterns match the basename at any
-  depth), and `*`, `?`, `[...]`, and `**` globs follow git's rules. The
-  following directory names are always skipped: `.git`, `node_modules`,
-  `__pycache__`, `.venv`, `venv`, `env`, `dist`, `build`, `.next`, `coverage`,
-  `.mempalace`.
+  depth), and `*`, `?`, `[...]`, and `**` globs follow git's rules.
+
+Git-backed filesystem walks (branch-delta mines) additionally honor the
+repository-level exclude sources at git's precedence:
+`$GIT_DIR/info/exclude` and the global excludes file (`core.excludesFile`,
+defaulting to `$XDG_CONFIG_HOME/git/ignore`, or `~/.config/git/ignore`). As in
+git, per-directory `.gitignore` patterns outrank `info/exclude`, which outranks
+the global excludes file; these two repository-level sources are purely
+additive and never override the `.mempalaceignore` local protection.
+Repository-level excludes never apply to tracked index files: a tracked path
+stays eligible even when an exclude file names it.
+
+The following directory names are always skipped: `.git`, `node_modules`,
+`__pycache__`, `.venv`, `venv`, `env`, `dist`, `build`, `.next`, `coverage`,
+`.mempalace`.
 
 Linked Git worktrees reported by `git worktree list --porcelain` are always
 skipped, preventing duplicate checkout content from being mined.

@@ -34,6 +34,10 @@ Notes:
   checkouts use the tracked index, and non-Git directories use the
   ignore-aware filesystem walk, so ignored, untracked, and linked-worktree
   directories never produce rooms. A `general` room is always included.
+- The summary's file count reports the number of eligible project sources in
+  that same safe set — the files `mine` would actually ingest — rather than a
+  raw directory traversal, so ignored/untracked/secret-shaped files are not
+  counted.
 - The central registry is stored at `<base-dir>/projects.json` (normally
   `~/.mempalace/projects.json`) and uses normalized Git origin identity when
   available, with checkout paths as discovery aliases.

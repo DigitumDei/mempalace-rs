@@ -44,25 +44,6 @@ const STATUS_HEADER_WIDTH: usize = 55;
 const SEARCH_HEADER_WIDTH: usize = 60;
 const WAKE_UP_SEPARATOR_WIDTH: usize = 50;
 
-const SKIP_DIRS: &[&str] = &[
-    ".git",
-    "node_modules",
-    "__pycache__",
-    ".venv",
-    "venv",
-    "env",
-    "dist",
-    "build",
-    ".next",
-    "coverage",
-    ".mempalace",
-];
-
-const PROJECT_FILE_EXTENSIONS: &[&str] = &[
-    "txt", "md", "py", "js", "ts", "jsx", "tsx", "json", "yaml", "yml", "html", "css", "java",
-    "go", "rs", "rb", "sh", "csv", "sql", "toml",
-];
-
 const FOLDER_ROOM_MAP: &[(&str, &str)] = &[
     ("frontend", "frontend"),
     ("front_end", "frontend"),
@@ -580,8 +561,8 @@ where
         )
     })?;
 
-    let file_count = count_project_files(&project_dir).map_err(io_error)?;
     let detection = detect_rooms(&project_dir).map_err(ingest_error)?;
+    let file_count = detection.file_count;
     let config_path = project_dir.join("mempalace.yaml");
     let legacy_config_path = project_dir.join("mempal.yaml");
     let existing_config = config_path.exists() || legacy_config_path.exists();
@@ -2553,15 +2534,18 @@ fn read_global_config_file(
 struct RoomDetection {
     source: &'static str,
     rooms: Vec<ProjectRoomConfig>,
+    /// Number of eligible project sources the rooms were derived from.
+    file_count: usize,
 }
 
 fn detect_rooms(project_dir: &Path) -> mempalace_ingest::Result<RoomDetection> {
-    // Derive room candidates from the same safe source set mining uses
-    // (mempalace_ingest::discover_project_sources), so ignored, untracked, and
-    // linked-worktree directories never produce rooms. For Git-backed roots
-    // this is the tracked index; for non-Git roots it is the filesystem walk
-    // with git-compatible ignore handling.
+    // Derive room candidates and the reported file count from the same safe
+    // source set mining uses (mempalace_ingest::discover_project_sources), so
+    // ignored, untracked, and linked-worktree files never count or produce
+    // rooms. For Git-backed roots this is the tracked index; for non-Git roots
+    // it is the filesystem walk with git-compatible ignore handling.
     let discovery = mempalace_ingest::discover_project_sources(project_dir)?;
+    let file_count = discovery.sources.len();
     let mut discovered = BTreeMap::<String, BTreeSet<String>>::new();
 
     for source in &discovery.sources {
@@ -2613,7 +2597,7 @@ fn detect_rooms(project_dir: &Path) -> mempalace_ingest::Result<RoomDetection> {
     }
 
     deduped.sort_by(|left, right| left.name.cmp(&right.name));
-    Ok(RoomDetection { source, rooms: deduped })
+    Ok(RoomDetection { source, rooms: deduped, file_count })
 }
 
 fn record_room(discovered: &mut BTreeMap<String, BTreeSet<String>>, raw_name: &str) {
@@ -2690,34 +2674,6 @@ fn wing_ids_equal(left: &str, right: &str) -> bool {
         (Ok(left), Ok(right)) => left == right,
         _ => left.eq_ignore_ascii_case(right),
     }
-}
-
-fn count_project_files(project_dir: &Path) -> std::io::Result<usize> {
-    let mut total = 0usize;
-    let mut stack = vec![project_dir.to_path_buf()];
-
-    while let Some(dir) = stack.pop() {
-        for entry in fs::read_dir(dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            let file_type = entry.file_type()?;
-            let name = entry.file_name().to_string_lossy().to_string();
-
-            if file_type.is_dir() {
-                if !SKIP_DIRS.contains(&name.as_str()) {
-                    stack.push(path);
-                }
-                continue;
-            }
-
-            let extension = path.extension().and_then(|value| value.to_str()).unwrap_or_default();
-            if PROJECT_FILE_EXTENSIONS.contains(&extension) {
-                total += 1;
-            }
-        }
-    }
-
-    Ok(total)
 }
 
 fn default_embedding_cache_dir() -> PathBuf {
@@ -4099,6 +4055,7 @@ mod tests {
         assert!(names.contains(&"src"), "src room missing: {names:?}");
         assert!(!names.contains(&"ignored"), "ignored room must not be derived: {names:?}");
         assert!(!names.contains(&"untracked"), "untracked room must not be derived: {names:?}");
+        assert_eq!(detection.file_count, 2, "count must cover only eligible tracked sources");
     }
 
     /// A linked Git worktree inside the checkout is a duplicate repository and
@@ -4125,6 +4082,7 @@ mod tests {
         assert!(names.contains(&"documentation"), "documentation room missing: {names:?}");
         assert!(!names.contains(&"linked_wt"), "linked worktree room must not be derived: {names:?}");
         assert!(!names.contains(&"planning"), "worktree content room must not be derived: {names:?}");
+        assert_eq!(detection.file_count, 1, "linked-worktree files must not be counted");
     }
 
     /// Non-Git roots keep folder-based detection but honour ignore files.
@@ -4140,6 +4098,33 @@ mod tests {
         let names: Vec<_> = detection.rooms.iter().map(|room| room.name.clone()).collect();
         assert!(names.contains(&"src"), "src room missing: {names:?}");
         assert!(!names.contains(&"ignored"), "ignored room must not be derived: {names:?}");
+        assert_eq!(detection.file_count, 1, "ignored files must not be counted");
+    }
+
+    /// The `init` summary count reflects the same safe source set that rooms are
+    /// derived from, so ignored/untracked working-tree files are not counted.
+    #[test]
+    fn init_reports_eligible_source_count_not_directory_traversal() {
+        let workspace = tempdir().unwrap();
+        let repo = workspace.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        git_init_repo(&repo, &[("docs/roadmap.md", "roadmap\n")]);
+        write_file(&repo.join(".gitignore"), "ignored/\n");
+        write_file(&repo.join("ignored/secret.md"), "secret\n");
+        write_file(&repo.join("untracked/scratch.md"), "scratch\n");
+
+        let config_root = temp_config_root("init-count");
+        let context = CliContext::for_tests(config_root.clone());
+        let output =
+            run_cli(["init", repo.to_str().unwrap(), "--yes"], &context, stub_provider).unwrap();
+        assert_eq!(output.exit_code, 0, "{}", output.stderr);
+        assert!(
+            output.stdout.contains("(1 files found"),
+            "init must count only the eligible tracked source: {}",
+            output.stdout
+        );
+
+        remove_dir_all_if_exists(&config_root);
     }
 
     #[test]

@@ -125,6 +125,10 @@ Behavior:
   `$GIT_DIR/info/exclude` too — both repository-level sources at git's
   precedence. Linked git worktrees are always excluded from mining. See
   [Mined-Storage.md#discovery-rules](Mined-Storage.md#discovery-rules).
+- A canonical mine's `Files discovered` count is the same effective source
+  population that `init` and `project register` report, so the three commands
+  agree on what would be ingested. Branch-delta mines are the deliberate
+  exception: their filesystem walk also picks up untracked, non-ignored files.
 - Project resolution checks explicit CLI values, optional repository-local
   config, the central project registry, and then derived defaults. A project
   can therefore be mined without `mempalace.yaml`.
@@ -152,6 +156,13 @@ Commands:
 
 `project register --repo-config` additionally emits a portable repository-local
 `mempalace.yaml`.
+
+`project register` derives rooms from the same safe source set `init` and a
+canonical mine use (tracked index for Git-backed roots, the ignore-aware
+filesystem walk otherwise), and its output reports the same eligible source
+count as `init`'s summary — the files a canonical mine would actually ingest —
+so ignored, untracked, and linked-worktree files are neither counted nor turned
+into rooms.
 
 ### `search <query>`
 

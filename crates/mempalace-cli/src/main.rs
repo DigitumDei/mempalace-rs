@@ -656,7 +656,7 @@ where
         "=".repeat(INIT_HEADER_WIDTH),
         String::new(),
         format!("  WING: {}", project_config.wing),
-        format!("  ({} files found, rooms detected from {})", file_count, detection.source),
+        render_source_population_line(file_count, detection.source),
         String::new(),
     ];
 
@@ -698,7 +698,8 @@ fn execute_project_command(
                     format!("failed to access project directory `{}`: {source}", dir.display()),
                 )
             })?;
-            let detection = detect_rooms(&project_dir).map_err(ingest_error)?;
+            let RoomDetection { source, rooms, file_count } =
+                detect_rooms(&project_dir).map_err(ingest_error)?;
             let mut project_config = if project_dir.join("mempalace.yaml").exists()
                 || project_dir.join("mempal.yaml").exists()
             {
@@ -712,7 +713,7 @@ fn execute_project_command(
                     context.config_base_dir.as_deref(),
                     Some(&candidate_project_id),
                     &derived_wing,
-                    detection.rooms,
+                    rooms,
                 )
                 .map_err(config_error)?
             };
@@ -786,6 +787,7 @@ fn execute_project_command(
             let mut lines = vec![
                 format!("Project registered: {project_id}"),
                 format!("  Wing: {}", project_config.wing),
+                render_source_population_line(file_count, source),
                 format!("  Registry: {}", registry_path.display()),
             ];
             if repo_config {
@@ -2445,6 +2447,13 @@ fn render_secret_skip_lines(skips: &[ProjectSourceSkip]) -> Vec<String> {
         format!("    {} — secret-shaped path ({})", skip.relative_path, skip.reason)
     }));
     lines
+}
+
+/// The "N files found, rooms detected from <source>" summary line shared by
+/// `init` and `project register`, so both report the same effective source
+/// population that a canonical mine ingests.
+fn render_source_population_line(file_count: usize, source: &'static str) -> String {
+    format!("  ({file_count} files found, rooms detected from {source})")
 }
 
 fn deferred_command(command: &str) -> CliOutput {
@@ -4122,6 +4131,57 @@ mod tests {
             output.stdout.contains("(1 files found"),
             "init must count only the eligible tracked source: {}",
             output.stdout
+        );
+
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    /// `init`, `project register`, and a canonical mine all report the same
+    /// eligible source population (issues #95/#96): for a Git-backed root that
+    /// is the tracked index, so ignored and untracked working-tree files are
+    /// neither counted nor mined.
+    #[test]
+    fn init_register_and_mine_report_the_same_eligible_source_count() {
+        let workspace = tempdir().unwrap();
+        let repo = workspace.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        git_init_repo(&repo, &[("docs/roadmap.md", "roadmap\n"), ("src/lib.rs", "fn lib() {}\n")]);
+        write_file(&repo.join(".gitignore"), "ignored/\n");
+        write_file(&repo.join("ignored/secret.md"), "secret\n");
+        write_file(&repo.join("untracked/scratch.md"), "scratch\n");
+
+        let config_root = temp_config_root("same-population");
+        let context = CliContext::for_tests(config_root.clone());
+
+        let init =
+            run_cli(["init", repo.to_str().unwrap(), "--yes"], &context, stub_provider).unwrap();
+        assert_eq!(init.exit_code, 0, "{}", init.stderr);
+        assert!(init.stdout.contains("(2 files found"), "init: {}", init.stdout);
+
+        let register = run_cli(
+            ["project", "register", repo.to_str().unwrap()],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+        assert_eq!(register.exit_code, 0, "{}", register.stderr);
+        assert!(
+            register.stdout.contains("(2 files found"),
+            "register must report the same eligible source count: {}",
+            register.stdout
+        );
+
+        let mine = run_cli(
+            ["mine", repo.to_str().unwrap(), "--dry-run", "--full"],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+        assert_eq!(mine.exit_code, 0, "{}", mine.stderr);
+        assert!(
+            mine.stdout.contains("Files discovered: 2"),
+            "mine must discover the same eligible sources: {}",
+            mine.stdout
         );
 
         remove_dir_all_if_exists(&config_root);

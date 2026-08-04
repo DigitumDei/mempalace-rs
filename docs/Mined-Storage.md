@@ -192,7 +192,11 @@ skipped, preventing duplicate checkout content from being mined.
 
 Room detection during `init` and `project register` uses the same safe source
 set: rooms are derived from the directories that hold eligible sources, so
-ignored, untracked, and linked-worktree directories never produce rooms.
+ignored, untracked, and linked-worktree directories never produce rooms. Both
+commands also report the same eligible source count — the number of files in
+that safe set — which matches the `Files discovered` line of a canonical
+`mine` (branch-delta mines deliberately add untracked, non-ignored files and so
+report a larger set).
 
 ### Accepted extensions
 

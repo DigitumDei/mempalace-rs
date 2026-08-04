@@ -142,13 +142,22 @@ valid UTF-8 always use the legacy stored-content path. Re-mining them with
 
 ## Discovery rules
 
-`mine --mode projects` uses the following acceptance rules on every file found
-under the target directory. `.gitignore` and `.mempalaceignore` files are
-honored throughout, and the following directory names are always skipped:
-`.git`, `node_modules`, `__pycache__`, `.venv`, `venv`, `env`, `dist`, `build`,
-`.next`, `coverage`, `.mempalace`. Linked Git worktrees reported by
-`git worktree list --porcelain` are also skipped, preventing duplicate checkout
-content from being mined.
+`mine --mode projects` discovers eligible sources in one of two ways:
+
+- **Git-backed roots** enumerate the tracked index (`git ls-files`): only
+  committed files are mined. Ignored and untracked working-tree content
+  (`.gitignore`d files such as `.env`, local editor overrides like
+  `*.local.json`, and build output) never enters the source set. Branch-delta
+  mines (`--branch` / `--view <name>`) are the deliberate exception: they also
+  include untracked, non-ignored files so that new branch work is captured
+  before it is committed.
+- **Non-Git directories** use a filesystem walk. `.gitignore` and
+  `.mempalaceignore` files are honored, and the following directory names are
+  always skipped: `.git`, `node_modules`, `__pycache__`, `.venv`, `venv`,
+  `env`, `dist`, `build`, `.next`, `coverage`, `.mempalace`.
+
+Linked Git worktrees reported by `git worktree list --porcelain` are always
+skipped, preventing duplicate checkout content from being mined.
 
 ### Accepted extensions
 

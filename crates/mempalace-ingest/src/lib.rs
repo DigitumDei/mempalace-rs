@@ -476,10 +476,36 @@ struct IgnoreMatcher {
     rules: Vec<IgnoreRule>,
 }
 
+/// A single eligible project source path.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct DiscoveredSource {
-    absolute_path: PathBuf,
-    relative_path: String,
+pub struct ProjectSource {
+    /// Absolute path to the source on disk.
+    pub absolute_path: PathBuf,
+    /// Repository-relative path, `/`-separated, relative to the discovery root.
+    pub relative_path: String,
+}
+
+/// The source set that produced a [`ProjectSourceDiscovery`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectSourceBasis {
+    /// Git-backed root: the eligible subset of tracked index paths
+    /// (`git ls-files`). Untracked and ignored working-tree files are never
+    /// eligible.
+    GitIndex,
+    /// Non-Git root: a filesystem walk honouring git-compatible ignore rules.
+    Filesystem,
+}
+
+/// Result of [`discover_project_sources`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectSourceDiscovery {
+    /// Eligible sources, sorted by `relative_path` (deterministic order).
+    pub sources: Vec<ProjectSource>,
+    /// Which source set produced `sources`.
+    pub basis: ProjectSourceBasis,
+    /// Number of candidate paths skipped (ignored, ineligible, or missing on
+    /// disk).
+    pub skipped: usize,
 }
 
 /// A single chunk produced by [`prepare_file_chunks`], with all byte/line
@@ -579,7 +605,14 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
         })),
         false => None,
     };
-    let discovered = discover_project_files(&root)?;
+    // Branch-delta mining deliberately mines untracked (non-ignored) files, so
+    // it keeps the filesystem walk; canonical mines use the safe tracked-index
+    // source set.
+    let discovered = if branch_mode {
+        discover_project_files_with_untracked(&root)?
+    } else {
+        discover_project_files(&root)?
+    };
     let routing_fingerprint = project_routing_fingerprint(&config.rooms);
 
     // Resolve the git commit hash once per mine run (None if not in a repo).
@@ -629,7 +662,7 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
         discovered.files
     };
 
-    let files: Vec<DiscoveredSource> = apply_limit(discovered_files, request.limit).collect();
+    let files: Vec<ProjectSource> = apply_limit(discovered_files, request.limit).collect();
 
     for file in &files {
         match prepare_file_chunks(file, &routing_fingerprint, &config.rooms) {
@@ -1181,7 +1214,7 @@ async fn replace_source_drawers(
 /// chunking will have an empty `chunks` vec — the caller handles the
 /// replace-with-empty semantics.
 fn prepare_file_chunks(
-    file: &DiscoveredSource,
+    file: &ProjectSource,
     routing_fingerprint: &str,
     rooms: &[ProjectRoomConfig],
 ) -> Result<PreparedFileChunks> {
@@ -1736,7 +1769,7 @@ pub fn prepare_project_batch_with_config(
         .filter(|view| *view != "canonical")
         .map(str::to_owned);
 
-    let files_to_process: Vec<DiscoveredSource> =
+    let files_to_process: Vec<ProjectSource> =
         apply_limit(discovered.files, request.limit).collect();
     let mut file_dtos: Vec<IngestFileDto> = Vec::new();
 
@@ -1964,26 +1997,157 @@ fn has_shebang(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn discover_project_files(root: &Path) -> Result<DiscoveryReport> {
-    let extension_set = PROJECT_READABLE_EXTENSIONS.iter().copied().collect::<BTreeSet<_>>();
-    discover_files(root, true, |path, file_name| {
-        // Secrets / lockfile hygiene (includes the .env prefix rule).
-        if project_file_skip_by_name(file_name) {
-            return false;
+/// Discover the safe set of eligible project sources under `root`.
+///
+/// For Git-backed roots the eligible sources are the project-readable subset of
+/// tracked index paths (`git ls-files`), so ignored and untracked working-tree
+/// files are never mined. For non-Git directories a filesystem walk with
+/// git-compatible ignore handling is used. Sources are sorted by relative path
+/// (deterministic order), are relative to `root`, and linked Git worktrees are
+/// always excluded.
+pub fn discover_project_sources(root: &Path) -> Result<ProjectSourceDiscovery> {
+    let root = root
+        .canonicalize()
+        .map_err(|source| IngestError::Io { path: root.to_path_buf(), source })?;
+    if git_is_backed(&root) {
+        discover_git_index_sources(&root)
+    } else {
+        discover_filesystem_sources(&root)
+    }
+}
+
+/// Returns `true` when `root` is inside a Git work tree whose tracked index
+/// paths can be enumerated with `git ls-files`.
+fn git_is_backed(root: &Path) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .output()
+        .ok()
+        .is_some_and(|output| {
+            output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "true"
+        })
+}
+
+/// Enumerate the tracked index paths under `root` and keep the project-eligible
+/// subset.
+fn discover_git_index_sources(root: &Path) -> Result<ProjectSourceDiscovery> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "-z"])
+        .output()
+        .map_err(|source| IngestError::Io { path: root.to_path_buf(), source })?;
+    if !output.status.success() {
+        // `ls-files` failed despite `rev-parse` succeeding — fall back to a
+        // filesystem walk rather than aborting the mine.
+        return discover_filesystem_sources(root);
+    }
+
+    let ignore_matcher = IgnoreMatcher::load(root)?;
+    let worktree_skip = linked_worktree_paths(root);
+    let mut skipped = 0usize;
+    let mut sources = Vec::new();
+
+    for entry in output.stdout.split(|byte| *byte == b'\0') {
+        if entry.is_empty() {
+            continue;
         }
+        let relative = match path_from_git_bytes(entry) {
+            Some(relative) => relative,
+            // Undecodable path bytes (non-UTF-8 on platforms where git emits
+            // text) can't be represented in the String-based relative model.
+            None => {
+                skipped += 1;
+                continue;
+            }
+        };
+        let relative_str = relative.to_string_lossy();
+        let absolute = root.join(&relative);
 
-        let raw_ext = path.extension().and_then(|value| value.to_str()).unwrap_or_default();
-        let has_ext = !raw_ext.is_empty();
-        let normalized_suffix = format!(".{}", raw_ext.to_ascii_lowercase());
+        let file_type = match fs::metadata(&absolute) {
+            Ok(metadata) => metadata,
+            // The index can still name a file that has been deleted from the
+            // working tree since it was staged.
+            Err(_) => {
+                skipped += 1;
+                continue;
+            }
+        };
+        if !file_type.is_file() {
+            // Submodules (gitlinks) and other non-file index entries.
+            skipped += 1;
+            continue;
+        }
+        // Linked Git worktrees are separate checkouts; the main index never
+        // lists their files, but keep the exclusion explicit and defensive.
+        if worktree_skip.contains(&absolute) {
+            skipped += 1;
+            continue;
+        }
+        if ignore_matcher.matches(relative_str.as_ref(), false) {
+            skipped += 1;
+            continue;
+        }
+        let file_name =
+            relative.file_name().and_then(|value| value.to_str()).unwrap_or_default();
+        if !is_project_eligible(&absolute, file_name) {
+            skipped += 1;
+            continue;
+        }
+        sources.push(ProjectSource {
+            absolute_path: absolute,
+            relative_path: relative_str.into_owned(),
+        });
+    }
 
-        let accepted = (has_ext && extension_set.contains(normalized_suffix.as_str()))
-            || (!has_ext
-                && (PROJECT_READABLE_BASENAMES.contains(&file_name) || has_shebang(path)));
+    sources.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    Ok(ProjectSourceDiscovery { sources, basis: ProjectSourceBasis::GitIndex, skipped })
+}
 
-        // Binary sniff: exclude files with a NUL byte in the first 8 KiB even
-        // when the extension claims text (misnamed binaries).
-        accepted && !looks_binary(path)
+/// Walk `root` with git-compatible ignore handling, keeping the project-eligible
+/// subset. Used for non-Git roots.
+fn discover_filesystem_sources(root: &Path) -> Result<ProjectSourceDiscovery> {
+    let report = discover_files(root, true, is_project_eligible)?;
+    Ok(ProjectSourceDiscovery {
+        sources: report.files,
+        basis: ProjectSourceBasis::Filesystem,
+        skipped: report.ignored_files,
     })
+}
+
+/// Returns `true` when `path` (with `file_name`) is eligible for project mining:
+/// not a secret or lockfile, accepted extension or basename (or shebang), and
+/// not binary-sniffed.
+fn is_project_eligible(path: &Path, file_name: &str) -> bool {
+    if project_file_skip_by_name(file_name) {
+        return false;
+    }
+    let raw_ext = path.extension().and_then(|value| value.to_str()).unwrap_or_default();
+    let has_ext = !raw_ext.is_empty();
+    let normalized_suffix = format!(".{}", raw_ext.to_ascii_lowercase());
+    let accepted = (has_ext && PROJECT_READABLE_EXTENSIONS.contains(&normalized_suffix.as_str()))
+        || (!has_ext
+            && (PROJECT_READABLE_BASENAMES.contains(&file_name) || has_shebang(path)));
+    // Binary sniff: exclude files with a NUL byte in the first 8 KiB even
+    // when the extension claims text (misnamed binaries).
+    accepted && !looks_binary(path)
+}
+
+/// Internal discovery used by project mining and remote batch preparation.
+/// Mirrors [`discover_project_sources`] and reports into the legacy shape.
+fn discover_project_files(root: &Path) -> Result<DiscoveryReport> {
+    let discovery = discover_project_sources(root)?;
+    Ok(DiscoveryReport { files: discovery.sources, ignored_files: discovery.skipped })
+}
+
+/// Discovery used by branch-delta mining, which deliberately mines untracked
+/// (non-ignored) working-tree files in addition to changed tracked files.
+/// Keeps the filesystem walk with git-compatible ignore handling; linked Git
+/// worktrees are still skipped.
+fn discover_project_files_with_untracked(root: &Path) -> Result<DiscoveryReport> {
+    discover_files(root, true, is_project_eligible)
 }
 
 fn discover_conversation_files(root: &Path) -> Result<DiscoveryReport> {
@@ -1996,9 +2160,9 @@ fn discover_conversation_files(root: &Path) -> Result<DiscoveryReport> {
 }
 
 fn apply_limit(
-    files: Vec<DiscoveredSource>,
+    files: Vec<ProjectSource>,
     limit: Option<usize>,
-) -> Box<dyn Iterator<Item = DiscoveredSource>> {
+) -> Box<dyn Iterator<Item = ProjectSource>> {
     match limit {
         Some(limit) => Box::new(files.into_iter().take(limit)),
         None => Box::new(files.into_iter()),
@@ -2007,7 +2171,7 @@ fn apply_limit(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DiscoveryReport {
-    files: Vec<DiscoveredSource>,
+    files: Vec<ProjectSource>,
     ignored_files: usize,
 }
 
@@ -2124,7 +2288,7 @@ fn discover_files(
                 continue;
             }
 
-            files.push(DiscoveredSource { absolute_path: path, relative_path: relative });
+            files.push(ProjectSource { absolute_path: path, relative_path: relative });
         }
     }
 
@@ -5375,9 +5539,16 @@ mod tests {
         // Drop a file inside the linked worktree.
         fs::write(worktree_dir.join("extra.rs"), "fn extra() {}\n").unwrap();
 
-        // Also create a sibling directory that is NOT a worktree.
+        // Also create a sibling directory that is NOT a worktree, and track it
+        // so it is part of the safe (tracked-index) source set.
         fs::create_dir_all(root.join("sibling")).unwrap();
         fs::write(root.join("sibling").join("sibling.rs"), "fn sibling() {}\n").unwrap();
+        let status = Command::new("git")
+            .args(["add", "sibling/sibling.rs"])
+            .current_dir(&root)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git add sibling/sibling.rs failed");
 
         let report = discover_project_files(&root).unwrap();
         let names: Vec<_> = report.files.iter().map(|f| f.relative_path.as_str()).collect();
@@ -5398,11 +5569,17 @@ mod tests {
             "worktree/extra.rs must be skipped: {names:?}"
         );
 
-        // The linked worktree directory itself counts as ignored.
+        // The linked worktree is a known excluded checkout, and its untracked
+        // content never enters the safe source set (nothing mined under it).
+        let worktree_dir_canon =
+            worktree_dir.canonicalize().unwrap_or_else(|_| worktree_dir.clone());
         assert!(
-            report.ignored_files >= 1,
-            "expected at least 1 ignored file (the linked worktree), got {}",
-            report.ignored_files
+            linked_worktree_paths(&root).contains(&worktree_dir_canon),
+            "linked worktree path must be excluded by discovery"
+        );
+        assert!(
+            names.iter().all(|name| !name.starts_with("worktree/")),
+            "no linked-worktree paths may be discovered: {names:?}"
         );
 
         // Clean up the linked worktree so tempdir removal doesn't trip over it.
@@ -5494,6 +5671,121 @@ mod tests {
             .collect::<BTreeSet<_>>();
 
         assert!(paths.contains(&worktree_dir));
+    }
+
+    // ─── Centralized project-source discovery tests ──────────────────────────
+
+    /// Git-backed roots enumerate tracked index paths only: untracked and
+    /// gitignored working-tree files never enter the source set.
+    #[test]
+    fn git_index_discovery_uses_tracked_sources_only() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path().to_path_buf();
+        git_init_with_commit(
+            &root,
+            "main",
+            &[("tracked.md", "tracked\n"), ("main.rs", "fn main() {}\n")],
+        );
+
+        // Untracked working-tree content: an ignored secret, an ignored local
+        // override (not in the built-in skip list), and a plain file.
+        fs::write(root.join(".env"), "SECRET=hunter2\n").unwrap();
+        fs::write(root.join("secrets.local.json"), "{\"key\":\"hunter2\"}\n").unwrap();
+        fs::write(root.join(".gitignore"), ".env\nsecrets.local.json\n").unwrap();
+        fs::write(root.join("scratch.rs"), "fn scratch() {}\n").unwrap();
+
+        let discovery = discover_project_sources(&root).unwrap();
+        assert_eq!(discovery.basis, ProjectSourceBasis::GitIndex);
+        let names: Vec<_> = discovery.sources.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["main.rs", "tracked.md"]);
+        assert!(!names.contains(&".env"));
+        assert!(!names.contains(&"secrets.local.json"));
+        assert!(!names.contains(&"scratch.rs"));
+        // The gitignored/untracked files are simply absent from the index, not
+        // counted as skipped candidates.
+        assert_eq!(discovery.skipped, 0);
+    }
+
+    /// .mempalaceignore still applies to tracked files in git-index mode.
+    #[test]
+    fn git_index_discovery_honors_mempalace_ignore_for_tracked_files() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path().to_path_buf();
+        git_init_with_commit(
+            &root,
+            "main",
+            &[("tracked.md", "tracked\n"), ("main.rs", "fn main() {}\n")],
+        );
+        fs::write(root.join(".mempalaceignore"), "main.rs\n").unwrap();
+
+        let discovery = discover_project_sources(&root).unwrap();
+        assert_eq!(discovery.basis, ProjectSourceBasis::GitIndex);
+        let names: Vec<_> = discovery.sources.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["tracked.md"]);
+        assert_eq!(discovery.skipped, 1);
+    }
+
+    /// A tracked file deleted from the working tree is skipped, not mined.
+    #[test]
+    fn git_index_discovery_skips_tracked_file_missing_on_disk() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path().to_path_buf();
+        git_init_with_commit(
+            &root,
+            "main",
+            &[("tracked.md", "tracked\n"), ("gone.rs", "fn gone() {}\n")],
+        );
+        fs::remove_file(root.join("gone.rs")).unwrap();
+
+        let discovery = discover_project_sources(&root).unwrap();
+        assert_eq!(discovery.basis, ProjectSourceBasis::GitIndex);
+        let names: Vec<_> = discovery.sources.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["tracked.md"]);
+        assert_eq!(discovery.skipped, 1);
+    }
+
+    /// Git-index discovery is deterministic (sorted) and root-relative.
+    #[test]
+    fn git_index_discovery_is_deterministic_and_root_relative() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path().to_path_buf();
+        git_init_with_commit(
+            &root,
+            "main",
+            &[
+                ("zebra.md", "z\n"),
+                ("alpha/src/lib.rs", "fn lib() {}\n"),
+                ("mid/dir/beta.md", "b\n"),
+            ],
+        );
+
+        let discovery = discover_project_sources(&root).unwrap();
+        assert_eq!(discovery.basis, ProjectSourceBasis::GitIndex);
+        let names: Vec<_> = discovery.sources.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["alpha/src/lib.rs", "mid/dir/beta.md", "zebra.md"]);
+        for source in &discovery.sources {
+            assert!(
+                source.absolute_path.starts_with(&root),
+                "absolute path for {}",
+                source.relative_path
+            );
+        }
+    }
+
+    /// Non-Git roots keep the filesystem walk and report the Filesystem basis.
+    #[test]
+    fn discover_project_sources_reports_filesystem_basis_for_non_git() {
+        let tempdir = tempdir().unwrap();
+        fs::write(tempdir.path().join(".gitignore"), "ignored/\n").unwrap();
+        fs::create_dir_all(tempdir.path().join("ignored")).unwrap();
+        fs::write(tempdir.path().join("ignored").join("secret.md"), "hidden").unwrap();
+        fs::write(tempdir.path().join("keep").join("visible.md"), "visible").unwrap();
+
+        let discovery = discover_project_sources(tempdir.path()).unwrap();
+        assert_eq!(discovery.basis, ProjectSourceBasis::Filesystem);
+        let names: Vec<_> = discovery.sources.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["keep/visible.md"]);
+        assert!(discovery.skipped >= 2);
     }
 
     #[test]

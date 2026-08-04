@@ -97,6 +97,14 @@ Automatic view detection (`--mode projects` only):
 Behavior:
 - `projects` uses the project ingest path.
 - `convos` uses the conversation ingest path.
+- In `projects` mode, source discovery honours git: a Git-backed root mines the
+  tracked index only (`git ls-files`), so ignored and untracked working-tree
+  files (e.g. `.env`, `*.local.json`, build output) are never ingested.
+  Non-Git directories fall back to a filesystem walk that honours `.gitignore`
+  and `.mempalaceignore`. Branch-delta mines (`--branch` / `--view <name>`)
+  are the exception: they additionally include untracked, non-ignored files.
+  Linked git worktrees are always excluded from mining. See
+  [Mined-Storage.md#discovery-rules](Mined-Storage.md#discovery-rules).
 - Project resolution checks explicit CLI values, optional repository-local
   config, the central project registry, and then derived defaults. A project
   can therefore be mined without `mempalace.yaml`.

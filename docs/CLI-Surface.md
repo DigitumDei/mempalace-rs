@@ -32,8 +32,10 @@ Notes:
 - Wing name is derived from the directory name, lowercased with spaces and hyphens normalized to underscores.
 - Room detection derives from the same safe source set mining uses: Git-backed
   checkouts use the tracked index, and non-Git directories use the
-  ignore-aware filesystem walk, so ignored, untracked, and linked-worktree
-  directories never produce rooms. A `general` room is always included.
+  ignore-aware filesystem walk, so ignored, untracked, secret-shaped, and
+  linked-worktree files never produce rooms. A Git-backed root whose index
+  cannot be enumerated fails discovery rather than silently falling back to a
+  filesystem walk. A `general` room is always included.
 - The summary's file count reports the number of eligible project sources in
   that same safe set — the files `mine` would actually ingest — rather than a
   raw directory traversal, so ignored/untracked/secret-shaped files are not
@@ -123,7 +125,11 @@ Behavior:
   (`--branch` / `--view <name>`) are the exception: they additionally include
   untracked, non-ignored files, and their filesystem walk honours
   `$GIT_DIR/info/exclude` too — both repository-level sources at git's
-  precedence. Linked git worktrees are always excluded from mining. See
+  precedence. Linked git worktrees are always excluded from mining. A
+  Git-backed root whose index cannot be enumerated fails discovery with a
+  `GitIndexUnavailable` error rather than falling back to a filesystem walk, so
+  a git-read failure can never leak untracked or ignored content into a
+  canonical mine. See
   [Mined-Storage.md#discovery-rules](Mined-Storage.md#discovery-rules).
 - A canonical mine's `Files discovered` count is the same effective source
   population that `init` and `project register` report, so the three commands
@@ -161,8 +167,8 @@ Commands:
 canonical mine use (tracked index for Git-backed roots, the ignore-aware
 filesystem walk otherwise), and its output reports the same eligible source
 count as `init`'s summary — the files a canonical mine would actually ingest —
-so ignored, untracked, and linked-worktree files are neither counted nor turned
-into rooms.
+so ignored, untracked, secret-shaped, and linked-worktree files are neither
+counted nor turned into rooms.
 
 ### `search <query>`
 

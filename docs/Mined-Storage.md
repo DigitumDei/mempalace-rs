@@ -159,6 +159,14 @@ valid UTF-8 always use the legacy stored-content path. Re-mining them with
   mines (`--branch` / `--view <name>`) are the deliberate exception: they also
   include untracked, non-ignored files so that new branch work is captured
   before it is committed.
+
+  The tracked-index guarantee is strict: a Git-backed root whose index cannot be
+  enumerated (`git ls-files` failure) fails discovery with a `GitIndexUnavailable`
+  error rather than silently falling back to a filesystem walk, so untracked or
+  ignored working-tree content can never leak into a canonical mine through a
+  failed git read. In this canonical path the filesystem walk is used only for
+  roots that are not Git-backed.
+
 - **Non-Git directories** use a filesystem walk that honors `.gitignore` and
   `.mempalaceignore` files at every directory level with git-compatible
   semantics: nested files are scoped to their own directory, `!` patterns
@@ -192,11 +200,11 @@ skipped, preventing duplicate checkout content from being mined.
 
 Room detection during `init` and `project register` uses the same safe source
 set: rooms are derived from the directories that hold eligible sources, so
-ignored, untracked, and linked-worktree directories never produce rooms. Both
-commands also report the same eligible source count — the number of files in
-that safe set — which matches the `Files discovered` line of a canonical
-`mine` (branch-delta mines deliberately add untracked, non-ignored files and so
-report a larger set).
+ignored, untracked, secret-shaped, and linked-worktree files never produce
+rooms. Both commands also report the same eligible source count — the number of
+files in that safe set — which matches the `Files discovered` line of a
+canonical `mine` (branch-delta mines deliberately add untracked, non-ignored
+files and so report a larger set).
 
 ### Accepted extensions
 

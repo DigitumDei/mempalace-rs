@@ -106,12 +106,12 @@ Behavior:
   `.gitignore` never suppresses a tracked file; `.mempalaceignore` is the
   explicit additional exclusion. Non-Git directories fall back to a filesystem
   walk that honours `.gitignore` and `.mempalaceignore` at every level with
-  git-compatible semantics (nesting, `!` negation, anchoring, and globs).
-  Branch-delta mines (`--branch` / `--view <name>`) are the exception: they
-  additionally include untracked, non-ignored files, and their filesystem walk
-  honours the repository-level excludes too — `$GIT_DIR/info/exclude` and the
-  global excludes file (`core.excludesFile`) at git's precedence. Linked git
-  worktrees are always excluded from mining. See
+  git-compatible semantics (nesting, `!` negation, anchoring, and globs) plus
+  the `core.excludesFile` global excludes file. Branch-delta mines
+  (`--branch` / `--view <name>`) are the exception: they additionally include
+  untracked, non-ignored files, and their filesystem walk honours
+  `$GIT_DIR/info/exclude` too — both repository-level sources at git's
+  precedence. Linked git worktrees are always excluded from mining. See
   [Mined-Storage.md#discovery-rules](Mined-Storage.md#discovery-rules).
 - Project resolution checks explicit CLI values, optional repository-local
   config, the central project registry, and then derived defaults. A project

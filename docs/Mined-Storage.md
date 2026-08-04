@@ -161,17 +161,19 @@ valid UTF-8 always use the legacy stored-content path. Re-mining them with
   semantics: nested files are scoped to their own directory, `!` patterns
   re-include previously excluded paths, patterns containing a `/` are anchored
   to the ignore file's directory (unanchored patterns match the basename at any
-  depth), and `*`, `?`, `[...]`, and `**` globs follow git's rules. Two
-  git-only details are preserved exactly: a trailing `/**` matches everything
-  *inside* the named directory but not the directory itself (so
-  `abc/**` + `!abc/keep.md` keeps `abc/keep.md`, as in git), and a trailing
+  depth), and `*`, `?`, `[...]`, and `**` globs follow git's rules. Git-only
+  details are preserved exactly: a leading `\#` or `\!` escapes a literal
+  hash/bang that would otherwise open a comment or a negation, a trailing `/**`
+  matches everything *inside* the named directory but not the directory itself
+  (so `abc/**` + `!abc/keep.md` keeps `abc/keep.md`, as in git), and a trailing
   space is ignored unless it is escaped (`foo\ ` targets a filename literally
-  ending in a space).
+  ending in a space). The global excludes file (`core.excludesFile`, defaulting
+  to `$XDG_CONFIG_HOME/git/ignore`, or `~/.config/git/ignore`) also applies,
+  since it is user-level git configuration rather than a repository concept.
 
-Git-backed filesystem walks (branch-delta mines) additionally honor the
-repository-level exclude sources at git's precedence:
-`$GIT_DIR/info/exclude` and the global excludes file (`core.excludesFile`,
-defaulting to `$XDG_CONFIG_HOME/git/ignore`, or `~/.config/git/ignore`). As in
+The repository-level exclude sources are honored at git's precedence:
+`$GIT_DIR/info/exclude` (Git-backed roots only) and the global excludes file
+(`core.excludesFile`) for every filesystem walk, including non-Git roots. As in
 git, per-directory `.gitignore` patterns outrank `info/exclude`, which outranks
 the global excludes file; these two repository-level sources are purely
 additive and never override the `.mempalaceignore` local protection.

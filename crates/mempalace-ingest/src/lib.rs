@@ -505,8 +505,9 @@ enum IgnoreTier {
 
 /// Git-compatible ignore matcher: `.gitignore`/`.mempalaceignore` patterns
 /// with nested-file scoping, negation, and glob/anchoring semantics, plus
-/// `$GIT_DIR/info/exclude` and the `core.excludesFile` global file at the
-/// correct precedence, and the built-in always-skipped directories.
+/// `$GIT_DIR/info/exclude` (Git-backed roots only) and the
+/// `core.excludesFile` global file (any walk) at the correct precedence, and
+/// the built-in always-skipped directories.
 #[derive(Debug, Clone)]
 struct IgnoreMatcher {
     /// Absolute root all relative paths are resolved against.
@@ -2049,10 +2050,11 @@ fn has_shebang(path: &Path) -> bool {
 /// `.mempalaceignore` is the explicit additional exclusion. For non-Git
 /// directories a filesystem walk with git-compatible ignore handling
 /// (nested `.gitignore`/`.mempalaceignore` files, `!` negation, anchoring, and
-/// globs) is used. Git-backed filesystem walks — the branch-delta mine — also
-/// honour `$GIT_DIR/info/exclude` and the `core.excludesFile` global file at
-/// git's precedence. Sources are sorted by relative path (deterministic order),
-/// are relative to `root`, and linked Git worktrees are always excluded.
+/// globs) is used, honouring the `core.excludesFile` global excludes file.
+/// Git-backed filesystem walks — the branch-delta mine — also honour
+/// `$GIT_DIR/info/exclude` at git's precedence. Sources are sorted by relative
+/// path (deterministic order), are relative to `root`, and linked Git worktrees
+/// are always excluded.
 pub fn discover_project_sources(root: &Path) -> Result<ProjectSourceDiscovery> {
     let root = root
         .canonicalize()
@@ -2262,7 +2264,8 @@ fn discover_git_index_sources(root: &Path) -> Result<ProjectSourceDiscovery> {
 }
 
 /// Walk `root` with git-compatible ignore handling, keeping the project-eligible
-/// subset. Used for non-Git roots (repository-level git excludes do not apply).
+/// subset. Used for non-Git roots; the `core.excludesFile` global excludes file
+/// still applies, but `$GIT_DIR/info/exclude` does not (no git work tree).
 fn discover_filesystem_sources(root: &Path) -> Result<ProjectSourceDiscovery> {
     let report = discover_files(root, true, is_project_eligible)?;
     Ok(ProjectSourceDiscovery {
@@ -2300,8 +2303,8 @@ fn discover_project_files(root: &Path) -> Result<DiscoveryReport> {
 /// Discovery used by branch-delta mining, which deliberately mines untracked
 /// (non-ignored) working-tree files in addition to changed tracked files.
 /// Keeps the filesystem walk with git-compatible ignore handling (including
-/// `$GIT_DIR/info/exclude` and `core.excludesFile` for Git-backed roots);
-/// linked Git worktrees are still skipped.
+/// `$GIT_DIR/info/exclude` for Git-backed roots and the `core.excludesFile`
+/// global file); linked Git worktrees are still skipped.
 fn discover_project_files_with_untracked(root: &Path) -> Result<DiscoveryReport> {
     discover_files(root, true, is_project_eligible)
 }
@@ -2385,10 +2388,10 @@ fn path_from_git_bytes(bytes: &[u8]) -> Option<PathBuf> {
 }
 
 /// Walk `root` applying ignore rules (worktree `.gitignore`/`.mempalaceignore`
-/// plus, for Git-backed roots, `$GIT_DIR/info/exclude` and the
-/// `core.excludesFile` global file), accepting files for which `accept_file`
-/// returns `true`. The closure receives the absolute path and the (lossy) file
-/// name; everything it rejects counts toward `ignored_files`.
+/// plus `$GIT_DIR/info/exclude` for Git-backed roots and the
+/// `core.excludesFile` global file for any walk), accepting files for which
+/// `accept_file` returns `true`. The closure receives the absolute path and the
+/// (lossy) file name; everything it rejects counts toward `ignored_files`.
 fn discover_files(
     root: &Path,
     skip_linked_worktrees: bool,
@@ -2404,8 +2407,8 @@ fn discover_files(
     let mut ignore_matcher = IgnoreMatcher::new(&root);
     let mut ignored_files = 0;
     let mut files = Vec::new();
-    // Repository-level excludes (`$GIT_DIR/info/exclude`, `core.excludesFile`)
-    // apply at every depth of a Git-backed root's walk.
+    // Repository-level excludes (`$GIT_DIR/info/exclude` for Git-backed roots,
+    // `core.excludesFile` for any walk) apply at every depth.
     ignore_matcher.load_repo_excludes()?;
     let mut stack = vec![root.to_path_buf()];
     // Pre-compute linked worktree paths so we can skip them during the walk.
@@ -2520,14 +2523,15 @@ impl IgnoreMatcher {
     /// Parse the repository-level ignore sources — `$GIT_DIR/info/exclude` and
     /// the `core.excludesFile` global file — whose patterns are anchored at the
     /// repository root and have lower precedence than any `.gitignore`. These
-    /// are git concepts, so they only apply when `root` is inside a Git work
-    /// tree. This runs before the walk so the rules apply at every depth.
+    /// run before the walk so the rules apply at every depth. `info/exclude`
+    /// is a git concept and only applies inside a Git work tree; the global
+    /// excludes file is user-level configuration and applies to any walk,
+    /// including the non-Git filesystem fallback.
     fn load_repo_excludes(&mut self) -> Result<()> {
-        if !git_is_backed(&self.root) {
-            return Ok(());
-        }
-        if let Some(path) = repo_info_exclude_path(&self.root) {
-            self.load_pattern_file(&path, IgnoreTier::RepoExclude)?;
+        if git_is_backed(&self.root) {
+            if let Some(path) = repo_info_exclude_path(&self.root) {
+                self.load_pattern_file(&path, IgnoreTier::RepoExclude)?;
+            }
         }
         if let Some(path) = global_excludes_path(&self.root) {
             self.load_pattern_file(&path, IgnoreTier::GlobalExclude)?;
@@ -2660,8 +2664,15 @@ fn parse_ignore_pattern(line: &str) -> Option<IgnorePattern> {
         Some(rest) => (true, rest),
         None => (false, line),
     };
-    // A leading backslash escapes a literal `#`/`!`/etc.
-    let rest = rest.strip_prefix('\\').unwrap_or(rest);
+    // A leading backslash escapes a literal `#`/`!` so those characters can
+    // open a real pattern (gitignore(5)). For any other character the backslash
+    // is part of the glob itself and must survive for the matcher: `\*` targets
+    // a file literally named `*`, it must not become an ignore-everything `*`.
+    let rest = if rest.starts_with("\\#") || rest.starts_with("\\!") {
+        &rest[1..]
+    } else {
+        rest
+    };
     if rest.is_empty() {
         return None;
     }
@@ -6455,6 +6466,103 @@ mod tests {
 
         let escaped_tab = parse_ignore_pattern("tab\\\t").unwrap();
         assert!(escaped_tab.matches_path("tab\t", false));
+    }
+
+    /// A leading backslash escapes only a literal `#`/`!` (so those characters
+    /// can open a real pattern); for any other character the backslash is part
+    /// of the glob, so `\*` targets a file literally named `*` instead of
+    /// matching everything (regression for the ignore-everything bug).
+    #[test]
+    fn parse_ignore_pattern_escapes_only_literal_hash_and_bang() {
+        let star = parse_ignore_pattern("\\*").unwrap();
+        assert_eq!(star.parts, vec!["\\*".to_owned()]);
+        assert!(star.matches_path("*", false));
+        assert!(!star.matches_path("anything", false));
+
+        let star_md = parse_ignore_pattern("\\*.md").unwrap();
+        assert_eq!(star_md.parts, vec!["\\*.md".to_owned()]);
+        assert!(star_md.matches_path("*.md", false));
+        assert!(!star_md.matches_path("notes.md", false));
+
+        let hash = parse_ignore_pattern("\\#hash").unwrap();
+        assert_eq!(hash.parts, vec!["#hash".to_owned()]);
+        assert!(hash.matches_path("#hash", false));
+
+        let bang = parse_ignore_pattern("\\!bang").unwrap();
+        assert_eq!(bang.parts, vec!["!bang".to_owned()]);
+        assert!(!bang.negated);
+        assert!(bang.matches_path("!bang", false));
+    }
+
+    /// A `.gitignore` line `\*.md` ignores only a file literally named
+    /// `*.md`, not every `.md` file (regression: the escaped backslash was
+    /// stripped and the pattern became an ignore-everything `*.md`).
+    #[test]
+    fn filesystem_discovery_escaped_leading_glob_does_not_ignore_everything() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path();
+        fs::write(root.join(".gitignore"), "\\*.md\n").unwrap();
+        fs::write(root.join("*.md"), "ignored").unwrap();
+        fs::write(root.join("normal.md"), "kept").unwrap();
+
+        let discovery = discover_project_sources(root).unwrap();
+        assert_eq!(discovery.basis, ProjectSourceBasis::Filesystem);
+        let names: Vec<_> = discovery.sources.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["normal.md"]);
+    }
+
+    /// The `core.excludesFile` global excludes file applies to the non-Git
+    /// filesystem fallback too, not just Git-backed walks. `$GIT_DIR/info/
+    /// exclude` is git-specific, but the global file is user-level git
+    /// configuration. The test re-runs itself in a child process with a temp
+    /// `HOME` (and the system gitconfig disabled) so git resolves its global
+    /// config to a hermetic `.gitconfig`.
+    #[test]
+    fn non_git_filesystem_walk_honors_global_excludes_file() {
+        const TEST_NAME: &str = "tests::non_git_filesystem_walk_honors_global_excludes_file";
+        // Child mode: the temp HOME is active, so run the real assertions.
+        if std::env::var_os("MEMPALACE_TEST_TEMP_HOME").is_some() {
+            let tempdir = tempdir().unwrap();
+            let root = tempdir.path();
+            fs::write(root.join("notes.bak.md"), "ignored\n").unwrap();
+            fs::write(root.join("notes.md"), "kept\n").unwrap();
+
+            let discovery = discover_project_sources(root).unwrap();
+            assert_eq!(discovery.basis, ProjectSourceBasis::Filesystem);
+            let names: Vec<_> =
+                discovery.sources.iter().map(|s| s.relative_path.as_str()).collect();
+            assert_eq!(names, vec!["notes.md"]);
+            return;
+        }
+
+        // Parent mode: write a global excludes file and a `.gitconfig` that
+        // points at it, then re-run this test under a temp HOME.
+        let tempdir = tempdir().unwrap();
+        let home = tempdir.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let global = tempdir.path().join("global-excludes");
+        fs::write(&global, "*.bak.md\n").unwrap();
+        fs::write(
+            home.join(".gitconfig"),
+            format!("[core]\n\texcludesFile = {}\n", global.display()),
+        )
+        .unwrap();
+
+        let output = Command::new(std::env::current_exe().unwrap())
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("MEMPALACE_TEST_TEMP_HOME", "1")
+            .env_remove("GIT_CONFIG_GLOBAL")
+            .args(["--exact", TEST_NAME])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child run of {TEST_NAME} failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
     }
 
     /// A trailing `/**` keeps the directory walkable so the walker can evaluate

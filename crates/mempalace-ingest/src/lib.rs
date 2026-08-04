@@ -2332,20 +2332,26 @@ fn discover_git_index_sources(root: &Path) -> Result<ProjectSourceDiscovery> {
     // A `.gitignore` never suppresses a tracked index path: tracked paths stay
     // tracked even after an ignore pattern is added, and the ignore file itself
     // may be untracked. `.mempalaceignore` is the explicit additional exclusion;
-    // it is read from the root and from every directory that holds a tracked
-    // entry so nested files apply.
+    // it is read from the root and from every ancestor directory of each tracked
+    // entry — not just its immediate parent — so intermediate scopes like
+    // `a/.mempalaceignore` apply to `a/b/file.rs` as well as `a/b`'s own file.
+    // Directories are loaded in root-to-leaf order so deeper scopes, which
+    // override shallower ones, are parsed after the scopes they refine.
     let mut ignore_matcher = IgnoreMatcher::new(root);
-    let mut tracked_dirs = BTreeSet::new();
+    let mut scopes = BTreeSet::new();
     for (relative, _) in &entries {
-        if let Some(parent) = relative.parent() {
-            if !parent.as_os_str().is_empty() {
-                tracked_dirs.insert(parent.to_path_buf());
+        let mut ancestor = relative.parent();
+        while let Some(dir) = ancestor {
+            if dir.as_os_str().is_empty() {
+                break;
             }
+            scopes.insert(dir.to_path_buf());
+            ancestor = dir.parent();
         }
     }
     ignore_matcher.load_directory(Path::new(""), false)?;
-    for dir in tracked_dirs {
-        ignore_matcher.load_directory(&dir, false)?;
+    for scope in scopes {
+        ignore_matcher.load_directory(&scope, false)?;
     }
 
     let worktree_skip = linked_worktree_paths(root);
@@ -6726,6 +6732,62 @@ mod tests {
         let names: Vec<_> = discovery.sources.iter().map(|s| s.relative_path.as_str()).collect();
         assert_eq!(names, vec!["docs/keep.md", "src/lib.rs"]);
         assert_eq!(discovery.skipped, 1);
+    }
+
+    /// An intermediate ancestor's `.mempalaceignore` applies to tracked files
+    /// beneath it, even when the immediate parent directory has no ignore file
+    /// of its own: `a/.mempalaceignore` excludes `a/b/file.rs`.
+    #[test]
+    fn git_index_discovery_loads_ancestor_mempalace_ignore_scope() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path().to_path_buf();
+        git_init_with_commit(
+            &root,
+            "main",
+            &[
+                ("a/b/file.rs", "fn f() {}\n"),
+                ("a/b/keep.md", "keep\n"),
+                ("c/main.rs", "fn main() {}\n"),
+            ],
+        );
+        // Only the intermediate ancestor directory `a` carries an ignore file;
+        // `a/b` itself has none.
+        fs::write(root.join("a").join(".mempalaceignore"), "file.rs\n").unwrap();
+
+        let discovery = discover_project_sources(&root).unwrap();
+        assert_eq!(discovery.basis, ProjectSourceBasis::GitIndex);
+        let names: Vec<_> = discovery.sources.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["a/b/keep.md", "c/main.rs"]);
+        assert_eq!(discovery.skipped, 1);
+    }
+
+    /// Nested ancestor `.mempalaceignore` scopes are loaded in root-to-leaf
+    /// order and deeper scopes take precedence: a negation in a deeper ancestor
+    /// scope re-includes a tracked file a shallower scope excluded.
+    #[test]
+    fn git_index_discovery_nested_ancestor_scope_precedence() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path().to_path_buf();
+        git_init_with_commit(
+            &root,
+            "main",
+            &[
+                ("a/keep.md", "keep\n"),
+                ("a/b/nested.md", "nested\n"),
+                ("a/drop.md", "drop\n"),
+                ("a/b/drop2.md", "drop2\n"),
+                ("main.rs", "fn main() {}\n"),
+            ],
+        );
+        fs::write(root.join(".mempalaceignore"), "*.md\n").unwrap();
+        fs::write(root.join("a").join(".mempalaceignore"), "!keep.md\n").unwrap();
+        fs::write(root.join("a").join("b").join(".mempalaceignore"), "!nested.md\n").unwrap();
+
+        let discovery = discover_project_sources(&root).unwrap();
+        assert_eq!(discovery.basis, ProjectSourceBasis::GitIndex);
+        let names: Vec<_> = discovery.sources.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["a/b/nested.md", "a/keep.md", "main.rs"]);
+        assert_eq!(discovery.skipped, 2);
     }
 
     /// A directory-only `.mempalaceignore` rule (`generated/`) excludes the

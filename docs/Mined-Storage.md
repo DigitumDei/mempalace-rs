@@ -152,7 +152,11 @@ valid UTF-8 always use the legacy stored-content path. Re-mining them with
   because it is simply absent from the index. A `.gitignore` does **not**
   suppress a tracked file: tracked paths remain tracked even after an ignore
   pattern is added. `.mempalaceignore` is the explicit additional exclusion and
-  applies to tracked files, including nested files at any depth. Independently
+  applies to tracked files, including nested files at any depth: it is read from
+  the root and from every ancestor directory of each tracked path (in
+  root-to-leaf order), so an intermediate scope such as `a/.mempalaceignore`
+  applies to `a/b/file.rs` just as `a/b`'s own file does, and deeper scopes take
+  precedence over shallower ones. Independently
   of git, the secret-path denylist still applies to tracked index paths: a
   secret-shaped file that was committed (e.g. a tracked `.env`) is withheld and
   reported, never mined. Tracked **symlinks are rejected outright**, before any

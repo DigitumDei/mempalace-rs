@@ -161,7 +161,12 @@ valid UTF-8 always use the legacy stored-content path. Re-mining them with
   semantics: nested files are scoped to their own directory, `!` patterns
   re-include previously excluded paths, patterns containing a `/` are anchored
   to the ignore file's directory (unanchored patterns match the basename at any
-  depth), and `*`, `?`, `[...]`, and `**` globs follow git's rules.
+  depth), and `*`, `?`, `[...]`, and `**` globs follow git's rules. Two
+  git-only details are preserved exactly: a trailing `/**` matches everything
+  *inside* the named directory but not the directory itself (so
+  `abc/**` + `!abc/keep.md` keeps `abc/keep.md`, as in git), and a trailing
+  space is ignored unless it is escaped (`foo\ ` targets a filename literally
+  ending in a space).
 
 Git-backed filesystem walks (branch-delta mines) additionally honor the
 repository-level exclude sources at git's precedence:

@@ -2652,7 +2652,7 @@ impl IgnorePattern {
 /// Parse a single ignore-file line into a pattern, or `None` for blank lines,
 /// comments, and empty (after `!`/trailing-slash stripping) patterns.
 fn parse_ignore_pattern(line: &str) -> Option<IgnorePattern> {
-    let line = line.trim_end();
+    let line = strip_unescaped_trailing_whitespace(line);
     if line.is_empty() || line.starts_with('#') {
         return None;
     }
@@ -2688,15 +2688,40 @@ fn parse_ignore_pattern(line: &str) -> Option<IgnorePattern> {
     Some(IgnorePattern { negated, directory_only, anchored, parts })
 }
 
-/// Match a `/`-split glob pattern against a `/`-split path, where `**` spans
-/// zero or more path components and every other component uses git glob rules.
+/// Strip trailing whitespace from a pattern line, but only when it is not
+/// escaped: git ignores a trailing space but treats `foo\ ` as a pattern for a
+/// filename literally ending in a space, so the `\ ` must survive.
+fn strip_unescaped_trailing_whitespace(line: &str) -> &str {
+    let mut end = line.len();
+    let bytes = line.as_bytes();
+    while end > 0 {
+        let byte = bytes[end - 1];
+        let is_whitespace = matches!(byte, b' ' | b'\t' | b'\r' | b'\x0b' | b'\x0c');
+        if !is_whitespace || (end >= 2 && bytes[end - 2] == b'\\') {
+            break;
+        }
+        end -= 1;
+    }
+    &line[..end]
+}
+
+/// Match a `/`-split glob pattern against a `/`-split path, where a middle
+/// `**` spans zero or more path components, a *trailing* `**` spans one or
+/// more (git's `abc/**` "everything inside" rule), and every other component
+/// uses git glob rules.
 fn glob_match(parts: &[String], path: &[&str]) -> bool {
     fn go(parts: &[String], path: &[&str]) -> bool {
         if parts.is_empty() {
             return path.is_empty();
         }
         if parts[0] == "**" {
-            (0..=path.len()).any(|index| go(&parts[1..], &path[index..]))
+            // A trailing `/**` matches everything inside the matched prefix
+            // but not the prefix itself: `abc/**` must not match `abc`, or
+            // git's `abc/**` + `!abc/keep.md` re-inclusion could never be
+            // evaluated. A trailing `**` therefore consumes at least one
+            // component; a middle `**` may consume none.
+            let min = if parts.len() == 1 { 1 } else { 0 };
+            (min..=path.len()).any(|index| go(&parts[1..], &path[index..]))
         } else if path.is_empty() {
             false
         } else {
@@ -6371,6 +6396,82 @@ mod tests {
         assert_eq!(discovery.basis, ProjectSourceBasis::Filesystem);
         let names: Vec<_> = discovery.sources.iter().map(|s| s.relative_path.as_str()).collect();
         assert_eq!(names, vec!["a/b/n.md", "doc/nested/readme.md", "x/cache/tmp12.md"]);
+    }
+
+    /// A trailing `/**` matches everything inside the named directory but not
+    /// the directory itself, exactly as git's `abc/**` keeps `abc` traversable
+    /// so a `!abc/keep.md` rule can still re-include a file beneath it.
+    #[test]
+    fn filesystem_discovery_trailing_doublestar_does_not_exclude_directory() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path();
+        fs::write(root.join(".gitignore"), "abc/**\n!abc/keep.md\n").unwrap();
+        fs::create_dir_all(root.join("abc")).unwrap();
+        fs::write(root.join("abc").join("keep.md"), "kept\n").unwrap();
+        fs::write(root.join("abc").join("drop.md"), "ignored\n").unwrap();
+
+        let discovery = discover_project_sources(root).unwrap();
+        assert_eq!(discovery.basis, ProjectSourceBasis::Filesystem);
+        let names: Vec<_> = discovery.sources.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["abc/keep.md"]);
+        assert!(discovery.skipped >= 1, "abc/drop.md should be skipped");
+    }
+
+    /// A trailing `/**` on a directory-only rule still ignores only what is
+    /// inside the directory, mirroring git's `abc/**/`: the directory `abc`
+    /// itself and files directly inside it stay, while subdirectories (and
+    /// everything beneath them) are ignored.
+    #[test]
+    fn filesystem_discovery_trailing_doublestar_directory_only_keeps_dir_itself() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path();
+        fs::write(root.join(".gitignore"), "abc/**/\n").unwrap();
+        fs::create_dir_all(root.join("abc").join("sub")).unwrap();
+        fs::write(root.join("abc").join("top.md"), "kept\n").unwrap();
+        fs::write(root.join("abc").join("sub").join("drop.md"), "ignored\n").unwrap();
+
+        let discovery = discover_project_sources(root).unwrap();
+        assert_eq!(discovery.basis, ProjectSourceBasis::Filesystem);
+        let names: Vec<_> = discovery.sources.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["abc/top.md"]);
+        assert!(discovery.skipped >= 1, "abc/sub should be skipped");
+    }
+
+    /// An unescaped trailing space is stripped, but an escaped one is kept: a
+    /// `foo\ ` pattern targets a filename literally ending in a space, as in
+    /// git.
+    #[test]
+    fn parse_ignore_pattern_strips_unescaped_but_keeps_escaped_trailing_space() {
+        let bare = parse_ignore_pattern("notes.txt ").unwrap();
+        assert_eq!(bare.parts, vec!["notes.txt".to_owned()]);
+
+        let escaped = parse_ignore_pattern("trail\\ ").unwrap();
+        assert_eq!(escaped.parts, vec!["trail\\ ".to_owned()]);
+        assert!(escaped.matches_path("trail ", false));
+        assert!(!escaped.matches_path("trail", false));
+
+        let tabbed = parse_ignore_pattern("notes.txt\t").unwrap();
+        assert_eq!(tabbed.parts, vec!["notes.txt".to_owned()]);
+
+        let escaped_tab = parse_ignore_pattern("tab\\\t").unwrap();
+        assert!(escaped_tab.matches_path("tab\t", false));
+    }
+
+    /// A trailing `/**` keeps the directory walkable so the walker can evaluate
+    /// a re-inclusion rule for a file inside it — the case that broke before
+    /// the trailing-`/**` fix.
+    #[test]
+    fn filesystem_walk_reincludes_file_under_trailing_doublestar_ignore() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path().to_path_buf();
+        fs::write(root.join(".gitignore"), "abc/**\n!abc/keep.md\n").unwrap();
+        fs::create_dir_all(root.join("abc")).unwrap();
+        fs::write(root.join("abc").join("keep.md"), "kept\n").unwrap();
+        fs::write(root.join("abc").join("drop.md"), "ignored\n").unwrap();
+
+        let report = discover_project_files(&root).unwrap();
+        let names: Vec<_> = report.files.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["abc/keep.md"]);
     }
 
     /// Pin this repo's `core.excludesFile` to a path that does not exist so

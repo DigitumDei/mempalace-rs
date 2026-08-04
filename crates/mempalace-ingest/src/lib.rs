@@ -6697,6 +6697,7 @@ mod tests {
         fs::write(root.join("x").join("cache").join("tmp12.md"), "t12").unwrap();
         fs::create_dir_all(root.join("a").join("x").join("b")).unwrap();
         fs::write(root.join("a").join("x").join("b").join("m.md"), "m").unwrap();
+        fs::create_dir_all(root.join("a").join("b")).unwrap();
         fs::write(root.join("a").join("b").join("n.md"), "n").unwrap();
 
         let discovery = discover_project_sources(root).unwrap();

@@ -12,7 +12,7 @@ This is the frozen command surface for `mempalace-cli` v1.
 ### `init <dir>`
 
 Purpose:
-- Detect rooms from the project folder structure.
+- Detect rooms from the project's safe source directories.
 - Register the project centrally under the configured MemPalace base directory.
 - Initialize the default global config tree if needed.
 - Run embedding startup validation and report the status.
@@ -30,7 +30,10 @@ Flags:
 
 Notes:
 - Wing name is derived from the directory name, lowercased with spaces and hyphens normalized to underscores.
-- Room detection is folder-name-based and always includes a `general` room.
+- Room detection derives from the same safe source set mining uses: Git-backed
+  checkouts use the tracked index, and non-Git directories use the
+  ignore-aware filesystem walk, so ignored, untracked, and linked-worktree
+  directories never produce rooms. A `general` room is always included.
 - The central registry is stored at `<base-dir>/projects.json` (normally
   `~/.mempalace/projects.json`) and uses normalized Git origin identity when
   available, with checkout paths as discovery aliases.
@@ -99,11 +102,14 @@ Behavior:
 - `convos` uses the conversation ingest path.
 - In `projects` mode, source discovery honours git: a Git-backed root mines the
   tracked index only (`git ls-files`), so ignored and untracked working-tree
-  files (e.g. `.env`, `*.local.json`, build output) are never ingested.
-  Non-Git directories fall back to a filesystem walk that honours `.gitignore`
-  and `.mempalaceignore`. Branch-delta mines (`--branch` / `--view <name>`)
-  are the exception: they additionally include untracked, non-ignored files.
-  Linked git worktrees are always excluded from mining. See
+  files (e.g. `.env`, `*.local.json`, build output) are never ingested. A
+  `.gitignore` never suppresses a tracked file; `.mempalaceignore` is the
+  explicit additional exclusion. Non-Git directories fall back to a filesystem
+  walk that honours `.gitignore` and `.mempalaceignore` at every level with
+  git-compatible semantics (nesting, `!` negation, anchoring, and globs).
+  Branch-delta mines (`--branch` / `--view <name>`) are the exception: they
+  additionally include untracked, non-ignored files. Linked git worktrees are
+  always excluded from mining. See
   [Mined-Storage.md#discovery-rules](Mined-Storage.md#discovery-rules).
 - Project resolution checks explicit CLI values, optional repository-local
   config, the central project registry, and then derived defaults. A project

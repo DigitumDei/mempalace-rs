@@ -192,7 +192,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Detect rooms from your folder structure.
+    /// Detect rooms from your project's safe source directories.
     Init {
         dir: PathBuf,
         #[arg(long, help = "Auto-accept detected rooms")]
@@ -581,7 +581,7 @@ where
     })?;
 
     let file_count = count_project_files(&project_dir).map_err(io_error)?;
-    let detection = detect_rooms(&project_dir).map_err(io_error)?;
+    let detection = detect_rooms(&project_dir).map_err(ingest_error)?;
     let config_path = project_dir.join("mempalace.yaml");
     let legacy_config_path = project_dir.join("mempal.yaml");
     let existing_config = config_path.exists() || legacy_config_path.exists();
@@ -717,7 +717,7 @@ fn execute_project_command(
                     format!("failed to access project directory `{}`: {source}", dir.display()),
                 )
             })?;
-            let detection = detect_rooms(&project_dir).map_err(io_error)?;
+            let detection = detect_rooms(&project_dir).map_err(ingest_error)?;
             let mut project_config = if project_dir.join("mempalace.yaml").exists()
                 || project_dir.join("mempal.yaml").exists()
             {
@@ -2532,31 +2532,25 @@ struct RoomDetection {
     rooms: Vec<ProjectRoomConfig>,
 }
 
-fn detect_rooms(project_dir: &Path) -> std::io::Result<RoomDetection> {
+fn detect_rooms(project_dir: &Path) -> mempalace_ingest::Result<RoomDetection> {
+    // Derive room candidates from the same safe source set mining uses
+    // (mempalace_ingest::discover_project_sources), so ignored, untracked, and
+    // linked-worktree directories never produce rooms. For Git-backed roots
+    // this is the tracked index; for non-Git roots it is the filesystem walk
+    // with git-compatible ignore handling.
+    let discovery = mempalace_ingest::discover_project_sources(project_dir)?;
     let mut discovered = BTreeMap::<String, BTreeSet<String>>::new();
 
-    for entry in fs::read_dir(project_dir)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() {
-            continue;
+    for source in &discovery.sources {
+        // Room candidates are the top-level and second-level directories that
+        // hold an eligible source (matching the pre-discovery folder scan).
+        let Some((parent, _)) = source.relative_path.rsplit_once('/') else { continue };
+        let mut parts = parent.split('/');
+        if let Some(first) = parts.next() {
+            record_room(&mut discovered, first);
         }
-
-        let name = entry.file_name().to_string_lossy().to_string();
-        if SKIP_DIRS.contains(&name.as_str()) {
-            continue;
-        }
-        record_room(&mut discovered, &name);
-        for subentry in fs::read_dir(entry.path())? {
-            let subentry = subentry?;
-            if !subentry.file_type()?.is_dir() {
-                continue;
-            }
-
-            let subname = subentry.file_name().to_string_lossy().to_string();
-            if SKIP_DIRS.contains(&subname.as_str()) {
-                continue;
-            }
-            record_room(&mut discovered, &subname);
+        if let Some(second) = parts.next() {
+            record_room(&mut discovered, second);
         }
     }
 
@@ -2564,7 +2558,7 @@ fn detect_rooms(project_dir: &Path) -> std::io::Result<RoomDetection> {
         ("fallback", vec![project_room("general", "All project files", &["general"])])
     } else {
         (
-            "folder structure",
+            "safe project sources",
             discovered
                 .into_iter()
                 .map(|(room, originals)| {
@@ -4003,6 +3997,10 @@ mod tests {
         let workspace = tempdir().unwrap();
         fs::create_dir_all(workspace.path().join("frontend")).unwrap();
         fs::create_dir_all(workspace.path().join("client")).unwrap();
+        fs::write(workspace.path().join("frontend").join("index.ts"), "export const x = 1;\n")
+            .unwrap();
+        fs::write(workspace.path().join("client").join("app.ts"), "export const y = 2;\n")
+            .unwrap();
 
         let detection = detect_rooms(workspace.path()).unwrap();
         let frontend = detection.rooms.iter().find(|room| room.name == "frontend").unwrap();
@@ -4010,6 +4008,68 @@ mod tests {
         assert!(frontend.description.as_ref().unwrap().contains("client"));
         assert!(frontend.keywords.contains(&"frontend".to_owned()));
         assert!(frontend.keywords.contains(&"client".to_owned()));
+    }
+
+    /// Rooms come from the safe source set, so directories that are ignored or
+    /// untracked in a Git checkout never produce rooms.
+    #[test]
+    fn detect_rooms_ignores_gitignored_and_untracked_directories_in_git_repo() {
+        let workspace = tempdir().unwrap();
+        let repo = workspace.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        git_init_repo(&repo, &[("docs/roadmap.md", "roadmap\n"), ("src/lib.rs", "fn lib() {}\n")]);
+
+        write_file(&repo.join(".gitignore"), "ignored/\n");
+        write_file(&repo.join("ignored/secret.md"), "secret\n");
+        write_file(&repo.join("untracked/scratch.md"), "scratch\n");
+
+        let detection = detect_rooms(&repo).unwrap();
+        let names: Vec<_> = detection.rooms.iter().map(|room| room.name.clone()).collect();
+        assert!(names.contains(&"documentation"), "documentation room missing: {names:?}");
+        assert!(names.contains(&"src"), "src room missing: {names:?}");
+        assert!(!names.contains(&"ignored"), "ignored room must not be derived: {names:?}");
+        assert!(!names.contains(&"untracked"), "untracked room must not be derived: {names:?}");
+    }
+
+    /// A linked Git worktree inside the checkout is a duplicate repository and
+    /// must not contribute rooms.
+    #[test]
+    fn detect_rooms_excludes_linked_worktree_directories() {
+        let workspace = tempdir().unwrap();
+        let repo = workspace.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        git_init_repo(&repo, &[("docs/roadmap.md", "roadmap\n")]);
+
+        let wt = repo.join("linked-wt");
+        let status = std::process::Command::new("git")
+            .args(["worktree", "add", "-b", "wt-branch"])
+            .arg(&wt)
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git worktree add failed");
+        write_file(&wt.join("planning/notes.md"), "planning notes\n");
+
+        let detection = detect_rooms(&repo).unwrap();
+        let names: Vec<_> = detection.rooms.iter().map(|room| room.name.clone()).collect();
+        assert!(names.contains(&"documentation"), "documentation room missing: {names:?}");
+        assert!(!names.contains(&"linked_wt"), "linked worktree room must not be derived: {names:?}");
+        assert!(!names.contains(&"planning"), "worktree content room must not be derived: {names:?}");
+    }
+
+    /// Non-Git roots keep folder-based detection but honour ignore files.
+    #[test]
+    fn detect_rooms_non_git_root_honors_ignore_files() {
+        let workspace = tempdir().unwrap();
+        let root = workspace.path();
+        write_file(&root.join(".gitignore"), "ignored/\n");
+        write_file(&root.join("ignored/secret.md"), "secret\n");
+        write_file(&root.join("src/lib.rs"), "fn lib() {}\n");
+
+        let detection = detect_rooms(root).unwrap();
+        let names: Vec<_> = detection.rooms.iter().map(|room| room.name.clone()).collect();
+        assert!(names.contains(&"src"), "src room missing: {names:?}");
+        assert!(!names.contains(&"ignored"), "ignored room must not be derived: {names:?}");
     }
 
     #[test]

@@ -460,22 +460,46 @@ struct Message {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct IgnorePattern {
+    /// `true` when the pattern starts with `!`: a match re-includes paths that
+    /// an earlier, lower-precedence rule excluded.
+    negated: bool,
+    /// `true` when the pattern ends with `/` and therefore only matches
+    /// directories (and, through the walk, everything beneath them).
+    directory_only: bool,
+    /// `true` when the pattern is anchored to the directory its ignore file
+    /// lives in (the pattern contains a `/`, or begins with one). Unanchored
+    /// patterns match the basename at any depth, like git.
+    anchored: bool,
+    /// The glob pattern split into `/`-separated components.
+    parts: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct IgnoreRule {
-    raw: String,
-    kind: IgnoreRuleKind,
+    pattern: IgnorePattern,
+    /// Relative directory the rule was declared in (`""` for the root).
+    scope: String,
+    /// Number of path components in `scope` (0 for the root).
+    scope_depth: usize,
+    /// Load order within the same scope; later rules take precedence.
+    order: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum IgnoreRuleKind {
-    Extension(String),
-    Directory(String),
-    RelativePrefix(String),
-    Basename(String),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Git-compatible ignore matcher: `.gitignore`/`.mempalaceignore` patterns
+/// with nested-file scoping, negation, and glob/anchoring semantics, plus the
+/// built-in always-skipped directories.
+#[derive(Debug, Clone)]
 struct IgnoreMatcher {
+    /// Absolute root all relative paths are resolved against.
+    root: PathBuf,
+    /// Built-in directory names that are always skipped.
+    skip_dirs: BTreeSet<String>,
+    /// Rules sorted by `(scope_depth, order)`; the last matching rule wins.
     rules: Vec<IgnoreRule>,
+    /// Directories whose ignore files have already been parsed.
+    loaded: BTreeSet<PathBuf>,
+    next_order: usize,
 }
 
 /// A single eligible project source path.
@@ -2003,10 +2027,12 @@ fn has_shebang(path: &Path) -> bool {
 ///
 /// For Git-backed roots the eligible sources are the project-readable subset of
 /// tracked index paths (`git ls-files`), so ignored and untracked working-tree
-/// files are never mined. For non-Git directories a filesystem walk with
-/// git-compatible ignore handling is used. Sources are sorted by relative path
-/// (deterministic order), are relative to `root`, and linked Git worktrees are
-/// always excluded.
+/// files are never mined; a `.gitignore` never suppresses a tracked path, and
+/// `.mempalaceignore` is the explicit additional exclusion. For non-Git
+/// directories a filesystem walk with git-compatible ignore handling
+/// (nested `.gitignore`/`.mempalaceignore` files, `!` negation, anchoring, and
+/// globs) is used. Sources are sorted by relative path (deterministic order),
+/// are relative to `root`, and linked Git worktrees are always excluded.
 pub fn discover_project_sources(root: &Path) -> Result<ProjectSourceDiscovery> {
     let root = root
         .canonicalize()
@@ -2057,11 +2083,10 @@ fn discover_git_index_sources(root: &Path) -> Result<ProjectSourceDiscovery> {
         });
     }
 
-    let ignore_matcher = IgnoreMatcher::load(root)?;
-    let worktree_skip = linked_worktree_paths(root);
+    // Collect the tracked index entries first so the directories that contain
+    // them are known before building the ignore matcher.
+    let mut entries = Vec::new();
     let mut skipped = 0usize;
-    let mut sources = Vec::new();
-
     for entry in output.stdout.split(|byte| *byte == b'\0') {
         if entry.is_empty() {
             continue;
@@ -2075,7 +2100,33 @@ fn discover_git_index_sources(root: &Path) -> Result<ProjectSourceDiscovery> {
                 continue;
             }
         };
-        let relative_str = relative.to_string_lossy();
+        let relative_str = relative.to_string_lossy().into_owned();
+        entries.push((relative, relative_str));
+    }
+
+    // A `.gitignore` never suppresses a tracked index path: tracked paths stay
+    // tracked even after an ignore pattern is added, and the ignore file itself
+    // may be untracked. `.mempalaceignore` is the explicit additional exclusion;
+    // it is read from the root and from every directory that holds a tracked
+    // entry so nested files apply.
+    let mut ignore_matcher = IgnoreMatcher::new(root);
+    let mut tracked_dirs = BTreeSet::new();
+    for (relative, _) in &entries {
+        if let Some(parent) = relative.parent() {
+            if !parent.as_os_str().is_empty() {
+                tracked_dirs.insert(parent.to_path_buf());
+            }
+        }
+    }
+    ignore_matcher.load_directory(Path::new(""), false)?;
+    for dir in tracked_dirs {
+        ignore_matcher.load_directory(&dir, false)?;
+    }
+
+    let worktree_skip = linked_worktree_paths(root);
+    let mut sources = Vec::new();
+
+    for (relative, relative_str) in entries {
         let absolute = root.join(&relative);
 
         let file_type = match fs::metadata(&absolute) {
@@ -2098,7 +2149,7 @@ fn discover_git_index_sources(root: &Path) -> Result<ProjectSourceDiscovery> {
             skipped += 1;
             continue;
         }
-        if ignore_matcher.matches(relative_str.as_ref(), false) {
+        if ignore_matcher.matches_with_ancestors(&relative_str) {
             skipped += 1;
             continue;
         }
@@ -2110,7 +2161,7 @@ fn discover_git_index_sources(root: &Path) -> Result<ProjectSourceDiscovery> {
         }
         sources.push(ProjectSource {
             absolute_path: absolute,
-            relative_path: relative_str.into_owned(),
+            relative_path: relative_str,
         });
     }
 
@@ -2255,7 +2306,7 @@ fn discover_files(
     } else {
         root.to_path_buf()
     };
-    let ignore_matcher = IgnoreMatcher::load(&root)?;
+    let mut ignore_matcher = IgnoreMatcher::new(&root);
     let mut ignored_files = 0;
     let mut files = Vec::new();
     let mut stack = vec![root.to_path_buf()];
@@ -2265,6 +2316,13 @@ fn discover_files(
         .unwrap_or_default();
 
     while let Some(dir) = stack.pop() {
+        // Nested `.gitignore`/`.mempalaceignore` files apply to the entries of
+        // the directory that contains them. Directories that are themselves
+        // ignored are never descended into, so their ignore files never load —
+        // matching git's behaviour.
+        let dir_rel = relative_path(&root, &dir)?;
+        ignore_matcher.load_directory(&dir_rel, true)?;
+
         let read_dir =
             fs::read_dir(&dir).map_err(|source| IngestError::Io { path: dir.clone(), source })?;
         for entry in read_dir {
@@ -2309,68 +2367,266 @@ fn discover_files(
 }
 
 impl IgnoreMatcher {
-    fn load(root: &Path) -> Result<Self> {
-        let mut rules = DEFAULT_SKIP_DIRS
-            .iter()
-            .map(|entry| IgnoreRule {
-                raw: (*entry).to_owned(),
-                kind: IgnoreRuleKind::Directory((*entry).to_owned()),
-            })
-            .collect::<Vec<_>>();
+    /// Create a matcher over `root` with the built-in skip directories; no
+    /// ignore files are parsed until [`IgnoreMatcher::load_directory`] runs.
+    fn new(root: &Path) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            skip_dirs: DEFAULT_SKIP_DIRS.iter().map(|entry| (*entry).to_owned()).collect(),
+            rules: Vec::new(),
+            loaded: BTreeSet::new(),
+            next_order: 0,
+        }
+    }
 
-        for file_name in [".gitignore", ".mempalaceignore"] {
-            let path = root.join(file_name);
-            if !path.exists() {
-                continue;
-            }
+    /// Parse the ignore files in `dir_rel` (relative to the root; an empty path
+    /// is the root itself). When `load_gitignore` is set, `.gitignore` is read
+    /// first and `.mempalaceignore` second, so mempalace-specific rules take
+    /// precedence within the same directory. Idempotent per directory.
+    fn load_directory(&mut self, dir_rel: &Path, load_gitignore: bool) -> Result<()> {
+        if !self.loaded.insert(dir_rel.to_path_buf()) {
+            return Ok(());
+        }
+        let scope = dir_rel.to_string_lossy().replace('\\', "/");
+        let scope_depth = if scope.is_empty() { 0 } else { scope.split('/').count() };
 
-            let body = fs::read_to_string(&path)
-                .map_err(|source| IngestError::Io { path: path.clone(), source })?;
+        let mut file_names = Vec::new();
+        if load_gitignore {
+            file_names.push(".gitignore");
+        }
+        file_names.push(".mempalaceignore");
+
+        for file_name in file_names {
+            let path = self.root.join(dir_rel).join(file_name);
+            let body = match fs::read_to_string(&path) {
+                Ok(body) => body,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(source) => return Err(IngestError::Io { path, source }),
+            };
             for line in body.lines() {
-                let trimmed = line.trim();
-                if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('!') {
-                    continue;
-                }
-                let kind = if let Some(ext) = trimmed.strip_prefix("*.") {
-                    IgnoreRuleKind::Extension(ext.to_ascii_lowercase())
-                } else if let Some(dir) = trimmed.strip_suffix('/') {
-                    IgnoreRuleKind::Directory(dir.to_owned())
-                } else if trimmed.contains('/') {
-                    IgnoreRuleKind::RelativePrefix(trimmed.trim_start_matches('/').to_owned())
-                } else {
-                    IgnoreRuleKind::Basename(trimmed.to_owned())
-                };
-                rules.push(IgnoreRule { raw: trimmed.to_owned(), kind });
+                let Some(pattern) = parse_ignore_pattern(line) else { continue };
+                self.rules.push(IgnoreRule {
+                    pattern,
+                    scope: scope.clone(),
+                    scope_depth,
+                    order: self.next_order,
+                });
+                self.next_order += 1;
             }
         }
-
-        Ok(Self { rules })
+        // Deeper scopes override shallower ones; within a scope, later rules
+        // override earlier ones. The last matching rule wins during `matches`.
+        self.rules.sort_by(|left, right| {
+            (left.scope_depth, left.order).cmp(&(right.scope_depth, right.order))
+        });
+        Ok(())
     }
 
+    /// Returns `true` when `relative_path` (relative to the root) is ignored:
+    /// either a built-in skip directory, or the highest-precedence matching
+    /// ignore pattern is a non-negated one.
     fn matches(&self, relative_path: &str, is_dir: bool) -> bool {
         let normalized = relative_path.replace('\\', "/");
-        let file_name = normalized.rsplit('/').next().unwrap_or(normalized.as_str());
-        let parts = normalized.split('/').collect::<Vec<_>>();
-        let directory_parts =
-            if is_dir { parts.as_slice() } else { &parts[..parts.len().saturating_sub(1)] };
-
-        self.rules.iter().any(|rule| match &rule.kind {
-            IgnoreRuleKind::Extension(ext) => {
-                !is_dir
-                    && file_name
-                        .rsplit('.')
-                        .next()
-                        .is_some_and(|value| value.eq_ignore_ascii_case(ext))
+        if self.matches_skip_dir(&normalized, is_dir) {
+            return true;
+        }
+        let mut ignored = false;
+        let mut decided = false;
+        for rule in &self.rules {
+            let Some(rest) = rule.scope_relative(&normalized) else { continue };
+            if !rule.pattern.matches_path(rest, is_dir) {
+                continue;
             }
-            IgnoreRuleKind::Directory(dir) => directory_parts.iter().any(|part| part == dir),
-            IgnoreRuleKind::RelativePrefix(prefix) => {
-                normalized == *prefix || normalized.starts_with(&format!("{prefix}/"))
-            }
-            IgnoreRuleKind::Basename(name) => {
-                file_name == name || parts.iter().any(|part| part == name)
-            }
-        })
+            ignored = !rule.pattern.negated;
+            decided = true;
+        }
+        decided && ignored
     }
+
+    /// Returns `true` when `relative_path` (a file) or any of its ancestor
+    /// directories is ignored. Used in git-index mode where files are matched
+    /// directly instead of during a walk: a directory-only rule such as
+    /// `build/` must exclude the tracked files beneath `build`, and (as in git)
+    /// a negated pattern cannot re-include a file under an excluded directory.
+    fn matches_with_ancestors(&self, relative_path: &str) -> bool {
+        let normalized = relative_path.replace('\\', "/");
+        if self.matches(&normalized, false) {
+            return true;
+        }
+        let mut parent = normalized.rsplit_once('/').map(|(parent, _)| parent);
+        while let Some(dir) = parent {
+            if self.matches(dir, true) {
+                return true;
+            }
+            parent = dir.rsplit_once('/').map(|(parent, _)| parent);
+        }
+        false
+    }
+
+    /// Built-in skip directories match any *directory* component of the path:
+    /// a directory named `node_modules` is skipped along with everything under
+    /// it, but a file that merely shares the name is not.
+    fn matches_skip_dir(&self, normalized: &str, is_dir: bool) -> bool {
+        let parts = normalized.split('/').collect::<Vec<_>>();
+        let candidates: &[&str] =
+            if is_dir { &parts } else { &parts[..parts.len().saturating_sub(1)] };
+        self.skip_dirs.iter().any(|name| candidates.contains(&name.as_str()))
+    }
+}
+
+impl IgnoreRule {
+    /// Returns the portion of `path` (root-relative) that lives under this
+    /// rule's scope directory, or `None` when the rule does not apply.
+    fn scope_relative<'a>(&self, path: &'a str) -> Option<&'a str> {
+        if self.scope.is_empty() {
+            return Some(path);
+        }
+        path.strip_prefix(&format!("{}/", self.scope))
+    }
+}
+
+impl IgnorePattern {
+    fn matches_path(&self, path: &str, is_dir: bool) -> bool {
+        if self.directory_only && !is_dir {
+            return false;
+        }
+        let components = path.split('/').collect::<Vec<_>>();
+        if self.anchored {
+            glob_match(&self.parts, &components)
+        } else {
+            let Some(basename) = self.parts.first() else { return false };
+            components.iter().any(|component| glob_component_match(basename, component))
+        }
+    }
+}
+
+/// Parse a single ignore-file line into a pattern, or `None` for blank lines,
+/// comments, and empty (after `!`/trailing-slash stripping) patterns.
+fn parse_ignore_pattern(line: &str) -> Option<IgnorePattern> {
+    let line = line.trim_end();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+    let (negated, rest) = match line.strip_prefix('!') {
+        Some(rest) => (true, rest),
+        None => (false, line),
+    };
+    // A leading backslash escapes a literal `#`/`!`/etc.
+    let rest = rest.strip_prefix('\\').unwrap_or(rest);
+    if rest.is_empty() {
+        return None;
+    }
+    let (directory_only, body) = match rest.strip_suffix('/') {
+        Some(body) => (true, body),
+        None => (false, rest),
+    };
+    if body.is_empty() {
+        return None;
+    }
+    // A pattern with a slash (other than a trailing one) is anchored to the
+    // ignore file's directory; a leading slash anchors it explicitly.
+    let (anchored, pattern_body) = if let Some(stripped) = body.strip_prefix('/') {
+        (true, stripped)
+    } else if body.contains('/') {
+        (true, body)
+    } else {
+        (false, body)
+    };
+    if pattern_body.is_empty() {
+        return None;
+    }
+    let parts = pattern_body.split('/').map(str::to_owned).collect();
+    Some(IgnorePattern { negated, directory_only, anchored, parts })
+}
+
+/// Match a `/`-split glob pattern against a `/`-split path, where `**` spans
+/// zero or more path components and every other component uses git glob rules.
+fn glob_match(parts: &[String], path: &[&str]) -> bool {
+    fn go(parts: &[String], path: &[&str]) -> bool {
+        if parts.is_empty() {
+            return path.is_empty();
+        }
+        if parts[0] == "**" {
+            (0..=path.len()).any(|index| go(&parts[1..], &path[index..]))
+        } else if path.is_empty() {
+            false
+        } else {
+            glob_component_match(&parts[0], path[0]) && go(&parts[1..], &path[1..])
+        }
+    }
+    go(parts, path)
+}
+
+/// Match a single glob component against text: `*` spans any run of
+/// characters, `?` matches one character, `[...]` is a character class, and
+/// `\` escapes the following character.
+fn glob_component_match(pattern: &str, text: &str) -> bool {
+    let pattern = pattern.chars().collect::<Vec<_>>();
+    let text = text.chars().collect::<Vec<_>>();
+
+    fn go(pattern: &[char], text: &[char]) -> bool {
+        if pattern.is_empty() {
+            return text.is_empty();
+        }
+        match pattern[0] {
+            '*' => (0..=text.len()).any(|index| go(&pattern[1..], &text[index..])),
+            '?' => !text.is_empty() && go(&pattern[1..], &text[1..]),
+            '[' => {
+                if text.is_empty() {
+                    return false;
+                }
+                match match_char_class(pattern, text[0]) {
+                    Some(next) => go(&pattern[next..], &text[1..]),
+                    None => false,
+                }
+            }
+            '\\' => {
+                pattern.len() >= 2
+                    && !text.is_empty()
+                    && pattern[1] == text[0]
+                    && go(&pattern[2..], &text[1..])
+            }
+            literal => !text.is_empty() && literal == text[0] && go(&pattern[1..], &text[1..]),
+        }
+    }
+
+    go(&pattern, &text)
+}
+
+/// Match the `[...]` character class at the start of `pattern` (which begins
+/// with `[`) against `text_char`, returning the index just past the closing
+/// `]` on a match, or `None` for an unterminated class. Supports negation
+/// (`!`/`^`) and `a-z` ranges.
+fn match_char_class(pattern: &[char], text_char: char) -> Option<usize> {
+    debug_assert_eq!(pattern[0], '[');
+    let mut index = 1;
+    let mut negate = false;
+    if index < pattern.len() && (pattern[index] == '!' || pattern[index] == '^') {
+        negate = true;
+        index += 1;
+    }
+    let mut matched = false;
+    // A `]` immediately after `[` (or after `[!`) is a literal `]`, so the
+    // class only closes once at least one item has been consumed.
+    let mut can_close = false;
+    while index < pattern.len() {
+        if pattern[index] == ']' && can_close {
+            return Some(index + 1).filter(|_| matched != negate);
+        }
+        if index + 2 < pattern.len() && pattern[index + 1] == '-' && pattern[index + 2] != ']' {
+            if text_char >= pattern[index] && text_char <= pattern[index + 2] {
+                matched = true;
+            }
+            index += 3;
+        } else {
+            if pattern[index] == text_char {
+                matched = true;
+            }
+            index += 1;
+        }
+        can_close = true;
+    }
+    None
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3822,7 +4078,7 @@ mod tests {
     #[test]
     fn does_not_treat_file_named_like_directory_as_ignored_directory() {
         let tempdir = tempdir().unwrap();
-        let matcher = IgnoreMatcher::load(tempdir.path()).unwrap();
+        let matcher = IgnoreMatcher::new(tempdir.path());
         assert!(!matcher.matches("node_modules", false));
         assert!(matcher.matches("node_modules", true));
     }
@@ -5784,6 +6040,91 @@ mod tests {
         }
     }
 
+    /// A tracked file remains eligible even after `.gitignore` later names it:
+    /// tracked index paths are not subject to a (possibly untracked) ignore
+    /// file — git keeps tracked paths tracked.
+    #[test]
+    fn git_index_discovery_keeps_tracked_files_even_when_gitignored() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path().to_path_buf();
+        git_init_with_commit(
+            &root,
+            "main",
+            &[("tracked.md", "tracked\n"), ("docs/notes.md", "notes\n")],
+        );
+        fs::write(root.join(".gitignore"), "*.md\n").unwrap();
+
+        let discovery = discover_project_sources(&root).unwrap();
+        assert_eq!(discovery.basis, ProjectSourceBasis::GitIndex);
+        let names: Vec<_> = discovery.sources.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["docs/notes.md", "tracked.md"]);
+        assert_eq!(discovery.skipped, 0);
+    }
+
+    /// `.mempalaceignore` is the explicit additional exclusion in git-index
+    /// mode: it suppresses tracked files even when `.gitignore` does not.
+    #[test]
+    fn git_index_discovery_applies_mempalace_ignore_even_over_gitignore() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path().to_path_buf();
+        git_init_with_commit(
+            &root,
+            "main",
+            &[("tracked.md", "tracked\n"), ("docs/notes.md", "notes\n")],
+        );
+        fs::write(root.join(".gitignore"), "*.md\n").unwrap();
+        fs::write(root.join(".mempalaceignore"), "tracked.md\n").unwrap();
+
+        let discovery = discover_project_sources(&root).unwrap();
+        assert_eq!(discovery.basis, ProjectSourceBasis::GitIndex);
+        let names: Vec<_> = discovery.sources.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["docs/notes.md"]);
+        assert_eq!(discovery.skipped, 1);
+    }
+
+    /// Nested `.mempalaceignore` files apply to tracked files in their scope.
+    #[test]
+    fn git_index_discovery_honors_nested_mempalace_ignore() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path().to_path_buf();
+        git_init_with_commit(
+            &root,
+            "main",
+            &[
+                ("src/lib.rs", "fn lib() {}\n"),
+                ("src/skip.me.md", "skip\n"),
+                ("docs/keep.md", "keep\n"),
+            ],
+        );
+        fs::write(root.join("src").join(".mempalaceignore"), "skip.me.md\n").unwrap();
+
+        let discovery = discover_project_sources(&root).unwrap();
+        assert_eq!(discovery.basis, ProjectSourceBasis::GitIndex);
+        let names: Vec<_> = discovery.sources.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["docs/keep.md", "src/lib.rs"]);
+        assert_eq!(discovery.skipped, 1);
+    }
+
+    /// A directory-only `.mempalaceignore` rule (`generated/`) excludes the
+    /// tracked files beneath that directory in git-index mode.
+    #[test]
+    fn git_index_discovery_honors_directory_only_mempalace_ignore() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path().to_path_buf();
+        git_init_with_commit(
+            &root,
+            "main",
+            &[("generated/out.rs", "fn out() {}\n"), ("src/lib.rs", "fn lib() {}\n")],
+        );
+        fs::write(root.join(".mempalaceignore"), "generated/\n").unwrap();
+
+        let discovery = discover_project_sources(&root).unwrap();
+        assert_eq!(discovery.basis, ProjectSourceBasis::GitIndex);
+        let names: Vec<_> = discovery.sources.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["src/lib.rs"]);
+        assert_eq!(discovery.skipped, 1);
+    }
+
     /// Non-Git roots keep the filesystem walk and report the Filesystem basis.
     #[test]
     fn discover_project_sources_reports_filesystem_basis_for_non_git() {
@@ -5799,6 +6140,86 @@ mod tests {
         let names: Vec<_> = discovery.sources.iter().map(|s| s.relative_path.as_str()).collect();
         assert_eq!(names, vec!["keep/visible.md"]);
         assert!(discovery.skipped >= 2);
+    }
+
+    /// Nested `.gitignore` files apply relative to their own directory, so a
+    /// deeper ignore file can hide files a shallower one would keep.
+    #[test]
+    fn filesystem_discovery_honors_nested_gitignore() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path();
+        fs::write(root.join(".gitignore"), "*.log\n").unwrap();
+        fs::create_dir_all(root.join("sub")).unwrap();
+        fs::write(root.join("sub").join(".gitignore"), "secret.md\n").unwrap();
+        fs::write(root.join("sub").join("secret.md"), "hidden").unwrap();
+        fs::write(root.join("sub").join("visible.md"), "visible").unwrap();
+        fs::write(root.join("trace.log"), "noise").unwrap();
+
+        let discovery = discover_project_sources(root).unwrap();
+        assert_eq!(discovery.basis, ProjectSourceBasis::Filesystem);
+        let names: Vec<_> = discovery.sources.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["sub/visible.md"]);
+    }
+
+    /// `!`-negated patterns re-include paths a previous rule excluded.
+    #[test]
+    fn filesystem_discovery_supports_negation() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path();
+        fs::write(root.join(".gitignore"), "*.md\n!important.md\n").unwrap();
+        fs::write(root.join("trace.md"), "noise").unwrap();
+        fs::write(root.join("important.md"), "keep").unwrap();
+
+        let discovery = discover_project_sources(root).unwrap();
+        assert_eq!(discovery.basis, ProjectSourceBasis::Filesystem);
+        let names: Vec<_> = discovery.sources.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["important.md"]);
+    }
+
+    /// Slash-anchored patterns match relative to the ignore file's directory,
+    /// unlike unanchored basename patterns which match at any depth.
+    #[test]
+    fn filesystem_discovery_honors_anchored_patterns() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path();
+        fs::write(root.join(".gitignore"), "/artifacts/\n").unwrap();
+        fs::create_dir_all(root.join("artifacts")).unwrap();
+        fs::write(root.join("artifacts").join("artifact.md"), "a").unwrap();
+        fs::create_dir_all(root.join("src").join("artifacts")).unwrap();
+        fs::write(root.join("src").join("artifacts").join("artifact.md"), "b").unwrap();
+        fs::write(root.join("src").join("lib.md"), "lib").unwrap();
+
+        let discovery = discover_project_sources(root).unwrap();
+        assert_eq!(discovery.basis, ProjectSourceBasis::Filesystem);
+        let names: Vec<_> = discovery.sources.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["src/artifacts/artifact.md", "src/lib.md"]);
+    }
+
+    /// Git glob semantics: `*` does not cross `/`, `?` matches one character,
+    /// and `**` spans directory levels.
+    #[test]
+    fn filesystem_discovery_supports_globs_and_doublestar() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path();
+        fs::write(
+            root.join(".gitignore"),
+            "doc/*.md\n**/cache/tmp?.md\na/**/b/m.md\n",
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("doc")).unwrap();
+        fs::write(root.join("doc").join("readme.md"), "r").unwrap();
+        fs::write(root.join("doc").join("nested").join("readme.md"), "r2").unwrap();
+        fs::create_dir_all(root.join("x").join("cache")).unwrap();
+        fs::write(root.join("x").join("cache").join("tmp1.md"), "t1").unwrap();
+        fs::write(root.join("x").join("cache").join("tmp12.md"), "t12").unwrap();
+        fs::create_dir_all(root.join("a").join("x").join("b")).unwrap();
+        fs::write(root.join("a").join("x").join("b").join("m.md"), "m").unwrap();
+        fs::write(root.join("a").join("b").join("n.md"), "n").unwrap();
+
+        let discovery = discover_project_sources(root).unwrap();
+        assert_eq!(discovery.basis, ProjectSourceBasis::Filesystem);
+        let names: Vec<_> = discovery.sources.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["a/b/n.md", "doc/nested/readme.md", "x/cache/tmp12.md"]);
     }
 
     #[test]

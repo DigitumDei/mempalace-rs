@@ -147,19 +147,31 @@ valid UTF-8 always use the legacy stored-content path. Re-mining them with
 - **Git-backed roots** enumerate the tracked index (`git ls-files`): only
   tracked index files are mined (this includes staged, uncommitted entries,
   but never untracked or ignored working-tree content). Ignored and untracked
-  working-tree content
-  (`.gitignore`d files such as `.env`, local editor overrides like
-  `*.local.json`, and build output) never enters the source set. Branch-delta
+  working-tree content (`.gitignore`d files such as `.env`, local editor
+  overrides like `*.local.json`, and build output) never enters the source set
+  because it is simply absent from the index. A `.gitignore` does **not**
+  suppress a tracked file: tracked paths remain tracked even after an ignore
+  pattern is added. `.mempalaceignore` is the explicit additional exclusion and
+  applies to tracked files, including nested files at any depth. Branch-delta
   mines (`--branch` / `--view <name>`) are the deliberate exception: they also
   include untracked, non-ignored files so that new branch work is captured
   before it is committed.
-- **Non-Git directories** use a filesystem walk. `.gitignore` and
-  `.mempalaceignore` files are honored, and the following directory names are
-  always skipped: `.git`, `node_modules`, `__pycache__`, `.venv`, `venv`,
-  `env`, `dist`, `build`, `.next`, `coverage`, `.mempalace`.
+- **Non-Git directories** use a filesystem walk that honors `.gitignore` and
+  `.mempalaceignore` files at every directory level with git-compatible
+  semantics: nested files are scoped to their own directory, `!` patterns
+  re-include previously excluded paths, patterns containing a `/` are anchored
+  to the ignore file's directory (unanchored patterns match the basename at any
+  depth), and `*`, `?`, `[...]`, and `**` globs follow git's rules. The
+  following directory names are always skipped: `.git`, `node_modules`,
+  `__pycache__`, `.venv`, `venv`, `env`, `dist`, `build`, `.next`, `coverage`,
+  `.mempalace`.
 
 Linked Git worktrees reported by `git worktree list --porcelain` are always
 skipped, preventing duplicate checkout content from being mined.
+
+Room detection during `init` and `project register` uses the same safe source
+set: rooms are derived from the directories that hold eligible sources, so
+ignored, untracked, and linked-worktree directories never produce rooms.
 
 ### Accepted extensions
 

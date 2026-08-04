@@ -329,7 +329,7 @@ federation HTTP server started by `mempalace serve`.
   - `token`: string — the bearer secret a client must present (required).
   - `name`: string — the identity recorded as `added_by` on writes from that token (required).
   - `enabled`: boolean — `false` treats the entry as if it did not exist (instant revoke) (required).
-  - `level`: string — optional access level. One of `read`, `write`, or `admin`. Defaults to `write` when omitted (backward compatible). Unknown values fail server start.
+  - `level`: string — optional access level. One of `read`, `write`, or `admin`. Defaults to `write` when omitted (backward compatible). An unknown `level` value, or any unexpected key on a token entry, fails server start.
 - Access is enforced per route: `read` tokens may call every read route but are rejected with `403 forbidden` on write routes; `write` and `admin` are equivalent for the current route set. The level is a whole-token gate, not a per-user or per-wing policy.
 
 #### `server.checkouts`

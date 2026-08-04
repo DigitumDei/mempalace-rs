@@ -124,7 +124,15 @@ Operational notes:
   monitoring that only need to query the palace; issue `write`-level (or
   `admin`) tokens for interactive agents that also add drawers, KG facts, or
   ingest mined data. The token file is hot-reloaded, so revoking a token (set
-  `enabled: false`) takes effect on the next request without a restart.
+  `enabled: false`) takes effect on the next request without a restart. Note
+  that a read token can enumerate the change-event feed (`GET /v1/changes`),
+  whose `actor` fields include end-user identities when delegation is in use
+  (e.g. `hub:dion@corp.com`) — treat read tokens as able to list those users,
+  not just service identities.
+- An unknown `level` value or any unexpected key in the token file causes the
+  whole file to be rejected. Because reload is fail-closed, a typo introduced
+  during a live edit disables **every** token until the file is fixed — verify
+  edits before saving on a running server.
 - Access levels gate the API: `read` tokens may call read routes only and get
   `403 forbidden` on write routes (drawer add/delete, KG add/invalidate, ingest);
   `write` and `admin` may call everything. There is no per-user or per-wing

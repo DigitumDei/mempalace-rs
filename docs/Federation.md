@@ -78,7 +78,9 @@ Authentication is bearer-token based. The token file is a JSON array of entries:
 - `name` — the identity recorded as `added_by` on writes from that token.
 - `enabled` — `false` treats the entry as if it did not exist (instant revoke).
 - `level` — optional access level: `read`, `write`, or `admin`. Defaults to
-  `write` when omitted (backward compatible). Unknown values fail server start.
+  `write` when omitted (backward compatible). An unknown `level` value, or any
+  unexpected key on a token entry, fails server start — a typo such as
+  `levle` cannot silently mint a more-privileged token.
 
 Access is enforced per route. A `read` token can call every read route
 (including `POST /v1/drawers/check_duplicate`) but is rejected with `403

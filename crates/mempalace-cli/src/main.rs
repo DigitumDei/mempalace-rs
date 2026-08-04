@@ -4437,10 +4437,6 @@ mod tests {
                 maintenance_idle_secs: 0,
                 maintenance_last_run: None,
                 maintenance_status: mempalace_federation::MaintenanceStatus::Disabled,
-                authenticated_token: None,
-                authenticated_level: None,
-                on_behalf_of: None,
-                composed_identity: None,
             })
         }
 

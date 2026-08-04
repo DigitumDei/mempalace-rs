@@ -42,18 +42,6 @@ pub struct InfoResponse {
     /// `null` of `maintenance_last_run` with explicit states.
     #[serde(default)]
     pub maintenance_status: MaintenanceStatus,
-    /// The authenticated token's name, if the caller authenticated.
-    #[serde(default)]
-    pub authenticated_token: Option<String>,
-    /// The authenticated token's access level, if the caller authenticated.
-    #[serde(default)]
-    pub authenticated_level: Option<String>,
-    /// The delegated principal, if the caller provided a delegation header.
-    #[serde(default)]
-    pub on_behalf_of: Option<String>,
-    /// The composed identity: `token_name` or `token_name:on_behalf_of`.
-    #[serde(default)]
-    pub composed_identity: Option<String>,
 }
 
 // ─── Maintenance status ────────────────────────────────────────────────────────
@@ -481,6 +469,35 @@ pub struct ErrorBody {
 
 // ─── Whoami ──────────────────────────────────────────────────────────────────
 
+/// Access tier for a bearer token: gates which routes a caller may use and is
+/// reported back by `GET /v1/whoami`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AccessLevel {
+    /// Read-only access: search, query, list, get.
+    Read,
+    /// Read + write access: add drawers, add KG facts, ingest.
+    Write,
+    /// Unrestricted access within the palace.
+    Admin,
+}
+
+impl AccessLevel {
+    /// The lowercase wire string for this level.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AccessLevel::Read => "read",
+            AccessLevel::Write => "write",
+            AccessLevel::Admin => "admin",
+        }
+    }
+
+    /// Serde default for token files that omit `level` (backward compatible).
+    pub fn default_write() -> Self {
+        AccessLevel::Write
+    }
+}
+
 /// Response body for `GET /v1/whoami`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WhoamiResponse {
@@ -492,7 +509,7 @@ pub struct WhoamiResponse {
     /// The composed principal: `token_name` or `token_name:on_behalf_of`.
     pub identity: String,
     /// The authenticated token's access level.
-    pub level: String,
+    pub level: AccessLevel,
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -516,10 +533,6 @@ mod tests {
             maintenance_idle_secs: 300,
             maintenance_last_run: None,
             maintenance_status: MaintenanceStatus::Idle,
-            authenticated_token: None,
-            authenticated_level: None,
-            on_behalf_of: None,
-            composed_identity: None,
         };
         let json = serde_json::to_string(&original).unwrap();
         let decoded: InfoResponse = serde_json::from_str(&json).unwrap();
@@ -861,7 +874,7 @@ mod tests {
             token_name: "alice".to_owned(),
             on_behalf_of: None,
             identity: "alice".to_owned(),
-            level: "write".to_owned(),
+            level: AccessLevel::Write,
         };
         let json = serde_json::to_string(&plain).unwrap();
         let decoded: WhoamiResponse = serde_json::from_str(&json).unwrap();
@@ -875,7 +888,7 @@ mod tests {
             token_name: "alice".to_owned(),
             on_behalf_of: Some("dion@corp.com".to_owned()),
             identity: "alice:dion@corp.com".to_owned(),
-            level: "admin".to_owned(),
+            level: AccessLevel::Admin,
         };
         let json = serde_json::to_string(&delegated).unwrap();
         let decoded: WhoamiResponse = serde_json::from_str(&json).unwrap();
@@ -886,7 +899,8 @@ mod tests {
     }
 
     #[test]
-    fn info_response_with_identity_round_trips() {
+    fn info_response_round_trips_without_identity() {
+        // /v1/info is server metadata; caller identity lives in /v1/whoami.
         let original = InfoResponse {
             server_version: "2.0.0".to_owned(),
             federation_api_version: FEDERATION_API_VERSION,
@@ -897,26 +911,29 @@ mod tests {
             maintenance_idle_secs: 300,
             maintenance_last_run: None,
             maintenance_status: MaintenanceStatus::Idle,
-            authenticated_token: Some("alice".to_owned()),
-            authenticated_level: Some("write".to_owned()),
-            on_behalf_of: Some("dion@corp.com".to_owned()),
-            composed_identity: Some("alice:dion@corp.com".to_owned()),
         };
         let json = serde_json::to_string(&original).unwrap();
         let decoded: InfoResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(original, decoded);
-        assert!(json.contains(r#""authenticated_token":"alice""#));
-        assert!(json.contains(r#""composed_identity":"alice:dion@corp.com""#));
+        assert!(!json.contains("authenticated_token"));
+        assert!(!json.contains("composed_identity"));
     }
 
     #[test]
     fn info_response_without_identity_backward_compatible() {
-        // Legacy JSON without identity fields must deserialize with defaults.
+        // Legacy JSON (with or without the dropped identity fields) must still
+        // deserialize into the current DTO without error.
         let raw = r#"{"server_version":"1.0","federation_api_version":1}"#;
         let info: InfoResponse = serde_json::from_str(raw).unwrap();
-        assert!(info.authenticated_token.is_none());
-        assert!(info.authenticated_level.is_none());
-        assert!(info.on_behalf_of.is_none());
-        assert!(info.composed_identity.is_none());
+        assert_eq!(info.server_version, "1.0");
+    }
+
+    #[test]
+    fn access_level_as_str_matches_wire_serde() {
+        assert_eq!(AccessLevel::Read.as_str(), "read");
+        assert_eq!(AccessLevel::Write.as_str(), "write");
+        assert_eq!(AccessLevel::Admin.as_str(), "admin");
+        assert_eq!(serde_json::to_value(AccessLevel::Read).unwrap(), "read");
+        assert_eq!(serde_json::to_value(AccessLevel::Admin).unwrap(), "admin");
     }
 }

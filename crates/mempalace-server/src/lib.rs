@@ -42,11 +42,11 @@ use mempalace_core::{
 };
 use mempalace_embeddings::{EmbeddingProvider, EmbeddingRequest};
 use mempalace_federation::{
-    AddDrawerRequest, AddDrawerResponse, ChangeEventDto, ChangesQuery, ChangesResponse,
-    CheckDuplicateRequest, CheckDuplicateResponse, DrawerSearchRequest, DrawerSearchResponse,
-    ErrorBody, FEDERATION_API_VERSION, InfoResponse, IngestBatchRequest, IngestBatchResponse,
-    IngestFileResult, KgAddFactRequest, KgInvalidateRequest, KgQueryRequest, ListDrawersQuery,
-    ListDrawersResponse, MaintenanceAbortReason as FedMaintenanceAbortReason,
+    AccessLevel, AddDrawerRequest, AddDrawerResponse, ChangeEventDto, ChangesQuery,
+    ChangesResponse, CheckDuplicateRequest, CheckDuplicateResponse, DrawerSearchRequest,
+    DrawerSearchResponse, ErrorBody, FEDERATION_API_VERSION, InfoResponse, IngestBatchRequest,
+    IngestBatchResponse, IngestFileResult, KgAddFactRequest, KgInvalidateRequest, KgQueryRequest,
+    ListDrawersQuery, ListDrawersResponse, MaintenanceAbortReason as FedMaintenanceAbortReason,
     MaintenanceRunStatus as FedMaintenanceRunStatus,
     MaintenanceSkipReason as FedMaintenanceSkipReason, MaintenanceStatus, RemoteDrawerResult,
     WhoamiResponse,
@@ -243,38 +243,13 @@ impl IntoResponse for ServerError {
 
 // ─── Token auth ──────────────────────────────────────────────────────────────
 
-/// Access level for a bearer token.
-///
-/// Ordering is `Read < Write < Admin` (increasing privilege).
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    serde::Serialize,
-    serde::Deserialize,
-)]
-#[serde(rename_all = "lowercase")]
-pub enum AccessLevel {
-    /// Read-only access: search, query, list, get.
-    Read,
-    /// Read + write access: add drawers, add KG facts, ingest.
-    Write,
-    /// Unrestricted access within the palace.
-    Admin,
-}
-
-impl AccessLevel {
-    fn default_write() -> Self {
-        AccessLevel::Write
-    }
-}
-
 /// A single entry in the bearer-token file as stored on disk.
+///
+/// Unknown keys are rejected (`deny_unknown_fields`) so a typo such as `levle`
+/// cannot silently fall back to the `write` default and mint a more-privileged
+/// token than the operator intended.
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TokenEntry {
     /// The raw bearer token string.
     token: String,
@@ -854,7 +829,7 @@ fn summary_to_status(summary: &MaintenanceRunSummary) -> MaintenanceStatus {
 
 async fn route_info<P>(
     State(state): State<Arc<ServerState<P>>>,
-    auth: axum::extract::Extension<AuthIdentity>,
+    _auth: axum::extract::Extension<AuthIdentity>,
 ) -> Result<impl IntoResponse, ServerError>
 where
     P: EmbeddingProvider + Send + Sync + 'static,
@@ -867,10 +842,6 @@ where
         .and_then(|s| serde_json::to_value(s).ok());
 
     let status = state.maintenance_status.lock().unwrap().clone();
-
-    let level = serde_json::to_value(&auth.level)
-        .ok()
-        .and_then(|v| v.as_str().map(str::to_owned));
 
     Ok(Json(InfoResponse {
         server_version: BUILD_VERSION.to_owned(),
@@ -889,10 +860,6 @@ where
         maintenance_idle_secs: state.config.maintenance.idle_secs as u64,
         maintenance_last_run: last_run,
         maintenance_status: status,
-        authenticated_token: Some(auth.token_name.clone()),
-        authenticated_level: level,
-        on_behalf_of: auth.on_behalf_of.clone(),
-        composed_identity: Some(auth.principal()),
     }))
 }
 
@@ -901,16 +868,11 @@ where
 async fn route_whoami(
     auth: axum::extract::Extension<AuthIdentity>,
 ) -> impl IntoResponse {
-    let level = serde_json::to_value(&auth.level)
-        .ok()
-        .and_then(|v| v.as_str().map(str::to_owned))
-        .unwrap_or_else(|| "unknown".to_owned());
-
     Json(WhoamiResponse {
         token_name: auth.token_name.clone(),
         on_behalf_of: auth.on_behalf_of.clone(),
         identity: auth.principal(),
-        level,
+        level: auth.level,
     })
 }
 
@@ -1061,7 +1023,7 @@ where
         event_type: "drawer_added".to_owned(),
         occurred_at: now,
         entity_id: drawer_id.as_str().to_owned(),
-        actor: Some(auth.principal()),
+        actor: Some(added_by.clone()),
         details_json: Some(json!({"wing": wing.as_str(), "room": room.as_str()}).to_string()),
     })?;
 
@@ -1989,7 +1951,7 @@ where
             event_type: "mine_batch".to_owned(),
             occurred_at: now,
             entity_id: format!("mine_batch:{wing_str}"),
-            actor: Some(auth.principal()),
+            actor: Some(added_by.clone()),
             details_json: Some(
                 json!({
                     "repo_id": body.repo_id,
@@ -2623,6 +2585,33 @@ mod tests {
                 assert!(
                     msg.contains("superadmin"),
                     "expected unknown-level detail in error: {msg}"
+                );
+            }
+            other => panic!("expected TokenFile error, got {other}"),
+        }
+    }
+
+    #[test]
+    fn token_registry_rejects_unknown_key() {
+        let tempdir = TempDir::new().unwrap();
+        let token_file = tempdir.path().join("tokens.json");
+        // A mis-typed key must not silently fall back to the `write` default.
+        std::fs::write(
+            &token_file,
+            serde_json::to_string(&serde_json::json!([
+                {"token": "x", "name": "bad", "enabled": true, "levle": "read"},
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        restrict_token_file(&token_file);
+
+        let err = TokenRegistry::load(token_file).unwrap_err();
+        match err {
+            ServerError::TokenFile(msg) => {
+                assert!(
+                    msg.contains("levle"),
+                    "expected unknown-key detail in error: {msg}"
                 );
             }
             other => panic!("expected TokenFile error, got {other}"),
@@ -4571,6 +4560,23 @@ mod tests {
             .unwrap();
         let get_body = body_json(get_resp).await;
         assert_eq!(get_body["added_by"], "alice:carol");
+
+        // The change feed must record the composed fallback principal as the
+        // actor, not drop the body-claimed identity from the audit trail.
+        let changes_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_get("/v1/changes?limit=5", ALICE_TOKEN))
+            .await
+            .unwrap();
+        assert_eq!(changes_resp.status(), StatusCode::OK);
+        let changes_body = body_json(changes_resp).await;
+        let events = changes_body["events"].as_array().unwrap();
+        let added = events
+            .iter()
+            .find(|ev| ev["event_type"] == "drawer_added")
+            .expect("expected a drawer_added event");
+        assert_eq!(added["actor"], "alice:carol");
     }
 
     #[tokio::test]
@@ -5150,54 +5156,5 @@ mod tests {
         let harness = make_harness().await;
         let resp = harness.router.oneshot(authed_get("/v1/whoami", BAD_TOKEN)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn info_returns_authenticated_identity() {
-        let harness = make_harness().await;
-        let resp = harness.router.oneshot(authed_get("/v1/info", ALICE_TOKEN)).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = body_json(resp).await;
-        assert_eq!(body["authenticated_token"], "alice");
-        assert_eq!(body["authenticated_level"], "write");
-        assert_eq!(body["on_behalf_of"], serde_json::Value::Null);
-        assert_eq!(body["composed_identity"], "alice");
-    }
-
-    #[tokio::test]
-    async fn info_returns_delegated_identity() {
-        let harness = make_harness().await;
-        let resp = harness
-            .router
-            .clone()
-            .oneshot(delegated_get("/v1/info", ALICE_TOKEN, "dion@corp.com"))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = body_json(resp).await;
-        assert_eq!(body["authenticated_token"], "alice");
-        assert_eq!(body["authenticated_level"], "write");
-        assert_eq!(body["on_behalf_of"], "dion@corp.com");
-        assert_eq!(body["composed_identity"], "alice:dion@corp.com");
-    }
-
-    #[tokio::test]
-    async fn info_returns_admin_level() {
-        let harness = make_harness().await;
-        let resp = harness.router.oneshot(authed_get("/v1/info", ADMIN_TOKEN)).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = body_json(resp).await;
-        assert_eq!(body["authenticated_token"], "admin");
-        assert_eq!(body["authenticated_level"], "admin");
-    }
-
-    #[tokio::test]
-    async fn info_returns_read_level() {
-        let harness = make_harness().await;
-        let resp = harness.router.oneshot(authed_get("/v1/info", READ_TOKEN)).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = body_json(resp).await;
-        assert_eq!(body["authenticated_token"], "reader");
-        assert_eq!(body["authenticated_level"], "read");
     }
 }

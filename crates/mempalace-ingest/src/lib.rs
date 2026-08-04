@@ -71,7 +71,9 @@ const DEFAULT_SKIP_DIRS: &[&str] = &[
     ".mempalace",
 ];
 /// Exact file names (case-sensitive) that are always skipped in project discovery.
-/// Also see: `.env`-prefix skip in `project_file_skip_by_name`.
+/// This is the non-secret hygiene list (lockfiles, palace config); the
+/// secret-shaped path denylist (issue #95) is matched separately in
+/// [`secret_path_kind`].
 const PROJECT_SKIP_FILES: &[&str] = &[
     "mempalace.yaml",
     "mempalace.yml",
@@ -369,6 +371,9 @@ pub struct IngestSummary {
     /// The view name detected/used for this mine, if any.  `None` for canonical
     /// or non-Git mines.
     pub view_name: Option<String>,
+    /// Secret-shaped paths withheld by the path denylist during discovery
+    /// (issue #95). Carries path and reason only; never file content.
+    pub secret_path_skips: Vec<ProjectSourceSkip>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -541,6 +546,59 @@ pub enum ProjectSourceBasis {
     Filesystem,
 }
 
+/// A candidate path withheld by the path-based secret denylist (issue #95).
+///
+/// Recorded so operators can see what was withheld rather than auditing after
+/// the fact. Carries the path and a reason only — never any file content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectSourceSkip {
+    /// Root-relative, `/`-separated path of the withheld candidate.
+    pub relative_path: String,
+    /// Short human-readable reason describing the denylist match.
+    pub reason: String,
+}
+
+/// Categories of the path-based secret denylist (issue #95). Matches are made
+/// on the file name (case-insensitive) *before* any content is read, so a
+/// secret path is withheld without opening the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretPathKind {
+    /// `.env` and `.env.*` process-environment files.
+    DotEnv,
+    /// `*.kubeconfig*` Kubernetes configuration files.
+    Kubeconfig,
+    /// SSH private keys: `id_rsa*`, `id_ed25519`, `id_ecdsa`, `id_dsa`.
+    SshPrivateKey,
+    /// Keystores and truststores: `*.pfx`, `*.p12`, `*.jks`.
+    Keystore,
+    /// Package/registry credential files: `.npmrc`, `.netrc`.
+    Netrc,
+    /// Terraform state and variable files: `*.tfstate`, `*.tfvars`.
+    TerraformSecret,
+    /// JSON secret bundles: `secrets*.json`.
+    SecretsJson,
+    /// Local override/config files that commonly hold credentials:
+    /// `*.local.json`.
+    LocalJson,
+}
+
+impl SecretPathKind {
+    /// The denylist pattern(s) this category covers, for operator-facing skip
+    /// records.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DotEnv => ".env / *.env",
+            Self::Kubeconfig => "*.kubeconfig*",
+            Self::SshPrivateKey => "id_rsa* / id_ed25519 / id_ecdsa / id_dsa (SSH private key)",
+            Self::Keystore => "*.pfx / *.p12 / *.jks (keystore)",
+            Self::Netrc => ".npmrc / .netrc",
+            Self::TerraformSecret => "*.tfstate / *.tfvars",
+            Self::SecretsJson => "secrets*.json",
+            Self::LocalJson => "*.local.json",
+        }
+    }
+}
+
 /// Result of [`discover_project_sources`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectSourceDiscovery {
@@ -551,6 +609,9 @@ pub struct ProjectSourceDiscovery {
     /// Number of candidate paths skipped (ignored, ineligible, or missing on
     /// disk).
     pub skipped: usize,
+    /// Secret-denylist exclusions, in discovery order, for operator
+    /// visibility. Path and reason only; never file content.
+    pub skips: Vec<ProjectSourceSkip>,
 }
 
 /// A single chunk produced by [`prepare_file_chunks`], with all byte/line
@@ -686,6 +747,7 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
     let mut summary = IngestSummary::default();
     summary.discovered_files = discovered.files.len();
     summary.ignored_files = discovered.ignored_files;
+    summary.secret_path_skips = discovered.skips;
     summary.view_name = branch_name.clone();
 
     // For branch mode: compute the delta set and filter files.
@@ -1000,6 +1062,7 @@ pub async fn ingest_conversations<P: EmbeddingProvider>(
     let mut summary = IngestSummary::default();
     summary.discovered_files = discovered.files.len();
     summary.ignored_files = discovered.ignored_files;
+    summary.secret_path_skips = discovered.skips;
     let files = apply_limit(discovered.files, request.limit);
 
     for file in files {
@@ -1806,6 +1869,7 @@ pub fn prepare_project_batch_with_config(
     let mut summary = IngestSummary::default();
     summary.discovered_files = discovered.files.len();
     summary.ignored_files = discovered.ignored_files;
+    summary.secret_path_skips = discovered.skips;
     // Remote mine callers resolve the checkout view before preparing the batch.
     // Preserve it so their summaries match local mine output.
     summary.view_name = request
@@ -2001,19 +2065,83 @@ pub fn resolve_current_branch(root: &Path) -> Option<String> {
     if s.is_empty() || s == "HEAD" { None } else { Some(s) }
 }
 
-/// Returns `true` if `file_name` should be skipped for secrets / lockfile hygiene.
+/// Returns the secret-denylist category for `file_name` (matched
+/// case-insensitively), or `None` when the name is not secret-shaped.
 ///
-/// Handles exact matches from `PROJECT_SKIP_FILES` and the `.env`-prefix rule
-/// (`.env`, `.env.local`, `.env.production`, etc.).
-fn project_file_skip_by_name(file_name: &str) -> bool {
+/// The match is purely path-based and runs before any content is read, so a
+/// secret-shaped path is withheld without opening the file (issue #95).
+fn secret_path_kind(file_name: &str) -> Option<SecretPathKind> {
+    let name = file_name.to_ascii_lowercase();
+    if name.starts_with(".env") || name.ends_with(".env") {
+        return Some(SecretPathKind::DotEnv);
+    }
+    if name.contains("kubeconfig") {
+        return Some(SecretPathKind::Kubeconfig);
+    }
+    if ["id_rsa", "id_ed25519", "id_ecdsa", "id_dsa"]
+        .iter()
+        .any(|prefix| name.starts_with(*prefix))
+    {
+        return Some(SecretPathKind::SshPrivateKey);
+    }
+    if [".pfx", ".p12", ".jks"].iter().any(|ext| name.ends_with(*ext)) {
+        return Some(SecretPathKind::Keystore);
+    }
+    if name == ".npmrc" || name == ".netrc" {
+        return Some(SecretPathKind::Netrc);
+    }
+    if name.ends_with(".tfstate") || name.ends_with(".tfvars") {
+        return Some(SecretPathKind::TerraformSecret);
+    }
+    if name.starts_with("secrets") && name.ends_with(".json") {
+        return Some(SecretPathKind::SecretsJson);
+    }
+    if name.ends_with(".local.json") {
+        return Some(SecretPathKind::LocalJson);
+    }
+    None
+}
+
+/// Whether a candidate source is eligible for mining, and — when excluded by
+/// the secret-shaped denylist — the category for an operator-visible skip
+/// record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Eligibility {
+    Eligible,
+    /// Excluded for a reason that is not surfaced as a skip record
+    /// (extension mismatch, binary sniff, lockfile, palace config, ...).
+    Excluded,
+    /// Excluded by the secret-shaped path denylist (issue #95).
+    Secret(SecretPathKind),
+}
+
+/// Classify `file_name` against the built-in always-skip lists: the
+/// secret-shaped path denylist (issue #95) and the general hygiene list
+/// (lockfiles, palace config, `.gitignore`).
+fn project_skip_by_name(file_name: &str) -> Option<Eligibility> {
+    if let Some(kind) = secret_path_kind(file_name) {
+        return Some(Eligibility::Secret(kind));
+    }
     if PROJECT_SKIP_FILES.contains(&file_name) {
-        return true;
+        return Some(Eligibility::Excluded);
     }
-    // Skip any file whose name starts with ".env" (covers .env, .env.local, …)
-    if file_name.starts_with(".env") {
-        return true;
+    None
+}
+
+/// Append a secret-denylist skip record for `relative_path` when
+/// `eligibility` carries one. Used by both Git-index and filesystem discovery
+/// so exclusions are counted and recorded consistently.
+fn record_secret_skip(
+    eligibility: Eligibility,
+    relative_path: String,
+    skips: &mut Vec<ProjectSourceSkip>,
+) {
+    if let Eligibility::Secret(kind) = eligibility {
+        skips.push(ProjectSourceSkip {
+            relative_path,
+            reason: kind.as_str().to_owned(),
+        });
     }
-    false
 }
 
 /// Read up to `limit` bytes from `path`.  Returns `None` on any I/O error.
@@ -2219,6 +2347,7 @@ fn discover_git_index_sources(root: &Path) -> Result<ProjectSourceDiscovery> {
 
     let worktree_skip = linked_worktree_paths(root);
     let mut sources = Vec::new();
+    let mut skips = Vec::new();
 
     for (relative, relative_str) in entries {
         let absolute = root.join(&relative);
@@ -2249,38 +2378,49 @@ fn discover_git_index_sources(root: &Path) -> Result<ProjectSourceDiscovery> {
         }
         let file_name =
             relative.file_name().and_then(|value| value.to_str()).unwrap_or_default();
-        if !is_project_eligible(&absolute, file_name) {
-            skipped += 1;
-            continue;
+        match project_eligibility(&absolute, file_name) {
+            Eligibility::Eligible => sources.push(ProjectSource {
+                absolute_path: absolute,
+                relative_path: relative_str,
+            }),
+            eligibility => {
+                skipped += 1;
+                record_secret_skip(eligibility, relative_str, &mut skips);
+            }
         }
-        sources.push(ProjectSource {
-            absolute_path: absolute,
-            relative_path: relative_str,
-        });
     }
 
     sources.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
-    Ok(ProjectSourceDiscovery { sources, basis: ProjectSourceBasis::GitIndex, skipped })
+    Ok(ProjectSourceDiscovery {
+        sources,
+        basis: ProjectSourceBasis::GitIndex,
+        skipped,
+        skips,
+    })
 }
 
 /// Walk `root` with git-compatible ignore handling, keeping the project-eligible
 /// subset. Used for non-Git roots; the `core.excludesFile` global excludes file
 /// still applies, but `$GIT_DIR/info/exclude` does not (no git work tree).
 fn discover_filesystem_sources(root: &Path) -> Result<ProjectSourceDiscovery> {
-    let report = discover_files(root, true, is_project_eligible)?;
+    let report = discover_files(root, true, project_eligibility)?;
     Ok(ProjectSourceDiscovery {
         sources: report.files,
         basis: ProjectSourceBasis::Filesystem,
         skipped: report.ignored_files,
+        skips: report.skips,
     })
 }
 
-/// Returns `true` when `path` (with `file_name`) is eligible for project mining:
-/// not a secret or lockfile, accepted extension or basename (or shebang), and
-/// not binary-sniffed.
-fn is_project_eligible(path: &Path, file_name: &str) -> bool {
-    if project_file_skip_by_name(file_name) {
-        return false;
+/// Returns the eligibility of `path` (with `file_name`) for project mining.
+///
+/// The secret-shaped path denylist is checked first, before any content read
+/// (shebang or binary sniff), so secret paths are withheld without opening the
+/// file. Non-secret rejections (extension mismatch, lockfile, palace config,
+/// binary sniff) are counted but not recorded as skip records.
+fn project_eligibility(path: &Path, file_name: &str) -> Eligibility {
+    if let Some(eligibility) = project_skip_by_name(file_name) {
+        return eligibility;
     }
     let raw_ext = path.extension().and_then(|value| value.to_str()).unwrap_or_default();
     let has_ext = !raw_ext.is_empty();
@@ -2290,14 +2430,21 @@ fn is_project_eligible(path: &Path, file_name: &str) -> bool {
             && (PROJECT_READABLE_BASENAMES.contains(&file_name) || has_shebang(path)));
     // Binary sniff: exclude files with a NUL byte in the first 8 KiB even
     // when the extension claims text (misnamed binaries).
-    accepted && !looks_binary(path)
+    if !accepted || looks_binary(path) {
+        return Eligibility::Excluded;
+    }
+    Eligibility::Eligible
 }
 
 /// Internal discovery used by project mining and remote batch preparation.
 /// Mirrors [`discover_project_sources`] and reports into the legacy shape.
 fn discover_project_files(root: &Path) -> Result<DiscoveryReport> {
     let discovery = discover_project_sources(root)?;
-    Ok(DiscoveryReport { files: discovery.sources, ignored_files: discovery.skipped })
+    Ok(DiscoveryReport {
+        files: discovery.sources,
+        ignored_files: discovery.skipped,
+        skips: discovery.skips,
+    })
 }
 
 /// Discovery used by branch-delta mining, which deliberately mines untracked
@@ -2306,7 +2453,7 @@ fn discover_project_files(root: &Path) -> Result<DiscoveryReport> {
 /// `$GIT_DIR/info/exclude` for Git-backed roots and the `core.excludesFile`
 /// global file); linked Git worktrees are still skipped.
 fn discover_project_files_with_untracked(root: &Path) -> Result<DiscoveryReport> {
-    discover_files(root, true, is_project_eligible)
+    discover_files(root, true, project_eligibility)
 }
 
 fn discover_conversation_files(root: &Path) -> Result<DiscoveryReport> {
@@ -2314,7 +2461,11 @@ fn discover_conversation_files(root: &Path) -> Result<DiscoveryReport> {
     discover_files(root, false, move |path, _file_name| {
         let suffix = path.extension().and_then(|value| value.to_str()).unwrap_or_default();
         let normalized_suffix = format!(".{}", suffix.to_ascii_lowercase());
-        extension_set.contains(normalized_suffix.as_str())
+        if extension_set.contains(normalized_suffix.as_str()) {
+            Eligibility::Eligible
+        } else {
+            Eligibility::Excluded
+        }
     })
 }
 
@@ -2332,6 +2483,7 @@ fn apply_limit(
 struct DiscoveryReport {
     files: Vec<ProjectSource>,
     ignored_files: usize,
+    skips: Vec<ProjectSourceSkip>,
 }
 
 /// Run `git worktree list --porcelain -z` from `root` and return the paths of
@@ -2390,12 +2542,14 @@ fn path_from_git_bytes(bytes: &[u8]) -> Option<PathBuf> {
 /// Walk `root` applying ignore rules (worktree `.gitignore`/`.mempalaceignore`
 /// plus `$GIT_DIR/info/exclude` for Git-backed roots and the
 /// `core.excludesFile` global file for any walk), accepting files for which
-/// `accept_file` returns `true`. The closure receives the absolute path and the
-/// (lossy) file name; everything it rejects counts toward `ignored_files`.
+/// `accept_file` returns [`Eligibility::Eligible`]. The closure receives the
+/// absolute path and the (lossy) file name; everything it rejects counts toward
+/// `ignored_files`, and secret-denylist rejections are also recorded as skip
+/// records.
 fn discover_files(
     root: &Path,
     skip_linked_worktrees: bool,
-    accept_file: impl Fn(&Path, &str) -> bool,
+    accept_file: impl Fn(&Path, &str) -> Eligibility,
 ) -> Result<DiscoveryReport> {
     // Git reports worktree paths as absolute, so use an absolute root when
     // comparing them during project discovery.
@@ -2407,6 +2561,7 @@ fn discover_files(
     let mut ignore_matcher = IgnoreMatcher::new(&root);
     let mut ignored_files = 0;
     let mut files = Vec::new();
+    let mut skips = Vec::new();
     // Repository-level excludes (`$GIT_DIR/info/exclude` for Git-backed roots,
     // `core.excludesFile` for any walk) apply at every depth.
     ignore_matcher.load_repo_excludes()?;
@@ -2454,17 +2609,20 @@ fn discover_files(
             }
 
             let file_name = path.file_name().and_then(|value| value.to_str()).unwrap_or_default();
-            if !accept_file(&path, file_name) {
-                ignored_files += 1;
-                continue;
+            match accept_file(&path, file_name) {
+                Eligibility::Eligible => {
+                    files.push(ProjectSource { absolute_path: path, relative_path: relative });
+                }
+                eligibility => {
+                    ignored_files += 1;
+                    record_secret_skip(eligibility, relative, &mut skips);
+                }
             }
-
-            files.push(ProjectSource { absolute_path: path, relative_path: relative });
         }
     }
 
     files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
-    Ok(DiscoveryReport { files, ignored_files })
+    Ok(DiscoveryReport { files, ignored_files, skips })
 }
 
 impl IgnoreMatcher {
@@ -5288,6 +5446,144 @@ mod tests {
         assert!(names.contains(&"main.rs"), "main.rs must be discovered: {names:?}");
     }
 
+    // ─── Secret-shaped path denylist tests (issue #95) ───────────────────────
+
+    /// The classifier matches the secret-shaped names and extensions from issue
+    /// #95, case-insensitively, and leaves non-secret files alone.
+    #[test]
+    fn secret_path_kind_matches_issue95_denylist() {
+        let cases: &[(&str, Option<SecretPathKind>)] = &[
+            (".env", Some(SecretPathKind::DotEnv)),
+            (".env.local", Some(SecretPathKind::DotEnv)),
+            (".ENV", Some(SecretPathKind::DotEnv)),
+            ("prod.env", Some(SecretPathKind::DotEnv)),
+            ("kubeconfig", Some(SecretPathKind::Kubeconfig)),
+            ("kubeconfig.yaml", Some(SecretPathKind::Kubeconfig)),
+            (".kubeconfig", Some(SecretPathKind::Kubeconfig)),
+            ("id_rsa", Some(SecretPathKind::SshPrivateKey)),
+            ("id_rsa.pub", Some(SecretPathKind::SshPrivateKey)),
+            ("id_ed25519", Some(SecretPathKind::SshPrivateKey)),
+            ("cert.pfx", Some(SecretPathKind::Keystore)),
+            ("keystore.p12", Some(SecretPathKind::Keystore)),
+            ("truststore.jks", Some(SecretPathKind::Keystore)),
+            (".npmrc", Some(SecretPathKind::Netrc)),
+            (".netrc", Some(SecretPathKind::Netrc)),
+            ("terraform.tfstate", Some(SecretPathKind::TerraformSecret)),
+            ("vars.tfvars", Some(SecretPathKind::TerraformSecret)),
+            ("secrets.json", Some(SecretPathKind::SecretsJson)),
+            ("secrets.local.json", Some(SecretPathKind::SecretsJson)),
+            ("appsettings.local.json", Some(SecretPathKind::LocalJson)),
+            ("config.json", None),
+            ("main.rs", None),
+            ("Dockerfile", None),
+            (".gitignore", None),
+            ("Cargo.lock", None),
+        ];
+        for (name, expected) in cases {
+            assert_eq!(secret_path_kind(name), *expected, "secret_path_kind({name:?}) mismatch");
+        }
+    }
+
+    /// The denylist applies to the filesystem walk: secret-shaped files are
+    /// withheld, counted consistently, and recorded with path + reason (never
+    /// content).
+    #[test]
+    fn secret_denylist_withheld_in_filesystem_discovery() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path();
+        fs::write(root.join(".env"), "SECRET=abc\n").unwrap();
+        fs::write(root.join("prod.env"), "SECRET=prod\n").unwrap();
+        fs::write(root.join("kubeconfig.yaml"), "apiVersion: v1\n").unwrap();
+        fs::write(root.join("id_rsa"), "PRIVATE KEY\n").unwrap();
+        fs::write(root.join("secrets.local.json"), "{\"key\":\"x\"}\n").unwrap();
+        fs::write(root.join("appsettings.local.json"), "{\"key\":\"x\"}\n").unwrap();
+        fs::write(root.join("vars.tfvars"), "token = \"x\"\n").unwrap();
+        fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+        fs::write(root.join("config.json"), "{\"ok\":true}\n").unwrap();
+
+        let discovery = discover_project_sources(root).unwrap();
+        assert_eq!(discovery.basis, ProjectSourceBasis::Filesystem);
+        let names: Vec<_> = discovery.sources.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["config.json", "main.rs"]);
+        // Every secret-shaped path is counted as a skip and recorded with a
+        // reason.
+        assert_eq!(discovery.skipped, 7, "skipped = {}", discovery.skipped);
+        let recorded: Vec<(&str, &str)> = discovery
+            .skips
+            .iter()
+            .map(|s| (s.relative_path.as_str(), s.reason.as_str()))
+            .collect();
+        assert_eq!(recorded.len(), 7);
+        for (path, reason) in &recorded {
+            assert!(!names.contains(path), "{path} must not be discovered");
+            assert!(!reason.is_empty(), "skip record must carry a reason");
+            assert!(
+                !path.contains("SECRET") && !path.contains("PRIVATE") && !reason.contains("SECRET"),
+                "skip records must never expose file content: {recorded:?}"
+            );
+        }
+    }
+
+    /// The denylist also protects Git-index discovery: a secret-shaped file
+    /// that was committed is withheld and recorded, even though git would
+    /// otherwise mine it.
+    #[test]
+    fn secret_denylist_withheld_in_git_index_discovery() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path().to_path_buf();
+        git_init_with_commit(
+            &root,
+            "main",
+            &[
+                ("main.rs", "fn main() {}\n"),
+                (".env", "SECRET=hunter2\n"),
+                ("secrets.local.json", "{\"key\":\"hunter2\"}\n"),
+                ("kubeconfig.yaml", "apiVersion: v1\n"),
+            ],
+        );
+
+        let discovery = discover_project_sources(&root).unwrap();
+        assert_eq!(discovery.basis, ProjectSourceBasis::GitIndex);
+        let names: Vec<_> = discovery.sources.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["main.rs"]);
+        assert_eq!(discovery.skipped, 3);
+        let recorded: Vec<(&str, &str)> = discovery
+            .skips
+            .iter()
+            .map(|s| (s.relative_path.as_str(), s.reason.as_str()))
+            .collect();
+        assert_eq!(
+            recorded,
+            vec![
+                (".env", ".env / *.env"),
+                ("kubeconfig.yaml", "*.kubeconfig*"),
+                ("secrets.local.json", "secrets*.json"),
+            ]
+        );
+    }
+
+    /// Lockfiles and palace config are skipped but are not secret denylist
+    /// matches, so they are counted without producing skip records.
+    #[test]
+    fn non_secret_skips_are_counted_but_not_recorded() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path();
+        fs::write(root.join("Cargo.lock"), "[package]\nname = \"x\"\n").unwrap();
+        fs::write(root.join("mempalace.yaml"), "wing: test\n").unwrap();
+        fs::write(root.join(".env"), "SECRET=abc\n").unwrap();
+        fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+
+        let discovery = discover_project_sources(root).unwrap();
+        let names: Vec<_> = discovery.sources.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["main.rs"]);
+        // Cargo.lock and mempalace.yaml are counted but not recorded; .env is
+        // counted and recorded.
+        assert_eq!(discovery.skipped, 3);
+        assert_eq!(discovery.skips.len(), 1);
+        assert_eq!(discovery.skips[0].relative_path, ".env");
+        assert_eq!(discovery.skips[0].reason, ".env / *.env");
+    }
+
     // ─── normalize_git_remote_url table tests ────────────────────────────────
 
     #[test]
@@ -6779,5 +7075,6 @@ mod tests {
     fn ingest_summary_view_name_defaults_to_none() {
         let summary = IngestSummary::default();
         assert_eq!(summary.view_name, None);
+        assert!(summary.secret_path_skips.is_empty());
     }
 }

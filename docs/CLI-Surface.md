@@ -104,7 +104,15 @@ Behavior:
   tracked index only (`git ls-files`), so ignored and untracked working-tree
   files (e.g. `.env`, `*.local.json`, build output) are never ingested. A
   `.gitignore` never suppresses a tracked file; `.mempalaceignore` is the
-  explicit additional exclusion. Non-Git directories fall back to a filesystem
+  explicit additional exclusion. Independently of git, a path-based **secret
+  denylist** (issue #95) withholds secret-shaped paths — `.env`/`*.env`,
+  `*.kubeconfig*`, SSH private keys (`id_rsa*`, `id_ed25519`, `id_ecdsa`,
+  `id_dsa`), keystores (`*.pfx`/`*.p12`/`*.jks`), `.npmrc`/`.netrc`,
+  `*.tfstate`/`*.tfvars`, `secrets*.json`, `*.local.json` — before any content
+  is read, in both Git-index and filesystem discovery. These are counted like
+  any skipped candidate and shown in the mine summary as `Secrets withheld: N`
+  with one `<path> — secret-shaped path (<reason>)` line per withheld file
+  (never the file content). Non-Git directories fall back to a filesystem
   walk that honours `.gitignore` and `.mempalaceignore` at every level with
   git-compatible semantics (nesting, `!` negation, anchoring, and globs) plus
   the `core.excludesFile` global excludes file. Branch-delta mines

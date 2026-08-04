@@ -21,10 +21,10 @@ use mempalace_server::{TokenRegistry, build_router};
 use mempalace_federation::{IngestBatchRequest, IngestBatchResponse};
 use mempalace_ingest::{
     ConversationExtractMode, ConversationIngestRequest, IngestError, IngestSummary,
-    PROJECTS_BRANCH_INGEST_KIND, PROJECTS_INGEST_KIND, ProjectIngestRequest, derive_project_id,
-    ingest_conversations, ingest_project_with_config, prepare_project_batch_with_config,
-    project_branch_source_prefix, project_canonical_source_prefix, project_root_relative,
-    wing_kind_source_prefix,
+    PROJECTS_BRANCH_INGEST_KIND, PROJECTS_INGEST_KIND, ProjectIngestRequest, ProjectSourceSkip,
+    derive_project_id, ingest_conversations, ingest_project_with_config,
+    prepare_project_batch_with_config, project_branch_source_prefix,
+    project_canonical_source_prefix, project_root_relative, wing_kind_source_prefix,
 };
 use mempalace_remote::{RemoteApi, RemoteClient, RemoteEndpoint, RemoteError};
 use mempalace_search::{Layer1Config, SearchRuntime, SearchRuntimePolicy, WakeUpRequest};
@@ -1710,6 +1710,7 @@ fn execute_remote_mine(
         if let Some(view_name) = &prepared.summary.view_name {
             lines.push(format!("  View: {view_name}"));
         }
+        lines.extend(render_secret_skip_lines(&prepared.summary.secret_path_skips));
         if let Some(ref warning) = branch_warning {
             lines.push(format!("  {}", warning.trim()));
         }
@@ -1848,6 +1849,7 @@ fn execute_remote_mine(
                             total_drawers_written,
                             &all_warnings,
                             &failed_files,
+                            &prepared.summary.secret_path_skips,
                             branch_warning.as_deref(),
                             view_name.as_deref(),
                             true,
@@ -1921,6 +1923,7 @@ fn execute_remote_mine(
         total_drawers_written,
         &all_warnings,
         &failed_files,
+        &prepared.summary.secret_path_skips,
         branch_warning.as_deref(),
         view_name.as_deref(),
         dual_write,
@@ -1981,6 +1984,7 @@ fn render_remote_mine_summary(
     drawers_written: usize,
     warnings: &[String],
     failed_files: &[(String, String)],
+    secret_skips: &[ProjectSourceSkip],
     branch_warning: Option<&str>,
     view_name: Option<&str>,
     dual_write: bool,
@@ -2001,6 +2005,7 @@ fn render_remote_mine_summary(
         format!("  Files failed: {failed_count}"),
         format!("  Drawers written: {drawers_written}"),
     ];
+    lines.extend(render_secret_skip_lines(secret_skips));
 
     if dual_write {
         if replication_incomplete {
@@ -2434,6 +2439,10 @@ fn render_mine_summary(
         lines.push(format!("  View: {view_name}"));
     }
 
+    // Secret-shaped paths withheld during discovery (issue #95). Only printed
+    // when non-empty to preserve byte-parity with existing test output.
+    lines.extend(render_secret_skip_lines(&summary.secret_path_skips));
+
     // Only print when non-zero to preserve byte-parity with existing test output.
     if summary.removed_sources > 0 {
         lines.push(format!("  Sources removed: {}", summary.removed_sources));
@@ -2441,6 +2450,20 @@ fn render_mine_summary(
 
     lines.push(format!("{}\n", "=".repeat(SEARCH_HEADER_WIDTH)));
     lines.join("\n")
+}
+
+/// Render the operator-visible secret-denylist skip records (path + reason,
+/// never file content) as summary lines. Empty when there are none.
+fn render_secret_skip_lines(skips: &[ProjectSourceSkip]) -> Vec<String> {
+    if skips.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = Vec::with_capacity(skips.len() + 1);
+    lines.push(format!("  Secrets withheld: {}", skips.len()));
+    lines.extend(skips.iter().map(|skip| {
+        format!("    {} — secret-shaped path ({})", skip.relative_path, skip.reason)
+    }));
+    lines
 }
 
 fn deferred_command(command: &str) -> CliOutput {
@@ -3577,7 +3600,7 @@ mod tests {
         // No per-file failures, but replication_incomplete=true → "partial — transport interrupted".
         let output = render_remote_mine_summary(
             src, "hub", "http://example.com", "wing_test", "repo-1",
-            5, 0, 0, 5, &[], &[], None, Some("feature-x"), true, true,
+            5, 0, 0, 5, &[], &[], &[], None, Some("feature-x"), true, true,
         );
         assert!(
             output.contains("replication: partial"),
@@ -3595,7 +3618,7 @@ mod tests {
         // No per-file failures, replication_incomplete=false → "succeeded".
         let output = render_remote_mine_summary(
             src, "hub", "http://example.com", "wing_test", "repo-1",
-            5, 0, 0, 5, &[], &[], None, None, true, false,
+            5, 0, 0, 5, &[], &[], &[], None, None, true, false,
         );
         assert!(
             output.contains("replication: succeeded"),
@@ -3605,7 +3628,7 @@ mod tests {
         // Per-file failures, replication_incomplete=false → "partial — some files had errors".
         let output = render_remote_mine_summary(
             src, "hub", "http://example.com", "wing_test", "repo-1",
-            3, 0, 2, 3, &[], &[("bad.rs".into(), "err".into())], None, None, true, false,
+            3, 0, 2, 3, &[], &[("bad.rs".into(), "err".into())], &[], None, None, true, false,
         );
         assert!(
             output.contains("replication: partial"),
@@ -3619,7 +3642,7 @@ mod tests {
         // Both incomplete AND per-file failures → "partial — transport interrupted".
         let output = render_remote_mine_summary(
             src, "hub", "http://example.com", "wing_test", "repo-1",
-            3, 0, 2, 3, &[], &[("bad.rs".into(), "err".into())], None, None, true, true,
+            3, 0, 2, 3, &[], &[("bad.rs".into(), "err".into())], &[], None, None, true, true,
         );
         assert!(
             output.contains("replication: partial"),
@@ -3641,7 +3664,7 @@ mod tests {
         // Non dual_write: no replication label at all.
         let output = render_remote_mine_summary(
             src, "hub", "http://example.com", "wing_test", "repo-1",
-            5, 0, 0, 5, &[], &[], None, None, false, false,
+            5, 0, 0, 5, &[], &[], &[], None, None, false, false,
         );
         assert!(
             !output.contains("replication:"),
@@ -3650,7 +3673,7 @@ mod tests {
         assert!(
             render_remote_mine_summary(
                 src, "hub", "http://example.com", "wing_test", "repo-1",
-                5, 0, 0, 5, &[], &[], None, Some("feature-x"), false, false,
+                5, 0, 0, 5, &[], &[], &[], None, Some("feature-x"), false, false,
             )
             .contains("View: feature-x"),
         );
@@ -3695,6 +3718,53 @@ mod tests {
         assert!(!layout.sqlite_path.exists());
         assert!(!layout.lancedb_dir.exists());
         fs::remove_dir_all(config_root).unwrap();
+    }
+
+    /// The mine summary surfaces secret-shaped paths withheld by the denylist
+    /// (issue #95): a count plus the path and reason — never the content.
+    #[test]
+    fn mine_summary_reports_secret_paths_withheld() {
+        let workspace = tempdir().unwrap();
+        let project_dir = setup_project_fixture(workspace.path());
+        write_file(&project_dir.join(".env"), "SECRET=hunter2\n");
+        write_file(&project_dir.join("kubeconfig.yaml"), "apiVersion: v1\n");
+        write_file(&project_dir.join("secrets.local.json"), "{\"key\":\"hunter2\"}\n");
+
+        let config_root = temp_config_root("secret-mine");
+        let context = CliContext::for_tests(config_root.clone());
+        run_cli(["init", project_dir.to_str().unwrap(), "--yes"], &context, stub_provider).unwrap();
+        let output = run_cli(
+            ["mine", project_dir.to_str().unwrap(), "--dry-run"],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+
+        assert_eq!(output.exit_code, 0, "mine failed: {:?}", output.stderr);
+        assert!(
+            output.stdout.contains("Secrets withheld: 3"),
+            "expected secrets count, got: {}",
+            output.stdout
+        );
+        assert!(output.stdout.contains(".env"), "expected .env in output: {}", output.stdout);
+        assert!(
+            output.stdout.contains("kubeconfig.yaml"),
+            "expected kubeconfig.yaml in output: {}",
+            output.stdout
+        );
+        assert!(
+            output.stdout.contains("secrets.local.json"),
+            "expected secrets.local.json in output: {}",
+            output.stdout
+        );
+        // The paths and reasons are shown, but the file content is not.
+        assert!(
+            !output.stdout.contains("hunter2"),
+            "secret content must never be printed: {}",
+            output.stdout
+        );
+
+        remove_dir_all_if_exists(&config_root);
     }
 
     #[test]

@@ -152,7 +152,10 @@ valid UTF-8 always use the legacy stored-content path. Re-mining them with
   because it is simply absent from the index. A `.gitignore` does **not**
   suppress a tracked file: tracked paths remain tracked even after an ignore
   pattern is added. `.mempalaceignore` is the explicit additional exclusion and
-  applies to tracked files, including nested files at any depth. Branch-delta
+  applies to tracked files, including nested files at any depth. Independently
+  of git, the secret-path denylist still applies to tracked index paths: a
+  secret-shaped file that was committed (e.g. a tracked `.env`) is withheld and
+  reported, never mined. Branch-delta
   mines (`--branch` / `--view <name>`) are the deliberate exception: they also
   include untracked, non-ignored files so that new branch work is captured
   before it is committed.
@@ -230,11 +233,30 @@ excludes misnamed binaries, compiled outputs, and other non-text data.
 
 The following files are never discovered regardless of extension:
 
-- **Secrets**: `.env`, `.env.*` (any name starting with `.env`)
+- **Secrets** (the path-based secret denylist, matched case-insensitively on
+  the file name **before any content is read**, in both Git-index and
+  filesystem discovery):
+  - `.env` / `.env.*` — process-environment files (any name starting with
+    `.env`) and `*.env` (any name ending in `.env`)
+  - `*.kubeconfig*` — Kubernetes configuration files
+  - `id_rsa*`, `id_ed25519`, `id_ecdsa`, `id_dsa` — SSH private keys
+  - `*.pfx`, `*.p12`, `*.jks` — keystores and truststores
+  - `.npmrc`, `.netrc` — package/registry credential files
+  - `*.tfstate`, `*.tfvars` — Terraform state and variable files
+  - `secrets*.json` — JSON secret bundles
+  - `*.local.json` — local override/config files that commonly hold credentials
 - **Lockfiles**: `package-lock.json`, `Cargo.lock`, `yarn.lock`,
   `pnpm-lock.yaml`, `poetry.lock`, `composer.lock`, `Gemfile.lock`
 - **Palace config**: `mempalace.yaml`, `mempalace.yml`, `mempal.yaml`,
   `mempal.yml`, `.gitignore`
+
+Every secret-denylist exclusion is counted in the run's discovery metrics (the
+`Files ignored` line / `ProjectSourceDiscovery.skipped`) exactly like any other
+skipped candidate, and is also emitted as an **operator-visible skip record**
+with the withheld path and a short reason — but never any file content. The
+mine summary reports these as `Secrets withheld: N` followed by one
+`<path> — secret-shaped path (<reason>)` line per path, so an operator can see
+what was withheld rather than having to audit after the fact.
 
 ## Federation notes
 

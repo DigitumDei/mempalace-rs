@@ -1002,8 +1002,14 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
         }
     }
 
-    // Remove path-hash source rows that were not present in this mine.  This
-    // catches files deleted before the stable project-id migration ran.
+    // Remove source rows that were not present in this mine. Two key spaces are
+    // swept for an unlimited canonical run: the legacy path-hash prefix (files
+    // that predate the stable project-id migration) and the current stable
+    // `projects:{wing}:{root_key}` prefix. The stable sweep is what makes the
+    // safety policy retroactive: content excluded by the new deny-by-name
+    // rules, the tracked-index-only population, or symlink rejection no longer
+    // appears in `files`, so its previously mined rows and drawers must be
+    // removed rather than left searchable.
     if branch_name.is_none() && request.limit.is_none() && !request.dry_run {
         let current_rel_paths: BTreeSet<&str> =
             files.iter().map(|file| file.relative_path.as_str()).collect();
@@ -1015,6 +1021,20 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
             let rel = key.splitn(4, ':').nth(3).unwrap_or("");
             if !current_rel_paths.contains(rel) {
                 engine.remove_source_key(&key).await?;
+                summary.removed_sources += 1;
+            }
+        }
+        let stable_prefix = format!("{ingest_kind}:{wing_name}:{project_root_key}:");
+        for key in engine
+            .operational_store()
+            .ingested_source_keys_with_prefix(&stable_prefix)?
+        {
+            // Key format: projects:{wing}:{root_key}:{rel_path}. Split off the
+            // first 3 ':'-delimited segments to recover the relative path.
+            let rel = key.splitn(4, ':').nth(3).unwrap_or("");
+            if !current_rel_paths.contains(rel) {
+                engine.remove_source_key(&key).await?;
+                summary.removed_sources += 1;
             }
         }
     }
@@ -5909,6 +5929,210 @@ mod tests {
             .committed_drawer_ids_for_source_key(&stable_key)
             .unwrap()
             .is_empty());
+    }
+
+    /// An unlimited canonical re-mine must purge stale rows under the *stable*
+    /// project-source prefix, not just the legacy path-hash prefix. Content that
+    /// the new safety policy keeps out of the eligible set (a secret denylisted
+    /// by name) must not remain stored and searchable after re-mining.
+    #[tokio::test]
+    async fn canonical_remine_purges_stale_stable_secret_rows() {
+        let tempdir = tempdir().unwrap();
+        let project_dir = tempdir.path().join("project");
+        fs::create_dir_all(&project_dir).unwrap();
+
+        // `.env` is denied by the secret denylist; `keep.md` is eligible.
+        git_init_with_commit(
+            &project_dir,
+            "main",
+            &[(".env", "SECRET=hunter2\n"), ("keep.md", "# keep\n")],
+        );
+
+        let root = project_dir.canonicalize().unwrap();
+        let wing_name = "purgesecret";
+        let repo_id = derive_repo_id(&root, wing_name);
+        let project_root_key = stable_project_root_key(&repo_id);
+        let stale_key = project_source_key("projects", &project_root_key, wing_name, ".env");
+
+        let engine = open_engine(&tempdir.path().join("palace")).await;
+        let mut provider =
+            FakeEmbeddingProvider::new(EmbeddingProfile::Balanced.metadata().dimensions);
+
+        // Simulate a pre-upgrade canonical mine that stored the secret under its
+        // stable key, before the denylist existed to keep it out.
+        let stale_drawers = build_drawers(
+            &mut provider,
+            &wing_id(wing_name).unwrap(),
+            &stale_key,
+            ".env",
+            "projects",
+            None,
+            "legacy",
+            None,
+            vec![Chunk {
+                content: "pre-upgrade secret drawer that must be purged".to_owned(),
+                chunk_index: 0,
+                room_hint: Some("general".to_owned()),
+                date_hint: None,
+                byte_range: None,
+            }],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        engine
+            .commit_ingest(IngestCommitRequest {
+                ingest_kind: "projects".to_owned(),
+                source_key: stale_key.clone(),
+                source_file: ".env".to_owned(),
+                content_hash: "stale-content-hash".to_owned(),
+                drawers: stale_drawers,
+                duplicate_strategy: DuplicateStrategy::Overwrite,
+            })
+            .await
+            .unwrap();
+
+        let summary = ingest_project(
+            &engine,
+            &mut provider,
+            &ProjectIngestRequest {
+                project_dir: project_dir.clone(),
+                wing: Some(wing_name.to_owned()),
+                agent: "tester".to_owned(),
+                limit: None,
+                dry_run: false,
+                reindex: false,
+                max_embed_batch_size: None,
+                branch: false,
+                view: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // The stale secret row (manifest + drawers) is removed by the stable sweep.
+        assert_eq!(summary.removed_sources, 1);
+        assert!(
+            engine.operational_store().get_ingested_file(&stale_key).unwrap().is_none(),
+            "the stale .env manifest must be removed"
+        );
+        assert!(
+            engine
+                .operational_store()
+                .committed_drawer_ids_for_source_key(&stale_key)
+                .unwrap()
+                .is_empty(),
+            "the stale .env drawers must be removed"
+        );
+        // The eligible file's row survives the purge.
+        let keep_key = project_source_key("projects", &project_root_key, wing_name, "keep.md");
+        assert!(!engine
+            .operational_store()
+            .committed_drawer_ids_for_source_key(&keep_key)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// The stable sweep must be scoped to the current project identity: re-mining
+    /// one project in a wing must not remove another project's rows share the
+    /// same wing.
+    #[tokio::test]
+    async fn canonical_stable_sweep_is_scoped_to_current_project() {
+        let tempdir = tempdir().unwrap();
+        let project_a = tempdir.path().join("project-a");
+        let project_b = tempdir.path().join("project-b");
+        for dir in [&project_a, &project_b] {
+            fs::create_dir_all(dir).unwrap();
+            git_init_with_commit(dir, "main", &[("keep.md", "# keep\n")]);
+        }
+
+        let wing_name = "sweepisolation";
+        let root_a = project_a.canonicalize().unwrap();
+        let root_b = project_b.canonicalize().unwrap();
+        let key_a = project_source_key(
+            "projects",
+            &stable_project_root_key(&derive_repo_id(&root_a, wing_name)),
+            wing_name,
+            "keep.md",
+        );
+        let key_b = project_source_key(
+            "projects",
+            &stable_project_root_key(&derive_repo_id(&root_b, wing_name)),
+            wing_name,
+            "keep.md",
+        );
+
+        let engine = open_engine(&tempdir.path().join("palace")).await;
+        let mut provider =
+            FakeEmbeddingProvider::new(EmbeddingProfile::Balanced.metadata().dimensions);
+
+        for key in [&key_a, &key_b] {
+            let drawers = build_drawers(
+                &mut provider,
+                &wing_id(wing_name).unwrap(),
+                key,
+                "keep.md",
+                "projects",
+                None,
+                "tester",
+                None,
+                vec![Chunk {
+                    content: format!("content for {key}").into(),
+                    chunk_index: 0,
+                    room_hint: Some("general".to_owned()),
+                    date_hint: None,
+                    byte_range: None,
+                }],
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            engine
+                .commit_ingest(IngestCommitRequest {
+                    ingest_kind: "projects".to_owned(),
+                    source_key: key.clone(),
+                    source_file: "keep.md".to_owned(),
+                    content_hash: hash_text(key),
+                    drawers,
+                    duplicate_strategy: DuplicateStrategy::Overwrite,
+                })
+                .await
+                .unwrap();
+        }
+
+        // Re-mine only project A.
+        ingest_project(
+            &engine,
+            &mut provider,
+            &ProjectIngestRequest {
+                project_dir: project_a.clone(),
+                wing: Some(wing_name.to_owned()),
+                agent: "tester".to_owned(),
+                limit: None,
+                dry_run: false,
+                reindex: false,
+                max_embed_batch_size: None,
+                branch: false,
+                view: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(!engine
+            .operational_store()
+            .committed_drawer_ids_for_source_key(&key_a)
+            .unwrap()
+            .is_empty());
+        assert!(!engine
+            .operational_store()
+            .committed_drawer_ids_for_source_key(&key_b)
+            .unwrap()
+            .is_empty(),
+            "project B's rows must be untouched by project A's canonical sweep"
+        );
     }
 
     #[test]

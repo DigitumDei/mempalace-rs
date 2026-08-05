@@ -619,6 +619,10 @@ pub struct ProjectSourceDiscovery {
     pub sources: Vec<ProjectSource>,
     /// Which source set produced `sources`.
     pub basis: ProjectSourceBasis,
+    /// Whether discovery observed every tracked candidate needed to reconcile
+    /// an existing canonical snapshot. A tracked index path missing from the
+    /// working tree is not evidence that a stored source was deleted.
+    pub complete: bool,
     /// Number of candidate paths skipped (ignored, ineligible, or missing on
     /// disk).
     pub skipped: usize,
@@ -774,6 +778,7 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
         ("projects", None)
     };
 
+    let discovery_complete = discovered.complete;
     let discovered_files = if let Some(ref delta) = delta_set {
         discovered
             .files
@@ -1023,7 +1028,11 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
     // rules, the tracked-index-only population, or symlink rejection no longer
     // appears in `files`, so its previously mined rows and drawers must be
     // removed rather than left searchable.
-    if branch_name.is_none() && request.limit.is_none() && !request.dry_run {
+    if branch_name.is_none()
+        && discovery_complete
+        && request.limit.is_none()
+        && !request.dry_run
+    {
         let current_rel_paths: BTreeSet<&str> =
             files.iter().map(|file| file.relative_path.as_str()).collect();
         let legacy_prefix = format!("{ingest_kind}:{wing_name}:{legacy_root_key}:");
@@ -1663,9 +1672,20 @@ fn git_delta_paths(root: &Path, merge_base: &str) -> Option<Vec<String>> {
         return None;
     }
 
-    // Untracked files.
+    // Untracked files. `git ls-files` otherwise reports paths relative to the
+    // directory passed to `-C`, while `git diff` reports repo-relative paths.
+    // Keep both streams repo-relative before compute_branch_delta narrows them
+    // to the project root.
     let untracked_out = Command::new("git")
-        .args(["-C", &root_str, "ls-files", "--others", "--exclude-standard", "-z"])
+        .args([
+            "-C",
+            &root_str,
+            "ls-files",
+            "--full-name",
+            "--others",
+            "--exclude-standard",
+            "-z",
+        ])
         .output()
         .ok()?;
     if !untracked_out.status.success() {
@@ -2112,7 +2132,7 @@ const SSH_PRIVATE_KEY_NAMES: [&str; 4] = ["id_rsa", "id_ed25519", "id_ecdsa", "i
 /// secret-shaped path is withheld without opening the file (issue #95).
 fn secret_path_kind(file_name: &str) -> Option<SecretPathKind> {
     let name = file_name.to_ascii_lowercase();
-    if name.starts_with(".env") || name.ends_with(".env") {
+    if name == ".env" || name.starts_with(".env.") || name.ends_with(".env") {
         return Some(SecretPathKind::DotEnv);
     }
     if name.contains("kubeconfig") {
@@ -2441,6 +2461,7 @@ fn discover_git_index_sources(root: &Path) -> Result<ProjectSourceDiscovery> {
     let worktree_skip = linked_worktree_paths(root);
     let mut sources = Vec::new();
     let mut skips = Vec::new();
+    let mut complete = true;
 
     for (relative, relative_str) in entries {
         let absolute = root.join(&relative);
@@ -2458,6 +2479,7 @@ fn discover_git_index_sources(root: &Path) -> Result<ProjectSourceDiscovery> {
             // working tree since it was staged.
             Err(_) => {
                 skipped += 1;
+                complete = false;
                 continue;
             }
         };
@@ -2493,6 +2515,7 @@ fn discover_git_index_sources(root: &Path) -> Result<ProjectSourceDiscovery> {
     Ok(ProjectSourceDiscovery {
         sources,
         basis: ProjectSourceBasis::GitIndex,
+        complete,
         skipped,
         skips,
     })
@@ -2536,6 +2559,7 @@ fn discover_filesystem_sources(root: &Path) -> Result<ProjectSourceDiscovery> {
     Ok(ProjectSourceDiscovery {
         sources: report.files,
         basis: ProjectSourceBasis::Filesystem,
+        complete: report.complete,
         skipped: report.ignored_files,
         skips: report.skips,
     })
@@ -2573,6 +2597,7 @@ fn discover_project_files(root: &Path) -> Result<DiscoveryReport> {
         files: discovery.sources,
         ignored_files: discovery.skipped,
         skips: discovery.skips,
+        complete: discovery.complete,
     })
 }
 
@@ -2616,6 +2641,7 @@ fn discover_project_branch_sources(root: &Path) -> Result<DiscoveryReport> {
             files: combined,
             ignored_files: tracked.skipped + walk.ignored_files,
             skips,
+            complete: tracked.complete && walk.complete,
         })
     } else {
         discover_project_files_with_untracked(root)
@@ -2658,6 +2684,7 @@ struct DiscoveryReport {
     files: Vec<ProjectSource>,
     ignored_files: usize,
     skips: Vec<ProjectSourceSkip>,
+    complete: bool,
 }
 
 /// Run `git worktree list --porcelain -z` from `root` and return the paths of
@@ -2787,6 +2814,14 @@ fn discover_files(
                 continue;
             }
 
+            // Do not follow file symlinks from filesystem discovery. This
+            // keeps non-Git and branch-untracked walks from reading a target
+            // outside the root under an in-root filename.
+            if file_type.is_symlink() {
+                ignored_files += 1;
+                continue;
+            }
+
             // Branch-delta discovery unions eligible index files with this
             // untracked walk. Exclude every tracked path here before matching
             // or eligibility checks so a rejected tracked symlink cannot be
@@ -2814,7 +2849,7 @@ fn discover_files(
     }
 
     files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
-    Ok(DiscoveryReport { files, ignored_files, skips })
+    Ok(DiscoveryReport { files, ignored_files, skips, complete: true })
 }
 
 impl IgnoreMatcher {
@@ -5698,6 +5733,9 @@ mod tests {
             (".env.local", Some(SecretPathKind::DotEnv)),
             (".ENV", Some(SecretPathKind::DotEnv)),
             ("prod.env", Some(SecretPathKind::DotEnv)),
+            (".envrc", None),
+            (".environment", None),
+            (".envoy.rs", None),
             ("kubeconfig", Some(SecretPathKind::Kubeconfig)),
             ("kubeconfig.yaml", Some(SecretPathKind::Kubeconfig)),
             (".kubeconfig", Some(SecretPathKind::Kubeconfig)),
@@ -6112,6 +6150,85 @@ mod tests {
             .committed_drawer_ids_for_source_key(&stable_key)
             .unwrap()
             .is_empty());
+    }
+
+    /// A canonical re-mine must not treat an index path missing from this
+    /// working tree as proof that its durable source was deleted. This happens
+    /// in sparse and partial checkouts, where `git ls-files` still reports the
+    /// path but it is absent on disk.
+    #[tokio::test]
+    async fn canonical_remine_preserves_rows_when_tracked_worktree_is_incomplete() {
+        let tempdir = tempdir().unwrap();
+        let project_dir = tempdir.path().join("project");
+        fs::create_dir_all(&project_dir).unwrap();
+        let keep = "# keep\n\nThis file keeps the mine otherwise healthy.\n".repeat(4);
+        git_init_with_commit(
+            &project_dir,
+            "main",
+            &[("keep.md", keep.as_str()), ("missing.md", keep.as_str())],
+        );
+
+        let wing_name = "partialpurge";
+        let root = project_dir.canonicalize().unwrap();
+        let root_key = stable_project_root_key(&derive_repo_id(&root, wing_name));
+        let missing_key = project_source_key("projects", &root_key, wing_name, "missing.md");
+        let engine = open_engine(&tempdir.path().join("palace")).await;
+        let mut provider =
+            FakeEmbeddingProvider::new(EmbeddingProfile::Balanced.metadata().dimensions);
+        let drawers = build_drawers(
+            &mut provider,
+            &wing_id(wing_name).unwrap(),
+            &missing_key,
+            "missing.md",
+            "projects",
+            None,
+            "tester",
+            None,
+            vec![Chunk {
+                content: "durable source from a complete checkout".to_owned(),
+                chunk_index: 0,
+                room_hint: Some("general".to_owned()),
+                date_hint: None,
+                byte_range: None,
+            }],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        engine
+            .commit_ingest(IngestCommitRequest {
+                ingest_kind: "projects".to_owned(),
+                source_key: missing_key.clone(),
+                source_file: "missing.md".to_owned(),
+                content_hash: "existing".to_owned(),
+                drawers,
+                duplicate_strategy: DuplicateStrategy::Overwrite,
+            })
+            .await
+            .unwrap();
+        fs::remove_file(project_dir.join("missing.md")).unwrap();
+
+        let summary = ingest_project(
+            &engine,
+            &mut provider,
+            &ProjectIngestRequest {
+                project_dir,
+                wing: Some(wing_name.to_owned()),
+                agent: "tester".to_owned(),
+                limit: None,
+                dry_run: false,
+                reindex: false,
+                max_embed_batch_size: None,
+                branch: false,
+                view: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(summary.removed_sources, 0);
+        assert!(engine.operational_store().get_ingested_file(&missing_key).unwrap().is_some());
     }
 
     /// An unlimited canonical re-mine must purge stale rows under the *stable*
@@ -6704,6 +6821,9 @@ mod tests {
         fs::write(project_dir.join("src/lib.rs"), &changed).unwrap();
         let outside_changed = "fn outside_changed() {}\n".repeat(5);
         fs::write(repo_dir.join("other/outside.rs"), &outside_changed).unwrap();
+        // This is deliberately untracked. `git ls-files --others` must report
+        // it repo-relative even though the mine starts from the subdirectory.
+        fs::write(project_dir.join("src/new.rs"), "pub fn new_file() {}\n".repeat(5)).unwrap();
 
         let engine = open_engine(&tempdir.path().join("palace")).await;
         let mut provider =
@@ -6726,10 +6846,10 @@ mod tests {
         .await
         .unwrap();
 
-        // Only src/lib.rs (inside the project) should be mined; outside.rs should be ignored.
+        // Both changed paths inside the project are mined; outside.rs is ignored.
         assert_eq!(
-            summary.ingested_files, 1,
-            "only the file inside the project subdir must be mined"
+            summary.ingested_files, 2,
+            "changed tracked and untracked files inside the project subdir must be mined"
         );
     }
 
@@ -7389,6 +7509,27 @@ mod tests {
         let report = discover_project_branch_sources(&repo).unwrap();
         let names: Vec<_> = report.files.iter().map(|s| s.relative_path.as_str()).collect();
         assert_eq!(names, vec!["tracked.md"]);
+    }
+
+    /// Filesystem-backed discovery must not follow an untracked symlink either:
+    /// unlike an index path, it may point anywhere on the host.
+    #[test]
+    #[cfg(unix)]
+    fn filesystem_discovery_rejects_untracked_symlink_escaping_root() {
+        use std::os::unix::fs::symlink;
+
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path().join("project");
+        fs::create_dir_all(&root).unwrap();
+        let external = tempdir.path().join("external.md");
+        fs::write(&external, "external content\n").unwrap();
+        symlink(&external, root.join("link.md")).unwrap();
+        fs::write(root.join("keep.md"), "keep\n").unwrap();
+
+        let discovery = discover_project_sources(&root).unwrap();
+        let names: Vec<_> = discovery.sources.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["keep.md"]);
+        assert!(discovery.skipped >= 1, "the symlink should be skipped");
     }
 
     /// A directory containing `.git` metadata is not safe to fall back to a

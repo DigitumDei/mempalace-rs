@@ -310,8 +310,8 @@ discovered (see [Conversation discovery](#conversation-discovery)).
 - **Secrets** (the path-based secret denylist, matched case-insensitively on
   the file name **before any content is read**, in both Git-index and
   filesystem discovery):
-  - `.env` / `.env.*` — process-environment files (any name starting with
-    `.env`) and `*.env` (any name ending in `.env`)
+  - `.env` / `.env.*` — process-environment files, plus `*.env` (an exact
+    `.env` prefix is required, so `.envrc` and `.environment` are not matched)
   - `*.kubeconfig*` — Kubernetes configuration files
   - `id_rsa`, `id_ed25519`, `id_ecdsa`, `id_dsa` — SSH private keys (matched
     on the exact name, case-insensitively; public keys such as `id_ed25519.pub`
@@ -647,10 +647,12 @@ therefore converge on the same keys.
 > `projects:{wing}:{blake3_hex("project:" + repo_id)}:` and removes any row whose
 > relative path is **not** in the freshly discovered eligible source set. This is what
 > makes the discovery safety policy (tracked-index-only population, the secret-path
-> denylist, and tracked-symlink rejection) retroactive: content that a re-mine now
+> denylist, and symlink rejection) retroactive: content that a re-mine now
 > excludes — a secret denylisted by name, or a file that only lives outside the tracked
 > index — has its previously mined manifests and drawers removed rather than left
-> searchable. The purge is scoped to the current project identity, so re-mining one
+> searchable. To avoid treating a sparse or partial working tree as an authoritative
+> deletion snapshot, the purge is skipped when any tracked index path is absent from
+> disk. The purge is scoped to the current project identity, so re-mining one
 > project in a wing never touches another project's rows in the same wing. Rows are
 > removed only on an unlimited run; a `--limit` deliberately leaves out-of-limit paths
 > in place, and a secret removed this way is reported in `Sources removed: N`.

@@ -120,8 +120,8 @@ Behavior:
   files (e.g. `.env`, `*.local.json`, build output) are never ingested. A
   `.gitignore` never suppresses a tracked file; `.mempalaceignore` is the
   explicit additional exclusion and is deny-only — it outranks a nested
-  `.gitignore` `!` negation in filesystem and branch walks. Tracked symlinks
-  are rejected outright before
+  `.gitignore` `!` negation in filesystem and branch walks. Symlinks are
+  rejected outright before
   any eligibility check or file read, so a link that escapes the discovery
   root can never pull its target's content into the palace. Independently of
   git, a path-based **secret

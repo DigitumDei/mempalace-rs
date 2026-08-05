@@ -625,6 +625,20 @@ therefore converge on the same keys.
 > `prune --project-id` cannot select them, because it builds the stable-identity prefix
 > these rows were never keyed under. See [CLI Surface → `prune`](CLI-Surface.md#prune).
 
+> **Canonical re-mine purges stale stable rows.** In addition to the legacy sweep
+> above, an unlimited canonical mine (`mine <dir>`, no `--limit`, not `--dry-run`)
+> enumerates the current stable prefix
+> `projects:{wing}:{blake3_hex("project:" + repo_id)}:` and removes any row whose
+> relative path is **not** in the freshly discovered eligible source set. This is what
+> makes the discovery safety policy (tracked-index-only population, the secret-path
+> denylist, and tracked-symlink rejection) retroactive: content that a re-mine now
+> excludes — a secret denylisted by name, or a file that only lives outside the tracked
+> index — has its previously mined manifests and drawers removed rather than left
+> searchable. The purge is scoped to the current project identity, so re-mining one
+> project in a wing never touches another project's rows in the same wing. Rows are
+> removed only on an unlimited run; a `--limit` deliberately leaves out-of-limit paths
+> in place, and a secret removed this way is reported in `Sources removed: N`.
+
 ### Overlay composition at search time
 
 Search is view-scoped rather than view-blind:

@@ -163,9 +163,12 @@ valid UTF-8 always use the legacy stored-content path. Re-mining them with
   eligibility check or file read: a symlink can point outside the discovery
   root, and its target's content must never be mined under an in-repo path.
   Branch-delta
-  mines (`--branch` / `--view <name>`) are the deliberate exception: they also
-  include untracked, non-ignored files so that new branch work is captured
-  before it is committed.
+  mines (`--branch` / `--view <name>`) are the deliberate exception: their source
+  set is the union of the canonical tracked-index set and the untracked,
+  non-ignored filesystem walk, so that new branch work is captured before it is
+  committed *and* a changed tracked file is never lost to `.gitignore`. Because
+  tracked files come from the index, a branch edit to a tracked `generated/schema.rs`
+  still produces a branch row even when `generated/` is listed in `.gitignore`.
 
   The tracked-index guarantee is strict: a Git-backed root whose index cannot be
   enumerated (`git ls-files` failure) fails discovery with a `GitIndexUnavailable`
@@ -197,9 +200,17 @@ valid UTF-8 always use the legacy stored-content path. Re-mining them with
 The repository-level exclude sources are honored at git's precedence:
 `$GIT_DIR/info/exclude` (Git-backed roots only) and the global excludes file
 (`core.excludesFile`) for every filesystem walk, including non-Git roots. As in
-git, per-directory `.gitignore` patterns outrank `info/exclude`, which outranks
-the global excludes file; these two repository-level sources are purely
-additive and never override the `.mempalaceignore` local protection. Both are
+git, `.mempalaceignore` outranks `.gitignore`, which outranks `info/exclude`,
+which outranks the global excludes file. The `.mempalaceignore` exclusion is
+deny-only and takes precedence over a `.gitignore` **across scopes**: a deeper
+`.gitignore` `!` negation can never clear a parent `.mempalaceignore` rule,
+which is exactly what the operator explicitly excluded from discovery. Both
+repository-level sources are purely additive and never override the
+`.mempalaceignore` local protection. Their patterns are anchored at the Git
+**toplevel** (as in git, where `info/exclude` and the global file resolve
+leading `/` against the worktree root), so mining a subdirectory of a
+repository matches them against the Git-relative path: a rooted `/secret.md`
+excludes only the toplevel `secret.md`, never `sub/secret.md`. Both are
 optional files: a missing `info/exclude` or global excludes file is treated as
 empty, as in git; one that exists but cannot be read (a permission failure or
 a directory in place of the file) is treated as empty too, rather than failing

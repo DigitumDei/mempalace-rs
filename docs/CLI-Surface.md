@@ -119,7 +119,9 @@ Behavior:
   tracked index only (`git ls-files`), so ignored and untracked working-tree
   files (e.g. `.env`, `*.local.json`, build output) are never ingested. A
   `.gitignore` never suppresses a tracked file; `.mempalaceignore` is the
-  explicit additional exclusion. Tracked symlinks are rejected outright before
+  explicit additional exclusion and is deny-only — it outranks a nested
+  `.gitignore` `!` negation in filesystem and branch walks. Tracked symlinks
+  are rejected outright before
   any eligibility check or file read, so a link that escapes the discovery
   root can never pull its target's content into the palace. Independently of
   git, a path-based **secret
@@ -135,10 +137,13 @@ Behavior:
   walk that honours `.gitignore` and `.mempalaceignore` at every level with
   git-compatible semantics (nesting, `!` negation, anchoring, and globs) plus
   the `core.excludesFile` global excludes file. Branch-delta mines
-  (`--branch` / `--view <name>`) are the exception: they additionally include
-  untracked, non-ignored files, and their filesystem walk honours
+  (`--branch` / `--view <name>`) union the tracked-index set with the
+  untracked, non-ignored filesystem walk, so a changed tracked file is never
+  lost to `.gitignore`, and their walk honours
   `$GIT_DIR/info/exclude` too — both repository-level sources at git's
-  precedence. Linked git worktrees are always excluded from mining. A
+  precedence, anchored at the Git toplevel (a rooted `/secret.md` excludes
+  only the toplevel `secret.md`, never `sub/secret.md`). Linked git worktrees
+  are always excluded from mining. A
   Git-backed root whose index cannot be enumerated fails discovery with a
   `GitIndexUnavailable` error rather than falling back to a filesystem walk, so
   a git-read failure can never leak untracked or ignored content into a

@@ -494,18 +494,24 @@ struct IgnoreRule {
     order: usize,
 }
 
-/// Source precedence of an ignore rule, mirroring git's precedence order
-/// (gitignore(5)): worktree `.gitignore`/`.mempalaceignore` files override
-/// `$GIT_DIR/info/exclude`, which overrides the `core.excludesFile` global
-/// file. Lower-tier rules sort first so that a matching higher-tier rule wins.
+/// Source precedence of an ignore rule. Lower-tier rules sort first so that a
+/// matching higher-tier rule wins (gitignore(5) order, extended so that the
+/// MemPalace-specific exclusion always outranks a `.gitignore`): worktree
+/// `.mempalaceignore` beats a same-scope `.gitignore`, which beats
+/// `$GIT_DIR/info/exclude`, which beats the `core.excludesFile` global file.
+/// Keeping `.mempalaceignore` in its own tier makes it deny-only across
+/// scopes — a deeper `.gitignore` negation can never clear a parent
+/// `.mempalaceignore` exclusion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum IgnoreTier {
     /// `core.excludesFile` (default `$XDG_CONFIG_HOME/git/ignore`).
     GlobalExclude,
     /// `$GIT_DIR/info/exclude`.
     RepoExclude,
-    /// Per-directory `.gitignore` / `.mempalaceignore`.
-    Worktree,
+    /// Per-directory `.gitignore`.
+    WorktreeGitignore,
+    /// Per-directory `.mempalaceignore` (the explicit MemPalace exclusion).
+    WorktreeMempalaceignore,
 }
 
 /// Git-compatible ignore matcher: `.gitignore`/`.mempalaceignore` patterns
@@ -519,7 +525,12 @@ struct IgnoreMatcher {
     root: PathBuf,
     /// Built-in directory names that are always skipped.
     skip_dirs: BTreeSet<String>,
-    /// Rules sorted by `(scope_depth, order)`; the last matching rule wins.
+    /// The discovery root's path relative to the Git toplevel (`""` when the
+    /// root *is* the toplevel, or for any non-Git walk). Repository-level
+    /// exclude patterns (`info/exclude`, `core.excludesFile`) are anchored at
+    /// the Git toplevel, so they are matched against `<repo_offset>/<path>`.
+    repo_offset: String,
+    /// Rules sorted by `(tier, scope_depth, order)`; the last matching rule wins.
     rules: Vec<IgnoreRule>,
     /// Directories whose ignore files have already been parsed.
     loaded: BTreeSet<PathBuf>,
@@ -713,11 +724,13 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
         })),
         false => None,
     };
-    // Branch-delta mining deliberately mines untracked (non-ignored) files, so
-    // it keeps the filesystem walk; canonical mines use the safe tracked-index
+    // Branch-delta mining deliberately mines untracked (non-ignored) files
+    // alongside changed tracked paths, so it keeps the filesystem walk; the
+    // tracked-index half ensures a changed tracked file is never
+    // suppressed by `.gitignore`. Canonical mines use the safe tracked-index
     // source set.
     let discovered = if branch_mode {
-        discover_project_files_with_untracked(&root)?
+        discover_project_branch_sources(&root)?
     } else {
         discover_project_files(&root)?
     };
@@ -2494,6 +2507,36 @@ fn discover_project_files_with_untracked(root: &Path) -> Result<DiscoveryReport>
     discover_files(root, true, true, project_eligibility)
 }
 
+/// Build the source set for a branch-delta mine: the union of the canonical
+/// tracked-index set (which, as in a canonical mine, never lets `.gitignore`
+/// suppress a tracked path) and the untracked non-ignored filesystem walk.
+/// Without the tracked-index half, a changed *tracked* file that lives under an
+/// ignored directory (e.g. tracked `generated/schema.rs` with `generated/` in
+/// `.gitignore`) would be dropped by the walk and never appear in the delta,
+/// so search would keep showing the stale canonical content. Non-Git roots fall
+/// back to the plain ignore-aware walk, which is already correct for them.
+fn discover_project_branch_sources(root: &Path) -> Result<DiscoveryReport> {
+    if git_is_backed(root) {
+        let tracked = discover_git_index_sources(root)?;
+        let mut combined: Vec<ProjectSource> = Vec::with_capacity(tracked.sources.len());
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        for source in tracked.sources {
+            seen.insert(source.relative_path.clone());
+            combined.push(source);
+        }
+        let walk = discover_files(root, true, true, project_eligibility)?;
+        for source in walk.files {
+            if seen.insert(source.relative_path.clone()) {
+                combined.push(source);
+            }
+        }
+        combined.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+        Ok(DiscoveryReport { files: combined, ignored_files: walk.ignored_files, skips: walk.skips })
+    } else {
+        discover_project_files_with_untracked(root)
+    }
+}
+
 /// Conversation discovery is deliberately scoped: it walks the filesystem and
 /// honors worktree ignore files — nested `.gitignore`/`.mempalaceignore` files
 /// with git-compatible semantics plus the built-in skip directories — but it
@@ -2687,6 +2730,7 @@ impl IgnoreMatcher {
         Self {
             root: root.to_path_buf(),
             skip_dirs: DEFAULT_SKIP_DIRS.iter().map(|entry| (*entry).to_owned()).collect(),
+            repo_offset: String::new(),
             rules: Vec::new(),
             loaded: BTreeSet::new(),
             next_order: 0,
@@ -2695,8 +2739,9 @@ impl IgnoreMatcher {
 
     /// Parse the ignore files in `dir_rel` (relative to the root; an empty path
     /// is the root itself). When `load_gitignore` is set, `.gitignore` is read
-    /// first and `.mempalaceignore` second, so mempalace-specific rules take
-    /// precedence within the same directory. Idempotent per directory.
+    /// first and `.mempalaceignore` second, and mempalace-specific rules take
+    /// precedence over `.gitignore` rules in the same directory. Idempotent per
+    /// directory.
     fn load_directory(&mut self, dir_rel: &Path, load_gitignore: bool) -> Result<()> {
         if !self.loaded.insert(dir_rel.to_path_buf()) {
             return Ok(());
@@ -2704,13 +2749,13 @@ impl IgnoreMatcher {
         let scope = dir_rel.to_string_lossy().replace('\\', "/");
         let scope_depth = if scope.is_empty() { 0 } else { scope.split('/').count() };
 
-        let mut file_names = Vec::new();
+        let mut file_names: Vec<(&str, IgnoreTier)> = Vec::new();
         if load_gitignore {
-            file_names.push(".gitignore");
+            file_names.push((".gitignore", IgnoreTier::WorktreeGitignore));
         }
-        file_names.push(".mempalaceignore");
+        file_names.push((".mempalaceignore", IgnoreTier::WorktreeMempalaceignore));
 
-        for file_name in file_names {
+        for (file_name, tier) in file_names {
             let path = self.root.join(dir_rel).join(file_name);
             let body = match fs::read_to_string(&path) {
                 Ok(body) => body,
@@ -2723,7 +2768,7 @@ impl IgnoreMatcher {
                     pattern,
                     scope: scope.clone(),
                     scope_depth,
-                    tier: IgnoreTier::Worktree,
+                    tier,
                     order: self.next_order,
                 });
                 self.next_order += 1;
@@ -2745,11 +2790,41 @@ impl IgnoreMatcher {
             if let Some(path) = repo_info_exclude_path(&self.root) {
                 self.load_pattern_file(&path, IgnoreTier::RepoExclude)?;
             }
+            // Repository-level exclude patterns are anchored at the Git
+            // toplevel, not at the discovery root. When the project directory
+            // is a subdirectory of the worktree, record its offset from the
+            // toplevel so anchored patterns resolve against the right root.
+            self.repo_offset = self.git_toplevel_offset();
         }
         if let Some(path) = global_excludes_path(&self.root) {
             self.load_pattern_file(&path, IgnoreTier::GlobalExclude)?;
         }
         Ok(())
+    }
+
+    /// The discovery root's path relative to the Git toplevel, as a `/`-joined
+    /// string (`""` when they coincide, or when the root is not inside a work
+    /// tree).
+    fn git_toplevel_offset(&self) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&self.root)
+            .args(["rev-parse", "--show-toplevel"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned());
+        let Some(toplevel) = output else { return String::new() };
+        let toplevel = Path::new(&toplevel)
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(toplevel));
+        let root_canon = self.root.canonicalize().unwrap_or_else(|_| self.root.clone());
+        match root_canon.strip_prefix(&toplevel) {
+            Ok(rest) if !rest.as_os_str().is_empty() => {
+                rest.iter().map(|c| c.to_string_lossy()).collect::<Vec<_>>().join("/")
+            }
+            _ => String::new(),
+        }
     }
 
     /// Parse the patterns in an absolute exclude file (root-scoped) into rules
@@ -2783,8 +2858,9 @@ impl IgnoreMatcher {
     /// last matching rule wins, so later elements override earlier ones.
     fn sort_rules(&mut self) {
         // Deeper scopes override shallower ones; within a scope, later rules
-        // override earlier ones. Cross-source, worktree files beat
-        // `info/exclude`, which beats the global excludes file.
+        // override earlier ones. Cross-source, worktree `.mempalaceignore` beats
+        // `.gitignore`, which beats `info/exclude`, which beats the global
+        // excludes file.
         self.rules.sort_by(|left, right| {
             (left.tier, left.scope_depth, left.order)
                 .cmp(&(right.tier, right.scope_depth, right.order))
@@ -2802,7 +2878,20 @@ impl IgnoreMatcher {
         let mut ignored = false;
         let mut decided = false;
         for rule in &self.rules {
-            let Some(rest) = rule.scope_relative(&normalized) else { continue };
+            // Repository-level rules are anchored at the Git toplevel, so when
+            // the discovery root is a subdirectory of the worktree their
+            // patterns are evaluated against the prefixed (Git-relative) path.
+            let candidate = match rule.tier {
+                IgnoreTier::RepoExclude | IgnoreTier::GlobalExclude => {
+                    if self.repo_offset.is_empty() {
+                        normalized.clone()
+                    } else {
+                        format!("{}/{}", self.repo_offset, normalized)
+                    }
+                }
+                _ => normalized.clone(),
+            };
+            let Some(rest) = rule.scope_relative(&candidate) else { continue };
             if !rule.pattern.matches_path(rest, is_dir) {
                 continue;
             }
@@ -5941,11 +6030,14 @@ mod tests {
         let project_dir = tempdir.path().join("project");
         fs::create_dir_all(&project_dir).unwrap();
 
-        // `.env` is denied by the secret denylist; `keep.md` is eligible.
+        // `.env` is denied by the secret denylist; `keep.md` is eligible and
+        // long enough to produce real chunks.
+        let keep_md =
+            "# keep\n\nThis eligible file must survive the stale canonical sweep.\n".repeat(4);
         git_init_with_commit(
             &project_dir,
             "main",
-            &[(".env", "SECRET=hunter2\n"), ("keep.md", "# keep\n")],
+            &[(".env", "SECRET=hunter2\n"), ("keep.md", keep_md.as_str())],
         );
 
         let root = project_dir.canonicalize().unwrap();
@@ -6044,7 +6136,14 @@ mod tests {
         let project_b = tempdir.path().join("project-b");
         for dir in [&project_a, &project_b] {
             fs::create_dir_all(dir).unwrap();
-            git_init_with_commit(dir, "main", &[("keep.md", "# keep\n")]);
+            let keep_md =
+                "# keep\n\nThis eligible file must survive the scoped canonical sweep.\n"
+                    .repeat(4);
+            git_init_with_commit(
+                dir,
+                "main",
+                &[("keep.md", keep_md.as_str())],
+            );
         }
 
         let wing_name = "sweepisolation";
@@ -7069,10 +7168,84 @@ mod tests {
         );
     }
 
-    /// An explicitly configured `core.excludesFile` that points at an
-    /// unreadable path (here: a directory) is treated as empty rather than
-    /// aborting discovery. Git exits fatally in exactly this case; tolerating
-    /// it is the intentional robustness divergence.
+    // ─── Review round-1 findings ─────────────────────────────────────────────
+
+    /// `.mempalaceignore` is the explicit MemPalace exclusion and must remain
+    /// deny-only across scopes: a parent `.mempalaceignore` `private/**` cannot
+    /// be overridden by a deeper `private/.gitignore` `!config.toml` negation
+    /// in a filesystem walk. Without the mempalace-over-gitignore tier, the
+    /// deeper negation would be the last matching rule and re-include a file
+    /// the operator explicitly excluded from discovery.
+    #[test]
+    fn mempalaceignore_outranks_nested_gitignore_negation_in_walk() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path().to_path_buf();
+        fs::create_dir_all(root.join("private")).unwrap();
+        fs::write(root.join(".mempalaceignore"), "private/**\n").unwrap();
+        fs::write(root.join("private").join(".gitignore"), "!config.toml\n").unwrap();
+        fs::write(root.join("private").join("config.toml"), "cfg\n").unwrap();
+        fs::write(root.join("private").join("other.txt"), "txt\n").unwrap();
+        fs::write(root.join("keep.md"), "kept\n").unwrap();
+
+        let report = discover_project_files_with_untracked(&root).unwrap();
+        let names: Vec<_> = report.files.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["keep.md"]);
+    }
+
+    /// Repository-level exclude patterns (`$GIT_DIR/info/exclude`,
+    /// `core.excludesFile`) are anchored at the Git toplevel, not at the
+    /// project directory. When a subdirectory of the repo is mined, an
+    /// anchored `/secret.md` must exclude only the toplevel `secret.md`, never
+    /// `sub/secret.md`. Without the toplevel offset, `/secret.md` loaded with a
+    /// root scope matches the subdirectory-relative `secret.md` and wrongly
+    /// skips it.
+    #[test]
+    fn repo_exclude_anchored_at_git_toplevel_for_subdir_walk() {
+        let tempdir = tempdir().unwrap();
+        let repo = tempdir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(repo.join("sub")).unwrap();
+        git_init_with_commit(
+            &repo,
+            "main",
+            &[
+                ("secret.md", "root secret\n"),
+                ("sub/keep.md", "keep\n"),
+                ("sub/secret.md", "sub secret\n"),
+            ],
+        );
+        fs::write(repo.join(".git").join("info").join("exclude"), "/secret.md\n").unwrap();
+        pin_absent_global_excludes(&repo);
+
+        let sub = repo.join("sub");
+        let report = discover_project_files_with_untracked(&sub).unwrap();
+        let names: Vec<_> = report.files.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["keep.md", "secret.md"]);
+    }
+
+    /// Branch-delta source sets must include a changed *tracked* file even
+    /// when it lives under a `.gitignore`d directory: git never lets
+    /// `.gitignore` untrack a tracked path, so the walk alone would drop
+    /// `generated/schema.rs` and the branch edit would never surface. The union
+    /// with the tracked-index set keeps it.
+    #[test]
+    fn branch_sources_include_tracked_files_under_ignored_dir() {
+        let tempdir = tempdir().unwrap();
+        let repo = tempdir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        git_init_with_commit(
+            &repo,
+            "main",
+            &[("generated/schema.rs", "const SCHEMA: &str = \"v1\";\n"), ("keep.rs", "fn keep() {}\n")],
+        );
+        fs::write(repo.join(".gitignore"), "generated/\n").unwrap();
+
+        let report = discover_project_branch_sources(&repo).unwrap();
+        let names: Vec<_> = report.files.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["generated/schema.rs", "keep.rs"]);
+    }
+
+
     #[test]
     fn unreadable_configured_global_excludes_does_not_abort_discovery() {
         let tempdir = tempdir().unwrap();

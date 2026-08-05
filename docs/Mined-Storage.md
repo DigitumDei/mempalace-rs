@@ -208,6 +208,12 @@ fatally when an exclude file cannot be opened. Repository-level excludes never
 apply to tracked index files: a tracked path stays eligible even when an
 exclude file names it.
 
+These linked-worktree rules apply only to project discovery. Linked Git
+worktrees reported by `git worktree list --porcelain` are always skipped,
+preventing duplicate checkout content from being mined; conversation
+discovery does not skip them, because conversation directories are not
+checkouts and its walk does not consult git state or spawn git subprocesses.
+
 ### Conversation discovery
 
 `mine --mode convos` walks the conversation directory with the same worktree
@@ -231,9 +237,6 @@ deliberately narrower than project discovery:
 The following directory names are always skipped: `.git`, `node_modules`,
 `__pycache__`, `.venv`, `venv`, `env`, `dist`, `build`, `.next`, `coverage`,
 `.mempalace`.
-
-Linked Git worktrees reported by `git worktree list --porcelain` are always
-skipped, preventing duplicate checkout content from being mined.
 
 Room detection during `init` and `project register` uses the same safe source
 set: rooms are derived from the directories that hold eligible sources, so

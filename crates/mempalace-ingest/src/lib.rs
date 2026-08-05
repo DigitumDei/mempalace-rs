@@ -5527,49 +5527,59 @@ mod tests {
         }
     }
 
-    /// SSH private-key names are matched exactly (case-insensitively): public
-    /// keys (`id_ed25519.pub`) and unrelated prefix collisions
-    /// (`id_dsa_notes.md`) are not withheld, while the canonical private-key
-    /// names stay protected.
+    /// SSH private-key names are matched exactly (case-insensitively): only the
+    /// canonical private-key names (`id_rsa`/`id_ed25519`/`id_ecdsa`/`id_dsa`)
+    /// are withheld. Public keys (`id_ed25519.pub`) and unrelated `id_*` prefix
+    /// collisions (`id_dsa_notes.md`, `my_id_rsa`) are not private keys and must
+    /// not be withheld — this table pins down the false-positive boundary.
     #[test]
-    fn ssh_private_key_denylist_is_exact_name_match() {
-        let withheld: &[&str] = &[
-            "id_rsa",
-            "id_ed25519",
-            "id_ecdsa",
-            "id_dsa",
-            "ID_RSA",
-            "Id_Ed25519",
-            "ID_ECDSA",
-            "id_DSA",
+    fn ssh_private_key_denylist_boundary_is_explicit() {
+        let cases: &[(&str, Option<SecretPathKind>)] = &[
+            // Canonical private keys — always withheld.
+            ("id_rsa", Some(SecretPathKind::SshPrivateKey)),
+            ("id_ed25519", Some(SecretPathKind::SshPrivateKey)),
+            ("id_ecdsa", Some(SecretPathKind::SshPrivateKey)),
+            ("id_dsa", Some(SecretPathKind::SshPrivateKey)),
+            // Case variants of the canonical names — still withheld, because the
+            // match is case-insensitive ASCII.
+            ("ID_RSA", Some(SecretPathKind::SshPrivateKey)),
+            ("Id_Ed25519", Some(SecretPathKind::SshPrivateKey)),
+            ("ID_ECDSA", Some(SecretPathKind::SshPrivateKey)),
+            ("id_DSA", Some(SecretPathKind::SshPrivateKey)),
+            ("Id_Rsa", Some(SecretPathKind::SshPrivateKey)),
+            ("ID_ED25519", Some(SecretPathKind::SshPrivateKey)),
+            // Public keys — a different file kind, never a private key.
+            ("id_rsa.pub", None),
+            ("id_ed25519.pub", None),
+            ("id_ecdsa.pub", None),
+            ("id_dsa.pub", None),
+            ("ID_RSA.PUB", None),
+            ("Id_Ed25519.Pub", None),
+            // Signed/Cert authority companion files — still public metadata.
+            ("id_rsa-cert.pub", None),
+            ("id_ed25519_cert.pub", None),
+            // Unrelated id_* prefix collisions — not the canonical name itself.
+            ("id_rsa_notes.md", None),
+            ("id_dsa_notes.md", None),
+            ("id_ed25519_notes.md", None),
+            ("id_dsa.txt", None),
+            ("id_rsa_backup", None),
+            ("id_ed25519.old", None),
+            ("id_rsa_", None),
+            ("not_id_rsa", None),
+            ("my_id_ed25519", None),
+            ("github_id_dsa", None),
+            ("id_rsa_bak_suffix", None),
+            // Unrelated names sharing no id_* shape at all.
+            ("my_private_key", None),
+            ("github_rsa", None),
+            ("rsa_key", None),
         ];
-        let allowed: &[&str] = &[
-            "id_rsa.pub",
-            "id_ed25519.pub",
-            "id_ecdsa.pub",
-            "id_dsa.pub",
-            "id_rsa-cert.pub",
-            "id_ed25519_cert.pub",
-            "id_rsa_notes.md",
-            "id_dsa_notes.md",
-            "id_ed25519_notes.md",
-            "id_rsa_backup",
-            "id_dsa.txt",
-            "my_private_key",
-            "github_rsa",
-        ];
-        for name in withheld {
+        for (name, expected) in cases {
             assert_eq!(
                 secret_path_kind(name),
-                Some(SecretPathKind::SshPrivateKey),
-                "private key {name:?} must be withheld"
-            );
-        }
-        for name in allowed {
-            assert_eq!(
-                secret_path_kind(name),
-                None,
-                "non-secret name {name:?} must not be withheld"
+                *expected,
+                "secret_path_kind({name:?}) must sit on the intended side of the boundary"
             );
         }
     }

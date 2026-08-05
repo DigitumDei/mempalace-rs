@@ -278,9 +278,15 @@ Every candidate file (including extension- and basename-matched files) is
 rejected if any of the first 8 KiB of bytes is a NUL byte (`0x00`). This
 excludes misnamed binaries, compiled outputs, and other non-text data.
 
-### Always-skipped files
+### Always-skipped files in project discovery
 
-The following files are never discovered regardless of extension:
+The following files are never discovered by **project** discovery — the
+canonical Git-index path, the branch-delta filesystem walk, and the non-Git
+filesystem walk — regardless of extension. **Conversation** discovery is the
+deliberate exception: it applies only its `.txt`/`.md`/`.json`/`.jsonl`
+extension filter, so none of these rules apply there, and a file such as a
+`.env.json` or `package-lock.json` sitting in a conversation directory is still
+discovered (see [Conversation discovery](#conversation-discovery)).
 
 - **Secrets** (the path-based secret denylist, matched case-insensitively on
   the file name **before any content is read**, in both Git-index and

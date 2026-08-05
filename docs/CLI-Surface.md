@@ -139,14 +139,16 @@ Behavior:
   the `core.excludesFile` global excludes file. Branch-delta mines
   (`--branch` / `--view <name>`) union the tracked-index set with the
   untracked, non-ignored filesystem walk, so a changed tracked file is never
-  lost to `.gitignore`, and their walk honours
+  lost to `.gitignore`; that walk excludes every tracked index path before
+  reading it, so rejected tracked symlinks cannot re-enter from the filesystem.
+  It honours
   `$GIT_DIR/info/exclude` too — both repository-level sources at git's
   precedence, anchored at the Git toplevel (a rooted `/secret.md` excludes
   only the toplevel `secret.md`, never `sub/secret.md`). Linked git worktrees
   are always excluded from mining. A
-  Git-backed root whose index cannot be enumerated fails discovery with a
-  `GitIndexUnavailable` error rather than falling back to a filesystem walk, so
-  a git-read failure can never leak untracked or ignored content into a
+  Git-backed root whose Git detection or index cannot be read fails discovery
+  with a `GitIndexUnavailable` error rather than falling back to a filesystem
+  walk, so a git-read failure can never leak untracked or ignored content into a
   canonical mine. See
   [Mined-Storage.md#discovery-rules](Mined-Storage.md#discovery-rules).
 - A canonical mine's `Files discovered` count is the same effective source

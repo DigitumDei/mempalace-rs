@@ -2224,7 +2224,7 @@ pub fn discover_project_sources(root: &Path) -> Result<ProjectSourceDiscovery> {
     let root = root
         .canonicalize()
         .map_err(|source| IngestError::Io { path: root.to_path_buf(), source })?;
-    if git_is_backed(&root) {
+    if git_is_backed(&root)? {
         discover_git_index_sources(&root)
     } else {
         discover_filesystem_sources(&root)
@@ -2232,17 +2232,47 @@ pub fn discover_project_sources(root: &Path) -> Result<ProjectSourceDiscovery> {
 }
 
 /// Returns `true` when `root` is inside a Git work tree whose tracked index
-/// paths can be enumerated with `git ls-files`.
-fn git_is_backed(root: &Path) -> bool {
-    Command::new("git")
+/// paths can be enumerated with `git ls-files`. If Git cannot inspect a
+/// directory that contains repository metadata, fail closed rather than
+/// treating its working tree as a non-Git directory.
+fn git_is_backed(root: &Path) -> Result<bool> {
+    let output = Command::new("git")
         .arg("-C")
         .arg(root)
         .args(["rev-parse", "--is-inside-work-tree"])
-        .output()
-        .ok()
-        .is_some_and(|output| {
-            output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "true"
-        })
+        .output();
+    match output {
+        Ok(output)
+            if output.status.success()
+                && String::from_utf8_lossy(&output.stdout).trim() == "true" =>
+        {
+            Ok(true)
+        }
+        Ok(output) if git_metadata_present(root) => {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            Err(IngestError::GitIndexUnavailable {
+                path: root.to_path_buf(),
+                reason: if stderr.is_empty() {
+                    "git could not determine whether the directory is inside a work tree".to_owned()
+                } else {
+                    stderr
+                },
+            })
+        }
+        Err(error) if git_metadata_present(root) => Err(IngestError::GitIndexUnavailable {
+            path: root.to_path_buf(),
+            reason: format!("could not run git to inspect repository metadata: {error}"),
+        }),
+        _ => Ok(false),
+    }
+}
+
+/// Whether `root` or an ancestor contains a `.git` directory or gitdir file.
+/// This deliberately does not validate the metadata: when Git cannot do so,
+/// canonical project discovery must fail closed instead of walking it as an
+/// ordinary directory.
+fn git_metadata_present(root: &Path) -> bool {
+    root.ancestors().any(|directory| directory.join(".git").exists())
 }
 
 /// Absolute path to `$GIT_DIR/info/exclude` for `root`, resolved via
@@ -2295,9 +2325,12 @@ fn global_excludes_path(root: &Path) -> Option<PathBuf> {
                         return Some(PathBuf::from(home).join(stripped));
                     }
                 }
-                // git resolves a relative core.excludesFile against the
-                // directory it runs in, which is the repository root here.
-                return Some(root.join(path));
+                // Git resolves a relative core.excludesFile from the worktree
+                // toplevel, even when discovery begins in a subdirectory.
+                // Non-Git filesystem walks retain their root-relative
+                // behavior.
+                let base = git_toplevel(root).unwrap_or_else(|| root.to_path_buf());
+                return Some(base.join(path));
             }
         }
     }
@@ -2315,6 +2348,21 @@ fn default_global_excludes_path(xdg_config_home: Option<&str>, home: Option<&Pat
         _ => home.unwrap_or(Path::new("~")).join(".config"),
     };
     base.join("git").join("ignore")
+}
+
+/// Canonical Git worktree toplevel for `root`, when Git can report one.
+fn git_toplevel(root: &Path) -> Option<PathBuf> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    Some(path.canonicalize().unwrap_or(path))
 }
 
 /// Enumerate the tracked index paths under `root` and keep the project-eligible
@@ -2450,11 +2498,41 @@ fn discover_git_index_sources(root: &Path) -> Result<ProjectSourceDiscovery> {
     })
 }
 
+/// Return every UTF-8-representable path in the tracked index. Branch-delta
+/// discovery uses this as an exclusion set for its filesystem half so index
+/// entries rejected by the canonical safety gate cannot be reintroduced.
+fn tracked_index_paths(root: &Path) -> Result<BTreeSet<String>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "-z"])
+        .output()
+        .map_err(|source| IngestError::Io { path: root.to_path_buf(), source })?;
+    if !output.status.success() {
+        let reason = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        return Err(IngestError::GitIndexUnavailable {
+            path: root.to_path_buf(),
+            reason: if reason.is_empty() {
+                "git ls-files exited unsuccessfully".to_owned()
+            } else {
+                reason
+            },
+        });
+    }
+    Ok(output
+        .stdout
+        .split(|byte| *byte == b'\0')
+        .filter(|entry| !entry.is_empty())
+        .filter_map(path_from_git_bytes)
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect())
+}
+
 /// Walk `root` with git-compatible ignore handling, keeping the project-eligible
 /// subset. Used for non-Git roots; the `core.excludesFile` global excludes file
 /// still applies, but `$GIT_DIR/info/exclude` does not (no git work tree).
 fn discover_filesystem_sources(root: &Path) -> Result<ProjectSourceDiscovery> {
-    let report = discover_files(root, true, true, project_eligibility)?;
+    let report = discover_files(root, true, true, None, project_eligibility)?;
     Ok(ProjectSourceDiscovery {
         sources: report.files,
         basis: ProjectSourceBasis::Filesystem,
@@ -2504,7 +2582,7 @@ fn discover_project_files(root: &Path) -> Result<DiscoveryReport> {
 /// `$GIT_DIR/info/exclude` for Git-backed roots and the `core.excludesFile`
 /// global file); linked Git worktrees are still skipped.
 fn discover_project_files_with_untracked(root: &Path) -> Result<DiscoveryReport> {
-    discover_files(root, true, true, project_eligibility)
+    discover_files(root, true, true, None, project_eligibility)
 }
 
 /// Build the source set for a branch-delta mine: the union of the canonical
@@ -2516,22 +2594,29 @@ fn discover_project_files_with_untracked(root: &Path) -> Result<DiscoveryReport>
 /// so search would keep showing the stale canonical content. Non-Git roots fall
 /// back to the plain ignore-aware walk, which is already correct for them.
 fn discover_project_branch_sources(root: &Path) -> Result<DiscoveryReport> {
-    if git_is_backed(root) {
+    if git_is_backed(root)? {
         let tracked = discover_git_index_sources(root)?;
+        // Keep every index path out of the filesystem half, not only the
+        // eligible tracked sources. In particular this prevents a tracked
+        // symlink rejected by index discovery from being followed and added
+        // back by the walk.
+        let tracked_paths = tracked_index_paths(root)?;
         let mut combined: Vec<ProjectSource> = Vec::with_capacity(tracked.sources.len());
-        let mut seen: BTreeSet<String> = BTreeSet::new();
         for source in tracked.sources {
-            seen.insert(source.relative_path.clone());
             combined.push(source);
         }
-        let walk = discover_files(root, true, true, project_eligibility)?;
+        let walk = discover_files(root, true, true, Some(&tracked_paths), project_eligibility)?;
         for source in walk.files {
-            if seen.insert(source.relative_path.clone()) {
-                combined.push(source);
-            }
+            combined.push(source);
         }
         combined.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
-        Ok(DiscoveryReport { files: combined, ignored_files: walk.ignored_files, skips: walk.skips })
+        let mut skips = tracked.skips;
+        skips.extend(walk.skips);
+        Ok(DiscoveryReport {
+            files: combined,
+            ignored_files: tracked.skipped + walk.ignored_files,
+            skips,
+        })
     } else {
         discover_project_files_with_untracked(root)
     }
@@ -2547,7 +2632,7 @@ fn discover_project_branch_sources(root: &Path) -> Result<DiscoveryReport> {
 /// and discovery should not depend on git state or spawn git subprocesses.
 fn discover_conversation_files(root: &Path) -> Result<DiscoveryReport> {
     let extension_set = CONVO_EXTENSIONS.iter().copied().collect::<BTreeSet<_>>();
-    discover_files(root, false, false, move |path, _file_name| {
+    discover_files(root, false, false, None, move |path, _file_name| {
         let suffix = path.extension().and_then(|value| value.to_str()).unwrap_or_default();
         let normalized_suffix = format!(".{}", suffix.to_ascii_lowercase());
         if extension_set.contains(normalized_suffix.as_str()) {
@@ -2644,6 +2729,7 @@ fn discover_files(
     root: &Path,
     skip_linked_worktrees: bool,
     load_repo_excludes: bool,
+    excluded_paths: Option<&BTreeSet<String>>,
     accept_file: impl Fn(&Path, &str) -> Eligibility,
 ) -> Result<DiscoveryReport> {
     // Git reports worktree paths as absolute, so use an absolute root when
@@ -2698,6 +2784,14 @@ fn discover_files(
                     continue;
                 }
                 stack.push(path);
+                continue;
+            }
+
+            // Branch-delta discovery unions eligible index files with this
+            // untracked walk. Exclude every tracked path here before matching
+            // or eligibility checks so a rejected tracked symlink cannot be
+            // followed by `project_eligibility` and reintroduced.
+            if excluded_paths.is_some_and(|paths| paths.contains(&relative)) {
                 continue;
             }
 
@@ -2786,7 +2880,7 @@ impl IgnoreMatcher {
     /// excludes file is user-level configuration and applies to any walk,
     /// including the non-Git filesystem fallback.
     fn load_repo_excludes(&mut self) -> Result<()> {
-        if git_is_backed(&self.root) {
+        if git_is_backed(&self.root)? {
             if let Some(path) = repo_info_exclude_path(&self.root) {
                 self.load_pattern_file(&path, IgnoreTier::RepoExclude)?;
             }
@@ -7243,6 +7337,90 @@ mod tests {
         let report = discover_project_branch_sources(&repo).unwrap();
         let names: Vec<_> = report.files.iter().map(|s| s.relative_path.as_str()).collect();
         assert_eq!(names, vec!["generated/schema.rs", "keep.rs"]);
+    }
+
+    /// A relative `core.excludesFile` is rooted at the Git worktree, not at a
+    /// subdirectory passed to branch discovery. This matches `git check-ignore`
+    /// and prevents subproject walks from missing the configured exclusion.
+    #[test]
+    fn relative_core_excludes_file_is_resolved_from_git_toplevel() {
+        let tempdir = tempdir().unwrap();
+        let repo = tempdir.path().join("repo");
+        fs::create_dir_all(repo.join("sub")).unwrap();
+        git_init_with_commit(&repo, "main", &[("sub/tracked.md", "tracked\n")]);
+        fs::write(repo.join("excludes"), "*.tmp.md\n").unwrap();
+        let status = Command::new("git")
+            .args(["config", "core.excludesFile", "excludes"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git config core.excludesFile failed");
+        fs::write(repo.join("sub/drop.tmp.md"), "drop\n").unwrap();
+        fs::write(repo.join("sub/keep.md"), "keep\n").unwrap();
+
+        let report = discover_project_files_with_untracked(&repo.join("sub")).unwrap();
+        let names: Vec<_> = report.files.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["keep.md", "tracked.md"]);
+    }
+
+    /// Branch discovery must never let the filesystem half follow a tracked
+    /// symlink that the index half correctly rejected. The external target is
+    /// eligible by name, which makes this specifically exercise the safety
+    /// boundary rather than an extension filter.
+    #[test]
+    #[cfg(unix)]
+    fn branch_sources_do_not_reintroduce_tracked_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let tempdir = tempdir().unwrap();
+        let repo = tempdir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        git_init_with_commit(&repo, "main", &[("tracked.md", "tracked\n")]);
+        let external = tempdir.path().join("external.md");
+        fs::write(&external, "external secret-like content\n").unwrap();
+        symlink(&external, repo.join("link.md")).unwrap();
+        let status = Command::new("git")
+            .args(["add", "-f", "link.md"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git add tracked symlink failed");
+
+        let report = discover_project_branch_sources(&repo).unwrap();
+        let names: Vec<_> = report.files.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["tracked.md"]);
+    }
+
+    /// A directory containing `.git` metadata is not safe to fall back to a
+    /// filesystem walk when `git` itself cannot be run. The child process
+    /// isolates its PATH so concurrent tests keep their normal Git binary.
+    #[test]
+    fn git_detection_failure_with_metadata_fails_closed() {
+        const TEST_NAME: &str = "tests::git_detection_failure_with_metadata_fails_closed";
+        if let Some(root) = std::env::var_os("MEMPALACE_TEST_GIT_ROOT") {
+            let error = discover_project_sources(Path::new(&root)).unwrap_err();
+            assert!(matches!(error, IngestError::GitIndexUnavailable { .. }));
+            return;
+        }
+
+        let tempdir = tempdir().unwrap();
+        let repo = tempdir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        git_init_with_commit(&repo, "main", &[("tracked.md", "tracked\n")]);
+        let no_git_path = tempdir.path().join("no-git-on-path");
+        fs::create_dir_all(&no_git_path).unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .env("MEMPALACE_TEST_GIT_ROOT", &repo)
+            .env("PATH", &no_git_path)
+            .args(["--exact", TEST_NAME])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child run of {TEST_NAME} failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
     }
 
 

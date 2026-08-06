@@ -21,10 +21,10 @@ use mempalace_server::{TokenRegistry, build_router};
 use mempalace_federation::{IngestBatchRequest, IngestBatchResponse};
 use mempalace_ingest::{
     ConversationExtractMode, ConversationIngestRequest, IngestError, IngestSummary,
-    PROJECTS_BRANCH_INGEST_KIND, PROJECTS_INGEST_KIND, ProjectIngestRequest, derive_project_id,
-    ingest_conversations, ingest_project_with_config, prepare_project_batch_with_config,
-    project_branch_source_prefix, project_canonical_source_prefix, project_root_relative,
-    wing_kind_source_prefix,
+    PROJECTS_BRANCH_INGEST_KIND, PROJECTS_INGEST_KIND, ProjectIngestRequest, ProjectSourceSkip,
+    derive_project_id, ingest_conversations, ingest_project_with_config,
+    prepare_project_batch_with_config, project_branch_source_prefix,
+    project_canonical_source_prefix, project_root_relative, wing_kind_source_prefix,
 };
 use mempalace_remote::{RemoteApi, RemoteClient, RemoteEndpoint, RemoteError};
 use mempalace_search::{Layer1Config, SearchRuntime, SearchRuntimePolicy, WakeUpRequest};
@@ -43,25 +43,6 @@ const INIT_HEADER_WIDTH: usize = 55;
 const STATUS_HEADER_WIDTH: usize = 55;
 const SEARCH_HEADER_WIDTH: usize = 60;
 const WAKE_UP_SEPARATOR_WIDTH: usize = 50;
-
-const SKIP_DIRS: &[&str] = &[
-    ".git",
-    "node_modules",
-    "__pycache__",
-    ".venv",
-    "venv",
-    "env",
-    "dist",
-    "build",
-    ".next",
-    "coverage",
-    ".mempalace",
-];
-
-const PROJECT_FILE_EXTENSIONS: &[&str] = &[
-    "txt", "md", "py", "js", "ts", "jsx", "tsx", "json", "yaml", "yml", "html", "css", "java",
-    "go", "rs", "rb", "sh", "csv", "sql", "toml",
-];
 
 const FOLDER_ROOM_MAP: &[(&str, &str)] = &[
     ("frontend", "frontend"),
@@ -192,7 +173,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Detect rooms from your folder structure.
+    /// Detect rooms from your project's safe source directories.
     Init {
         dir: PathBuf,
         #[arg(long, help = "Auto-accept detected rooms")]
@@ -580,8 +561,8 @@ where
         )
     })?;
 
-    let file_count = count_project_files(&project_dir).map_err(io_error)?;
-    let detection = detect_rooms(&project_dir).map_err(io_error)?;
+    let detection = detect_rooms(&project_dir).map_err(ingest_error)?;
+    let file_count = detection.file_count;
     let config_path = project_dir.join("mempalace.yaml");
     let legacy_config_path = project_dir.join("mempal.yaml");
     let existing_config = config_path.exists() || legacy_config_path.exists();
@@ -675,7 +656,7 @@ where
         "=".repeat(INIT_HEADER_WIDTH),
         String::new(),
         format!("  WING: {}", project_config.wing),
-        format!("  ({} files found, rooms detected from {})", file_count, detection.source),
+        render_source_population_line(file_count, detection.source),
         String::new(),
     ];
 
@@ -717,7 +698,8 @@ fn execute_project_command(
                     format!("failed to access project directory `{}`: {source}", dir.display()),
                 )
             })?;
-            let detection = detect_rooms(&project_dir).map_err(io_error)?;
+            let RoomDetection { source, rooms, file_count } =
+                detect_rooms(&project_dir).map_err(ingest_error)?;
             let mut project_config = if project_dir.join("mempalace.yaml").exists()
                 || project_dir.join("mempal.yaml").exists()
             {
@@ -731,7 +713,7 @@ fn execute_project_command(
                     context.config_base_dir.as_deref(),
                     Some(&candidate_project_id),
                     &derived_wing,
-                    detection.rooms,
+                    rooms,
                 )
                 .map_err(config_error)?
             };
@@ -805,6 +787,7 @@ fn execute_project_command(
             let mut lines = vec![
                 format!("Project registered: {project_id}"),
                 format!("  Wing: {}", project_config.wing),
+                render_source_population_line(file_count, source),
                 format!("  Registry: {}", registry_path.display()),
             ];
             if repo_config {
@@ -1710,6 +1693,7 @@ fn execute_remote_mine(
         if let Some(view_name) = &prepared.summary.view_name {
             lines.push(format!("  View: {view_name}"));
         }
+        lines.extend(render_secret_skip_lines(&prepared.summary.secret_path_skips));
         if let Some(ref warning) = branch_warning {
             lines.push(format!("  {}", warning.trim()));
         }
@@ -1848,6 +1832,7 @@ fn execute_remote_mine(
                             total_drawers_written,
                             &all_warnings,
                             &failed_files,
+                            &prepared.summary.secret_path_skips,
                             branch_warning.as_deref(),
                             view_name.as_deref(),
                             true,
@@ -1921,6 +1906,7 @@ fn execute_remote_mine(
         total_drawers_written,
         &all_warnings,
         &failed_files,
+        &prepared.summary.secret_path_skips,
         branch_warning.as_deref(),
         view_name.as_deref(),
         dual_write,
@@ -1981,6 +1967,7 @@ fn render_remote_mine_summary(
     drawers_written: usize,
     warnings: &[String],
     failed_files: &[(String, String)],
+    secret_skips: &[ProjectSourceSkip],
     branch_warning: Option<&str>,
     view_name: Option<&str>,
     dual_write: bool,
@@ -2001,6 +1988,7 @@ fn render_remote_mine_summary(
         format!("  Files failed: {failed_count}"),
         format!("  Drawers written: {drawers_written}"),
     ];
+    lines.extend(render_secret_skip_lines(secret_skips));
 
     if dual_write {
         if replication_incomplete {
@@ -2434,6 +2422,10 @@ fn render_mine_summary(
         lines.push(format!("  View: {view_name}"));
     }
 
+    // Secret-shaped paths withheld during discovery (issue #95). Only printed
+    // when non-empty to preserve byte-parity with existing test output.
+    lines.extend(render_secret_skip_lines(&summary.secret_path_skips));
+
     // Only print when non-zero to preserve byte-parity with existing test output.
     if summary.removed_sources > 0 {
         lines.push(format!("  Sources removed: {}", summary.removed_sources));
@@ -2441,6 +2433,27 @@ fn render_mine_summary(
 
     lines.push(format!("{}\n", "=".repeat(SEARCH_HEADER_WIDTH)));
     lines.join("\n")
+}
+
+/// Render the operator-visible secret-denylist skip records (path + reason,
+/// never file content) as summary lines. Empty when there are none.
+fn render_secret_skip_lines(skips: &[ProjectSourceSkip]) -> Vec<String> {
+    if skips.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = Vec::with_capacity(skips.len() + 1);
+    lines.push(format!("  Secrets withheld: {}", skips.len()));
+    lines.extend(skips.iter().map(|skip| {
+        format!("    {} — secret-shaped path ({})", skip.relative_path, skip.reason)
+    }));
+    lines
+}
+
+/// The "N files found, rooms detected from <source>" summary line shared by
+/// `init` and `project register`, so both report the same effective source
+/// population that a canonical mine ingests.
+fn render_source_population_line(file_count: usize, source: &'static str) -> String {
+    format!("  ({file_count} files found, rooms detected from {source})")
 }
 
 fn deferred_command(command: &str) -> CliOutput {
@@ -2530,33 +2543,30 @@ fn read_global_config_file(
 struct RoomDetection {
     source: &'static str,
     rooms: Vec<ProjectRoomConfig>,
+    /// Number of eligible project sources the rooms were derived from.
+    file_count: usize,
 }
 
-fn detect_rooms(project_dir: &Path) -> std::io::Result<RoomDetection> {
+fn detect_rooms(project_dir: &Path) -> mempalace_ingest::Result<RoomDetection> {
+    // Derive room candidates and the reported file count from the same safe
+    // source set mining uses (mempalace_ingest::discover_project_sources), so
+    // ignored, untracked, and linked-worktree files never count or produce
+    // rooms. For Git-backed roots this is the tracked index; for non-Git roots
+    // it is the filesystem walk with git-compatible ignore handling.
+    let discovery = mempalace_ingest::discover_project_sources(project_dir)?;
+    let file_count = discovery.sources.len();
     let mut discovered = BTreeMap::<String, BTreeSet<String>>::new();
 
-    for entry in fs::read_dir(project_dir)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() {
-            continue;
+    for source in &discovery.sources {
+        // Room candidates are the top-level and second-level directories that
+        // hold an eligible source (matching the pre-discovery folder scan).
+        let Some((parent, _)) = source.relative_path.rsplit_once('/') else { continue };
+        let mut parts = parent.split('/');
+        if let Some(first) = parts.next() {
+            record_room(&mut discovered, first);
         }
-
-        let name = entry.file_name().to_string_lossy().to_string();
-        if SKIP_DIRS.contains(&name.as_str()) {
-            continue;
-        }
-        record_room(&mut discovered, &name);
-        for subentry in fs::read_dir(entry.path())? {
-            let subentry = subentry?;
-            if !subentry.file_type()?.is_dir() {
-                continue;
-            }
-
-            let subname = subentry.file_name().to_string_lossy().to_string();
-            if SKIP_DIRS.contains(&subname.as_str()) {
-                continue;
-            }
-            record_room(&mut discovered, &subname);
+        if let Some(second) = parts.next() {
+            record_room(&mut discovered, second);
         }
     }
 
@@ -2564,7 +2574,7 @@ fn detect_rooms(project_dir: &Path) -> std::io::Result<RoomDetection> {
         ("fallback", vec![project_room("general", "All project files", &["general"])])
     } else {
         (
-            "folder structure",
+            "safe project sources",
             discovered
                 .into_iter()
                 .map(|(room, originals)| {
@@ -2596,7 +2606,7 @@ fn detect_rooms(project_dir: &Path) -> std::io::Result<RoomDetection> {
     }
 
     deduped.sort_by(|left, right| left.name.cmp(&right.name));
-    Ok(RoomDetection { source, rooms: deduped })
+    Ok(RoomDetection { source, rooms: deduped, file_count })
 }
 
 fn record_room(discovered: &mut BTreeMap<String, BTreeSet<String>>, raw_name: &str) {
@@ -2673,34 +2683,6 @@ fn wing_ids_equal(left: &str, right: &str) -> bool {
         (Ok(left), Ok(right)) => left == right,
         _ => left.eq_ignore_ascii_case(right),
     }
-}
-
-fn count_project_files(project_dir: &Path) -> std::io::Result<usize> {
-    let mut total = 0usize;
-    let mut stack = vec![project_dir.to_path_buf()];
-
-    while let Some(dir) = stack.pop() {
-        for entry in fs::read_dir(dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            let file_type = entry.file_type()?;
-            let name = entry.file_name().to_string_lossy().to_string();
-
-            if file_type.is_dir() {
-                if !SKIP_DIRS.contains(&name.as_str()) {
-                    stack.push(path);
-                }
-                continue;
-            }
-
-            let extension = path.extension().and_then(|value| value.to_str()).unwrap_or_default();
-            if PROJECT_FILE_EXTENSIONS.contains(&extension) {
-                total += 1;
-            }
-        }
-    }
-
-    Ok(total)
 }
 
 fn default_embedding_cache_dir() -> PathBuf {
@@ -3583,7 +3565,7 @@ mod tests {
         // No per-file failures, but replication_incomplete=true → "partial — transport interrupted".
         let output = render_remote_mine_summary(
             src, "hub", "http://example.com", "wing_test", "repo-1",
-            5, 0, 0, 5, &[], &[], None, Some("feature-x"), true, true,
+            5, 0, 0, 5, &[], &[], &[], None, Some("feature-x"), true, true,
         );
         assert!(
             output.contains("replication: partial"),
@@ -3601,7 +3583,7 @@ mod tests {
         // No per-file failures, replication_incomplete=false → "succeeded".
         let output = render_remote_mine_summary(
             src, "hub", "http://example.com", "wing_test", "repo-1",
-            5, 0, 0, 5, &[], &[], None, None, true, false,
+            5, 0, 0, 5, &[], &[], &[], None, None, true, false,
         );
         assert!(
             output.contains("replication: succeeded"),
@@ -3611,7 +3593,7 @@ mod tests {
         // Per-file failures, replication_incomplete=false → "partial — some files had errors".
         let output = render_remote_mine_summary(
             src, "hub", "http://example.com", "wing_test", "repo-1",
-            3, 0, 2, 3, &[], &[("bad.rs".into(), "err".into())], None, None, true, false,
+            3, 0, 2, 3, &[], &[("bad.rs".into(), "err".into())], &[], None, None, true, false,
         );
         assert!(
             output.contains("replication: partial"),
@@ -3625,7 +3607,7 @@ mod tests {
         // Both incomplete AND per-file failures → "partial — transport interrupted".
         let output = render_remote_mine_summary(
             src, "hub", "http://example.com", "wing_test", "repo-1",
-            3, 0, 2, 3, &[], &[("bad.rs".into(), "err".into())], None, None, true, true,
+            3, 0, 2, 3, &[], &[("bad.rs".into(), "err".into())], &[], None, None, true, true,
         );
         assert!(
             output.contains("replication: partial"),
@@ -3647,7 +3629,7 @@ mod tests {
         // Non dual_write: no replication label at all.
         let output = render_remote_mine_summary(
             src, "hub", "http://example.com", "wing_test", "repo-1",
-            5, 0, 0, 5, &[], &[], None, None, false, false,
+            5, 0, 0, 5, &[], &[], &[], None, None, false, false,
         );
         assert!(
             !output.contains("replication:"),
@@ -3656,7 +3638,7 @@ mod tests {
         assert!(
             render_remote_mine_summary(
                 src, "hub", "http://example.com", "wing_test", "repo-1",
-                5, 0, 0, 5, &[], &[], None, Some("feature-x"), false, false,
+                5, 0, 0, 5, &[], &[], &[], None, Some("feature-x"), false, false,
             )
             .contains("View: feature-x"),
         );
@@ -3701,6 +3683,53 @@ mod tests {
         assert!(!layout.sqlite_path.exists());
         assert!(!layout.lancedb_dir.exists());
         fs::remove_dir_all(config_root).unwrap();
+    }
+
+    /// The mine summary surfaces secret-shaped paths withheld by the denylist
+    /// (issue #95): a count plus the path and reason — never the content.
+    #[test]
+    fn mine_summary_reports_secret_paths_withheld() {
+        let workspace = tempdir().unwrap();
+        let project_dir = setup_project_fixture(workspace.path());
+        write_file(&project_dir.join(".env"), "SECRET=hunter2\n");
+        write_file(&project_dir.join("kubeconfig.yaml"), "apiVersion: v1\n");
+        write_file(&project_dir.join("secrets.local.json"), "{\"key\":\"hunter2\"}\n");
+
+        let config_root = temp_config_root("secret-mine");
+        let context = CliContext::for_tests(config_root.clone());
+        run_cli(["init", project_dir.to_str().unwrap(), "--yes"], &context, stub_provider).unwrap();
+        let output = run_cli(
+            ["mine", project_dir.to_str().unwrap(), "--dry-run"],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+
+        assert_eq!(output.exit_code, 0, "mine failed: {:?}", output.stderr);
+        assert!(
+            output.stdout.contains("Secrets withheld: 3"),
+            "expected secrets count, got: {}",
+            output.stdout
+        );
+        assert!(output.stdout.contains(".env"), "expected .env in output: {}", output.stdout);
+        assert!(
+            output.stdout.contains("kubeconfig.yaml"),
+            "expected kubeconfig.yaml in output: {}",
+            output.stdout
+        );
+        assert!(
+            output.stdout.contains("secrets.local.json"),
+            "expected secrets.local.json in output: {}",
+            output.stdout
+        );
+        // The paths and reasons are shown, but the file content is not.
+        assert!(
+            !output.stdout.contains("hunter2"),
+            "secret content must never be printed: {}",
+            output.stdout
+        );
+
+        remove_dir_all_if_exists(&config_root);
     }
 
     #[test]
@@ -4003,6 +4032,10 @@ mod tests {
         let workspace = tempdir().unwrap();
         fs::create_dir_all(workspace.path().join("frontend")).unwrap();
         fs::create_dir_all(workspace.path().join("client")).unwrap();
+        fs::write(workspace.path().join("frontend").join("index.ts"), "export const x = 1;\n")
+            .unwrap();
+        fs::write(workspace.path().join("client").join("app.ts"), "export const y = 2;\n")
+            .unwrap();
 
         let detection = detect_rooms(workspace.path()).unwrap();
         let frontend = detection.rooms.iter().find(|room| room.name == "frontend").unwrap();
@@ -4010,6 +4043,148 @@ mod tests {
         assert!(frontend.description.as_ref().unwrap().contains("client"));
         assert!(frontend.keywords.contains(&"frontend".to_owned()));
         assert!(frontend.keywords.contains(&"client".to_owned()));
+    }
+
+    /// Rooms come from the safe source set, so directories that are ignored or
+    /// untracked in a Git checkout never produce rooms.
+    #[test]
+    fn detect_rooms_ignores_gitignored_and_untracked_directories_in_git_repo() {
+        let workspace = tempdir().unwrap();
+        let repo = workspace.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        git_init_repo(&repo, &[("docs/roadmap.md", "roadmap\n"), ("src/lib.rs", "fn lib() {}\n")]);
+
+        write_file(&repo.join(".gitignore"), "ignored/\n");
+        write_file(&repo.join("ignored/secret.md"), "secret\n");
+        write_file(&repo.join("untracked/scratch.md"), "scratch\n");
+
+        let detection = detect_rooms(&repo).unwrap();
+        let names: Vec<_> = detection.rooms.iter().map(|room| room.name.clone()).collect();
+        assert!(names.iter().any(|name| name == &"documentation"), "documentation room missing: {names:?}");
+        assert!(names.iter().any(|name| name == &"src"), "src room missing: {names:?}");
+        assert!(!names.iter().any(|name| name == &"ignored"), "ignored room must not be derived: {names:?}");
+        assert!(!names.iter().any(|name| name == &"untracked"), "untracked room must not be derived: {names:?}");
+        assert_eq!(detection.file_count, 2, "count must cover only eligible tracked sources");
+    }
+
+    /// A linked Git worktree inside the checkout is a duplicate repository and
+    /// must not contribute rooms.
+    #[test]
+    fn detect_rooms_excludes_linked_worktree_directories() {
+        let workspace = tempdir().unwrap();
+        let repo = workspace.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        git_init_repo(&repo, &[("docs/roadmap.md", "roadmap\n")]);
+
+        let wt = repo.join("linked-wt");
+        let status = std::process::Command::new("git")
+            .args(["worktree", "add", "-b", "wt-branch"])
+            .arg(&wt)
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git worktree add failed");
+        write_file(&wt.join("planning/notes.md"), "planning notes\n");
+
+        let detection = detect_rooms(&repo).unwrap();
+        let names: Vec<_> = detection.rooms.iter().map(|room| room.name.clone()).collect();
+        assert!(names.iter().any(|name| name == &"documentation"), "documentation room missing: {names:?}");
+        assert!(!names.iter().any(|name| name == &"linked_wt"), "linked worktree room must not be derived: {names:?}");
+        assert!(!names.iter().any(|name| name == &"planning"), "worktree content room must not be derived: {names:?}");
+        assert_eq!(detection.file_count, 1, "linked-worktree files must not be counted");
+    }
+
+    /// Non-Git roots keep folder-based detection but honour ignore files.
+    #[test]
+    fn detect_rooms_non_git_root_honors_ignore_files() {
+        let workspace = tempdir().unwrap();
+        let root = workspace.path();
+        write_file(&root.join(".gitignore"), "ignored/\n");
+        write_file(&root.join("ignored/secret.md"), "secret\n");
+        write_file(&root.join("src/lib.rs"), "fn lib() {}\n");
+
+        let detection = detect_rooms(root).unwrap();
+        let names: Vec<_> = detection.rooms.iter().map(|room| room.name.clone()).collect();
+        assert!(names.iter().any(|name| name == &"src"), "src room missing: {names:?}");
+        assert!(!names.iter().any(|name| name == &"ignored"), "ignored room must not be derived: {names:?}");
+        assert_eq!(detection.file_count, 1, "ignored files must not be counted");
+    }
+
+    /// The `init` summary count reflects the same safe source set that rooms are
+    /// derived from, so ignored/untracked working-tree files are not counted.
+    #[test]
+    fn init_reports_eligible_source_count_not_directory_traversal() {
+        let workspace = tempdir().unwrap();
+        let repo = workspace.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        git_init_repo(&repo, &[("docs/roadmap.md", "roadmap\n")]);
+        write_file(&repo.join(".gitignore"), "ignored/\n");
+        write_file(&repo.join("ignored/secret.md"), "secret\n");
+        write_file(&repo.join("untracked/scratch.md"), "scratch\n");
+
+        let config_root = temp_config_root("init-count");
+        let context = CliContext::for_tests(config_root.clone());
+        let output =
+            run_cli(["init", repo.to_str().unwrap(), "--yes"], &context, stub_provider).unwrap();
+        assert_eq!(output.exit_code, 0, "{}", output.stderr);
+        assert!(
+            output.stdout.contains("(1 files found"),
+            "init must count only the eligible tracked source: {}",
+            output.stdout
+        );
+
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    /// `init`, `project register`, and a canonical mine all report the same
+    /// eligible source population (issues #95/#96): for a Git-backed root that
+    /// is the tracked index, so ignored and untracked working-tree files are
+    /// neither counted nor mined.
+    #[test]
+    fn init_register_and_mine_report_the_same_eligible_source_count() {
+        let workspace = tempdir().unwrap();
+        let repo = workspace.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        git_init_repo(&repo, &[("docs/roadmap.md", "roadmap\n"), ("src/lib.rs", "fn lib() {}\n")]);
+        write_file(&repo.join(".gitignore"), "ignored/\n");
+        write_file(&repo.join("ignored/secret.md"), "secret\n");
+        write_file(&repo.join("untracked/scratch.md"), "scratch\n");
+
+        let config_root = temp_config_root("same-population");
+        let context = CliContext::for_tests(config_root.clone());
+
+        let init =
+            run_cli(["init", repo.to_str().unwrap(), "--yes"], &context, stub_provider).unwrap();
+        assert_eq!(init.exit_code, 0, "{}", init.stderr);
+        assert!(init.stdout.contains("(2 files found"), "init: {}", init.stdout);
+
+        let register = run_cli(
+            ["project", "register", repo.to_str().unwrap()],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+        assert_eq!(register.exit_code, 0, "{}", register.stderr);
+        assert!(
+            register.stdout.contains("(2 files found"),
+            "register must report the same eligible source count: {}",
+            register.stdout
+        );
+
+        let mine = run_cli(
+            ["mine", repo.to_str().unwrap(), "--dry-run", "--full"],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+        assert_eq!(mine.exit_code, 0, "{}", mine.stderr);
+        assert!(
+            mine.stdout.contains("Files discovered: 2"),
+            "mine must discover the same eligible sources: {}",
+            mine.stdout
+        );
+
+        remove_dir_all_if_exists(&config_root);
     }
 
     #[test]

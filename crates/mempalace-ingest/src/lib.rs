@@ -71,7 +71,9 @@ const DEFAULT_SKIP_DIRS: &[&str] = &[
     ".mempalace",
 ];
 /// Exact file names (case-sensitive) that are always skipped in project discovery.
-/// Also see: `.env`-prefix skip in `project_file_skip_by_name`.
+/// This is the non-secret hygiene list (lockfiles, palace config); the
+/// secret-shaped path denylist (issue #95) is matched separately in
+/// [`secret_path_kind`].
 const PROJECT_SKIP_FILES: &[&str] = &[
     "mempalace.yaml",
     "mempalace.yml",
@@ -332,6 +334,8 @@ pub enum IngestError {
         "branch-delta mining requires a git repository with a detectable default branch: {reason}"
     )]
     BranchDeltaUnavailable { reason: String },
+    #[error("could not enumerate the tracked index for `{path}`: {reason}")]
+    GitIndexUnavailable { path: PathBuf, reason: String },
 }
 
 pub type Result<T> = std::result::Result<T, IngestError>;
@@ -361,12 +365,15 @@ pub struct IngestSummary {
     pub ingested_files: usize,
     pub drawers_written: usize,
     pub truncated_files: usize,
-    /// Number of previously-mined source keys removed during a branch cleanup
-    /// pass.  Always 0 for non-branch runs.
+    /// Number of previously-mined source keys removed during local reconciliation.
+    /// This includes branch cleanup and unlimited canonical local re-mines.
     pub removed_sources: usize,
     /// The view name detected/used for this mine, if any.  `None` for canonical
     /// or non-Git mines.
     pub view_name: Option<String>,
+    /// Secret-shaped paths withheld by the path denylist during discovery
+    /// (issue #95). Carries path and reason only; never file content.
+    pub secret_path_skips: Vec<ProjectSourceSkip>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -458,28 +465,170 @@ struct Message {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct IgnorePattern {
+    /// `true` when the pattern starts with `!`: a match re-includes paths that
+    /// an earlier, lower-precedence rule excluded.
+    negated: bool,
+    /// `true` when the pattern ends with `/` and therefore only matches
+    /// directories (and, through the walk, everything beneath them).
+    directory_only: bool,
+    /// `true` when the pattern is anchored to the directory its ignore file
+    /// lives in (the pattern contains a `/`, or begins with one). Unanchored
+    /// patterns match the basename at any depth, like git.
+    anchored: bool,
+    /// The glob pattern split into `/`-separated components.
+    parts: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct IgnoreRule {
-    raw: String,
-    kind: IgnoreRuleKind,
+    pattern: IgnorePattern,
+    /// Relative directory the rule was declared in (`""` for the root).
+    scope: String,
+    /// Number of path components in `scope` (0 for the root).
+    scope_depth: usize,
+    /// Source precedence of the rule; later (higher-precedence) sources can
+    /// override earlier ones.
+    tier: IgnoreTier,
+    /// Load order within the same scope; later rules take precedence.
+    order: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum IgnoreRuleKind {
-    Extension(String),
-    Directory(String),
-    RelativePrefix(String),
-    Basename(String),
+/// Source precedence of an ignore rule. Lower-tier rules sort first so that a
+/// matching higher-tier rule wins (gitignore(5) order, extended so that the
+/// MemPalace-specific exclusion always outranks a `.gitignore`): worktree
+/// `.mempalaceignore` beats a same-scope `.gitignore`, which beats
+/// `$GIT_DIR/info/exclude`, which beats the `core.excludesFile` global file.
+/// Keeping `.mempalaceignore` in its own tier makes it deny-only across
+/// scopes — a deeper `.gitignore` negation can never clear a parent
+/// `.mempalaceignore` exclusion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum IgnoreTier {
+    /// `core.excludesFile` (default `$XDG_CONFIG_HOME/git/ignore`).
+    GlobalExclude,
+    /// `$GIT_DIR/info/exclude`.
+    RepoExclude,
+    /// Per-directory `.gitignore`.
+    WorktreeGitignore,
+    /// Per-directory `.mempalaceignore` (the explicit MemPalace exclusion).
+    WorktreeMempalaceignore,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Git-compatible ignore matcher: `.gitignore`/`.mempalaceignore` patterns
+/// with nested-file scoping, negation, and glob/anchoring semantics, plus
+/// `$GIT_DIR/info/exclude` (Git-backed roots only) and the
+/// `core.excludesFile` global file (any walk) at the correct precedence, and
+/// the built-in always-skipped directories.
+#[derive(Debug, Clone)]
 struct IgnoreMatcher {
+    /// Absolute root all relative paths are resolved against.
+    root: PathBuf,
+    /// Built-in directory names that are always skipped.
+    skip_dirs: BTreeSet<String>,
+    /// The discovery root's path relative to the Git toplevel (`""` when the
+    /// root *is* the toplevel, or for any non-Git walk). Repository-level
+    /// exclude patterns (`info/exclude`, `core.excludesFile`) are anchored at
+    /// the Git toplevel, so they are matched against `<repo_offset>/<path>`.
+    repo_offset: String,
+    /// Rules sorted by `(tier, scope_depth, order)`; the last matching rule wins.
     rules: Vec<IgnoreRule>,
+    /// Directories whose ignore files have already been parsed.
+    loaded: BTreeSet<PathBuf>,
+    next_order: usize,
 }
 
+/// A single eligible project source path.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct DiscoveredSource {
-    absolute_path: PathBuf,
-    relative_path: String,
+pub struct ProjectSource {
+    /// Absolute path to the source on disk.
+    pub absolute_path: PathBuf,
+    /// Repository-relative path, `/`-separated, relative to the discovery root.
+    pub relative_path: String,
+}
+
+/// The source set that produced a [`ProjectSourceDiscovery`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectSourceBasis {
+    /// Git-backed root: the eligible subset of tracked index paths
+    /// (`git ls-files`). Untracked and ignored working-tree files are never
+    /// eligible, and tracked symlinks are rejected outright so discovery can
+    /// never pull content from outside the root.
+    GitIndex,
+    /// Non-Git root: a filesystem walk honouring git-compatible ignore rules.
+    Filesystem,
+}
+
+/// A candidate path withheld by the path-based secret denylist (issue #95).
+///
+/// Recorded so operators can see what was withheld rather than auditing after
+/// the fact. Carries the path and a reason only — never any file content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectSourceSkip {
+    /// Root-relative, `/`-separated path of the withheld candidate.
+    pub relative_path: String,
+    /// Short human-readable reason describing the denylist match.
+    pub reason: String,
+}
+
+/// Categories of the path-based secret denylist (issue #95). Matches are made
+/// on the file name (case-insensitive) *before* any content is read, so a
+/// secret path is withheld without opening the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretPathKind {
+    /// `.env` and `.env.*` process-environment files.
+    DotEnv,
+    /// `*.kubeconfig*` Kubernetes configuration files.
+    Kubeconfig,
+    /// SSH private keys: `id_rsa`, `id_ed25519`, `id_ecdsa`, `id_dsa` (exact
+    /// name match, so public keys and prefix collisions are not withheld).
+    SshPrivateKey,
+    /// Keystores and truststores: `*.pfx`, `*.p12`, `*.jks`.
+    Keystore,
+    /// Package/registry credential files: `.npmrc`, `.netrc`.
+    Netrc,
+    /// Terraform state and variable files: `*.tfstate`, `*.tfvars`.
+    TerraformSecret,
+    /// JSON secret bundles: `secrets*.json`.
+    SecretsJson,
+    /// Local override/config files that commonly hold credentials:
+    /// `*.local.json`.
+    LocalJson,
+}
+
+impl SecretPathKind {
+    /// The denylist pattern(s) this category covers, for operator-facing skip
+    /// records.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DotEnv => ".env / *.env",
+            Self::Kubeconfig => "*.kubeconfig*",
+            Self::SshPrivateKey => "id_rsa / id_ed25519 / id_ecdsa / id_dsa (SSH private key)",
+            Self::Keystore => "*.pfx / *.p12 / *.jks (keystore)",
+            Self::Netrc => ".npmrc / .netrc",
+            Self::TerraformSecret => "*.tfstate / *.tfvars",
+            Self::SecretsJson => "secrets*.json",
+            Self::LocalJson => "*.local.json",
+        }
+    }
+}
+
+/// Result of [`discover_project_sources`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectSourceDiscovery {
+    /// Eligible sources, sorted by `relative_path` (deterministic order).
+    pub sources: Vec<ProjectSource>,
+    /// Which source set produced `sources`.
+    pub basis: ProjectSourceBasis,
+    /// Whether discovery observed every tracked candidate needed to reconcile
+    /// an existing canonical snapshot. A tracked index path missing from the
+    /// working tree is not evidence that a stored source was deleted.
+    pub complete: bool,
+    /// Number of candidate paths skipped (ignored, ineligible, or missing on
+    /// disk).
+    pub skipped: usize,
+    /// Secret-denylist exclusions, in discovery order, for operator
+    /// visibility. Path and reason only; never file content.
+    pub skips: Vec<ProjectSourceSkip>,
 }
 
 /// A single chunk produced by [`prepare_file_chunks`], with all byte/line
@@ -579,7 +728,16 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
         })),
         false => None,
     };
-    let discovered = discover_project_files(&root)?;
+    // Branch-delta mining deliberately mines untracked (non-ignored) files
+    // alongside changed tracked paths, so it keeps the filesystem walk; the
+    // tracked-index half ensures a changed tracked file is never
+    // suppressed by `.gitignore`. Canonical mines use the safe tracked-index
+    // source set.
+    let discovered = if branch_mode {
+        discover_project_branch_sources(&root)?
+    } else {
+        discover_project_files(&root)?
+    };
     let routing_fingerprint = project_routing_fingerprint(&config.rooms);
 
     // Resolve the git commit hash once per mine run (None if not in a repo).
@@ -608,6 +766,7 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
     let mut summary = IngestSummary::default();
     summary.discovered_files = discovered.files.len();
     summary.ignored_files = discovered.ignored_files;
+    summary.secret_path_skips = discovered.skips;
     summary.view_name = branch_name.clone();
 
     // For branch mode: compute the delta set and filter files.
@@ -619,6 +778,7 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
         ("projects", None)
     };
 
+    let discovery_complete = discovered.complete;
     let discovered_files = if let Some(ref delta) = delta_set {
         discovered
             .files
@@ -629,7 +789,7 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
         discovered.files
     };
 
-    let files: Vec<DiscoveredSource> = apply_limit(discovered_files, request.limit).collect();
+    let files: Vec<ProjectSource> = apply_limit(discovered_files, request.limit).collect();
 
     for file in &files {
         match prepare_file_chunks(file, &routing_fingerprint, &config.rooms) {
@@ -860,9 +1020,19 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
         }
     }
 
-    // Remove path-hash source rows that were not present in this mine.  This
-    // catches files deleted before the stable project-id migration ran.
-    if branch_name.is_none() && request.limit.is_none() && !request.dry_run {
+    // Remove source rows that were not present in this mine. Two key spaces are
+    // swept for an unlimited canonical run: the legacy path-hash prefix (files
+    // that predate the stable project-id migration) and the current stable
+    // `projects:{wing}:{root_key}` prefix. The stable sweep is what makes the
+    // safety policy retroactive: content excluded by the new deny-by-name
+    // rules, the tracked-index-only population, or symlink rejection no longer
+    // appears in `files`, so its previously mined rows and drawers must be
+    // removed rather than left searchable.
+    if branch_name.is_none()
+        && discovery_complete
+        && request.limit.is_none()
+        && !request.dry_run
+    {
         let current_rel_paths: BTreeSet<&str> =
             files.iter().map(|file| file.relative_path.as_str()).collect();
         let legacy_prefix = format!("{ingest_kind}:{wing_name}:{legacy_root_key}:");
@@ -873,6 +1043,20 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
             let rel = key.splitn(4, ':').nth(3).unwrap_or("");
             if !current_rel_paths.contains(rel) {
                 engine.remove_source_key(&key).await?;
+                summary.removed_sources += 1;
+            }
+        }
+        let stable_prefix = format!("{ingest_kind}:{wing_name}:{project_root_key}:");
+        for key in engine
+            .operational_store()
+            .ingested_source_keys_with_prefix(&stable_prefix)?
+        {
+            // Key format: projects:{wing}:{root_key}:{rel_path}. Split off the
+            // first 3 ':'-delimited segments to recover the relative path.
+            let rel = key.splitn(4, ':').nth(3).unwrap_or("");
+            if !current_rel_paths.contains(rel) {
+                engine.remove_source_key(&key).await?;
+                summary.removed_sources += 1;
             }
         }
     }
@@ -922,6 +1106,7 @@ pub async fn ingest_conversations<P: EmbeddingProvider>(
     let mut summary = IngestSummary::default();
     summary.discovered_files = discovered.files.len();
     summary.ignored_files = discovered.ignored_files;
+    summary.secret_path_skips = discovered.skips;
     let files = apply_limit(discovered.files, request.limit);
 
     for file in files {
@@ -1181,7 +1366,7 @@ async fn replace_source_drawers(
 /// chunking will have an empty `chunks` vec — the caller handles the
 /// replace-with-empty semantics.
 fn prepare_file_chunks(
-    file: &DiscoveredSource,
+    file: &ProjectSource,
     routing_fingerprint: &str,
     rooms: &[ProjectRoomConfig],
 ) -> Result<PreparedFileChunks> {
@@ -1487,9 +1672,20 @@ fn git_delta_paths(root: &Path, merge_base: &str) -> Option<Vec<String>> {
         return None;
     }
 
-    // Untracked files.
+    // Untracked files. `git ls-files` otherwise reports paths relative to the
+    // directory passed to `-C`, while `git diff` reports repo-relative paths.
+    // Keep both streams repo-relative before compute_branch_delta narrows them
+    // to the project root.
     let untracked_out = Command::new("git")
-        .args(["-C", &root_str, "ls-files", "--others", "--exclude-standard", "-z"])
+        .args([
+            "-C",
+            &root_str,
+            "ls-files",
+            "--full-name",
+            "--others",
+            "--exclude-standard",
+            "-z",
+        ])
         .output()
         .ok()?;
     if !untracked_out.status.success() {
@@ -1728,6 +1924,7 @@ pub fn prepare_project_batch_with_config(
     let mut summary = IngestSummary::default();
     summary.discovered_files = discovered.files.len();
     summary.ignored_files = discovered.ignored_files;
+    summary.secret_path_skips = discovered.skips;
     // Remote mine callers resolve the checkout view before preparing the batch.
     // Preserve it so their summaries match local mine output.
     summary.view_name = request
@@ -1736,7 +1933,7 @@ pub fn prepare_project_batch_with_config(
         .filter(|view| *view != "canonical")
         .map(str::to_owned);
 
-    let files_to_process: Vec<DiscoveredSource> =
+    let files_to_process: Vec<ProjectSource> =
         apply_limit(discovered.files, request.limit).collect();
     let mut file_dtos: Vec<IngestFileDto> = Vec::new();
 
@@ -1923,19 +2120,85 @@ pub fn resolve_current_branch(root: &Path) -> Option<String> {
     if s.is_empty() || s == "HEAD" { None } else { Some(s) }
 }
 
-/// Returns `true` if `file_name` should be skipped for secrets / lockfile hygiene.
+/// Canonical OpenSSH private-key file names, matched exactly (case-
+/// insensitively). Public keys (`id_ed25519.pub`) and unrelated prefix
+/// collisions (`id_dsa_notes.md`) are not private keys and are not withheld.
+const SSH_PRIVATE_KEY_NAMES: [&str; 4] = ["id_rsa", "id_ed25519", "id_ecdsa", "id_dsa"];
+
+/// Returns the secret-denylist category for `file_name` (matched
+/// case-insensitively), or `None` when the name is not secret-shaped.
 ///
-/// Handles exact matches from `PROJECT_SKIP_FILES` and the `.env`-prefix rule
-/// (`.env`, `.env.local`, `.env.production`, etc.).
-fn project_file_skip_by_name(file_name: &str) -> bool {
+/// The match is purely path-based and runs before any content is read, so a
+/// secret-shaped path is withheld without opening the file (issue #95).
+fn secret_path_kind(file_name: &str) -> Option<SecretPathKind> {
+    let name = file_name.to_ascii_lowercase();
+    if name == ".env" || name.starts_with(".env.") || name.ends_with(".env") {
+        return Some(SecretPathKind::DotEnv);
+    }
+    if name.contains("kubeconfig") {
+        return Some(SecretPathKind::Kubeconfig);
+    }
+    if SSH_PRIVATE_KEY_NAMES.contains(&name.as_str()) {
+        return Some(SecretPathKind::SshPrivateKey);
+    }
+    if [".pfx", ".p12", ".jks"].iter().any(|ext| name.ends_with(*ext)) {
+        return Some(SecretPathKind::Keystore);
+    }
+    if name == ".npmrc" || name == ".netrc" {
+        return Some(SecretPathKind::Netrc);
+    }
+    if name.ends_with(".tfstate") || name.ends_with(".tfvars") {
+        return Some(SecretPathKind::TerraformSecret);
+    }
+    if name.starts_with("secrets") && name.ends_with(".json") {
+        return Some(SecretPathKind::SecretsJson);
+    }
+    if name.ends_with(".local.json") {
+        return Some(SecretPathKind::LocalJson);
+    }
+    None
+}
+
+/// Whether a candidate source is eligible for mining, and — when excluded by
+/// the secret-shaped denylist — the category for an operator-visible skip
+/// record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Eligibility {
+    Eligible,
+    /// Excluded for a reason that is not surfaced as a skip record
+    /// (extension mismatch, binary sniff, lockfile, palace config, ...).
+    Excluded,
+    /// Excluded by the secret-shaped path denylist (issue #95).
+    Secret(SecretPathKind),
+}
+
+/// Classify `file_name` against the built-in always-skip lists: the
+/// secret-shaped path denylist (issue #95) and the general hygiene list
+/// (lockfiles, palace config, `.gitignore`).
+fn project_skip_by_name(file_name: &str) -> Option<Eligibility> {
+    if let Some(kind) = secret_path_kind(file_name) {
+        return Some(Eligibility::Secret(kind));
+    }
     if PROJECT_SKIP_FILES.contains(&file_name) {
-        return true;
+        return Some(Eligibility::Excluded);
     }
-    // Skip any file whose name starts with ".env" (covers .env, .env.local, …)
-    if file_name.starts_with(".env") {
-        return true;
+    None
+}
+
+/// Append a secret-denylist skip record for `relative_path` when
+/// `eligibility` carries one. Used by both Git-index and filesystem discovery
+/// so exclusions are counted and recorded consistently.
+fn record_secret_skip(
+    eligibility: Eligibility,
+    relative_path: String,
+    skips: &mut Vec<ProjectSourceSkip>,
+) {
+    if let Eligibility::Secret(kind) = eligibility {
+        skips.push(ProjectSourceSkip {
+            relative_path,
+            reason: kind.as_str().to_owned(),
+        });
     }
-    false
 }
 
 /// Read up to `limit` bytes from `path`.  Returns `None` on any I/O error.
@@ -1964,41 +2227,452 @@ fn has_shebang(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn discover_project_files(root: &Path) -> Result<DiscoveryReport> {
-    let extension_set = PROJECT_READABLE_EXTENSIONS.iter().copied().collect::<BTreeSet<_>>();
-    discover_files(root, true, |path, file_name| {
-        // Secrets / lockfile hygiene (includes the .env prefix rule).
-        if project_file_skip_by_name(file_name) {
-            return false;
+/// Discover the safe set of eligible project sources under `root`.
+///
+/// For Git-backed roots the eligible sources are the project-readable subset of
+/// tracked index paths (`git ls-files`), so ignored and untracked working-tree
+/// files are never mined; a `.gitignore` never suppresses a tracked path, and
+/// `.mempalaceignore` is the explicit additional exclusion. For non-Git
+/// directories a filesystem walk with git-compatible ignore handling
+/// (nested `.gitignore`/`.mempalaceignore` files, `!` negation, anchoring, and
+/// globs) is used, honouring the `core.excludesFile` global excludes file.
+/// Git-backed filesystem walks — the branch-delta mine — also honour
+/// `$GIT_DIR/info/exclude` at git's precedence. Sources are sorted by relative
+/// path (deterministic order), are relative to `root`, and linked Git worktrees
+/// are always excluded.
+pub fn discover_project_sources(root: &Path) -> Result<ProjectSourceDiscovery> {
+    let root = root
+        .canonicalize()
+        .map_err(|source| IngestError::Io { path: root.to_path_buf(), source })?;
+    if git_is_backed(&root)? {
+        discover_git_index_sources(&root)
+    } else {
+        discover_filesystem_sources(&root)
+    }
+}
+
+/// Returns `true` when `root` is inside a Git work tree whose tracked index
+/// paths can be enumerated with `git ls-files`. If Git cannot inspect a
+/// directory that contains repository metadata, fail closed rather than
+/// treating its working tree as a non-Git directory.
+fn git_is_backed(root: &Path) -> Result<bool> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .output();
+    match output {
+        Ok(output)
+            if output.status.success()
+                && String::from_utf8_lossy(&output.stdout).trim() == "true" =>
+        {
+            Ok(true)
         }
+        Ok(output) if git_metadata_present(root) => {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            Err(IngestError::GitIndexUnavailable {
+                path: root.to_path_buf(),
+                reason: if stderr.is_empty() {
+                    "git could not determine whether the directory is inside a work tree".to_owned()
+                } else {
+                    stderr
+                },
+            })
+        }
+        Err(error) if git_metadata_present(root) => Err(IngestError::GitIndexUnavailable {
+            path: root.to_path_buf(),
+            reason: format!("could not run git to inspect repository metadata: {error}"),
+        }),
+        _ => Ok(false),
+    }
+}
 
-        let raw_ext = path.extension().and_then(|value| value.to_str()).unwrap_or_default();
-        let has_ext = !raw_ext.is_empty();
-        let normalized_suffix = format!(".{}", raw_ext.to_ascii_lowercase());
+/// Whether `root` or an ancestor contains a `.git` directory or gitdir file.
+/// This deliberately does not validate the metadata: when Git cannot do so,
+/// canonical project discovery must fail closed instead of walking it as an
+/// ordinary directory.
+fn git_metadata_present(root: &Path) -> bool {
+    root.ancestors().any(|directory| directory.join(".git").exists())
+}
 
-        let accepted = (has_ext && extension_set.contains(normalized_suffix.as_str()))
-            || (!has_ext
-                && (PROJECT_READABLE_BASENAMES.contains(&file_name) || has_shebang(path)));
+/// Absolute path to `$GIT_DIR/info/exclude` for `root`, resolved via
+/// `git rev-parse --git-path` (handles `GIT_DIR`, linked worktrees, and
+/// gitdir files), falling back to `<root>/.git/info/exclude`. Returns `None`
+/// when git cannot report a path.
+fn repo_info_exclude_path(root: &Path) -> Option<PathBuf> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--git-path", "info/exclude"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if text.is_empty() {
+        return Some(root.join(".git").join("info").join("exclude"));
+    }
+    let path = PathBuf::from(text);
+    if path.is_absolute() {
+        Some(path)
+    } else {
+        // git prints paths relative to the directory `-C` ran in.
+        Some(root.join(path))
+    }
+}
 
-        // Binary sniff: exclude files with a NUL byte in the first 8 KiB even
-        // when the extension claims text (misnamed binaries).
-        accepted && !looks_binary(path)
+/// Absolute path to the global excludes file for `root`: the value of
+/// `core.excludesFile` (with `~/` expanded against `HOME`), or the XDG default
+/// when the option is not configured.
+fn global_excludes_path(root: &Path) -> Option<PathBuf> {
+    let configured = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["config", "--get", "core.excludesFile"])
+        .output()
+        .ok();
+    if let Some(output) = configured {
+        if output.status.success() {
+            let text = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            if !text.is_empty() {
+                let path = PathBuf::from(&text);
+                if path.is_absolute() {
+                    return Some(path);
+                }
+                if let Some(home) = std::env::var_os("HOME") {
+                    if let Some(stripped) = text.strip_prefix("~/") {
+                        return Some(PathBuf::from(home).join(stripped));
+                    }
+                }
+                // Git resolves a relative core.excludesFile from the worktree
+                // toplevel, even when discovery begins in a subdirectory.
+                // Non-Git filesystem walks retain their root-relative
+                // behavior.
+                let base = git_toplevel(root).unwrap_or_else(|| root.to_path_buf());
+                return Some(base.join(path));
+            }
+        }
+    }
+    let xdg_config_home = std::env::var("XDG_CONFIG_HOME").ok();
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    Some(default_global_excludes_path(xdg_config_home.as_deref(), home.as_deref()))
+}
+
+/// The XDG default location for global excludes when `core.excludesFile` is
+/// unset: `$XDG_CONFIG_HOME/git/ignore`, or `~/.config/git/ignore` when
+/// `XDG_CONFIG_HOME` is unset.
+fn default_global_excludes_path(xdg_config_home: Option<&str>, home: Option<&Path>) -> PathBuf {
+    let base = match xdg_config_home {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => home.unwrap_or(Path::new("~")).join(".config"),
+    };
+    base.join("git").join("ignore")
+}
+
+/// Canonical Git worktree toplevel for `root`, when Git can report one.
+fn git_toplevel(root: &Path) -> Option<PathBuf> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    Some(path.canonicalize().unwrap_or(path))
+}
+
+/// Enumerate the tracked index paths under `root` and keep the project-eligible
+/// subset. Tracked symlinks are rejected before eligibility checks or file
+/// reads: a symlink can escape the discovery root, and its target's content
+/// must never be mined under an in-repo path.
+fn discover_git_index_sources(root: &Path) -> Result<ProjectSourceDiscovery> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "-z"])
+        .output()
+        .map_err(|source| IngestError::Io { path: root.to_path_buf(), source })?;
+    if !output.status.success() {
+        // The root was confirmed Git-backed but the index cannot be enumerated.
+        // Falling back to a filesystem walk here could ingest untracked and
+        // ignored working-tree files, violating the tracked-index-only source
+        // guarantee — surface the failure instead.
+        let reason = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        return Err(IngestError::GitIndexUnavailable {
+            path: root.to_path_buf(),
+            reason: if reason.is_empty() {
+                "git ls-files exited unsuccessfully".to_owned()
+            } else {
+                reason
+            },
+        });
+    }
+
+    // Collect the tracked index entries first so the directories that contain
+    // them are known before building the ignore matcher.
+    let mut entries = Vec::new();
+    let mut skipped = 0usize;
+    for entry in output.stdout.split(|byte| *byte == b'\0') {
+        if entry.is_empty() {
+            continue;
+        }
+        let relative = match path_from_git_bytes(entry) {
+            Some(relative) => relative,
+            // Undecodable path bytes (non-UTF-8 on platforms where git emits
+            // text) can't be represented in the String-based relative model.
+            None => {
+                skipped += 1;
+                continue;
+            }
+        };
+        let relative_str = relative.to_string_lossy().into_owned();
+        entries.push((relative, relative_str));
+    }
+
+    // A `.gitignore` never suppresses a tracked index path: tracked paths stay
+    // tracked even after an ignore pattern is added, and the ignore file itself
+    // may be untracked. `.mempalaceignore` is the explicit additional exclusion;
+    // it is read from the root and from every ancestor directory of each tracked
+    // entry — not just its immediate parent — so intermediate scopes like
+    // `a/.mempalaceignore` apply to `a/b/file.rs` as well as `a/b`'s own file.
+    // Directories are loaded in root-to-leaf order so deeper scopes, which
+    // override shallower ones, are parsed after the scopes they refine.
+    let mut ignore_matcher = IgnoreMatcher::new(root);
+    let mut scopes = BTreeSet::new();
+    for (relative, _) in &entries {
+        let mut ancestor = relative.parent();
+        while let Some(dir) = ancestor {
+            if dir.as_os_str().is_empty() {
+                break;
+            }
+            scopes.insert(dir.to_path_buf());
+            ancestor = dir.parent();
+        }
+    }
+    ignore_matcher.load_directory(Path::new(""), false)?;
+    for scope in scopes {
+        ignore_matcher.load_directory(&scope, false)?;
+    }
+
+    let worktree_skip = linked_worktree_paths(root);
+    let mut sources = Vec::new();
+    let mut skips = Vec::new();
+    let mut complete = true;
+
+    for (relative, relative_str) in entries {
+        let absolute = root.join(&relative);
+
+        // `symlink_metadata` (lstat) inspects the entry itself instead of
+        // following it, unlike `fs::metadata`. Tracked symlinks are rejected
+        // outright before any eligibility check or file read: a symlink can
+        // target a path outside the discovery root, and following it would
+        // let an external file's content into the palace under an in-repo
+        // path. Submodules (gitlinks) and other non-file index entries are
+        // rejected the same way.
+        let file_type = match fs::symlink_metadata(&absolute) {
+            Ok(metadata) => metadata,
+            // The index can still name a file that has been deleted from the
+            // working tree since it was staged.
+            Err(_) => {
+                skipped += 1;
+                complete = false;
+                continue;
+            }
+        };
+        if file_type.is_symlink() || !file_type.is_file() {
+            skipped += 1;
+            continue;
+        }
+        // Linked Git worktrees are separate checkouts; the main index never
+        // lists their files, but keep the exclusion explicit and defensive.
+        if worktree_skip.contains(&absolute) {
+            skipped += 1;
+            continue;
+        }
+        if ignore_matcher.matches_with_ancestors(&relative_str) {
+            skipped += 1;
+            continue;
+        }
+        let file_name =
+            relative.file_name().and_then(|value| value.to_str()).unwrap_or_default();
+        match project_eligibility(&absolute, file_name) {
+            Eligibility::Eligible => sources.push(ProjectSource {
+                absolute_path: absolute,
+                relative_path: relative_str,
+            }),
+            eligibility => {
+                skipped += 1;
+                record_secret_skip(eligibility, relative_str, &mut skips);
+            }
+        }
+    }
+
+    sources.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    Ok(ProjectSourceDiscovery {
+        sources,
+        basis: ProjectSourceBasis::GitIndex,
+        complete,
+        skipped,
+        skips,
     })
 }
 
+/// Return every UTF-8-representable path in the tracked index. Branch-delta
+/// discovery uses this as an exclusion set for its filesystem half so index
+/// entries rejected by the canonical safety gate cannot be reintroduced.
+fn tracked_index_paths(root: &Path) -> Result<BTreeSet<String>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "-z"])
+        .output()
+        .map_err(|source| IngestError::Io { path: root.to_path_buf(), source })?;
+    if !output.status.success() {
+        let reason = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        return Err(IngestError::GitIndexUnavailable {
+            path: root.to_path_buf(),
+            reason: if reason.is_empty() {
+                "git ls-files exited unsuccessfully".to_owned()
+            } else {
+                reason
+            },
+        });
+    }
+    Ok(output
+        .stdout
+        .split(|byte| *byte == b'\0')
+        .filter(|entry| !entry.is_empty())
+        .filter_map(path_from_git_bytes)
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect())
+}
+
+/// Walk `root` with git-compatible ignore handling, keeping the project-eligible
+/// subset. Used for non-Git roots; the `core.excludesFile` global excludes file
+/// still applies, but `$GIT_DIR/info/exclude` does not (no git work tree).
+fn discover_filesystem_sources(root: &Path) -> Result<ProjectSourceDiscovery> {
+    let report = discover_files(root, true, true, None, project_eligibility)?;
+    Ok(ProjectSourceDiscovery {
+        sources: report.files,
+        basis: ProjectSourceBasis::Filesystem,
+        complete: report.complete,
+        skipped: report.ignored_files,
+        skips: report.skips,
+    })
+}
+
+/// Returns the eligibility of `path` (with `file_name`) for project mining.
+///
+/// The secret-shaped path denylist is checked first, before any content read
+/// (shebang or binary sniff), so secret paths are withheld without opening the
+/// file. Non-secret rejections (extension mismatch, lockfile, palace config,
+/// binary sniff) are counted but not recorded as skip records.
+fn project_eligibility(path: &Path, file_name: &str) -> Eligibility {
+    if let Some(eligibility) = project_skip_by_name(file_name) {
+        return eligibility;
+    }
+    let raw_ext = path.extension().and_then(|value| value.to_str()).unwrap_or_default();
+    let has_ext = !raw_ext.is_empty();
+    let normalized_suffix = format!(".{}", raw_ext.to_ascii_lowercase());
+    let accepted = (has_ext && PROJECT_READABLE_EXTENSIONS.contains(&normalized_suffix.as_str()))
+        || (!has_ext
+            && (PROJECT_READABLE_BASENAMES.contains(&file_name) || has_shebang(path)));
+    // Binary sniff: exclude files with a NUL byte in the first 8 KiB even
+    // when the extension claims text (misnamed binaries).
+    if !accepted || looks_binary(path) {
+        return Eligibility::Excluded;
+    }
+    Eligibility::Eligible
+}
+
+/// Internal discovery used by project mining and remote batch preparation.
+/// Mirrors [`discover_project_sources`] and reports into the legacy shape.
+fn discover_project_files(root: &Path) -> Result<DiscoveryReport> {
+    let discovery = discover_project_sources(root)?;
+    Ok(DiscoveryReport {
+        files: discovery.sources,
+        ignored_files: discovery.skipped,
+        skips: discovery.skips,
+        complete: discovery.complete,
+    })
+}
+
+/// Discovery used by branch-delta mining, which deliberately mines untracked
+/// (non-ignored) working-tree files in addition to changed tracked files.
+/// Keeps the filesystem walk with git-compatible ignore handling (including
+/// `$GIT_DIR/info/exclude` for Git-backed roots and the `core.excludesFile`
+/// global file); linked Git worktrees are still skipped.
+fn discover_project_files_with_untracked(root: &Path) -> Result<DiscoveryReport> {
+    discover_files(root, true, true, None, project_eligibility)
+}
+
+/// Build the source set for a branch-delta mine: the union of the canonical
+/// tracked-index set (which, as in a canonical mine, never lets `.gitignore`
+/// suppress a tracked path) and the untracked non-ignored filesystem walk.
+/// Without the tracked-index half, a changed *tracked* file that lives under an
+/// ignored directory (e.g. tracked `generated/schema.rs` with `generated/` in
+/// `.gitignore`) would be dropped by the walk and never appear in the delta,
+/// so search would keep showing the stale canonical content. Non-Git roots fall
+/// back to the plain ignore-aware walk, which is already correct for them.
+fn discover_project_branch_sources(root: &Path) -> Result<DiscoveryReport> {
+    if git_is_backed(root)? {
+        let tracked = discover_git_index_sources(root)?;
+        // Keep every index path out of the filesystem half, not only the
+        // eligible tracked sources. In particular this prevents a tracked
+        // symlink rejected by index discovery from being followed and added
+        // back by the walk.
+        let tracked_paths = tracked_index_paths(root)?;
+        let mut combined: Vec<ProjectSource> = Vec::with_capacity(tracked.sources.len());
+        for source in tracked.sources {
+            combined.push(source);
+        }
+        let walk = discover_files(root, true, true, Some(&tracked_paths), project_eligibility)?;
+        for source in walk.files {
+            combined.push(source);
+        }
+        combined.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+        let mut skips = tracked.skips;
+        skips.extend(walk.skips);
+        Ok(DiscoveryReport {
+            files: combined,
+            ignored_files: tracked.skipped + walk.ignored_files,
+            skips,
+            complete: tracked.complete && walk.complete,
+        })
+    } else {
+        discover_project_files_with_untracked(root)
+    }
+}
+
+/// Conversation discovery is deliberately scoped: it walks the filesystem and
+/// honors worktree ignore files — nested `.gitignore`/`.mempalaceignore` files
+/// with git-compatible semantics plus the built-in skip directories — but it
+/// does **not** load the repository-level exclude sources
+/// (`$GIT_DIR/info/exclude` and the `core.excludesFile` global file), and it
+/// does not apply the project secret-path denylist. Conversation exports are
+/// not code: user-level git exclusion config must not silently filter them,
+/// and discovery should not depend on git state or spawn git subprocesses.
 fn discover_conversation_files(root: &Path) -> Result<DiscoveryReport> {
     let extension_set = CONVO_EXTENSIONS.iter().copied().collect::<BTreeSet<_>>();
-    discover_files(root, false, move |path, _file_name| {
+    discover_files(root, false, false, None, move |path, _file_name| {
         let suffix = path.extension().and_then(|value| value.to_str()).unwrap_or_default();
         let normalized_suffix = format!(".{}", suffix.to_ascii_lowercase());
-        extension_set.contains(normalized_suffix.as_str())
+        if extension_set.contains(normalized_suffix.as_str()) {
+            Eligibility::Eligible
+        } else {
+            Eligibility::Excluded
+        }
     })
 }
 
 fn apply_limit(
-    files: Vec<DiscoveredSource>,
+    files: Vec<ProjectSource>,
     limit: Option<usize>,
-) -> Box<dyn Iterator<Item = DiscoveredSource>> {
+) -> Box<dyn Iterator<Item = ProjectSource>> {
     match limit {
         Some(limit) => Box::new(files.into_iter().take(limit)),
         None => Box::new(files.into_iter()),
@@ -2007,8 +2681,10 @@ fn apply_limit(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DiscoveryReport {
-    files: Vec<DiscoveredSource>,
+    files: Vec<ProjectSource>,
     ignored_files: usize,
+    skips: Vec<ProjectSourceSkip>,
+    complete: bool,
 }
 
 /// Run `git worktree list --porcelain -z` from `root` and return the paths of
@@ -2064,13 +2740,24 @@ fn path_from_git_bytes(bytes: &[u8]) -> Option<PathBuf> {
     String::from_utf8(bytes.to_vec()).ok().map(PathBuf::from)
 }
 
-/// Walk `root` applying ignore rules, accepting files for which `accept_file`
-/// returns `true`. The closure receives the absolute path and the (lossy) file
-/// name; everything it rejects counts toward `ignored_files`.
+/// Walk `root` applying worktree ignore rules (nested `.gitignore`/
+/// `.mempalaceignore` files) and accepting files for which `accept_file`
+/// returns [`Eligibility::Eligible`]. The closure receives the absolute path
+/// and the (lossy) file name; everything it rejects counts toward
+/// `ignored_files`, and secret-denylist rejections are also recorded as skip
+/// records.
+///
+/// When `load_repo_excludes` is set, the repository-level sources are also
+/// loaded before the walk (`$GIT_DIR/info/exclude` for Git-backed roots and
+/// the `core.excludesFile` global file for any walk), and their rules apply at
+/// every depth. Project-source walks set this; conversation discovery does
+/// not, so it never consults git state or spawns git subprocesses.
 fn discover_files(
     root: &Path,
     skip_linked_worktrees: bool,
-    accept_file: impl Fn(&Path, &str) -> bool,
+    load_repo_excludes: bool,
+    excluded_paths: Option<&BTreeSet<String>>,
+    accept_file: impl Fn(&Path, &str) -> Eligibility,
 ) -> Result<DiscoveryReport> {
     // Git reports worktree paths as absolute, so use an absolute root when
     // comparing them during project discovery.
@@ -2079,9 +2766,16 @@ fn discover_files(
     } else {
         root.to_path_buf()
     };
-    let ignore_matcher = IgnoreMatcher::load(&root)?;
+    let mut ignore_matcher = IgnoreMatcher::new(&root);
     let mut ignored_files = 0;
     let mut files = Vec::new();
+    let mut skips = Vec::new();
+    // Repository-level excludes (`$GIT_DIR/info/exclude` for Git-backed roots,
+    // `core.excludesFile` for any walk) apply at every depth, but only for
+    // walks that opt into them.
+    if load_repo_excludes {
+        ignore_matcher.load_repo_excludes()?;
+    }
     let mut stack = vec![root.to_path_buf()];
     // Pre-compute linked worktree paths so we can skip them during the walk.
     let worktree_skip = skip_linked_worktrees
@@ -2089,6 +2783,13 @@ fn discover_files(
         .unwrap_or_default();
 
     while let Some(dir) = stack.pop() {
+        // Nested `.gitignore`/`.mempalaceignore` files apply to the entries of
+        // the directory that contains them. Directories that are themselves
+        // ignored are never descended into, so their ignore files never load —
+        // matching git's behaviour.
+        let dir_rel = relative_path(&root, &dir)?;
+        ignore_matcher.load_directory(Path::new(&dir_rel), true)?;
+
         let read_dir =
             fs::read_dir(&dir).map_err(|source| IngestError::Io { path: dir.clone(), source })?;
         for entry in read_dir {
@@ -2113,88 +2814,438 @@ fn discover_files(
                 continue;
             }
 
+            // Do not follow file symlinks from filesystem discovery. This
+            // keeps non-Git and branch-untracked walks from reading a target
+            // outside the root under an in-root filename.
+            if file_type.is_symlink() {
+                ignored_files += 1;
+                continue;
+            }
+
+            // Branch-delta discovery unions eligible index files with this
+            // untracked walk. Exclude every tracked path here before matching
+            // or eligibility checks so a rejected tracked symlink cannot be
+            // followed by `project_eligibility` and reintroduced.
+            if excluded_paths.is_some_and(|paths| paths.contains(&relative)) {
+                continue;
+            }
+
             if ignore_matcher.matches(&relative, false) {
                 ignored_files += 1;
                 continue;
             }
 
             let file_name = path.file_name().and_then(|value| value.to_str()).unwrap_or_default();
-            if !accept_file(&path, file_name) {
-                ignored_files += 1;
-                continue;
+            match accept_file(&path, file_name) {
+                Eligibility::Eligible => {
+                    files.push(ProjectSource { absolute_path: path, relative_path: relative });
+                }
+                eligibility => {
+                    ignored_files += 1;
+                    record_secret_skip(eligibility, relative, &mut skips);
+                }
             }
-
-            files.push(DiscoveredSource { absolute_path: path, relative_path: relative });
         }
     }
 
     files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
-    Ok(DiscoveryReport { files, ignored_files })
+    Ok(DiscoveryReport { files, ignored_files, skips, complete: true })
 }
 
 impl IgnoreMatcher {
-    fn load(root: &Path) -> Result<Self> {
-        let mut rules = DEFAULT_SKIP_DIRS
-            .iter()
-            .map(|entry| IgnoreRule {
-                raw: (*entry).to_owned(),
-                kind: IgnoreRuleKind::Directory((*entry).to_owned()),
-            })
-            .collect::<Vec<_>>();
+    /// Create a matcher over `root` with the built-in skip directories; no
+    /// ignore files are parsed until [`IgnoreMatcher::load_directory`] runs.
+    fn new(root: &Path) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            skip_dirs: DEFAULT_SKIP_DIRS.iter().map(|entry| (*entry).to_owned()).collect(),
+            repo_offset: String::new(),
+            rules: Vec::new(),
+            loaded: BTreeSet::new(),
+            next_order: 0,
+        }
+    }
 
-        for file_name in [".gitignore", ".mempalaceignore"] {
-            let path = root.join(file_name);
-            if !path.exists() {
-                continue;
-            }
+    /// Parse the ignore files in `dir_rel` (relative to the root; an empty path
+    /// is the root itself). When `load_gitignore` is set, `.gitignore` is read
+    /// first and `.mempalaceignore` second, and mempalace-specific rules take
+    /// precedence over `.gitignore` rules in the same directory. Idempotent per
+    /// directory.
+    fn load_directory(&mut self, dir_rel: &Path, load_gitignore: bool) -> Result<()> {
+        if !self.loaded.insert(dir_rel.to_path_buf()) {
+            return Ok(());
+        }
+        let scope = dir_rel.to_string_lossy().replace('\\', "/");
+        let scope_depth = if scope.is_empty() { 0 } else { scope.split('/').count() };
 
-            let body = fs::read_to_string(&path)
-                .map_err(|source| IngestError::Io { path: path.clone(), source })?;
+        let mut file_names: Vec<(&str, IgnoreTier)> = Vec::new();
+        if load_gitignore {
+            file_names.push((".gitignore", IgnoreTier::WorktreeGitignore));
+        }
+        file_names.push((".mempalaceignore", IgnoreTier::WorktreeMempalaceignore));
+
+        for (file_name, tier) in file_names {
+            let path = self.root.join(dir_rel).join(file_name);
+            let body = match fs::read_to_string(&path) {
+                Ok(body) => body,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(source) => return Err(IngestError::Io { path, source }),
+            };
             for line in body.lines() {
-                let trimmed = line.trim();
-                if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('!') {
-                    continue;
-                }
-                let kind = if let Some(ext) = trimmed.strip_prefix("*.") {
-                    IgnoreRuleKind::Extension(ext.to_ascii_lowercase())
-                } else if let Some(dir) = trimmed.strip_suffix('/') {
-                    IgnoreRuleKind::Directory(dir.to_owned())
-                } else if trimmed.contains('/') {
-                    IgnoreRuleKind::RelativePrefix(trimmed.trim_start_matches('/').to_owned())
-                } else {
-                    IgnoreRuleKind::Basename(trimmed.to_owned())
-                };
-                rules.push(IgnoreRule { raw: trimmed.to_owned(), kind });
+                let Some(pattern) = parse_ignore_pattern(line) else { continue };
+                self.rules.push(IgnoreRule {
+                    pattern,
+                    scope: scope.clone(),
+                    scope_depth,
+                    tier,
+                    order: self.next_order,
+                });
+                self.next_order += 1;
             }
         }
-
-        Ok(Self { rules })
+        self.sort_rules();
+        Ok(())
     }
 
+    /// Parse the repository-level ignore sources — `$GIT_DIR/info/exclude` and
+    /// the `core.excludesFile` global file — whose patterns are anchored at the
+    /// repository root and have lower precedence than any `.gitignore`. These
+    /// run before the walk so the rules apply at every depth. `info/exclude`
+    /// is a git concept and only applies inside a Git work tree; the global
+    /// excludes file is user-level configuration and applies to any walk,
+    /// including the non-Git filesystem fallback.
+    fn load_repo_excludes(&mut self) -> Result<()> {
+        if git_is_backed(&self.root)? {
+            if let Some(path) = repo_info_exclude_path(&self.root) {
+                self.load_pattern_file(&path, IgnoreTier::RepoExclude)?;
+            }
+            // Repository-level exclude patterns are anchored at the Git
+            // toplevel, not at the discovery root. When the project directory
+            // is a subdirectory of the worktree, record its offset from the
+            // toplevel so anchored patterns resolve against the right root.
+            self.repo_offset = self.git_toplevel_offset();
+        }
+        if let Some(path) = global_excludes_path(&self.root) {
+            self.load_pattern_file(&path, IgnoreTier::GlobalExclude)?;
+        }
+        Ok(())
+    }
+
+    /// The discovery root's path relative to the Git toplevel, as a `/`-joined
+    /// string (`""` when they coincide, or when the root is not inside a work
+    /// tree).
+    fn git_toplevel_offset(&self) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&self.root)
+            .args(["rev-parse", "--show-toplevel"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned());
+        let Some(toplevel) = output else { return String::new() };
+        let toplevel = Path::new(&toplevel)
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(toplevel));
+        let root_canon = self.root.canonicalize().unwrap_or_else(|_| self.root.clone());
+        match root_canon.strip_prefix(&toplevel) {
+            Ok(rest) if !rest.as_os_str().is_empty() => {
+                rest.iter().map(|c| c.to_string_lossy()).collect::<Vec<_>>().join("/")
+            }
+            _ => String::new(),
+        }
+    }
+
+    /// Parse the patterns in an absolute exclude file (root-scoped) into rules
+    /// at `tier`. A missing file is not an error, as in git. An unreadable file
+    /// — a permission failure or a path that is not a regular file (a
+    /// directory, a broken link) — is also treated as empty: these sources
+    /// (`$GIT_DIR/info/exclude` and the `core.excludesFile` global file) are
+    /// optional, and discovery must not abort because one cannot be read. This
+    /// is an intentional robustness divergence from git, which exits fatally
+    /// when an exclude file it reads cannot be opened.
+    fn load_pattern_file(&mut self, path: &Path, tier: IgnoreTier) -> Result<()> {
+        let Ok(body) = fs::read_to_string(path) else {
+            return Ok(());
+        };
+        for line in body.lines() {
+            let Some(pattern) = parse_ignore_pattern(line) else { continue };
+            self.rules.push(IgnoreRule {
+                pattern,
+                scope: String::new(),
+                scope_depth: 0,
+                tier,
+                order: self.next_order,
+            });
+            self.next_order += 1;
+        }
+        self.sort_rules();
+        Ok(())
+    }
+
+    /// Sort rules so that higher-precedence sources and scopes come last: the
+    /// last matching rule wins, so later elements override earlier ones.
+    fn sort_rules(&mut self) {
+        // Deeper scopes override shallower ones; within a scope, later rules
+        // override earlier ones. Cross-source, worktree `.mempalaceignore` beats
+        // `.gitignore`, which beats `info/exclude`, which beats the global
+        // excludes file.
+        self.rules.sort_by(|left, right| {
+            (left.tier, left.scope_depth, left.order)
+                .cmp(&(right.tier, right.scope_depth, right.order))
+        });
+    }
+
+    /// Returns `true` when `relative_path` (relative to the root) is ignored:
+    /// either a built-in skip directory, or the highest-precedence matching
+    /// ignore pattern is a non-negated one.
     fn matches(&self, relative_path: &str, is_dir: bool) -> bool {
         let normalized = relative_path.replace('\\', "/");
-        let file_name = normalized.rsplit('/').next().unwrap_or(normalized.as_str());
-        let parts = normalized.split('/').collect::<Vec<_>>();
-        let directory_parts =
-            if is_dir { parts.as_slice() } else { &parts[..parts.len().saturating_sub(1)] };
-
-        self.rules.iter().any(|rule| match &rule.kind {
-            IgnoreRuleKind::Extension(ext) => {
-                !is_dir
-                    && file_name
-                        .rsplit('.')
-                        .next()
-                        .is_some_and(|value| value.eq_ignore_ascii_case(ext))
+        if self.matches_skip_dir(&normalized, is_dir) {
+            return true;
+        }
+        let mut ignored = false;
+        let mut decided = false;
+        for rule in &self.rules {
+            // Repository-level rules are anchored at the Git toplevel, so when
+            // the discovery root is a subdirectory of the worktree their
+            // patterns are evaluated against the prefixed (Git-relative) path.
+            let candidate = match rule.tier {
+                IgnoreTier::RepoExclude | IgnoreTier::GlobalExclude => {
+                    if self.repo_offset.is_empty() {
+                        normalized.clone()
+                    } else {
+                        format!("{}/{}", self.repo_offset, normalized)
+                    }
+                }
+                _ => normalized.clone(),
+            };
+            let Some(rest) = rule.scope_relative(&candidate) else { continue };
+            if !rule.pattern.matches_path(rest, is_dir) {
+                continue;
             }
-            IgnoreRuleKind::Directory(dir) => directory_parts.iter().any(|part| part == dir),
-            IgnoreRuleKind::RelativePrefix(prefix) => {
-                normalized == *prefix || normalized.starts_with(&format!("{prefix}/"))
-            }
-            IgnoreRuleKind::Basename(name) => {
-                file_name == name || parts.iter().any(|part| part == name)
-            }
-        })
+            ignored = !rule.pattern.negated;
+            decided = true;
+        }
+        decided && ignored
     }
+
+    /// Returns `true` when `relative_path` (a file) or any of its ancestor
+    /// directories is ignored. Used in git-index mode where files are matched
+    /// directly instead of during a walk: a directory-only rule such as
+    /// `build/` must exclude the tracked files beneath `build`, and (as in git)
+    /// a negated pattern cannot re-include a file under an excluded directory.
+    fn matches_with_ancestors(&self, relative_path: &str) -> bool {
+        let normalized = relative_path.replace('\\', "/");
+        if self.matches(&normalized, false) {
+            return true;
+        }
+        let mut parent = normalized.rsplit_once('/').map(|(parent, _)| parent);
+        while let Some(dir) = parent {
+            if self.matches(dir, true) {
+                return true;
+            }
+            parent = dir.rsplit_once('/').map(|(parent, _)| parent);
+        }
+        false
+    }
+
+    /// Built-in skip directories match any *directory* component of the path:
+    /// a directory named `node_modules` is skipped along with everything under
+    /// it, but a file that merely shares the name is not.
+    fn matches_skip_dir(&self, normalized: &str, is_dir: bool) -> bool {
+        let parts = normalized.split('/').collect::<Vec<_>>();
+        let candidates: &[&str] =
+            if is_dir { &parts } else { &parts[..parts.len().saturating_sub(1)] };
+        self.skip_dirs.iter().any(|name| candidates.contains(&name.as_str()))
+    }
+}
+
+impl IgnoreRule {
+    /// Returns the portion of `path` (root-relative) that lives under this
+    /// rule's scope directory, or `None` when the rule does not apply.
+    fn scope_relative<'a>(&self, path: &'a str) -> Option<&'a str> {
+        if self.scope.is_empty() {
+            return Some(path);
+        }
+        path.strip_prefix(&format!("{}/", self.scope))
+    }
+}
+
+impl IgnorePattern {
+    fn matches_path(&self, path: &str, is_dir: bool) -> bool {
+        if self.directory_only && !is_dir {
+            return false;
+        }
+        let components = path.split('/').collect::<Vec<_>>();
+        if self.anchored {
+            glob_match(&self.parts, &components)
+        } else {
+            let Some(basename) = self.parts.first() else { return false };
+            components.iter().any(|component| glob_component_match(basename, component))
+        }
+    }
+}
+
+/// Parse a single ignore-file line into a pattern, or `None` for blank lines,
+/// comments, and empty (after `!`/trailing-slash stripping) patterns.
+fn parse_ignore_pattern(line: &str) -> Option<IgnorePattern> {
+    let line = strip_unescaped_trailing_whitespace(line);
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+    let (negated, rest) = match line.strip_prefix('!') {
+        Some(rest) => (true, rest),
+        None => (false, line),
+    };
+    // A leading backslash escapes a literal `#`/`!` so those characters can
+    // open a real pattern (gitignore(5)). For any other character the backslash
+    // is part of the glob itself and must survive for the matcher: `\*` targets
+    // a file literally named `*`, it must not become an ignore-everything `*`.
+    let rest = if rest.starts_with("\\#") || rest.starts_with("\\!") {
+        &rest[1..]
+    } else {
+        rest
+    };
+    if rest.is_empty() {
+        return None;
+    }
+    let (directory_only, body) = match rest.strip_suffix('/') {
+        Some(body) => (true, body),
+        None => (false, rest),
+    };
+    if body.is_empty() {
+        return None;
+    }
+    // A pattern with a slash (other than a trailing one) is anchored to the
+    // ignore file's directory; a leading slash anchors it explicitly.
+    let (anchored, pattern_body) = if let Some(stripped) = body.strip_prefix('/') {
+        (true, stripped)
+    } else if body.contains('/') {
+        (true, body)
+    } else {
+        (false, body)
+    };
+    if pattern_body.is_empty() {
+        return None;
+    }
+    let parts = pattern_body.split('/').map(str::to_owned).collect();
+    Some(IgnorePattern { negated, directory_only, anchored, parts })
+}
+
+/// Strip trailing whitespace from a pattern line, but only when it is not
+/// escaped: git ignores a trailing space but treats `foo\ ` as a pattern for a
+/// filename literally ending in a space, so the `\ ` must survive.
+fn strip_unescaped_trailing_whitespace(line: &str) -> &str {
+    let mut end = line.len();
+    let bytes = line.as_bytes();
+    while end > 0 {
+        let byte = bytes[end - 1];
+        let is_whitespace = matches!(byte, b' ' | b'\t' | b'\r' | b'\x0b' | b'\x0c');
+        if !is_whitespace || (end >= 2 && bytes[end - 2] == b'\\') {
+            break;
+        }
+        end -= 1;
+    }
+    &line[..end]
+}
+
+/// Match a `/`-split glob pattern against a `/`-split path, where a middle
+/// `**` spans zero or more path components, a *trailing* `**` spans one or
+/// more (git's `abc/**` "everything inside" rule), and every other component
+/// uses git glob rules.
+fn glob_match(parts: &[String], path: &[&str]) -> bool {
+    fn go(parts: &[String], path: &[&str]) -> bool {
+        if parts.is_empty() {
+            return path.is_empty();
+        }
+        if parts[0] == "**" {
+            // A trailing `/**` matches everything inside the matched prefix
+            // but not the prefix itself: `abc/**` must not match `abc`, or
+            // git's `abc/**` + `!abc/keep.md` re-inclusion could never be
+            // evaluated. A trailing `**` therefore consumes at least one
+            // component; a middle `**` may consume none.
+            let min = if parts.len() == 1 { 1 } else { 0 };
+            (min..=path.len()).any(|index| go(&parts[1..], &path[index..]))
+        } else if path.is_empty() {
+            false
+        } else {
+            glob_component_match(&parts[0], path[0]) && go(&parts[1..], &path[1..])
+        }
+    }
+    go(parts, path)
+}
+
+/// Match a single glob component against text: `*` spans any run of
+/// characters, `?` matches one character, `[...]` is a character class, and
+/// `\` escapes the following character.
+fn glob_component_match(pattern: &str, text: &str) -> bool {
+    let pattern = pattern.chars().collect::<Vec<_>>();
+    let text = text.chars().collect::<Vec<_>>();
+
+    fn go(pattern: &[char], text: &[char]) -> bool {
+        if pattern.is_empty() {
+            return text.is_empty();
+        }
+        match pattern[0] {
+            '*' => (0..=text.len()).any(|index| go(&pattern[1..], &text[index..])),
+            '?' => !text.is_empty() && go(&pattern[1..], &text[1..]),
+            '[' => {
+                if text.is_empty() {
+                    return false;
+                }
+                match match_char_class(pattern, text[0]) {
+                    Some(next) => go(&pattern[next..], &text[1..]),
+                    None => false,
+                }
+            }
+            '\\' => {
+                pattern.len() >= 2
+                    && !text.is_empty()
+                    && pattern[1] == text[0]
+                    && go(&pattern[2..], &text[1..])
+            }
+            literal => !text.is_empty() && literal == text[0] && go(&pattern[1..], &text[1..]),
+        }
+    }
+
+    go(&pattern, &text)
+}
+
+/// Match the `[...]` character class at the start of `pattern` (which begins
+/// with `[`) against `text_char`, returning the index just past the closing
+/// `]` on a match, or `None` for an unterminated class. Supports negation
+/// (`!`/`^`) and `a-z` ranges.
+fn match_char_class(pattern: &[char], text_char: char) -> Option<usize> {
+    debug_assert_eq!(pattern[0], '[');
+    let mut index = 1;
+    let mut negate = false;
+    if index < pattern.len() && (pattern[index] == '!' || pattern[index] == '^') {
+        negate = true;
+        index += 1;
+    }
+    let mut matched = false;
+    // A `]` immediately after `[` (or after `[!`) is a literal `]`, so the
+    // class only closes once at least one item has been consumed.
+    let mut can_close = false;
+    while index < pattern.len() {
+        if pattern[index] == ']' && can_close {
+            return Some(index + 1).filter(|_| matched != negate);
+        }
+        if index + 2 < pattern.len() && pattern[index + 1] == '-' && pattern[index + 2] != ']' {
+            if text_char >= pattern[index] && text_char <= pattern[index + 2] {
+                matched = true;
+            }
+            index += 3;
+        } else {
+            if pattern[index] == text_char {
+                matched = true;
+            }
+            index += 1;
+        }
+        can_close = true;
+    }
+    None
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3646,7 +4697,7 @@ mod tests {
     #[test]
     fn does_not_treat_file_named_like_directory_as_ignored_directory() {
         let tempdir = tempdir().unwrap();
-        let matcher = IgnoreMatcher::load(tempdir.path()).unwrap();
+        let matcher = IgnoreMatcher::new(tempdir.path());
         assert!(!matcher.matches("node_modules", false));
         assert!(matcher.matches("node_modules", true));
     }
@@ -4671,6 +5722,209 @@ mod tests {
         assert!(names.contains(&"main.rs"), "main.rs must be discovered: {names:?}");
     }
 
+    // ─── Secret-shaped path denylist tests (issue #95) ───────────────────────
+
+    /// The classifier matches the secret-shaped names and extensions from issue
+    /// #95, case-insensitively, and leaves non-secret files alone.
+    #[test]
+    fn secret_path_kind_matches_issue95_denylist() {
+        let cases: &[(&str, Option<SecretPathKind>)] = &[
+            (".env", Some(SecretPathKind::DotEnv)),
+            (".env.local", Some(SecretPathKind::DotEnv)),
+            (".ENV", Some(SecretPathKind::DotEnv)),
+            ("prod.env", Some(SecretPathKind::DotEnv)),
+            (".envrc", None),
+            (".environment", None),
+            (".envoy.rs", None),
+            ("kubeconfig", Some(SecretPathKind::Kubeconfig)),
+            ("kubeconfig.yaml", Some(SecretPathKind::Kubeconfig)),
+            (".kubeconfig", Some(SecretPathKind::Kubeconfig)),
+            ("id_rsa", Some(SecretPathKind::SshPrivateKey)),
+            ("id_rsa.pub", None),
+            ("id_ed25519", Some(SecretPathKind::SshPrivateKey)),
+            ("id_ed25519.pub", None),
+            ("id_ecdsa", Some(SecretPathKind::SshPrivateKey)),
+            ("id_dsa", Some(SecretPathKind::SshPrivateKey)),
+            ("id_dsa_notes.md", None),
+            ("id_rsa_notes.md", None),
+            ("cert.pfx", Some(SecretPathKind::Keystore)),
+            ("keystore.p12", Some(SecretPathKind::Keystore)),
+            ("truststore.jks", Some(SecretPathKind::Keystore)),
+            (".npmrc", Some(SecretPathKind::Netrc)),
+            (".netrc", Some(SecretPathKind::Netrc)),
+            ("terraform.tfstate", Some(SecretPathKind::TerraformSecret)),
+            ("vars.tfvars", Some(SecretPathKind::TerraformSecret)),
+            ("secrets.json", Some(SecretPathKind::SecretsJson)),
+            ("secrets.local.json", Some(SecretPathKind::SecretsJson)),
+            ("appsettings.local.json", Some(SecretPathKind::LocalJson)),
+            ("config.json", None),
+            ("main.rs", None),
+            ("Dockerfile", None),
+            (".gitignore", None),
+            ("Cargo.lock", None),
+        ];
+        for (name, expected) in cases {
+            assert_eq!(secret_path_kind(name), *expected, "secret_path_kind({name:?}) mismatch");
+        }
+    }
+
+    /// SSH private-key names are matched exactly (case-insensitively): only the
+    /// canonical private-key names (`id_rsa`/`id_ed25519`/`id_ecdsa`/`id_dsa`)
+    /// are withheld. Public keys (`id_ed25519.pub`) and unrelated `id_*` prefix
+    /// collisions (`id_dsa_notes.md`, `my_id_rsa`) are not private keys and must
+    /// not be withheld — this table pins down the false-positive boundary.
+    #[test]
+    fn ssh_private_key_denylist_boundary_is_explicit() {
+        let cases: &[(&str, Option<SecretPathKind>)] = &[
+            // Canonical private keys — always withheld.
+            ("id_rsa", Some(SecretPathKind::SshPrivateKey)),
+            ("id_ed25519", Some(SecretPathKind::SshPrivateKey)),
+            ("id_ecdsa", Some(SecretPathKind::SshPrivateKey)),
+            ("id_dsa", Some(SecretPathKind::SshPrivateKey)),
+            // Case variants of the canonical names — still withheld, because the
+            // match is case-insensitive ASCII.
+            ("ID_RSA", Some(SecretPathKind::SshPrivateKey)),
+            ("Id_Ed25519", Some(SecretPathKind::SshPrivateKey)),
+            ("ID_ECDSA", Some(SecretPathKind::SshPrivateKey)),
+            ("id_DSA", Some(SecretPathKind::SshPrivateKey)),
+            ("Id_Rsa", Some(SecretPathKind::SshPrivateKey)),
+            ("ID_ED25519", Some(SecretPathKind::SshPrivateKey)),
+            // Public keys — a different file kind, never a private key.
+            ("id_rsa.pub", None),
+            ("id_ed25519.pub", None),
+            ("id_ecdsa.pub", None),
+            ("id_dsa.pub", None),
+            ("ID_RSA.PUB", None),
+            ("Id_Ed25519.Pub", None),
+            // Signed/Cert authority companion files — still public metadata.
+            ("id_rsa-cert.pub", None),
+            ("id_ed25519_cert.pub", None),
+            // Unrelated id_* prefix collisions — not the canonical name itself.
+            ("id_rsa_notes.md", None),
+            ("id_dsa_notes.md", None),
+            ("id_ed25519_notes.md", None),
+            ("id_dsa.txt", None),
+            ("id_rsa_backup", None),
+            ("id_ed25519.old", None),
+            ("id_rsa_", None),
+            ("not_id_rsa", None),
+            ("my_id_ed25519", None),
+            ("github_id_dsa", None),
+            ("id_rsa_bak_suffix", None),
+            // Unrelated names sharing no id_* shape at all.
+            ("my_private_key", None),
+            ("github_rsa", None),
+            ("rsa_key", None),
+        ];
+        for (name, expected) in cases {
+            assert_eq!(
+                secret_path_kind(name),
+                *expected,
+                "secret_path_kind({name:?}) must sit on the intended side of the boundary"
+            );
+        }
+    }
+
+    /// The denylist applies to the filesystem walk: secret-shaped files are
+    /// withheld, counted consistently, and recorded with path + reason (never
+    /// content).
+    #[test]
+    fn secret_denylist_withheld_in_filesystem_discovery() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path();
+        fs::write(root.join(".env"), "SECRET=abc\n").unwrap();
+        fs::write(root.join("prod.env"), "SECRET=prod\n").unwrap();
+        fs::write(root.join("kubeconfig.yaml"), "apiVersion: v1\n").unwrap();
+        fs::write(root.join("id_rsa"), "PRIVATE KEY\n").unwrap();
+        fs::write(root.join("secrets.local.json"), "{\"key\":\"x\"}\n").unwrap();
+        fs::write(root.join("appsettings.local.json"), "{\"key\":\"x\"}\n").unwrap();
+        fs::write(root.join("vars.tfvars"), "token = \"x\"\n").unwrap();
+        fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+        fs::write(root.join("config.json"), "{\"ok\":true}\n").unwrap();
+
+        let discovery = discover_project_sources(root).unwrap();
+        assert_eq!(discovery.basis, ProjectSourceBasis::Filesystem);
+        let names: Vec<_> = discovery.sources.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["config.json", "main.rs"]);
+        // Every secret-shaped path is counted as a skip and recorded with a
+        // reason.
+        assert_eq!(discovery.skipped, 7, "skipped = {}", discovery.skipped);
+        let recorded: Vec<(&str, &str)> = discovery
+            .skips
+            .iter()
+            .map(|s| (s.relative_path.as_str(), s.reason.as_str()))
+            .collect();
+        assert_eq!(recorded.len(), 7);
+        for (path, reason) in &recorded {
+            assert!(!names.contains(path), "{path} must not be discovered");
+            assert!(!reason.is_empty(), "skip record must carry a reason");
+            assert!(
+                !path.contains("SECRET") && !path.contains("PRIVATE") && !reason.contains("SECRET"),
+                "skip records must never expose file content: {recorded:?}"
+            );
+        }
+    }
+
+    /// The denylist also protects Git-index discovery: a secret-shaped file
+    /// that was committed is withheld and recorded, even though git would
+    /// otherwise mine it.
+    #[test]
+    fn secret_denylist_withheld_in_git_index_discovery() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path().to_path_buf();
+        git_init_with_commit(
+            &root,
+            "main",
+            &[
+                ("main.rs", "fn main() {}\n"),
+                (".env", "SECRET=hunter2\n"),
+                ("secrets.local.json", "{\"key\":\"hunter2\"}\n"),
+                ("kubeconfig.yaml", "apiVersion: v1\n"),
+            ],
+        );
+
+        let discovery = discover_project_sources(&root).unwrap();
+        assert_eq!(discovery.basis, ProjectSourceBasis::GitIndex);
+        let names: Vec<_> = discovery.sources.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["main.rs"]);
+        assert_eq!(discovery.skipped, 3);
+        let recorded: Vec<(&str, &str)> = discovery
+            .skips
+            .iter()
+            .map(|s| (s.relative_path.as_str(), s.reason.as_str()))
+            .collect();
+        assert_eq!(
+            recorded,
+            vec![
+                (".env", ".env / *.env"),
+                ("kubeconfig.yaml", "*.kubeconfig*"),
+                ("secrets.local.json", "secrets*.json"),
+            ]
+        );
+    }
+
+    /// Lockfiles and palace config are skipped but are not secret denylist
+    /// matches, so they are counted without producing skip records.
+    #[test]
+    fn non_secret_skips_are_counted_but_not_recorded() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path();
+        fs::write(root.join("Cargo.lock"), "[package]\nname = \"x\"\n").unwrap();
+        fs::write(root.join("mempalace.yaml"), "wing: test\n").unwrap();
+        fs::write(root.join(".env"), "SECRET=abc\n").unwrap();
+        fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+
+        let discovery = discover_project_sources(root).unwrap();
+        let names: Vec<_> = discovery.sources.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["main.rs"]);
+        // Cargo.lock and mempalace.yaml are counted but not recorded; .env is
+        // counted and recorded.
+        assert_eq!(discovery.skipped, 3);
+        assert_eq!(discovery.skips.len(), 1);
+        assert_eq!(discovery.skips[0].relative_path, ".env");
+        assert_eq!(discovery.skips[0].reason, ".env / *.env");
+    }
+
     // ─── normalize_git_remote_url table tests ────────────────────────────────
 
     #[test]
@@ -4898,6 +6152,299 @@ mod tests {
             .is_empty());
     }
 
+    /// A canonical re-mine must not treat an index path missing from this
+    /// working tree as proof that its durable source was deleted. This happens
+    /// in sparse and partial checkouts, where `git ls-files` still reports the
+    /// path but it is absent on disk.
+    #[tokio::test]
+    async fn canonical_remine_preserves_rows_when_tracked_worktree_is_incomplete() {
+        let tempdir = tempdir().unwrap();
+        let project_dir = tempdir.path().join("project");
+        fs::create_dir_all(&project_dir).unwrap();
+        let keep = "# keep\n\nThis file keeps the mine otherwise healthy.\n".repeat(4);
+        git_init_with_commit(
+            &project_dir,
+            "main",
+            &[("keep.md", keep.as_str()), ("missing.md", keep.as_str())],
+        );
+
+        let wing_name = "partialpurge";
+        let root = project_dir.canonicalize().unwrap();
+        let root_key = stable_project_root_key(&derive_repo_id(&root, wing_name));
+        let missing_key = project_source_key("projects", &root_key, wing_name, "missing.md");
+        let engine = open_engine(&tempdir.path().join("palace")).await;
+        let mut provider =
+            FakeEmbeddingProvider::new(EmbeddingProfile::Balanced.metadata().dimensions);
+        let drawers = build_drawers(
+            &mut provider,
+            &wing_id(wing_name).unwrap(),
+            &missing_key,
+            "missing.md",
+            "projects",
+            None,
+            "tester",
+            None,
+            vec![Chunk {
+                content: "durable source from a complete checkout".to_owned(),
+                chunk_index: 0,
+                room_hint: Some("general".to_owned()),
+                date_hint: None,
+                byte_range: None,
+            }],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        engine
+            .commit_ingest(IngestCommitRequest {
+                ingest_kind: "projects".to_owned(),
+                source_key: missing_key.clone(),
+                source_file: "missing.md".to_owned(),
+                content_hash: "existing".to_owned(),
+                drawers,
+                duplicate_strategy: DuplicateStrategy::Overwrite,
+            })
+            .await
+            .unwrap();
+        fs::remove_file(project_dir.join("missing.md")).unwrap();
+
+        let summary = ingest_project(
+            &engine,
+            &mut provider,
+            &ProjectIngestRequest {
+                project_dir,
+                wing: Some(wing_name.to_owned()),
+                agent: "tester".to_owned(),
+                limit: None,
+                dry_run: false,
+                reindex: false,
+                max_embed_batch_size: None,
+                branch: false,
+                view: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(summary.removed_sources, 0);
+        assert!(engine.operational_store().get_ingested_file(&missing_key).unwrap().is_some());
+    }
+
+    /// An unlimited canonical re-mine must purge stale rows under the *stable*
+    /// project-source prefix, not just the legacy path-hash prefix. Content that
+    /// the new safety policy keeps out of the eligible set (a secret denylisted
+    /// by name) must not remain stored and searchable after re-mining.
+    #[tokio::test]
+    async fn canonical_remine_purges_stale_stable_secret_rows() {
+        let tempdir = tempdir().unwrap();
+        let project_dir = tempdir.path().join("project");
+        fs::create_dir_all(&project_dir).unwrap();
+
+        // `.env` is denied by the secret denylist; `keep.md` is eligible and
+        // long enough to produce real chunks.
+        let keep_md =
+            "# keep\n\nThis eligible file must survive the stale canonical sweep.\n".repeat(4);
+        git_init_with_commit(
+            &project_dir,
+            "main",
+            &[(".env", "SECRET=hunter2\n"), ("keep.md", keep_md.as_str())],
+        );
+
+        let root = project_dir.canonicalize().unwrap();
+        let wing_name = "purgesecret";
+        let repo_id = derive_repo_id(&root, wing_name);
+        let project_root_key = stable_project_root_key(&repo_id);
+        let stale_key = project_source_key("projects", &project_root_key, wing_name, ".env");
+
+        let engine = open_engine(&tempdir.path().join("palace")).await;
+        let mut provider =
+            FakeEmbeddingProvider::new(EmbeddingProfile::Balanced.metadata().dimensions);
+
+        // Simulate a pre-upgrade canonical mine that stored the secret under its
+        // stable key, before the denylist existed to keep it out.
+        let stale_drawers = build_drawers(
+            &mut provider,
+            &wing_id(wing_name).unwrap(),
+            &stale_key,
+            ".env",
+            "projects",
+            None,
+            "legacy",
+            None,
+            vec![Chunk {
+                content: "pre-upgrade secret drawer that must be purged".to_owned(),
+                chunk_index: 0,
+                room_hint: Some("general".to_owned()),
+                date_hint: None,
+                byte_range: None,
+            }],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        engine
+            .commit_ingest(IngestCommitRequest {
+                ingest_kind: "projects".to_owned(),
+                source_key: stale_key.clone(),
+                source_file: ".env".to_owned(),
+                content_hash: "stale-content-hash".to_owned(),
+                drawers: stale_drawers,
+                duplicate_strategy: DuplicateStrategy::Overwrite,
+            })
+            .await
+            .unwrap();
+
+        let summary = ingest_project(
+            &engine,
+            &mut provider,
+            &ProjectIngestRequest {
+                project_dir: project_dir.clone(),
+                wing: Some(wing_name.to_owned()),
+                agent: "tester".to_owned(),
+                limit: None,
+                dry_run: false,
+                reindex: false,
+                max_embed_batch_size: None,
+                branch: false,
+                view: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // The stale secret row (manifest + drawers) is removed by the stable sweep.
+        assert_eq!(summary.removed_sources, 1);
+        assert!(
+            engine.operational_store().get_ingested_file(&stale_key).unwrap().is_none(),
+            "the stale .env manifest must be removed"
+        );
+        assert!(
+            engine
+                .operational_store()
+                .committed_drawer_ids_for_source_key(&stale_key)
+                .unwrap()
+                .is_empty(),
+            "the stale .env drawers must be removed"
+        );
+        // The eligible file's row survives the purge.
+        let keep_key = project_source_key("projects", &project_root_key, wing_name, "keep.md");
+        assert!(!engine
+            .operational_store()
+            .committed_drawer_ids_for_source_key(&keep_key)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// The stable sweep must be scoped to the current project identity: re-mining
+    /// one project in a wing must not remove another project's rows share the
+    /// same wing.
+    #[tokio::test]
+    async fn canonical_stable_sweep_is_scoped_to_current_project() {
+        let tempdir = tempdir().unwrap();
+        let project_a = tempdir.path().join("project-a");
+        let project_b = tempdir.path().join("project-b");
+        for dir in [&project_a, &project_b] {
+            fs::create_dir_all(dir).unwrap();
+            let keep_md =
+                "# keep\n\nThis eligible file must survive the scoped canonical sweep.\n"
+                    .repeat(4);
+            git_init_with_commit(
+                dir,
+                "main",
+                &[("keep.md", keep_md.as_str())],
+            );
+        }
+
+        let wing_name = "sweepisolation";
+        let root_a = project_a.canonicalize().unwrap();
+        let root_b = project_b.canonicalize().unwrap();
+        let key_a = project_source_key(
+            "projects",
+            &stable_project_root_key(&derive_repo_id(&root_a, wing_name)),
+            wing_name,
+            "keep.md",
+        );
+        let key_b = project_source_key(
+            "projects",
+            &stable_project_root_key(&derive_repo_id(&root_b, wing_name)),
+            wing_name,
+            "keep.md",
+        );
+
+        let engine = open_engine(&tempdir.path().join("palace")).await;
+        let mut provider =
+            FakeEmbeddingProvider::new(EmbeddingProfile::Balanced.metadata().dimensions);
+
+        for key in [&key_a, &key_b] {
+            let drawers = build_drawers(
+                &mut provider,
+                &wing_id(wing_name).unwrap(),
+                key,
+                "keep.md",
+                "projects",
+                None,
+                "tester",
+                None,
+                vec![Chunk {
+                    content: format!("content for {key}").into(),
+                    chunk_index: 0,
+                    room_hint: Some("general".to_owned()),
+                    date_hint: None,
+                    byte_range: None,
+                }],
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            engine
+                .commit_ingest(IngestCommitRequest {
+                    ingest_kind: "projects".to_owned(),
+                    source_key: key.clone(),
+                    source_file: "keep.md".to_owned(),
+                    content_hash: hash_text(key),
+                    drawers,
+                    duplicate_strategy: DuplicateStrategy::Overwrite,
+                })
+                .await
+                .unwrap();
+        }
+
+        // Re-mine only project A.
+        ingest_project(
+            &engine,
+            &mut provider,
+            &ProjectIngestRequest {
+                project_dir: project_a.clone(),
+                wing: Some(wing_name.to_owned()),
+                agent: "tester".to_owned(),
+                limit: None,
+                dry_run: false,
+                reindex: false,
+                max_embed_batch_size: None,
+                branch: false,
+                view: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(!engine
+            .operational_store()
+            .committed_drawer_ids_for_source_key(&key_a)
+            .unwrap()
+            .is_empty());
+        assert!(!engine
+            .operational_store()
+            .committed_drawer_ids_for_source_key(&key_b)
+            .unwrap()
+            .is_empty(),
+            "project B's rows must be untouched by project A's canonical sweep"
+        );
+    }
+
     #[test]
     fn prepare_batch_non_utf8_file_has_no_file_hash_and_no_ranges() {
         let tempdir = tempdir().unwrap();
@@ -5019,6 +6566,8 @@ mod tests {
                 ("stable.rs", &stable_content),
             ],
         );
+        // A host-global excludes file must not silently drop the delta files.
+        pin_absent_global_excludes(&repo_dir);
 
         // Create and switch to feature branch.
         let run_git = |args: &[&str]| {
@@ -5272,6 +6821,9 @@ mod tests {
         fs::write(project_dir.join("src/lib.rs"), &changed).unwrap();
         let outside_changed = "fn outside_changed() {}\n".repeat(5);
         fs::write(repo_dir.join("other/outside.rs"), &outside_changed).unwrap();
+        // This is deliberately untracked. `git ls-files --others` must report
+        // it repo-relative even though the mine starts from the subdirectory.
+        fs::write(project_dir.join("src/new.rs"), "pub fn new_file() {}\n".repeat(5)).unwrap();
 
         let engine = open_engine(&tempdir.path().join("palace")).await;
         let mut provider =
@@ -5294,10 +6846,10 @@ mod tests {
         .await
         .unwrap();
 
-        // Only src/lib.rs (inside the project) should be mined; outside.rs should be ignored.
+        // Both changed paths inside the project are mined; outside.rs is ignored.
         assert_eq!(
-            summary.ingested_files, 1,
-            "only the file inside the project subdir must be mined"
+            summary.ingested_files, 2,
+            "changed tracked and untracked files inside the project subdir must be mined"
         );
     }
 
@@ -5375,9 +6927,16 @@ mod tests {
         // Drop a file inside the linked worktree.
         fs::write(worktree_dir.join("extra.rs"), "fn extra() {}\n").unwrap();
 
-        // Also create a sibling directory that is NOT a worktree.
+        // Also create a sibling directory that is NOT a worktree, and track it
+        // so it is part of the safe (tracked-index) source set.
         fs::create_dir_all(root.join("sibling")).unwrap();
         fs::write(root.join("sibling").join("sibling.rs"), "fn sibling() {}\n").unwrap();
+        let status = Command::new("git")
+            .args(["add", "sibling/sibling.rs"])
+            .current_dir(&root)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git add sibling/sibling.rs failed");
 
         let report = discover_project_files(&root).unwrap();
         let names: Vec<_> = report.files.iter().map(|f| f.relative_path.as_str()).collect();
@@ -5398,11 +6957,17 @@ mod tests {
             "worktree/extra.rs must be skipped: {names:?}"
         );
 
-        // The linked worktree directory itself counts as ignored.
+        // The linked worktree is a known excluded checkout, and its untracked
+        // content never enters the safe source set (nothing mined under it).
+        let worktree_dir_canon =
+            worktree_dir.canonicalize().unwrap_or_else(|_| worktree_dir.clone());
         assert!(
-            report.ignored_files >= 1,
-            "expected at least 1 ignored file (the linked worktree), got {}",
-            report.ignored_files
+            linked_worktree_paths(&root).contains(&worktree_dir_canon),
+            "linked worktree path must be excluded by discovery"
+        );
+        assert!(
+            names.iter().all(|name| !name.starts_with("worktree/")),
+            "no linked-worktree paths may be discovered: {names:?}"
         );
 
         // Clean up the linked worktree so tempdir removal doesn't trip over it.
@@ -5496,6 +7061,1169 @@ mod tests {
         assert!(paths.contains(&worktree_dir));
     }
 
+    // ─── Centralized project-source discovery tests ──────────────────────────
+
+    /// Git-backed roots enumerate tracked index paths only: untracked and
+    /// gitignored working-tree files never enter the source set.
+    #[test]
+    fn git_index_discovery_uses_tracked_sources_only() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path().to_path_buf();
+        git_init_with_commit(
+            &root,
+            "main",
+            &[("tracked.md", "tracked\n"), ("main.rs", "fn main() {}\n")],
+        );
+
+        // Untracked working-tree content: an ignored secret, an ignored local
+        // override (not in the built-in skip list), and a plain file.
+        fs::write(root.join(".env"), "SECRET=hunter2\n").unwrap();
+        fs::write(root.join("secrets.local.json"), "{\"key\":\"hunter2\"}\n").unwrap();
+        fs::write(root.join(".gitignore"), ".env\nsecrets.local.json\n").unwrap();
+        fs::write(root.join("scratch.rs"), "fn scratch() {}\n").unwrap();
+
+        let discovery = discover_project_sources(&root).unwrap();
+        assert_eq!(discovery.basis, ProjectSourceBasis::GitIndex);
+        let names: Vec<_> = discovery.sources.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["main.rs", "tracked.md"]);
+        assert!(!names.contains(&".env"));
+        assert!(!names.contains(&"secrets.local.json"));
+        assert!(!names.contains(&"scratch.rs"));
+        // The gitignored/untracked files are simply absent from the index, not
+        // counted as skipped candidates.
+        assert_eq!(discovery.skipped, 0);
+    }
+
+    /// .mempalaceignore still applies to tracked files in git-index mode.
+    #[test]
+    fn git_index_discovery_honors_mempalace_ignore_for_tracked_files() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path().to_path_buf();
+        git_init_with_commit(
+            &root,
+            "main",
+            &[("tracked.md", "tracked\n"), ("main.rs", "fn main() {}\n")],
+        );
+        fs::write(root.join(".mempalaceignore"), "main.rs\n").unwrap();
+
+        let discovery = discover_project_sources(&root).unwrap();
+        assert_eq!(discovery.basis, ProjectSourceBasis::GitIndex);
+        let names: Vec<_> = discovery.sources.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["tracked.md"]);
+        assert_eq!(discovery.skipped, 1);
+    }
+
+    /// A tracked file deleted from the working tree is skipped, not mined.
+    #[test]
+    fn git_index_discovery_skips_tracked_file_missing_on_disk() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path().to_path_buf();
+        git_init_with_commit(
+            &root,
+            "main",
+            &[("tracked.md", "tracked\n"), ("gone.rs", "fn gone() {}\n")],
+        );
+        fs::remove_file(root.join("gone.rs")).unwrap();
+
+        let discovery = discover_project_sources(&root).unwrap();
+        assert_eq!(discovery.basis, ProjectSourceBasis::GitIndex);
+        let names: Vec<_> = discovery.sources.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["tracked.md"]);
+        assert_eq!(discovery.skipped, 1);
+    }
+
+    /// Git-index discovery is deterministic (sorted) and root-relative.
+    #[test]
+    fn git_index_discovery_is_deterministic_and_root_relative() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path().to_path_buf();
+        git_init_with_commit(
+            &root,
+            "main",
+            &[
+                ("zebra.md", "z\n"),
+                ("alpha/src/lib.rs", "fn lib() {}\n"),
+                ("mid/dir/beta.md", "b\n"),
+            ],
+        );
+
+        let discovery = discover_project_sources(&root).unwrap();
+        assert_eq!(discovery.basis, ProjectSourceBasis::GitIndex);
+        let names: Vec<_> = discovery.sources.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["alpha/src/lib.rs", "mid/dir/beta.md", "zebra.md"]);
+        for source in &discovery.sources {
+            assert!(
+                source.absolute_path.starts_with(&root),
+                "absolute path for {}",
+                source.relative_path
+            );
+        }
+    }
+
+    /// A tracked file remains eligible even after `.gitignore` later names it:
+    /// tracked index paths are not subject to a (possibly untracked) ignore
+    /// file — git keeps tracked paths tracked.
+    #[test]
+    fn git_index_discovery_keeps_tracked_files_even_when_gitignored() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path().to_path_buf();
+        git_init_with_commit(
+            &root,
+            "main",
+            &[("tracked.md", "tracked\n"), ("docs/notes.md", "notes\n")],
+        );
+        fs::write(root.join(".gitignore"), "*.md\n").unwrap();
+
+        let discovery = discover_project_sources(&root).unwrap();
+        assert_eq!(discovery.basis, ProjectSourceBasis::GitIndex);
+        let names: Vec<_> = discovery.sources.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["docs/notes.md", "tracked.md"]);
+        assert_eq!(discovery.skipped, 0);
+    }
+
+    /// `.mempalaceignore` is the explicit additional exclusion in git-index
+    /// mode: it suppresses tracked files even when `.gitignore` does not.
+    #[test]
+    fn git_index_discovery_applies_mempalace_ignore_even_over_gitignore() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path().to_path_buf();
+        git_init_with_commit(
+            &root,
+            "main",
+            &[("tracked.md", "tracked\n"), ("docs/notes.md", "notes\n")],
+        );
+        fs::write(root.join(".gitignore"), "*.md\n").unwrap();
+        fs::write(root.join(".mempalaceignore"), "tracked.md\n").unwrap();
+
+        let discovery = discover_project_sources(&root).unwrap();
+        assert_eq!(discovery.basis, ProjectSourceBasis::GitIndex);
+        let names: Vec<_> = discovery.sources.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["docs/notes.md"]);
+        assert_eq!(discovery.skipped, 1);
+    }
+
+    // ─── Conversation-discovery scope tests ──────────────────────────────────
+
+    /// Conversation discovery is deliberately scoped to worktree ignore files:
+    /// nested `.gitignore`/`.mempalaceignore` rules (git-compatible semantics)
+    /// and the built-in skip directories still apply, matching the historical
+    /// root-level behaviour.
+    #[test]
+    fn conversation_discovery_honors_worktree_ignore_files() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path().to_path_buf();
+        fs::write(root.join(".mempalaceignore"), "private/\n").unwrap();
+        fs::create_dir_all(root.join("private")).unwrap();
+        fs::create_dir_all(root.join("chat")).unwrap();
+        fs::write(root.join("private").join("secret.md"), "hidden\n").unwrap();
+        fs::write(root.join("chat").join(".gitignore"), "draft.md\n").unwrap();
+        fs::write(root.join("chat").join("draft.md"), "ignored\n").unwrap();
+        fs::write(root.join("chat").join("keep.md"), "kept\n").unwrap();
+
+        let report = discover_conversation_files(&root).unwrap();
+        let names: Vec<_> = report.files.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["chat/keep.md"]);
+        assert!(report.ignored_files >= 2);
+    }
+
+    /// The secret-path denylist is scoped to project discovery: conversation
+    /// mining applies only the conversation-extension filter, so a
+    /// secret-shaped file with an accepted conversation extension
+    /// (`.env.json`) is still discovered and produces no skip record.
+    #[test]
+    fn conversation_discovery_does_not_apply_secret_denylist() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path().to_path_buf();
+        fs::write(root.join(".env.json"), "{\"TOKEN\": \"x\"}\n").unwrap();
+        fs::write(root.join("notes.md"), "hi\n").unwrap();
+
+        let report = discover_conversation_files(&root).unwrap();
+        let names: Vec<_> = report.files.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec![".env.json", "notes.md"]);
+        assert!(report.skips.is_empty());
+    }
+
+    /// Conversation discovery does not consult `$GIT_DIR/info/exclude`: a
+    /// conversation file named by an `info/exclude` pattern is still
+    /// discovered, and no git subprocess is spawned to resolve it.
+    #[test]
+    fn conversation_discovery_does_not_apply_git_info_exclude() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path().to_path_buf();
+        git_init_with_commit(&root, "main", &[("tracked.md", "tracked\n")]);
+        fs::create_dir_all(root.join(".git").join("info")).unwrap();
+        fs::write(root.join(".git").join("info").join("exclude"), "chats.md\n").unwrap();
+        fs::write(root.join("chats.md"), "conversation\n").unwrap();
+
+        let report = discover_conversation_files(&root).unwrap();
+        let names: Vec<_> = report.files.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["chats.md", "tracked.md"]);
+    }
+
+    /// Conversation discovery never loads the `core.excludesFile` global file:
+    /// user-level git exclusion config must not silently filter conversation
+    /// exports. Runs under a temp HOME so the configured global excludes are
+    /// deterministic.
+    #[test]
+    fn conversation_discovery_does_not_apply_global_excludes() {
+        const TEST_NAME: &str = "tests::conversation_discovery_does_not_apply_global_excludes";
+        // Child mode: the temp HOME is active, so run the real assertions.
+        if std::env::var_os("MEMPALACE_TEST_TEMP_HOME").is_some() {
+            let tempdir = tempdir().unwrap();
+            let root = tempdir.path();
+            fs::write(root.join("notes.bak.md"), "would be globally excluded\n").unwrap();
+            fs::write(root.join("notes.md"), "kept\n").unwrap();
+
+            let report = discover_conversation_files(root).unwrap();
+            let names: Vec<_> = report.files.iter().map(|s| s.relative_path.as_str()).collect();
+            assert_eq!(names, vec!["notes.bak.md", "notes.md"]);
+            return;
+        }
+
+        // Parent mode: write a global excludes file and a `.gitconfig` that
+        // points at it, then re-run this test under a temp HOME.
+        let tempdir = tempdir().unwrap();
+        let home = tempdir.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let global = tempdir.path().join("global-excludes");
+        fs::write(&global, "*.bak.md\n").unwrap();
+        fs::write(
+            home.join(".gitconfig"),
+            format!("[core]\n\texcludesFile = {}\n", global.display()),
+        )
+        .unwrap();
+
+        let output = Command::new(std::env::current_exe().unwrap())
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("MEMPALACE_TEST_TEMP_HOME", "1")
+            .env_remove("GIT_CONFIG_GLOBAL")
+            .args(["--exact", TEST_NAME])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child run of {TEST_NAME} failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    // ─── Unreadable exclude sources ──────────────────────────────────────────
+
+    /// An unreadable `$GIT_DIR/info/exclude` (here: a directory where the file
+    /// is expected) is treated as empty — an optional exclude file that cannot
+    /// be read must not abort discovery. This is an intentional robustness
+    /// divergence from git, which exits fatally when an exclude file cannot be
+    /// opened.
+    #[test]
+    fn unreadable_git_info_exclude_does_not_abort_discovery() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path().to_path_buf();
+        git_init_with_commit(&root, "main", &[("tracked.md", "tracked\n")]);
+        pin_absent_global_excludes(&root);
+        // `git init` already created `.git/info/exclude` as a regular file;
+        // replace it with a directory so reading it as a file fails.
+        let exclude = root.join(".git").join("info").join("exclude");
+        fs::remove_file(&exclude).unwrap();
+        fs::create_dir_all(&exclude).unwrap();
+        fs::write(root.join("local.md"), "untracked\n").unwrap();
+
+        let report = discover_project_files_with_untracked(&root).unwrap();
+        let names: Vec<_> = report.files.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["local.md", "tracked.md"]);
+    }
+
+    /// An unreadable global excludes file (here: a directory in place of
+    /// `$XDG_CONFIG_HOME/git/ignore`) is treated as empty rather than aborting
+    /// discovery. Runs under a temp HOME so the default global-excludes path
+    /// is deterministic.
+    #[test]
+    fn unreadable_global_excludes_does_not_abort_discovery() {
+        const TEST_NAME: &str = "tests::unreadable_global_excludes_does_not_abort_discovery";
+        // Child mode: the temp HOME is active, so run the real assertions.
+        if std::env::var_os("MEMPALACE_TEST_TEMP_HOME").is_some() {
+            let tempdir = tempdir().unwrap();
+            let root = tempdir.path();
+            fs::write(root.join("notes.md"), "kept\n").unwrap();
+            fs::write(root.join("notes.bak.md"), "kept\n").unwrap();
+
+            let discovery = discover_project_sources(root).unwrap();
+            assert_eq!(discovery.basis, ProjectSourceBasis::Filesystem);
+            let names: Vec<_> =
+                discovery.sources.iter().map(|s| s.relative_path.as_str()).collect();
+            assert_eq!(names, vec!["notes.bak.md", "notes.md"]);
+            return;
+        }
+
+        // Parent mode: make the default global-excludes location a directory
+        // (so reading it as a file fails), then re-run this test under a temp
+        // HOME with no configured core.excludesFile.
+        let tempdir = tempdir().unwrap();
+        let home = tempdir.path().join("home");
+        let xdg = home.join(".config");
+        fs::create_dir_all(xdg.join("git").join("ignore")).unwrap();
+
+        let output = Command::new(std::env::current_exe().unwrap())
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &xdg)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("MEMPALACE_TEST_TEMP_HOME", "1")
+            .env_remove("GIT_CONFIG_GLOBAL")
+            .args(["--exact", TEST_NAME])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child run of {TEST_NAME} failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    // ─── Review round-1 findings ─────────────────────────────────────────────
+
+    /// `.mempalaceignore` is the explicit MemPalace exclusion and must remain
+    /// deny-only across scopes: a parent `.mempalaceignore` `private/**` cannot
+    /// be overridden by a deeper `private/.gitignore` `!config.toml` negation
+    /// in a filesystem walk. Without the mempalace-over-gitignore tier, the
+    /// deeper negation would be the last matching rule and re-include a file
+    /// the operator explicitly excluded from discovery.
+    #[test]
+    fn mempalaceignore_outranks_nested_gitignore_negation_in_walk() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path().to_path_buf();
+        fs::create_dir_all(root.join("private")).unwrap();
+        fs::write(root.join(".mempalaceignore"), "private/**\n").unwrap();
+        fs::write(root.join("private").join(".gitignore"), "!config.toml\n").unwrap();
+        fs::write(root.join("private").join("config.toml"), "cfg\n").unwrap();
+        fs::write(root.join("private").join("other.txt"), "txt\n").unwrap();
+        fs::write(root.join("keep.md"), "kept\n").unwrap();
+
+        let report = discover_project_files_with_untracked(&root).unwrap();
+        let names: Vec<_> = report.files.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["keep.md"]);
+    }
+
+    /// Repository-level exclude patterns (`$GIT_DIR/info/exclude`,
+    /// `core.excludesFile`) are anchored at the Git toplevel, not at the
+    /// project directory. When a subdirectory of the repo is mined, an
+    /// anchored `/secret.md` must exclude only the toplevel `secret.md`, never
+    /// `sub/secret.md`. Without the toplevel offset, `/secret.md` loaded with a
+    /// root scope matches the subdirectory-relative `secret.md` and wrongly
+    /// skips it.
+    #[test]
+    fn repo_exclude_anchored_at_git_toplevel_for_subdir_walk() {
+        let tempdir = tempdir().unwrap();
+        let repo = tempdir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(repo.join("sub")).unwrap();
+        git_init_with_commit(
+            &repo,
+            "main",
+            &[
+                ("secret.md", "root secret\n"),
+                ("sub/keep.md", "keep\n"),
+                ("sub/secret.md", "sub secret\n"),
+            ],
+        );
+        fs::write(repo.join(".git").join("info").join("exclude"), "/secret.md\n").unwrap();
+        pin_absent_global_excludes(&repo);
+
+        let sub = repo.join("sub");
+        let report = discover_project_files_with_untracked(&sub).unwrap();
+        let names: Vec<_> = report.files.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["keep.md", "secret.md"]);
+    }
+
+    /// Branch-delta source sets must include a changed *tracked* file even
+    /// when it lives under a `.gitignore`d directory: git never lets
+    /// `.gitignore` untrack a tracked path, so the walk alone would drop
+    /// `generated/schema.rs` and the branch edit would never surface. The union
+    /// with the tracked-index set keeps it.
+    #[test]
+    fn branch_sources_include_tracked_files_under_ignored_dir() {
+        let tempdir = tempdir().unwrap();
+        let repo = tempdir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        git_init_with_commit(
+            &repo,
+            "main",
+            &[("generated/schema.rs", "const SCHEMA: &str = \"v1\";\n"), ("keep.rs", "fn keep() {}\n")],
+        );
+        fs::write(repo.join(".gitignore"), "generated/\n").unwrap();
+
+        let report = discover_project_branch_sources(&repo).unwrap();
+        let names: Vec<_> = report.files.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["generated/schema.rs", "keep.rs"]);
+    }
+
+    /// A relative `core.excludesFile` is rooted at the Git worktree, not at a
+    /// subdirectory passed to branch discovery. This matches `git check-ignore`
+    /// and prevents subproject walks from missing the configured exclusion.
+    #[test]
+    fn relative_core_excludes_file_is_resolved_from_git_toplevel() {
+        let tempdir = tempdir().unwrap();
+        let repo = tempdir.path().join("repo");
+        fs::create_dir_all(repo.join("sub")).unwrap();
+        git_init_with_commit(&repo, "main", &[("sub/tracked.md", "tracked\n")]);
+        fs::write(repo.join("excludes"), "*.tmp.md\n").unwrap();
+        let status = Command::new("git")
+            .args(["config", "core.excludesFile", "excludes"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git config core.excludesFile failed");
+        fs::write(repo.join("sub/drop.tmp.md"), "drop\n").unwrap();
+        fs::write(repo.join("sub/keep.md"), "keep\n").unwrap();
+
+        let report = discover_project_files_with_untracked(&repo.join("sub")).unwrap();
+        let names: Vec<_> = report.files.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["keep.md", "tracked.md"]);
+    }
+
+    /// Branch discovery must never let the filesystem half follow a tracked
+    /// symlink that the index half correctly rejected. The external target is
+    /// eligible by name, which makes this specifically exercise the safety
+    /// boundary rather than an extension filter.
+    #[test]
+    #[cfg(unix)]
+    fn branch_sources_do_not_reintroduce_tracked_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let tempdir = tempdir().unwrap();
+        let repo = tempdir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        git_init_with_commit(&repo, "main", &[("tracked.md", "tracked\n")]);
+        let external = tempdir.path().join("external.md");
+        fs::write(&external, "external secret-like content\n").unwrap();
+        symlink(&external, repo.join("link.md")).unwrap();
+        let status = Command::new("git")
+            .args(["add", "-f", "link.md"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git add tracked symlink failed");
+
+        let report = discover_project_branch_sources(&repo).unwrap();
+        let names: Vec<_> = report.files.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["tracked.md"]);
+    }
+
+    /// Filesystem-backed discovery must not follow an untracked symlink either:
+    /// unlike an index path, it may point anywhere on the host.
+    #[test]
+    #[cfg(unix)]
+    fn filesystem_discovery_rejects_untracked_symlink_escaping_root() {
+        use std::os::unix::fs::symlink;
+
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path().join("project");
+        fs::create_dir_all(&root).unwrap();
+        let external = tempdir.path().join("external.md");
+        fs::write(&external, "external content\n").unwrap();
+        symlink(&external, root.join("link.md")).unwrap();
+        fs::write(root.join("keep.md"), "keep\n").unwrap();
+
+        let discovery = discover_project_sources(&root).unwrap();
+        let names: Vec<_> = discovery.sources.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["keep.md"]);
+        assert!(discovery.skipped >= 1, "the symlink should be skipped");
+    }
+
+    /// A directory containing `.git` metadata is not safe to fall back to a
+    /// filesystem walk when `git` itself cannot be run. The child process
+    /// isolates its PATH so concurrent tests keep their normal Git binary.
+    #[test]
+    fn git_detection_failure_with_metadata_fails_closed() {
+        const TEST_NAME: &str = "tests::git_detection_failure_with_metadata_fails_closed";
+        if let Some(root) = std::env::var_os("MEMPALACE_TEST_GIT_ROOT") {
+            let error = discover_project_sources(Path::new(&root)).unwrap_err();
+            assert!(matches!(error, IngestError::GitIndexUnavailable { .. }));
+            return;
+        }
+
+        let tempdir = tempdir().unwrap();
+        let repo = tempdir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        git_init_with_commit(&repo, "main", &[("tracked.md", "tracked\n")]);
+        let no_git_path = tempdir.path().join("no-git-on-path");
+        fs::create_dir_all(&no_git_path).unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .env("MEMPALACE_TEST_GIT_ROOT", &repo)
+            .env("PATH", &no_git_path)
+            .args(["--exact", TEST_NAME])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child run of {TEST_NAME} failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+
+    #[test]
+    fn unreadable_configured_global_excludes_does_not_abort_discovery() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path().to_path_buf();
+        git_init_with_commit(&root, "main", &[("tracked.md", "tracked\n")]);
+        let global = tempdir.path().join("global-excludes");
+        fs::create_dir_all(&global).unwrap();
+        let status = Command::new("git")
+            .args(["config", "core.excludesFile", global.to_str().unwrap()])
+            .current_dir(&root)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git config core.excludesFile failed");
+        fs::write(root.join("notes.bak.md"), "kept\n").unwrap();
+        fs::write(root.join("notes.md"), "kept\n").unwrap();
+
+        let report = discover_project_files_with_untracked(&root).unwrap();
+        let names: Vec<_> = report.files.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["notes.bak.md", "notes.md", "tracked.md"]);
+    }
+
+    /// A tracked symlink is rejected before any eligibility check or file read:
+    /// it can point outside the discovery root, and following it (as
+    /// `fs::metadata` does) would pull an external file's content into the
+    /// palace under an in-repo path. The symlink is neither discovered nor —
+    /// since discovery is the sole gate before reading — ever read.
+    #[test]
+    #[cfg(unix)]
+    fn git_index_discovery_rejects_tracked_symlink_escaping_root() {
+        use std::os::unix::fs::symlink;
+
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path().join("repo");
+        fs::create_dir_all(&root).unwrap();
+        git_init_with_commit(
+            &root,
+            "main",
+            &[
+                ("tracked.md", "tracked\n"),
+                ("notes.md", "notes\n"),
+            ],
+        );
+
+        // The tracked symlink points at an eligible file outside the repo. If
+        // it were followed, that external content would be mined as `link.md`.
+        let external_dir = tempdir.path().join("external");
+        fs::create_dir_all(&external_dir).unwrap();
+        let external = external_dir.join("credentials.md");
+        fs::write(&external, "TOP-SECRET-EXTERNAL\n".repeat(5)).unwrap();
+        symlink(&external, root.join("link.md")).unwrap();
+
+        let run = |args: &[&str]| {
+            let status = Command::new("git").args(args).current_dir(&root).status().unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run(&["add", "-f", "link.md"]);
+
+        let discovery = discover_project_sources(&root).unwrap();
+        assert_eq!(discovery.basis, ProjectSourceBasis::GitIndex);
+        let names: Vec<_> = discovery.sources.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["notes.md", "tracked.md"]);
+        assert!(
+            !discovery.sources.iter().any(|s| s.relative_path == "link.md"),
+            "tracked symlink must not be discovered: {names:?}"
+        );
+        // The symlink is a skipped candidate, exactly like any other ineligible
+        // index entry, and never becomes a source so its target is never read.
+        assert_eq!(discovery.skipped, 1);
+    }
+
+    /// A full canonical mine never reads the target of a tracked symlink that
+    /// escapes the root: the external file produces no ingested-file record and
+    /// no drawer under the link's in-repo path.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn git_index_mine_does_not_read_tracked_symlink_target() {
+        use std::os::unix::fs::symlink;
+
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path().join("repo");
+        fs::create_dir_all(&root).unwrap();
+        git_init_with_commit(
+            &root,
+            "main",
+            &[
+                ("mempalace.yaml", "wing: symlinktest\nrooms:\n  - name: general\n"),
+                ("tracked.md", "tracked content\n"),
+            ],
+        );
+
+        // The external target is eligible and long enough to be chunked, so a
+        // regression that followed the link would ingest it as `link.md`.
+        let secret = "TOP-SECRET-EXTERNAL-CONTENT\n".repeat(10);
+        let external_dir = tempdir.path().join("external");
+        fs::create_dir_all(&external_dir).unwrap();
+        fs::write(external_dir.join("credentials.md"), &secret).unwrap();
+        symlink(external_dir.join("credentials.md"), root.join("link.md")).unwrap();
+        let status = Command::new("git")
+            .args(["add", "-f", "link.md"])
+            .current_dir(&root)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git add symlink failed");
+
+        let engine = open_engine(&tempdir.path().join("palace")).await;
+        let mut provider =
+            FakeEmbeddingProvider::new(EmbeddingProfile::Balanced.metadata().dimensions);
+        let summary = ingest_project(
+            &engine,
+            &mut provider,
+            &ProjectIngestRequest {
+                project_dir: root.clone(),
+                wing: None,
+                agent: "tester".to_owned(),
+                limit: None,
+                dry_run: false,
+                reindex: false,
+                max_embed_batch_size: None,
+                branch: false,
+                view: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // The escaping symlink never becomes a source, so its target is never
+        // read: the tracked regular file is the only discovered/ingested file.
+        assert_eq!(summary.discovered_files, 1);
+        assert_eq!(summary.ingested_files, 1);
+
+        // No ingested-file record exists under the link's in-repo path.
+        let canonical_root = root.canonicalize().unwrap();
+        let repo_id = derive_repo_id(&canonical_root, "symlinktest");
+        let project_root_key = stable_project_root_key(&repo_id);
+        let link_key = project_source_key("projects", &project_root_key, "symlinktest", "link.md");
+        assert!(
+            engine.operational_store().get_ingested_file(&link_key).unwrap().is_none(),
+            "no ingested-file record may exist for the tracked symlink path"
+        );
+
+        // And no drawer references the link path or holds the external content.
+        let drawers = engine
+            .drawer_store()
+            .list_drawers(&DrawerFilter {
+                source_file: Some("link.md".to_owned()),
+                ..DrawerFilter::default()
+            })
+            .await
+            .unwrap();
+        assert!(drawers.is_empty(), "no drawer may reference the tracked symlink path");
+    }
+
+    /// Nested `.mempalaceignore` files apply to tracked files in their scope.
+    #[test]
+    fn git_index_discovery_honors_nested_mempalace_ignore() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path().to_path_buf();
+        git_init_with_commit(
+            &root,
+            "main",
+            &[
+                ("src/lib.rs", "fn lib() {}\n"),
+                ("src/skip.me.md", "skip\n"),
+                ("docs/keep.md", "keep\n"),
+            ],
+        );
+        fs::write(root.join("src").join(".mempalaceignore"), "skip.me.md\n").unwrap();
+
+        let discovery = discover_project_sources(&root).unwrap();
+        assert_eq!(discovery.basis, ProjectSourceBasis::GitIndex);
+        let names: Vec<_> = discovery.sources.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["docs/keep.md", "src/lib.rs"]);
+        assert_eq!(discovery.skipped, 1);
+    }
+
+    /// An intermediate ancestor's `.mempalaceignore` applies to tracked files
+    /// beneath it, even when the immediate parent directory has no ignore file
+    /// of its own: `a/.mempalaceignore` excludes `a/b/file.rs`.
+    #[test]
+    fn git_index_discovery_loads_ancestor_mempalace_ignore_scope() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path().to_path_buf();
+        git_init_with_commit(
+            &root,
+            "main",
+            &[
+                ("a/b/file.rs", "fn f() {}\n"),
+                ("a/b/keep.md", "keep\n"),
+                ("c/main.rs", "fn main() {}\n"),
+            ],
+        );
+        // Only the intermediate ancestor directory `a` carries an ignore file;
+        // `a/b` itself has none.
+        fs::write(root.join("a").join(".mempalaceignore"), "file.rs\n").unwrap();
+
+        let discovery = discover_project_sources(&root).unwrap();
+        assert_eq!(discovery.basis, ProjectSourceBasis::GitIndex);
+        let names: Vec<_> = discovery.sources.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["a/b/keep.md", "c/main.rs"]);
+        assert_eq!(discovery.skipped, 1);
+    }
+
+    /// Nested ancestor `.mempalaceignore` scopes are loaded in root-to-leaf
+    /// order and deeper scopes take precedence: a negation in a deeper ancestor
+    /// scope re-includes a tracked file a shallower scope excluded.
+    #[test]
+    fn git_index_discovery_nested_ancestor_scope_precedence() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path().to_path_buf();
+        git_init_with_commit(
+            &root,
+            "main",
+            &[
+                ("a/keep.md", "keep\n"),
+                ("a/b/nested.md", "nested\n"),
+                ("a/drop.md", "drop\n"),
+                ("a/b/drop2.md", "drop2\n"),
+                ("main.rs", "fn main() {}\n"),
+            ],
+        );
+        fs::write(root.join(".mempalaceignore"), "*.md\n").unwrap();
+        fs::write(root.join("a").join(".mempalaceignore"), "!keep.md\n").unwrap();
+        fs::write(root.join("a").join("b").join(".mempalaceignore"), "!nested.md\n").unwrap();
+
+        let discovery = discover_project_sources(&root).unwrap();
+        assert_eq!(discovery.basis, ProjectSourceBasis::GitIndex);
+        let names: Vec<_> = discovery.sources.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["a/b/nested.md", "a/keep.md", "main.rs"]);
+        assert_eq!(discovery.skipped, 2);
+    }
+
+    /// A directory-only `.mempalaceignore` rule (`generated/`) excludes the
+    /// tracked files beneath that directory in git-index mode.
+    #[test]
+    fn git_index_discovery_honors_directory_only_mempalace_ignore() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path().to_path_buf();
+        git_init_with_commit(
+            &root,
+            "main",
+            &[("generated/out.rs", "fn out() {}\n"), ("src/lib.rs", "fn lib() {}\n")],
+        );
+        fs::write(root.join(".mempalaceignore"), "generated/\n").unwrap();
+
+        let discovery = discover_project_sources(&root).unwrap();
+        assert_eq!(discovery.basis, ProjectSourceBasis::GitIndex);
+        let names: Vec<_> = discovery.sources.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["src/lib.rs"]);
+        assert_eq!(discovery.skipped, 1);
+    }
+
+    /// Non-Git roots keep the filesystem walk and report the Filesystem basis.
+    #[test]
+    fn discover_project_sources_reports_filesystem_basis_for_non_git() {
+        let tempdir = tempdir().unwrap();
+        fs::write(tempdir.path().join(".gitignore"), "ignored/\n").unwrap();
+        fs::create_dir_all(tempdir.path().join("ignored")).unwrap();
+        fs::write(tempdir.path().join("ignored").join("secret.md"), "hidden").unwrap();
+        fs::create_dir_all(tempdir.path().join("keep")).unwrap();
+        fs::write(tempdir.path().join("keep").join("visible.md"), "visible").unwrap();
+
+        let discovery = discover_project_sources(tempdir.path()).unwrap();
+        assert_eq!(discovery.basis, ProjectSourceBasis::Filesystem);
+        let names: Vec<_> = discovery.sources.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["keep/visible.md"]);
+        assert!(discovery.skipped >= 2);
+    }
+
+    /// Nested `.gitignore` files apply relative to their own directory, so a
+    /// deeper ignore file can hide files a shallower one would keep.
+    #[test]
+    fn filesystem_discovery_honors_nested_gitignore() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path();
+        fs::write(root.join(".gitignore"), "*.log\n").unwrap();
+        fs::create_dir_all(root.join("sub")).unwrap();
+        fs::write(root.join("sub").join(".gitignore"), "secret.md\n").unwrap();
+        fs::write(root.join("sub").join("secret.md"), "hidden").unwrap();
+        fs::write(root.join("sub").join("visible.md"), "visible").unwrap();
+        fs::write(root.join("trace.log"), "noise").unwrap();
+
+        let discovery = discover_project_sources(root).unwrap();
+        assert_eq!(discovery.basis, ProjectSourceBasis::Filesystem);
+        let names: Vec<_> = discovery.sources.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["sub/visible.md"]);
+    }
+
+    /// `!`-negated patterns re-include paths a previous rule excluded.
+    #[test]
+    fn filesystem_discovery_supports_negation() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path();
+        fs::write(root.join(".gitignore"), "*.md\n!important.md\n").unwrap();
+        fs::write(root.join("trace.md"), "noise").unwrap();
+        fs::write(root.join("important.md"), "keep").unwrap();
+
+        let discovery = discover_project_sources(root).unwrap();
+        assert_eq!(discovery.basis, ProjectSourceBasis::Filesystem);
+        let names: Vec<_> = discovery.sources.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["important.md"]);
+    }
+
+    /// Slash-anchored patterns match relative to the ignore file's directory,
+    /// unlike unanchored basename patterns which match at any depth.
+    #[test]
+    fn filesystem_discovery_honors_anchored_patterns() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path();
+        fs::write(root.join(".gitignore"), "/artifacts/\n").unwrap();
+        fs::create_dir_all(root.join("artifacts")).unwrap();
+        fs::write(root.join("artifacts").join("artifact.md"), "a").unwrap();
+        fs::create_dir_all(root.join("src").join("artifacts")).unwrap();
+        fs::write(root.join("src").join("artifacts").join("artifact.md"), "b").unwrap();
+        fs::write(root.join("src").join("lib.md"), "lib").unwrap();
+
+        let discovery = discover_project_sources(root).unwrap();
+        assert_eq!(discovery.basis, ProjectSourceBasis::Filesystem);
+        let names: Vec<_> = discovery.sources.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["src/artifacts/artifact.md", "src/lib.md"]);
+    }
+
+    /// Git glob semantics: `*` does not cross `/`, `?` matches one character,
+    /// and `**` spans directory levels.
+    #[test]
+    fn filesystem_discovery_supports_globs_and_doublestar() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path();
+        fs::write(
+            root.join(".gitignore"),
+            "doc/*.md\n**/cache/tmp?.md\na/**/b/m.md\n",
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("doc").join("nested")).unwrap();
+        fs::write(root.join("doc").join("readme.md"), "r").unwrap();
+        fs::write(root.join("doc").join("nested").join("readme.md"), "r2").unwrap();
+        fs::create_dir_all(root.join("x").join("cache")).unwrap();
+        fs::write(root.join("x").join("cache").join("tmp1.md"), "t1").unwrap();
+        fs::write(root.join("x").join("cache").join("tmp12.md"), "t12").unwrap();
+        fs::create_dir_all(root.join("a").join("x").join("b")).unwrap();
+        fs::write(root.join("a").join("x").join("b").join("m.md"), "m").unwrap();
+        fs::create_dir_all(root.join("a").join("b")).unwrap();
+        fs::write(root.join("a").join("b").join("n.md"), "n").unwrap();
+
+        let discovery = discover_project_sources(root).unwrap();
+        assert_eq!(discovery.basis, ProjectSourceBasis::Filesystem);
+        let names: Vec<_> = discovery.sources.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["a/b/n.md", "doc/nested/readme.md", "x/cache/tmp12.md"]);
+    }
+
+    /// A trailing `/**` matches everything inside the named directory but not
+    /// the directory itself, exactly as git's `abc/**` keeps `abc` traversable
+    /// so a `!abc/keep.md` rule can still re-include a file beneath it.
+    #[test]
+    fn filesystem_discovery_trailing_doublestar_does_not_exclude_directory() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path();
+        fs::write(root.join(".gitignore"), "abc/**\n!abc/keep.md\n").unwrap();
+        fs::create_dir_all(root.join("abc")).unwrap();
+        fs::write(root.join("abc").join("keep.md"), "kept\n").unwrap();
+        fs::write(root.join("abc").join("drop.md"), "ignored\n").unwrap();
+
+        let discovery = discover_project_sources(root).unwrap();
+        assert_eq!(discovery.basis, ProjectSourceBasis::Filesystem);
+        let names: Vec<_> = discovery.sources.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["abc/keep.md"]);
+        assert!(discovery.skipped >= 1, "abc/drop.md should be skipped");
+    }
+
+    /// A trailing `/**` on a directory-only rule still ignores only what is
+    /// inside the directory, mirroring git's `abc/**/`: the directory `abc`
+    /// itself and files directly inside it stay, while subdirectories (and
+    /// everything beneath them) are ignored.
+    #[test]
+    fn filesystem_discovery_trailing_doublestar_directory_only_keeps_dir_itself() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path();
+        fs::write(root.join(".gitignore"), "abc/**/\n").unwrap();
+        fs::create_dir_all(root.join("abc").join("sub")).unwrap();
+        fs::write(root.join("abc").join("top.md"), "kept\n").unwrap();
+        fs::write(root.join("abc").join("sub").join("drop.md"), "ignored\n").unwrap();
+
+        let discovery = discover_project_sources(root).unwrap();
+        assert_eq!(discovery.basis, ProjectSourceBasis::Filesystem);
+        let names: Vec<_> = discovery.sources.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["abc/top.md"]);
+        assert!(discovery.skipped >= 1, "abc/sub should be skipped");
+    }
+
+    /// An unescaped trailing space is stripped, but an escaped one is kept: a
+    /// `foo\ ` pattern targets a filename literally ending in a space, as in
+    /// git.
+    #[test]
+    fn parse_ignore_pattern_strips_unescaped_but_keeps_escaped_trailing_space() {
+        let bare = parse_ignore_pattern("notes.txt ").unwrap();
+        assert_eq!(bare.parts, vec!["notes.txt".to_owned()]);
+
+        let escaped = parse_ignore_pattern("trail\\ ").unwrap();
+        assert_eq!(escaped.parts, vec!["trail\\ ".to_owned()]);
+        assert!(escaped.matches_path("trail ", false));
+        assert!(!escaped.matches_path("trail", false));
+
+        let tabbed = parse_ignore_pattern("notes.txt\t").unwrap();
+        assert_eq!(tabbed.parts, vec!["notes.txt".to_owned()]);
+
+        let escaped_tab = parse_ignore_pattern("tab\\\t").unwrap();
+        assert!(escaped_tab.matches_path("tab\t", false));
+    }
+
+    /// A leading backslash escapes only a literal `#`/`!` (so those characters
+    /// can open a real pattern); for any other character the backslash is part
+    /// of the glob, so `\*` targets a file literally named `*` instead of
+    /// matching everything (regression for the ignore-everything bug).
+    #[test]
+    fn parse_ignore_pattern_escapes_only_literal_hash_and_bang() {
+        let star = parse_ignore_pattern("\\*").unwrap();
+        assert_eq!(star.parts, vec!["\\*".to_owned()]);
+        assert!(star.matches_path("*", false));
+        assert!(!star.matches_path("anything", false));
+
+        let star_md = parse_ignore_pattern("\\*.md").unwrap();
+        assert_eq!(star_md.parts, vec!["\\*.md".to_owned()]);
+        assert!(star_md.matches_path("*.md", false));
+        assert!(!star_md.matches_path("notes.md", false));
+
+        let hash = parse_ignore_pattern("\\#hash").unwrap();
+        assert_eq!(hash.parts, vec!["#hash".to_owned()]);
+        assert!(hash.matches_path("#hash", false));
+
+        let bang = parse_ignore_pattern("\\!bang").unwrap();
+        assert_eq!(bang.parts, vec!["!bang".to_owned()]);
+        assert!(!bang.negated);
+        assert!(bang.matches_path("!bang", false));
+    }
+
+    /// A `.gitignore` line `\*.md` ignores only a file literally named
+    /// `*.md`, not every `.md` file (regression: the escaped backslash was
+    /// stripped and the pattern became an ignore-everything `*.md`).
+    #[test]
+    fn filesystem_discovery_escaped_leading_glob_does_not_ignore_everything() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path();
+        fs::write(root.join(".gitignore"), "\\*.md\n").unwrap();
+        fs::write(root.join("*.md"), "ignored").unwrap();
+        fs::write(root.join("normal.md"), "kept").unwrap();
+
+        let discovery = discover_project_sources(root).unwrap();
+        assert_eq!(discovery.basis, ProjectSourceBasis::Filesystem);
+        let names: Vec<_> = discovery.sources.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["normal.md"]);
+    }
+
+    /// The `core.excludesFile` global excludes file applies to the non-Git
+    /// filesystem fallback too, not just Git-backed walks. `$GIT_DIR/info/
+    /// exclude` is git-specific, but the global file is user-level git
+    /// configuration. The test re-runs itself in a child process with a temp
+    /// `HOME` (and the system gitconfig disabled) so git resolves its global
+    /// config to a hermetic `.gitconfig`.
+    #[test]
+    fn non_git_filesystem_walk_honors_global_excludes_file() {
+        const TEST_NAME: &str = "tests::non_git_filesystem_walk_honors_global_excludes_file";
+        // Child mode: the temp HOME is active, so run the real assertions.
+        if std::env::var_os("MEMPALACE_TEST_TEMP_HOME").is_some() {
+            let tempdir = tempdir().unwrap();
+            let root = tempdir.path();
+            fs::write(root.join("notes.bak.md"), "ignored\n").unwrap();
+            fs::write(root.join("notes.md"), "kept\n").unwrap();
+
+            let discovery = discover_project_sources(root).unwrap();
+            assert_eq!(discovery.basis, ProjectSourceBasis::Filesystem);
+            let names: Vec<_> =
+                discovery.sources.iter().map(|s| s.relative_path.as_str()).collect();
+            assert_eq!(names, vec!["notes.md"]);
+            return;
+        }
+
+        // Parent mode: write a global excludes file and a `.gitconfig` that
+        // points at it, then re-run this test under a temp HOME.
+        let tempdir = tempdir().unwrap();
+        let home = tempdir.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let global = tempdir.path().join("global-excludes");
+        fs::write(&global, "*.bak.md\n").unwrap();
+        fs::write(
+            home.join(".gitconfig"),
+            format!("[core]\n\texcludesFile = {}\n", global.display()),
+        )
+        .unwrap();
+
+        let output = Command::new(std::env::current_exe().unwrap())
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("MEMPALACE_TEST_TEMP_HOME", "1")
+            .env_remove("GIT_CONFIG_GLOBAL")
+            .args(["--exact", TEST_NAME])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child run of {TEST_NAME} failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    /// A trailing `/**` keeps the directory walkable so the walker can evaluate
+    /// a re-inclusion rule for a file inside it — the case that broke before
+    /// the trailing-`/**` fix.
+    #[test]
+    fn filesystem_walk_reincludes_file_under_trailing_doublestar_ignore() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path().to_path_buf();
+        fs::write(root.join(".gitignore"), "abc/**\n!abc/keep.md\n").unwrap();
+        fs::create_dir_all(root.join("abc")).unwrap();
+        fs::write(root.join("abc").join("keep.md"), "kept\n").unwrap();
+        fs::write(root.join("abc").join("drop.md"), "ignored\n").unwrap();
+
+        let report = discover_project_files(&root).unwrap();
+        let names: Vec<_> = report.files.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["abc/keep.md"]);
+    }
+
+    /// Pin this repo's `core.excludesFile` to a path that does not exist so
+    /// global excludes are deterministic regardless of the host's git config.
+    fn pin_absent_global_excludes(root: &Path) {
+        let status = Command::new("git")
+            .args(["config", "core.excludesFile", "absent-global-excludes"])
+            .current_dir(root)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git config core.excludesFile failed");
+    }
+
+    /// `$GIT_DIR/info/exclude` excludes untracked files in a Git-backed
+    /// filesystem walk (branch-delta mining), with patterns anchored at the
+    /// repository root.
+    #[test]
+    fn filesystem_walk_honors_git_info_exclude() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path().to_path_buf();
+        git_init_with_commit(&root, "main", &[("tracked.md", "tracked\n")]);
+        pin_absent_global_excludes(&root);
+        fs::create_dir_all(root.join(".git").join("info")).unwrap();
+        fs::write(root.join(".git").join("info").join("exclude"), "local.md\n").unwrap();
+        fs::write(root.join("local.md"), "ignored\n").unwrap();
+        fs::write(root.join("keep.md"), "kept\n").unwrap();
+
+        let report = discover_project_files_with_untracked(&root).unwrap();
+        let names: Vec<_> = report.files.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["keep.md", "tracked.md"]);
+    }
+
+    /// The `core.excludesFile` global excludes file excludes untracked files
+    /// in a Git-backed filesystem walk.
+    #[test]
+    fn filesystem_walk_honors_core_excludes_file() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path().to_path_buf();
+        git_init_with_commit(&root, "main", &[("tracked.md", "tracked\n")]);
+        let global = tempdir.path().join("global-excludes");
+        fs::write(&global, "*.bak.md\n").unwrap();
+        let status = Command::new("git")
+            .args(["config", "core.excludesFile", global.to_str().unwrap()])
+            .current_dir(&root)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git config core.excludesFile failed");
+        fs::write(root.join("notes.bak.md"), "ignored\n").unwrap();
+        fs::write(root.join("notes.md"), "kept\n").unwrap();
+
+        let report = discover_project_files_with_untracked(&root).unwrap();
+        let names: Vec<_> = report.files.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["notes.md", "tracked.md"]);
+    }
+
+    /// Worktree `.gitignore` patterns outrank `$GIT_DIR/info/exclude`: an
+    /// `info/exclude` negation cannot re-include a file a `.gitignore`
+    /// (higher-precedence) rule excludes.
+    #[test]
+    fn filesystem_walk_precedence_gitignore_beats_info_exclude() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path().to_path_buf();
+        git_init_with_commit(&root, "main", &[("tracked.rs", "fn tracked() {}\n")]);
+        pin_absent_global_excludes(&root);
+        fs::write(root.join(".gitignore"), "*.md\n").unwrap();
+        fs::create_dir_all(root.join(".git").join("info")).unwrap();
+        fs::write(root.join(".git").join("info").join("exclude"), "!keep.md\n").unwrap();
+        fs::write(root.join("keep.md"), "ignored\n").unwrap();
+
+        let report = discover_project_files_with_untracked(&root).unwrap();
+        let names: Vec<_> = report.files.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["tracked.rs"]);
+    }
+
+    /// `$GIT_DIR/info/exclude` outranks the global excludes file: an
+    /// `info/exclude` negation re-includes a file a global rule excludes.
+    #[test]
+    fn filesystem_walk_precedence_info_exclude_beats_global() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path().to_path_buf();
+        git_init_with_commit(&root, "main", &[("tracked.rs", "fn tracked() {}\n")]);
+        let global = tempdir.path().join("global-excludes");
+        fs::write(&global, "*.md\n").unwrap();
+        let status = Command::new("git")
+            .args(["config", "core.excludesFile", global.to_str().unwrap()])
+            .current_dir(&root)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git config core.excludesFile failed");
+        fs::create_dir_all(root.join(".git").join("info")).unwrap();
+        fs::write(root.join(".git").join("info").join("exclude"), "!keep.md\n").unwrap();
+        fs::write(root.join("keep.md"), "kept\n").unwrap();
+        fs::write(root.join("skip.md"), "ignored\n").unwrap();
+
+        let report = discover_project_files_with_untracked(&root).unwrap();
+        let names: Vec<_> = report.files.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["keep.md", "tracked.rs"]);
+    }
+
+    /// Git-index discovery never consults repository-level excludes: a tracked
+    /// file stays eligible even when `$GIT_DIR/info/exclude` names it, exactly
+    /// as git keeps tracked paths tracked.
+    #[test]
+    fn git_index_discovery_ignores_repo_excludes_for_tracked_files() {
+        let tempdir = tempdir().unwrap();
+        let root = tempdir.path().to_path_buf();
+        git_init_with_commit(
+            &root,
+            "main",
+            &[("tracked.md", "tracked\n"), ("docs/notes.md", "notes\n")],
+        );
+        fs::create_dir_all(root.join(".git").join("info")).unwrap();
+        fs::write(root.join(".git").join("info").join("exclude"), "tracked.md\n").unwrap();
+
+        let discovery = discover_project_sources(&root).unwrap();
+        assert_eq!(discovery.basis, ProjectSourceBasis::GitIndex);
+        let names: Vec<_> = discovery.sources.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(names, vec!["docs/notes.md", "tracked.md"]);
+        assert_eq!(discovery.skipped, 0);
+    }
+
+    /// The XDG fallback location for global excludes follows git's default
+    /// (`$XDG_CONFIG_HOME/git/ignore`, else `~/.config/git/ignore`).
+    #[test]
+    fn default_global_excludes_path_follows_xdg_then_home() {
+        assert_eq!(
+            default_global_excludes_path(Some("/custom/xdg"), Some(Path::new("/home/u"))),
+            PathBuf::from("/custom/xdg/git/ignore")
+        );
+        assert_eq!(
+            default_global_excludes_path(None, Some(Path::new("/home/u"))),
+            PathBuf::from("/home/u/.config/git/ignore")
+        );
+        assert_eq!(
+            default_global_excludes_path(Some(""), Some(Path::new("/home/u"))),
+            PathBuf::from("/home/u/.config/git/ignore")
+        );
+    }
+
     #[test]
     fn detect_checkout_view_returns_nongit_for_non_repo() {
         let tempdir = tempdir().unwrap();
@@ -5556,5 +8284,6 @@ mod tests {
     fn ingest_summary_view_name_defaults_to_none() {
         let summary = IngestSummary::default();
         assert_eq!(summary.view_name, None);
+        assert!(summary.secret_path_skips.is_empty());
     }
 }

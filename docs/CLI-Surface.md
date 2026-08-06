@@ -12,7 +12,7 @@ This is the frozen command surface for `mempalace-cli` v1.
 ### `init <dir>`
 
 Purpose:
-- Detect rooms from the project folder structure.
+- Detect rooms from the project's safe source directories.
 - Register the project centrally under the configured MemPalace base directory.
 - Initialize the default global config tree if needed.
 - Run embedding startup validation and report the status.
@@ -30,7 +30,17 @@ Flags:
 
 Notes:
 - Wing name is derived from the directory name, lowercased with spaces and hyphens normalized to underscores.
-- Room detection is folder-name-based and always includes a `general` room.
+- Room detection derives from the same safe source set mining uses: Git-backed
+  checkouts use the tracked index, and non-Git directories use the
+  ignore-aware filesystem walk, so ignored, untracked, secret-shaped,
+  tracked-symlink, and linked-worktree files never produce rooms. A Git-backed
+  root whose index
+  cannot be enumerated fails discovery rather than silently falling back to a
+  filesystem walk. A `general` room is always included.
+- The summary's file count reports the number of eligible project sources in
+  that same safe set — the files `mine` would actually ingest — rather than a
+  raw directory traversal, so ignored/untracked/secret-shaped files are not
+  counted.
 - The central registry is stored at `<base-dir>/projects.json` (normally
   `~/.mempalace/projects.json`) and uses normalized Git origin identity when
   available, with checkout paths as discovery aliases.
@@ -97,6 +107,54 @@ Automatic view detection (`--mode projects` only):
 Behavior:
 - `projects` uses the project ingest path.
 - `convos` uses the conversation ingest path.
+- In `convos` mode, discovery walks the conversation directory honouring only
+  the worktree ignore files (nested `.gitignore`/`.mempalaceignore` and the
+  built-in skip directories), then applies the `.txt`/`.md`/`.json`/`.jsonl`
+  extension filter. It deliberately does **not** load the repository-level
+  exclude sources (`$GIT_DIR/info/exclude`, `core.excludesFile`) and does not
+  apply the project secret-path denylist, so conversation discovery never
+  depends on git state or spawns git subprocesses. See
+  [Mined-Storage.md#conversation-discovery](Mined-Storage.md#conversation-discovery).
+- In `projects` mode, source discovery honours git: a Git-backed root mines the
+  tracked index only (`git ls-files`), so ignored and untracked working-tree
+  files (e.g. `.env`, `*.local.json`, build output) are never ingested. A
+  `.gitignore` never suppresses a tracked file; `.mempalaceignore` is the
+  explicit additional exclusion and is deny-only — it outranks a nested
+  `.gitignore` `!` negation in filesystem and branch walks. Symlinks are
+  rejected outright before
+  any eligibility check or file read, so a link that escapes the discovery
+  root can never pull its target's content into the palace. Independently of
+  git, a path-based **secret
+  denylist** (issue #95) withholds secret-shaped paths — `.env`/`*.env`,
+  `*.kubeconfig*`, SSH private keys (`id_rsa`, `id_ed25519`, `id_ecdsa`,
+  `id_dsa` — exact name, so public keys and prefix collisions stay
+  discoverable), keystores (`*.pfx`/`*.p12`/`*.jks`), `.npmrc`/`.netrc`,
+  `*.tfstate`/`*.tfvars`, `secrets*.json`, `*.local.json` — before any content
+  is read, in both Git-index and filesystem discovery. These are counted like
+  any skipped candidate and shown in the mine summary as `Secrets withheld: N`
+  with one `<path> — secret-shaped path (<reason>)` line per withheld file
+  (never the file content). Non-Git directories fall back to a filesystem
+  walk that honours `.gitignore` and `.mempalaceignore` at every level with
+  git-compatible semantics (nesting, `!` negation, anchoring, and globs) plus
+  the `core.excludesFile` global excludes file. Branch-delta mines
+  (`--branch` / `--view <name>`) union the tracked-index set with the
+  untracked, non-ignored filesystem walk, so a changed tracked file is never
+  lost to `.gitignore`; that walk excludes every tracked index path before
+  reading it, so rejected tracked symlinks cannot re-enter from the filesystem.
+  It honours
+  `$GIT_DIR/info/exclude` too — both repository-level sources at git's
+  precedence, anchored at the Git toplevel (a rooted `/secret.md` excludes
+  only the toplevel `secret.md`, never `sub/secret.md`). Linked git worktrees
+  are always excluded from mining. A
+  Git-backed root whose Git detection or index cannot be read fails discovery
+  with a `GitIndexUnavailable` error rather than falling back to a filesystem
+  walk, so a git-read failure can never leak untracked or ignored content into a
+  canonical mine. See
+  [Mined-Storage.md#discovery-rules](Mined-Storage.md#discovery-rules).
+- A canonical mine's `Files discovered` count is the same effective source
+  population that `init` and `project register` report, so the three commands
+  agree on what would be ingested. Branch-delta mines are the deliberate
+  exception: their filesystem walk also picks up untracked, non-ignored files.
 - Project resolution checks explicit CLI values, optional repository-local
   config, the central project registry, and then derived defaults. A project
   can therefore be mined without `mempalace.yaml`.
@@ -124,6 +182,13 @@ Commands:
 
 `project register --repo-config` additionally emits a portable repository-local
 `mempalace.yaml`.
+
+`project register` derives rooms from the same safe source set `init` and a
+canonical mine use (tracked index for Git-backed roots, the ignore-aware
+filesystem walk otherwise), and its output reports the same eligible source
+count as `init`'s summary — the files a canonical mine would actually ingest —
+so ignored, untracked, secret-shaped, tracked-symlink, and linked-worktree
+files are neither counted nor turned into rooms.
 
 ### `search <query>`
 
@@ -193,7 +258,11 @@ Behavior:
 - Exit codes: `0` on success (including "nothing matched"); `2` for a scope that is too broad,
   invalid, or selects nothing; `1` when no palace exists at the resolved path.
 
-Known limitation:
+Known limitations:
+- Canonical stale-row reconciliation is local-only. A `write: remote` mine uploads
+  eligible files but does not delete stale remote rows; with `write: both`, only the
+  local replica is reconciled. Remote stale-row reconciliation is not currently
+  available through `mine` or `prune`.
 - Project data mined **before** the stable project-id migration is keyed by a checkout-path
   hash rather than `hash("project:<id>")`, so `--project-id` does not match those legacy
   rows. Re-mining migrates the **canonical** ones. Legacy `projects-branch` rows are never

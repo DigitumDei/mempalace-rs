@@ -142,13 +142,125 @@ valid UTF-8 always use the legacy stored-content path. Re-mining them with
 
 ## Discovery rules
 
-`mine --mode projects` uses the following acceptance rules on every file found
-under the target directory. `.gitignore` and `.mempalaceignore` files are
-honored throughout, and the following directory names are always skipped:
-`.git`, `node_modules`, `__pycache__`, `.venv`, `venv`, `env`, `dist`, `build`,
-`.next`, `coverage`, `.mempalace`. Linked Git worktrees reported by
-`git worktree list --porcelain` are also skipped, preventing duplicate checkout
-content from being mined.
+`mine --mode projects` discovers eligible sources in one of two ways:
+
+- **Git-backed roots** enumerate the tracked index (`git ls-files`): only
+  tracked index files are mined (this includes staged, uncommitted entries,
+  but never untracked or ignored working-tree content). Ignored and untracked
+  working-tree content (`.gitignore`d files such as `.env`, local editor
+  overrides like `*.local.json`, and build output) never enters the source set
+  because it is simply absent from the index. A `.gitignore` does **not**
+  suppress a tracked file: tracked paths remain tracked even after an ignore
+  pattern is added. `.mempalaceignore` is the explicit additional exclusion and
+  applies to tracked files, including nested files at any depth: it is read from
+  the root and from every ancestor directory of each tracked path (in
+  root-to-leaf order), so an intermediate scope such as `a/.mempalaceignore`
+  applies to `a/b/file.rs` just as `a/b`'s own file does, and deeper scopes take
+  precedence over shallower ones. Independently
+  of git, the secret-path denylist still applies to tracked index paths: a
+  secret-shaped file that was committed (e.g. a tracked `.env`) is withheld and
+  reported, never mined. Tracked **symlinks are rejected outright**, before any
+  eligibility check or file read: a symlink can point outside the discovery
+  root, and its target's content must never be mined under an in-repo path.
+  Branch-delta
+  mines (`--branch` / `--view <name>`) are the deliberate exception: their source
+  set is the union of the canonical tracked-index set and the untracked,
+  non-ignored filesystem walk, so that new branch work is captured before it is
+  committed *and* a changed tracked file is never lost to `.gitignore`. Because
+  tracked files come from the index, a branch edit to a tracked `generated/schema.rs`
+  still produces a branch row even when `generated/` is listed in `.gitignore`.
+  The filesystem half is strictly untracked-only: it excludes **all** index
+  paths before any file read, including rejected tracked symlinks, so it cannot
+  reintroduce an external symlink target.
+
+  The tracked-index guarantee is strict: a Git-backed root whose Git detection
+  or index enumeration fails (`git rev-parse` / `git ls-files`) fails discovery
+  with a `GitIndexUnavailable` error rather than silently falling back to a
+  filesystem walk, so untracked or ignored working-tree content can never leak
+  into a canonical mine through a failed git read. In this canonical path the
+  filesystem walk is used only for roots that are not Git-backed.
+
+- **Non-Git directories** use a filesystem walk that honors `.gitignore` and
+  `.mempalaceignore` files at every directory level with git-compatible
+  semantics: nested files are scoped to their own directory, `!` patterns
+  re-include previously excluded paths, patterns containing a `/` are anchored
+  to the ignore file's directory (unanchored patterns match the basename at any
+  depth), and `*`, `?`, `[...]`, and `**` globs follow git's rules. Git-only
+  details are preserved exactly: a leading `\#` or `\!` escapes a literal
+  hash/bang that would otherwise open a comment or a negation, a trailing `/**`
+  matches everything *inside* the named directory but not the directory itself
+  (so `abc/**` + `!abc/keep.md` keeps `abc/keep.md`, as in git), and a trailing
+  space is ignored unless it is escaped (`foo\ ` targets a filename literally
+  ending in a space). The global excludes file (`core.excludesFile`, defaulting
+  to `$XDG_CONFIG_HOME/git/ignore`, or `~/.config/git/ignore`) also applies,
+  since it is user-level git configuration rather than a repository concept.
+  A missing global excludes file is treated as empty, as in git. An unreadable
+  one — a permission failure or a path that is not a regular file — is also
+  treated as empty rather than aborting discovery; this is an intentional
+  robustness divergence from git, which exits fatally when an exclude file
+  cannot be opened.
+
+The repository-level exclude sources are honored at git's precedence:
+`$GIT_DIR/info/exclude` (Git-backed roots only) and the global excludes file
+(`core.excludesFile`) for every filesystem walk, including non-Git roots. A
+relative `core.excludesFile` is resolved from the Git worktree toplevel (or the
+discovery root for a non-Git walk). As in git, `.mempalaceignore` outranks
+`.gitignore`, which outranks `info/exclude`, which outranks the global excludes
+file. The `.mempalaceignore` exclusion is
+deny-only and takes precedence over a `.gitignore` **across scopes**: a deeper
+`.gitignore` `!` negation can never clear a parent `.mempalaceignore` rule,
+which is exactly what the operator explicitly excluded from discovery. Both
+repository-level sources are purely additive and never override the
+`.mempalaceignore` local protection. Their patterns are anchored at the Git
+**toplevel** (as in git, where `info/exclude` and the global file resolve
+leading `/` against the worktree root), so mining a subdirectory of a
+repository matches them against the Git-relative path: a rooted `/secret.md`
+excludes only the toplevel `secret.md`, never `sub/secret.md`. Both are
+optional files: a missing `info/exclude` or global excludes file is treated as
+empty, as in git; one that exists but cannot be read (a permission failure or
+a directory in place of the file) is treated as empty too, rather than failing
+discovery — an intentional robustness divergence from git, which exits
+fatally when an exclude file cannot be opened. Repository-level excludes never
+apply to tracked index files: a tracked path stays eligible even when an
+exclude file names it.
+
+These linked-worktree rules apply only to project discovery. Linked Git
+worktrees reported by `git worktree list --porcelain` are always skipped,
+preventing duplicate checkout content from being mined; conversation
+discovery does not skip them, because conversation directories are not
+checkouts and its walk does not consult git state or spawn git subprocesses.
+
+### Conversation discovery
+
+`mine --mode convos` walks the conversation directory with the same worktree
+ignore handling as the non-Git project walk: nested `.gitignore`/
+`.mempalaceignore` files (git-compatible semantics) and the built-in skip
+directories apply, so an export can exclude files explicitly. The scope is
+deliberately narrower than project discovery:
+
+- The repository-level exclude sources (`$GIT_DIR/info/exclude` and the
+  `core.excludesFile` global file) are **not** loaded. Conversation exports are
+  not code, so user-level git exclusion config never silently filters them, and
+  conversation discovery does not depend on git state or spawn git
+  subprocesses.
+- The project secret-path denylist is **not** applied. Conversation discovery
+  keeps its extension-only filter, so a secret-shaped file with an accepted
+  conversation extension (for example `.env.json`) is still discovered.
+- Linked Git worktrees are not consulted (conversation directories are not
+  checkouts). The `.txt` `.md` `.json` `.jsonl` extension filter is applied
+  after the worktree ignore rules.
+
+The following directory names are always skipped: `.git`, `node_modules`,
+`__pycache__`, `.venv`, `venv`, `env`, `dist`, `build`, `.next`, `coverage`,
+`.mempalace`.
+
+Room detection during `init` and `project register` uses the same safe source
+set: rooms are derived from the directories that hold eligible sources, so
+ignored, untracked, secret-shaped, tracked-symlink, and linked-worktree files
+never produce rooms. Both commands also report the same eligible source count — the number of
+files in that safe set — which matches the `Files discovered` line of a
+canonical `mine` (branch-delta mines deliberately add untracked, non-ignored
+files and so report a larger set).
 
 ### Accepted extensions
 
@@ -185,15 +297,42 @@ Every candidate file (including extension- and basename-matched files) is
 rejected if any of the first 8 KiB of bytes is a NUL byte (`0x00`). This
 excludes misnamed binaries, compiled outputs, and other non-text data.
 
-### Always-skipped files
+### Always-skipped files in project discovery
 
-The following files are never discovered regardless of extension:
+The following files are never discovered by **project** discovery — the
+canonical Git-index path, the branch-delta filesystem walk, and the non-Git
+filesystem walk — regardless of extension. **Conversation** discovery is the
+deliberate exception: it applies only its `.txt`/`.md`/`.json`/`.jsonl`
+extension filter, so none of these rules apply there, and a file such as a
+`.env.json` or `package-lock.json` sitting in a conversation directory is still
+discovered (see [Conversation discovery](#conversation-discovery)).
 
-- **Secrets**: `.env`, `.env.*` (any name starting with `.env`)
+- **Secrets** (the path-based secret denylist, matched case-insensitively on
+  the file name **before any content is read**, in both Git-index and
+  filesystem discovery):
+  - `.env` / `.env.*` — process-environment files, plus `*.env` (an exact
+    `.env` prefix is required, so `.envrc` and `.environment` are not matched)
+  - `*.kubeconfig*` — Kubernetes configuration files
+  - `id_rsa`, `id_ed25519`, `id_ecdsa`, `id_dsa` — SSH private keys (matched
+    on the exact name, case-insensitively; public keys such as `id_ed25519.pub`
+    and unrelated names such as `id_dsa_notes.md` are not withheld)
+  - `*.pfx`, `*.p12`, `*.jks` — keystores and truststores
+  - `.npmrc`, `.netrc` — package/registry credential files
+  - `*.tfstate`, `*.tfvars` — Terraform state and variable files
+  - `secrets*.json` — JSON secret bundles
+  - `*.local.json` — local override/config files that commonly hold credentials
 - **Lockfiles**: `package-lock.json`, `Cargo.lock`, `yarn.lock`,
   `pnpm-lock.yaml`, `poetry.lock`, `composer.lock`, `Gemfile.lock`
 - **Palace config**: `mempalace.yaml`, `mempalace.yml`, `mempal.yaml`,
   `mempal.yml`, `.gitignore`
+
+Every secret-denylist exclusion is counted in the run's discovery metrics (the
+`Files ignored` line / `ProjectSourceDiscovery.skipped`) exactly like any other
+skipped candidate, and is also emitted as an **operator-visible skip record**
+with the withheld path and a short reason — but never any file content. The
+mine summary reports these as `Secrets withheld: N` followed by one
+`<path> — secret-shaped path (<reason>)` line per path, so an operator can see
+what was withheld rather than having to audit after the fact.
 
 ## Federation notes
 
@@ -501,6 +640,28 @@ therefore converge on the same keys.
 > `--wing` + `--kind projects-branch` prune after checking the preview —
 > `prune --project-id` cannot select them, because it builds the stable-identity prefix
 > these rows were never keyed under. See [CLI Surface → `prune`](CLI-Surface.md#prune).
+
+> **Local canonical re-mine purges stale stable rows.** In addition to the legacy sweep
+> above, an unlimited **local** canonical mine (`mine <dir>`, no `--limit`, not `--dry-run`)
+> enumerates the current stable prefix
+> `projects:{wing}:{blake3_hex("project:" + repo_id)}:` and removes any row whose
+> relative path is **not** in the freshly discovered eligible source set. This is what
+> makes the discovery safety policy (tracked-index-only population, the secret-path
+> denylist, and symlink rejection) retroactive: content that a re-mine now
+> excludes — a secret denylisted by name, or a file that only lives outside the tracked
+> index — has its previously mined manifests and drawers removed rather than left
+> searchable. To avoid treating a sparse or partial working tree as an authoritative
+> deletion snapshot, the purge is skipped when any tracked index path is absent from
+> disk. The purge is scoped to the current project identity, so re-mining one
+> project in a wing never touches another project's rows in the same wing. Rows are
+> removed only on an unlimited run; a `--limit` deliberately leaves out-of-limit paths
+> in place, and a secret removed this way is reported in `Sources removed: N`.
+>
+> **Remote canonical mines are additive.** A wing routed with `write: remote` uploads
+> the currently eligible files but does not reconcile or delete stale remote rows.
+> With `write: both`, the local replica receives the reconciliation above while the
+> remote replica remains additive. Remote stale-row reconciliation is not currently
+> available through `mine` or `prune`.
 
 ### Overlay composition at search time
 

@@ -258,7 +258,11 @@ Behavior:
 - Exit codes: `0` on success (including "nothing matched"); `2` for a scope that is too broad,
   invalid, or selects nothing; `1` when no palace exists at the resolved path.
 
-Known limitation:
+Known limitations:
+- Canonical stale-row reconciliation is local-only. A `write: remote` mine uploads
+  eligible files but does not delete stale remote rows; with `write: both`, only the
+  local replica is reconciled. Remote stale-row reconciliation is not currently
+  available through `mine` or `prune`.
 - Project data mined **before** the stable project-id migration is keyed by a checkout-path
   hash rather than `hash("project:<id>")`, so `--project-id` does not match those legacy
   rows. Re-mining migrates the **canonical** ones. Legacy `projects-branch` rows are never

@@ -641,8 +641,8 @@ therefore converge on the same keys.
 > `prune --project-id` cannot select them, because it builds the stable-identity prefix
 > these rows were never keyed under. See [CLI Surface → `prune`](CLI-Surface.md#prune).
 
-> **Canonical re-mine purges stale stable rows.** In addition to the legacy sweep
-> above, an unlimited canonical mine (`mine <dir>`, no `--limit`, not `--dry-run`)
+> **Local canonical re-mine purges stale stable rows.** In addition to the legacy sweep
+> above, an unlimited **local** canonical mine (`mine <dir>`, no `--limit`, not `--dry-run`)
 > enumerates the current stable prefix
 > `projects:{wing}:{blake3_hex("project:" + repo_id)}:` and removes any row whose
 > relative path is **not** in the freshly discovered eligible source set. This is what
@@ -656,6 +656,12 @@ therefore converge on the same keys.
 > project in a wing never touches another project's rows in the same wing. Rows are
 > removed only on an unlimited run; a `--limit` deliberately leaves out-of-limit paths
 > in place, and a secret removed this way is reported in `Sources removed: N`.
+>
+> **Remote canonical mines are additive.** A wing routed with `write: remote` uploads
+> the currently eligible files but does not reconcile or delete stale remote rows.
+> With `write: both`, the local replica receives the reconciliation above while the
+> remote replica remains additive. Remote stale-row reconciliation is not currently
+> available through `mine` or `prune`.
 
 ### Overlay composition at search time
 

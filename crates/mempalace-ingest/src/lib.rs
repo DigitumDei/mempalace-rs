@@ -365,8 +365,8 @@ pub struct IngestSummary {
     pub ingested_files: usize,
     pub drawers_written: usize,
     pub truncated_files: usize,
-    /// Number of previously-mined source keys removed during a branch cleanup
-    /// pass.  Always 0 for non-branch runs.
+    /// Number of previously-mined source keys removed during local reconciliation.
+    /// This includes branch cleanup and unlimited canonical local re-mines.
     pub removed_sources: usize,
     /// The view name detected/used for this mine, if any.  `None` for canonical
     /// or non-Git mines.

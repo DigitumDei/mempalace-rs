@@ -4,7 +4,10 @@ use std::ffi::OsString;
 
 use mempalace_config::{ConfigLoader, build_runtime};
 use mempalace_embeddings::env_flag;
-use mempalace_mcp::{DeterministicStubProvider, McpServer, default_provider, serve_transport};
+use mempalace_mcp::{
+    DeterministicStubProvider, McpServer, configured_lineage_id_from_env, default_provider,
+    serve_transport,
+};
 use tokio::io::{self, BufReader};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -14,19 +17,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let config = ConfigLoader::load_with_env(None)?;
+    let lineage_id = configured_lineage_id_from_env()?;
     build_runtime(&config)?.block_on(async move {
         if env_flag("MEMPALACE_STUB_EMBEDDINGS") {
-            let server = McpServer::from_parts(
+            let server = McpServer::from_parts_with_lineage(
                 config.clone(),
                 DeterministicStubProvider::new(config.embedding_profile),
+                lineage_id,
             )
             .await?;
             return serve_transport(&server, BufReader::new(io::stdin()), io::stdout()).await;
         }
 
-        let server =
-            McpServer::from_parts(config.clone(), default_provider(config.embedding_profile)?)
-                .await?;
+        let server = McpServer::from_parts_with_lineage(
+            config.clone(),
+            default_provider(config.embedding_profile)?,
+            lineage_id,
+        )
+        .await?;
         serve_transport(&server, BufReader::new(io::stdin()), io::stdout()).await
     })
 }
@@ -63,6 +71,8 @@ fn help_text() -> &'static str {
         "Options:\n",
         "  -h, --help     Print help\n",
         "  -V, --version  Print version\n",
+        "\nEnvironment:\n",
+        "  MEMPALACE_LINEAGE_ID  Bind identity wake-up to an existing lineage\n",
     )
 }
 

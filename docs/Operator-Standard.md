@@ -101,6 +101,11 @@ target/release/mempalace-mcp
 
 The server exposes the frozen v1 tool set listed in [Release Scope](Release-Scope.md).
 
+Set `MEMPALACE_LINEAGE_ID` in an MCP host's server environment to bind wake-up and identity
+packets to one existing lineage. The binding is validated by `mempalace-mcp`, cannot be overridden
+by model-facing tool arguments, and fails closed if its target does not exist. Leave it unset to use
+the palace default. See [Self-continuity](Self-Continuity.md#binding-a-lineage-to-an-mcp-client).
+
 If the MCP host needs to bootstrap a cold cache on first start, launch it with:
 
 ```bash

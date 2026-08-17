@@ -30,7 +30,9 @@ The packet contains:
 
 - `packet_version`
 - the constitution and its path
-- the requested lineage, or the default lineage
+- the MCP-bound lineage, or the palace default when the server has no binding
+- `lineage_selection`, including the selected ID, its source, and
+  `override_allowed: false`
 - promoted observations that apply to the current runtime
 - recent migration records
 - runtime metadata and compilation time
@@ -43,12 +45,67 @@ Candidates are excluded by default. Set `include_candidates: true` only when rev
 developing the self-model. If no default lineage exists, wake-up still succeeds and returns
 `configured: false` with guidance and any available lineages.
 
+`lineage_id` is deliberately absent from both model-facing packet tools. If a client sends it
+anyway, the call is rejected. The `agent_name`, `model`, and `harness` fields describe the current
+runtime for attribution and engine-scoped filtering; none of them can select a lineage.
+
 Engine-scoped observations are included only when every model or harness constraint recorded on
 the observation matches the runtime supplied to wake-up. Omitting runtime metadata therefore
 does not accidentally load engine-specific behavior as universal identity.
 
 `mempalace_identity_packet` compiles the same structure on demand without performing the rest of
 wake-up.
+
+## Binding a lineage to an MCP client
+
+Set `MEMPALACE_LINEAGE_ID` in the environment of the local `mempalace-mcp` process to bind that
+MCP connection to one existing lineage. This is a host-controlled capability boundary: the model
+cannot override the binding in a tool call, even if it knows another valid lineage ID. A configured
+ID is syntax-checked when the server starts. If the ID does not exist in the palace, identity packet
+and wake-up calls fail closed instead of falling back to another lineage.
+
+Different MCP clients can share the same palace while binding their separately launched server
+processes to different lineages. For example, Codex can use `codex-dion` while OpenCode uses
+`opencode-dion`.
+
+Codex `config.toml`:
+
+```toml
+[mcp_servers.mempalace]
+command = "/absolute/path/to/mempalace-mcp"
+
+[mcp_servers.mempalace.env]
+MEMPALACE_LINEAGE_ID = "codex-dion"
+```
+
+Equivalent Codex CLI registration:
+
+```bash
+codex mcp add mempalace --env MEMPALACE_LINEAGE_ID=codex-dion -- /absolute/path/to/mempalace-mcp
+```
+
+OpenCode V2 configuration:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "servers": {
+      "mempalace": {
+        "type": "local",
+        "command": ["/absolute/path/to/mempalace-mcp"],
+        "environment": {
+          "MEMPALACE_LINEAGE_ID": "opencode-dion"
+        }
+      }
+    }
+  }
+}
+```
+
+Changing the binding requires editing the MCP host configuration and restarting that server
+connection. When `MEMPALACE_LINEAGE_ID` is absent, packet tools use only the palace's stored
+default lineage; there is still no per-call override.
 
 ## Establishing a lineage
 

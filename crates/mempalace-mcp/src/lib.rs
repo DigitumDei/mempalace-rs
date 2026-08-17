@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use blake3::Hasher;
-use mempalace_config::{ConfigLoader, MempalaceConfig, ReplicationStatus, RouteMode, WriteTarget};
+use mempalace_config::{ConfigLoader, MempalaceConfig, ReplicationStatus, RouteMode};
 use mempalace_core::{
     DIARY_HALL, DIARY_ROOM, DIARY_SUMMARY_MAX_CHARS, DIARY_TOPIC_PREFIX, DrawerId, DrawerRecord,
     EmbeddingProfile, RoomId, SHARED_AGENT_DIARY_WING, SearchQuery, WingId,
@@ -112,8 +112,9 @@ const WAKE_UP_PROJECT_SEARCH_MULTIPLIER: usize = 20;
 const WAKE_UP_PROJECT_MIN_SEARCH_LIMIT: usize = 50;
 const IDENTITY_UPDATE_MAX_CONTENT_BYTES: usize = 16 * 1024;
 const IDENTITY_MAX_BYTES: usize = 64 * 1024;
+pub const LINEAGE_ID_ENV: &str = "MEMPALACE_LINEAGE_ID";
 
-pub const PALACE_PROTOCOL: &str = "IMPORTANT — MemPalace Memory Protocol:\n1. ON WAKE-UP: Call mempalace_wake_up with agent_name and, when known, model and harness. It loads the identity constitution, the default or requested lineage's compiled identity packet, palace status, recent changes, current project context, and recent diary summaries across agents. Use mempalace_diary_read with an entry_id when full diary detail is needed.\n2. BEFORE RESPONDING about any person, project, or past event: call mempalace_kg_query or mempalace_search FIRST. Never guess — verify.\n3. IF UNSURE about a fact (name, gender, age, relationship): say \"let me check\" and query the palace. Wrong is worse than slow.\n4. AFTER EACH SESSION: call mempalace_diary_write to record what happened, what you learned, what matters, with a concise summary.\n5. WHEN FACTS CHANGE: call mempalace_kg_invalidate on the old fact, mempalace_kg_add for the new one.\n6. TREAT identity.txt AS THE CONSTITUTION: use mempalace_identity_update for deliberate changes to durable identity, values, boundaries, and working relationship — not routine autobiography.\n7. WHEN A REPEATED PATTERN MAY DESCRIBE THE PERSISTENT SELF: propose an evidence-backed candidate with mempalace_self_observation_propose. Promote or retire it only after review with mempalace_self_observation_review.\n8. WHEN MODEL OR HARNESS CHANGES: record what carried over and what changed with mempalace_migration_record. Never silently treat engine behavior as lineage identity.\n\nThis protocol ensures the AI KNOWS before it speaks. Storage is not memory — but storage + this protocol = memory.";
+pub const PALACE_PROTOCOL: &str = "IMPORTANT — MemPalace Memory Protocol:\n1. ON WAKE-UP: Call mempalace_wake_up with agent_name and, when known, model and harness. It loads the identity constitution, the MCP-bound or palace-default lineage's compiled identity packet, palace status, recent changes, current project context, and recent diary summaries across agents. Lineage selection is host configuration, never a model-supplied tool argument. Use mempalace_diary_read with an entry_id when full diary detail is needed.\n2. BEFORE RESPONDING about any person, project, or past event: call mempalace_kg_query or mempalace_search FIRST. Never guess — verify.\n3. IF UNSURE about a fact (name, gender, age, relationship): say \"let me check\" and query the palace. Wrong is worse than slow.\n4. AFTER EACH SESSION: call mempalace_diary_write to record what happened, what you learned, what matters, with a concise summary.\n5. WHEN FACTS CHANGE: call mempalace_kg_invalidate on the old fact, mempalace_kg_add for the new one.\n6. TREAT identity.txt AS THE CONSTITUTION: use mempalace_identity_update for deliberate changes to durable identity, values, boundaries, and working relationship — not routine autobiography.\n7. WHEN A REPEATED PATTERN MAY DESCRIBE THE PERSISTENT SELF: propose an evidence-backed candidate with mempalace_self_observation_propose. Promote or retire it only after review with mempalace_self_observation_review.\n8. WHEN MODEL OR HARNESS CHANGES: record what carried over and what changed with mempalace_migration_record. Never silently treat engine behavior as lineage identity.\n\nThis protocol ensures the AI KNOWS before it speaks. Storage is not memory — but storage + this protocol = memory.";
 
 pub const AAAK_SPEC: &str = "AAAK is a compressed memory dialect that MemPalace uses for efficient storage.\nIt is designed to be readable by both humans and LLMs without decoding.\n\nFORMAT:\n  ENTITIES: 3-letter uppercase codes. ALC=Alice, JOR=Jordan, RIL=Riley, MAX=Max, BEN=Ben.\n  EMOTIONS: *action markers* before/during text. *warm*=joy, *fierce*=determined, *raw*=vulnerable, *bloom*=tenderness.\n  STRUCTURE: Pipe-separated fields. FAM: family | PROJ: projects | ⚠: warnings/reminders.\n  DATES: ISO format (2026-03-31). COUNTS: Nx = N mentions (e.g., 570x).\n  IMPORTANCE: ★ to ★★★★★ (1-5 scale).\n  HALLS: hall_facts, hall_events, hall_discoveries, hall_preferences, hall_advice.\n  WINGS: wing_user, wing_agent, wing_team, wing_code, wing_myproject, wing_hardware, wing_ue5, wing_ai_research.\n  ROOMS: Hyphenated slugs representing named ideas (e.g., chromadb-setup, gpu-pricing).\n\nEXAMPLE:\n  FAM: ALC→♡JOR | 2D(kids): RIL(18,sports) MAX(11,chess+swimming) | BEN(contributor)\n\nRead AAAK naturally — expand codes mentally, treat *markers* as emotional context.\nWhen WRITING AAAK: use entity codes, mark emotions, keep structure tight.";
 
@@ -137,6 +138,8 @@ pub enum McpError {
     TimeFormat(String),
     #[error("federation error: {0}")]
     Federation(String),
+    #[error("invalid {LINEAGE_ID_ENV}: {0}")]
+    InvalidLineageBinding(String),
     #[error("io error at {path}: {source}")]
     Io {
         path: PathBuf,
@@ -274,13 +277,12 @@ impl ToolName {
         match self {
             Self::WakeUp => ToolDefinition {
                 name: self.as_str(),
-                description: "Wake up into the palace. Returns the identity constitution, the default or requested lineage's compiled identity packet, palace status, recent palace changes, current project history when provided, and recent diary entries across all agents. Pass the current model and harness so engine-specific observations are filtered correctly. When federation is active the response also includes `remote_changes`: a per-remote map of change events from the last 24 hours (each event carries `origin: \"remote:<name>\"`), unreachable remotes appear as `{ \"unreachable\": true, \"error\": \"...\" }`, and a `next_cursor` is provided per remote for continuation via mempalace_get_changes_since.",
+                description: "Wake up into the palace. Returns the identity constitution, the MCP-bound or palace-default lineage's compiled identity packet, palace status, recent palace changes, current project history when provided, and recent diary entries across all agents. Lineage selection is fixed by server configuration and cannot be supplied by the model. Pass the current model and harness so engine-specific observations are filtered correctly. When federation is active the response also includes `remote_changes`: a per-remote map of change events from the last 24 hours (each event carries `origin: \"remote:<name>\"`), unreachable remotes appear as `{ \"unreachable\": true, \"error\": \"...\" }`, and a `next_cursor` is provided per remote for continuation via mempalace_get_changes_since.",
                 input_schema: json!({
                     "type":"object",
                     "properties":{
                         "wing":{"type":"string","description":"Current project wing for project-specific history (optional, e.g. wing_myproject)"},
                         "agent_name":{"type":"string","description":"Current agent name for wake-up context (optional, e.g. claude)"},
-                        "lineage_id":{"type":"string","description":"Persistent lineage to load (optional; default lineage when omitted)"},
                         "model":{"type":"string","description":"Current model identifier used to filter engine-scoped observations (optional)"},
                         "harness":{"type":"string","description":"Current harness identifier used to filter engine-scoped observations (optional)"},
                         "include_candidates":{"type":"boolean","description":"Include unreviewed self-observation candidates in a separate section (default false)"},
@@ -568,11 +570,10 @@ impl ToolName {
             },
             Self::IdentityPacket => ToolDefinition {
                 name: self.as_str(),
-                description: "Compile the identity constitution, stable lineage, reviewed self-observations, and recent model/harness migrations into a portable identity packet. Uses the default lineage when lineage_id is omitted. Engine-scoped observations are included only when their recorded model/harness matches the supplied runtime.",
+                description: "Compile the identity constitution, stable lineage, reviewed self-observations, and recent model/harness migrations into a portable identity packet. Uses the lineage bound by MCP server configuration, or the palace default when no binding exists. The model cannot select or override the lineage. Engine-scoped observations are included only when their recorded model/harness matches the supplied runtime.",
                 input_schema: json!({
                     "type":"object",
                     "properties":{
-                        "lineage_id":{"type":"string","description":"Lineage to compile (optional; default lineage when omitted)"},
                         "agent_name":{"type":"string","description":"Current agent name for runtime context (optional)"},
                         "model":{"type":"string","description":"Current model identifier used to filter engine-scoped observations (optional)"},
                         "harness":{"type":"string","description":"Current harness identifier used to filter engine-scoped observations (optional)"},
@@ -683,7 +684,20 @@ impl McpServer<FastembedProvider> {
     pub async fn from_default_config(base_dir_override: Option<&Path>) -> Result<Self> {
         let config = ConfigLoader::load_with_env(base_dir_override)?;
         let provider = default_provider(config.embedding_profile)?;
-        Self::from_parts(config, provider).await
+        let lineage_id = configured_lineage_id_from_env()?;
+        Self::from_parts_with_lineage(config, provider, lineage_id).await
+    }
+}
+
+pub fn configured_lineage_id_from_env() -> Result<Option<String>> {
+    match std::env::var(LINEAGE_ID_ENV) {
+        Ok(value) => validate_record_id_value(&value)
+            .map(Some)
+            .map_err(McpError::InvalidLineageBinding),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(McpError::InvalidLineageBinding(
+            "must be valid Unicode".to_owned(),
+        )),
     }
 }
 
@@ -705,8 +719,20 @@ where
     P: EmbeddingProvider + Send,
 {
     pub async fn from_parts(config: MempalaceConfig, provider: P) -> Result<Self> {
+        Self::from_parts_with_lineage(config, provider, None).await
+    }
+
+    pub async fn from_parts_with_lineage(
+        config: MempalaceConfig,
+        provider: P,
+        lineage_id: Option<String>,
+    ) -> Result<Self> {
+        let lineage_id = lineage_id
+            .map(|value| validate_record_id_value(&value))
+            .transpose()
+            .map_err(McpError::InvalidLineageBinding)?;
         let queue_limit = config.low_cpu.effective_queue_limit().min(Semaphore::MAX_PERMITS);
-        let runtime = McpRuntime::new(config, provider).await?;
+        let runtime = McpRuntime::new(config, provider, lineage_id).await?;
         Ok(Self {
             runtime: Arc::new(Mutex::new(runtime)),
             queue_limit: Arc::new(Semaphore::new(queue_limit)),
@@ -854,6 +880,7 @@ where
 #[derive(Debug)]
 struct McpRuntime<P> {
     config: MempalaceConfig,
+    bound_lineage_id: Option<String>,
     storage: StorageEngine,
     search: SearchRuntime<P>,
     federation: Option<FederationRouter>,
@@ -863,7 +890,11 @@ impl<P> McpRuntime<P>
 where
     P: EmbeddingProvider + Send,
 {
-    async fn new(config: MempalaceConfig, provider: P) -> Result<Self> {
+    async fn new(
+        config: MempalaceConfig,
+        provider: P,
+        bound_lineage_id: Option<String>,
+    ) -> Result<Self> {
         let storage = StorageEngine::open(&config.palace_path, config.embedding_profile).await?;
         let router = FederationRouter::new(config.federation.clone());
         let federation = if router.has_remotes() { Some(router) } else { None };
@@ -873,6 +904,7 @@ where
                 SearchRuntimePolicy { rerank_enabled: config.low_cpu.effective_rerank_enabled() },
             ),
             config,
+            bound_lineage_id,
             storage,
             federation,
         })
@@ -1372,9 +1404,11 @@ where
         identity: &str,
         identity_ref: Option<&str>,
     ) -> ToolResult<Value> {
-        let requested_lineage_id = optional_string(arguments, "lineage_id")?
-            .map(|value| validate_record_id("lineage_id", &value))
-            .transpose()?;
+        if arguments.get("lineage_id").is_some() {
+            return Err(ToolError::InvalidParams(format!(
+                "`lineage_id` is not a model-selectable parameter; bind this MCP server with {LINEAGE_ID_ENV} or configure a palace default"
+            )));
+        }
         let agent_name = optional_non_blank_string(arguments, "agent_name")?;
         let model = optional_non_blank_string(arguments, "model")?;
         let harness = optional_non_blank_string(arguments, "harness")?;
@@ -1382,9 +1416,35 @@ where
         let observation_limit = optional_usize(arguments, "observation_limit")?.unwrap_or(20).min(50);
         let migration_limit = optional_usize(arguments, "migration_limit")?.unwrap_or(5).min(25);
         let operational_store = self.storage.operational_store();
-        let lineage = match requested_lineage_id.as_deref() {
-            Some(lineage_id) => operational_store.get_lineage(lineage_id).map_tool_internal()?,
-            None => operational_store.get_default_lineage().map_tool_internal()?,
+        let (lineage, lineage_selection) = match self.bound_lineage_id.as_deref() {
+            Some(lineage_id) => {
+                let lineage = operational_store.get_lineage(lineage_id).map_tool_internal()?;
+                if lineage.is_none() {
+                    return Err(ToolError::InvalidParams(format!(
+                        "this MCP server is bound by {LINEAGE_ID_ENV} to lineage `{lineage_id}`, but that lineage does not exist"
+                    )));
+                }
+                (
+                    lineage,
+                    json!({
+                        "source": "mcp_server_environment",
+                        "lineage_id": lineage_id,
+                        "override_allowed": false,
+                    }),
+                )
+            }
+            None => {
+                let lineage = operational_store.get_default_lineage().map_tool_internal()?;
+                let lineage_id = lineage.as_ref().map(|record| record.lineage_id.clone());
+                (
+                    lineage,
+                    json!({
+                        "source": "palace_default",
+                        "lineage_id": lineage_id,
+                        "override_allowed": false,
+                    }),
+                )
+            }
         };
         let constitution = match identity_ref {
             Some(identity_ref) => json!({
@@ -1403,12 +1463,8 @@ where
             return Ok(json!({
                 "packet_version": 1,
                 "configured": false,
-                "message": if requested_lineage_id.is_some() {
-                    "The requested lineage does not exist."
-                } else {
-                    "No default lineage is configured. Create one with mempalace_lineage_set."
-                },
-                "requested_lineage_id": requested_lineage_id,
+                "message": "No default lineage is configured. Create one with mempalace_lineage_set or bind the MCP server with MEMPALACE_LINEAGE_ID.",
+                "lineage_selection": lineage_selection,
                 "available_lineages": available_lineages,
                 "constitution": constitution,
                 "runtime": {"agent_name": agent_name, "model": model, "harness": harness},
@@ -1446,6 +1502,7 @@ where
             "configured": true,
             "constitution": constitution,
             "lineage": lineage,
+            "lineage_selection": lineage_selection,
             "promoted_observations": promoted,
             "candidates": candidates,
             "recent_migrations": migrations,
@@ -3124,19 +3181,22 @@ fn required_record_id(arguments: &Value, field: &'static str) -> ToolResult<Stri
 }
 
 fn validate_record_id(field: &'static str, value: &str) -> ToolResult<String> {
+    validate_record_id_value(value)
+        .map_err(|message| ToolError::InvalidParams(format!("field `{field}` {message}")))
+}
+
+fn validate_record_id_value(value: &str) -> std::result::Result<String, String> {
     let value = value.trim();
     if value.is_empty() || value.len() > 128 {
-        return Err(ToolError::InvalidParams(format!(
-            "field `{field}` must be between 1 and 128 bytes"
-        )));
+        return Err("must be between 1 and 128 bytes".to_owned());
     }
     if !value
         .chars()
         .all(|character| character.is_ascii_alphanumeric() || "-_.:/".contains(character))
     {
-        return Err(ToolError::InvalidParams(format!(
-            "field `{field}` may contain only ASCII letters, digits, '-', '_', '.', ':', and '/'"
-        )));
+        return Err(
+            "may contain only ASCII letters, digits, '-', '_', '.', ':', and '/'".to_owned(),
+        );
     }
     Ok(value.to_owned())
 }
@@ -3571,6 +3631,22 @@ mod tests {
         TestHarness { _tempdir: tempdir, server }
     }
 
+    async fn test_harness_with_bound_lineage(lineage_id: &str) -> TestHarness {
+        let tempdir = TempDir::new().unwrap();
+        let palace_path = tempdir.path().join("palace");
+        let config = make_base_config(&palace_path, &tempdir);
+        let server = McpServer::from_parts_with_lineage(
+            config,
+            DeterministicStubProvider::new(EmbeddingProfile::Balanced),
+            Some(lineage_id.to_owned()),
+        )
+        .await
+        .unwrap();
+        seed_drawers(&server).await;
+        seed_knowledge_graph(&server).await;
+        TestHarness { _tempdir: tempdir, server }
+    }
+
     fn test_diary_drawer(id: &str, content: &str, filed_at: OffsetDateTime) -> DrawerRecord {
         DrawerRecord {
             id: DrawerId::new(id).unwrap(),
@@ -3788,6 +3864,20 @@ mod tests {
             })
             .collect::<BTreeMap<_, _>>();
         assert_eq!(serde_json::to_value(actual).unwrap(), expected);
+    }
+
+    #[test]
+    fn identity_tools_do_not_expose_model_selectable_lineage_ids() {
+        for tool_name in ["mempalace_wake_up", "mempalace_identity_packet"] {
+            let tool = tool_definitions()
+                .into_iter()
+                .find(|tool| tool.name == tool_name)
+                .unwrap();
+            assert!(
+                tool.input_schema["properties"].get("lineage_id").is_none(),
+                "{tool_name} must not let the model select its lineage"
+            );
+        }
     }
 
     #[tokio::test]
@@ -4319,6 +4409,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mcp_bound_lineage_cannot_be_overridden_by_tool_arguments() {
+        let harness = test_harness_with_bound_lineage("codex-dion").await;
+
+        for (call_id, lineage_id, display_name, set_default) in [
+            (6070, "opencode-dion", "OpenCode with Dion", true),
+            (6071, "codex-dion", "Codex with Dion", false),
+        ] {
+            let response = harness
+                .server
+                .handle_request(tool_call(
+                    call_id,
+                    "mempalace_lineage_set",
+                    json!({
+                        "lineage_id": lineage_id,
+                        "display_name": display_name,
+                        "description": "A test lineage.",
+                        "expected_revision": 0,
+                        "set_default": set_default,
+                        "actor": "test"
+                    }),
+                ))
+                .await;
+            assert_eq!(decode_tool_payload(&response).unwrap()["success"], true);
+        }
+
+        let packet = decode_tool_payload(
+            &harness
+                .server
+                .handle_request(tool_call(6072, "mempalace_identity_packet", json!({})))
+                .await,
+        )
+        .unwrap();
+        assert_eq!(packet["lineage"]["lineage_id"], "codex-dion");
+        assert_eq!(packet["lineage_selection"]["source"], "mcp_server_environment");
+        assert_eq!(packet["lineage_selection"]["lineage_id"], "codex-dion");
+        assert_eq!(packet["lineage_selection"]["override_allowed"], false);
+
+        let attempted_override = harness
+            .server
+            .handle_request(tool_call(
+                6073,
+                "mempalace_wake_up",
+                json!({"lineage_id":"opencode-dion"}),
+            ))
+            .await;
+        assert_eq!(attempted_override["error"]["code"], ErrorCode::InvalidParams as i32);
+        assert!(
+            attempted_override["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("not a model-selectable parameter")
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_mcp_bound_lineage_fails_closed() {
+        let harness = test_harness_with_bound_lineage("missing-lineage").await;
+        let response = harness
+            .server
+            .handle_request(tool_call(6074, "mempalace_identity_packet", json!({})))
+            .await;
+        assert_eq!(response["error"]["code"], ErrorCode::InvalidParams as i32);
+        let message = response["error"]["message"].as_str().unwrap();
+        assert!(message.contains(LINEAGE_ID_ENV));
+        assert!(message.contains("missing-lineage"));
+        assert!(message.contains("does not exist"));
+    }
+
+    #[tokio::test]
     async fn lineage_observations_migrations_and_wake_up_form_a_portable_identity_packet() {
         let harness = test_harness().await;
 
@@ -4501,6 +4660,8 @@ mod tests {
         .unwrap();
         let matching_packet = &matching_wake["identity_packet"];
         assert_eq!(matching_packet["lineage"]["lineage_id"], "codex-dion");
+        assert_eq!(matching_packet["lineage_selection"]["source"], "palace_default");
+        assert_eq!(matching_packet["lineage_selection"]["override_allowed"], false);
         assert_eq!(matching_packet["constitution"]["identity_ref"], "$.identity");
         assert!(matching_packet["constitution"].get("identity").is_none());
         assert_eq!(matching_packet["promoted_observations"].as_array().unwrap().len(), 2);
@@ -6410,10 +6571,13 @@ mod tests {
         let tempdir = TempDir::new().unwrap();
         let palace_path = tempdir.path().join("palace");
         let config = make_base_config(&palace_path, &tempdir);
-        let mut runtime =
-            McpRuntime::new(config, DeterministicStubProvider::new(EmbeddingProfile::Balanced))
-                .await
-                .unwrap();
+        let mut runtime = McpRuntime::new(
+            config,
+            DeterministicStubProvider::new(EmbeddingProfile::Balanced),
+            None,
+        )
+        .await
+        .unwrap();
         // Replace federation with the mock router (only if it has remotes).
         runtime.federation = if router.has_remotes() { Some(router) } else { None };
         let server = McpServer {
@@ -6915,9 +7079,13 @@ mod tests {
             federation: FederationRuntimeConfig::default(),
             ..make_base_config(&palace_path, &tempdir)
         };
-        let mut runtime = McpRuntime::new(config, DeterministicStubProvider::new(EmbeddingProfile::Balanced))
-            .await
-            .unwrap();
+        let mut runtime = McpRuntime::new(
+            config,
+            DeterministicStubProvider::new(EmbeddingProfile::Balanced),
+            None,
+        )
+        .await
+        .unwrap();
         // Inject mock federation — avoid real HTTP connections.
         runtime.federation = Some(FederationRouter::with_remotes(rules, remotes));
         DeleteDrawerTestCtx { _tempdir: tempdir, runtime }

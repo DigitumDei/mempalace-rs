@@ -78,8 +78,9 @@ Full flag reference: [CLI Surface](CLI-Surface.md).
 - `mempalace_identity_packet`
 - `mempalace_migration_record`
 
-The five self-continuity tools are local-only. `mempalace_wake_up` compiles the default or
-requested lineage into an identity packet; see [Self-Continuity Across Models](Self-Continuity.md).
+The five self-continuity tools are local-only. `mempalace_wake_up` compiles the MCP-bound or
+palace-default lineage into an identity packet; model-facing calls cannot select or override it.
+See [Self-Continuity Across Models](Self-Continuity.md).
 
 ### Federation
 

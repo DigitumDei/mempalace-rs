@@ -14,16 +14,16 @@ Use drawers as a durable coordination log and opaque change cursors as discovery
    - Read `references/manager-as-tools.md` when one manager invokes workers and retains control.
    - Read `references/explicit-handoff.md` when responsibility moves between agents or sessions.
 3. Create a unique `coordination_id` and `task_id`. Keep IDs unchanged through the workflow.
-4. Capture each origin's opaque cursor from `mempalace_get_changes_since`; resume with the returned `next_cursor`, never a synthesized timestamp.
+4. Capture each remote origin's opaque cursor from `mempalace_get_changes_since`; resume that remote with its returned `next_cursor`, never a synthesized timestamp. The Phase 0 API has no local cursor: for local discovery, poll a bounded time window with intentional overlap, de-duplicate by drawer ID and `idempotency_key`, and report the audit as inconclusive if the per-origin limit is reached.
 
 ## Coordinate
 
 1. File a `task` envelope verbatim with `mempalace_add_drawer` in an explicitly chosen wing and room.
-2. Treat the returned drawer ID and origin as the stable reference. Pass that reference, not a copied transcript.
+2. Treat the returned drawer ID and origin as the stable reference. For a local write, construct `origin` as the literal `"local"`; for a remote write, preserve the `remote:<name>` origin reported by the routed operation. Pass the complete `{drawer_id, wing, room, origin}` reference, not a copied transcript.
 3. For explicit transfer, file a `handoff` envelope referencing the task drawer, then have the recipient acknowledge it with a new envelope before work begins.
 4. Store every substantial output once as an `artifact` envelope. Put the durable content in `payload.content` and record the returned drawer ID.
 5. File a `result` envelope that references the task and artifact drawer IDs. Keep its summary small.
-6. Poll changes by cursor to discover candidate events. If the installed API has no exact get-by-ID operation, search may locate content for this experiment, but delivery remains unverified; never describe that fallback as authoritative dereferencing.
+6. Poll remote changes by cursor and local changes with a bounded, overlapping timestamp window to discover candidate events. If a local response reaches the requested limit, widen or subdivide the audit window; because events sharing a timestamp cannot be paginated authoritatively, report the audit as inconclusive if the limit remains saturated. If the installed API has no exact get-by-ID operation, search may locate content for this experiment, but delivery remains unverified; never describe that fallback as authoritative dereferencing.
 7. Record measurements from `references/measurements.md`.
 
 Validate local envelope files with:

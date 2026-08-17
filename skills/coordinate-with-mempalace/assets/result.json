@@ -5,7 +5,7 @@
   "message_id": "msg-result-1",
   "created_at": "2026-08-17T00:03:00Z",
   "producer": "worker",
-  "idempotency_key": "coord-example:result:task-1",
+  "idempotency_key": "coord-example:result:task-1:worker:assignment-1",
   "payload": {
     "task_id": "task-1",
     "status": "completed",

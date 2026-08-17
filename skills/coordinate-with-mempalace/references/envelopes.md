@@ -15,7 +15,7 @@ All envelopes are UTF-8 JSON objects. Version `mempalace.coordination/v1alpha1` 
 | `idempotency_key` | Stable key for one logical action |
 | `payload` | Kind-specific object |
 
-Use opaque, collision-resistant IDs such as UUIDs. References have `drawer_id`, `wing`, `room`, and `origin`; consumers must use the exact drawer ID and origin as authority. The Phase 0 API cannot dereference this pair directly, so reference passing is durable but reference retrieval is not yet reliable.
+Use opaque, collision-resistant IDs such as UUIDs. References have `drawer_id`, `wing`, `room`, and `origin`; consumers must use the exact drawer ID and origin as authority. Set `origin` to `local` for a local write; preserve `remote:<name>` for a routed remote write. The Phase 0 API cannot dereference this pair directly, so reference passing is durable but reference retrieval is not yet reliable.
 
 ## Kinds
 
@@ -33,6 +33,6 @@ Use opaque, collision-resistant IDs such as UUIDs. References have `drawer_id`, 
 
 ### `result`
 
-`payload` requires `task_id`, `status` (`completed`, `blocked`, or `failed`), `summary`, `task_ref`, and `artifact_refs`. Keep `summary` concise; artifact references carry the output.
+`payload` requires `task_id`, `status` (`completed`, `blocked`, or `failed`), `summary`, `task_ref`, and `artifact_refs` (array). Keep `summary` concise; artifact references carry the output. Scope the idempotency key to one logical result by including a stable assignment, producer, or result-role component; retries of that result reuse the same key, while worker and manager results use different keys.
 
 Templates are in `assets/*.json`. Run `scripts/validate_envelope.py` before filing when working from a local file.

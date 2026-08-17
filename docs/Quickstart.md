@@ -141,9 +141,9 @@ claude mcp add mempalace -- ~/.mempalace/bin/mempalace-mcp
 
 ### Cline / Cursor / Any MCP host
 
-Point your MCP client at the `mempalace-mcp` binary. No arguments needed — the server speaks stdio MCP and exposes all 23 tools on `initialize`.
+Point your MCP client at the `mempalace-mcp` binary. No arguments needed — the server speaks stdio MCP and exposes all 28 tools on `initialize`.
 
-Your AI now has access to `mempalace_search`, `mempalace_add_drawer`, `mempalace_kg_query`, and 20 more tools. Ask it anything about your project — it can search your palace on demand. The full list is in [Release Scope](Release-Scope.md#mcp-tool-surface-23-tools).
+Your AI now has access to `mempalace_search`, `mempalace_add_drawer`, `mempalace_kg_query`, and 25 more tools. Ask it anything about your project — it can search your palace on demand. The full list is in [Release Scope](Release-Scope.md#mcp-tool-surface-28-tools).
 
 ## Next steps
 
@@ -152,4 +152,5 @@ Your AI now has access to `mempalace_search`, `mempalace_add_drawer`, `mempalace
 - [Config schema](Config-Schema.md) — `~/.mempalace/config.json`, `projects.json`, and optional `mempalace.yaml`
 - [Low-CPU mode](Operator-Low-CPU.md) — constrained environments
 - [Federation](Federation.md) — share a palace across machines: server setup, routing, federated & branch-aware mining
+- [Self-continuity](Self-Continuity.md) — preserve a reviewed agent lineage across model and harness changes
 - [Hook installation](../hooks/README.md) — auto-save for Claude Code

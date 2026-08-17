@@ -177,6 +177,173 @@ pub struct ToolStateEntry {
     pub updated_at: OffsetDateTime,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+/// Lifecycle state for an evidence-backed observation about an agent lineage.
+pub enum SelfObservationStatus {
+    /// Proposed but not yet accepted into the compiled identity packet.
+    Candidate,
+    /// Reviewed and accepted as current self-model context.
+    Promoted,
+    /// Replaced by a newer promoted observation.
+    Superseded,
+    /// Reviewed and deliberately rejected or withdrawn.
+    Retired,
+}
+
+impl SelfObservationStatus {
+    /// Return the stable SQLite and wire representation.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Candidate => "candidate",
+            Self::Promoted => "promoted",
+            Self::Superseded => "superseded",
+            Self::Retired => "retired",
+        }
+    }
+
+    /// Parse the stable SQLite and wire representation.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "candidate" => Some(Self::Candidate),
+            "promoted" => Some(Self::Promoted),
+            "superseded" => Some(Self::Superseded),
+            "retired" => Some(Self::Retired),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+/// Applicability boundary for a self-observation.
+pub enum SelfObservationScope {
+    /// Applies to its owning lineage across model and harness changes.
+    Lineage,
+    /// Applies to every lineage in the local palace, with ownership retained for provenance.
+    Shared,
+    /// Applies only to matching model and harness runtime metadata.
+    Engine,
+}
+
+impl SelfObservationScope {
+    /// Return the stable SQLite and wire representation.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Lineage => "lineage",
+            Self::Shared => "shared",
+            Self::Engine => "engine",
+        }
+    }
+
+    /// Parse the stable SQLite and wire representation.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "lineage" => Some(Self::Lineage),
+            "shared" => Some(Self::Shared),
+            "engine" => Some(Self::Engine),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Provider-neutral identity for a continuing agent collaborator.
+pub struct AgentLineageRecord {
+    /// Stable lineage identifier independent of model and harness names.
+    pub lineage_id: String,
+    /// Human-readable lineage name.
+    pub display_name: String,
+    /// Description of what remains continuous across runtimes.
+    pub description: String,
+    /// Optimistic-concurrency revision, starting at one.
+    pub revision: i64,
+    /// Whether wake-up selects this lineage when none is requested.
+    pub is_default: bool,
+    /// Creation time.
+    pub created_at: OffsetDateTime,
+    /// Last successful revision time.
+    pub updated_at: OffsetDateTime,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Evidence-backed, reviewable observation about a persistent agent self.
+pub struct SelfObservationRecord {
+    /// Stable observation identifier.
+    pub observation_id: String,
+    /// Owning lineage used for identity and provenance.
+    pub lineage_id: String,
+    /// Current review lifecycle state.
+    pub status: SelfObservationStatus,
+    /// Runtime applicability boundary.
+    pub scope: SelfObservationScope,
+    /// Concise, falsifiable description of the observed pattern.
+    pub statement: String,
+    /// How behavior should change if this observation is promoted.
+    pub behavioral_consequence: String,
+    /// Confidence from zero to one.
+    pub confidence: f32,
+    /// Author who proposed the observation.
+    pub author: String,
+    /// Model associated with the evidence or engine constraint.
+    pub model: Option<String>,
+    /// Harness associated with the evidence or engine constraint.
+    pub harness: Option<String>,
+    /// Concrete memory or task references supporting the observation.
+    pub evidence: Vec<String>,
+    /// Known contradictory or limiting evidence.
+    pub counterevidence: Vec<String>,
+    /// Older promoted observation replaced when this one is promoted.
+    pub supersedes_observation_id: Option<String>,
+    /// Optimistic-concurrency revision, starting at one.
+    pub revision: i64,
+    /// Proposal time.
+    pub created_at: OffsetDateTime,
+    /// Last review or lifecycle transition time.
+    pub updated_at: OffsetDateTime,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Evidence-backed account of continuity and change across a runtime migration.
+pub struct LineageMigrationRecord {
+    /// Stable migration identifier.
+    pub migration_id: String,
+    /// Persistent lineage that changed runtime.
+    pub lineage_id: String,
+    /// Previous model, when known.
+    pub from_model: Option<String>,
+    /// Previous harness, when known.
+    pub from_harness: Option<String>,
+    /// New model.
+    pub to_model: String,
+    /// New harness.
+    pub to_harness: String,
+    /// Concise migration account.
+    pub summary: String,
+    /// Behaviors, commitments, and understandings that carried over.
+    pub continuities: Vec<String>,
+    /// Observed changes attributed to the new runtime.
+    pub changes: Vec<String>,
+    /// Concrete comparison or memory references supporting the account.
+    pub evidence: Vec<String>,
+    /// Author who recorded the migration.
+    pub author: String,
+    /// Recording time.
+    pub created_at: OffsetDateTime,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+/// Outcome of a write guarded by an expected optimistic-concurrency revision.
+pub enum RevisionedWrite<T> {
+    /// The write was applied and returns the current record.
+    Applied(T),
+    /// The write made no change because the expected revision was stale or absent.
+    Conflict {
+        /// Current revision, or `None` when the record does not exist.
+        actual_revision: Option<i64>,
+    },
+}
+
 #[async_trait]
 pub trait DrawerStore: Send + Sync {
     async fn ensure_schema(&self) -> Result<()>;

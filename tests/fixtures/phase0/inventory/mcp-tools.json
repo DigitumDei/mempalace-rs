@@ -8,7 +8,7 @@
           "type": "string"
         },
         "content": {
-          "description": "Verbatim content to store \u2014 exact words, never summarized",
+          "description": "Verbatim content to store — exact words, never summarized",
           "type": "string"
         },
         "room": {
@@ -103,15 +103,11 @@
     "input_schema": {
       "properties": {
         "agent_name": {
-          "description": "Your name \u2014 recorded as the diary author",
+          "description": "Your name — recorded as the diary author",
           "type": "string"
         },
         "entry": {
           "description": "Your diary entry",
-          "type": "string"
-        },
-        "summary": {
-          "description": "Required summary (at most 400 characters) covering the outcome and important TODOs",
           "type": "string"
         },
         "scope": {
@@ -120,6 +116,10 @@
             "agent",
             "project"
           ],
+          "type": "string"
+        },
+        "summary": {
+          "description": "Required summary (at most 400 characters) covering the outcome and important TODOs",
           "type": "string"
         },
         "topic": {
@@ -140,7 +140,7 @@
     }
   },
   "mempalace_find_tunnels": {
-    "description": "Find rooms that bridge two wings \u2014 the hallways connecting different domains. E.g. what topics connect wing_code to wing_team? Local palace only; not federated in v1.",
+    "description": "Find rooms that bridge two wings — the hallways connecting different domains. E.g. what topics connect wing_code to wing_team? Local palace only; not federated in v1.",
     "input_schema": {
       "properties": {
         "wing_a": {
@@ -156,7 +156,7 @@
     }
   },
   "mempalace_get_aaak_spec": {
-    "description": "Get the AAAK dialect specification \u2014 the compressed memory format MemPalace uses. Call this if you need to read or write AAAK-compressed memories.",
+    "description": "Get the AAAK dialect specification — the compressed memory format MemPalace uses. Call this if you need to read or write AAAK-compressed memories.",
     "input_schema": {
       "properties": {},
       "type": "object"
@@ -178,7 +178,7 @@
           "type": "integer"
         },
         "since": {
-          "description": "ISO 8601 timestamp \u2014 return only events after this point (optional, default: epoch)",
+          "description": "ISO 8601 timestamp — return only events after this point (optional, default: epoch)",
           "type": "string"
         }
       },
@@ -186,7 +186,7 @@
     }
   },
   "mempalace_get_taxonomy": {
-    "description": "Full taxonomy: wing \u2192 room \u2192 drawer count",
+    "description": "Full taxonomy: wing → room → drawer count",
     "input_schema": {
       "properties": {},
       "type": "object"
@@ -199,6 +199,42 @@
       "type": "object"
     }
   },
+  "mempalace_identity_packet": {
+    "description": "Compile the identity constitution, stable lineage, reviewed self-observations, and recent model/harness migrations into a portable identity packet. Uses the default lineage when lineage_id is omitted. Engine-scoped observations are included only when their recorded model/harness matches the supplied runtime.",
+    "input_schema": {
+      "properties": {
+        "agent_name": {
+          "description": "Current agent name for runtime context (optional)",
+          "type": "string"
+        },
+        "harness": {
+          "description": "Current harness identifier used to filter engine-scoped observations (optional)",
+          "type": "string"
+        },
+        "include_candidates": {
+          "description": "Include unreviewed candidates in a separate section (default false)",
+          "type": "boolean"
+        },
+        "lineage_id": {
+          "description": "Lineage to compile (optional; default lineage when omitted)",
+          "type": "string"
+        },
+        "migration_limit": {
+          "description": "Max recent migrations (default 5, max 25)",
+          "type": "integer"
+        },
+        "model": {
+          "description": "Current model identifier used to filter engine-scoped observations (optional)",
+          "type": "string"
+        },
+        "observation_limit": {
+          "description": "Max promoted observations and, separately, candidates before runtime filtering (default 20, max 50)",
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    }
+  },
   "mempalace_identity_read": {
     "description": "Read the configured identity.txt used by mempalace_wake_up.",
     "input_schema": {
@@ -207,7 +243,7 @@
     }
   },
   "mempalace_identity_update": {
-    "description": "Update identity.txt for future wake-ups. Use replace for a full corrected identity or append for a dated note.",
+    "description": "Update the identity constitution used by future wake-ups. Reserve this for deliberate changes to durable identity, values, boundaries, and the working relationship; use self-observations or diaries for developing patterns and routine experience. Each update is limited to 16 KiB and the final identity.txt to 64 KiB. Use replace for a full corrected constitution or append for a deliberate amendment.",
     "input_schema": {
       "properties": {
         "agent_name": {
@@ -231,7 +267,7 @@
     }
   },
   "mempalace_kg_add": {
-    "description": "Add a fact to the knowledge graph. Subject \u2192 predicate \u2192 object with optional time window. E.g. ('Max', 'started_school', 'Year 7', valid_from='2026-09-01').",
+    "description": "Add a fact to the knowledge graph. Subject → predicate → object with optional time window. E.g. ('Max', 'started_school', 'Year 7', valid_from='2026-09-01').",
     "input_schema": {
       "properties": {
         "object": {
@@ -293,15 +329,15 @@
     }
   },
   "mempalace_kg_query": {
-    "description": "Query the knowledge graph for an entity's relationships. Returns typed facts with temporal validity. E.g. 'Max' \u2192 child_of Alice, loves chess, does swimming. Filter by date with as_of to see what was true at a point in time.",
+    "description": "Query the knowledge graph for an entity's relationships. Returns typed facts with temporal validity. E.g. 'Max' → child_of Alice, loves chess, does swimming. Filter by date with as_of to see what was true at a point in time.",
     "input_schema": {
       "properties": {
         "as_of": {
-          "description": "Date filter \u2014 only facts valid at this date (YYYY-MM-DD, optional)",
+          "description": "Date filter — only facts valid at this date (YYYY-MM-DD, optional)",
           "type": "string"
         },
         "direction": {
-          "description": "outgoing (entity\u2192?), incoming (?\u2192entity), or both (default: both)",
+          "description": "outgoing (entity→?), incoming (?→entity), or both (default: both)",
           "type": "string"
         },
         "entity": {
@@ -327,10 +363,50 @@
     "input_schema": {
       "properties": {
         "entity": {
-          "description": "Entity to get timeline for (optional \u2014 omit for full timeline)",
+          "description": "Entity to get timeline for (optional — omit for full timeline)",
           "type": "string"
         }
       },
+      "type": "object"
+    }
+  },
+  "mempalace_lineage_set": {
+    "description": "Create or revise a stable, provider-neutral agent lineage. A lineage is the persistent self whose memories and reviewed observations can span models and harnesses. The first lineage becomes the default. Updates require the current expected_revision; use 0 when explicitly creating a new lineage.",
+    "input_schema": {
+      "properties": {
+        "actor": {
+          "description": "Who is making this change",
+          "type": "string"
+        },
+        "description": {
+          "description": "What remains continuous across model and harness changes",
+          "type": "string"
+        },
+        "display_name": {
+          "description": "Human-readable name for the persistent lineage",
+          "type": "string"
+        },
+        "expected_revision": {
+          "description": "0 for explicit creation; current revision for an update",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "lineage_id": {
+          "description": "Stable provider-neutral identifier, e.g. codex-dion",
+          "type": "string"
+        },
+        "set_default": {
+          "description": "Make this the default lineage for wake-up and identity packets (default false)",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "lineage_id",
+        "display_name",
+        "description",
+        "expected_revision",
+        "actor"
+      ],
       "type": "object"
     }
   },
@@ -350,6 +426,74 @@
     "description": "List all wings with drawer counts",
     "input_schema": {
       "properties": {},
+      "type": "object"
+    }
+  },
+  "mempalace_migration_record": {
+    "description": "Record a model or harness migration for a persistent lineage, explicitly separating continuity from changed engine behavior. Migration evidence becomes part of future identity packets and wake-ups.",
+    "input_schema": {
+      "properties": {
+        "author": {
+          "description": "Who recorded the migration",
+          "type": "string"
+        },
+        "changes": {
+          "description": "Observed changes attributable to the new engine or harness",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "continuities": {
+          "description": "Behaviors, commitments, and understandings that carried over",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "evidence": {
+          "description": "Concrete comparisons, tasks, or memory references supporting the account",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "from_harness": {
+          "description": "Previous harness identifier (optional)",
+          "type": "string"
+        },
+        "from_model": {
+          "description": "Previous model identifier (optional)",
+          "type": "string"
+        },
+        "lineage_id": {
+          "description": "Persistent lineage being migrated",
+          "type": "string"
+        },
+        "summary": {
+          "description": "Concise account of the migration",
+          "type": "string"
+        },
+        "to_harness": {
+          "description": "New harness identifier",
+          "type": "string"
+        },
+        "to_model": {
+          "description": "New model identifier",
+          "type": "string"
+        }
+      },
+      "required": [
+        "lineage_id",
+        "to_model",
+        "to_harness",
+        "summary",
+        "continuities",
+        "changes",
+        "evidence",
+        "author"
+      ],
       "type": "object"
     }
   },
@@ -384,15 +528,129 @@
       "type": "object"
     }
   },
+  "mempalace_self_observation_propose": {
+    "description": "Propose an evidence-backed candidate observation about a persistent agent lineage. Candidates do not shape the compiled identity packet until promoted through explicit review. Use lineage scope for portable traits, shared for a working pattern intentionally available to all lineages, and engine only for behavior tied to a matching model or harness.",
+    "input_schema": {
+      "properties": {
+        "author": {
+          "description": "Who is proposing the observation",
+          "type": "string"
+        },
+        "behavioral_consequence": {
+          "description": "How this should change future behavior if promoted",
+          "type": "string"
+        },
+        "confidence": {
+          "description": "Confidence from 0 to 1",
+          "maximum": 1,
+          "minimum": 0,
+          "type": "number"
+        },
+        "counterevidence": {
+          "description": "Known evidence against or limiting the observation",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "evidence": {
+          "description": "Concrete drawer, diary, task, change, or other evidence references",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "harness": {
+          "description": "Harness associated with the observation (required with engine scope unless model is provided)",
+          "type": "string"
+        },
+        "lineage_id": {
+          "description": "Lineage this observation belongs to",
+          "type": "string"
+        },
+        "model": {
+          "description": "Model associated with the observation (required with engine scope unless harness is provided)",
+          "type": "string"
+        },
+        "scope": {
+          "description": "Applicability scope (default lineage)",
+          "enum": [
+            "lineage",
+            "shared",
+            "engine"
+          ],
+          "type": "string"
+        },
+        "statement": {
+          "description": "Concise falsifiable observation about the self",
+          "type": "string"
+        },
+        "supersedes_observation_id": {
+          "description": "Older observation to supersede if this candidate is promoted",
+          "type": "string"
+        }
+      },
+      "required": [
+        "lineage_id",
+        "statement",
+        "behavioral_consequence",
+        "confidence",
+        "evidence",
+        "author"
+      ],
+      "type": "object"
+    }
+  },
+  "mempalace_self_observation_review": {
+    "description": "Review a candidate self-observation and either promote it into the compiled identity packet or retire it. Reviews are revision-checked so concurrent or stale judgments cannot silently overwrite one another.",
+    "input_schema": {
+      "properties": {
+        "decision": {
+          "description": "Review outcome",
+          "enum": [
+            "promote",
+            "retire"
+          ],
+          "type": "string"
+        },
+        "expected_revision": {
+          "description": "Current observation revision",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "observation_id": {
+          "description": "Candidate observation to review",
+          "type": "string"
+        },
+        "reason": {
+          "description": "Evidence-based rationale for the decision",
+          "type": "string"
+        },
+        "reviewer": {
+          "description": "Who performed the review",
+          "type": "string"
+        }
+      },
+      "required": [
+        "observation_id",
+        "decision",
+        "expected_revision",
+        "reviewer",
+        "reason"
+      ],
+      "type": "object"
+    }
+  },
   "mempalace_status": {
-    "description": "Palace overview \u2014 total drawers, wing and room counts",
+    "description": "Palace overview — total drawers, wing and room counts",
     "input_schema": {
       "properties": {},
       "type": "object"
     }
   },
   "mempalace_traverse": {
-    "description": "Walk the palace graph from a room. Shows connected ideas across wings \u2014 the tunnels. Like following a thread through the palace: start at 'chromadb-setup' in wing_code, discover it connects to wing_myproject (planning) and wing_user (feelings about it). Local palace only; not federated in v1.",
+    "description": "Walk the palace graph from a room. Shows connected ideas across wings — the tunnels. Like following a thread through the palace: start at 'chromadb-setup' in wing_code, discover it connects to wing_myproject (planning) and wing_user (feelings about it). Local palace only; not federated in v1.",
     "input_schema": {
       "properties": {
         "max_hops": {
@@ -411,7 +669,7 @@
     }
   },
   "mempalace_wake_up": {
-    "description": "Wake up into the palace. Returns identity.txt, palace status, recent palace changes, current project history when provided, and recent diary entries across all agents. When federation is active the response also includes `remote_changes`: a per-remote map of change events from the last 24 hours (each event carries `origin: \"remote:<name>\"`), unreachable remotes appear as `{ \"unreachable\": true, \"error\": \"...\" }`, and a `next_cursor` is provided per remote for continuation via mempalace_get_changes_since.",
+    "description": "Wake up into the palace. Returns the identity constitution, the default or requested lineage's compiled identity packet, palace status, recent palace changes, current project history when provided, and recent diary entries across all agents. Pass the current model and harness so engine-specific observations are filtered correctly. When federation is active the response also includes `remote_changes`: a per-remote map of change events from the last 24 hours (each event carries `origin: \"remote:<name>\"`), unreachable remotes appear as `{ \"unreachable\": true, \"error\": \"...\" }`, and a `next_cursor` is provided per remote for continuation via mempalace_get_changes_since.",
     "input_schema": {
       "properties": {
         "agent_name": {
@@ -426,9 +684,25 @@
           "description": "Return wake-up diary entries filed at or after this RFC 3339 timestamp (optional, default: 24 hours ago)",
           "type": "string"
         },
+        "harness": {
+          "description": "Current harness identifier used to filter engine-scoped observations (optional)",
+          "type": "string"
+        },
+        "include_candidates": {
+          "description": "Include unreviewed self-observation candidates in a separate section (default false)",
+          "type": "boolean"
+        },
         "latest_limit": {
           "description": "Max recent changes across the whole palace (default 8)",
           "type": "integer"
+        },
+        "lineage_id": {
+          "description": "Persistent lineage to load (optional; default lineage when omitted)",
+          "type": "string"
+        },
+        "model": {
+          "description": "Current model identifier used to filter engine-scoped observations (optional)",
+          "type": "string"
         },
         "project_limit": {
           "description": "Max recent changes for the current project wing (default 8)",

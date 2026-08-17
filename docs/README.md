@@ -13,6 +13,8 @@ This directory documents the Rust release surface that exists in `mempalace-rs/`
 - [CLI Surface](CLI-Surface.md) — every `mempalace-cli` command and flag
 - [Config Schema](Config-Schema.md) — `config.json`, `projects.json`, `mempalace.yaml`, env overrides
 - [Mined Storage](Mined-Storage.md) — locator model, repository views, stale semantics, discovery rules
+- [Self-Continuity Across Models](Self-Continuity.md) — lineages, reviewed self-observations,
+  identity packets, and model/harness migrations
 - [Federation](Federation.md) — server, client routing, federated and branch-aware mining
 
 ### Operations

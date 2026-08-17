@@ -16,6 +16,29 @@ to store chunk text verbatim with no locator.
 Conversation exports, diary entries, and authored drawers always store content
 verbatim, regardless of encoding.
 
+### Operational self-continuity records
+
+Self-continuity data is operational state, not mined vector content. Migration
+`0009_agent_lineages` creates four tables in `storage.sqlite3`:
+
+| Table | Purpose |
+|---|---|
+| `agent_lineages` | Stable provider-neutral lineage identity, description, default selection, and optimistic revision. A partial unique index permits only one default lineage. |
+| `self_observations` | Candidate, promoted, superseded, or retired observations with scope, behavioral consequence, confidence, evidence, counterevidence, runtime metadata, and revision. |
+| `self_observation_reviews` | Append-only review history recording each status transition, reviewer, reason, revision, and time. |
+| `lineage_migrations` | Evidence-backed records of continuity and change across model or harness transitions. |
+
+Foreign keys keep observations and migrations attached to an existing lineage.
+Promoting a candidate that names `supersedes_observation_id` updates the old
+observation and writes both review records in the same SQLite transaction.
+Lineage writes and observation reviews use expected revisions; conflicts make no
+change and return the actual revision to the MCP caller.
+
+These records are compiled with `identity.txt` at read time. They do not add rows
+to LanceDB, do not require embeddings, and are not federated. See
+[Self-Continuity Across Models](Self-Continuity.md) for the lifecycle and wake-up
+semantics.
+
 ### Locator fields
 
 | Field | Type | Description |

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Coordinate with MemPalace"
+  short_description: "Coordinate agents through durable MemPalace envelopes"
+  default_prompt: "Use $coordinate-with-mempalace to coordinate this work through durable task, handoff, result, and artifact envelopes."

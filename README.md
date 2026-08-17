@@ -146,6 +146,7 @@ Full index: [docs/README.md](docs/README.md).
 - [Cloud environment](docs/Cloud-Environment.md) — building and testing in a cloud sandbox or CI runner
 - [Mined storage](docs/Mined-Storage.md) — locator model, repository views, stale semantics, discovery rules
 - [Federation](docs/Federation.md) — running a server, client routing, federated & branch-aware mining
+- [Coordination Phase 0](docs/Coordination-Phase-0.md) — experimental durable coordination skill and design findings
 - [Release operations](docs/Release-Operations.md) — signed candidate and stable release runbook
 - [Hook setup](hooks/README.md) — auto-save for Claude Code
 

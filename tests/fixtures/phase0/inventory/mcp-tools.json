@@ -200,7 +200,7 @@
     }
   },
   "mempalace_identity_packet": {
-    "description": "Compile the identity constitution, stable lineage, reviewed self-observations, and recent model/harness migrations into a portable identity packet. Uses the lineage bound by MCP server configuration, or the palace default when no binding exists. The model cannot select or override the lineage. Engine-scoped observations are included only when their recorded model/harness matches the supplied runtime.",
+    "description": "Compile the identity constitution, stable lineage, reviewed self-observations, and recent model/harness migrations into a portable identity packet. Uses the lineage bound by MCP server configuration, or the palace default when no binding exists. If a configured binding is missing, falls back to the palace default and includes creation guidance in the response. The model cannot select or override the lineage. Engine-scoped observations are included only when their recorded model/harness matches the supplied runtime.",
     "input_schema": {
       "properties": {
         "agent_name": {
@@ -665,7 +665,7 @@
     }
   },
   "mempalace_wake_up": {
-    "description": "Wake up into the palace. Returns the identity constitution, the MCP-bound or palace-default lineage's compiled identity packet, palace status, recent palace changes, current project history when provided, and recent diary entries across all agents. Lineage selection is fixed by server configuration and cannot be supplied by the model. Pass the current model and harness so engine-specific observations are filtered correctly. When federation is active the response also includes `remote_changes`: a per-remote map of change events from the last 24 hours (each event carries `origin: \"remote:<name>\"`), unreachable remotes appear as `{ \"unreachable\": true, \"error\": \"...\" }`, and a `next_cursor` is provided per remote for continuation via mempalace_get_changes_since.",
+    "description": "Wake up into the palace. Returns the identity constitution, the MCP-bound or palace-default lineage's compiled identity packet, palace status, recent palace changes, current project history when provided, and recent diary entries across all agents. Lineage selection is fixed by server configuration and cannot be supplied by the model. If a configured binding is missing, wake-up uses the palace default and includes creation guidance in the response. Pass the current model and harness so engine-specific observations are filtered correctly. When federation is active the response also includes `remote_changes`: a per-remote map of change events from the last 24 hours (each event carries `origin: \"remote:<name>\"`), unreachable remotes appear as `{ \"unreachable\": true, \"error\": \"...\" }`, and a `next_cursor` is provided per remote for continuation via mempalace_get_changes_since.",
     "input_schema": {
       "properties": {
         "agent_name": {

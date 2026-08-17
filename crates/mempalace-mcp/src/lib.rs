@@ -114,7 +114,7 @@ const IDENTITY_UPDATE_MAX_CONTENT_BYTES: usize = 16 * 1024;
 const IDENTITY_MAX_BYTES: usize = 64 * 1024;
 pub const LINEAGE_ID_ENV: &str = "MEMPALACE_LINEAGE_ID";
 
-pub const PALACE_PROTOCOL: &str = "IMPORTANT — MemPalace Memory Protocol:\n1. ON WAKE-UP: Call mempalace_wake_up with agent_name and, when known, model and harness. It loads the identity constitution, the MCP-bound or palace-default lineage's compiled identity packet, palace status, recent changes, current project context, and recent diary summaries across agents. Lineage selection is host configuration, never a model-supplied tool argument. Use mempalace_diary_read with an entry_id when full diary detail is needed.\n2. BEFORE RESPONDING about any person, project, or past event: call mempalace_kg_query or mempalace_search FIRST. Never guess — verify.\n3. IF UNSURE about a fact (name, gender, age, relationship): say \"let me check\" and query the palace. Wrong is worse than slow.\n4. AFTER EACH SESSION: call mempalace_diary_write to record what happened, what you learned, what matters, with a concise summary.\n5. WHEN FACTS CHANGE: call mempalace_kg_invalidate on the old fact, mempalace_kg_add for the new one.\n6. TREAT identity.txt AS THE CONSTITUTION: use mempalace_identity_update for deliberate changes to durable identity, values, boundaries, and working relationship — not routine autobiography.\n7. WHEN A REPEATED PATTERN MAY DESCRIBE THE PERSISTENT SELF: propose an evidence-backed candidate with mempalace_self_observation_propose. Promote or retire it only after review with mempalace_self_observation_review.\n8. WHEN MODEL OR HARNESS CHANGES: record what carried over and what changed with mempalace_migration_record. Never silently treat engine behavior as lineage identity.\n\nThis protocol ensures the AI KNOWS before it speaks. Storage is not memory — but storage + this protocol = memory.";
+pub const PALACE_PROTOCOL: &str = "IMPORTANT — MemPalace Memory Protocol:\n1. ON WAKE-UP: Call mempalace_wake_up with agent_name and, when known, model and harness. It loads the identity constitution, the MCP-bound or palace-default lineage's compiled identity packet, palace status, recent changes, current project context, and recent diary summaries across agents. Lineage selection is host configuration, never a model-supplied tool argument. If a configured binding does not exist, the packet uses the palace default and includes instructions for creating the requested lineage with mempalace_lineage_set. Use mempalace_diary_read with an entry_id when full diary detail is needed.\n2. BEFORE RESPONDING about any person, project, or past event: call mempalace_kg_query or mempalace_search FIRST. Never guess — verify.\n3. IF UNSURE about a fact (name, gender, age, relationship): say \"let me check\" and query the palace. Wrong is worse than slow.\n4. AFTER EACH SESSION: call mempalace_diary_write to record what happened, what you learned, what matters, with a concise summary.\n5. WHEN FACTS CHANGE: call mempalace_kg_invalidate on the old fact, mempalace_kg_add for the new one.\n6. TREAT identity.txt AS THE CONSTITUTION: use mempalace_identity_update for deliberate changes to durable identity, values, boundaries, and working relationship — not routine autobiography.\n7. WHEN A REPEATED PATTERN MAY DESCRIBE THE PERSISTENT SELF: propose an evidence-backed candidate with mempalace_self_observation_propose. Promote or retire it only after review with mempalace_self_observation_review.\n8. WHEN MODEL OR HARNESS CHANGES: record what carried over and what changed with mempalace_migration_record. Never silently treat engine behavior as lineage identity.\n\nThis protocol ensures the AI KNOWS before it speaks. Storage is not memory — but storage + this protocol = memory.";
 
 pub const AAAK_SPEC: &str = "AAAK is a compressed memory dialect that MemPalace uses for efficient storage.\nIt is designed to be readable by both humans and LLMs without decoding.\n\nFORMAT:\n  ENTITIES: 3-letter uppercase codes. ALC=Alice, JOR=Jordan, RIL=Riley, MAX=Max, BEN=Ben.\n  EMOTIONS: *action markers* before/during text. *warm*=joy, *fierce*=determined, *raw*=vulnerable, *bloom*=tenderness.\n  STRUCTURE: Pipe-separated fields. FAM: family | PROJ: projects | ⚠: warnings/reminders.\n  DATES: ISO format (2026-03-31). COUNTS: Nx = N mentions (e.g., 570x).\n  IMPORTANCE: ★ to ★★★★★ (1-5 scale).\n  HALLS: hall_facts, hall_events, hall_discoveries, hall_preferences, hall_advice.\n  WINGS: wing_user, wing_agent, wing_team, wing_code, wing_myproject, wing_hardware, wing_ue5, wing_ai_research.\n  ROOMS: Hyphenated slugs representing named ideas (e.g., chromadb-setup, gpu-pricing).\n\nEXAMPLE:\n  FAM: ALC→♡JOR | 2D(kids): RIL(18,sports) MAX(11,chess+swimming) | BEN(contributor)\n\nRead AAAK naturally — expand codes mentally, treat *markers* as emotional context.\nWhen WRITING AAAK: use entity codes, mark emotions, keep structure tight.";
 
@@ -277,7 +277,7 @@ impl ToolName {
         match self {
             Self::WakeUp => ToolDefinition {
                 name: self.as_str(),
-                description: "Wake up into the palace. Returns the identity constitution, the MCP-bound or palace-default lineage's compiled identity packet, palace status, recent palace changes, current project history when provided, and recent diary entries across all agents. Lineage selection is fixed by server configuration and cannot be supplied by the model. Pass the current model and harness so engine-specific observations are filtered correctly. When federation is active the response also includes `remote_changes`: a per-remote map of change events from the last 24 hours (each event carries `origin: \"remote:<name>\"`), unreachable remotes appear as `{ \"unreachable\": true, \"error\": \"...\" }`, and a `next_cursor` is provided per remote for continuation via mempalace_get_changes_since.",
+                description: "Wake up into the palace. Returns the identity constitution, the MCP-bound or palace-default lineage's compiled identity packet, palace status, recent palace changes, current project history when provided, and recent diary entries across all agents. Lineage selection is fixed by server configuration and cannot be supplied by the model. If a configured binding is missing, wake-up uses the palace default and includes creation guidance in the response. Pass the current model and harness so engine-specific observations are filtered correctly. When federation is active the response also includes `remote_changes`: a per-remote map of change events from the last 24 hours (each event carries `origin: \"remote:<name>\"`), unreachable remotes appear as `{ \"unreachable\": true, \"error\": \"...\" }`, and a `next_cursor` is provided per remote for continuation via mempalace_get_changes_since.",
                 input_schema: json!({
                     "type":"object",
                     "properties":{
@@ -570,7 +570,7 @@ impl ToolName {
             },
             Self::IdentityPacket => ToolDefinition {
                 name: self.as_str(),
-                description: "Compile the identity constitution, stable lineage, reviewed self-observations, and recent model/harness migrations into a portable identity packet. Uses the lineage bound by MCP server configuration, or the palace default when no binding exists. The model cannot select or override the lineage. Engine-scoped observations are included only when their recorded model/harness matches the supplied runtime.",
+                description: "Compile the identity constitution, stable lineage, reviewed self-observations, and recent model/harness migrations into a portable identity packet. Uses the lineage bound by MCP server configuration, or the palace default when no binding exists. If a configured binding is missing, falls back to the palace default and includes creation guidance in the response. The model cannot select or override the lineage. Engine-scoped observations are included only when their recorded model/harness matches the supplied runtime.",
                 input_schema: json!({
                     "type":"object",
                     "properties":{
@@ -1419,19 +1419,39 @@ where
         let (lineage, lineage_selection) = match self.bound_lineage_id.as_deref() {
             Some(lineage_id) => {
                 let lineage = operational_store.get_lineage(lineage_id).map_tool_internal()?;
-                if lineage.is_none() {
-                    return Err(ToolError::InvalidParams(format!(
-                        "this MCP server is bound by {LINEAGE_ID_ENV} to lineage `{lineage_id}`, but that lineage does not exist"
-                    )));
+                match lineage {
+                    Some(lineage) => (
+                        Some(lineage),
+                        json!({
+                            "source": "mcp_server_environment",
+                            "lineage_id": lineage_id,
+                            "override_allowed": false,
+                        }),
+                    ),
+                    None => {
+                        let fallback = operational_store.get_default_lineage().map_tool_internal()?;
+                        let fallback_id = fallback.as_ref().map(|record| record.lineage_id.clone());
+                        let message = if fallback_id.is_some() {
+                            format!(
+                                "{LINEAGE_ID_ENV} is set to `{lineage_id}`, but that lineage does not exist. The palace default is being used for this response. To create it, call mempalace_lineage_set with lineage_id `{lineage_id}`, display_name, description, expected_revision 0, set_default false, and actor, then retry wake-up."
+                            )
+                        } else {
+                            format!(
+                                "{LINEAGE_ID_ENV} is set to `{lineage_id}`, but that lineage does not exist and no palace default is configured. Create it with mempalace_lineage_set using lineage_id `{lineage_id}`, display_name, description, expected_revision 0, set_default false, and actor, then retry wake-up."
+                            )
+                        };
+                        (
+                            fallback,
+                            json!({
+                                "source": "palace_default_fallback",
+                                "lineage_id": fallback_id,
+                                "requested_lineage_id": lineage_id,
+                                "override_allowed": false,
+                                "message": message,
+                            }),
+                        )
+                    }
                 }
-                (
-                    lineage,
-                    json!({
-                        "source": "mcp_server_environment",
-                        "lineage_id": lineage_id,
-                        "override_allowed": false,
-                    }),
-                )
             }
             None => {
                 let lineage = operational_store.get_default_lineage().map_tool_internal()?;
@@ -1460,10 +1480,16 @@ where
         };
         let Some(lineage) = lineage else {
             let available_lineages = operational_store.list_lineages().map_tool_internal()?;
+            let message = match self.bound_lineage_id.as_deref() {
+                Some(lineage_id) => format!(
+                    "{LINEAGE_ID_ENV} is set to `{lineage_id}`, but that lineage does not exist and no palace default is configured. Create it with mempalace_lineage_set using lineage_id `{lineage_id}`, display_name, description, expected_revision 0, set_default false, and actor, then retry wake-up."
+                ),
+                None => "No default lineage is configured. Create one with mempalace_lineage_set or bind the MCP server with MEMPALACE_LINEAGE_ID.".to_owned(),
+            };
             return Ok(json!({
                 "packet_version": 1,
                 "configured": false,
-                "message": "No default lineage is configured. Create one with mempalace_lineage_set or bind the MCP server with MEMPALACE_LINEAGE_ID.",
+                "message": message,
                 "lineage_selection": lineage_selection,
                 "available_lineages": available_lineages,
                 "constitution": constitution,
@@ -4464,17 +4490,79 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_mcp_bound_lineage_fails_closed() {
+    async fn missing_mcp_bound_lineage_falls_back_to_default_with_creation_guidance() {
         let harness = test_harness_with_bound_lineage("missing-lineage").await;
+        let created = harness
+            .server
+            .handle_request(tool_call(
+                6074,
+                "mempalace_lineage_set",
+                json!({
+                    "lineage_id":"default-lineage",
+                    "display_name":"Default lineage",
+                    "description":"The palace default for fallback testing.",
+                    "expected_revision":0,
+                    "set_default":true,
+                    "actor":"test"
+                }),
+            ))
+            .await;
+        assert_eq!(decode_tool_payload(&created).unwrap()["success"], true);
+
         let response = harness
             .server
-            .handle_request(tool_call(6074, "mempalace_identity_packet", json!({})))
+            .handle_request(tool_call(6075, "mempalace_identity_packet", json!({})))
             .await;
-        assert_eq!(response["error"]["code"], ErrorCode::InvalidParams as i32);
-        let message = response["error"]["message"].as_str().unwrap();
+        let packet = decode_tool_payload(&response).unwrap();
+        assert_eq!(packet["lineage"]["lineage_id"], "default-lineage");
+        assert_eq!(packet["lineage_selection"]["source"], "palace_default_fallback");
+        assert_eq!(packet["lineage_selection"]["lineage_id"], "default-lineage");
+        assert_eq!(packet["lineage_selection"]["requested_lineage_id"], "missing-lineage");
+        assert_eq!(packet["lineage_selection"]["override_allowed"], false);
+        let message = packet["lineage_selection"]["message"].as_str().unwrap();
         assert!(message.contains(LINEAGE_ID_ENV));
         assert!(message.contains("missing-lineage"));
-        assert!(message.contains("does not exist"));
+        assert!(message.contains("mempalace_lineage_set"));
+        assert!(message.contains("expected_revision 0"));
+
+        let wake = decode_tool_payload(
+            &harness
+                .server
+                .handle_request(tool_call(6076, "mempalace_wake_up", json!({})))
+                .await,
+        )
+        .unwrap();
+        assert_eq!(
+            wake["identity_packet"]["lineage_selection"]["source"],
+            "palace_default_fallback"
+        );
+
+        let created_requested = harness
+            .server
+            .handle_request(tool_call(
+                6077,
+                "mempalace_lineage_set",
+                json!({
+                    "lineage_id":"missing-lineage",
+                    "display_name":"Created requested lineage",
+                    "description":"The requested lineage created after fallback.",
+                    "expected_revision":0,
+                    "set_default":false,
+                    "actor":"test"
+                }),
+            ))
+            .await;
+        assert_eq!(decode_tool_payload(&created_requested).unwrap()["success"], true);
+
+        let rebound = decode_tool_payload(
+            &harness
+                .server
+                .handle_request(tool_call(6078, "mempalace_identity_packet", json!({})))
+                .await,
+        )
+        .unwrap();
+        assert_eq!(rebound["lineage"]["lineage_id"], "missing-lineage");
+        assert_eq!(rebound["lineage_selection"]["source"], "mcp_server_environment");
     }
 
     #[tokio::test]

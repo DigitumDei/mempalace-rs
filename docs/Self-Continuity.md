@@ -32,7 +32,8 @@ The packet contains:
 - the constitution and its path
 - the MCP-bound lineage, or the palace default when the server has no binding
 - `lineage_selection`, including the selected ID, its source, and
-  `override_allowed: false`
+  `override_allowed: false`; when a bound ID is missing, it also reports the requested ID and
+  creation guidance
 - promoted observations that apply to the current runtime
 - recent migration records
 - runtime metadata and compilation time
@@ -59,10 +60,11 @@ wake-up.
 ## Binding a lineage to an MCP client
 
 Set `MEMPALACE_LINEAGE_ID` in the environment of the local `mempalace-mcp` process to bind that
-MCP connection to one existing lineage. This is a host-controlled capability boundary: the model
-cannot override the binding in a tool call, even if it knows another valid lineage ID. A configured
-ID is syntax-checked when the server starts. If the ID does not exist in the palace, identity packet
-and wake-up calls fail closed instead of falling back to another lineage.
+MCP connection to one lineage. This is a host-controlled capability boundary: the model cannot
+override the binding in a tool call, even if it knows another valid lineage ID. A configured ID is
+syntax-checked when the server starts. If the ID does not exist in the palace, identity packet and
+wake-up calls use the palace default for that response and include a `lineage_selection.message`
+explaining how to create the requested lineage with `mempalace_lineage_set`.
 
 Different MCP clients can share the same palace while binding their separately launched server
 processes to different lineages. For example, Codex can use `codex-dion` while OpenCode uses
@@ -105,7 +107,9 @@ OpenCode V2 configuration:
 
 Changing the binding requires editing the MCP host configuration and restarting that server
 connection. When `MEMPALACE_LINEAGE_ID` is absent, packet tools use only the palace's stored
-default lineage; there is still no per-call override.
+default lineage; there is still no per-call override. When a bound lineage is newly created with
+`mempalace_lineage_set`, retry wake-up or identity-packet compilation and the binding will take
+effect without changing the host configuration.
 
 ## Establishing a lineage
 

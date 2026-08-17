@@ -72,7 +72,7 @@ fn help_text() -> &'static str {
         "  -h, --help     Print help\n",
         "  -V, --version  Print version\n",
         "\nEnvironment:\n",
-        "  MEMPALACE_LINEAGE_ID  Bind identity wake-up to an existing lineage\n",
+        "  MEMPALACE_LINEAGE_ID  Bind identity wake-up; missing IDs fall back to the palace default\n",
     )
 }
 

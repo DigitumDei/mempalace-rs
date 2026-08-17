@@ -1069,7 +1069,11 @@ mod tests {
             }));
         }
         barrier.wait();
-        let wins = joins.into_iter().filter(|join| join.join().expect("worker thread")).count();
+        let wins = joins
+            .into_iter()
+            .map(|join| join.join().expect("worker thread"))
+            .filter(|claimed| *claimed)
+            .count();
         assert_eq!(wins, 1);
     }
     #[test]

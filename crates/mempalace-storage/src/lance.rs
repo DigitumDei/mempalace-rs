@@ -1,6 +1,3 @@
-use std::collections::HashSet;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use arrow_array::{
     Array, ArrayRef, Date32Array, FixedSizeListArray, Float32Array, RecordBatch,
     RecordBatchIterator, StringArray, TimestampMicrosecondArray, UInt32Array, UInt64Array,
@@ -15,6 +12,9 @@ use lancedb::index::Index;
 use lancedb::query::{ExecutableQuery, QueryBase, Select};
 use lancedb::table::NewColumnTransform;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use time::{Date, OffsetDateTime};
 
 use crate::error::{Result, StorageError};
@@ -176,11 +176,8 @@ impl LanceDrawerStore {
         if ids.is_empty() {
             return Ok(HashSet::new());
         }
-        let filter = DrawerFilter {
-            ids: ids.to_vec(),
-            include_all_views: true,
-            ..DrawerFilter::default()
-        };
+        let filter =
+            DrawerFilter { ids: ids.to_vec(), include_all_views: true, ..DrawerFilter::default() };
         let table = self.table().await?;
         let mut query = table.query().select(Select::Columns(vec!["id".to_owned()]));
         query = query.only_if(compile_filter(&filter));
@@ -351,8 +348,8 @@ impl LanceDrawerStore {
         let versions = table.list_versions().await?;
         let versions_before = versions.len();
 
-        let older_than = lancedb::table::Duration::try_hours(retention_hours as i64)
-            .ok_or_else(|| {
+        let older_than =
+            lancedb::table::Duration::try_hours(retention_hours as i64).ok_or_else(|| {
                 StorageError::Invariant(format!("invalid retention_hours: {retention_hours}"))
             })?;
         let _optimize_stats = table
@@ -457,13 +454,8 @@ impl DrawerStore for LanceDrawerStore {
         // Migrate: compute columns present in expected schema but missing from the table.
         // This is idempotent and handles old tables that predate the locator columns.
         // SQL type expressions are picked below based on the Arrow DataType.
-        let existing_fields: std::collections::HashSet<String> = table
-            .schema()
-            .await?
-            .fields()
-            .iter()
-            .map(|f| f.name().clone())
-            .collect();
+        let existing_fields: std::collections::HashSet<String> =
+            table.schema().await?.fields().iter().map(|f| f.name().clone()).collect();
 
         // Lance/DataFusion SQL type names (verified against lance-datafusion-1.0.1/src/planner.rs):
         //   UInt64 → "BIGINT UNSIGNED"
@@ -488,7 +480,9 @@ impl DrawerStore for LanceDrawerStore {
             table
                 .add_columns(NewColumnTransform::SqlExpressions(missing_columns), None)
                 .await
-                .map_err(|err| StorageError::Invariant(format!("schema migration failed: {err}")))?;
+                .map_err(|err| {
+                    StorageError::Invariant(format!("schema migration failed: {err}"))
+                })?;
         }
 
         self.ensure_indices(&table).await?;
@@ -719,10 +713,7 @@ fn drawers_to_reader(
                 drawers
                     .iter()
                     .map(|drawer| {
-                        drawer
-                            .locator
-                            .as_ref()
-                            .and_then(|loc| loc.commit_hash.as_deref())
+                        drawer.locator.as_ref().and_then(|loc| loc.commit_hash.as_deref())
                     })
                     .collect::<Vec<_>>(),
             )),
@@ -736,7 +727,9 @@ fn drawers_to_reader(
             Arc::new(StringArray::from(
                 drawers
                     .iter()
-                    .map(|drawer| drawer.view_metadata.as_ref().and_then(|vm| vm.view_name.as_deref()))
+                    .map(|drawer| {
+                        drawer.view_metadata.as_ref().and_then(|vm| vm.view_name.as_deref())
+                    })
                     .collect::<Vec<_>>(),
             )),
             Arc::new(StringArray::from(
@@ -922,22 +915,18 @@ fn records_from_batches(batches: &[RecordBatch]) -> Result<Vec<DrawerRecord>> {
             .as_string::<i32>();
         // Locator columns are optional (absent from tables created before schema migration).
         // Treat the whole group as absent (locator = None) when any required column is missing.
-        let locator_byte_start =
-            batch.column_by_name("locator_byte_start").map(|col| {
-                col.as_primitive::<arrow_array::types::UInt64Type>()
-            });
-        let locator_byte_end =
-            batch.column_by_name("locator_byte_end").map(|col| {
-                col.as_primitive::<arrow_array::types::UInt64Type>()
-            });
-        let locator_line_start =
-            batch.column_by_name("locator_line_start").map(|col| {
-                col.as_primitive::<arrow_array::types::UInt32Type>()
-            });
-        let locator_line_end =
-            batch.column_by_name("locator_line_end").map(|col| {
-                col.as_primitive::<arrow_array::types::UInt32Type>()
-            });
+        let locator_byte_start = batch
+            .column_by_name("locator_byte_start")
+            .map(|col| col.as_primitive::<arrow_array::types::UInt64Type>());
+        let locator_byte_end = batch
+            .column_by_name("locator_byte_end")
+            .map(|col| col.as_primitive::<arrow_array::types::UInt64Type>());
+        let locator_line_start = batch
+            .column_by_name("locator_line_start")
+            .map(|col| col.as_primitive::<arrow_array::types::UInt32Type>());
+        let locator_line_end = batch
+            .column_by_name("locator_line_end")
+            .map(|col| col.as_primitive::<arrow_array::types::UInt32Type>());
         let locator_file_hash =
             batch.column_by_name("locator_file_hash").map(|col| col.as_string::<i32>());
         let locator_resolve_root =
@@ -945,16 +934,13 @@ fn records_from_batches(batches: &[RecordBatch]) -> Result<Vec<DrawerRecord>> {
         let locator_commit =
             batch.column_by_name("locator_commit").map(|col| col.as_string::<i32>());
         // View-metadata columns are optional (absent from tables created before schema migration).
-        let view_repo_id =
-            batch.column_by_name("view_repo_id").map(|col| col.as_string::<i32>());
-        let view_name =
-            batch.column_by_name("view_name").map(|col| col.as_string::<i32>());
+        let view_repo_id = batch.column_by_name("view_repo_id").map(|col| col.as_string::<i32>());
+        let view_name = batch.column_by_name("view_name").map(|col| col.as_string::<i32>());
         let view_source_path =
             batch.column_by_name("view_source_path").map(|col| col.as_string::<i32>());
         let view_head_commit =
             batch.column_by_name("view_head_commit").map(|col| col.as_string::<i32>());
-        let view_base_ref =
-            batch.column_by_name("view_base_ref").map(|col| col.as_string::<i32>());
+        let view_base_ref = batch.column_by_name("view_base_ref").map(|col| col.as_string::<i32>());
         let view_merge_base =
             batch.column_by_name("view_merge_base").map(|col| col.as_string::<i32>());
         let view_worktree_id =
@@ -1040,15 +1026,9 @@ fn build_locator(
     let be = byte_end.filter(|col| !col.is_null(row)).map(|col| col.value(row))?;
     let ls = line_start.filter(|col| !col.is_null(row)).map(|col| col.value(row))?;
     let le = line_end.filter(|col| !col.is_null(row)).map(|col| col.value(row))?;
-    let fh = file_hash
-        .filter(|col| !col.is_null(row))
-        .map(|col| col.value(row).to_owned())?;
-    let rr = resolve_root
-        .filter(|col| !col.is_null(row))
-        .map(|col| col.value(row).to_owned())?;
-    let ch = commit
-        .filter(|col| !col.is_null(row))
-        .map(|col| col.value(row).to_owned());
+    let fh = file_hash.filter(|col| !col.is_null(row)).map(|col| col.value(row).to_owned())?;
+    let rr = resolve_root.filter(|col| !col.is_null(row)).map(|col| col.value(row).to_owned())?;
+    let ch = commit.filter(|col| !col.is_null(row)).map(|col| col.value(row).to_owned());
     Some(mempalace_core::SourceLocator {
         byte_start: bs,
         byte_end: be,
@@ -1075,30 +1055,18 @@ fn build_view_metadata(
     path_state: Option<&arrow_array::StringArray>,
 ) -> Option<mempalace_core::RepositoryViewMetadata> {
     let rid = repo_id.filter(|col| !col.is_null(row)).map(|col| col.value(row).to_owned())?;
-    let sp = source_path
-        .filter(|col| !col.is_null(row))
-        .map(|col| col.value(row).to_owned())?;
-    let wtid = worktree_id
-        .filter(|col| !col.is_null(row))
-        .map(|col| col.value(row).to_owned())?;
-    let ps = path_state
-        .filter(|col| !col.is_null(row))
-        .map(|col| col.value(row).to_owned())?;
+    let sp = source_path.filter(|col| !col.is_null(row)).map(|col| col.value(row).to_owned())?;
+    let wtid = worktree_id.filter(|col| !col.is_null(row)).map(|col| col.value(row).to_owned())?;
+    let ps = path_state.filter(|col| !col.is_null(row)).map(|col| col.value(row).to_owned())?;
     Some(mempalace_core::RepositoryViewMetadata {
         repo_id: rid,
-        view_name: view_name
-            .filter(|col| !col.is_null(row))
-            .map(|col| col.value(row).to_owned()),
+        view_name: view_name.filter(|col| !col.is_null(row)).map(|col| col.value(row).to_owned()),
         source_path: sp,
         head_commit: head_commit
             .filter(|col| !col.is_null(row))
             .map(|col| col.value(row).to_owned()),
-        base_ref: base_ref
-            .filter(|col| !col.is_null(row))
-            .map(|col| col.value(row).to_owned()),
-        merge_base: merge_base
-            .filter(|col| !col.is_null(row))
-            .map(|col| col.value(row).to_owned()),
+        base_ref: base_ref.filter(|col| !col.is_null(row)).map(|col| col.value(row).to_owned()),
+        merge_base: merge_base.filter(|col| !col.is_null(row)).map(|col| col.value(row).to_owned()),
         worktree_id: wtid,
         path_state: ps,
     })
@@ -1530,10 +1498,7 @@ mod tests {
         )
         .unwrap();
         old_table
-            .add(RecordBatchIterator::new(
-                vec![Ok(old_batch)].into_iter(),
-                old_schema,
-            ))
+            .add(RecordBatchIterator::new(vec![Ok(old_batch)].into_iter(), old_schema))
             .execute()
             .await
             .unwrap();
@@ -1543,10 +1508,7 @@ mod tests {
         store.ensure_schema().await.unwrap();
 
         // Old row must read back with locator: None and intact content.
-        let rows = store
-            .list_drawers(&DrawerFilter::default())
-            .await
-            .unwrap();
+        let rows = store.list_drawers(&DrawerFilter::default()).await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].content, legacy_content);
         assert!(rows[0].locator.is_none(), "legacy row must have locator: None");
@@ -1584,11 +1546,8 @@ mod tests {
         };
         store.put_drawers(&[new_row], DuplicateStrategy::Error).await.unwrap();
 
-        let fetched = store
-            .get_drawer(&DrawerId::new("loc/room/0002").unwrap())
-            .await
-            .unwrap()
-            .unwrap();
+        let fetched =
+            store.get_drawer(&DrawerId::new("loc/room/0002").unwrap()).await.unwrap().unwrap();
         let loc = fetched.locator.as_ref().unwrap();
         assert_eq!(loc.byte_start, 10);
         assert_eq!(loc.byte_end, 20);
@@ -1631,11 +1590,8 @@ mod tests {
         };
         store.put_drawers(&[row_no_commit], DuplicateStrategy::Error).await.unwrap();
 
-        let fetched2 = store
-            .get_drawer(&DrawerId::new("loc/room/0003").unwrap())
-            .await
-            .unwrap()
-            .unwrap();
+        let fetched2 =
+            store.get_drawer(&DrawerId::new("loc/room/0003").unwrap()).await.unwrap().unwrap();
         let loc2 = fetched2.locator.as_ref().unwrap();
         assert_eq!(loc2.commit_hash, None, "commit_hash should round-trip as None");
         assert_eq!(loc2.file_hash, "fff");

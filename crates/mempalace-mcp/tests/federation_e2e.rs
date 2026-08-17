@@ -22,9 +22,9 @@ use mempalace_config::{
 use mempalace_core::EmbeddingProfile;
 use mempalace_federation::{DrawerSearchRequest, KgQueryRequest};
 use mempalace_mcp::{DeterministicStubProvider, JsonRpcRequest, McpServer, decode_tool_payload};
+use mempalace_remote::{RemoteApi, RemoteClient, RemoteEndpoint};
 use mempalace_server::{TokenRegistry, build_router};
 use serde_json::{Value, json};
-use mempalace_remote::{RemoteApi, RemoteClient, RemoteEndpoint};
 use tempfile::TempDir;
 
 // ─── Test token ───────────────────────────────────────────────────────────────
@@ -257,13 +257,9 @@ async fn federated_kg_reads_return_empty_for_unknown_entities() {
 
     // The local palace also lacks the entity. It must still merge the remote
     // result instead of short-circuiting with an unknown-entity error.
-    let response = call_tool(
-        &server,
-        1,
-        "mempalace_kg_query",
-        json!({"entity": "unknown federation entity"}),
-    )
-    .await;
+    let response =
+        call_tool(&server, 1, "mempalace_kg_query", json!({"entity": "unknown federation entity"}))
+            .await;
     assert_eq!(response["count"], 0);
     assert_eq!(response["facts"], json!([]));
     assert!(response.get("warnings").is_none(), "{response}");
@@ -299,14 +295,8 @@ async fn add_remote_search_combined_delete_remote_roundtrip() {
     let mut wing_rules = BTreeMap::new();
     wing_rules.insert("wing_shared".to_owned(), combined_wing_rule_remote_write());
 
-    let server = mcp_server_with_hub(
-        &local_dir,
-        &hub_url,
-        wing_rules,
-        RouteMode::Local,
-        None,
-    )
-    .await;
+    let server =
+        mcp_server_with_hub(&local_dir, &hub_url, wing_rules, RouteMode::Local, None).await;
 
     // ── 1. Add into wing_shared (Combined, write=Remote) ─────────────────────
     let add_shared = call_tool(
@@ -323,18 +313,13 @@ async fn add_remote_search_combined_delete_remote_roundtrip() {
     .await;
 
     assert_eq!(add_shared["success"], true, "add_shared failed: {add_shared}");
-    assert_eq!(
-        add_shared["origin"], "hub",
-        "add_shared must report origin=hub; got: {add_shared}"
-    );
+    assert_eq!(add_shared["origin"], "hub", "add_shared must report origin=hub; got: {add_shared}");
     assert_eq!(
         add_shared["applied_to"], "remote:hub",
         "add_shared must report applied_to=remote:hub; got: {add_shared}"
     );
-    let remote_drawer_id = add_shared["drawer_id"]
-        .as_str()
-        .expect("add_shared must return drawer_id")
-        .to_owned();
+    let remote_drawer_id =
+        add_shared["drawer_id"].as_str().expect("add_shared must return drawer_id").to_owned();
 
     // ── 2. Add locally into wing_local (no rule → Local) ─────────────────────
     let add_local = call_tool(
@@ -393,20 +378,17 @@ async fn add_remote_search_combined_delete_remote_roundtrip() {
     let all_results = search_all["results"].as_array().expect("results must be array");
     assert!(!all_results.is_empty(), "global search must return results");
 
-    let has_local =
-        all_results.iter().any(|r| r["origin"].as_str() == Some("local") || r.get("origin").is_none());
+    let has_local = all_results
+        .iter()
+        .any(|r| r["origin"].as_str() == Some("local") || r.get("origin").is_none());
     let has_hub = all_results.iter().any(|r| r["origin"].as_str() == Some("hub"));
     assert!(has_local, "global search must include local result; results: {all_results:?}");
     assert!(has_hub, "global search must include hub result; results: {all_results:?}");
 
     // ── 5. Delete remote drawer → local miss, remote fallback deletes ────────
-    let delete_resp = call_tool(
-        &server,
-        5,
-        "mempalace_delete_drawer",
-        json!({"drawer_id": remote_drawer_id}),
-    )
-    .await;
+    let delete_resp =
+        call_tool(&server, 5, "mempalace_delete_drawer", json!({"drawer_id": remote_drawer_id}))
+            .await;
 
     assert_eq!(
         delete_resp["success"], true,
@@ -641,20 +623,13 @@ async fn different_embedding_profiles_per_side() {
     let global_results = search_global["results"].as_array().expect("results array");
     assert!(!global_results.is_empty(), "global search must return results");
 
-    let origins: Vec<&str> =
-        global_results.iter().filter_map(|r| r["origin"].as_str()).collect();
+    let origins: Vec<&str> = global_results.iter().filter_map(|r| r["origin"].as_str()).collect();
     let has_hub = origins.iter().any(|&o| o == "hub");
     let has_local = origins.iter().any(|&o| o == "local");
     // The key assertion: both origins are present in the combined result set,
     // even though each side ranks with a different embedding profile.
-    assert!(
-        has_hub,
-        "global search must include hub origin; origins: {origins:?}"
-    );
-    assert!(
-        has_local,
-        "global search must include local origin; origins: {origins:?}"
-    );
+    assert!(has_hub, "global search must include hub origin; origins: {origins:?}");
+    assert!(has_local, "global search must include local origin; origins: {origins:?}");
 }
 
 // ─── Test 4: remote_down_degrades_reads ──────────────────────────────────────
@@ -760,10 +735,7 @@ async fn remote_down_degrades_reads() {
     )
     .await;
     assert_eq!(kg_add["success"], true, "kg_add must succeed locally: {kg_add}");
-    assert_eq!(
-        kg_add["applied_to"], "local",
-        "kg_add must report applied_to=local: {kg_add}"
-    );
+    assert_eq!(kg_add["applied_to"], "local", "kg_add must report applied_to=local: {kg_add}");
 
     // Combined-mode search with dead remote → local results + warnings.
     let search = call_tool(
@@ -789,17 +761,14 @@ async fn remote_down_degrades_reads() {
 
     // mempalace_status → federation.remotes[].reachable must be false.
     let status = call_tool(&server, 4, "mempalace_status", json!({})).await;
-    let remotes_info = status["federation"]["remotes"]
-        .as_array()
-        .expect("status must include federation.remotes");
-    assert!(
-        !remotes_info.is_empty(),
-        "status must list at least one remote: {status}"
-    );
+    let remotes_info =
+        status["federation"]["remotes"].as_array().expect("status must include federation.remotes");
+    assert!(!remotes_info.is_empty(), "status must list at least one remote: {status}");
     let hub_entry = remotes_info.iter().find(|r| r["name"].as_str() == Some("hub"));
     assert!(hub_entry.is_some(), "status must list hub remote: {remotes_info:?}");
     assert_eq!(
-        hub_entry.unwrap()["reachable"], false,
+        hub_entry.unwrap()["reachable"],
+        false,
         "hub must be reported unreachable: {remotes_info:?}"
     );
 
@@ -831,10 +800,7 @@ async fn remote_down_degrades_reads() {
         json!({"drawer_id": local_add["drawer_id"]}),
     )
     .await;
-    assert_eq!(
-        local_delete["success"], true,
-        "local delete must succeed: {local_delete}"
-    );
+    assert_eq!(local_delete["success"], true, "local delete must succeed: {local_delete}");
     assert_eq!(
         local_delete["applied_to"], "local",
         "local delete must report applied_to=local: {local_delete}"
@@ -858,14 +824,8 @@ async fn diary_room_never_routes_remote() {
     let mut wing_rules = BTreeMap::new();
     wing_rules.insert("wing_diary_test".to_owned(), remote_wing_rule());
 
-    let server = mcp_server_with_hub(
-        &local_dir,
-        &hub_url,
-        wing_rules,
-        RouteMode::Local,
-        None,
-    )
-    .await;
+    let server =
+        mcp_server_with_hub(&local_dir, &hub_url, wing_rules, RouteMode::Local, None).await;
 
     // Attempt to add a drawer with room "diary" into the remoted wing.
     // The diary hard-override must redirect this to local storage.
@@ -883,10 +843,7 @@ async fn diary_room_never_routes_remote() {
     .await;
 
     // The add must succeed (locally).
-    assert_eq!(
-        add_diary["success"], true,
-        "diary add must succeed locally; got: {add_diary}"
-    );
+    assert_eq!(add_diary["success"], true, "diary add must succeed locally; got: {add_diary}");
 
     // Local adds do not include "origin" field — no "hub" origin.
     let origin = add_diary.get("origin");
@@ -943,14 +900,8 @@ async fn wing_availability_reflects_rules() {
     let mut wing_rules = BTreeMap::new();
     wing_rules.insert("wing_remote_ruled".to_owned(), remote_wing_rule());
 
-    let server = mcp_server_with_hub(
-        &local_dir,
-        &hub_url,
-        wing_rules,
-        RouteMode::Local,
-        None,
-    )
-    .await;
+    let server =
+        mcp_server_with_hub(&local_dir, &hub_url, wing_rules, RouteMode::Local, None).await;
 
     // Add a local drawer so wing_local_only appears in the palace.
     let local_add = call_tool(
@@ -970,9 +921,9 @@ async fn wing_availability_reflects_rules() {
     // mempalace_status must include wing_availability.
     let status = call_tool(&server, 2, "mempalace_status", json!({})).await;
 
-    let wing_availability = status.get("wing_availability").expect(
-        "status with federation must include wing_availability",
-    );
+    let wing_availability = status
+        .get("wing_availability")
+        .expect("status with federation must include wing_availability");
 
     // The ruled-Remote wing must show "remote:hub".
     let ruled_avail = wing_availability.get("wing_remote_ruled");
@@ -1000,9 +951,9 @@ async fn wing_availability_reflects_rules() {
 
     // Also verify via mempalace_list_wings (which also returns wing_availability).
     let list_wings = call_tool(&server, 3, "mempalace_list_wings", json!({})).await;
-    let wings_avail = list_wings.get("wing_availability").expect(
-        "list_wings with federation must include wing_availability",
-    );
+    let wings_avail = list_wings
+        .get("wing_availability")
+        .expect("list_wings with federation must include wing_availability");
     assert_eq!(
         wings_avail.get("wing_remote_ruled").and_then(|v| v.as_str()),
         Some("remote:hub"),
@@ -1030,14 +981,8 @@ async fn wake_up_includes_remote_changes_from_hub() {
     let mut wing_rules = BTreeMap::new();
     wing_rules.insert("wing_wake".to_owned(), combined_wing_rule_remote_write());
 
-    let server = mcp_server_with_hub(
-        &local_dir,
-        &hub_url,
-        wing_rules,
-        RouteMode::Local,
-        None,
-    )
-    .await;
+    let server =
+        mcp_server_with_hub(&local_dir, &hub_url, wing_rules, RouteMode::Local, None).await;
 
     // Seed two drawers on the hub. Use distinct embedding clusters so the stub
     // provider gives each drawer a unique vector and duplicate detection does
@@ -1093,12 +1038,9 @@ async fn wake_up_includes_remote_changes_from_hub() {
     assert!(wake.get("diary").is_some(), "wake_up must include diary: {wake}");
 
     // remote_changes must exist and include a "hub" key.
-    let remote_changes = wake
-        .get("remote_changes")
-        .expect("wake_up with federation must include remote_changes");
-    let hub_changes = remote_changes
-        .get("hub")
-        .expect("remote_changes must include 'hub' entry");
+    let remote_changes =
+        wake.get("remote_changes").expect("wake_up with federation must include remote_changes");
+    let hub_changes = remote_changes.get("hub").expect("remote_changes must include 'hub' entry");
 
     // Must not be an unreachable marker.
     assert!(
@@ -1106,13 +1048,9 @@ async fn wake_up_includes_remote_changes_from_hub() {
         "hub must be reachable in wake_up: {hub_changes}"
     );
 
-    let events = hub_changes["events"]
-        .as_array()
-        .expect("hub remote_changes must have events array");
-    assert!(
-        !events.is_empty(),
-        "hub remote_changes.events must be non-empty: {hub_changes}"
-    );
+    let events =
+        hub_changes["events"].as_array().expect("hub remote_changes must have events array");
+    assert!(!events.is_empty(), "hub remote_changes.events must be non-empty: {hub_changes}");
 
     // Every event must carry origin == "remote:hub".
     for event in events {
@@ -1124,10 +1062,7 @@ async fn wake_up_includes_remote_changes_from_hub() {
     }
 
     // Both seeded entity ids must appear.
-    let entity_ids: Vec<&str> = events
-        .iter()
-        .filter_map(|e| e["entity_id"].as_str())
-        .collect();
+    let entity_ids: Vec<&str> = events.iter().filter_map(|e| e["entity_id"].as_str()).collect();
     assert!(
         entity_ids.contains(&entity_id1.as_str()),
         "wake_up hub events must include entity_id {entity_id1}; ids: {entity_ids:?}"
@@ -1194,13 +1129,7 @@ async fn wake_up_with_down_remote_marks_unreachable_and_succeeds() {
             .unwrap();
 
     // wake_up must succeed despite the dead remote.
-    let wake = call_tool(
-        &server,
-        1,
-        "mempalace_wake_up",
-        json!({"agent_name": "down-test"}),
-    )
-    .await;
+    let wake = call_tool(&server, 1, "mempalace_wake_up", json!({"agent_name": "down-test"})).await;
 
     // Standard sections must still be present (graceful degradation).
     assert!(
@@ -1216,9 +1145,7 @@ async fn wake_up_with_down_remote_marks_unreachable_and_succeeds() {
     let remote_changes = wake
         .get("remote_changes")
         .expect("wake_up with federation must include remote_changes even when remote is down");
-    let hub_changes = remote_changes
-        .get("hub")
-        .expect("remote_changes must include 'hub' entry");
+    let hub_changes = remote_changes.get("hub").expect("remote_changes must include 'hub' entry");
 
     assert_eq!(
         hub_changes["unreachable"], true,
@@ -1250,14 +1177,8 @@ async fn get_changes_since_cursor_continuation_across_two_pages() {
     let mut wing_rules = BTreeMap::new();
     wing_rules.insert("wing_pages".to_owned(), combined_wing_rule_remote_write());
 
-    let server = mcp_server_with_hub(
-        &local_dir,
-        &hub_url,
-        wing_rules,
-        RouteMode::Local,
-        None,
-    )
-    .await;
+    let server =
+        mcp_server_with_hub(&local_dir, &hub_url, wing_rules, RouteMode::Local, None).await;
 
     // Seed 3 drawers on the hub using distinct embedding clusters so duplicate
     // detection does not reject any add.
@@ -1305,7 +1226,8 @@ async fn get_changes_since_cursor_continuation_across_two_pages() {
         .filter(|e| e["origin"].as_str().map_or(false, |o| o.starts_with("remote:")))
         .collect();
     assert_eq!(
-        page1_remote.len(), 2,
+        page1_remote.len(),
+        2,
         "first page must return exactly 2 remote-origin events; events: {page1_events:?}"
     );
 
@@ -1313,10 +1235,7 @@ async fn get_changes_since_cursor_continuation_across_two_pages() {
     for pair in page1_remote.windows(2) {
         let t0 = pair[0]["occurred_at"].as_str().unwrap_or("");
         let t1 = pair[1]["occurred_at"].as_str().unwrap_or("");
-        assert!(
-            t0 <= t1,
-            "events must be ascending by occurred_at; got {t0} then {t1}"
-        );
+        assert!(t0 <= t1, "events must be ascending by occurred_at; got {t0} then {t1}");
     }
 
     // remotes.hub.next_cursor must be a non-null string.
@@ -1325,10 +1244,8 @@ async fn get_changes_since_cursor_continuation_across_two_pages() {
         .as_str()
         .expect("remotes.hub.next_cursor must be a string on page 1");
 
-    let page1_entity_ids: Vec<&str> = page1_remote
-        .iter()
-        .filter_map(|e| e["entity_id"].as_str())
-        .collect();
+    let page1_entity_ids: Vec<&str> =
+        page1_remote.iter().filter_map(|e| e["entity_id"].as_str()).collect();
 
     // Second page: pass the cursor for hub.
     let page2 = call_tool(
@@ -1354,10 +1271,8 @@ async fn get_changes_since_cursor_continuation_across_two_pages() {
     );
 
     // No entity_id overlap between pages.
-    let page2_entity_ids: Vec<&str> = page2_remote
-        .iter()
-        .filter_map(|e| e["entity_id"].as_str())
-        .collect();
+    let page2_entity_ids: Vec<&str> =
+        page2_remote.iter().filter_map(|e| e["entity_id"].as_str()).collect();
     for id in &page2_entity_ids {
         assert!(
             !page1_entity_ids.contains(id),
@@ -1431,10 +1346,7 @@ async fn diary_events_never_appear_in_remote_changes() {
             }),
         )
         .await;
-        assert_eq!(
-            diary_resp["success"], true,
-            "hub diary_write must succeed: {diary_resp}"
-        );
+        assert_eq!(diary_resp["success"], true, "hub diary_write must succeed: {diary_resp}");
         // hub_mcp is dropped here — the palace engine is released before HTTP spawn.
     }
 
@@ -1446,14 +1358,8 @@ async fn diary_events_never_appear_in_remote_changes() {
     let mut wing_rules = BTreeMap::new();
     wing_rules.insert("wing_diary_filter".to_owned(), combined_wing_rule_remote_write());
 
-    let server = mcp_server_with_hub(
-        &local_dir,
-        &hub_url,
-        wing_rules,
-        RouteMode::Local,
-        None,
-    )
-    .await;
+    let server =
+        mcp_server_with_hub(&local_dir, &hub_url, wing_rules, RouteMode::Local, None).await;
 
     // ── Step 4: add a normal drawer on the hub to ensure at least one drawer event.
     // Use "auth migration parity" cluster so the stub provider gives a distinct vector.
@@ -1471,7 +1377,10 @@ async fn diary_events_never_appear_in_remote_changes() {
     .await;
     assert_eq!(hub_add["success"], true, "hub drawer add must succeed: {hub_add}");
     assert_eq!(hub_add["origin"], "hub", "hub drawer must go to hub: {hub_add}");
-    assert_eq!(hub_add["applied_to"], "remote:hub", "hub drawer must report applied_to=remote:hub: {hub_add}");
+    assert_eq!(
+        hub_add["applied_to"], "remote:hub",
+        "hub drawer must report applied_to=remote:hub: {hub_add}"
+    );
     let hub_drawer_id = hub_add["drawer_id"].as_str().unwrap().to_owned();
 
     // ── Step 5: write a diary entry LOCALLY on the local MCP server.
@@ -1487,10 +1396,7 @@ async fn diary_events_never_appear_in_remote_changes() {
         }),
     )
     .await;
-    assert_eq!(
-        local_diary["success"], true,
-        "local diary_write must succeed: {local_diary}"
-    );
+    assert_eq!(local_diary["success"], true, "local diary_write must succeed: {local_diary}");
 
     // ── Step 6: call federated get_changes_since.
     let changes = call_tool(
@@ -1530,8 +1436,7 @@ async fn diary_events_never_appear_in_remote_changes() {
 
     // The local diary_written event must appear with origin == "local".
     let local_diary_event = events.iter().find(|e| {
-        e["event_type"].as_str() == Some("diary_written")
-            && e["origin"].as_str() == Some("local")
+        e["event_type"].as_str() == Some("diary_written") && e["origin"].as_str() == Some("local")
     });
     assert!(
         local_diary_event.is_some(),
@@ -1554,14 +1459,8 @@ async fn get_changes_since_includes_local_and_remote_origins() {
     let mut wing_rules = BTreeMap::new();
     wing_rules.insert("wing_mixed".to_owned(), combined_wing_rule_remote_write());
 
-    let server = mcp_server_with_hub(
-        &local_dir,
-        &hub_url,
-        wing_rules,
-        RouteMode::Local,
-        None,
-    )
-    .await;
+    let server =
+        mcp_server_with_hub(&local_dir, &hub_url, wing_rules, RouteMode::Local, None).await;
 
     // Add a drawer to the hub via routed write (wing_mixed → write=Remote).
     // "auth migration parity" cluster → [1,0,0,0] vector.
@@ -1579,7 +1478,10 @@ async fn get_changes_since_includes_local_and_remote_origins() {
     .await;
     assert_eq!(hub_add["success"], true, "hub add must succeed: {hub_add}");
     assert_eq!(hub_add["origin"], "hub", "hub add must go to hub: {hub_add}");
-    assert_eq!(hub_add["applied_to"], "remote:hub", "hub add must report applied_to=remote:hub: {hub_add}");
+    assert_eq!(
+        hub_add["applied_to"], "remote:hub",
+        "hub add must report applied_to=remote:hub: {hub_add}"
+    );
 
     // Add a drawer locally (wing without a remote rule → default Local).
     // "rust cli tooling" cluster → [0,0,1,0] vector.
@@ -1608,17 +1510,10 @@ async fn get_changes_since_includes_local_and_remote_origins() {
 
     let events = changes["events"].as_array().expect("events must be array");
 
-    let has_local = events
-        .iter()
-        .any(|e| e["origin"].as_str() == Some("local"));
-    let has_remote_hub = events
-        .iter()
-        .any(|e| e["origin"].as_str() == Some("remote:hub"));
+    let has_local = events.iter().any(|e| e["origin"].as_str() == Some("local"));
+    let has_remote_hub = events.iter().any(|e| e["origin"].as_str() == Some("remote:hub"));
 
-    assert!(
-        has_local,
-        "changes must include at least one local-origin event; events: {events:?}"
-    );
+    assert!(has_local, "changes must include at least one local-origin event; events: {events:?}");
     assert!(
         has_remote_hub,
         "changes must include at least one remote:hub-origin event; events: {events:?}"
@@ -1626,26 +1521,18 @@ async fn get_changes_since_includes_local_and_remote_origins() {
 
     // remotes meta: hub count must equal the number of hub-origin events in the list.
     let remotes_meta = changes.get("remotes").expect("federated changes must include remotes meta");
-    let hub_count = remotes_meta["hub"]["count"]
-        .as_u64()
-        .expect("remotes.hub.count must be a number");
-    let actual_hub_count = events
-        .iter()
-        .filter(|e| e["origin"].as_str() == Some("remote:hub"))
-        .count() as u64;
+    let hub_count =
+        remotes_meta["hub"]["count"].as_u64().expect("remotes.hub.count must be a number");
+    let actual_hub_count =
+        events.iter().filter(|e| e["origin"].as_str() == Some("remote:hub")).count() as u64;
     assert_eq!(
         hub_count, actual_hub_count,
         "remotes.hub.count must equal number of remote:hub events in events array"
     );
 
-
     // Total count field must equal total events length.
     let total_count = changes["count"].as_u64().expect("count must be a number");
-    assert_eq!(
-        total_count,
-        events.len() as u64,
-        "top-level count must equal events.len()"
-    );
+    assert_eq!(total_count, events.len() as u64, "top-level count must equal events.len()");
 }
 
 // ─── Dual-write (write:both) tests ─────────────────────────────────────────
@@ -1667,14 +1554,8 @@ async fn add_drawer_both_replicates_successfully() {
     let mut wing_rules = BTreeMap::new();
     wing_rules.insert("wing_both".to_owned(), combined_wing_rule_both_write());
 
-    let server = mcp_server_with_hub(
-        &local_dir,
-        &hub_url,
-        wing_rules,
-        RouteMode::Local,
-        None,
-    )
-    .await;
+    let server =
+        mcp_server_with_hub(&local_dir, &hub_url, wing_rules, RouteMode::Local, None).await;
 
     // ── Add via Both route ──────────────────────────────────────────────────
     let add = call_tool(
@@ -1737,13 +1618,11 @@ async fn add_drawer_both_replicates_successfully() {
         })
         .await
         .expect("hub search must succeed");
-    let hub_hit = hub_search.results.iter().any(|result| {
-        result.content == "dual-write e2e test drawer successful replication"
-    });
-    assert!(
-        hub_hit,
-        "hub search must include the replicated drawer; results: {hub_search:?}"
-    );
+    let hub_hit = hub_search
+        .results
+        .iter()
+        .any(|result| result.content == "dual-write e2e test drawer successful replication");
+    assert!(hub_hit, "hub search must include the replicated drawer; results: {hub_search:?}");
 }
 
 // ─── Test 22: add_drawer_both_replication_fails_with_remote_rejection ───────
@@ -1869,14 +1748,8 @@ async fn add_drawer_both_duplicate_replication() {
     let mut wing_rules_a = BTreeMap::new();
     wing_rules_a.insert("wing_seed".to_owned(), combined_wing_rule_remote_write());
 
-    let server_a = mcp_server_with_hub(
-        &local_dir_a,
-        &hub_url,
-        wing_rules_a,
-        RouteMode::Local,
-        None,
-    )
-    .await;
+    let server_a =
+        mcp_server_with_hub(&local_dir_a, &hub_url, wing_rules_a, RouteMode::Local, None).await;
 
     let seed = call_tool(
         &server_a,
@@ -1897,14 +1770,8 @@ async fn add_drawer_both_duplicate_replication() {
     let mut wing_rules_b = BTreeMap::new();
     wing_rules_b.insert("wing_both_dup".to_owned(), combined_wing_rule_both_write());
 
-    let server_b = mcp_server_with_hub(
-        &local_dir_b,
-        &hub_url,
-        wing_rules_b,
-        RouteMode::Local,
-        None,
-    )
-    .await;
+    let server_b =
+        mcp_server_with_hub(&local_dir_b, &hub_url, wing_rules_b, RouteMode::Local, None).await;
 
     let dup = call_tool(
         &server_b,
@@ -1921,10 +1788,7 @@ async fn add_drawer_both_duplicate_replication() {
 
     // Local write must succeed.
     assert_eq!(dup["success"], true, "both add with duplicate content must succeed locally: {dup}");
-    assert_eq!(
-        dup["applied_to"], "local",
-        "both add must report applied_to=local: {dup}"
-    );
+    assert_eq!(dup["applied_to"], "local", "both add must report applied_to=local: {dup}");
 
     // Replication must be converged (exact same content already on hub).
     let replication = dup.get("replication").expect("both add must include replication field");
@@ -2143,14 +2007,9 @@ async fn add_drawer_both_retry_reuses_local_drawer_and_replicates() {
     .await;
 
     assert_eq!(first["success"], true, "first add must succeed locally: {first}");
-    assert_eq!(
-        first["applied_to"], "local",
-        "first add must report applied_to=local: {first}"
-    );
-    let drawer_id = first["drawer_id"]
-        .as_str()
-        .expect("first add must return drawer_id")
-        .to_owned();
+    assert_eq!(first["applied_to"], "local", "first add must report applied_to=local: {first}");
+    let drawer_id =
+        first["drawer_id"].as_str().expect("first add must return drawer_id").to_owned();
 
     let replication = first.get("replication").expect("both add must include replication");
     assert_eq!(
@@ -2227,10 +2086,7 @@ async fn add_drawer_both_retry_reuses_local_drawer_and_replicates() {
     .await;
 
     assert_eq!(retry["success"], true, "retry add must succeed: {retry}");
-    assert_eq!(
-        retry["applied_to"], "local",
-        "retry must report applied_to=local: {retry}"
-    );
+    assert_eq!(retry["applied_to"], "local", "retry must report applied_to=local: {retry}");
     assert_eq!(
         retry["drawer_id"].as_str().unwrap_or(""),
         drawer_id,
@@ -2269,10 +2125,12 @@ async fn add_drawer_both_retry_reuses_local_drawer_and_replicates() {
         maintenance: MaintenanceRuntimeConfig::defaults(),
         federation: FederationRuntimeConfig::default(),
     };
-    let local_only_server =
-        McpServer::from_parts(local_only_config, DeterministicStubProvider::new(EmbeddingProfile::Balanced))
-            .await
-            .unwrap();
+    let local_only_server = McpServer::from_parts(
+        local_only_config,
+        DeterministicStubProvider::new(EmbeddingProfile::Balanced),
+    )
+    .await
+    .unwrap();
     let local_status = call_tool(&local_only_server, 1, "mempalace_list_wings", json!({})).await;
     drop(local_only_server);
     let local_wings = local_status["wings"].as_object().expect("wings must be an object");
@@ -2438,10 +2296,7 @@ async fn kg_add_both_replicates_successfully() {
     .await;
 
     assert_eq!(kg_add["success"], true, "kg_add both must succeed: {kg_add}");
-    assert_eq!(
-        kg_add["applied_to"], "local",
-        "kg_add both must report applied_to=local: {kg_add}"
-    );
+    assert_eq!(kg_add["applied_to"], "local", "kg_add both must report applied_to=local: {kg_add}");
     let replication = kg_add.get("replication").expect("kg_add both must include replication");
     assert_eq!(
         replication["status"], "replicated",
@@ -2451,10 +2306,7 @@ async fn kg_add_both_replicates_successfully() {
         replication["remote"], "hub",
         "kg_add replication must target hub; got: {replication}"
     );
-    assert!(
-        kg_add.get("warnings").is_none(),
-        "kg_add must not have warnings on success: {kg_add}"
-    );
+    assert!(kg_add.get("warnings").is_none(), "kg_add must not have warnings on success: {kg_add}");
 
     // Verify the fact exists on the hub directly. Combined KG queries dedupe
     // identical facts and prefer local, so no separate hub-origin fact remains.
@@ -2550,19 +2402,13 @@ async fn kg_add_both_replication_fails_with_down_remote() {
     .await;
 
     assert_eq!(kg_add["success"], true, "kg_add with down remote must succeed locally: {kg_add}");
-    assert_eq!(
-        kg_add["applied_to"], "local",
-        "kg_add must report applied_to=local: {kg_add}"
-    );
+    assert_eq!(kg_add["applied_to"], "local", "kg_add must report applied_to=local: {kg_add}");
     let replication = kg_add.get("replication").expect("kg_add both must include replication");
     assert_eq!(
         replication["status"], "failed",
         "replication must be failed with down remote; got: {replication}"
     );
-    assert_eq!(
-        replication["remote"], "hub",
-        "replication must target hub; got: {replication}"
-    );
+    assert_eq!(replication["remote"], "hub", "replication must target hub; got: {replication}");
     let reason = replication["reason"].as_str().unwrap_or("");
     assert!(!reason.is_empty(), "failure reason must be non-empty; got: {replication}");
 
@@ -2633,8 +2479,7 @@ async fn kg_invalidate_both_replicates_successfully() {
         .expect("hub KG query before invalidation must succeed");
     let hub_fact_before = hub_before["facts"].as_array().and_then(|facts| {
         facts.iter().find(|f| {
-            f["predicate"].as_str() == Some("replication")
-                && f["object"].as_str() == Some("active")
+            f["predicate"].as_str() == Some("replication") && f["object"].as_str() == Some("active")
         })
     });
     assert!(
@@ -2656,15 +2501,13 @@ async fn kg_invalidate_both_replicates_successfully() {
     )
     .await;
 
-    assert_eq!(
-        invalidate["success"], true,
-        "kg_invalidate both must succeed: {invalidate}"
-    );
+    assert_eq!(invalidate["success"], true, "kg_invalidate both must succeed: {invalidate}");
     assert_eq!(
         invalidate["applied_to"], "local",
         "kg_invalidate must report applied_to=local: {invalidate}"
     );
-    let replication = invalidate.get("replication").expect("kg_invalidate must include replication");
+    let replication =
+        invalidate.get("replication").expect("kg_invalidate must include replication");
     assert_eq!(
         replication["status"], "replicated",
         "invalidate replication must be replicated; got: {replication}"
@@ -2689,8 +2532,7 @@ async fn kg_invalidate_both_replicates_successfully() {
         .expect("hub KG query after invalidation must succeed");
     let hub_fact = hub_after["facts"].as_array().and_then(|facts| {
         facts.iter().find(|f| {
-            f["predicate"].as_str() == Some("replication")
-                && f["object"].as_str() == Some("active")
+            f["predicate"].as_str() == Some("replication") && f["object"].as_str() == Some("active")
         })
     });
     assert!(
@@ -2712,8 +2554,7 @@ async fn kg_invalidate_both_replicates_successfully() {
     // The fact should still appear in the unfiltered query but with current: false.
     // We just verify the hub at least has the fact in the unfiltered view.
     let hub_fact_historical = facts_all.iter().find(|f| {
-        f["predicate"].as_str() == Some("replication")
-            && f["object"].as_str() == Some("active")
+        f["predicate"].as_str() == Some("replication") && f["object"].as_str() == Some("active")
     });
     assert!(
         hub_fact_historical.is_some(),
@@ -2809,15 +2650,13 @@ async fn kg_invalidate_both_replication_fails_with_down_remote() {
         invalidate["applied_to"], "local",
         "kg_invalidate must report applied_to=local: {invalidate}"
     );
-    let replication = invalidate.get("replication").expect("kg_invalidate must include replication");
+    let replication =
+        invalidate.get("replication").expect("kg_invalidate must include replication");
     assert_eq!(
         replication["status"], "failed",
         "replication must be failed with down remote; got: {replication}"
     );
-    assert_eq!(
-        replication["remote"], "hub",
-        "replication must target hub; got: {replication}"
-    );
+    assert_eq!(replication["remote"], "hub", "replication must target hub; got: {replication}");
     let reason = replication["reason"].as_str().unwrap_or("");
     assert!(!reason.is_empty(), "failure reason must be non-empty; got: {replication}");
 
@@ -2842,14 +2681,8 @@ async fn legacy_local_route_has_no_replication_field() {
     let hub_url = format!("http://{addr}");
 
     // No wing rules → all wings route as Local (default_mode=Local).
-    let server = mcp_server_with_hub(
-        &local_dir,
-        &hub_url,
-        BTreeMap::new(),
-        RouteMode::Local,
-        None,
-    )
-    .await;
+    let server =
+        mcp_server_with_hub(&local_dir, &hub_url, BTreeMap::new(), RouteMode::Local, None).await;
 
     let add = call_tool(
         &server,
@@ -2889,14 +2722,8 @@ async fn legacy_remote_route_has_no_replication_field() {
     let mut wing_rules = BTreeMap::new();
     wing_rules.insert("wing_legacy_remote".to_owned(), combined_wing_rule_remote_write());
 
-    let server = mcp_server_with_hub(
-        &local_dir,
-        &hub_url,
-        wing_rules,
-        RouteMode::Local,
-        None,
-    )
-    .await;
+    let server =
+        mcp_server_with_hub(&local_dir, &hub_url, wing_rules, RouteMode::Local, None).await;
 
     let add = call_tool(
         &server,
@@ -2940,14 +2767,8 @@ async fn add_drawer_both_diary_guard_skips_replication() {
     let mut wing_rules = BTreeMap::new();
     wing_rules.insert("wing_diary_both".to_owned(), combined_wing_rule_both_write());
 
-    let server = mcp_server_with_hub(
-        &local_dir,
-        &hub_url,
-        wing_rules,
-        RouteMode::Local,
-        None,
-    )
-    .await;
+    let server =
+        mcp_server_with_hub(&local_dir, &hub_url, wing_rules, RouteMode::Local, None).await;
 
     let add = call_tool(
         &server,
@@ -2963,10 +2784,7 @@ async fn add_drawer_both_diary_guard_skips_replication() {
     .await;
 
     assert_eq!(add["success"], true, "diary both add must succeed: {add}");
-    assert_eq!(
-        add["applied_to"], "local",
-        "diary both add must report applied_to=local: {add}"
-    );
+    assert_eq!(add["applied_to"], "local", "diary both add must report applied_to=local: {add}");
 
     // Diary-local writes must NOT include a replication field per contract.
     assert!(
@@ -3098,10 +2916,7 @@ async fn kg_add_both_replication_fails_with_remote_rejection() {
         kg_add["success"], true,
         "kg_add with wrong token must still succeed locally: {kg_add}"
     );
-    assert_eq!(
-        kg_add["applied_to"], "local",
-        "kg_add must report applied_to=local: {kg_add}"
-    );
+    assert_eq!(kg_add["applied_to"], "local", "kg_add must report applied_to=local: {kg_add}");
 
     // Replication must be failed.
     let replication = kg_add.get("replication").expect("kg_add both must include replication");
@@ -3244,15 +3059,13 @@ async fn kg_invalidate_both_replication_fails_with_remote_rejection() {
     );
 
     // Replication must be failed.
-    let replication = invalidate.get("replication").expect("kg_invalidate must include replication");
+    let replication =
+        invalidate.get("replication").expect("kg_invalidate must include replication");
     assert_eq!(
         replication["status"], "failed",
         "replication must be failed with wrong token; got: {replication}"
     );
-    assert_eq!(
-        replication["remote"], "hub",
-        "replication must target hub; got: {replication}"
-    );
+    assert_eq!(replication["remote"], "hub", "replication must target hub; got: {replication}");
     let reason = replication["reason"].as_str().unwrap_or("");
     assert!(!reason.is_empty(), "failure reason must be non-empty; got: {replication}");
 

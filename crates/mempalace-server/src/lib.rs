@@ -522,8 +522,7 @@ where
                     .unwrap_or_default()
                     .subsec_nanos() as f64)
                     / 1_000_000_000.0;
-                let jitter =
-                    Duration::from_secs_f64(jitter_frac * base.as_secs_f64() * 0.1);
+                let jitter = Duration::from_secs_f64(jitter_frac * base.as_secs_f64() * 0.1);
                 let sleep_dur = base + jitter;
 
                 tokio::time::sleep(sleep_dur).await;
@@ -547,7 +546,8 @@ where
                 match task_state.storage.run_maintenance(&settings).await {
                     Ok(summary) => {
                         *task_state.last_maintenance_status.lock().unwrap() = Some(summary.clone());
-                        *task_state.maintenance_status.lock().unwrap() = summary_to_status(&summary);
+                        *task_state.maintenance_status.lock().unwrap() =
+                            summary_to_status(&summary);
                     }
                     Err(e) => {
                         warn!(error = %e, "background maintenance run failed");
@@ -635,10 +635,14 @@ fn summary_to_status(summary: &MaintenanceRunSummary) -> MaintenanceStatus {
         return MaintenanceStatus::Disabled;
     }
 
-    let all_skipped =
-        summary.tier_results.iter().all(|r| matches!(r.outcome, MaintenanceOutcome::Skipped { .. }));
-    let any_aborted =
-        summary.tier_results.iter().any(|r| matches!(r.outcome, MaintenanceOutcome::Aborted { .. }));
+    let all_skipped = summary
+        .tier_results
+        .iter()
+        .all(|r| matches!(r.outcome, MaintenanceOutcome::Skipped { .. }));
+    let any_aborted = summary
+        .tier_results
+        .iter()
+        .any(|r| matches!(r.outcome, MaintenanceOutcome::Aborted { .. }));
     let any_failed =
         summary.tier_results.iter().any(|r| matches!(r.outcome, MaintenanceOutcome::Failed { .. }));
     let any_completed = summary
@@ -647,13 +651,10 @@ fn summary_to_status(summary: &MaintenanceRunSummary) -> MaintenanceStatus {
         .any(|r| matches!(r.outcome, MaintenanceOutcome::Completed { .. }));
 
     if all_skipped {
-        let reason = summary
-            .tier_results
-            .first()
-            .and_then(|r| match &r.outcome {
-                MaintenanceOutcome::Skipped { reason } => Some(reason),
-                _ => None,
-            });
+        let reason = summary.tier_results.first().and_then(|r| match &r.outcome {
+            MaintenanceOutcome::Skipped { reason } => Some(reason),
+            _ => None,
+        });
         let fed_reason = match reason {
             Some(MaintenanceSkipReason::NotIdle) => FedMaintenanceSkipReason::NotIdle,
             Some(MaintenanceSkipReason::NothingToDo) => FedMaintenanceSkipReason::NothingToDo,
@@ -1969,7 +1970,8 @@ where
         room: None,
         limit: DUPLICATE_SEARCH_LIMIT,
         profile: state.config.embedding_profile,
-                view: None,};
+        view: None,
+    };
     let results = {
         let mut search = state.search.lock().await;
         search.search_semantic(state.storage.drawer_store(), &query).await?
@@ -2145,7 +2147,9 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Method, Request, StatusCode, header};
     use http_body_util::BodyExt;
-    use mempalace_config::{FederationRuntimeConfig, LowCpuRuntimeConfig, MaintenanceRuntimeConfig, ServerRuntimeConfig};
+    use mempalace_config::{
+        FederationRuntimeConfig, LowCpuRuntimeConfig, MaintenanceRuntimeConfig, ServerRuntimeConfig,
+    };
     use mempalace_core::EmbeddingProfile;
     use mempalace_embeddings::DeterministicStubProvider;
     use serde_json::Value;
@@ -3526,7 +3530,8 @@ mod tests {
         let harness = make_harness().await;
         // Wait for the startup check to complete (up to 5 s).
         for _ in 0..100 {
-            let resp = harness.router.clone().oneshot(authed_get("/v1/info", ALICE_TOKEN)).await.unwrap();
+            let resp =
+                harness.router.clone().oneshot(authed_get("/v1/info", ALICE_TOKEN)).await.unwrap();
             assert_eq!(resp.status(), StatusCode::OK);
             let body = body_json(resp).await;
             let status = &body["maintenance_status"];
@@ -3543,10 +3548,8 @@ mod tests {
     async fn info_returns_maintenance_status_skipped_not_idle_when_busy() {
         // Use a very short idle_secs so the startup check completes quickly,
         // then keep sending requests to ensure the background check is skipped.
-        let short_idle = MaintenanceRuntimeConfig {
-            idle_secs: 1,
-            ..MaintenanceRuntimeConfig::defaults()
-        };
+        let short_idle =
+            MaintenanceRuntimeConfig { idle_secs: 1, ..MaintenanceRuntimeConfig::defaults() };
         let harness = build_with_maintenance(short_idle).await;
 
         // Wait for startup check to finish.
@@ -3700,10 +3703,8 @@ mod tests {
 
     #[tokio::test]
     async fn maintenance_disabled_creates_no_scheduler() {
-        let disabled = MaintenanceRuntimeConfig {
-            enabled: false,
-            ..MaintenanceRuntimeConfig::defaults()
-        };
+        let disabled =
+            MaintenanceRuntimeConfig { enabled: false, ..MaintenanceRuntimeConfig::defaults() };
         let harness = build_with_maintenance(disabled).await;
         // Wait long enough that even a startup check would have run.
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -3727,11 +3728,8 @@ mod tests {
     #[tokio::test]
     async fn maintenance_health_check_does_not_signal_write_activity() {
         let harness = make_harness().await;
-        let request = Request::builder()
-            .method(Method::GET)
-            .uri("/v1/health")
-            .body(Body::empty())
-            .unwrap();
+        let request =
+            Request::builder().method(Method::GET).uri("/v1/health").body(Body::empty()).unwrap();
         let _ = harness.router.clone().oneshot(request).await.unwrap();
         assert!(
             !harness.state.storage.take_activity_signal(),
@@ -3743,10 +3741,8 @@ mod tests {
     async fn maintenance_runs_after_one_idle_period() {
         use mempalace_storage::{MaintenanceOutcome, MaintenanceSkipReason};
 
-        let short_idle = MaintenanceRuntimeConfig {
-            idle_secs: 1,
-            ..MaintenanceRuntimeConfig::defaults()
-        };
+        let short_idle =
+            MaintenanceRuntimeConfig { idle_secs: 1, ..MaintenanceRuntimeConfig::defaults() };
         let harness = build_with_maintenance(short_idle).await;
 
         // Wait for the startup check to complete.

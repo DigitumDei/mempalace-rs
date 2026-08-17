@@ -42,22 +42,13 @@ pub enum MaintenanceAbortReason {
 #[serde(rename_all = "snake_case")]
 pub enum MaintenanceOutcome {
     /// Completed successfully with a count of affected items.
-    Completed {
-        items_affected: u64,
-    },
+    Completed { items_affected: u64 },
     /// Skipped without starting.
-    Skipped {
-        reason: MaintenanceSkipReason,
-    },
+    Skipped { reason: MaintenanceSkipReason },
     /// Started but aborted before completion.
-    Aborted {
-        reason: MaintenanceAbortReason,
-        items_affected: u64,
-    },
+    Aborted { reason: MaintenanceAbortReason, items_affected: u64 },
     /// Failed with an error.
-    Failed {
-        message: String,
-    },
+    Failed { message: String },
 }
 
 /// Result of a single maintenance tier, including timing.
@@ -208,16 +199,12 @@ mod tests {
     fn maintenance_outcome_serde_round_trip() {
         let outcomes = vec![
             MaintenanceOutcome::Completed { items_affected: 42 },
-            MaintenanceOutcome::Skipped {
-                reason: MaintenanceSkipReason::NotIdle,
-            },
+            MaintenanceOutcome::Skipped { reason: MaintenanceSkipReason::NotIdle },
             MaintenanceOutcome::Aborted {
                 reason: MaintenanceAbortReason::Timeout,
                 items_affected: 7,
             },
-            MaintenanceOutcome::Failed {
-                message: "disk full".into(),
-            },
+            MaintenanceOutcome::Failed { message: "disk full".into() },
         ];
         for outcome in outcomes {
             let json = serde_json::to_string(&outcome).unwrap();

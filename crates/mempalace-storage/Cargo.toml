@@ -9,6 +9,7 @@ rust-version.workspace = true
 arrow-array = "56.2"
 arrow-schema = "56.2"
 async-trait = "0.1.89"
+blake3.workspace = true
 futures = "0.3.31"
 lancedb = { version = "0.23.1", default-features = false }
 mempalace-core = { path = "../mempalace-core" }

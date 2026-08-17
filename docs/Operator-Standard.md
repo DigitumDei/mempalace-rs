@@ -1,5 +1,7 @@
 # Standard Operator Guide
 
+Native coordination state is stored in `storage.sqlite3` and follows the same backup and restore boundary as other operational SQLite data. Preserve this file to retain task revisions, leases, inbox acknowledgements, results, artifacts, idempotency records, and event cursors. See [Native local coordination](Coordination.md#recovery-and-maintenance).
+
 This guide covers the normal Rust deployment path for `mempalace-cli` and `mempalace-mcp`.
 
 ## Prerequisites

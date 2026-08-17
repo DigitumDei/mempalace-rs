@@ -1,7 +1,10 @@
 use std::io::{BufRead, BufReader as StdBufReader, Write};
 use std::process::{Command, Stdio};
 
-use mempalace_config::{FederationRuntimeConfig, LowCpuRuntimeConfig, MaintenanceRuntimeConfig, MempalaceConfig, ServerRuntimeConfig};
+use mempalace_config::{
+    FederationRuntimeConfig, LowCpuRuntimeConfig, MaintenanceRuntimeConfig, MempalaceConfig,
+    ServerRuntimeConfig,
+};
 use mempalace_core::EmbeddingProfile;
 use mempalace_mcp::{DeterministicStubProvider, McpServer, serve_transport};
 use tempfile::TempDir;

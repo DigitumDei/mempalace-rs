@@ -27,19 +27,13 @@ pub fn mined_drawer_id(
     chunk_index: u32,
 ) -> Result<DrawerId, IdError> {
     let source_hash = &hash_text(source_key)[..12];
-    DrawerId::new(format!(
-        "{}/{}/{}-{:04}",
-        wing.as_str(),
-        room.as_str(),
-        source_hash,
-        chunk_index
-    ))
+    DrawerId::new(format!("{}/{}/{}-{:04}", wing.as_str(), room.as_str(), source_hash, chunk_index))
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::{mined_drawer_id, hash_text};
+    use super::{hash_text, mined_drawer_id};
     use crate::ids::{RoomId, WingId};
 
     #[test]

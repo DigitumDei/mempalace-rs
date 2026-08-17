@@ -496,11 +496,9 @@ impl ConfigLoader {
 
         let resolved_palace = expand_path(&palace_path)?;
         let server = resolve_server_config(file.server, &paths.base_dir, &paths.config_file)?;
-        let federation = resolve_federation_config(
-            file.federation,
-            &paths.config_file,
-            |name| env::var(name).ok(),
-        )?;
+        let federation = resolve_federation_config(file.federation, &paths.config_file, |name| {
+            env::var(name).ok()
+        })?;
         let maintenance = resolve_maintenance_config(
             file.maintenance,
             &paths.config_file,
@@ -591,20 +589,21 @@ impl ConfigLoader {
             .filter(|(project_id, entry)| project_entry_matches_path(project_id, entry, path))
             .collect::<Vec<_>>();
         if path_matches.len() > 1 {
-            let ids = path_matches
-                .iter()
-                .map(|(id, _)| id.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
+            let ids = path_matches.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>().join(", ");
             return Err(MempalaceError::ConfigParse {
                 path: resolve_paths(registry_base_dir)?.project_registry_file,
-                message: format!("conflicting project declarations match `{}`: {ids}", path.display()),
+                message: format!(
+                    "conflicting project declarations match `{}`: {ids}",
+                    path.display()
+                ),
             });
         }
         if let Some((_, entry)) = path_matches.first() {
             return Ok(entry.project_config());
         }
-        if let Some(project_id) = project_id.filter(|id| project_id_hint_has_repository_identity(id)) {
+        if let Some(project_id) =
+            project_id.filter(|id| project_id_hint_has_repository_identity(id))
+        {
             if let Some(entry) = registry.projects.get(project_id) {
                 return Ok(entry.project_config());
             }
@@ -895,11 +894,7 @@ fn normalize_git_remote_url(url: &str) -> Option<String> {
 
     let host = host.split(':').next().unwrap_or(host).to_ascii_lowercase();
     let path = path.trim_matches('/');
-    if host.is_empty() || path.is_empty() {
-        None
-    } else {
-        Some(format!("{host}/{path}"))
-    }
+    if host.is_empty() || path.is_empty() { None } else { Some(format!("{host}/{path}")) }
 }
 
 fn read_config_file(path: &Path) -> Result<ConfigFileV1> {
@@ -951,18 +946,12 @@ fn read_project_registry_file(path: &Path) -> Result<ProjectRegistryFileV1> {
     Ok(file)
 }
 
-fn write_project_registry_file(
-    path: &Path,
-    registry: &ProjectRegistryFileV1,
-) -> Result<()> {
-    let body = serde_json::to_string_pretty(registry).map_err(|err| MempalaceError::ConfigParse {
-        path: path.to_path_buf(),
-        message: err.to_string(),
+fn write_project_registry_file(path: &Path, registry: &ProjectRegistryFileV1) -> Result<()> {
+    let body = serde_json::to_string_pretty(registry).map_err(|err| {
+        MempalaceError::ConfigParse { path: path.to_path_buf(), message: err.to_string() }
     })?;
-    fs::write(path, body).map_err(|source| MempalaceError::ConfigWrite {
-        path: path.to_path_buf(),
-        source,
-    })
+    fs::write(path, body)
+        .map_err(|source| MempalaceError::ConfigWrite { path: path.to_path_buf(), source })
 }
 
 fn resolve_profile(
@@ -1018,7 +1007,8 @@ fn resolve_maintenance_config(
     tail_threshold_rows_override: Option<String>,
     small_fragment_threshold_override: Option<String>,
 ) -> Result<MaintenanceRuntimeConfig> {
-    let mut config = MaintenanceRuntimeConfig::defaults().with_overrides(file_section, config_path)?;
+    let mut config =
+        MaintenanceRuntimeConfig::defaults().with_overrides(file_section, config_path)?;
 
     if let Some(val) = enabled_override {
         config.enabled = parse_env_flag(&val, config_path, "MEMPALACE_MAINTENANCE_ENABLED")?;
@@ -1052,8 +1042,8 @@ fn resolve_maintenance_config(
         if config.version_retention_hours == 0 {
             return Err(MempalaceError::ConfigParse {
                 path: config_path.to_path_buf(),
-                message:
-                    "MEMPALACE_MAINTENANCE_VERSION_RETENTION_HOURS must be greater than 0".to_owned(),
+                message: "MEMPALACE_MAINTENANCE_VERSION_RETENTION_HOURS must be greater than 0"
+                    .to_owned(),
             });
         }
     }
@@ -1068,8 +1058,8 @@ fn resolve_maintenance_config(
         if config.tail_threshold_rows == 0 {
             return Err(MempalaceError::ConfigParse {
                 path: config_path.to_path_buf(),
-                message:
-                    "MEMPALACE_MAINTENANCE_TAIL_THRESHOLD_ROWS must be greater than 0".to_owned(),
+                message: "MEMPALACE_MAINTENANCE_TAIL_THRESHOLD_ROWS must be greater than 0"
+                    .to_owned(),
             });
         }
     }
@@ -1084,9 +1074,8 @@ fn resolve_maintenance_config(
         if config.small_fragment_threshold == 0 {
             return Err(MempalaceError::ConfigParse {
                 path: config_path.to_path_buf(),
-                message:
-                    "MEMPALACE_MAINTENANCE_SMALL_FRAGMENT_THRESHOLD must be greater than 0"
-                        .to_owned(),
+                message: "MEMPALACE_MAINTENANCE_SMALL_FRAGMENT_THRESHOLD must be greater than 0"
+                    .to_owned(),
             });
         }
     }
@@ -1100,9 +1089,7 @@ fn parse_env_flag(value: &str, config_path: &Path, variable: &str) -> Result<boo
         "0" | "false" | "FALSE" | "no" | "NO" => Ok(false),
         _ => Err(MempalaceError::ConfigParse {
             path: config_path.to_path_buf(),
-            message: format!(
-                "{variable} `{value}` is not a valid boolean; expected true or false"
-            ),
+            message: format!("{variable} `{value}` is not a valid boolean; expected true or false"),
         }),
     }
 }
@@ -1112,9 +1099,8 @@ fn resolve_server_config(
     base_dir: &Path,
     config_path: &Path,
 ) -> Result<ServerRuntimeConfig> {
-    let default_bind: SocketAddr = DEFAULT_SERVER_BIND
-        .parse()
-        .expect("DEFAULT_SERVER_BIND is a valid socket address");
+    let default_bind: SocketAddr =
+        DEFAULT_SERVER_BIND.parse().expect("DEFAULT_SERVER_BIND is a valid socket address");
     let default_token_file = base_dir.join(DEFAULT_SERVER_TOKEN_FILE);
 
     let Some(section) = file_section else {
@@ -1514,7 +1500,10 @@ mod tests {
             Vec::new(),
         )
         .unwrap();
-        assert_eq!(config, ProjectConfig { wing: "local".to_owned(), rooms: Vec::new(), routing: None });
+        assert_eq!(
+            config,
+            ProjectConfig { wing: "local".to_owned(), rooms: Vec::new(), routing: None }
+        );
 
         fs::remove_dir_all(config_base).unwrap();
         fs::remove_dir_all(project).unwrap();
@@ -1680,8 +1669,14 @@ mod tests {
         let registry = ConfigLoader::load_project_registry(Some(&config_base)).unwrap();
         assert_eq!(registry.projects.len(), 2);
         let canonical_repository = repository.canonicalize().unwrap();
-        assert_eq!(registry.projects["github.com/example/monorepo#crates/api"].checkouts, vec![canonical_repository.clone()]);
-        assert_eq!(registry.projects["github.com/example/monorepo#packages/web"].checkouts, vec![canonical_repository]);
+        assert_eq!(
+            registry.projects["github.com/example/monorepo#crates/api"].checkouts,
+            vec![canonical_repository.clone()]
+        );
+        assert_eq!(
+            registry.projects["github.com/example/monorepo#packages/web"].checkouts,
+            vec![canonical_repository]
+        );
 
         fs::remove_dir_all(config_base).unwrap();
         fs::remove_dir_all(repository).unwrap();
@@ -1858,10 +1853,7 @@ mod tests {
             config.server.checkouts.get("wing_proj"),
             Some(&PathBuf::from("/repos/myproject"))
         );
-        assert_eq!(
-            config.server.checkouts.get("wing_docs"),
-            Some(&PathBuf::from("/repos/docs"))
-        );
+        assert_eq!(config.server.checkouts.get("wing_docs"), Some(&PathBuf::from("/repos/docs")));
 
         fs::remove_dir_all(base).unwrap();
     }
@@ -1871,11 +1863,8 @@ mod tests {
         let base = temp_dir();
         fs::create_dir_all(&base).unwrap();
         // server section present but no checkouts field
-        fs::write(
-            base.join("config.json"),
-            r#"{"version":1,"server":{"bind":"127.0.0.1:8765"}}"#,
-        )
-        .unwrap();
+        fs::write(base.join("config.json"), r#"{"version":1,"server":{"bind":"127.0.0.1:8765"}}"#)
+            .unwrap();
 
         let config = ConfigLoader::load_with_env(Some(&base)).unwrap();
         assert!(config.server.checkouts.is_empty());
@@ -1940,11 +1929,8 @@ mod tests {
     fn invalid_server_bind_is_rejected_with_precise_error() {
         let base = temp_dir();
         fs::create_dir_all(&base).unwrap();
-        fs::write(
-            base.join("config.json"),
-            r#"{"version":1,"server":{"bind":"not-an-address"}}"#,
-        )
-        .unwrap();
+        fs::write(base.join("config.json"), r#"{"version":1,"server":{"bind":"not-an-address"}}"#)
+            .unwrap();
 
         let err = ConfigLoader::load_with_env(Some(&base)).unwrap_err();
         assert!(
@@ -2037,11 +2023,8 @@ mod tests {
     fn maintenance_env_overrides_take_precedence() {
         let base = temp_dir();
         fs::create_dir_all(&base).unwrap();
-        fs::write(
-            base.join("config.json"),
-            r#"{"version":1,"maintenance":{"idle_secs":999}}"#,
-        )
-        .unwrap();
+        fs::write(base.join("config.json"), r#"{"version":1,"maintenance":{"idle_secs":999}}"#)
+            .unwrap();
 
         let config = ConfigLoader::load_from_sources(
             Some(&base),
@@ -2100,14 +2083,30 @@ mod tests {
 
         // File value + no env override → file value kept
         let config = ConfigLoader::load_from_sources(
-            Some(&base), None, None, None, None, None, None, None, None,
+            Some(&base),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
         assert_eq!(config.maintenance.small_fragment_threshold, 99);
 
         // File value + env override → env wins
         let config = ConfigLoader::load_from_sources(
-            Some(&base), None, None, None, None, None, None, None, Some("50".to_owned()),
+            Some(&base),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("50".to_owned()),
         )
         .unwrap();
         assert_eq!(config.maintenance.small_fragment_threshold, 50);
@@ -2136,7 +2135,15 @@ mod tests {
         .unwrap();
 
         let config = ConfigLoader::load_from_sources(
-            Some(&base), None, None, None, None, None, None, None, None,
+            Some(&base),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
 

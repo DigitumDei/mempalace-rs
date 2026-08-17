@@ -1,5 +1,6 @@
 //! Storage layer for MemPalace Rust crates.
 
+mod coordination;
 mod engine;
 mod error;
 mod lance;
@@ -7,18 +8,21 @@ mod maintenance;
 mod sqlite;
 mod types;
 
+pub use coordination::{
+    Artifact, CoordinationCursor, CoordinationEvent, CoordinationEventPage, CoordinationStore,
+    InboxPage, Message, NewArtifact, NewMessage, NewTask, NewTaskResult, Task, TaskResult, TaskState,
+};
 pub use engine::StorageEngine;
 pub use error::{Result, StorageError};
-pub use lance::{
-    FragmentStats, LanceDrawerStore, OptimizeMetrics, PruneMetrics, VectorIndexStats,
-};
+pub use lance::{FragmentStats, LanceDrawerStore, OptimizeMetrics, PruneMetrics, VectorIndexStats};
 pub use maintenance::{
     MaintenanceAbortReason, MaintenanceOutcome, MaintenanceRunStatus, MaintenanceRunSummary,
     MaintenanceSettings, MaintenanceSkipReason, MaintenanceTier, MaintenanceTierResult,
 };
 pub use sqlite::{
-    ChangeCursor, ChangeEvent, ChangeLogStore, ChangePage, DiaryStore, EntityRegistryStore, GraphStore,
-    IngestManifestStore, KnowledgeGraphStore, MaintenanceLeaseStore, SqliteOperationalStore, ToolStateStore,
+    ChangeCursor, ChangeEvent, ChangeLogStore, ChangePage, DiaryStore, EntityRegistryStore,
+    GraphStore, IngestManifestStore, KnowledgeGraphStore, MaintenanceLeaseStore,
+    SqliteOperationalStore, ToolStateStore,
 };
 pub use types::{
     ConfigEntry, DrawerFilter, DrawerMatch, DrawerStore, DuplicateStrategy, EntityRecord,

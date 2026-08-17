@@ -45,7 +45,7 @@ Full flag reference: [CLI Surface](CLI-Surface.md).
 - `balanced`
 - `low_cpu`
 
-### MCP tool surface (23 tools)
+### MCP tool surface (38 tools)
 
 - `mempalace_wake_up`
 - `mempalace_status`
@@ -70,6 +70,21 @@ Full flag reference: [CLI Surface](CLI-Surface.md).
 - `mempalace_get_changes_since`
 - `mempalace_identity_read`
 - `mempalace_identity_update`
+- `mempalace_task_create`
+- `mempalace_task_get`
+- `mempalace_task_claim`
+- `mempalace_task_renew`
+- `mempalace_task_transition`
+- `mempalace_message_send`
+- `mempalace_message_get`
+- `mempalace_message_acknowledge`
+- `mempalace_inbox_read`
+- `mempalace_artifact_put`
+- `mempalace_artifact_get`
+- `mempalace_result_put`
+- `mempalace_result_get`
+- `mempalace_coordination_event_get`
+- `mempalace_coordination_events`
 
 ### Federation
 

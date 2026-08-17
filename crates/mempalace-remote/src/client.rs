@@ -3,7 +3,7 @@
 use mempalace_federation::{
     AddDrawerRequest, AddDrawerResponse, ChangesQuery, ChangesResponse, CheckDuplicateRequest,
     CheckDuplicateResponse, DrawerSearchRequest, DrawerSearchResponse, ErrorBody,
-    FEDERATION_API_VERSION, IngestBatchRequest, IngestBatchResponse, InfoResponse,
+    FEDERATION_API_VERSION, InfoResponse, IngestBatchRequest, IngestBatchResponse,
     KgAddFactRequest, KgInvalidateRequest, KgQueryRequest, ListDrawersQuery, ListDrawersResponse,
 };
 
@@ -135,7 +135,10 @@ impl RemoteClient {
     /// - HTTP 401 → [`RemoteError::Unauthorized`]
     /// - Other non-2xx → [`RemoteError::RemoteRejected`] (body included)
     /// - 2xx with bad JSON → [`RemoteError::InvalidResponse`]
-    async fn execute<T: serde::de::DeserializeOwned>(&self, rb: reqwest::RequestBuilder) -> Result<T> {
+    async fn execute<T: serde::de::DeserializeOwned>(
+        &self,
+        rb: reqwest::RequestBuilder,
+    ) -> Result<T> {
         let rb = match &self.token {
             Some(tok) => rb.bearer_auth(tok),
             None => rb,
@@ -412,21 +415,25 @@ mod tests {
     fn is_degradable_unreachable_only() {
         let mk_name = || "r".to_owned();
 
-        assert!(RemoteError::Unreachable { remote: mk_name(), message: "x".to_owned() }
-            .is_degradable());
+        assert!(
+            RemoteError::Unreachable { remote: mk_name(), message: "x".to_owned() }.is_degradable()
+        );
         assert!(!RemoteError::Unauthorized { remote: mk_name() }.is_degradable());
-        assert!(!RemoteError::VersionSkew { remote: mk_name(), ours: 1, theirs: 2 }
-            .is_degradable());
-        assert!(!RemoteError::RemoteRejected {
-            remote: mk_name(),
-            status: 404,
-            body: String::new()
-        }
-        .is_degradable());
-        assert!(!RemoteError::InvalidResponse { remote: mk_name(), message: "x".to_owned() }
-            .is_degradable());
-        assert!(!RemoteError::InvalidConfig { remote: mk_name(), message: "x".to_owned() }
-            .is_degradable());
+        assert!(
+            !RemoteError::VersionSkew { remote: mk_name(), ours: 1, theirs: 2 }.is_degradable()
+        );
+        assert!(
+            !RemoteError::RemoteRejected { remote: mk_name(), status: 404, body: String::new() }
+                .is_degradable()
+        );
+        assert!(
+            !RemoteError::InvalidResponse { remote: mk_name(), message: "x".to_owned() }
+                .is_degradable()
+        );
+        assert!(
+            !RemoteError::InvalidConfig { remote: mk_name(), message: "x".to_owned() }
+                .is_degradable()
+        );
     }
 
     #[test]

@@ -95,21 +95,13 @@ pub enum MaintenanceStatus {
     /// A maintenance run is currently in progress.
     Running,
     /// The most recent attempt was skipped before any tier started.
-    Skipped {
-        reason: MaintenanceSkipReason,
-    },
+    Skipped { reason: MaintenanceSkipReason },
     /// The most recent attempt was aborted mid-run.
-    Aborted {
-        reason: MaintenanceAbortReason,
-    },
+    Aborted { reason: MaintenanceAbortReason },
     /// The most recent attempt failed with an error.
-    Failed {
-        message: String,
-    },
+    Failed { message: String },
     /// The most recent run completed (possibly with tier-level failures).
-    Completed {
-        status: MaintenanceRunStatus,
-    },
+    Completed { status: MaintenanceRunStatus },
 }
 
 impl Default for MaintenanceStatus {
@@ -567,8 +559,7 @@ mod tests {
 
     #[test]
     fn maintenance_status_failed_with_message() {
-        let raw =
-            r#"{"maintenance_status":{"failed":{"message":"disk full"}}}"#;
+        let raw = r#"{"maintenance_status":{"failed":{"message":"disk full"}}}"#;
         let info: InfoResponse = serde_json::from_str(raw).unwrap();
         assert_eq!(
             info.maintenance_status,

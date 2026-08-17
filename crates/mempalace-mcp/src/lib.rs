@@ -23,8 +23,9 @@ use mempalace_graph::{
 };
 use mempalace_search::{SearchRuntime, SearchRuntimePolicy};
 use mempalace_storage::{
-    ChangeEvent, ChangeLogStore, DiaryStore, DrawerFilter, DrawerStore, DuplicateStrategy,
-    IngestCommitRequest, StorageEngine,
+    ChangeEvent, ChangeLogStore, CoordinationCursor, CoordinationStore, DiaryStore, DrawerFilter,
+    DrawerStore, DuplicateStrategy, IngestCommitRequest, NewArtifact, NewMessage, NewTask,
+    NewTaskResult, StorageEngine, TaskState,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -33,8 +34,8 @@ use time::{Date, Duration, OffsetDateTime, format_description::well_known::Rfc33
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Mutex, Semaphore, TryAcquireError};
 
-pub use mempalace_core as core;
 use federation::FederationRouter;
+pub use mempalace_core as core;
 
 // ─── Federation routing semantics ─────────────────────────────────────────────
 //
@@ -189,10 +190,25 @@ enum ToolName {
     GetChangesSince,
     IdentityRead,
     IdentityUpdate,
+    TaskCreate,
+    TaskGet,
+    TaskClaim,
+    TaskRenew,
+    TaskTransition,
+    MessageSend,
+    MessageGet,
+    MessageAcknowledge,
+    InboxRead,
+    ArtifactPut,
+    ArtifactGet,
+    ResultPut,
+    ResultGet,
+    CoordinationEventGet,
+    CoordinationEvents,
 }
 
 impl ToolName {
-    fn all() -> [Self; 23] {
+    fn all() -> [Self; 38] {
         [
             Self::WakeUp,
             Self::Status,
@@ -217,6 +233,21 @@ impl ToolName {
             Self::GetChangesSince,
             Self::IdentityRead,
             Self::IdentityUpdate,
+            Self::TaskCreate,
+            Self::TaskGet,
+            Self::TaskClaim,
+            Self::TaskRenew,
+            Self::TaskTransition,
+            Self::MessageSend,
+            Self::MessageGet,
+            Self::MessageAcknowledge,
+            Self::InboxRead,
+            Self::ArtifactPut,
+            Self::ArtifactGet,
+            Self::ResultPut,
+            Self::ResultGet,
+            Self::CoordinationEventGet,
+            Self::CoordinationEvents,
         ]
     }
 
@@ -245,6 +276,21 @@ impl ToolName {
             Self::GetChangesSince => "mempalace_get_changes_since",
             Self::IdentityRead => "mempalace_identity_read",
             Self::IdentityUpdate => "mempalace_identity_update",
+            Self::TaskCreate => "mempalace_task_create",
+            Self::TaskGet => "mempalace_task_get",
+            Self::TaskClaim => "mempalace_task_claim",
+            Self::TaskRenew => "mempalace_task_renew",
+            Self::TaskTransition => "mempalace_task_transition",
+            Self::MessageSend => "mempalace_message_send",
+            Self::MessageGet => "mempalace_message_get",
+            Self::MessageAcknowledge => "mempalace_message_acknowledge",
+            Self::InboxRead => "mempalace_inbox_read",
+            Self::ArtifactPut => "mempalace_artifact_put",
+            Self::ArtifactGet => "mempalace_artifact_get",
+            Self::ResultPut => "mempalace_result_put",
+            Self::ResultGet => "mempalace_result_get",
+            Self::CoordinationEventGet => "mempalace_coordination_event_get",
+            Self::CoordinationEvents => "mempalace_coordination_events",
         }
     }
 
@@ -492,6 +538,96 @@ impl ToolName {
                     "required":["content"]
                 }),
             },
+            Self::TaskCreate => coordination_definition(
+                self,
+                "Create a durable task idempotently. Replaying the same created_by and idempotency_key returns the committed task.",
+                json!({"title":{"type":"string"},"description":{"type":"string"},"created_by":{"type":"string"},"idempotency_key":{"type":"string"},"parent_id":{"type":"string"},"dependencies":{"type":"array","items":{"type":"string"}},"budget":{},"expires_at":{"type":"string"}}),
+                &["title", "description", "created_by", "idempotency_key"],
+            ),
+            Self::TaskGet => coordination_definition(
+                self,
+                "Retrieve a task authoritatively by exact ID; returns found:false for a miss.",
+                json!({"task_id":{"type":"string"}}),
+                &["task_id"],
+            ),
+            Self::TaskClaim => coordination_definition(
+                self,
+                "Atomically claim or reclaim a task lease using an expected revision.",
+                json!({"task_id":{"type":"string"},"worker":{"type":"string"},"expected_revision":{"type":"integer"},"lease_seconds":{"type":"integer"}}),
+                &["task_id", "worker", "expected_revision", "lease_seconds"],
+            ),
+            Self::TaskRenew => coordination_definition(
+                self,
+                "Renew a task lease using an expected revision.",
+                json!({"task_id":{"type":"string"},"worker":{"type":"string"},"expected_revision":{"type":"integer"},"lease_seconds":{"type":"integer"}}),
+                &["task_id", "worker", "expected_revision", "lease_seconds"],
+            ),
+            Self::TaskTransition => coordination_definition(
+                self,
+                "Durably transition a task lifecycle state using compare-and-swap revision semantics.",
+                json!({"task_id":{"type":"string"},"actor":{"type":"string"},"expected_revision":{"type":"integer"},"state":{"type":"string","enum":["pending","running","input_required","completed","cancelled","failed","expired"]},"details":{}}),
+                &["task_id", "actor", "expected_revision", "state"],
+            ),
+            Self::MessageSend => coordination_definition(
+                self,
+                "Send an addressed task message idempotently. Semantic similarity is never used for deduplication.",
+                json!({"task_id":{"type":"string"},"sender":{"type":"string"},"recipient":{"type":"string"},"kind":{"type":"string"},"payload":{},"idempotency_key":{"type":"string"},"envelope_version":{"type":"integer"}}),
+                &["task_id", "sender", "recipient", "kind", "payload", "idempotency_key"],
+            ),
+            Self::MessageGet => coordination_definition(
+                self,
+                "Retrieve a message authoritatively by exact ID; returns found:false for a miss.",
+                json!({"message_id":{"type":"string"}}),
+                &["message_id"],
+            ),
+            Self::MessageAcknowledge => coordination_definition(
+                self,
+                "Acknowledge an addressed message as its recipient.",
+                json!({"message_id":{"type":"string"},"actor":{"type":"string"}}),
+                &["message_id", "actor"],
+            ),
+            Self::InboxRead => coordination_definition(
+                self,
+                "Read messages addressed to a recipient using an opaque local cursor.",
+                json!({"recipient":{"type":"string"},"cursor":{"type":"integer"},"limit":{"type":"integer"},"unacknowledged_only":{"type":"boolean"}}),
+                &["recipient"],
+            ),
+            Self::ArtifactPut => coordination_definition(
+                self,
+                "Store an immutable task artifact idempotently with a content hash.",
+                json!({"task_id":{"type":"string"},"created_by":{"type":"string"},"role":{"type":"string"},"media_type":{"type":"string"},"content":{"type":"string"},"idempotency_key":{"type":"string"}}),
+                &["task_id", "created_by", "role", "media_type", "content", "idempotency_key"],
+            ),
+            Self::ArtifactGet => coordination_definition(
+                self,
+                "Retrieve an artifact authoritatively by exact ID; returns found:false for a miss.",
+                json!({"artifact_id":{"type":"string"}}),
+                &["artifact_id"],
+            ),
+            Self::ResultPut => coordination_definition(
+                self,
+                "Store an immutable task result idempotently. Semantic similarity is never used for deduplication.",
+                json!({"task_id":{"type":"string"},"created_by":{"type":"string"},"payload":{},"idempotency_key":{"type":"string"}}),
+                &["task_id", "created_by", "payload", "idempotency_key"],
+            ),
+            Self::ResultGet => coordination_definition(
+                self,
+                "Retrieve a task result authoritatively by exact ID; returns found:false for a miss.",
+                json!({"result_id":{"type":"string"}}),
+                &["result_id"],
+            ),
+            Self::CoordinationEventGet => coordination_definition(
+                self,
+                "Retrieve a coordination audit event authoritatively by exact ID; returns found:false for a miss.",
+                json!({"event_id":{"type":"string"}}),
+                &["event_id"],
+            ),
+            Self::CoordinationEvents => coordination_definition(
+                self,
+                "Read append-only coordination audit events using an opaque local cursor.",
+                json!({"cursor":{"type":"integer"},"task_id":{"type":"string"},"limit":{"type":"integer"}}),
+                &[],
+            ),
         }
     }
 
@@ -507,6 +643,21 @@ impl ToolName {
             | Self::IdentityRead
             | Self::IdentityUpdate
             | Self::GetAaaKSpec => ToolRoutingCategory::LocalOnly,
+            Self::TaskCreate
+            | Self::TaskGet
+            | Self::TaskClaim
+            | Self::TaskRenew
+            | Self::TaskTransition
+            | Self::MessageSend
+            | Self::MessageGet
+            | Self::MessageAcknowledge
+            | Self::InboxRead
+            | Self::ArtifactPut
+            | Self::ArtifactGet
+            | Self::ResultPut
+            | Self::ResultGet
+            | Self::CoordinationEventGet
+            | Self::CoordinationEvents => ToolRoutingCategory::LocalOnly,
             Self::Search
             | Self::ListWings
             | Self::ListRooms
@@ -515,12 +666,23 @@ impl ToolName {
             | Self::CheckDuplicate
             | Self::AddDrawer
             | Self::DeleteDrawer => ToolRoutingCategory::RoutableDrawer,
-            Self::KgQuery
-            | Self::KgAdd
-            | Self::KgInvalidate
-            | Self::KgTimeline
-            | Self::KgStats => ToolRoutingCategory::RoutableKg,
+            Self::KgQuery | Self::KgAdd | Self::KgInvalidate | Self::KgTimeline | Self::KgStats => {
+                ToolRoutingCategory::RoutableKg
+            }
         }
+    }
+}
+
+fn coordination_definition(
+    tool: ToolName,
+    description: &'static str,
+    properties: Value,
+    required: &[&str],
+) -> ToolDefinition {
+    ToolDefinition {
+        name: tool.as_str(),
+        description,
+        input_schema: json!({"type":"object","properties":properties,"required":required}),
     }
 }
 
@@ -709,6 +871,21 @@ where
             ToolName::GetChangesSince => runtime.tool_get_changes_since(&call.arguments).await,
             ToolName::IdentityRead => runtime.tool_identity_read().await,
             ToolName::IdentityUpdate => runtime.tool_identity_update(&call.arguments).await,
+            ToolName::TaskCreate => runtime.tool_task_create(&call.arguments),
+            ToolName::TaskGet => runtime.tool_task_get(&call.arguments),
+            ToolName::TaskClaim => runtime.tool_task_claim(&call.arguments),
+            ToolName::TaskRenew => runtime.tool_task_renew(&call.arguments),
+            ToolName::TaskTransition => runtime.tool_task_transition(&call.arguments),
+            ToolName::MessageSend => runtime.tool_message_send(&call.arguments),
+            ToolName::MessageGet => runtime.tool_message_get(&call.arguments),
+            ToolName::MessageAcknowledge => runtime.tool_message_acknowledge(&call.arguments),
+            ToolName::InboxRead => runtime.tool_inbox_read(&call.arguments),
+            ToolName::ArtifactPut => runtime.tool_artifact_put(&call.arguments),
+            ToolName::ArtifactGet => runtime.tool_artifact_get(&call.arguments),
+            ToolName::ResultPut => runtime.tool_result_put(&call.arguments),
+            ToolName::ResultGet => runtime.tool_result_get(&call.arguments),
+            ToolName::CoordinationEventGet => runtime.tool_coordination_event_get(&call.arguments),
+            ToolName::CoordinationEvents => runtime.tool_coordination_events(&call.arguments),
         };
 
         match result {
@@ -731,6 +908,7 @@ where
 struct McpRuntime<P> {
     config: MempalaceConfig,
     storage: StorageEngine,
+    coordination: CoordinationStore,
     search: SearchRuntime<P>,
     federation: Option<FederationRouter>,
 }
@@ -741,6 +919,8 @@ where
 {
     async fn new(config: MempalaceConfig, provider: P) -> Result<Self> {
         let storage = StorageEngine::open(&config.palace_path, config.embedding_profile).await?;
+        let coordination = CoordinationStore::new(config.palace_path.join("storage.sqlite3"));
+        coordination.ensure_schema()?;
         let router = FederationRouter::new(config.federation.clone());
         let federation = if router.has_remotes() { Some(router) } else { None };
         Ok(Self {
@@ -750,6 +930,7 @@ where
             ),
             config,
             storage,
+            coordination,
             federation,
         })
     }
@@ -824,9 +1005,8 @@ where
             if router.has_remotes() {
                 let fan_since = format_rfc3339(OffsetDateTime::now_utc() - Duration::days(1))?;
                 let cursors = BTreeMap::new();
-                let remote_changes = router
-                    .changes_fanout(Some(fan_since), Some(latest_limit), &cursors)
-                    .await;
+                let remote_changes =
+                    router.changes_fanout(Some(fan_since), Some(latest_limit), &cursors).await;
                 payload["remote_changes"] = json!(remote_changes);
             }
         }
@@ -840,7 +1020,11 @@ where
             payload = router.status_merge(payload).await?;
             let local_wings: BTreeMap<String, usize> = payload["wings"]
                 .as_object()
-                .map(|obj| obj.iter().filter_map(|(k, v)| v.as_u64().map(|n| (k.clone(), n as usize))).collect())
+                .map(|obj| {
+                    obj.iter()
+                        .filter_map(|(k, v)| v.as_u64().map(|n| (k.clone(), n as usize)))
+                        .collect()
+                })
                 .unwrap_or_default();
             if router.has_remotes() {
                 payload["wing_availability"] = router.wing_availability(&local_wings);
@@ -966,7 +1150,11 @@ where
             payload = router.wings_merge(payload).await?;
             let local_wings: BTreeMap<String, usize> = payload["wings"]
                 .as_object()
-                .map(|obj| obj.iter().filter_map(|(k, v)| v.as_u64().map(|n| (k.clone(), n as usize))).collect())
+                .map(|obj| {
+                    obj.iter()
+                        .filter_map(|(k, v)| v.as_u64().map(|n| (k.clone(), n as usize)))
+                        .collect()
+                })
                 .unwrap_or_default();
             if router.has_remotes() {
                 payload["wing_availability"] = router.wing_availability(&local_wings);
@@ -1042,12 +1230,10 @@ where
         if let Some(router) = &self.federation {
             let wing_str = wing.as_ref().map(|w| w.as_str());
             let room_str = room.as_ref().map(|r| r.as_str());
-            let (include_local, remote_targets) =
-                router.plan_search_targets(wing_str, room_str);
+            let (include_local, remote_targets) = router.plan_search_targets(wing_str, room_str);
             if !remote_targets.is_empty() {
-                let overlay = view
-                    .as_deref()
-                    .is_some_and(|view| view != "canonical" && view != "full");
+                let overlay =
+                    view.as_deref().is_some_and(|view| view != "canonical" && view != "full");
                 let max_candidate_limit = limit.saturating_mul(10).max(limit);
                 let mut candidate_limit = limit;
                 loop {
@@ -1104,8 +1290,7 @@ where
                         .await?;
                     let candidate_count = payload["results"].as_array().map_or(0, Vec::len);
                     if include_local {
-                        self.filter_federated_view_overrides(&mut payload, &view, &wing)
-                            .await?;
+                        self.filter_federated_view_overrides(&mut payload, &view, &wing).await?;
                     }
                     let result_count = payload["results"].as_array().map_or(0, Vec::len);
                     if !overlay
@@ -1175,9 +1360,7 @@ where
         view: &Option<String>,
         wing: &Option<WingId>,
     ) -> ToolResult<()> {
-        let Some(view) = view
-            .as_deref()
-            .filter(|view| *view != "canonical" && *view != "full")
+        let Some(view) = view.as_deref().filter(|view| *view != "canonical" && *view != "full")
         else {
             return Ok(());
         };
@@ -1289,8 +1472,7 @@ where
                 if let Some(existing) = duplicates.iter().find(|d| {
                     d.get("wing").and_then(|w| w.as_str()) == Some(wing.as_str())
                         && d.get("room").and_then(|r| r.as_str()) == Some(room.as_str())
-                        && d.get("content_hash")
-                            .and_then(|h| h.as_str())
+                        && d.get("content_hash").and_then(|h| h.as_str())
                             == Some(content_hash.as_str())
                 }) {
                     let existing_drawer_id = existing["id"].as_str().unwrap_or("");
@@ -1431,17 +1613,13 @@ where
         if deleted == 0 {
             // ── Federation fallback ──
             if let Some(router) = &self.federation {
-                if let Some(remote_resp) =
-                    router.delete_drawer_remote(drawer_id.as_str()).await?
-                {
+                if let Some(remote_resp) = router.delete_drawer_remote(drawer_id.as_str()).await? {
                     self.log_change(ChangeEvent {
                         event_type: "drawer_deleted".to_owned(),
                         occurred_at: OffsetDateTime::now_utc(),
                         entity_id: drawer_id.as_str().to_owned(),
                         actor: None,
-                        details_json: Some(
-                            json!({"origin": remote_resp["origin"]}).to_string(),
-                        ),
+                        details_json: Some(json!({"origin": remote_resp["origin"]}).to_string()),
                     });
                     return Ok(remote_resp);
                 }
@@ -1776,7 +1954,9 @@ where
                 Ok(facts) => facts,
                 // A federated query may name an entity that exists only on the remote.
                 // Keep the local side empty so federation can still complete the read.
-                Err(mempalace_graph::GraphError::UnknownEntity { .. }) if federated_read => Vec::new(),
+                Err(mempalace_graph::GraphError::UnknownEntity { .. }) if federated_read => {
+                    Vec::new()
+                }
                 Err(error) => return Err(ToolError::Internal(McpError::Graph(error))),
             }
         } else {
@@ -1884,11 +2064,7 @@ where
             if let Some(router) = &self.federation {
                 if let Some(route) = &route {
                     let replication = router
-                        .kg_add_replicate(
-                            &sub, &pred, &obj,
-                            valid_from_text.as_deref(),
-                            route,
-                        )
+                        .kg_add_replicate(&sub, &pred, &obj, valid_from_text.as_deref(), route)
                         .await;
                     if let Some(p) = payload.as_object_mut() {
                         p.insert("replication".to_owned(), json!(replication));
@@ -1990,11 +2166,7 @@ where
             if let Some(router) = &self.federation {
                 if let Some(route) = &route {
                     let replication = router
-                        .kg_invalidate_replicate(
-                            &sub, &pred, &obj,
-                            ended_text.as_deref(),
-                            route,
-                        )
+                        .kg_invalidate_replicate(&sub, &pred, &obj, ended_text.as_deref(), route)
                         .await;
                     if let Some(p) = payload.as_object_mut() {
                         p.insert("replication".to_owned(), json!(replication));
@@ -2022,7 +2194,9 @@ where
             match runtime.timeline(entity.as_deref()) {
                 Ok(timeline) => timeline,
                 // See `tool_kg_query`: an entity can be known only by a remote.
-                Err(mempalace_graph::GraphError::UnknownEntity { .. }) if federated_read => Vec::new(),
+                Err(mempalace_graph::GraphError::UnknownEntity { .. }) if federated_read => {
+                    Vec::new()
+                }
                 Err(error) => return Err(ToolError::Internal(McpError::Graph(error))),
             }
         } else {
@@ -2074,7 +2248,8 @@ where
             room: None,
             limit: DUPLICATE_SEARCH_LIMIT,
             profile: self.config.embedding_profile,
-                view: None,};
+            view: None,
+        };
         let results =
             self.search.search_semantic(self.storage.drawer_store(), &query).await.map_tool()?;
         Ok(results
@@ -2188,7 +2363,9 @@ where
                 let mut out = BTreeMap::new();
                 for (k, v) in map {
                     match v.as_str() {
-                        Some(s) => { out.insert(k.clone(), s.to_owned()); }
+                        Some(s) => {
+                            out.insert(k.clone(), s.to_owned());
+                        }
                         None => {
                             return Err(ToolError::InvalidParams(
                                 "field `cursors` must be an object of string values".to_owned(),
@@ -2220,9 +2397,8 @@ where
                 })
                 .collect();
 
-            let remote_results = router
-                .changes_fanout(since_str.clone(), Some(limit), &cursors)
-                .await;
+            let remote_results =
+                router.changes_fanout(since_str.clone(), Some(limit), &cursors).await;
 
             // Merge all events and collect per-remote metadata.
             let mut all_events: Vec<Value> = local_event_list;
@@ -2251,9 +2427,7 @@ where
             // across remotes still compare chronologically; unparseable
             // timestamps sort last, by raw string among themselves.
             let parse_occurred_at = |event: &Value| {
-                event["occurred_at"]
-                    .as_str()
-                    .and_then(|s| OffsetDateTime::parse(s, &Rfc3339).ok())
+                event["occurred_at"].as_str().and_then(|s| OffsetDateTime::parse(s, &Rfc3339).ok())
             };
             all_events.sort_by(|a, b| match (parse_occurred_at(a), parse_occurred_at(b)) {
                 (Some(ta), Some(tb)) => ta.cmp(&tb),
@@ -2282,6 +2456,127 @@ where
                 "events": event_list,
             }))
         }
+    }
+
+    fn tool_task_create(&self, arguments: &Value) -> ToolResult<Value> {
+        let input: NewTask = parse_coordination_input(arguments)?;
+        Ok(json!(self.coordination.create_task(&input).map_tool_internal()?))
+    }
+    fn tool_task_get(&self, arguments: &Value) -> ToolResult<Value> {
+        let id = required_string(arguments, "task_id")?;
+        exact_result(self.coordination.get_task(&id).map_tool_internal()?)
+    }
+    fn tool_task_claim(&self, arguments: &Value) -> ToolResult<Value> {
+        let task = self
+            .coordination
+            .claim_task(
+                &required_string(arguments, "task_id")?,
+                &required_string(arguments, "worker")?,
+                required_i64(arguments, "expected_revision")?,
+                Duration::seconds(required_positive_i64(arguments, "lease_seconds")?),
+            )
+            .map_tool_internal()?;
+        Ok(json!(task))
+    }
+    fn tool_task_renew(&self, arguments: &Value) -> ToolResult<Value> {
+        let task = self
+            .coordination
+            .renew_lease(
+                &required_string(arguments, "task_id")?,
+                &required_string(arguments, "worker")?,
+                required_i64(arguments, "expected_revision")?,
+                Duration::seconds(required_positive_i64(arguments, "lease_seconds")?),
+            )
+            .map_tool_internal()?;
+        Ok(json!(task))
+    }
+    fn tool_task_transition(&self, arguments: &Value) -> ToolResult<Value> {
+        let state: TaskState = serde_json::from_value(json!(required_string(arguments, "state")?))
+            .map_err(|e| ToolError::InvalidParams(e.to_string()))?;
+        let task = self
+            .coordination
+            .transition_task(
+                &required_string(arguments, "task_id")?,
+                &required_string(arguments, "actor")?,
+                required_i64(arguments, "expected_revision")?,
+                state,
+                arguments.get("details").cloned(),
+            )
+            .map_tool_internal()?;
+        Ok(json!(task))
+    }
+    fn tool_message_send(&self, arguments: &Value) -> ToolResult<Value> {
+        let input: NewMessage = parse_coordination_input(arguments)?;
+        Ok(json!(self.coordination.send_message(&input).map_tool_internal()?))
+    }
+    fn tool_message_get(&self, arguments: &Value) -> ToolResult<Value> {
+        exact_result(
+            self.coordination
+                .get_message(&required_string(arguments, "message_id")?)
+                .map_tool_internal()?,
+        )
+    }
+    fn tool_message_acknowledge(&self, arguments: &Value) -> ToolResult<Value> {
+        Ok(json!(
+            self.coordination
+                .acknowledge_message(
+                    &required_string(arguments, "message_id")?,
+                    &required_string(arguments, "actor")?
+                )
+                .map_tool_internal()?
+        ))
+    }
+    fn tool_inbox_read(&self, arguments: &Value) -> ToolResult<Value> {
+        let page = self
+            .coordination
+            .inbox(
+                &required_string(arguments, "recipient")?,
+                optional_i64(arguments, "cursor")?.map(CoordinationCursor),
+                optional_usize(arguments, "limit")?.unwrap_or(50),
+                optional_bool(arguments, "unacknowledged_only")?.unwrap_or(false),
+            )
+            .map_tool_internal()?;
+        Ok(json!(page))
+    }
+    fn tool_artifact_put(&self, arguments: &Value) -> ToolResult<Value> {
+        let input: NewArtifact = parse_coordination_input(arguments)?;
+        Ok(json!(self.coordination.put_artifact(&input).map_tool_internal()?))
+    }
+    fn tool_artifact_get(&self, arguments: &Value) -> ToolResult<Value> {
+        exact_result(
+            self.coordination
+                .get_artifact(&required_string(arguments, "artifact_id")?)
+                .map_tool_internal()?,
+        )
+    }
+    fn tool_result_put(&self, arguments: &Value) -> ToolResult<Value> {
+        let input: NewTaskResult = parse_coordination_input(arguments)?;
+        Ok(json!(self.coordination.put_result(&input).map_tool_internal()?))
+    }
+    fn tool_result_get(&self, arguments: &Value) -> ToolResult<Value> {
+        exact_result(
+            self.coordination
+                .get_result(&required_string(arguments, "result_id")?)
+                .map_tool_internal()?,
+        )
+    }
+    fn tool_coordination_event_get(&self, arguments: &Value) -> ToolResult<Value> {
+        exact_result(
+            self.coordination
+                .get_event(&required_string(arguments, "event_id")?)
+                .map_tool_internal()?,
+        )
+    }
+    fn tool_coordination_events(&self, arguments: &Value) -> ToolResult<Value> {
+        Ok(json!(
+            self.coordination
+                .events(
+                    optional_i64(arguments, "cursor")?.map(CoordinationCursor),
+                    optional_string(arguments, "task_id")?.as_deref(),
+                    optional_usize(arguments, "limit")?.unwrap_or(50),
+                )
+                .map_tool_internal()?
+        ))
     }
 }
 
@@ -2478,6 +2773,47 @@ fn optional_usize(arguments: &Value, field: &'static str) -> ToolResult<Option<u
     }
 }
 
+fn required_i64(arguments: &Value, field: &'static str) -> ToolResult<i64> {
+    arguments.get(field).and_then(Value::as_i64).ok_or_else(|| {
+        ToolError::InvalidParams(format!("missing required integer field `{field}`"))
+    })
+}
+fn required_positive_i64(arguments: &Value, field: &'static str) -> ToolResult<i64> {
+    let value = required_i64(arguments, field)?;
+    if value <= 0 {
+        Err(ToolError::InvalidParams(format!("field `{field}` must be positive")))
+    } else {
+        Ok(value)
+    }
+}
+fn optional_i64(arguments: &Value, field: &'static str) -> ToolResult<Option<i64>> {
+    match arguments.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_i64()
+            .map(Some)
+            .ok_or_else(|| ToolError::InvalidParams(format!("field `{field}` must be an integer"))),
+    }
+}
+fn optional_bool(arguments: &Value, field: &'static str) -> ToolResult<Option<bool>> {
+    match arguments.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_bool()
+            .map(Some)
+            .ok_or_else(|| ToolError::InvalidParams(format!("field `{field}` must be a boolean"))),
+    }
+}
+fn parse_coordination_input<T: for<'de> Deserialize<'de>>(arguments: &Value) -> ToolResult<T> {
+    serde_json::from_value(arguments.clone()).map_err(|e| ToolError::InvalidParams(e.to_string()))
+}
+fn exact_result<T: Serialize>(value: Option<T>) -> ToolResult<Value> {
+    Ok(match value {
+        Some(value) => json!({"found":true,"value":value}),
+        None => json!({"found":false}),
+    })
+}
+
 fn optional_f32(arguments: &Value, field: &'static str) -> ToolResult<Option<f32>> {
     match arguments.get(field) {
         None | Some(Value::Null) => Ok(None),
@@ -2545,10 +2881,8 @@ impl DiaryReadFilters {
         let wing =
             optional_string(arguments, "wing")?.map(|wing| parse_wing_id(&wing)).transpose()?;
         let topic = optional_string(arguments, "topic")?;
-        let entry_id = optional_string(arguments, "entry_id")?
-            .as_deref()
-            .map(parse_drawer_id)
-            .transpose()?;
+        let entry_id =
+            optional_string(arguments, "entry_id")?.as_deref().map(parse_drawer_id).transpose()?;
         let since = if entry_id.is_some() {
             None
         } else {
@@ -2797,8 +3131,8 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc;
 
     use mempalace_config::{
@@ -3002,11 +3336,7 @@ mod tests {
             {"origin": "alpha", "wing": "wing_team", "source_file": "changed.md"}
         ]});
         runtime
-            .filter_federated_view_overrides(
-                &mut payload,
-                &Some("feature-x".to_owned()),
-                &None,
-            )
+            .filter_federated_view_overrides(&mut payload, &Some("feature-x".to_owned()), &None)
             .await
             .unwrap();
 
@@ -3060,7 +3390,10 @@ mod tests {
                 )
             })
             .collect::<BTreeMap<_, _>>();
-        assert_eq!(serde_json::to_value(actual).unwrap(), expected);
+        let expected = expected.as_object().expect("phase 0 tool fixture must be an object");
+        for (name, definition) in expected {
+            assert_eq!(actual.get(name), Some(definition), "phase 0 tool `{name}` changed");
+        }
     }
 
     #[tokio::test]
@@ -3077,6 +3410,105 @@ mod tests {
             })
             .await;
         assert_eq!(response, fixture["initialize"]);
+    }
+
+    #[tokio::test]
+    async fn native_coordination_tools_support_exact_recovery_and_inbox_acknowledgement() {
+        let harness = test_harness().await;
+        let created = harness
+            .server
+            .handle_request(tool_call(
+                900,
+                "mempalace_task_create",
+                json!({
+                    "title":"Research", "description":"Produce a result", "created_by":"manager",
+                    "idempotency_key":"task-request-1", "budget":{"tokens":500}
+                }),
+            ))
+            .await;
+        let task = decode_tool_payload(&created).expect("task payload");
+        let task_id = task["task_id"].as_str().expect("task id");
+
+        let replay = harness
+            .server
+            .handle_request(tool_call(
+                901,
+                "mempalace_task_create",
+                json!({
+                    "title":"Research", "description":"Produce a result", "created_by":"manager",
+                    "idempotency_key":"task-request-1", "budget":{"tokens":500}
+                }),
+            ))
+            .await;
+        assert_eq!(decode_tool_payload(&replay).expect("replay")["task_id"], task_id);
+
+        let sent = harness
+            .server
+            .handle_request(tool_call(
+                902,
+                "mempalace_message_send",
+                json!({
+                    "task_id":task_id, "sender":"manager", "recipient":"worker", "kind":"handoff",
+                    "payload":{"instructions":"start"}, "idempotency_key":"message-request-1"
+                }),
+            ))
+            .await;
+        let message = decode_tool_payload(&sent).expect("message payload");
+        let message_id = message["message_id"].as_str().expect("message id");
+        let inbox = harness
+            .server
+            .handle_request(tool_call(903, "mempalace_inbox_read", json!({"recipient":"worker"})))
+            .await;
+        assert_eq!(
+            decode_tool_payload(&inbox).expect("inbox")["messages"][0]["message_id"],
+            message_id
+        );
+        let ack = harness
+            .server
+            .handle_request(tool_call(
+                904,
+                "mempalace_message_acknowledge",
+                json!({"message_id":message_id,"actor":"worker"}),
+            ))
+            .await;
+        assert!(decode_tool_payload(&ack).expect("ack")["acknowledged_at"].is_string());
+        let exact = harness
+            .server
+            .handle_request(tool_call(905, "mempalace_task_get", json!({"task_id":task_id})))
+            .await;
+        assert_eq!(decode_tool_payload(&exact).expect("exact")["found"], true);
+        let missing = harness
+            .server
+            .handle_request(tool_call(906, "mempalace_task_get", json!({"task_id":"task_missing"})))
+            .await;
+        assert_eq!(decode_tool_payload(&missing).expect("missing")["found"], false);
+        let result = harness
+            .server
+            .handle_request(tool_call(
+                907,
+                "mempalace_result_put",
+                json!({
+                    "task_id":task_id, "created_by":"worker", "payload":{"answer":42},
+                    "idempotency_key":"result-request-1"
+                }),
+            ))
+            .await;
+        let result_id = decode_tool_payload(&result).expect("result")["result_id"]
+            .as_str()
+            .expect("result id")
+            .to_owned();
+        let exact_result_response = harness
+            .server
+            .handle_request(tool_call(
+                908,
+                "mempalace_result_get",
+                json!({"result_id":result_id}),
+            ))
+            .await;
+        assert_eq!(
+            decode_tool_payload(&exact_result_response).expect("exact result")["found"],
+            true
+        );
     }
 
     #[tokio::test]
@@ -3913,7 +4345,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(detail["entry_id"], "detail_old_entry");
-        assert_eq!(detail["content"], "This is an old diary entry that should still be retrievable by ID.");
+        assert_eq!(
+            detail["content"],
+            "This is an old diary entry that should still be retrievable by ID."
+        );
         assert_eq!(detail["agent"], "Wake Test");
         assert_eq!(detail["topic"], "wakeup");
         assert!(detail.get("since").is_none());
@@ -5081,29 +5516,23 @@ mod tests {
         // The dispatch path must not panic/crash when federation is configured
         // with a non-local wing rule. No live remote is wired, so no remote HTTP
         // calls are made; tools fall through to local execution.
-        let harness = test_harness_with_federation(
-            FederationRuntimeConfig {
-                wings: [(
-                    "wing_code".to_owned(),
-                    ResolvedRouteRule {
-                        mode: RouteMode::Remote,
-                        remote: Some("remote-alpha".to_owned()),
-                        write: WriteTarget::Remote,
-                    },
-                )]
-                .into(),
-                ..FederationRuntimeConfig::default()
-            },
-        )
+        let harness = test_harness_with_federation(FederationRuntimeConfig {
+            wings: [(
+                "wing_code".to_owned(),
+                ResolvedRouteRule {
+                    mode: RouteMode::Remote,
+                    remote: Some("remote-alpha".to_owned()),
+                    write: WriteTarget::Remote,
+                },
+            )]
+            .into(),
+            ..FederationRuntimeConfig::default()
+        })
         .await;
 
         let response = harness
             .server
-            .handle_request(tool_call(
-                1001,
-                "mempalace_list_rooms",
-                json!({"wing": "wing_code"}),
-            ))
+            .handle_request(tool_call(1001, "mempalace_list_rooms", json!({"wing": "wing_code"})))
             .await;
         let payload = decode_tool_payload(&response).unwrap();
         assert_eq!(payload["wing"], "wing_code");
@@ -5114,10 +5543,8 @@ mod tests {
         // Regression: federation:None must produce responses identical to
         // having no federation configured at all.
         let harness_default = test_harness().await;
-        let harness_none_fed = test_harness_with_federation(
-            FederationRuntimeConfig::default(),
-        )
-        .await;
+        let harness_none_fed =
+            test_harness_with_federation(FederationRuntimeConfig::default()).await;
 
         let tools = [
             ("mempalace_status", json!({})),
@@ -5129,14 +5556,10 @@ mod tests {
         ];
 
         for (tool, args) in &tools {
-            let default_resp = harness_default
-                .server
-                .handle_request(tool_call(2000, tool, args.clone()))
-                .await;
-            let none_fed_resp = harness_none_fed
-                .server
-                .handle_request(tool_call(2001, tool, args.clone()))
-                .await;
+            let default_resp =
+                harness_default.server.handle_request(tool_call(2000, tool, args.clone())).await;
+            let none_fed_resp =
+                harness_none_fed.server.handle_request(tool_call(2001, tool, args.clone())).await;
             let mut default_payload = decode_tool_payload(&default_resp).unwrap();
             let mut none_fed_payload = decode_tool_payload(&none_fed_resp).unwrap();
             // Strip palace_path — each harness uses its own TempDir.
@@ -5153,8 +5576,7 @@ mod tests {
         // ── Additional byte-identical read tools ──────────────────────────────
 
         // mempalace_check_duplicate — use content that matches a seeded drawer.
-        let seeded_content =
-            "Code notes: auth-migration keeps search filter semantics exact while storage changes underneath.";
+        let seeded_content = "Code notes: auth-migration keeps search filter semantics exact while storage changes underneath.";
         {
             let default_resp = harness_default
                 .server
@@ -5303,9 +5725,7 @@ mod tests {
             &self,
             _req: mempalace_federation::DrawerSearchRequest,
         ) -> mempalace_remote::Result<mempalace_federation::DrawerSearchResponse> {
-            Ok(mempalace_federation::DrawerSearchResponse {
-                results: self.search_results.clone(),
-            })
+            Ok(mempalace_federation::DrawerSearchResponse { results: self.search_results.clone() })
         }
         async fn check_duplicate(
             &self,
@@ -5329,10 +5749,7 @@ mod tests {
             &self,
             _query: mempalace_federation::ListDrawersQuery,
         ) -> mempalace_remote::Result<mempalace_federation::ListDrawersResponse> {
-            Ok(mempalace_federation::ListDrawersResponse {
-                drawers: json!([]),
-                next_cursor: None,
-            })
+            Ok(mempalace_federation::ListDrawersResponse { drawers: json!([]), next_cursor: None })
         }
         async fn get_drawer(&self, _drawer_id: &str) -> mempalace_remote::Result<Value> {
             Ok(json!({}))
@@ -5358,14 +5775,13 @@ mod tests {
         ) -> mempalace_remote::Result<Value> {
             Ok(json!({"success":true}))
         }
-        async fn kg_timeline(
-            &self,
-            _entity: Option<&str>,
-        ) -> mempalace_remote::Result<Value> {
+        async fn kg_timeline(&self, _entity: Option<&str>) -> mempalace_remote::Result<Value> {
             Ok(json!({"entity":"all","timeline":[],"count":0}))
         }
         async fn kg_stats(&self) -> mempalace_remote::Result<Value> {
-            Ok(json!({"entities":0,"triples":0,"current_facts":0,"expired_facts":0,"relationship_types":[]}))
+            Ok(
+                json!({"entities":0,"triples":0,"current_facts":0,"expired_facts":0,"relationship_types":[]}),
+            )
         }
         async fn taxonomy(&self) -> mempalace_remote::Result<Value> {
             Ok(json!({"taxonomy":{}}))
@@ -5373,10 +5789,7 @@ mod tests {
         async fn wings(&self) -> mempalace_remote::Result<Value> {
             Ok(json!({"wings":{}}))
         }
-        async fn rooms(
-            &self,
-            _wing: Option<&str>,
-        ) -> mempalace_remote::Result<Value> {
+        async fn rooms(&self, _wing: Option<&str>) -> mempalace_remote::Result<Value> {
             Ok(json!({"rooms":{}}))
         }
         async fn changes(
@@ -5483,7 +5896,8 @@ mod tests {
 
         let runtime = harness.server.runtime.lock().await;
         let now = datetime!(2026-04-11 09:00:00 UTC);
-        let mut local_branch_row = test_diary_drawer("wing_code/general/branch", "local branch", now);
+        let mut local_branch_row =
+            test_diary_drawer("wing_code/general/branch", "local branch", now);
         local_branch_row.wing = WingId::new("wing_code").unwrap();
         local_branch_row.room = RoomId::new("general").unwrap();
         local_branch_row.source_file = "changed.md".to_owned();
@@ -5519,9 +5933,11 @@ mod tests {
         assert_eq!(payload["results"][0]["origin"], "hub");
     }
 
-    fn make_dto_event(event_type: &str, occurred_at: &str, entity_id: &str)
-        -> mempalace_federation::ChangeEventDto
-    {
+    fn make_dto_event(
+        event_type: &str,
+        occurred_at: &str,
+        entity_id: &str,
+    ) -> mempalace_federation::ChangeEventDto {
         mempalace_federation::ChangeEventDto {
             event_type: event_type.to_owned(),
             occurred_at: occurred_at.to_owned(),
@@ -5534,9 +5950,8 @@ mod tests {
     #[tokio::test]
     async fn tool_get_changes_since_with_federation_merges_events_and_annotates_origin() {
         let mut mock_hub = LibMockRemote::default();
-        mock_hub.changes_events = vec![
-            make_dto_event("drawer_added", "2026-06-10T12:00:00Z", "remote-entity-1"),
-        ];
+        mock_hub.changes_events =
+            vec![make_dto_event("drawer_added", "2026-06-10T12:00:00Z", "remote-entity-1")];
         mock_hub.changes_next_cursor = Some("cursor-hub-1".to_owned());
 
         let mut remotes: BTreeMap<String, Arc<dyn mempalace_remote::RemoteApi>> = BTreeMap::new();
@@ -5592,9 +6007,8 @@ mod tests {
     async fn tool_get_changes_since_events_sorted_by_occurred_at() {
         // Hub returns an event with an earlier timestamp; local event will be later.
         let mut mock_hub = LibMockRemote::default();
-        mock_hub.changes_events = vec![
-            make_dto_event("drawer_added", "2026-01-01T00:00:00Z", "early-remote"),
-        ];
+        mock_hub.changes_events =
+            vec![make_dto_event("drawer_added", "2026-01-01T00:00:00Z", "early-remote")];
 
         let mut remotes: BTreeMap<String, Arc<dyn mempalace_remote::RemoteApi>> = BTreeMap::new();
         remotes.insert("hub".to_owned(), Arc::new(mock_hub));
@@ -5626,10 +6040,8 @@ mod tests {
 
         let events = payload["events"].as_array().unwrap();
         // Events must be sorted ascending by occurred_at.
-        let timestamps: Vec<&str> = events
-            .iter()
-            .filter_map(|e| e["occurred_at"].as_str())
-            .collect();
+        let timestamps: Vec<&str> =
+            events.iter().filter_map(|e| e["occurred_at"].as_str()).collect();
         let mut sorted = timestamps.clone();
         sorted.sort();
         assert_eq!(timestamps, sorted, "events must be sorted ascending by occurred_at");
@@ -5670,9 +6082,8 @@ mod tests {
     #[tokio::test]
     async fn tool_wake_up_with_federation_includes_remote_changes() {
         let mut mock_hub = LibMockRemote::default();
-        mock_hub.changes_events = vec![
-            make_dto_event("drawer_added", "2026-06-10T10:00:00Z", "hub-entity-1"),
-        ];
+        mock_hub.changes_events =
+            vec![make_dto_event("drawer_added", "2026-06-10T10:00:00Z", "hub-entity-1")];
 
         let mut remotes: BTreeMap<String, Arc<dyn mempalace_remote::RemoteApi>> = BTreeMap::new();
         remotes.insert("hub".to_owned(), Arc::new(mock_hub));
@@ -5681,10 +6092,7 @@ mod tests {
         let harness = test_harness_with_mock_router(router).await;
 
         let payload = decode_tool_payload(
-            &harness
-                .server
-                .handle_request(tool_call(9030, "mempalace_wake_up", json!({})))
-                .await,
+            &harness.server.handle_request(tool_call(9030, "mempalace_wake_up", json!({}))).await,
         )
         .unwrap();
 
@@ -5710,10 +6118,7 @@ mod tests {
         let harness = test_harness_with_mock_router(router).await;
 
         let payload = decode_tool_payload(
-            &harness
-                .server
-                .handle_request(tool_call(9040, "mempalace_wake_up", json!({})))
-                .await,
+            &harness.server.handle_request(tool_call(9040, "mempalace_wake_up", json!({}))).await,
         )
         .unwrap();
 
@@ -5731,10 +6136,7 @@ mod tests {
     async fn federation_none_wake_up_has_no_remote_changes_key() {
         let harness = test_harness().await;
         let payload = decode_tool_payload(
-            &harness
-                .server
-                .handle_request(tool_call(9100, "mempalace_wake_up", json!({})))
-                .await,
+            &harness.server.handle_request(tool_call(9100, "mempalace_wake_up", json!({}))).await,
         )
         .unwrap();
         assert!(
@@ -5831,7 +6233,10 @@ mod tests {
         ) -> mempalace_remote::Result<mempalace_federation::ListDrawersResponse> {
             panic!("unexpected list_drawers call")
         }
-        async fn get_drawer(&self, _drawer_id: &str) -> mempalace_remote::Result<serde_json::Value> {
+        async fn get_drawer(
+            &self,
+            _drawer_id: &str,
+        ) -> mempalace_remote::Result<serde_json::Value> {
             panic!("unexpected get_drawer call")
         }
         async fn delete_drawer(&self, _drawer_id: &str) -> mempalace_remote::Result<()> {
@@ -5902,12 +6307,15 @@ mod tests {
     ) -> FederationRuntimeConfig {
         let mut rules_remotes = BTreeMap::new();
         for name in remotes.keys() {
-            rules_remotes.insert(name.clone(), ResolvedRemote {
-                name: name.clone(),
-                url: "https://mock.example".to_owned(),
-                token: None,
-                timeout: std::time::Duration::from_secs(5),
-            });
+            rules_remotes.insert(
+                name.clone(),
+                ResolvedRemote {
+                    name: name.clone(),
+                    url: "https://mock.example".to_owned(),
+                    token: None,
+                    timeout: std::time::Duration::from_secs(5),
+                },
+            );
         }
         FederationRuntimeConfig {
             remotes: rules_remotes,
@@ -5943,9 +6351,10 @@ mod tests {
             federation: FederationRuntimeConfig::default(),
             ..make_base_config(&palace_path, &tempdir)
         };
-        let mut runtime = McpRuntime::new(config, DeterministicStubProvider::new(EmbeddingProfile::Balanced))
-            .await
-            .unwrap();
+        let mut runtime =
+            McpRuntime::new(config, DeterministicStubProvider::new(EmbeddingProfile::Balanced))
+                .await
+                .unwrap();
         // Inject mock federation — avoid real HTTP connections.
         runtime.federation = Some(FederationRouter::with_remotes(rules, remotes));
         DeleteDrawerTestCtx { _tempdir: tempdir, runtime }
@@ -5960,10 +6369,8 @@ mod tests {
             delete_call_count: AtomicU64::new(0),
         });
         let mock_for_assert = mock.clone();
-        let remotes = BTreeMap::from([(
-            "alpha".to_owned(),
-            mock as Arc<dyn mempalace_remote::RemoteApi>,
-        )]);
+        let remotes =
+            BTreeMap::from([("alpha".to_owned(), mock as Arc<dyn mempalace_remote::RemoteApi>)]);
         let mut ctx = make_delete_drawer_ctx(remotes, WriteTarget::Remote).await;
 
         // Seed a drawer into the local store so it will be found locally.
@@ -5999,11 +6406,8 @@ mod tests {
             .await
             .unwrap();
 
-        let result = ctx
-            .runtime
-            .tool_delete_drawer(&json!({"drawer_id": local_id.as_str()}))
-            .await
-            .unwrap();
+        let result =
+            ctx.runtime.tool_delete_drawer(&json!({"drawer_id": local_id.as_str()})).await.unwrap();
 
         assert_eq!(result["success"], true);
         assert_eq!(result["drawer_id"], local_id.as_str());
@@ -6028,10 +6432,8 @@ mod tests {
             delete_call_count: AtomicU64::new(0),
         });
         let mock_for_assert = mock.clone();
-        let remotes = BTreeMap::from([(
-            "alpha".to_owned(),
-            mock as Arc<dyn mempalace_remote::RemoteApi>,
-        )]);
+        let remotes =
+            BTreeMap::from([("alpha".to_owned(), mock as Arc<dyn mempalace_remote::RemoteApi>)]);
         let mut ctx = make_delete_drawer_ctx(remotes, WriteTarget::Both).await;
 
         let local_id = DrawerId::new("local-test-drawer-002").unwrap();
@@ -6066,11 +6468,8 @@ mod tests {
             .await
             .unwrap();
 
-        let result = ctx
-            .runtime
-            .tool_delete_drawer(&json!({"drawer_id": local_id.as_str()}))
-            .await
-            .unwrap();
+        let result =
+            ctx.runtime.tool_delete_drawer(&json!({"drawer_id": local_id.as_str()})).await.unwrap();
 
         assert_eq!(result["success"], true);
         assert_eq!(result["drawer_id"], local_id.as_str());
@@ -6096,10 +6495,8 @@ mod tests {
             delete_call_count: AtomicU64::new(0),
         });
         let mock_for_assert = mock.clone();
-        let remotes = BTreeMap::from([(
-            "alpha".to_owned(),
-            mock as Arc<dyn mempalace_remote::RemoteApi>,
-        )]);
+        let remotes =
+            BTreeMap::from([("alpha".to_owned(), mock as Arc<dyn mempalace_remote::RemoteApi>)]);
         let mut ctx = make_delete_drawer_ctx(remotes, WriteTarget::Both).await;
 
         // Do NOT seed any drawer — local delete will return 0, triggering fallback.
@@ -6148,25 +6545,18 @@ mod tests {
             .unwrap();
 
         // Sanity-check that the summary exists before deletion.
-        assert!(ctx
-            .runtime
-            .storage
-            .operational_store()
-            .get_diary_summary(&drawer_id)
-            .unwrap()
-            .is_some());
+        assert!(
+            ctx.runtime
+                .storage
+                .operational_store()
+                .get_diary_summary(&drawer_id)
+                .unwrap()
+                .is_some()
+        );
 
-        ctx.runtime
-            .tool_delete_drawer(&json!({"drawer_id": drawer_id.as_str()}))
-            .await
-            .unwrap();
+        ctx.runtime.tool_delete_drawer(&json!({"drawer_id": drawer_id.as_str()})).await.unwrap();
 
-        let stored = ctx
-            .runtime
-            .storage
-            .operational_store()
-            .get_diary_summary(&drawer_id)
-            .unwrap();
+        let stored = ctx.runtime.storage.operational_store().get_diary_summary(&drawer_id).unwrap();
         assert!(
             stored.is_none(),
             "local diary drawer deletion must remove its SQLite summary; got: {stored:?}"
@@ -6183,10 +6573,8 @@ mod tests {
             delete_succeeds: true,
             delete_call_count: AtomicU64::new(0),
         });
-        let remotes = BTreeMap::from([(
-            "alpha".to_owned(),
-            mock as Arc<dyn mempalace_remote::RemoteApi>,
-        )]);
+        let remotes =
+            BTreeMap::from([("alpha".to_owned(), mock as Arc<dyn mempalace_remote::RemoteApi>)]);
         let mut ctx = make_delete_drawer_ctx(remotes, WriteTarget::Both).await;
 
         let drawer_id = DrawerId::new("diary-summary-remote-fallback-001").unwrap();
@@ -6199,13 +6587,14 @@ mod tests {
             .unwrap();
 
         // Verify the summary is present before the deletion attempt.
-        assert!(ctx
-            .runtime
-            .storage
-            .operational_store()
-            .get_diary_summary(&drawer_id)
-            .unwrap()
-            .is_some());
+        assert!(
+            ctx.runtime
+                .storage
+                .operational_store()
+                .get_diary_summary(&drawer_id)
+                .unwrap()
+                .is_some()
+        );
 
         let result = ctx
             .runtime
@@ -6218,12 +6607,7 @@ mod tests {
         assert_eq!(result["applied_to"], "remote:alpha");
 
         // The locally stored summary must still be present.
-        let stored = ctx
-            .runtime
-            .storage
-            .operational_store()
-            .get_diary_summary(&drawer_id)
-            .unwrap();
+        let stored = ctx.runtime.storage.operational_store().get_diary_summary(&drawer_id).unwrap();
         assert!(
             stored.is_some(),
             "remote-only fallback must NOT remove a locally stored diary summary"
@@ -6233,14 +6617,13 @@ mod tests {
     async fn test_harness_with_federation(federation: FederationRuntimeConfig) -> TestHarness {
         let tempdir = TempDir::new().unwrap();
         let palace_path = tempdir.path().join("palace");
-        let config = MempalaceConfig {
-            federation,
-            ..make_base_config(&palace_path, &tempdir)
-        };
-        let server =
-            McpServer::from_parts(config, DeterministicStubProvider::new(EmbeddingProfile::Balanced))
-                .await
-                .unwrap();
+        let config = MempalaceConfig { federation, ..make_base_config(&palace_path, &tempdir) };
+        let server = McpServer::from_parts(
+            config,
+            DeterministicStubProvider::new(EmbeddingProfile::Balanced),
+        )
+        .await
+        .unwrap();
         seed_drawers(&server).await;
         seed_knowledge_graph(&server).await;
         TestHarness { _tempdir: tempdir, server }

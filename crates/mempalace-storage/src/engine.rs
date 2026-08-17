@@ -4,8 +4,8 @@ use std::future::Future;
 use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use tracing::{info, warn};
@@ -16,7 +16,9 @@ use crate::maintenance::{
     MaintenanceAbortReason, MaintenanceOutcome, MaintenanceRunStatus, MaintenanceRunSummary,
     MaintenanceSettings, MaintenanceSkipReason, MaintenanceTier, MaintenanceTierResult,
 };
-use crate::sqlite::{DiaryStore, IngestManifestStore, MaintenanceLeaseStore, SqliteOperationalStore};
+use crate::sqlite::{
+    DiaryStore, IngestManifestStore, MaintenanceLeaseStore, SqliteOperationalStore,
+};
 use crate::types::{
     DrawerFilter, DrawerStore, DuplicateStrategy, IngestCommitRequest, IngestManifestEntry,
     RetryableRun, StorageLayout,
@@ -188,9 +190,7 @@ impl StorageEngine {
         // concurrent writer.
         let duplicate_ids = self.drawer_store.existing_ids(&[drawer_id.clone()]).await?;
         if !duplicate_ids.is_empty() {
-            return Err(StorageError::DuplicateDrawers(
-                duplicate_ids.into_iter().collect(),
-            ));
+            return Err(StorageError::DuplicateDrawers(duplicate_ids.into_iter().collect()));
         }
 
         // Create pending run AND store diary summary in a single SQLite
@@ -203,7 +203,8 @@ impl StorageEngine {
             &drawer_id,
             diary_summary,
             now,
-        )? else {
+        )?
+        else {
             return Err(StorageError::DuplicateDrawers(vec![drawer_id.as_str().to_owned()]));
         };
 
@@ -248,8 +249,7 @@ impl StorageEngine {
 
         // Also collect stale failed diary runs to clean up orphaned summaries
         // and drawers from previous failed writes.
-        let stale_failed_diary =
-            self.operational_store.stale_failed_diary_runs(stale_cutoff)?;
+        let stale_failed_diary = self.operational_store.stale_failed_diary_runs(stale_cutoff)?;
 
         // prune_orphaned_rows removes drawers whose IDs appear in stale runs
         // but are not currently committed, covering both stale pending and
@@ -312,8 +312,7 @@ impl StorageEngine {
         content_hash: String,
         drawers: Vec<DrawerRecord>,
     ) -> Result<()> {
-        let existing =
-            self.operational_store.committed_drawer_ids_for_source_key(source_key)?;
+        let existing = self.operational_store.committed_drawer_ids_for_source_key(source_key)?;
         let new_ids = drawers.iter().map(|d| d.id.clone()).collect::<BTreeSet<_>>();
 
         self.commit_ingest(IngestCommitRequest {
@@ -326,10 +325,7 @@ impl StorageEngine {
         })
         .await?;
 
-        let stale = existing
-            .into_iter()
-            .filter(|id| !new_ids.contains(id))
-            .collect::<Vec<_>>();
+        let stale = existing.into_iter().filter(|id| !new_ids.contains(id)).collect::<Vec<_>>();
         if !stale.is_empty() {
             self.signal_activity();
             self.drawer_store.delete_drawers(&stale).await?;
@@ -342,8 +338,7 @@ impl StorageEngine {
     /// This is used when migrating source-key identities so old path-based
     /// rows cannot remain alongside their stable project-id replacements.
     pub async fn remove_source_key(&self, source_key: &str) -> Result<()> {
-        let drawer_ids =
-            self.operational_store.committed_drawer_ids_for_source_key(source_key)?;
+        let drawer_ids = self.operational_store.committed_drawer_ids_for_source_key(source_key)?;
         if !drawer_ids.is_empty() {
             self.signal_activity();
             self.drawer_store.delete_drawers(&drawer_ids).await?;
@@ -380,8 +375,7 @@ impl StorageEngine {
             return Ok((0, 0));
         }
         let keys = sources.into_iter().map(|(key, _)| key).collect::<Vec<_>>();
-        let drawer_ids =
-            self.operational_store.committed_drawer_ids_for_source_keys(&keys)?;
+        let drawer_ids = self.operational_store.committed_drawer_ids_for_source_keys(&keys)?;
         if !drawer_ids.is_empty() {
             self.signal_activity();
             for chunk in drawer_ids.chunks(DELETE_CHUNK) {
@@ -424,11 +418,7 @@ impl StorageEngine {
     /// Periodically renews the SQLite lease while the tier future is in
     /// progress. If renewal fails, the tier future is dropped immediately so
     /// another lease holder cannot run the same operation concurrently.
-    async fn with_lease_renewal<Fut, T>(
-        &self,
-        holder_id: &str,
-        f: Fut,
-    ) -> Option<T>
+    async fn with_lease_renewal<Fut, T>(&self, holder_id: &str, f: Fut) -> Option<T>
     where
         Fut: Future<Output = T>,
     {
@@ -470,7 +460,10 @@ impl StorageEngine {
     /// When the system is not idle (recent write activity detected) or
     /// maintenance is disabled, the method returns immediately with a
     /// skipped outcome — it never blocks waiting for idleness.
-    pub async fn run_maintenance(&self, settings: &MaintenanceSettings) -> Result<MaintenanceRunSummary> {
+    pub async fn run_maintenance(
+        &self,
+        settings: &MaintenanceSettings,
+    ) -> Result<MaintenanceRunSummary> {
         let started_at = OffsetDateTime::now_utc();
         let wall_start = Instant::now();
         let cpu_start = process_cpu_time();
@@ -500,9 +493,7 @@ impl StorageEngine {
                 started_at,
                 duration: Duration::ZERO,
                 cpu_duration: Duration::ZERO,
-                outcome: MaintenanceOutcome::Skipped {
-                    reason: MaintenanceSkipReason::NotIdle,
-                },
+                outcome: MaintenanceOutcome::Skipped { reason: MaintenanceSkipReason::NotIdle },
             });
             let elapsed = wall_start.elapsed();
             let cpu_elapsed = process_cpu_time().saturating_sub(cpu_start);
@@ -531,9 +522,7 @@ impl StorageEngine {
                 started_at,
                 duration: Duration::ZERO,
                 cpu_duration: Duration::ZERO,
-                outcome: MaintenanceOutcome::Skipped {
-                    reason: MaintenanceSkipReason::NotIdle,
-                },
+                outcome: MaintenanceOutcome::Skipped { reason: MaintenanceSkipReason::NotIdle },
             });
             let elapsed = wall_start.elapsed();
             let cpu_elapsed = process_cpu_time().saturating_sub(cpu_start);
@@ -583,9 +572,7 @@ impl StorageEngine {
                     started_at,
                     duration: Duration::ZERO,
                     cpu_duration: Duration::ZERO,
-                    outcome: MaintenanceOutcome::Failed {
-                        message: e.to_string(),
-                    },
+                    outcome: MaintenanceOutcome::Failed { message: e.to_string() },
                 });
                 let elapsed = wall_start.elapsed();
                 let cpu_elapsed = process_cpu_time().saturating_sub(cpu_start);
@@ -609,9 +596,7 @@ impl StorageEngine {
                 started_at,
                 duration: Duration::ZERO,
                 cpu_duration: Duration::ZERO,
-                outcome: MaintenanceOutcome::Skipped {
-                    reason: MaintenanceSkipReason::NotIdle,
-                },
+                outcome: MaintenanceOutcome::Skipped { reason: MaintenanceSkipReason::NotIdle },
             });
             final_status = MaintenanceRunStatus::Partial;
             let _ = self.operational_store.release_lease(&holder_id);
@@ -655,9 +640,7 @@ impl StorageEngine {
                     started_at: OffsetDateTime::now_utc(),
                     duration: Duration::ZERO,
                     cpu_duration: Duration::ZERO,
-                    outcome: MaintenanceOutcome::Skipped {
-                        reason: MaintenanceSkipReason::NotIdle,
-                    },
+                    outcome: MaintenanceOutcome::Skipped { reason: MaintenanceSkipReason::NotIdle },
                 });
             }
         };
@@ -693,10 +676,15 @@ impl StorageEngine {
                             "maintenance tier completed",
                         );
                         let outcome = if metrics.ran {
-                            let items = metrics.indexed_rows_after.saturating_sub(metrics.indexed_rows_before) as u64;
+                            let items = metrics
+                                .indexed_rows_after
+                                .saturating_sub(metrics.indexed_rows_before)
+                                as u64;
                             MaintenanceOutcome::Completed { items_affected: items }
                         } else {
-                            MaintenanceOutcome::Skipped { reason: MaintenanceSkipReason::NothingToDo }
+                            MaintenanceOutcome::Skipped {
+                                reason: MaintenanceSkipReason::NothingToDo,
+                            }
                         };
                         MaintenanceTierResult {
                             tier: MaintenanceTier::VectorIndexOptimization,
@@ -730,7 +718,11 @@ impl StorageEngine {
             let Some(result) = self.with_lease_renewal(&holder_id, tier_future).await else {
                 let _ = self.operational_store.release_lease(&holder_id);
                 return Ok(maintenance_lease_lost_summary(
-                    run_id, started_at, wall_start, cpu_start, tier_results,
+                    run_id,
+                    started_at,
+                    wall_start,
+                    cpu_start,
+                    tier_results,
                     MaintenanceTier::VectorIndexOptimization,
                 ));
             };
@@ -768,7 +760,11 @@ impl StorageEngine {
             );
 
             let tier_future = async {
-                match self.drawer_store.compact_fragments(settings.small_fragment_threshold as usize).await {
+                match self
+                    .drawer_store
+                    .compact_fragments(settings.small_fragment_threshold as usize)
+                    .await
+                {
                     Ok(metrics) => {
                         let tier_wall = tier_start.elapsed();
                         let tier_cpu = process_cpu_time().saturating_sub(tier_cpu_start);
@@ -784,10 +780,15 @@ impl StorageEngine {
                             "maintenance tier completed",
                         );
                         let outcome = if metrics.ran {
-                            let items = metrics.indexed_rows_before.saturating_sub(metrics.indexed_rows_after) as u64;
+                            let items = metrics
+                                .indexed_rows_before
+                                .saturating_sub(metrics.indexed_rows_after)
+                                as u64;
                             MaintenanceOutcome::Completed { items_affected: items }
                         } else {
-                            MaintenanceOutcome::Skipped { reason: MaintenanceSkipReason::NothingToDo }
+                            MaintenanceOutcome::Skipped {
+                                reason: MaintenanceSkipReason::NothingToDo,
+                            }
                         };
                         MaintenanceTierResult {
                             tier: MaintenanceTier::FragmentCompaction,
@@ -821,7 +822,11 @@ impl StorageEngine {
             let Some(result) = self.with_lease_renewal(&holder_id, tier_future).await else {
                 let _ = self.operational_store.release_lease(&holder_id);
                 return Ok(maintenance_lease_lost_summary(
-                    run_id, started_at, wall_start, cpu_start, tier_results,
+                    run_id,
+                    started_at,
+                    wall_start,
+                    cpu_start,
+                    tier_results,
                     MaintenanceTier::FragmentCompaction,
                 ));
             };
@@ -869,9 +874,13 @@ impl StorageEngine {
                             "maintenance tier completed",
                         );
                         let outcome = if metrics.versions_removed > 0 {
-                            MaintenanceOutcome::Completed { items_affected: metrics.versions_removed as u64 }
+                            MaintenanceOutcome::Completed {
+                                items_affected: metrics.versions_removed as u64,
+                            }
                         } else {
-                            MaintenanceOutcome::Skipped { reason: MaintenanceSkipReason::NothingToDo }
+                            MaintenanceOutcome::Skipped {
+                                reason: MaintenanceSkipReason::NothingToDo,
+                            }
                         };
                         MaintenanceTierResult {
                             tier: MaintenanceTier::VersionRetention,
@@ -905,7 +914,11 @@ impl StorageEngine {
             let Some(result) = self.with_lease_renewal(&holder_id, tier_future).await else {
                 let _ = self.operational_store.release_lease(&holder_id);
                 return Ok(maintenance_lease_lost_summary(
-                    run_id, started_at, wall_start, cpu_start, tier_results,
+                    run_id,
+                    started_at,
+                    wall_start,
+                    cpu_start,
+                    tier_results,
                     MaintenanceTier::VersionRetention,
                 ));
             };
@@ -988,14 +1001,10 @@ fn process_cpu_time() -> time::Duration {
     #[cfg(target_os = "linux")]
     {
         let mut buf = String::new();
-        if File::open("/proc/self/stat")
-            .and_then(|mut f| f.read_to_string(&mut buf))
-            .is_ok()
-        {
+        if File::open("/proc/self/stat").and_then(|mut f| f.read_to_string(&mut buf)).is_ok() {
             let parts: Vec<&str> = buf.split_whitespace().collect();
             if parts.len() > 14 {
-                if let (Ok(utime), Ok(stime)) =
-                    (parts[13].parse::<u64>(), parts[14].parse::<u64>())
+                if let (Ok(utime), Ok(stime)) = (parts[13].parse::<u64>(), parts[14].parse::<u64>())
                 {
                     // sysconf(_SC_CLK_TCK) is typically 100 on Linux.
                     const CLK_TCK: u64 = 100;
@@ -1179,7 +1188,8 @@ mod tests {
     async fn prunes_orphaned_rows_from_branch_views() {
         let tempdir = tempdir().unwrap();
         let engine = StorageEngine::open(tempdir.path(), EmbeddingProfile::Balanced).await.unwrap();
-        let mut stale_drawer = record("project_alpha/backend/branch-0001", "auth.py", [1.0, 0.0, 0.0, 0.0]);
+        let mut stale_drawer =
+            record("project_alpha/backend/branch-0001", "auth.py", [1.0, 0.0, 0.0, 0.0]);
         stale_drawer.ingest_mode = "projects-branch".to_owned();
         let drawer_id = stale_drawer.id.clone();
         engine
@@ -1216,10 +1226,8 @@ mod tests {
             StorageEngine::open(tempdir.path(), EmbeddingProfile::Balanced).await.unwrap();
 
         // A missing table makes any accidental Lance access fail.
-        engine.drawer_store = LanceDrawerStore::new(
-            tempdir.path().join("unused_lance"),
-            EmbeddingProfile::Balanced,
-        );
+        engine.drawer_store =
+            LanceDrawerStore::new(tempdir.path().join("unused_lance"), EmbeddingProfile::Balanced);
 
         engine.reconcile().await.unwrap();
     }
@@ -1293,15 +1301,17 @@ mod tests {
             )
             .unwrap();
         // Mark the run committed so the drawer is tracked.
-        engine.operational_store().mark_run_committed(
-            run.id,
-            "diary:diary_wing_test_0010",
-            "diary:test",
-            "hash",
-            1,
-            datetime!(2026-04-01 01:00:00 UTC),
-        )
-        .unwrap();
+        engine
+            .operational_store()
+            .mark_run_committed(
+                run.id,
+                "diary:diary_wing_test_0010",
+                "diary:test",
+                "hash",
+                1,
+                datetime!(2026-04-01 01:00:00 UTC),
+            )
+            .unwrap();
 
         // Actually put the drawer in LanceDB so it's "present" (committed).
         let mut diary_record = record("diary_wing_test_0010", "diary:test", [1.0, 0.0, 0.0, 0.0]);
@@ -1333,7 +1343,8 @@ mod tests {
         let wing = mempalace_core::WingId::new("wing_agents").unwrap();
         let room = mempalace_core::RoomId::new("diary").unwrap();
 
-        let mut diary_record = record("diary_wing_test_0002", "diary:general", [1.0, 0.0, 0.0, 0.0]);
+        let mut diary_record =
+            record("diary_wing_test_0002", "diary:general", [1.0, 0.0, 0.0, 0.0]);
         diary_record.wing = wing;
         diary_record.room = room;
         diary_record.ingest_mode = "diary".to_owned();
@@ -1460,7 +1471,11 @@ mod tests {
         // Mark the run as failed to simulate the old code path.
         engine
             .operational_store()
-            .mark_run_failed(created_run.id, "simulated failure", datetime!(2026-03-01 01:00:00 UTC))
+            .mark_run_failed(
+                created_run.id,
+                "simulated failure",
+                datetime!(2026-03-01 01:00:00 UTC),
+            )
             .unwrap();
 
         // Write the drawer to LanceDB (simulating incomplete old cleanup).
@@ -1523,11 +1538,14 @@ mod tests {
             .await
             .unwrap();
 
-        let ids_after: Vec<_> =
-            engine.drawer_store().list_drawers(&DrawerFilter::default()).await.unwrap()
-                .into_iter()
-                .map(|d| d.id)
-                .collect();
+        let ids_after: Vec<_> = engine
+            .drawer_store()
+            .list_drawers(&DrawerFilter::default())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|d| d.id)
+            .collect();
         assert_eq!(ids_after.len(), 1, "stale drawers should be deleted");
         assert_eq!(ids_after[0], drawer_c.id, "the new drawer should remain");
     }
@@ -1646,8 +1664,10 @@ mod tests {
         // Claim the lease from a different holder so the engine's
         // run_maintenance cannot acquire it.
         let other_holder = "other-process-42";
-        let claimed =
-            engine.operational_store().try_claim_lease(other_holder, time::Duration::minutes(5)).unwrap();
+        let claimed = engine
+            .operational_store()
+            .try_claim_lease(other_holder, time::Duration::minutes(5))
+            .unwrap();
         assert!(claimed, "should claim lease from other holder");
 
         let settings = MaintenanceSettings { idle_secs: 0, ..MaintenanceSettings::default() };
@@ -1729,9 +1749,7 @@ mod tests {
         let settings = MaintenanceSettings { idle_secs: 0, ..MaintenanceSettings::default() };
 
         let engine_clone = Arc::clone(&engine);
-        let handle = tokio::spawn(async move {
-            engine_clone.run_maintenance(&settings).await
-        });
+        let handle = tokio::spawn(async move { engine_clone.run_maintenance(&settings).await });
 
         // Wait for tier 1 to complete (barrier part 1: notification).
         notify_rx.await.unwrap();
@@ -1825,7 +1843,10 @@ mod tests {
         assert_eq!(vio.tier, MaintenanceTier::VectorIndexOptimization);
         match &vio.outcome {
             MaintenanceOutcome::Completed { items_affected } => {
-                assert!(*items_affected > 0, "expected non-zero items affected for index optimization");
+                assert!(
+                    *items_affected > 0,
+                    "expected non-zero items affected for index optimization"
+                );
             }
             other => panic!("VectorIndexOptimization expected Completed, got {other:?}"),
         }
@@ -1968,17 +1989,12 @@ mod diary_summary_tests {
         );
 
         let (first_result, second_result) = tokio::join!(first, second);
-        let successes = [&first_result, &second_result]
-            .into_iter()
-            .filter(|result| result.is_ok())
-            .count();
+        let successes =
+            [&first_result, &second_result].into_iter().filter(|result| result.is_ok()).count();
         assert_eq!(successes, 1, "exactly one writer must claim the drawer ID");
 
-        let expected_summary = if first_result.is_ok() {
-            "first writer summary"
-        } else {
-            "second writer summary"
-        };
+        let expected_summary =
+            if first_result.is_ok() { "first writer summary" } else { "second writer summary" };
         assert_eq!(
             engine.operational_store().get_diary_summary(&drawer_id).unwrap(),
             Some(expected_summary.to_owned()),
@@ -2018,9 +2034,7 @@ mod diary_summary_tests {
         let drawer_id = DrawerId::new("over_limit_summary").unwrap();
 
         let over_limit = "x".repeat(DIARY_SUMMARY_MAX_CHARS + 1);
-        let result = engine
-            .operational_store()
-            .store_diary_summary(&drawer_id, &over_limit);
+        let result = engine.operational_store().store_diary_summary(&drawer_id, &over_limit);
         assert!(
             result.is_err(),
             "store_diary_summary must reject summaries exceeding {DIARY_SUMMARY_MAX_CHARS} characters"
@@ -2036,16 +2050,14 @@ mod diary_summary_tests {
         let drawer_id = DrawerId::new("pending_run_over_limit").unwrap();
 
         let over_limit = "z".repeat(DIARY_SUMMARY_MAX_CHARS + 1);
-        let result = engine
-            .operational_store()
-            .create_pending_diary_run(
-                "diary",
-                "diary:pending_run_over_limit",
-                &[],
-                &drawer_id,
-                &over_limit,
-                datetime!(2026-06-01 10:00:00 UTC),
-            );
+        let result = engine.operational_store().create_pending_diary_run(
+            "diary",
+            "diary:pending_run_over_limit",
+            &[],
+            &drawer_id,
+            &over_limit,
+            datetime!(2026-06-01 10:00:00 UTC),
+        );
         assert!(
             result.is_err(),
             "create_pending_diary_run must reject summaries exceeding {DIARY_SUMMARY_MAX_CHARS} characters"
@@ -2089,8 +2101,7 @@ mod diary_summary_tests {
             let stored = engine.operational_store().get_diary_summary(&drawer_id).unwrap();
             assert_eq!(stored, Some(summary_text.to_owned()));
 
-            let drawer =
-                engine.drawer_store().get_drawer(&drawer_id).await.unwrap();
+            let drawer = engine.drawer_store().get_drawer(&drawer_id).await.unwrap();
             assert!(drawer.is_some(), "drawer must survive restart");
         }
     }
@@ -2215,7 +2226,7 @@ mod diary_summary_tests {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod prefix_tests {
-use crate::sqlite::{IngestManifestStore, SqliteOperationalStore};
+    use crate::sqlite::{IngestManifestStore, SqliteOperationalStore};
     use crate::types::{IngestManifestEntry, IngestRunStatus};
     use mempalace_core::DrawerId;
     use tempfile::tempdir;
@@ -2277,11 +2288,7 @@ use crate::sqlite::{IngestManifestStore, SqliteOperationalStore};
         store.ensure_schema().unwrap();
 
         // Insert a key that would be matched by '%' if not escaped.
-        commit_source(
-            &store,
-            "projects:wing_x:abc123:src/real.rs",
-            "wing_x/code/real-0000",
-        );
+        commit_source(&store, "projects:wing_x:abc123:src/real.rs", "wing_x/code/real-0000");
 
         // A prefix containing '%' must NOT wildcard-match; expect zero results.
         let results = store.ingested_source_keys_with_prefix("projects:wing_x%").unwrap();

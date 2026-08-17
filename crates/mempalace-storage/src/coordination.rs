@@ -1,0 +1,1123 @@
+//! Transactional, local-first coordination storage.
+
+use std::path::{Path, PathBuf};
+
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
+use uuid::Uuid;
+
+use crate::{Result, StorageError};
+
+const MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
+
+/// Durable task lifecycle state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskState {
+    Pending,
+    Running,
+    InputRequired,
+    Completed,
+    Cancelled,
+    Failed,
+    Expired,
+}
+
+impl TaskState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::InputRequired => "input_required",
+            Self::Completed => "completed",
+            Self::Cancelled => "cancelled",
+            Self::Failed => "failed",
+            Self::Expired => "expired",
+        }
+    }
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "running" => Ok(Self::Running),
+            "input_required" => Ok(Self::InputRequired),
+            "completed" => Ok(Self::Completed),
+            "cancelled" => Ok(Self::Cancelled),
+            "failed" => Ok(Self::Failed),
+            "expired" => Ok(Self::Expired),
+            _ => Err(StorageError::Invariant(format!("unknown task state `{value}`"))),
+        }
+    }
+    fn terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Cancelled | Self::Failed | Self::Expired)
+    }
+}
+
+/// Input for an idempotent task creation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewTask {
+    pub title: String,
+    pub description: String,
+    pub created_by: String,
+    pub idempotency_key: String,
+    #[serde(default)]
+    pub parent_id: Option<String>,
+    #[serde(default)]
+    pub dependencies: Vec<String>,
+    #[serde(default)]
+    pub budget: Option<Value>,
+    #[serde(with = "time::serde::rfc3339::option", default)]
+    pub expires_at: Option<OffsetDateTime>,
+}
+
+/// Authoritative task record.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Task {
+    pub task_id: String,
+    pub title: String,
+    pub description: String,
+    pub state: TaskState,
+    pub revision: i64,
+    pub created_by: String,
+    pub owner: Option<String>,
+    pub parent_id: Option<String>,
+    pub dependencies: Vec<String>,
+    pub budget: Option<Value>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub lease_expires_at: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub expires_at: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
+}
+
+/// Input for an idempotent addressed message.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewMessage {
+    pub task_id: String,
+    pub sender: String,
+    pub recipient: String,
+    pub kind: String,
+    pub payload: Value,
+    pub idempotency_key: String,
+    #[serde(default = "default_envelope_version")]
+    pub envelope_version: i64,
+}
+fn default_envelope_version() -> i64 {
+    1
+}
+
+/// Append-only message record.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Message {
+    pub message_id: String,
+    pub sequence: i64,
+    pub task_id: String,
+    pub sender: String,
+    pub recipient: String,
+    pub kind: String,
+    pub payload: Value,
+    pub envelope_version: i64,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub acknowledged_at: Option<OffsetDateTime>,
+    pub acknowledged_by: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+}
+
+/// Input for an immutable artifact.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewArtifact {
+    pub task_id: String,
+    pub created_by: String,
+    pub role: String,
+    pub media_type: String,
+    pub content: String,
+    pub idempotency_key: String,
+}
+
+/// Immutable artifact record.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Artifact {
+    pub artifact_id: String,
+    pub task_id: String,
+    pub created_by: String,
+    pub role: String,
+    pub media_type: String,
+    pub content: String,
+    pub content_hash: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+}
+
+/// Input for an immutable, idempotent task result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewTaskResult {
+    pub task_id: String,
+    pub created_by: String,
+    pub payload: Value,
+    pub idempotency_key: String,
+}
+
+/// Immutable task result record.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskResult {
+    pub result_id: String,
+    pub task_id: String,
+    pub created_by: String,
+    pub payload: Value,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+}
+
+/// Opaque local ordering cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoordinationCursor(pub i64);
+/// Append-only audit event.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CoordinationEvent {
+    pub sequence: i64,
+    pub event_id: String,
+    pub entity_type: String,
+    pub entity_id: String,
+    pub task_id: Option<String>,
+    pub event_type: String,
+    pub actor: String,
+    pub from_state: Option<TaskState>,
+    pub to_state: Option<TaskState>,
+    pub revision: Option<i64>,
+    pub details: Option<Value>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub occurred_at: OffsetDateTime,
+}
+/// Cursor page of audit events.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CoordinationEventPage {
+    pub events: Vec<CoordinationEvent>,
+    pub next_cursor: Option<CoordinationCursor>,
+}
+/// Cursor page of addressed messages.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InboxPage {
+    pub messages: Vec<Message>,
+    pub next_cursor: Option<CoordinationCursor>,
+}
+
+/// SQLite-backed transactional coordination repository.
+#[derive(Debug, Clone)]
+pub struct CoordinationStore {
+    path: PathBuf,
+}
+
+impl CoordinationStore {
+    /// Open coordination state in the palace's operational SQLite database.
+    pub fn new(path: impl AsRef<Path>) -> Self {
+        Self { path: path.as_ref().to_path_buf() }
+    }
+
+    /// Install coordination tables and indexes.
+    pub fn ensure_schema(&self) -> Result<()> {
+        let conn = self.connection()?;
+        conn.execute_batch(r#"
+CREATE TABLE IF NOT EXISTS coordination_tasks (
+ task_id TEXT PRIMARY KEY, title TEXT NOT NULL, description TEXT NOT NULL, state TEXT NOT NULL,
+ revision INTEGER NOT NULL, created_by TEXT NOT NULL, owner TEXT, parent_id TEXT,
+ dependencies_json TEXT NOT NULL, budget_json TEXT, lease_expires_at TEXT, expires_at TEXT,
+ idempotency_key TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+ UNIQUE(created_by, idempotency_key), FOREIGN KEY(parent_id) REFERENCES coordination_tasks(task_id));
+CREATE TABLE IF NOT EXISTS coordination_messages (
+ sequence INTEGER PRIMARY KEY AUTOINCREMENT, message_id TEXT UNIQUE NOT NULL, task_id TEXT NOT NULL,
+ sender TEXT NOT NULL, recipient TEXT NOT NULL, kind TEXT NOT NULL, payload_json TEXT NOT NULL,
+ envelope_version INTEGER NOT NULL, idempotency_key TEXT NOT NULL, acknowledged_at TEXT,
+ acknowledged_by TEXT, created_at TEXT NOT NULL, UNIQUE(sender, idempotency_key),
+ FOREIGN KEY(task_id) REFERENCES coordination_tasks(task_id));
+CREATE INDEX IF NOT EXISTS idx_coordination_inbox ON coordination_messages(recipient, sequence);
+CREATE TABLE IF NOT EXISTS coordination_artifacts (
+ artifact_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, created_by TEXT NOT NULL, role TEXT NOT NULL,
+ media_type TEXT NOT NULL, content TEXT NOT NULL, content_hash TEXT NOT NULL, idempotency_key TEXT NOT NULL,
+ created_at TEXT NOT NULL, UNIQUE(created_by, idempotency_key),
+ FOREIGN KEY(task_id) REFERENCES coordination_tasks(task_id));
+CREATE TABLE IF NOT EXISTS coordination_results (
+ result_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, created_by TEXT NOT NULL,
+ payload_json TEXT NOT NULL, idempotency_key TEXT NOT NULL, created_at TEXT NOT NULL,
+ UNIQUE(created_by, idempotency_key), FOREIGN KEY(task_id) REFERENCES coordination_tasks(task_id));
+CREATE TABLE IF NOT EXISTS coordination_events (
+ sequence INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT UNIQUE NOT NULL, entity_type TEXT NOT NULL,
+ entity_id TEXT NOT NULL, task_id TEXT, event_type TEXT NOT NULL, actor TEXT NOT NULL,
+ from_state TEXT, to_state TEXT, revision INTEGER, details_json TEXT, occurred_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(task_id, sequence);
+"#)?;
+        Ok(())
+    }
+
+    /// Create a task, or return the prior committed task for an idempotency replay.
+    pub fn create_task(&self, input: &NewTask) -> Result<Task> {
+        validate_key(&input.idempotency_key)?;
+        validate_actor(&input.created_by)?;
+        let mut conn = self.connection()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(task) = find_task_by_key(&tx, &input.created_by, &input.idempotency_key)? {
+            tx.commit()?;
+            return Ok(task);
+        }
+        for dependency in &input.dependencies {
+            require_task(&tx, dependency)?;
+        }
+        if let Some(parent) = &input.parent_id {
+            require_task(&tx, parent)?;
+        }
+        let now = OffsetDateTime::now_utc();
+        let id = format!("task_{}", Uuid::new_v4().simple());
+        tx.execute("INSERT INTO coordination_tasks VALUES (?1,?2,?3,'pending',0,?4,NULL,?5,?6,?7,NULL,?8,?9,?10,?10)", params![id,input.title,input.description,input.created_by,input.parent_id,serde_json::to_string(&input.dependencies)?,input.budget.as_ref().map(serde_json::to_string).transpose()?,format_time_opt(input.expires_at)?,input.idempotency_key,format_time(now)?])?;
+        append_event(
+            &tx,
+            "task",
+            &id,
+            Some(&id),
+            "task_created",
+            &input.created_by,
+            None,
+            Some(TaskState::Pending),
+            Some(0),
+            None,
+            now,
+        )?;
+        let task = get_task_tx(&tx, &id)?
+            .ok_or_else(|| StorageError::Invariant("created task disappeared".into()))?;
+        tx.commit()?;
+        Ok(task)
+    }
+
+    /// Retrieve a task by exact ID. `None` is an explicit authoritative miss.
+    pub fn get_task(&self, id: &str) -> Result<Option<Task>> {
+        get_task_conn(&self.connection()?, id)
+    }
+
+    /// Atomically claim a task revision, reclaiming an expired lease when needed.
+    pub fn claim_task(
+        &self,
+        id: &str,
+        worker: &str,
+        expected_revision: i64,
+        ttl: Duration,
+    ) -> Result<Task> {
+        validate_actor(worker)?;
+        if ttl <= Duration::ZERO {
+            return Err(StorageError::Invariant("lease ttl must be positive".into()));
+        }
+        let mut conn = self.connection()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let task = require_task(&tx, id)?;
+        let now = OffsetDateTime::now_utc();
+        if task.revision != expected_revision {
+            return Err(stale(expected_revision, task.revision));
+        }
+        if task.state.terminal() {
+            return Err(StorageError::Invariant("terminal task cannot be claimed".into()));
+        }
+        if task.expires_at.is_some_and(|v| v <= now) {
+            let next = task.revision + 1;
+            tx.execute(
+                "UPDATE coordination_tasks SET state='expired',revision=?2,owner=NULL,lease_expires_at=NULL,updated_at=?3 WHERE task_id=?1",
+                params![id, next, format_time(now)?],
+            )?;
+            append_event(
+                &tx,
+                "task",
+                id,
+                Some(id),
+                "task_expired",
+                worker,
+                Some(task.state),
+                Some(TaskState::Expired),
+                Some(next),
+                None,
+                now,
+            )?;
+            tx.commit()?;
+            return Err(StorageError::Invariant("task has expired".into()));
+        }
+        if task.owner.as_deref().is_some_and(|owner| owner != worker)
+            && task.lease_expires_at.is_some_and(|expiry| expiry > now)
+        {
+            return Err(StorageError::Invariant("task lease is held by another worker".into()));
+        }
+        let next = task.revision + 1;
+        let expiry = now + ttl;
+        let changed = tx.execute("UPDATE coordination_tasks SET state='running',revision=?2,owner=?3,lease_expires_at=?4,updated_at=?5 WHERE task_id=?1 AND revision=?6",params![id,next,worker,format_time(expiry)?,format_time(now)?,expected_revision])?;
+        if changed != 1 {
+            return Err(StorageError::Invariant("task changed while being claimed".into()));
+        }
+        append_event(
+            &tx,
+            "task",
+            id,
+            Some(id),
+            if task.owner.is_some() { "task_reclaimed" } else { "task_claimed" },
+            worker,
+            Some(task.state),
+            Some(TaskState::Running),
+            Some(next),
+            None,
+            now,
+        )?;
+        let result = require_task(&tx, id)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    /// Renew a live lease using compare-and-swap revision semantics.
+    pub fn renew_lease(
+        &self,
+        id: &str,
+        worker: &str,
+        expected_revision: i64,
+        ttl: Duration,
+    ) -> Result<Task> {
+        validate_actor(worker)?;
+        if ttl <= Duration::ZERO {
+            return Err(StorageError::Invariant("lease ttl must be positive".into()));
+        }
+        let mut conn = self.connection()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let task = require_task(&tx, id)?;
+        let now = OffsetDateTime::now_utc();
+        if task.revision != expected_revision {
+            return Err(stale(expected_revision, task.revision));
+        }
+        if task.owner.as_deref() != Some(worker) {
+            return Err(StorageError::Invariant("only the lease owner may renew".into()));
+        }
+        if task.lease_expires_at.is_none_or(|v| v <= now) {
+            return Err(StorageError::Invariant("lease has expired".into()));
+        }
+        let next = task.revision + 1;
+        tx.execute("UPDATE coordination_tasks SET revision=?2,lease_expires_at=?3,updated_at=?4 WHERE task_id=?1",params![id,next,format_time(now+ttl)?,format_time(now)?])?;
+        append_event(
+            &tx,
+            "task",
+            id,
+            Some(id),
+            "lease_renewed",
+            worker,
+            None,
+            None,
+            Some(next),
+            None,
+            now,
+        )?;
+        let result = require_task(&tx, id)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    /// Transition lifecycle state using an expected revision.
+    pub fn transition_task(
+        &self,
+        id: &str,
+        actor: &str,
+        expected_revision: i64,
+        to: TaskState,
+        details: Option<Value>,
+    ) -> Result<Task> {
+        validate_actor(actor)?;
+        let mut conn = self.connection()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let task = require_task(&tx, id)?;
+        let now = OffsetDateTime::now_utc();
+        if task.revision != expected_revision {
+            return Err(stale(expected_revision, task.revision));
+        }
+        if !allowed_transition(task.state, to) {
+            return Err(StorageError::Invariant(format!(
+                "invalid transition {} -> {}",
+                task.state.as_str(),
+                to.as_str()
+            )));
+        }
+        if task.owner.is_some()
+            && task.owner.as_deref() != Some(actor)
+            && to != TaskState::Cancelled
+        {
+            return Err(StorageError::Invariant("only the owner may transition this task".into()));
+        }
+        let next = task.revision + 1;
+        let clear = to != TaskState::Running;
+        tx.execute("UPDATE coordination_tasks SET state=?2,revision=?3,owner=CASE WHEN ?4 THEN NULL ELSE owner END,lease_expires_at=CASE WHEN ?4 THEN NULL ELSE lease_expires_at END,updated_at=?5 WHERE task_id=?1",params![id,to.as_str(),next,clear,format_time(now)?])?;
+        append_event(
+            &tx,
+            "task",
+            id,
+            Some(id),
+            "task_transitioned",
+            actor,
+            Some(task.state),
+            Some(to),
+            Some(next),
+            details.as_ref(),
+            now,
+        )?;
+        let result = require_task(&tx, id)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    /// Send an addressed message idempotently.
+    pub fn send_message(&self, input: &NewMessage) -> Result<Message> {
+        validate_key(&input.idempotency_key)?;
+        validate_actor(&input.sender)?;
+        validate_actor(&input.recipient)?;
+        bounded_json(&input.payload)?;
+        let mut conn = self.connection()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(v) = find_message_by_key(&tx, &input.sender, &input.idempotency_key)? {
+            tx.commit()?;
+            return Ok(v);
+        }
+        require_task(&tx, &input.task_id)?;
+        let now = OffsetDateTime::now_utc();
+        let id = format!("message_{}", Uuid::new_v4().simple());
+        tx.execute("INSERT INTO coordination_messages(message_id,task_id,sender,recipient,kind,payload_json,envelope_version,idempotency_key,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",params![id,input.task_id,input.sender,input.recipient,input.kind,serde_json::to_string(&input.payload)?,input.envelope_version,input.idempotency_key,format_time(now)?])?;
+        append_event(
+            &tx,
+            "message",
+            &id,
+            Some(&input.task_id),
+            "message_sent",
+            &input.sender,
+            None,
+            None,
+            None,
+            Some(&serde_json::json!({"recipient":input.recipient,"kind":input.kind})),
+            now,
+        )?;
+        let value = get_message_tx(&tx, &id)?
+            .ok_or_else(|| StorageError::Invariant("created message disappeared".into()))?;
+        tx.commit()?;
+        Ok(value)
+    }
+    /// Retrieve a message by exact ID.
+    pub fn get_message(&self, id: &str) -> Result<Option<Message>> {
+        get_message_conn(&self.connection()?, id)
+    }
+    /// Read an addressed inbox after an opaque sequence cursor.
+    pub fn inbox(
+        &self,
+        recipient: &str,
+        cursor: Option<CoordinationCursor>,
+        limit: usize,
+        unacknowledged_only: bool,
+    ) -> Result<InboxPage> {
+        let conn = self.connection()?;
+        let mut sql="SELECT message_id,sequence,task_id,sender,recipient,kind,payload_json,envelope_version,acknowledged_at,acknowledged_by,created_at FROM coordination_messages WHERE recipient=?1 AND sequence>?2".to_owned();
+        if unacknowledged_only {
+            sql.push_str(" AND acknowledged_at IS NULL");
+        }
+        sql.push_str(" ORDER BY sequence LIMIT ?3");
+        let requested = limit.clamp(1, 500);
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(
+                params![recipient, cursor.map_or(0, |c| c.0), (requested + 1) as i64],
+                message_row,
+            )?;
+        let mut values = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        values.truncate(requested);
+        let next_cursor = values.last().map(|message| CoordinationCursor(message.sequence));
+        Ok(InboxPage { messages: values, next_cursor })
+    }
+    /// Acknowledge a message. Replays by the same recipient are harmless.
+    pub fn acknowledge_message(&self, id: &str, actor: &str) -> Result<Message> {
+        let mut conn = self.connection()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let msg = get_message_tx(&tx, id)?
+            .ok_or_else(|| StorageError::Invariant(format!("message `{id}` not found")))?;
+        if msg.recipient != actor {
+            return Err(StorageError::Invariant("only the recipient may acknowledge".into()));
+        }
+        if msg.acknowledged_at.is_some() {
+            tx.commit()?;
+            return Ok(msg);
+        }
+        let now = OffsetDateTime::now_utc();
+        tx.execute("UPDATE coordination_messages SET acknowledged_at=?2,acknowledged_by=?3 WHERE message_id=?1",params![id,format_time(now)?,actor])?;
+        append_event(
+            &tx,
+            "message",
+            id,
+            Some(&msg.task_id),
+            "message_acknowledged",
+            actor,
+            None,
+            None,
+            None,
+            None,
+            now,
+        )?;
+        let value = get_message_tx(&tx, id)?
+            .ok_or_else(|| StorageError::Invariant("acknowledged message disappeared".into()))?;
+        tx.commit()?;
+        Ok(value)
+    }
+    /// Store an immutable artifact idempotently.
+    pub fn put_artifact(&self, input: &NewArtifact) -> Result<Artifact> {
+        validate_key(&input.idempotency_key)?;
+        validate_actor(&input.created_by)?;
+        if input.content.len() > MAX_PAYLOAD_BYTES {
+            return Err(StorageError::Invariant("artifact exceeds 1 MiB".into()));
+        }
+        let mut conn = self.connection()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(v) = find_artifact_by_key(&tx, &input.created_by, &input.idempotency_key)? {
+            tx.commit()?;
+            return Ok(v);
+        }
+        require_task(&tx, &input.task_id)?;
+        let now = OffsetDateTime::now_utc();
+        let id = format!("artifact_{}", Uuid::new_v4().simple());
+        let hash = blake3::hash(input.content.as_bytes()).to_hex().to_string();
+        tx.execute(
+            "INSERT INTO coordination_artifacts VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![
+                id,
+                input.task_id,
+                input.created_by,
+                input.role,
+                input.media_type,
+                input.content,
+                hash,
+                input.idempotency_key,
+                format_time(now)?
+            ],
+        )?;
+        append_event(
+            &tx,
+            "artifact",
+            &id,
+            Some(&input.task_id),
+            "artifact_created",
+            &input.created_by,
+            None,
+            None,
+            None,
+            Some(&serde_json::json!({"role":input.role,"content_hash":hash})),
+            now,
+        )?;
+        let value = get_artifact_tx(&tx, &id)?
+            .ok_or_else(|| StorageError::Invariant("created artifact disappeared".into()))?;
+        tx.commit()?;
+        Ok(value)
+    }
+    /// Retrieve an artifact by exact ID.
+    pub fn get_artifact(&self, id: &str) -> Result<Option<Artifact>> {
+        get_artifact_conn(&self.connection()?, id)
+    }
+    /// Store an immutable task result idempotently.
+    pub fn put_result(&self, input: &NewTaskResult) -> Result<TaskResult> {
+        validate_key(&input.idempotency_key)?;
+        validate_actor(&input.created_by)?;
+        bounded_json(&input.payload)?;
+        let mut conn = self.connection()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(value) = find_result_by_key(&tx, &input.created_by, &input.idempotency_key)? {
+            tx.commit()?;
+            return Ok(value);
+        }
+        require_task(&tx, &input.task_id)?;
+        let now = OffsetDateTime::now_utc();
+        let id = format!("result_{}", Uuid::new_v4().simple());
+        tx.execute(
+            "INSERT INTO coordination_results(result_id,task_id,created_by,payload_json,idempotency_key,created_at) VALUES(?1,?2,?3,?4,?5,?6)",
+            params![id, input.task_id, input.created_by, serde_json::to_string(&input.payload)?, input.idempotency_key, format_time(now)?],
+        )?;
+        append_event(&tx, "result", &id, Some(&input.task_id), "result_created", &input.created_by, None, None, None, None, now)?;
+        let value = get_result_tx(&tx, &id)?
+            .ok_or_else(|| StorageError::Invariant("created result disappeared".into()))?;
+        tx.commit()?;
+        Ok(value)
+    }
+    /// Retrieve a task result by exact ID.
+    pub fn get_result(&self, id: &str) -> Result<Option<TaskResult>> {
+        get_result_conn(&self.connection()?, id)
+    }
+    /// Read ordered audit events after an opaque cursor.
+    pub fn events(
+        &self,
+        cursor: Option<CoordinationCursor>,
+        task_id: Option<&str>,
+        limit: usize,
+    ) -> Result<CoordinationEventPage> {
+        let conn = self.connection()?;
+        let requested = limit.clamp(1, 500);
+        let (sql, task) = if let Some(id) = task_id {
+            (
+                "SELECT sequence,event_id,entity_type,entity_id,task_id,event_type,actor,from_state,to_state,revision,details_json,occurred_at FROM coordination_events WHERE sequence>?1 AND task_id=?2 ORDER BY sequence LIMIT ?3",
+                Some(id),
+            )
+        } else {
+            (
+                "SELECT sequence,event_id,entity_type,entity_id,task_id,event_type,actor,from_state,to_state,revision,details_json,occurred_at FROM coordination_events WHERE sequence>?1 ORDER BY sequence LIMIT ?2",
+                None,
+            )
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let rows = if let Some(id) = task {
+            stmt.query_map(
+                params![cursor.map_or(0, |c| c.0), id, (requested + 1) as i64],
+                event_row,
+            )?
+        } else {
+            stmt.query_map(
+                params![cursor.map_or(0, |c| c.0), (requested + 1) as i64],
+                event_row,
+            )?
+        };
+        let mut values = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        values.truncate(requested);
+        let next_cursor = values.last().map(|event| CoordinationCursor(event.sequence));
+        Ok(CoordinationEventPage { events: values, next_cursor })
+    }
+    /// Retrieve an audit event by exact ID.
+    pub fn get_event(&self, id: &str) -> Result<Option<CoordinationEvent>> {
+        let conn = self.connection()?;
+        let mut statement = conn.prepare(
+            "SELECT sequence,event_id,entity_type,entity_id,task_id,event_type,actor,from_state,to_state,revision,details_json,occurred_at FROM coordination_events WHERE event_id=?1",
+        )?;
+        statement.query_row([id], event_row).optional().map_err(Into::into)
+    }
+
+    fn connection(&self) -> Result<Connection> {
+        let conn = Connection::open(&self.path)?;
+        conn.execute_batch(
+            "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;",
+        )?;
+        Ok(conn)
+    }
+}
+
+fn validate_actor(v: &str) -> Result<()> {
+    if v.trim().is_empty() {
+        Err(StorageError::Invariant("actor must not be empty".into()))
+    } else {
+        Ok(())
+    }
+}
+fn validate_key(v: &str) -> Result<()> {
+    if v.trim().is_empty() || v.len() > 256 {
+        Err(StorageError::Invariant("idempotency key must contain 1..=256 bytes".into()))
+    } else {
+        Ok(())
+    }
+}
+fn bounded_json(v: &Value) -> Result<()> {
+    if serde_json::to_vec(v)?.len() > MAX_PAYLOAD_BYTES {
+        Err(StorageError::Invariant("payload exceeds 1 MiB".into()))
+    } else {
+        Ok(())
+    }
+}
+fn stale(expected: i64, actual: i64) -> StorageError {
+    StorageError::Invariant(format!("stale revision: expected {expected}, current {actual}"))
+}
+fn allowed_transition(from: TaskState, to: TaskState) -> bool {
+    if from.terminal() {
+        return false;
+    }
+    matches!(
+        (from, to),
+        (TaskState::Pending, TaskState::Cancelled | TaskState::Expired)
+            | (
+                TaskState::Running,
+                TaskState::InputRequired
+                    | TaskState::Completed
+                    | TaskState::Cancelled
+                    | TaskState::Failed
+                    | TaskState::Expired
+            )
+            | (
+                TaskState::InputRequired,
+                TaskState::Pending
+                    | TaskState::Running
+                    | TaskState::Cancelled
+                    | TaskState::Failed
+                    | TaskState::Expired
+            )
+    )
+}
+fn format_time(v: OffsetDateTime) -> Result<String> {
+    v.format(&Rfc3339).map_err(|e| StorageError::Invariant(e.to_string()))
+}
+fn format_time_opt(v: Option<OffsetDateTime>) -> Result<Option<String>> {
+    v.map(format_time).transpose()
+}
+fn parse_time(v: String) -> Result<OffsetDateTime> {
+    OffsetDateTime::parse(&v, &Rfc3339).map_err(|e| StorageError::Invariant(e.to_string()))
+}
+fn parse_time_opt(v: Option<String>) -> Result<Option<OffsetDateTime>> {
+    v.map(parse_time).transpose()
+}
+fn require_task(tx: &Transaction<'_>, id: &str) -> Result<Task> {
+    get_task_tx(tx, id)?.ok_or_else(|| StorageError::Invariant(format!("task `{id}` not found")))
+}
+fn get_task_conn(conn: &Connection, id: &str) -> Result<Option<Task>> {
+    let mut s=conn.prepare("SELECT task_id,title,description,state,revision,created_by,owner,parent_id,dependencies_json,budget_json,lease_expires_at,expires_at,created_at,updated_at FROM coordination_tasks WHERE task_id=?1")?;
+    s.query_row([id], task_row).optional().map_err(Into::into)
+}
+fn get_task_tx(tx: &Transaction<'_>, id: &str) -> Result<Option<Task>> {
+    get_task_conn(tx, id)
+}
+fn find_task_by_key(tx: &Transaction<'_>, actor: &str, key: &str) -> Result<Option<Task>> {
+    let id: Option<String> = tx
+        .query_row(
+            "SELECT task_id FROM coordination_tasks WHERE created_by=?1 AND idempotency_key=?2",
+            params![actor, key],
+            |r| r.get(0),
+        )
+        .optional()?;
+    id.map(|v| require_task(tx, &v)).transpose()
+}
+fn task_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
+    let state: String = r.get(3)?;
+    let deps: String = r.get(8)?;
+    let budget: Option<String> = r.get(9)?;
+    let lease: Option<String> = r.get(10)?;
+    let expiry: Option<String> = r.get(11)?;
+    let created: String = r.get(12)?;
+    let updated: String = r.get(13)?;
+    Ok(Task {
+        task_id: r.get(0)?,
+        title: r.get(1)?,
+        description: r.get(2)?,
+        state: TaskState::parse(&state).map_err(sql_conv)?,
+        revision: r.get(4)?,
+        created_by: r.get(5)?,
+        owner: r.get(6)?,
+        parent_id: r.get(7)?,
+        dependencies: serde_json::from_str(&deps).map_err(sql_conv)?,
+        budget: budget.map(|v| serde_json::from_str(&v)).transpose().map_err(sql_conv)?,
+        lease_expires_at: parse_time_opt(lease).map_err(sql_conv)?,
+        expires_at: parse_time_opt(expiry).map_err(sql_conv)?,
+        created_at: parse_time(created).map_err(sql_conv)?,
+        updated_at: parse_time(updated).map_err(sql_conv)?,
+    })
+}
+fn message_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
+    let payload: String = r.get(6)?;
+    let ack: Option<String> = r.get(8)?;
+    let created: String = r.get(10)?;
+    Ok(Message {
+        message_id: r.get(0)?,
+        sequence: r.get(1)?,
+        task_id: r.get(2)?,
+        sender: r.get(3)?,
+        recipient: r.get(4)?,
+        kind: r.get(5)?,
+        payload: serde_json::from_str(&payload).map_err(sql_conv)?,
+        envelope_version: r.get(7)?,
+        acknowledged_at: parse_time_opt(ack).map_err(sql_conv)?,
+        acknowledged_by: r.get(9)?,
+        created_at: parse_time(created).map_err(sql_conv)?,
+    })
+}
+fn get_message_conn(conn: &Connection, id: &str) -> Result<Option<Message>> {
+    let mut s=conn.prepare("SELECT message_id,sequence,task_id,sender,recipient,kind,payload_json,envelope_version,acknowledged_at,acknowledged_by,created_at FROM coordination_messages WHERE message_id=?1")?;
+    s.query_row([id], message_row).optional().map_err(Into::into)
+}
+fn get_message_tx(tx: &Transaction<'_>, id: &str) -> Result<Option<Message>> {
+    get_message_conn(tx, id)
+}
+fn find_message_by_key(tx: &Transaction<'_>, actor: &str, key: &str) -> Result<Option<Message>> {
+    let id: Option<String> = tx
+        .query_row(
+            "SELECT message_id FROM coordination_messages WHERE sender=?1 AND idempotency_key=?2",
+            params![actor, key],
+            |r| r.get(0),
+        )
+        .optional()?;
+    id.map(|v| {
+        get_message_tx(tx, &v)?
+            .ok_or_else(|| StorageError::Invariant("message key points to missing row".into()))
+    })
+    .transpose()
+}
+fn artifact_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Artifact> {
+    let created: String = r.get(7)?;
+    Ok(Artifact {
+        artifact_id: r.get(0)?,
+        task_id: r.get(1)?,
+        created_by: r.get(2)?,
+        role: r.get(3)?,
+        media_type: r.get(4)?,
+        content: r.get(5)?,
+        content_hash: r.get(6)?,
+        created_at: parse_time(created).map_err(sql_conv)?,
+    })
+}
+fn get_artifact_conn(conn: &Connection, id: &str) -> Result<Option<Artifact>> {
+    let mut s=conn.prepare("SELECT artifact_id,task_id,created_by,role,media_type,content,content_hash,created_at FROM coordination_artifacts WHERE artifact_id=?1")?;
+    s.query_row([id], artifact_row).optional().map_err(Into::into)
+}
+fn get_artifact_tx(tx: &Transaction<'_>, id: &str) -> Result<Option<Artifact>> {
+    get_artifact_conn(tx, id)
+}
+fn find_artifact_by_key(tx: &Transaction<'_>, actor: &str, key: &str) -> Result<Option<Artifact>> {
+    let id:Option<String>=tx.query_row("SELECT artifact_id FROM coordination_artifacts WHERE created_by=?1 AND idempotency_key=?2",params![actor,key],|r|r.get(0)).optional()?;
+    id.map(|v| {
+        get_artifact_tx(tx, &v)?
+            .ok_or_else(|| StorageError::Invariant("artifact key points to missing row".into()))
+    })
+    .transpose()
+}
+fn result_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<TaskResult> {
+    let payload: String = r.get(3)?;
+    let created: String = r.get(4)?;
+    Ok(TaskResult {
+        result_id: r.get(0)?,
+        task_id: r.get(1)?,
+        created_by: r.get(2)?,
+        payload: serde_json::from_str(&payload).map_err(sql_conv)?,
+        created_at: parse_time(created).map_err(sql_conv)?,
+    })
+}
+fn get_result_conn(conn: &Connection, id: &str) -> Result<Option<TaskResult>> {
+    let mut statement = conn.prepare(
+        "SELECT result_id,task_id,created_by,payload_json,created_at FROM coordination_results WHERE result_id=?1",
+    )?;
+    statement.query_row([id], result_row).optional().map_err(Into::into)
+}
+fn get_result_tx(tx: &Transaction<'_>, id: &str) -> Result<Option<TaskResult>> {
+    get_result_conn(tx, id)
+}
+fn find_result_by_key(
+    tx: &Transaction<'_>,
+    actor: &str,
+    key: &str,
+) -> Result<Option<TaskResult>> {
+    let id: Option<String> = tx
+        .query_row(
+            "SELECT result_id FROM coordination_results WHERE created_by=?1 AND idempotency_key=?2",
+            params![actor, key],
+            |row| row.get(0),
+        )
+        .optional()?;
+    id.map(|value| {
+        get_result_tx(tx, &value)?
+            .ok_or_else(|| StorageError::Invariant("result key points to missing row".into()))
+    })
+    .transpose()
+}
+fn append_event(
+    tx: &Transaction<'_>,
+    entity_type: &str,
+    entity_id: &str,
+    task_id: Option<&str>,
+    event_type: &str,
+    actor: &str,
+    from: Option<TaskState>,
+    to: Option<TaskState>,
+    revision: Option<i64>,
+    details: Option<&Value>,
+    at: OffsetDateTime,
+) -> Result<()> {
+    tx.execute("INSERT INTO coordination_events(event_id,entity_type,entity_id,task_id,event_type,actor,from_state,to_state,revision,details_json,occurred_at)VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",params![format!("event_{}",Uuid::new_v4().simple()),entity_type,entity_id,task_id,event_type,actor,from.map(TaskState::as_str),to.map(TaskState::as_str),revision,details.map(serde_json::to_string).transpose()?,format_time(at)?])?;
+    Ok(())
+}
+fn event_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<CoordinationEvent> {
+    let from: Option<String> = r.get(7)?;
+    let to: Option<String> = r.get(8)?;
+    let details: Option<String> = r.get(10)?;
+    let at: String = r.get(11)?;
+    Ok(CoordinationEvent {
+        sequence: r.get(0)?,
+        event_id: r.get(1)?,
+        entity_type: r.get(2)?,
+        entity_id: r.get(3)?,
+        task_id: r.get(4)?,
+        event_type: r.get(5)?,
+        actor: r.get(6)?,
+        from_state: from.map(|v| TaskState::parse(&v)).transpose().map_err(sql_conv)?,
+        to_state: to.map(|v| TaskState::parse(&v)).transpose().map_err(sql_conv)?,
+        revision: r.get(9)?,
+        details: details.map(|v| serde_json::from_str(&v)).transpose().map_err(sql_conv)?,
+        occurred_at: parse_time(at).map_err(sql_conv)?,
+    })
+}
+fn sql_conv<E: std::error::Error + Send + Sync + 'static>(e: E) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+    fn store() -> (TempDir, CoordinationStore) {
+        let d = TempDir::new().expect("temp");
+        let s = CoordinationStore::new(d.path().join("palace.sqlite3"));
+        s.ensure_schema().expect("schema");
+        (d, s)
+    }
+    fn task(s: &CoordinationStore) -> Task {
+        s.create_task(&NewTask {
+            title: "work".into(),
+            description: "do it".into(),
+            created_by: "manager".into(),
+            idempotency_key: "create-1".into(),
+            parent_id: None,
+            dependencies: vec![],
+            budget: Some(serde_json::json!({"tokens":100})),
+            expires_at: None,
+        })
+        .expect("task")
+    }
+    #[test]
+    fn exact_ids_and_idempotency_are_authoritative() {
+        let (_d, s) = store();
+        let a = task(&s);
+        let b = task(&s);
+        assert_eq!(a.task_id, b.task_id);
+        assert_eq!(s.get_task(&a.task_id).expect("get"), Some(a));
+        assert_eq!(s.get_task("task_missing").expect("miss"), None);
+    }
+    #[test]
+    fn claim_is_cas_and_expired_lease_is_reclaimable() {
+        let (_d, s) = store();
+        let t = task(&s);
+        let claimed = s.claim_task(&t.task_id, "a", 0, Duration::milliseconds(1)).expect("claim");
+        assert!(s.claim_task(&t.task_id, "b", 0, Duration::minutes(1)).is_err());
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let reclaimed =
+            s.claim_task(&t.task_id, "b", claimed.revision, Duration::minutes(1)).expect("reclaim");
+        assert_eq!(reclaimed.owner.as_deref(), Some("b"));
+        let events = s.events(None, Some(&t.task_id), 20).expect("events");
+        assert_eq!(events.events.len(), 3);
+        let event = events.events.first().expect("event").clone();
+        assert_eq!(s.get_event(&event.event_id).expect("exact event"), Some(event));
+        assert_eq!(s.get_event("event_missing").expect("missing event"), None);
+    }
+    #[test]
+    fn similar_messages_with_distinct_keys_survive_and_ack_is_authorized() {
+        let (_d, s) = store();
+        let t = task(&s);
+        let base = NewMessage {
+            task_id: t.task_id,
+            sender: "a".into(),
+            recipient: "b".into(),
+            kind: "result".into(),
+            payload: serde_json::json!({"text":"same"}),
+            idempotency_key: "m1".into(),
+            envelope_version: 1,
+        };
+        let a = s.send_message(&base).expect("a");
+        let mut second = base.clone();
+        second.idempotency_key = "m2".into();
+        let b = s.send_message(&second).expect("b");
+        assert_ne!(a.message_id, b.message_id);
+        assert!(s.acknowledge_message(&a.message_id, "a").is_err());
+        assert!(s.acknowledge_message(&a.message_id, "b").expect("ack").acknowledged_at.is_some());
+    }
+    #[test]
+    fn parent_dependencies_budget_and_cancellation_are_durable() {
+        let (_d, s) = store();
+        let parent = task(&s);
+        let child = s
+            .create_task(&NewTask {
+                title: "child".into(),
+                description: "dependent work".into(),
+                created_by: "manager".into(),
+                idempotency_key: "child-1".into(),
+                parent_id: Some(parent.task_id.clone()),
+                dependencies: vec![parent.task_id.clone()],
+                budget: Some(serde_json::json!({"tokens": 50})),
+                expires_at: None,
+            })
+            .expect("child");
+        assert_eq!(child.parent_id.as_deref(), Some(parent.task_id.as_str()));
+        assert_eq!(child.dependencies, vec![parent.task_id]);
+        assert_eq!(child.budget, Some(serde_json::json!({"tokens": 50})));
+        let cancelled = s
+            .transition_task(&child.task_id, "manager", child.revision, TaskState::Cancelled, None)
+            .expect("cancel");
+        assert_eq!(cancelled.state, TaskState::Cancelled);
+        assert!(
+            s.transition_task(
+                &child.task_id,
+                "manager",
+                cancelled.revision,
+                TaskState::Running,
+                None,
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn concurrent_claimers_cannot_win_the_same_revision() {
+        let (d, s) = store();
+        let t = task(&s);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut joins = Vec::new();
+        for worker in ["a", "b"] {
+            let path = d.path().join("palace.sqlite3");
+            let task_id = t.task_id.clone();
+            let gate = barrier.clone();
+            joins.push(std::thread::spawn(move || {
+                let store = CoordinationStore::new(path);
+                gate.wait();
+                store.claim_task(&task_id, worker, 0, Duration::minutes(1)).is_ok()
+            }));
+        }
+        barrier.wait();
+        let wins = joins.into_iter().filter(|join| join.join().expect("worker thread")).count();
+        assert_eq!(wins, 1);
+    }
+    #[test]
+    fn lifecycle_artifacts_and_restart_recovery_are_durable() {
+        let (d, s) = store();
+        let t = task(&s);
+        let running = s.claim_task(&t.task_id, "worker", 0, Duration::minutes(1)).expect("claim");
+        let waiting = s
+            .transition_task(&t.task_id, "worker", running.revision, TaskState::InputRequired, None)
+            .expect("input required");
+        assert_eq!(waiting.state, TaskState::InputRequired);
+        let artifact = s
+            .put_artifact(&NewArtifact {
+                task_id: t.task_id.clone(),
+                created_by: "worker".into(),
+                role: "result".into(),
+                media_type: "text/plain".into(),
+                content: "answer".into(),
+                idempotency_key: "artifact-1".into(),
+            })
+            .expect("artifact");
+        let result = s
+            .put_result(&NewTaskResult {
+                task_id: t.task_id.clone(),
+                created_by: "worker".into(),
+                payload: serde_json::json!({"answer": 42}),
+                idempotency_key: "result-1".into(),
+            })
+            .expect("result");
+        assert_eq!(
+            s.put_result(&NewTaskResult {
+                task_id: t.task_id.clone(),
+                created_by: "worker".into(),
+                payload: serde_json::json!({"different": "replay payload is ignored"}),
+                idempotency_key: "result-1".into(),
+            })
+            .expect("result replay")
+            .result_id,
+            result.result_id
+        );
+        drop(s);
+        let reopened = CoordinationStore::new(d.path().join("palace.sqlite3"));
+        reopened.ensure_schema().expect("schema");
+        assert_eq!(
+            reopened.get_task(&t.task_id).expect("task").expect("found").state,
+            TaskState::InputRequired
+        );
+        assert_eq!(reopened.get_artifact(&artifact.artifact_id).expect("artifact"), Some(artifact));
+        assert_eq!(reopened.get_result(&result.result_id).expect("result"), Some(result));
+    }
+}

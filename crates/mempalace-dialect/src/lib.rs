@@ -959,7 +959,8 @@ mod tests {
                 datetime!(2026-04-11 09:30:00 UTC),
             ),
         ];
-        let expected = "## L0 — IDENTITY\nReady.\n\n## L1 — AAAK STORY\n\n[alpha]\n  ... (more in L3 search)";
+        let expected =
+            "## L0 — IDENTITY\nReady.\n\n## L1 — AAAK STORY\n\n[alpha]\n  ... (more in L3 search)";
         let rendered = dialect.render_wake_up_aaak(
             "## L0 — IDENTITY\nReady.",
             &drawers,
@@ -975,15 +976,11 @@ mod tests {
     fn render_wake_up_aaak_honors_full_output_budget() {
         let dialect = Dialect::new();
         let identity = "## L0 — IDENTITY\nReady.";
-        let expected =
-            "## L0 — IDENTITY\nReady.\n\n## L1 — AAAK STORY\n\n[auth-migration]\n  ... (more in L3 search)";
+        let expected = "## L0 — IDENTITY\nReady.\n\n## L1 — AAAK STORY\n\n[auth-migration]\n  ... (more in L3 search)";
         let rendered = dialect.render_wake_up_aaak(
             identity,
             &sample_drawers(),
-            &WakeUpAaaKConfig {
-                max_drawers: 3,
-                max_chars: char_count(expected),
-            },
+            &WakeUpAaaKConfig { max_drawers: 3, max_chars: char_count(expected) },
         );
 
         assert_eq!(char_count(&rendered), char_count(expected));

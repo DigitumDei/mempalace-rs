@@ -1550,12 +1550,16 @@ where
         let lineages = operational_store.list_lineages().map_tool_internal()?;
         let mut observations = Vec::new();
         for candidate_lineage in lineages {
-            let mut records = operational_store
-                .list_self_observations(&candidate_lineage.lineage_id, statuses, limit)
+            let scope = (candidate_lineage.lineage_id != lineage.lineage_id)
+                .then_some(SelfObservationScope::Shared);
+            let records = operational_store
+                .list_self_observations_scoped(
+                    &candidate_lineage.lineage_id,
+                    statuses,
+                    scope,
+                    limit,
+                )
                 .map_tool_internal()?;
-            if candidate_lineage.lineage_id != lineage.lineage_id {
-                records.retain(|record| record.scope == SelfObservationScope::Shared);
-            }
             observations.extend(records);
         }
         observations.sort_by(|left, right| {
@@ -4563,6 +4567,107 @@ mod tests {
         .unwrap();
         assert_eq!(rebound["lineage"]["lineage_id"], "missing-lineage");
         assert_eq!(rebound["lineage_selection"]["source"], "mcp_server_environment");
+    }
+
+    #[tokio::test]
+    async fn shared_observations_are_filtered_before_the_lineage_limit() {
+        let harness = test_harness().await;
+        let now = datetime!(2026-08-17 12:00:00 UTC);
+        {
+            let runtime = harness.server.runtime.lock().await;
+            let store = runtime.storage.operational_store();
+            store
+                .set_lineage(
+                    "target-lineage",
+                    "Target Lineage",
+                    "The default lineage under test.",
+                    true,
+                    Some(0),
+                    now,
+                )
+                .unwrap();
+            store
+                .set_lineage(
+                    "other-lineage",
+                    "Other Lineage",
+                    "A second lineage supplying shared observations.",
+                    false,
+                    Some(0),
+                    now + Duration::minutes(1),
+                )
+                .unwrap();
+
+            let shared = SelfObservationRecord {
+                observation_id: "shared-observation".to_owned(),
+                lineage_id: "other-lineage".to_owned(),
+                status: SelfObservationStatus::Candidate,
+                scope: SelfObservationScope::Shared,
+                statement: "Shared observations remain available across lineages.".to_owned(),
+                behavioral_consequence: "Include shared observations in every identity packet."
+                    .to_owned(),
+                confidence: 0.9,
+                author: "test".to_owned(),
+                model: None,
+                harness: None,
+                evidence: vec!["test:shared-observation-limit".to_owned()],
+                counterevidence: Vec::new(),
+                supersedes_observation_id: None,
+                revision: 1,
+                created_at: now + Duration::minutes(2),
+                updated_at: now + Duration::minutes(2),
+            };
+            store.propose_self_observation(&shared).unwrap();
+            store
+                .review_self_observation(
+                    &shared.observation_id,
+                    1,
+                    SelfObservationStatus::Promoted,
+                    "test",
+                    "shared scope",
+                    now + Duration::minutes(3),
+                )
+                .unwrap();
+
+            let newer_lineage_observation = SelfObservationRecord {
+                observation_id: "newer-lineage-observation".to_owned(),
+                scope: SelfObservationScope::Lineage,
+                statement: "A newer lineage-scoped observation must not hide shared context."
+                    .to_owned(),
+                behavioral_consequence: "Filter applicability before applying the limit.".to_owned(),
+                evidence: vec!["test:newer-lineage-observation".to_owned()],
+                created_at: now + Duration::minutes(4),
+                updated_at: now + Duration::minutes(4),
+                ..shared
+            };
+            store
+                .propose_self_observation(&newer_lineage_observation)
+                .unwrap();
+            store
+                .review_self_observation(
+                    &newer_lineage_observation.observation_id,
+                    1,
+                    SelfObservationStatus::Promoted,
+                    "test",
+                    "newer lineage observation",
+                    now + Duration::minutes(5),
+                )
+                .unwrap();
+        }
+
+        let packet = decode_tool_payload(
+            &harness
+                .server
+                .handle_request(tool_call(
+                    6079,
+                    "mempalace_identity_packet",
+                    json!({"observation_limit":1}),
+                ))
+                .await,
+        )
+        .unwrap();
+        let promoted = packet["promoted_observations"].as_array().unwrap();
+        assert_eq!(promoted.len(), 1);
+        assert_eq!(promoted[0]["observation_id"], "shared-observation");
     }
 
     #[tokio::test]

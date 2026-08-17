@@ -370,6 +370,27 @@ pub trait SelfModelStore {
         statuses: &[SelfObservationStatus],
         limit: usize,
     ) -> Result<Vec<SelfObservationRecord>>;
+    /// List recent observations with an applicability-scope filter applied before the limit.
+    ///
+    /// The default implementation preserves compatibility for other stores by filtering the
+    /// unscoped result in memory. SQLite overrides it to apply the predicate in SQL.
+    fn list_self_observations_scoped(
+        &self,
+        lineage_id: &str,
+        statuses: &[SelfObservationStatus],
+        scope: Option<SelfObservationScope>,
+        limit: usize,
+    ) -> Result<Vec<SelfObservationRecord>> {
+        Ok(self
+            .list_self_observations(lineage_id, statuses, usize::MAX)?
+            .into_iter()
+            .filter(|record| match scope {
+                Some(scope) => record.scope == scope,
+                None => true,
+            })
+            .take(limit)
+            .collect())
+    }
     /// Apply a revision-checked review transition and append its audit record.
     fn review_self_observation(
         &self,
@@ -1596,7 +1617,12 @@ impl SelfModelStore for SqliteOperationalStore {
             transaction.query_row("SELECT COUNT(*) FROM agent_lineages", [], |row| row.get(0))?;
         let is_default = set_default || was_default || lineage_count == 0;
         if is_default {
-            transaction.execute("UPDATE agent_lineages SET is_default = 0", [])?;
+            transaction.execute(
+                "UPDATE agent_lineages
+                 SET is_default = 0, revision = revision + 1, updated_at = ?1
+                 WHERE is_default = 1 AND lineage_id <> ?2",
+                params![encode_time(now), lineage_id],
+            )?;
         }
 
         transaction.execute(
@@ -1729,18 +1755,31 @@ impl SelfModelStore for SqliteOperationalStore {
         statuses: &[SelfObservationStatus],
         limit: usize,
     ) -> Result<Vec<SelfObservationRecord>> {
+        self.list_self_observations_scoped(lineage_id, statuses, None, limit)
+    }
+
+    fn list_self_observations_scoped(
+        &self,
+        lineage_id: &str,
+        statuses: &[SelfObservationStatus],
+        scope: Option<SelfObservationScope>,
+        limit: usize,
+    ) -> Result<Vec<SelfObservationRecord>> {
         let connection = self.open_connection()?;
         let mut statement = connection.prepare(
             "SELECT observation_id, lineage_id, status, scope, statement,
                     behavioral_consequence, confidence, author, model, harness,
-                    evidence_json, counterevidence_json, supersedes_observation_id,
-                    revision, created_at, updated_at
+                     evidence_json, counterevidence_json, supersedes_observation_id,
+                     revision, created_at, updated_at
              FROM self_observations
-             WHERE lineage_id = ?1
+             WHERE lineage_id = ?1 AND (?2 IS NULL OR scope = ?2)
              ORDER BY updated_at DESC, observation_id ASC",
         )?;
         let records = statement
-            .query_map([lineage_id], decode_self_observation_row)?
+            .query_map(
+                params![lineage_id, scope.map(|scope| scope.as_str())],
+                decode_self_observation_row,
+            )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(records
             .into_iter()
@@ -1831,25 +1870,33 @@ impl SelfModelStore for SqliteOperationalStore {
                     "superseded observation `{superseded_id}` belongs to another lineage"
                 )));
             }
-            if superseded.status != SelfObservationStatus::Superseded {
-                let next_revision = superseded.revision + 1;
-                transaction.execute(
-                    "UPDATE self_observations
-                     SET status = 'superseded', revision = ?2, updated_at = ?3
-                     WHERE observation_id = ?1",
-                    params![superseded_id, next_revision, encode_time(now)],
-                )?;
-                insert_self_observation_review(
-                    &transaction,
-                    superseded_id,
-                    next_revision,
-                    superseded.status,
-                    SelfObservationStatus::Superseded,
-                    reviewer,
-                    &format!("superseded by `{observation_id}`: {reason}"),
-                    now,
-                )?;
+            if superseded.status != SelfObservationStatus::Promoted {
+                return Err(StorageError::Invariant(format!(
+                    "superseded observation `{superseded_id}` must currently be promoted"
+                )));
             }
+            let next_revision = superseded.revision + 1;
+            let updated = transaction.execute(
+                "UPDATE self_observations
+                 SET status = 'superseded', revision = ?2, updated_at = ?3
+                 WHERE observation_id = ?1 AND status = 'promoted' AND revision = ?4",
+                params![superseded_id, next_revision, encode_time(now), superseded.revision],
+            )?;
+            if updated != 1 {
+                return Err(StorageError::Invariant(format!(
+                    "superseded observation `{superseded_id}` changed before it could be superseded"
+                )));
+            }
+            insert_self_observation_review(
+                &transaction,
+                superseded_id,
+                next_revision,
+                superseded.status,
+                SelfObservationStatus::Superseded,
+                reviewer,
+                &format!("superseded by `{observation_id}`: {reason}"),
+                now,
+            )?;
         }
 
         transaction.commit()?;
@@ -2484,6 +2531,7 @@ mod tests {
     use tempfile::tempdir;
     use time::macros::datetime;
 
+    use crate::error::StorageError;
     use super::{
         ChangeCursor, ChangeEvent, ChangeLogStore, ChangePage, DiaryStore, EntityRegistryStore,
         GraphStore, IngestManifestStore, KnowledgeGraphStore, MIGRATIONS, MaintenanceLeaseStore,
@@ -2811,6 +2859,39 @@ mod tests {
         };
         assert_eq!(updated.revision, 2);
         assert_eq!(store.get_default_lineage().unwrap().unwrap().lineage_id, "dion-companion");
+
+        let switched_at = created_at + Duration::minutes(3);
+        let RevisionedWrite::Applied(switched) = store
+            .set_lineage(
+                "alternate-lineage",
+                "Alternate Lineage",
+                "A second provider-neutral lineage",
+                true,
+                Some(0),
+                switched_at,
+            )
+            .unwrap()
+        else {
+            panic!("a new lineage should be created");
+        };
+        assert!(switched.is_default);
+        let displaced = store.get_lineage("dion-companion").unwrap().unwrap();
+        assert!(!displaced.is_default);
+        assert_eq!(displaced.revision, 3);
+        assert_eq!(displaced.updated_at, switched_at);
+        assert_eq!(
+            store
+                .set_lineage(
+                    "dion-companion",
+                    "Dion Companion",
+                    "stale default update",
+                    false,
+                    Some(2),
+                    switched_at + Duration::minutes(1),
+                )
+                .unwrap(),
+            RevisionedWrite::Conflict { actual_revision: Some(3) }
+        );
     }
 
     #[test]
@@ -2918,6 +2999,105 @@ mod tests {
         let migrations = store.list_lineage_migrations("dion-companion", 5).unwrap();
         assert_eq!(migrations.len(), 1);
         assert_eq!(migrations[0].to_model, "model-b");
+    }
+
+    #[test]
+    fn rejects_superseding_an_observation_that_is_no_longer_promoted() {
+        let tempdir = tempdir().unwrap();
+        let store = SqliteOperationalStore::new(tempdir.path().join("storage.sqlite3"));
+        store.ensure_schema().unwrap();
+        let now = datetime!(2026-08-16 12:00:00 UTC);
+
+        store
+            .set_lineage(
+                "dion-companion",
+                "Dion Companion",
+                "Provider-neutral collaborator",
+                true,
+                Some(0),
+                now,
+            )
+            .unwrap();
+
+        let first = SelfObservationRecord {
+            observation_id: "selfobs-concurrent-first".to_owned(),
+            lineage_id: "dion-companion".to_owned(),
+            status: SelfObservationStatus::Candidate,
+            scope: SelfObservationScope::Lineage,
+            statement: "The first observation is current until replaced.".to_owned(),
+            behavioral_consequence: "Keep it in the packet until a reviewed replacement exists."
+                .to_owned(),
+            confidence: 0.8,
+            author: "codex".to_owned(),
+            model: None,
+            harness: None,
+            evidence: vec!["test:concurrent-first".to_owned()],
+            counterevidence: Vec::new(),
+            supersedes_observation_id: None,
+            revision: 1,
+            created_at: now,
+            updated_at: now,
+        };
+        store.propose_self_observation(&first).unwrap();
+        store
+            .review_self_observation(
+                &first.observation_id,
+                1,
+                SelfObservationStatus::Promoted,
+                "dion",
+                "confirmed",
+                now + Duration::minutes(1),
+            )
+            .unwrap();
+
+        for observation_id in ["selfobs-concurrent-second", "selfobs-concurrent-third"] {
+            store
+                .propose_self_observation(&SelfObservationRecord {
+                    observation_id: observation_id.to_owned(),
+                    statement: format!("Replacement candidate {observation_id}."),
+                    supersedes_observation_id: Some(first.observation_id.clone()),
+                    created_at: now + Duration::minutes(2),
+                    updated_at: now + Duration::minutes(2),
+                    ..first.clone()
+                })
+                .unwrap();
+        }
+
+        store
+            .review_self_observation(
+                "selfobs-concurrent-second",
+                1,
+                SelfObservationStatus::Promoted,
+                "dion",
+                "first replacement wins",
+                now + Duration::minutes(3),
+            )
+            .unwrap();
+
+        let error = store
+            .review_self_observation(
+                "selfobs-concurrent-third",
+                1,
+                SelfObservationStatus::Promoted,
+                "dion",
+                "stale replacement",
+                now + Duration::minutes(4),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            StorageError::Invariant(message)
+                if message.contains("selfobs-concurrent-first")
+                    && message.contains("must currently be promoted")
+        ));
+        assert_eq!(
+            store
+                .get_self_observation("selfobs-concurrent-third")
+                .unwrap()
+                .unwrap()
+                .status,
+            SelfObservationStatus::Candidate
+        );
     }
 
     #[test]

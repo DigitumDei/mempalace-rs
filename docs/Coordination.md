@@ -18,7 +18,7 @@ Task states are `pending`, `running`, `input_required`, `completed`, `cancelled`
 
 Actor IDs are asserted by the local host runtime. MemPalace enforces ownership and recipient checks against those IDs; transport-level authentication and worker execution remain host-runtime responsibilities.
 
-Payloads and artifact content are limited to 1 MiB. Idempotency keys are limited to 256 bytes.
+Task titles, descriptions, JSON payloads and budgets, and artifact content are limited to 1 MiB. Idempotency keys are limited to 256 bytes. Inbox and event cursors are `null` when a page contains the final available records; a non-null cursor indicates that another page is available.
 
 ## MCP tools
 

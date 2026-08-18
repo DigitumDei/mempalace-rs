@@ -11,6 +11,7 @@ use uuid::Uuid;
 use crate::{Result, StorageError};
 
 const MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
+const MAX_TASK_TEXT_BYTES: usize = 1024 * 1024;
 
 /// Durable task lifecycle state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -257,6 +258,11 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
     pub fn create_task(&self, input: &NewTask) -> Result<Task> {
         validate_key(&input.idempotency_key)?;
         validate_actor(&input.created_by)?;
+        bounded_text(&input.title, "task title")?;
+        bounded_text(&input.description, "task description")?;
+        if let Some(budget) = &input.budget {
+            bounded_json(budget)?;
+        }
         let mut conn = self.connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some(task) = find_task_by_key(&tx, &input.created_by, &input.idempotency_key)? {
@@ -445,7 +451,7 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
             return Err(StorageError::Invariant("only the owner may transition this task".into()));
         }
         let next = task.revision + 1;
-        let clear = to != TaskState::Running;
+        let clear = to.terminal();
         tx.execute("UPDATE coordination_tasks SET state=?2,revision=?3,owner=CASE WHEN ?4 THEN NULL ELSE owner END,lease_expires_at=CASE WHEN ?4 THEN NULL ELSE lease_expires_at END,updated_at=?5 WHERE task_id=?1",params![id,to.as_str(),next,clear,format_time(now)?])?;
         append_event(
             &tx,
@@ -525,8 +531,13 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
                 message_row,
             )?;
         let mut values = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        let has_more = values.len() > requested;
         values.truncate(requested);
-        let next_cursor = values.last().map(|message| CoordinationCursor(message.sequence));
+        let next_cursor = if has_more {
+            values.last().map(|message| CoordinationCursor(message.sequence))
+        } else {
+            None
+        };
         Ok(InboxPage { messages: values, next_cursor })
     }
     /// Acknowledge a message. Replays by the same recipient are harmless.
@@ -676,8 +687,13 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
             )?
         };
         let mut values = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        let has_more = values.len() > requested;
         values.truncate(requested);
-        let next_cursor = values.last().map(|event| CoordinationCursor(event.sequence));
+        let next_cursor = if has_more {
+            values.last().map(|event| CoordinationCursor(event.sequence))
+        } else {
+            None
+        };
         Ok(CoordinationEventPage { events: values, next_cursor })
     }
     /// Retrieve an audit event by exact ID.
@@ -715,6 +731,13 @@ fn validate_key(v: &str) -> Result<()> {
 fn bounded_json(v: &Value) -> Result<()> {
     if serde_json::to_vec(v)?.len() > MAX_PAYLOAD_BYTES {
         Err(StorageError::Invariant("payload exceeds 1 MiB".into()))
+    } else {
+        Ok(())
+    }
+}
+fn bounded_text(value: &str, name: &str) -> Result<()> {
+    if value.len() > MAX_TASK_TEXT_BYTES {
+        Err(StorageError::Invariant(format!("{name} exceeds 1 MiB")))
     } else {
         Ok(())
     }
@@ -1085,6 +1108,14 @@ mod tests {
             .transition_task(&t.task_id, "worker", running.revision, TaskState::InputRequired, None)
             .expect("input required");
         assert_eq!(waiting.state, TaskState::InputRequired);
+        assert_eq!(waiting.owner.as_deref(), Some("worker"));
+        assert!(s
+            .transition_task(&t.task_id, "other", waiting.revision, TaskState::Running, None)
+            .is_err());
+        let running_again = s
+            .transition_task(&t.task_id, "worker", waiting.revision, TaskState::Running, None)
+            .expect("owner resumes task");
+        assert_eq!(running_again.owner.as_deref(), Some("worker"));
         let artifact = s
             .put_artifact(&NewArtifact {
                 task_id: t.task_id.clone(),
@@ -1123,5 +1154,52 @@ mod tests {
         );
         assert_eq!(reopened.get_artifact(&artifact.artifact_id).expect("artifact"), Some(artifact));
         assert_eq!(reopened.get_result(&result.result_id).expect("result"), Some(result));
+    }
+
+    #[test]
+    fn task_fields_are_bounded_and_cursors_signal_more_pages() {
+        let (_d, s) = store();
+        let oversized = "x".repeat(MAX_TASK_TEXT_BYTES + 1);
+        assert!(s
+            .create_task(&NewTask {
+                title: oversized,
+                description: "description".into(),
+                created_by: "manager".into(),
+                idempotency_key: "oversized-title".into(),
+                parent_id: None,
+                dependencies: vec![],
+                budget: None,
+                expires_at: None,
+            })
+            .is_err());
+
+        let t = task(&s);
+        for key in ["m1", "m2"] {
+            s.send_message(&NewMessage {
+                task_id: t.task_id.clone(),
+                sender: "sender".into(),
+                recipient: "receiver".into(),
+                kind: "request".into(),
+                payload: serde_json::json!({"key": key}),
+                idempotency_key: key.into(),
+                envelope_version: 1,
+            })
+            .expect("message");
+        }
+        let first = s.inbox("receiver", None, 1, false).expect("first inbox page");
+        assert_eq!(first.messages.len(), 1);
+        assert!(first.next_cursor.is_some());
+        let last = s.inbox("receiver", first.next_cursor, 1, false).expect("last inbox page");
+        assert_eq!(last.messages.len(), 1);
+        assert_eq!(last.next_cursor, None);
+
+        let first_events = s.events(None, Some(&t.task_id), 1).expect("first event page");
+        assert_eq!(first_events.events.len(), 1);
+        assert!(first_events.next_cursor.is_some());
+        let mut cursor = first_events.next_cursor;
+        while cursor.is_some() {
+            let page = s.events(cursor, Some(&t.task_id), 500).expect("event page");
+            cursor = page.next_cursor;
+        }
     }
 }

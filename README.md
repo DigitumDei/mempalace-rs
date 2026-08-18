@@ -43,7 +43,9 @@ MemPalace provides a palace-style memory store with:
 - Semantic search via local embeddings (no external API calls)
 - A knowledge graph for structured facts, relationships, and timelines
 - An AAAK dialect for compact, human-readable memory storage
-- An MCP server (`mempalace-mcp`) for agent integration (23 tools)
+- An MCP server (`mempalace-mcp`) for agent integration (28 tools)
+- Provider-neutral agent lineages and reviewed identity packets that preserve a coherent self
+  across model and harness changes
 - A CLI (`mempalace-cli`) for direct palace management
 - Locator-based mined storage: project file chunks store byte/line ranges instead of duplicated text; snippets are resolved lazily from the checkout at read time with stale detection
 - Repository views: `mine` detects the checkout automatically — a full canonical snapshot on the default branch, a branch delta everywhere else — and `search --view <branch>` composes that delta over the canonical snapshot, tombstones included. Force either side with `--full` / `--branch`
@@ -141,7 +143,9 @@ Full index: [docs/README.md](docs/README.md).
 - [Operator guide](docs/Operator-Standard.md) — deployment, maintenance, troubleshooting, storage recovery
 - [CLI surface](docs/CLI-Surface.md) — all commands and flags
 - [Config schema](docs/Config-Schema.md) — `~/.mempalace/config.json`
-- [Release scope](docs/Release-Scope.md) — what ships, what's deferred, the 23 MCP tools
+- [Release scope](docs/Release-Scope.md) — what ships, what's deferred, the 28 MCP tools
+- [Self-continuity](docs/Self-Continuity.md) — lineages, reviewed self-observations, identity
+  packets, and model/harness migrations
 - [Low-CPU mode](docs/Operator-Low-CPU.md) — constrained environments
 - [Cloud environment](docs/Cloud-Environment.md) — building and testing in a cloud sandbox or CI runner
 - [Mined storage](docs/Mined-Storage.md) — locator model, repository views, stale semantics, discovery rules

@@ -18,13 +18,15 @@ pub use maintenance::{
 };
 pub use sqlite::{
     ChangeCursor, ChangeEvent, ChangeLogStore, ChangePage, DiaryStore, EntityRegistryStore, GraphStore,
-    IngestManifestStore, KnowledgeGraphStore, MaintenanceLeaseStore, SqliteOperationalStore, ToolStateStore,
+    IngestManifestStore, KnowledgeGraphStore, MaintenanceLeaseStore, SelfModelStore,
+    SqliteOperationalStore, ToolStateStore,
 };
 pub use types::{
-    ConfigEntry, DrawerFilter, DrawerMatch, DrawerStore, DuplicateStrategy, EntityRecord,
-    GraphDocument, IngestCommitRequest, IngestFileRecord, IngestManifestEntry, IngestRun,
-    IngestRunStatus, KnowledgeGraphFact, RetryableRun, SearchRequest, StorageLayout,
-    ToolStateEntry,
+    AgentLineageRecord, ConfigEntry, DrawerFilter, DrawerMatch, DrawerStore, DuplicateStrategy,
+    EntityRecord, GraphDocument, IngestCommitRequest, IngestFileRecord, IngestManifestEntry,
+    IngestRun, IngestRunStatus, KnowledgeGraphFact, LineageMigrationRecord, RetryableRun,
+    RevisionedWrite, SearchRequest, SelfObservationRecord, SelfObservationScope,
+    SelfObservationStatus, StorageLayout, ToolStateEntry,
 };
 
 pub use mempalace_core as core;

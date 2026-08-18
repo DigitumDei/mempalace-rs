@@ -184,6 +184,7 @@ counterpart, so they are not part of the override chain above:
 |---|---|---|
 | `MEMPALACE_EMBED_ALLOW_DOWNLOADS` | `mempalace-cli`, `mempalace-mcp`, `mempalace-cli serve` | Permits downloading missing embedding assets. Offline is the default. |
 | `MEMPALACE_STUB_EMBEDDINGS` | `mempalace-mcp`, `mempalace-cli serve` — **only** | Selects a deterministic stub embedding provider for offline dev and testing. |
+| `MEMPALACE_LINEAGE_ID` | `mempalace-mcp` — **only** | Binds wake-up and identity packets to a lineage. Model-facing tools cannot override it; a missing bound lineage falls back to the palace default and includes creation guidance in the response. |
 | `MEMPALACE_BUILD_VERSION` | build script | Embeds the calculated release version in both binaries and in `GET /v1/info`. Unset falls back to the workspace package version. See [Release Operations](Release-Operations.md#release-versions). |
 | `MEMPALACE_EMBED_CACHE` | `embedding_bench` / `lme_bench` examples | Overrides the embedding cache root for benchmark runs only. |
 | `MEMPALACE_EMBED_PROFILE`, `MEMPALACE_EMBED_ITERATIONS` | `embedding_bench` example | Benchmark profile selection and iteration count. |

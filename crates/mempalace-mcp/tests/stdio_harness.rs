@@ -179,3 +179,73 @@ fn compiled_binary_serves_stdio_with_stub_embeddings() {
     let exit = child.wait().unwrap();
     assert!(exit.success());
 }
+
+#[test]
+fn compiled_binary_falls_back_for_missing_bound_lineage_and_explains_creation() {
+    let tempdir = TempDir::new().unwrap();
+    let home_dir = tempdir.path().join("home");
+    std::fs::create_dir_all(&home_dir).unwrap();
+    let palace_path = tempdir.path().join("palace");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_mempalace-mcp"))
+        .env("HOME", &home_dir)
+        .env("MEMPALACE_PALACE_PATH", &palace_path)
+        .env("MEMPALACE_STUB_EMBEDDINGS", "1")
+        .env("MEMPALACE_LINEAGE_ID", "codex-dion")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    {
+        let mut stdin = child.stdin.take().unwrap();
+        writeln!(
+            stdin,
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{{\"name\":\"mempalace_lineage_set\",\"arguments\":{{\"lineage_id\":\"default-lineage\",\"display_name\":\"Default lineage\",\"description\":\"The palace default for fallback testing.\",\"expected_revision\":0,\"set_default\":true,\"actor\":\"stdio-test\"}}}}}}"
+        )
+        .unwrap();
+        writeln!(
+            stdin,
+            "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{{\"name\":\"mempalace_identity_packet\",\"arguments\":{{}}}}}}"
+        )
+        .unwrap();
+    }
+
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = StdBufReader::new(stdout);
+    let mut created = String::new();
+    let mut response = String::new();
+    reader.read_line(&mut created).unwrap();
+    reader.read_line(&mut response).unwrap();
+    let created: serde_json::Value = serde_json::from_str(created.trim()).unwrap();
+    let response: serde_json::Value = serde_json::from_str(response.trim()).unwrap();
+    assert_eq!(mempalace_mcp::decode_tool_payload(&created).unwrap()["success"], true);
+    let packet = mempalace_mcp::decode_tool_payload(&response).unwrap();
+    assert_eq!(packet["lineage"]["lineage_id"], "default-lineage");
+    assert_eq!(packet["lineage_selection"]["source"], "palace_default_fallback");
+    assert_eq!(packet["lineage_selection"]["requested_lineage_id"], "codex-dion");
+    let message = packet["lineage_selection"]["message"].as_str().unwrap();
+    assert!(message.contains("MEMPALACE_LINEAGE_ID"));
+    assert!(message.contains("codex-dion"));
+    assert!(message.contains("mempalace_lineage_set"));
+    assert!(message.contains("expected_revision 0"));
+
+    let exit = child.wait().unwrap();
+    assert!(exit.success());
+}
+
+#[test]
+fn compiled_binary_rejects_invalid_environment_lineage_id_at_startup() {
+    let tempdir = TempDir::new().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_mempalace-mcp"))
+        .env("HOME", tempdir.path())
+        .env("MEMPALACE_PALACE_PATH", tempdir.path().join("palace"))
+        .env("MEMPALACE_STUB_EMBEDDINGS", "1")
+        .env("MEMPALACE_LINEAGE_ID", "not a valid id")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("InvalidLineageBinding"));
+    assert!(stderr.contains("may contain only ASCII letters"));
+}

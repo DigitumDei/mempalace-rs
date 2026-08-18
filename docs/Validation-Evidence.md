@@ -80,7 +80,7 @@ Against an isolated palace root and a three-file fixture (`notes/welcome.md`, `n
 | 6 | `mempalace-cli --palace <root> wake-up` | 0 |
 | 7 | `mempalace-mcp` receives `initialize` + `tools/list` on stdio | 0 |
 
-The MCP response advertised `protocolVersion: 2024-11-05` and the 19 tools frozen at that time (the surface has since grown to 23 — see [Release-Scope.md](Release-Scope.md)): `mempalace_status`, `mempalace_list_wings`, `mempalace_list_rooms`, `mempalace_get_taxonomy`, `mempalace_get_aaak_spec`, `mempalace_kg_query`, `mempalace_kg_add`, `mempalace_kg_invalidate`, `mempalace_kg_timeline`, `mempalace_kg_stats`, `mempalace_traverse`, `mempalace_find_tunnels`, `mempalace_graph_stats`, `mempalace_search`, `mempalace_check_duplicate`, `mempalace_add_drawer`, `mempalace_delete_drawer`, `mempalace_diary_write`, `mempalace_diary_read`.
+The MCP response advertised `protocolVersion: 2024-11-05` and the 19 tools frozen at that time (the surface has since grown to 28 — see [Release-Scope.md](Release-Scope.md)): `mempalace_status`, `mempalace_list_wings`, `mempalace_list_rooms`, `mempalace_get_taxonomy`, `mempalace_get_aaak_spec`, `mempalace_kg_query`, `mempalace_kg_add`, `mempalace_kg_invalidate`, `mempalace_kg_timeline`, `mempalace_kg_stats`, `mempalace_traverse`, `mempalace_find_tunnels`, `mempalace_graph_stats`, `mempalace_search`, `mempalace_check_duplicate`, `mempalace_add_drawer`, `mempalace_delete_drawer`, `mempalace_diary_write`, `mempalace_diary_read`.
 
 ### Indicative benchmark (not signoff)
 
@@ -198,7 +198,7 @@ Recorded here so the dated evidence above is not mistaken for current state:
 | Finding 1 — `rust-version = "1.85"` is stale | Resolved. The workspace declares `rust-version = "1.88"`. |
 | Finding 4 — `mempalace-rs-storage.yml` did not run | Obsolete. That workflow no longer exists; [`ci.yml`](../.github/workflows/ci.yml) runs on every PR with no `paths:` filter. |
 | `build-and-package` job | Renamed and split. Package tests fan out per crate into `release-gate`, which gates the `release-host` build matrix. |
-| 19 MCP tools | 23 tools. See [Release Scope](Release-Scope.md#mcp-tool-surface-23-tools). |
+| 19 MCP tools | 28 tools. See [Release Scope](Release-Scope.md#mcp-tool-surface-28-tools). |
 | 6 crates under test | 14 crates. See the package list in [CLAUDE.md](../CLAUDE.md#test). |
 | CLI surface (`init`/`mine`/`search`/`status`/`wake-up`) | Also `project`, `prune`, `setup`, `maintain`, and `serve`. See [CLI Surface](CLI-Surface.md). |
 

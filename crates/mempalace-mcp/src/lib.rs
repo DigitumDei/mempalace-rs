@@ -3543,14 +3543,6 @@ fn required_i64(arguments: &Value, field: &'static str) -> ToolResult<i64> {
         ToolError::InvalidParams(format!("missing required integer field `{field}`"))
     })
 }
-fn required_positive_i64(arguments: &Value, field: &'static str) -> ToolResult<i64> {
-    let value = required_i64(arguments, field)?;
-    if value <= 0 {
-        Err(ToolError::InvalidParams(format!("field `{field}` must be positive")))
-    } else {
-        Ok(value)
-    }
-}
 fn optional_i64(arguments: &Value, field: &'static str) -> ToolResult<Option<i64>> {
     match arguments.get(field) {
         None | Some(Value::Null) => Ok(None),
@@ -3558,15 +3550,6 @@ fn optional_i64(arguments: &Value, field: &'static str) -> ToolResult<Option<i64
             .as_i64()
             .map(Some)
             .ok_or_else(|| ToolError::InvalidParams(format!("field `{field}` must be an integer"))),
-    }
-}
-fn optional_bool(arguments: &Value, field: &'static str) -> ToolResult<Option<bool>> {
-    match arguments.get(field) {
-        None | Some(Value::Null) => Ok(None),
-        Some(v) => v
-            .as_bool()
-            .map(Some)
-            .ok_or_else(|| ToolError::InvalidParams(format!("field `{field}` must be a boolean"))),
     }
 }
 fn parse_coordination_input<T: for<'de> Deserialize<'de>>(arguments: &Value) -> ToolResult<T> {

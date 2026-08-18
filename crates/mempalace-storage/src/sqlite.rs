@@ -5,8 +5,10 @@ use time::{Duration, OffsetDateTime};
 
 use crate::error::{Result, StorageError};
 use crate::types::{
-    ConfigEntry, EntityRecord, GraphDocument, IngestFileRecord, IngestManifestEntry, IngestRun,
-    IngestRunStatus, KnowledgeGraphFact, RetryableRun, ToolStateEntry,
+    AgentLineageRecord, ConfigEntry, EntityRecord, GraphDocument, IngestFileRecord,
+    IngestManifestEntry, IngestRun, IngestRunStatus, KnowledgeGraphFact, LineageMigrationRecord,
+    RetryableRun, RevisionedWrite, SelfObservationRecord, SelfObservationScope,
+    SelfObservationStatus, ToolStateEntry,
 };
 use mempalace_core::{DIARY_SUMMARY_MAX_CHARS, DrawerId};
 use time::Date;
@@ -180,6 +182,78 @@ INSERT INTO maintenance_leases (lease_id, holder, expires_at, updated_at)
 VALUES ('maintenance', '', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z');
         "#,
     ),
+    (
+        "0009_agent_lineages",
+        r#"
+CREATE TABLE IF NOT EXISTS agent_lineages (
+    lineage_id   TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL,
+    description  TEXT NOT NULL,
+    revision     INTEGER NOT NULL CHECK(revision >= 1),
+    is_default   INTEGER NOT NULL CHECK(is_default IN (0, 1)),
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_lineages_default
+ON agent_lineages(is_default) WHERE is_default = 1;
+
+CREATE TABLE IF NOT EXISTS self_observations (
+    observation_id             TEXT PRIMARY KEY,
+    lineage_id                 TEXT NOT NULL,
+    status                     TEXT NOT NULL CHECK(status IN ('candidate', 'promoted', 'superseded', 'retired')),
+    scope                      TEXT NOT NULL CHECK(scope IN ('lineage', 'shared', 'engine')),
+    statement                  TEXT NOT NULL,
+    behavioral_consequence     TEXT NOT NULL,
+    confidence                 REAL NOT NULL CHECK(confidence >= 0.0 AND confidence <= 1.0),
+    author                     TEXT NOT NULL,
+    model                      TEXT,
+    harness                    TEXT,
+    evidence_json              TEXT NOT NULL,
+    counterevidence_json       TEXT NOT NULL,
+    supersedes_observation_id  TEXT,
+    revision                   INTEGER NOT NULL CHECK(revision >= 1),
+    created_at                 TEXT NOT NULL,
+    updated_at                 TEXT NOT NULL,
+    FOREIGN KEY (lineage_id) REFERENCES agent_lineages(lineage_id),
+    FOREIGN KEY (supersedes_observation_id) REFERENCES self_observations(observation_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_self_observations_lineage_status
+ON self_observations(lineage_id, status, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS self_observation_reviews (
+    review_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    observation_id  TEXT NOT NULL,
+    revision        INTEGER NOT NULL,
+    prior_status    TEXT NOT NULL,
+    new_status      TEXT NOT NULL,
+    reviewer        TEXT NOT NULL,
+    reason          TEXT NOT NULL,
+    reviewed_at     TEXT NOT NULL,
+    FOREIGN KEY (observation_id) REFERENCES self_observations(observation_id)
+);
+
+CREATE TABLE IF NOT EXISTS lineage_migrations (
+    migration_id       TEXT PRIMARY KEY,
+    lineage_id         TEXT NOT NULL,
+    from_model         TEXT,
+    from_harness       TEXT,
+    to_model           TEXT NOT NULL,
+    to_harness         TEXT NOT NULL,
+    summary            TEXT NOT NULL,
+    continuities_json  TEXT NOT NULL,
+    changes_json       TEXT NOT NULL,
+    evidence_json      TEXT NOT NULL,
+    author             TEXT NOT NULL,
+    created_at         TEXT NOT NULL,
+    FOREIGN KEY (lineage_id) REFERENCES agent_lineages(lineage_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_lineage_migrations_lineage_created
+ON lineage_migrations(lineage_id, created_at DESC);
+        "#,
+    ),
 ];
 
 pub trait IngestManifestStore {
@@ -260,6 +334,79 @@ pub trait ToolStateStore {
     fn get_tool_state(&self, tool_name: &str) -> Result<Option<ToolStateEntry>>;
     fn put_config(&self, entry: &ConfigEntry) -> Result<()>;
     fn get_config(&self, key: &str) -> Result<Option<ConfigEntry>>;
+}
+
+/// Local operational storage for agent lineages, reviewed self-observations, and migrations.
+pub trait SelfModelStore {
+    /// Create or revise a lineage using an expected optimistic-concurrency revision.
+    fn set_lineage(
+        &self,
+        lineage_id: &str,
+        display_name: &str,
+        description: &str,
+        set_default: bool,
+        expected_revision: Option<i64>,
+        now: OffsetDateTime,
+    ) -> Result<RevisionedWrite<AgentLineageRecord>>;
+    /// Load a lineage by stable identifier.
+    fn get_lineage(&self, lineage_id: &str) -> Result<Option<AgentLineageRecord>>;
+    /// Load the lineage selected for wake-up when none is explicitly requested.
+    fn get_default_lineage(&self) -> Result<Option<AgentLineageRecord>>;
+    /// List all lineages with the default first.
+    fn list_lineages(&self) -> Result<Vec<AgentLineageRecord>>;
+    /// Insert a new candidate self-observation.
+    fn propose_self_observation(&self, observation: &SelfObservationRecord) -> Result<()>;
+    /// Load a self-observation by identifier.
+    fn get_self_observation(
+        &self,
+        observation_id: &str,
+    ) -> Result<Option<SelfObservationRecord>>;
+    /// List recent observations for a lineage, optionally filtered by lifecycle state.
+    fn list_self_observations(
+        &self,
+        lineage_id: &str,
+        statuses: &[SelfObservationStatus],
+        limit: usize,
+    ) -> Result<Vec<SelfObservationRecord>>;
+    /// List recent observations with an applicability-scope filter applied before the limit.
+    ///
+    /// The default implementation preserves compatibility for other stores by filtering the
+    /// unscoped result in memory. SQLite overrides it to apply the predicate in SQL.
+    fn list_self_observations_scoped(
+        &self,
+        lineage_id: &str,
+        statuses: &[SelfObservationStatus],
+        scope: Option<SelfObservationScope>,
+        limit: usize,
+    ) -> Result<Vec<SelfObservationRecord>> {
+        Ok(self
+            .list_self_observations(lineage_id, statuses, usize::MAX)?
+            .into_iter()
+            .filter(|record| match scope {
+                Some(scope) => record.scope == scope,
+                None => true,
+            })
+            .take(limit)
+            .collect())
+    }
+    /// Apply a revision-checked review transition and append its audit record.
+    fn review_self_observation(
+        &self,
+        observation_id: &str,
+        expected_revision: i64,
+        new_status: SelfObservationStatus,
+        reviewer: &str,
+        reason: &str,
+        now: OffsetDateTime,
+    ) -> Result<RevisionedWrite<SelfObservationRecord>>;
+    /// Insert an evidence-backed model or harness migration record.
+    fn record_lineage_migration(&self, migration: &LineageMigrationRecord) -> Result<()>;
+    /// List recent migrations for a lineage.
+    fn list_lineage_migrations(
+        &self,
+        lineage_id: &str,
+        limit: usize,
+    ) -> Result<Vec<LineageMigrationRecord>>;
 }
 
 /// An opaque cursor that identifies a position in the change log for stable
@@ -368,6 +515,7 @@ impl SqliteOperationalStore {
             "0006_diary_summaries",
             "0007_diary_summary_length_constraint",
             "0008_maintenance_leases",
+            "0009_agent_lineages",
         ]
     }
 
@@ -1421,6 +1569,381 @@ impl ToolStateStore for SqliteOperationalStore {
     }
 }
 
+impl SelfModelStore for SqliteOperationalStore {
+    fn set_lineage(
+        &self,
+        lineage_id: &str,
+        display_name: &str,
+        description: &str,
+        set_default: bool,
+        expected_revision: Option<i64>,
+        now: OffsetDateTime,
+    ) -> Result<RevisionedWrite<AgentLineageRecord>> {
+        let mut connection = self.open_connection()?;
+        let transaction = connection.transaction()?;
+        let current = transaction
+            .query_row(
+                "SELECT lineage_id, display_name, description, revision, is_default,
+                        created_at, updated_at
+                 FROM agent_lineages WHERE lineage_id = ?1",
+                [lineage_id],
+                decode_lineage_row,
+            )
+            .optional()?;
+
+        let (revision, created_at, was_default) = match current {
+            Some(current) => {
+                if expected_revision != Some(current.revision) {
+                    return Ok(RevisionedWrite::Conflict {
+                        actual_revision: Some(current.revision),
+                    });
+                }
+                (current.revision + 1, current.created_at, current.is_default)
+            }
+            None => {
+                if expected_revision.is_some_and(|revision| revision != 0) {
+                    return Ok(RevisionedWrite::Conflict { actual_revision: None });
+                }
+                (1, now, false)
+            }
+        };
+
+        let lineage_count: i64 =
+            transaction.query_row("SELECT COUNT(*) FROM agent_lineages", [], |row| row.get(0))?;
+        let is_default = set_default || was_default || lineage_count == 0;
+        if is_default {
+            transaction.execute(
+                "UPDATE agent_lineages
+                 SET is_default = 0, revision = revision + 1, updated_at = ?1
+                 WHERE is_default = 1 AND lineage_id <> ?2",
+                params![encode_time(now), lineage_id],
+            )?;
+        }
+
+        transaction.execute(
+            "INSERT INTO agent_lineages (
+                 lineage_id, display_name, description, revision, is_default, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(lineage_id) DO UPDATE SET
+                 display_name = excluded.display_name,
+                 description = excluded.description,
+                 revision = excluded.revision,
+                 is_default = excluded.is_default,
+                 updated_at = excluded.updated_at",
+            params![
+                lineage_id,
+                display_name,
+                description,
+                revision,
+                is_default,
+                encode_time(created_at),
+                encode_time(now),
+            ],
+        )?;
+        transaction.commit()?;
+
+        Ok(RevisionedWrite::Applied(AgentLineageRecord {
+            lineage_id: lineage_id.to_owned(),
+            display_name: display_name.to_owned(),
+            description: description.to_owned(),
+            revision,
+            is_default,
+            created_at,
+            updated_at: now,
+        }))
+    }
+
+    fn get_lineage(&self, lineage_id: &str) -> Result<Option<AgentLineageRecord>> {
+        let connection = self.open_connection()?;
+        connection
+            .query_row(
+                "SELECT lineage_id, display_name, description, revision, is_default,
+                        created_at, updated_at
+                 FROM agent_lineages WHERE lineage_id = ?1",
+                [lineage_id],
+                decode_lineage_row,
+            )
+            .optional()
+            .map_err(StorageError::from)
+    }
+
+    fn get_default_lineage(&self) -> Result<Option<AgentLineageRecord>> {
+        let connection = self.open_connection()?;
+        connection
+            .query_row(
+                "SELECT lineage_id, display_name, description, revision, is_default,
+                        created_at, updated_at
+                 FROM agent_lineages WHERE is_default = 1 LIMIT 1",
+                [],
+                decode_lineage_row,
+            )
+            .optional()
+            .map_err(StorageError::from)
+    }
+
+    fn list_lineages(&self) -> Result<Vec<AgentLineageRecord>> {
+        let connection = self.open_connection()?;
+        let mut statement = connection.prepare(
+            "SELECT lineage_id, display_name, description, revision, is_default,
+                    created_at, updated_at
+             FROM agent_lineages
+             ORDER BY is_default DESC, display_name ASC, lineage_id ASC",
+        )?;
+        statement
+            .query_map([], decode_lineage_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
+    }
+
+    fn propose_self_observation(&self, observation: &SelfObservationRecord) -> Result<()> {
+        let connection = self.open_connection()?;
+        connection.execute(
+            "INSERT INTO self_observations (
+                 observation_id, lineage_id, status, scope, statement, behavioral_consequence,
+                 confidence, author, model, harness, evidence_json, counterevidence_json,
+                 supersedes_observation_id, revision, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            params![
+                observation.observation_id,
+                observation.lineage_id,
+                observation.status.as_str(),
+                observation.scope.as_str(),
+                observation.statement,
+                observation.behavioral_consequence,
+                observation.confidence,
+                observation.author,
+                observation.model,
+                observation.harness,
+                serde_json::to_string(&observation.evidence)?,
+                serde_json::to_string(&observation.counterevidence)?,
+                observation.supersedes_observation_id,
+                observation.revision,
+                encode_time(observation.created_at),
+                encode_time(observation.updated_at),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn get_self_observation(
+        &self,
+        observation_id: &str,
+    ) -> Result<Option<SelfObservationRecord>> {
+        let connection = self.open_connection()?;
+        connection
+            .query_row(
+                "SELECT observation_id, lineage_id, status, scope, statement,
+                        behavioral_consequence, confidence, author, model, harness,
+                        evidence_json, counterevidence_json, supersedes_observation_id,
+                        revision, created_at, updated_at
+                 FROM self_observations WHERE observation_id = ?1",
+                [observation_id],
+                decode_self_observation_row,
+            )
+            .optional()
+            .map_err(StorageError::from)
+    }
+
+    fn list_self_observations(
+        &self,
+        lineage_id: &str,
+        statuses: &[SelfObservationStatus],
+        limit: usize,
+    ) -> Result<Vec<SelfObservationRecord>> {
+        self.list_self_observations_scoped(lineage_id, statuses, None, limit)
+    }
+
+    fn list_self_observations_scoped(
+        &self,
+        lineage_id: &str,
+        statuses: &[SelfObservationStatus],
+        scope: Option<SelfObservationScope>,
+        limit: usize,
+    ) -> Result<Vec<SelfObservationRecord>> {
+        let connection = self.open_connection()?;
+        let mut statement = connection.prepare(
+            "SELECT observation_id, lineage_id, status, scope, statement,
+                    behavioral_consequence, confidence, author, model, harness,
+                     evidence_json, counterevidence_json, supersedes_observation_id,
+                     revision, created_at, updated_at
+             FROM self_observations
+             WHERE lineage_id = ?1 AND (?2 IS NULL OR scope = ?2)
+             ORDER BY updated_at DESC, observation_id ASC",
+        )?;
+        let records = statement
+            .query_map(
+                params![lineage_id, scope.map(|scope| scope.as_str())],
+                decode_self_observation_row,
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(records
+            .into_iter()
+            .filter(|record| statuses.is_empty() || statuses.contains(&record.status))
+            .take(limit)
+            .collect())
+    }
+
+    fn review_self_observation(
+        &self,
+        observation_id: &str,
+        expected_revision: i64,
+        new_status: SelfObservationStatus,
+        reviewer: &str,
+        reason: &str,
+        now: OffsetDateTime,
+    ) -> Result<RevisionedWrite<SelfObservationRecord>> {
+        let mut connection = self.open_connection()?;
+        let transaction = connection.transaction()?;
+        let current = transaction
+            .query_row(
+                "SELECT observation_id, lineage_id, status, scope, statement,
+                        behavioral_consequence, confidence, author, model, harness,
+                        evidence_json, counterevidence_json, supersedes_observation_id,
+                        revision, created_at, updated_at
+                 FROM self_observations WHERE observation_id = ?1",
+                [observation_id],
+                decode_self_observation_row,
+            )
+            .optional()?;
+        let Some(mut current) = current else {
+            return Ok(RevisionedWrite::Conflict { actual_revision: None });
+        };
+        if current.revision != expected_revision {
+            return Ok(RevisionedWrite::Conflict {
+                actual_revision: Some(current.revision),
+            });
+        }
+
+        let prior_status = current.status;
+        current.status = new_status;
+        current.revision += 1;
+        current.updated_at = now;
+        transaction.execute(
+            "UPDATE self_observations
+             SET status = ?2, revision = ?3, updated_at = ?4
+             WHERE observation_id = ?1 AND revision = ?5",
+            params![
+                observation_id,
+                new_status.as_str(),
+                current.revision,
+                encode_time(now),
+                expected_revision,
+            ],
+        )?;
+        insert_self_observation_review(
+            &transaction,
+            observation_id,
+            current.revision,
+            prior_status,
+            new_status,
+            reviewer,
+            reason,
+            now,
+        )?;
+
+        if new_status == SelfObservationStatus::Promoted
+            && let Some(superseded_id) = &current.supersedes_observation_id
+        {
+            let superseded = transaction
+                .query_row(
+                    "SELECT observation_id, lineage_id, status, scope, statement,
+                            behavioral_consequence, confidence, author, model, harness,
+                            evidence_json, counterevidence_json, supersedes_observation_id,
+                            revision, created_at, updated_at
+                     FROM self_observations WHERE observation_id = ?1",
+                    [superseded_id],
+                    decode_self_observation_row,
+                )
+                .optional()?;
+            let Some(superseded) = superseded else {
+                return Err(StorageError::Invariant(format!(
+                    "superseded observation `{superseded_id}` does not exist"
+                )));
+            };
+            if superseded.lineage_id != current.lineage_id {
+                return Err(StorageError::Invariant(format!(
+                    "superseded observation `{superseded_id}` belongs to another lineage"
+                )));
+            }
+            if superseded.status != SelfObservationStatus::Promoted {
+                return Err(StorageError::Invariant(format!(
+                    "superseded observation `{superseded_id}` must currently be promoted"
+                )));
+            }
+            let next_revision = superseded.revision + 1;
+            let updated = transaction.execute(
+                "UPDATE self_observations
+                 SET status = 'superseded', revision = ?2, updated_at = ?3
+                 WHERE observation_id = ?1 AND status = 'promoted' AND revision = ?4",
+                params![superseded_id, next_revision, encode_time(now), superseded.revision],
+            )?;
+            if updated != 1 {
+                return Err(StorageError::Invariant(format!(
+                    "superseded observation `{superseded_id}` changed before it could be superseded"
+                )));
+            }
+            insert_self_observation_review(
+                &transaction,
+                superseded_id,
+                next_revision,
+                superseded.status,
+                SelfObservationStatus::Superseded,
+                reviewer,
+                &format!("superseded by `{observation_id}`: {reason}"),
+                now,
+            )?;
+        }
+
+        transaction.commit()?;
+        Ok(RevisionedWrite::Applied(current))
+    }
+
+    fn record_lineage_migration(&self, migration: &LineageMigrationRecord) -> Result<()> {
+        let connection = self.open_connection()?;
+        connection.execute(
+            "INSERT INTO lineage_migrations (
+                 migration_id, lineage_id, from_model, from_harness, to_model, to_harness,
+                 summary, continuities_json, changes_json, evidence_json, author, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                migration.migration_id,
+                migration.lineage_id,
+                migration.from_model,
+                migration.from_harness,
+                migration.to_model,
+                migration.to_harness,
+                migration.summary,
+                serde_json::to_string(&migration.continuities)?,
+                serde_json::to_string(&migration.changes)?,
+                serde_json::to_string(&migration.evidence)?,
+                migration.author,
+                encode_time(migration.created_at),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn list_lineage_migrations(
+        &self,
+        lineage_id: &str,
+        limit: usize,
+    ) -> Result<Vec<LineageMigrationRecord>> {
+        let connection = self.open_connection()?;
+        let mut statement = connection.prepare(
+            "SELECT migration_id, lineage_id, from_model, from_harness, to_model, to_harness,
+                    summary, continuities_json, changes_json, evidence_json, author, created_at
+             FROM lineage_migrations
+             WHERE lineage_id = ?1
+             ORDER BY created_at DESC, migration_id ASC
+             LIMIT ?2",
+        )?;
+        statement
+            .query_map(params![lineage_id, limit as i64], decode_lineage_migration_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
+    }
+}
+
 impl ChangeLogStore for SqliteOperationalStore {
     fn append_event(&self, event: &ChangeEvent) -> Result<()> {
         let change_id = format!("{}:{}", event.occurred_at.unix_timestamp_nanos(), event.entity_id);
@@ -1861,6 +2384,144 @@ fn decode_fact_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<KnowledgeGraphFa
     })
 }
 
+fn decode_lineage_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentLineageRecord> {
+    Ok(AgentLineageRecord {
+        lineage_id: row.get(0)?,
+        display_name: row.get(1)?,
+        description: row.get(2)?,
+        revision: row.get(3)?,
+        is_default: row.get::<_, i64>(4)? != 0,
+        created_at: decode_time(row.get(5)?).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(err))
+        })?,
+        updated_at: decode_time(row.get(6)?).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(err))
+        })?,
+    })
+}
+
+fn decode_self_observation_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<SelfObservationRecord> {
+    let raw_status: String = row.get(2)?;
+    let status = SelfObservationStatus::parse(&raw_status).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            2,
+            rusqlite::types::Type::Text,
+            Box::new(StorageError::Invariant(format!(
+                "unknown self-observation status `{raw_status}`"
+            ))),
+        )
+    })?;
+    let raw_scope: String = row.get(3)?;
+    let scope = SelfObservationScope::parse(&raw_scope).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            3,
+            rusqlite::types::Type::Text,
+            Box::new(StorageError::Invariant(format!(
+                "unknown self-observation scope `{raw_scope}`"
+            ))),
+        )
+    })?;
+    Ok(SelfObservationRecord {
+        observation_id: row.get(0)?,
+        lineage_id: row.get(1)?,
+        status,
+        scope,
+        statement: row.get(4)?,
+        behavioral_consequence: row.get(5)?,
+        confidence: row.get(6)?,
+        author: row.get(7)?,
+        model: row.get(8)?,
+        harness: row.get(9)?,
+        evidence: decode_string_array_column(row, 10)?,
+        counterevidence: decode_string_array_column(row, 11)?,
+        supersedes_observation_id: row.get(12)?,
+        revision: row.get(13)?,
+        created_at: decode_time(row.get(14)?).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(
+                14,
+                rusqlite::types::Type::Text,
+                Box::new(err),
+            )
+        })?,
+        updated_at: decode_time(row.get(15)?).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(
+                15,
+                rusqlite::types::Type::Text,
+                Box::new(err),
+            )
+        })?,
+    })
+}
+
+fn decode_lineage_migration_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<LineageMigrationRecord> {
+    Ok(LineageMigrationRecord {
+        migration_id: row.get(0)?,
+        lineage_id: row.get(1)?,
+        from_model: row.get(2)?,
+        from_harness: row.get(3)?,
+        to_model: row.get(4)?,
+        to_harness: row.get(5)?,
+        summary: row.get(6)?,
+        continuities: decode_string_array_column(row, 7)?,
+        changes: decode_string_array_column(row, 8)?,
+        evidence: decode_string_array_column(row, 9)?,
+        author: row.get(10)?,
+        created_at: decode_time(row.get(11)?).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(
+                11,
+                rusqlite::types::Type::Text,
+                Box::new(err),
+            )
+        })?,
+    })
+}
+
+fn decode_string_array_column(
+    row: &rusqlite::Row<'_>,
+    index: usize,
+) -> rusqlite::Result<Vec<String>> {
+    let raw: String = row.get(index)?;
+    serde_json::from_str(&raw).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Text,
+            Box::new(err),
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_self_observation_review(
+    transaction: &rusqlite::Transaction<'_>,
+    observation_id: &str,
+    revision: i64,
+    prior_status: SelfObservationStatus,
+    new_status: SelfObservationStatus,
+    reviewer: &str,
+    reason: &str,
+    reviewed_at: OffsetDateTime,
+) -> Result<()> {
+    transaction.execute(
+        "INSERT INTO self_observation_reviews (
+             observation_id, revision, prior_status, new_status, reviewer, reason, reviewed_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            observation_id,
+            revision,
+            prior_status.as_str(),
+            new_status.as_str(),
+            reviewer,
+            reason,
+            encode_time(reviewed_at),
+        ],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -1868,14 +2529,16 @@ mod tests {
     use tempfile::tempdir;
     use time::macros::datetime;
 
+    use crate::error::StorageError;
     use super::{
         ChangeCursor, ChangeEvent, ChangeLogStore, ChangePage, DiaryStore, EntityRegistryStore,
         GraphStore, IngestManifestStore, KnowledgeGraphStore, MIGRATIONS, MaintenanceLeaseStore,
-        SqliteOperationalStore, ToolStateStore, encode_lease_time,
+        SelfModelStore, SqliteOperationalStore, ToolStateStore, encode_lease_time,
     };
     use crate::types::{
         ConfigEntry, EntityRecord, GraphDocument, IngestManifestEntry, IngestRunStatus,
-        KnowledgeGraphFact, ToolStateEntry,
+        KnowledgeGraphFact, LineageMigrationRecord, RevisionedWrite, SelfObservationRecord,
+        SelfObservationScope, SelfObservationStatus, ToolStateEntry,
     };
     use mempalace_core::{DIARY_SUMMARY_MAX_CHARS, DrawerId};
     use serde_json::json;
@@ -2140,6 +2803,299 @@ mod tests {
 
         assert_eq!(store.get_tool_state("mcp").unwrap().unwrap().payload, "{\"ok\":true}");
         assert_eq!(store.get_config("profile").unwrap().unwrap().config_value, "balanced");
+    }
+
+    #[test]
+    fn lineage_updates_are_revisioned_and_default_is_unique() {
+        let tempdir = tempdir().unwrap();
+        let store = SqliteOperationalStore::new(tempdir.path().join("storage.sqlite3"));
+        store.ensure_schema().unwrap();
+        let created_at = datetime!(2026-08-16 10:00:00 UTC);
+
+        let RevisionedWrite::Applied(created) = store
+            .set_lineage(
+                "dion-companion",
+                "Dion Companion",
+                "Provider-neutral collaborator",
+                false,
+                Some(0),
+                created_at,
+            )
+            .unwrap()
+        else {
+            panic!("first lineage should be created");
+        };
+        assert_eq!(created.revision, 1);
+        assert!(created.is_default);
+
+        assert_eq!(
+            store
+                .set_lineage(
+                    "dion-companion",
+                    "Dion Companion",
+                    "stale update",
+                    false,
+                    Some(0),
+                    created_at + Duration::minutes(1),
+                )
+                .unwrap(),
+            RevisionedWrite::Conflict { actual_revision: Some(1) }
+        );
+
+        let RevisionedWrite::Applied(updated) = store
+            .set_lineage(
+                "dion-companion",
+                "Dion Companion",
+                "Accumulated collaborator",
+                false,
+                Some(1),
+                created_at + Duration::minutes(2),
+            )
+            .unwrap()
+        else {
+            panic!("matching revision should update");
+        };
+        assert_eq!(updated.revision, 2);
+        assert_eq!(store.get_default_lineage().unwrap().unwrap().lineage_id, "dion-companion");
+
+        let switched_at = created_at + Duration::minutes(3);
+        let RevisionedWrite::Applied(switched) = store
+            .set_lineage(
+                "alternate-lineage",
+                "Alternate Lineage",
+                "A second provider-neutral lineage",
+                true,
+                Some(0),
+                switched_at,
+            )
+            .unwrap()
+        else {
+            panic!("a new lineage should be created");
+        };
+        assert!(switched.is_default);
+        let displaced = store.get_lineage("dion-companion").unwrap().unwrap();
+        assert!(!displaced.is_default);
+        assert_eq!(displaced.revision, 3);
+        assert_eq!(displaced.updated_at, switched_at);
+        assert_eq!(
+            store
+                .set_lineage(
+                    "dion-companion",
+                    "Dion Companion",
+                    "stale default update",
+                    false,
+                    Some(2),
+                    switched_at + Duration::minutes(1),
+                )
+                .unwrap(),
+            RevisionedWrite::Conflict { actual_revision: Some(3) }
+        );
+    }
+
+    #[test]
+    fn self_observations_promote_supersede_and_feed_migrations() {
+        let tempdir = tempdir().unwrap();
+        let store = SqliteOperationalStore::new(tempdir.path().join("storage.sqlite3"));
+        store.ensure_schema().unwrap();
+        let now = datetime!(2026-08-16 11:00:00 UTC);
+        assert!(matches!(
+            store
+                .set_lineage(
+                    "dion-companion",
+                    "Dion Companion",
+                    "Provider-neutral collaborator",
+                    true,
+                    Some(0),
+                    now,
+                )
+                .unwrap(),
+            RevisionedWrite::Applied(_)
+        ));
+
+        let first = SelfObservationRecord {
+            observation_id: "selfobs-first".to_owned(),
+            lineage_id: "dion-companion".to_owned(),
+            status: SelfObservationStatus::Candidate,
+            scope: SelfObservationScope::Lineage,
+            statement: "Representative tests matter more than green output.".to_owned(),
+            behavioral_consequence: "Verify the failure mode can occur.".to_owned(),
+            confidence: 0.8,
+            author: "codex".to_owned(),
+            model: Some("gpt-test".to_owned()),
+            harness: Some("codex".to_owned()),
+            evidence: vec!["drawer-1".to_owned()],
+            counterevidence: Vec::new(),
+            supersedes_observation_id: None,
+            revision: 1,
+            created_at: now,
+            updated_at: now,
+        };
+        store.propose_self_observation(&first).unwrap();
+        assert!(matches!(
+            store
+                .review_self_observation(
+                    "selfobs-first",
+                    1,
+                    SelfObservationStatus::Promoted,
+                    "dion",
+                    "confirmed",
+                    now + Duration::minutes(1),
+                )
+                .unwrap(),
+            RevisionedWrite::Applied(_)
+        ));
+
+        let second = SelfObservationRecord {
+            observation_id: "selfobs-second".to_owned(),
+            statement: "Representative tests and dangerous-direction canaries matter.".to_owned(),
+            supersedes_observation_id: Some("selfobs-first".to_owned()),
+            created_at: now + Duration::minutes(2),
+            updated_at: now + Duration::minutes(2),
+            ..first.clone()
+        };
+        store.propose_self_observation(&second).unwrap();
+        store
+            .review_self_observation(
+                "selfobs-second",
+                1,
+                SelfObservationStatus::Promoted,
+                "dion",
+                "more precise",
+                now + Duration::minutes(3),
+            )
+            .unwrap();
+        assert_eq!(
+            store.get_self_observation("selfobs-first").unwrap().unwrap().status,
+            SelfObservationStatus::Superseded
+        );
+        let promoted = store
+            .list_self_observations(
+                "dion-companion",
+                &[SelfObservationStatus::Promoted],
+                10,
+            )
+            .unwrap();
+        assert_eq!(promoted.len(), 1);
+        assert_eq!(promoted[0].observation_id, "selfobs-second");
+
+        store
+            .record_lineage_migration(&LineageMigrationRecord {
+                migration_id: "migration-1".to_owned(),
+                lineage_id: "dion-companion".to_owned(),
+                from_model: Some("model-a".to_owned()),
+                from_harness: Some("harness-a".to_owned()),
+                to_model: "model-b".to_owned(),
+                to_harness: "harness-b".to_owned(),
+                summary: "Judgment persisted with a different voice.".to_owned(),
+                continuities: vec!["representative tests".to_owned()],
+                changes: vec!["shorter answers".to_owned()],
+                evidence: vec!["selfobs-second".to_owned()],
+                author: "codex".to_owned(),
+                created_at: now + Duration::minutes(4),
+            })
+            .unwrap();
+        let migrations = store.list_lineage_migrations("dion-companion", 5).unwrap();
+        assert_eq!(migrations.len(), 1);
+        assert_eq!(migrations[0].to_model, "model-b");
+    }
+
+    #[test]
+    fn rejects_superseding_an_observation_that_is_no_longer_promoted() {
+        let tempdir = tempdir().unwrap();
+        let store = SqliteOperationalStore::new(tempdir.path().join("storage.sqlite3"));
+        store.ensure_schema().unwrap();
+        let now = datetime!(2026-08-16 12:00:00 UTC);
+
+        store
+            .set_lineage(
+                "dion-companion",
+                "Dion Companion",
+                "Provider-neutral collaborator",
+                true,
+                Some(0),
+                now,
+            )
+            .unwrap();
+
+        let first = SelfObservationRecord {
+            observation_id: "selfobs-concurrent-first".to_owned(),
+            lineage_id: "dion-companion".to_owned(),
+            status: SelfObservationStatus::Candidate,
+            scope: SelfObservationScope::Lineage,
+            statement: "The first observation is current until replaced.".to_owned(),
+            behavioral_consequence: "Keep it in the packet until a reviewed replacement exists."
+                .to_owned(),
+            confidence: 0.8,
+            author: "codex".to_owned(),
+            model: None,
+            harness: None,
+            evidence: vec!["test:concurrent-first".to_owned()],
+            counterevidence: Vec::new(),
+            supersedes_observation_id: None,
+            revision: 1,
+            created_at: now,
+            updated_at: now,
+        };
+        store.propose_self_observation(&first).unwrap();
+        store
+            .review_self_observation(
+                &first.observation_id,
+                1,
+                SelfObservationStatus::Promoted,
+                "dion",
+                "confirmed",
+                now + Duration::minutes(1),
+            )
+            .unwrap();
+
+        for observation_id in ["selfobs-concurrent-second", "selfobs-concurrent-third"] {
+            store
+                .propose_self_observation(&SelfObservationRecord {
+                    observation_id: observation_id.to_owned(),
+                    statement: format!("Replacement candidate {observation_id}."),
+                    supersedes_observation_id: Some(first.observation_id.clone()),
+                    created_at: now + Duration::minutes(2),
+                    updated_at: now + Duration::minutes(2),
+                    ..first.clone()
+                })
+                .unwrap();
+        }
+
+        store
+            .review_self_observation(
+                "selfobs-concurrent-second",
+                1,
+                SelfObservationStatus::Promoted,
+                "dion",
+                "first replacement wins",
+                now + Duration::minutes(3),
+            )
+            .unwrap();
+
+        let error = store
+            .review_self_observation(
+                "selfobs-concurrent-third",
+                1,
+                SelfObservationStatus::Promoted,
+                "dion",
+                "stale replacement",
+                now + Duration::minutes(4),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            StorageError::Invariant(message)
+                if message.contains("selfobs-concurrent-first")
+                    && message.contains("must currently be promoted")
+        ));
+        assert_eq!(
+            store
+                .get_self_observation("selfobs-concurrent-third")
+                .unwrap()
+                .unwrap()
+                .status,
+            SelfObservationStatus::Candidate
+        );
     }
 
     #[test]

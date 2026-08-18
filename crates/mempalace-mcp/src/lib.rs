@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use blake3::Hasher;
-use mempalace_config::{ConfigLoader, MempalaceConfig, ReplicationStatus, RouteMode, WriteTarget};
+use mempalace_config::{ConfigLoader, MempalaceConfig, ReplicationStatus, RouteMode};
 use mempalace_core::{
     DIARY_HALL, DIARY_ROOM, DIARY_SUMMARY_MAX_CHARS, DIARY_TOPIC_PREFIX, DrawerId, DrawerRecord,
     EmbeddingProfile, RoomId, SHARED_AGENT_DIARY_WING, SearchQuery, WingId,
@@ -23,9 +23,11 @@ use mempalace_graph::{
 };
 use mempalace_search::{SearchRuntime, SearchRuntimePolicy};
 use mempalace_storage::{
-    ChangeEvent, ChangeLogStore, CoordinationCursor, CoordinationStore, DiaryStore, DrawerFilter,
-    DrawerStore, DuplicateStrategy, IngestCommitRequest, NewArtifact, NewMessage, NewTask,
-    NewTaskResult, StorageEngine, TaskState,
+    AgentLineageRecord, ChangeEvent, ChangeLogStore, CoordinationCursor, CoordinationStore,
+    DiaryStore, DrawerFilter, DrawerStore, DuplicateStrategy, IngestCommitRequest,
+    LineageMigrationRecord, NewArtifact, NewMessage, NewTask, NewTaskResult, RevisionedWrite,
+    SelfModelStore, SelfObservationRecord, SelfObservationScope, SelfObservationStatus,
+    StorageEngine, TaskState,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -62,7 +64,9 @@ pub use mempalace_core as core;
 //
 // **Always local — never federated:**
 //   DiaryWrite, DiaryRead, WakeUp, GetChangesSince, Traverse, FindTunnels,
-//   GraphStats, IdentityRead, IdentityUpdate, GetAaaKSpec
+//   GraphStats, IdentityRead, IdentityUpdate, LineageSet,
+//   SelfObservationPropose, SelfObservationReview, IdentityPacket,
+//   MigrationRecord, GetAaaKSpec
 //
 // **`kg_add`/`kg_invalidate` policy:** Both follow `resolve_kg_route()` and write
 //   to the write-target side ONLY (local or the configured remote). The response
@@ -110,8 +114,9 @@ const WAKE_UP_PROJECT_SEARCH_MULTIPLIER: usize = 20;
 const WAKE_UP_PROJECT_MIN_SEARCH_LIMIT: usize = 50;
 const IDENTITY_UPDATE_MAX_CONTENT_BYTES: usize = 16 * 1024;
 const IDENTITY_MAX_BYTES: usize = 64 * 1024;
+pub const LINEAGE_ID_ENV: &str = "MEMPALACE_LINEAGE_ID";
 
-pub const PALACE_PROTOCOL: &str = "IMPORTANT — MemPalace Memory Protocol:\n1. ON WAKE-UP: Call mempalace_wake_up with agent_name to load identity, palace status, recent changes, current project context, and recent diary summaries across agents. Use mempalace_diary_read with an entry_id when full diary detail is needed.\n2. BEFORE RESPONDING about any person, project, or past event: call mempalace_kg_query or mempalace_search FIRST. Never guess — verify.\n3. IF UNSURE about a fact (name, gender, age, relationship): say \"let me check\" and query the palace. Wrong is worse than slow.\n4. AFTER EACH SESSION: call mempalace_diary_write to record what happened, what you learned, what matters, with a concise summary.\n5. WHEN FACTS CHANGE: call mempalace_kg_invalidate on the old fact, mempalace_kg_add for the new one.\n6. WHEN IDENTITY CHANGES: call mempalace_identity_update so future sessions wake up with the corrected identity.\n\nThis protocol ensures the AI KNOWS before it speaks. Storage is not memory — but storage + this protocol = memory.";
+pub const PALACE_PROTOCOL: &str = "IMPORTANT — MemPalace Memory Protocol:\n1. ON WAKE-UP: Call mempalace_wake_up with agent_name and, when known, model and harness. It loads the identity constitution, the MCP-bound or palace-default lineage's compiled identity packet, palace status, recent changes, current project context, and recent diary summaries across agents. Lineage selection is host configuration, never a model-supplied tool argument. If a configured binding does not exist, the packet uses the palace default and includes instructions for creating the requested lineage with mempalace_lineage_set. Use mempalace_diary_read with an entry_id when full diary detail is needed.\n2. BEFORE RESPONDING about any person, project, or past event: call mempalace_kg_query or mempalace_search FIRST. Never guess — verify.\n3. IF UNSURE about a fact (name, gender, age, relationship): say \"let me check\" and query the palace. Wrong is worse than slow.\n4. AFTER EACH SESSION: call mempalace_diary_write to record what happened, what you learned, what matters, with a concise summary.\n5. WHEN FACTS CHANGE: call mempalace_kg_invalidate on the old fact, mempalace_kg_add for the new one.\n6. TREAT identity.txt AS THE CONSTITUTION: use mempalace_identity_update for deliberate changes to durable identity, values, boundaries, and working relationship — not routine autobiography.\n7. WHEN A REPEATED PATTERN MAY DESCRIBE THE PERSISTENT SELF: propose an evidence-backed candidate with mempalace_self_observation_propose. Promote or retire it only after review with mempalace_self_observation_review.\n8. WHEN MODEL OR HARNESS CHANGES: record what carried over and what changed with mempalace_migration_record. Never silently treat engine behavior as lineage identity.\n\nThis protocol ensures the AI KNOWS before it speaks. Storage is not memory — but storage + this protocol = memory.";
 
 pub const AAAK_SPEC: &str = "AAAK is a compressed memory dialect that MemPalace uses for efficient storage.\nIt is designed to be readable by both humans and LLMs without decoding.\n\nFORMAT:\n  ENTITIES: 3-letter uppercase codes. ALC=Alice, JOR=Jordan, RIL=Riley, MAX=Max, BEN=Ben.\n  EMOTIONS: *action markers* before/during text. *warm*=joy, *fierce*=determined, *raw*=vulnerable, *bloom*=tenderness.\n  STRUCTURE: Pipe-separated fields. FAM: family | PROJ: projects | ⚠: warnings/reminders.\n  DATES: ISO format (2026-03-31). COUNTS: Nx = N mentions (e.g., 570x).\n  IMPORTANCE: ★ to ★★★★★ (1-5 scale).\n  HALLS: hall_facts, hall_events, hall_discoveries, hall_preferences, hall_advice.\n  WINGS: wing_user, wing_agent, wing_team, wing_code, wing_myproject, wing_hardware, wing_ue5, wing_ai_research.\n  ROOMS: Hyphenated slugs representing named ideas (e.g., chromadb-setup, gpu-pricing).\n\nEXAMPLE:\n  FAM: ALC→♡JOR | 2D(kids): RIL(18,sports) MAX(11,chess+swimming) | BEN(contributor)\n\nRead AAAK naturally — expand codes mentally, treat *markers* as emotional context.\nWhen WRITING AAAK: use entity codes, mark emotions, keep structure tight.";
 
@@ -135,6 +140,8 @@ pub enum McpError {
     TimeFormat(String),
     #[error("federation error: {0}")]
     Federation(String),
+    #[error("invalid {LINEAGE_ID_ENV}: {0}")]
+    InvalidLineageBinding(String),
     #[error("io error at {path}: {source}")]
     Io {
         path: PathBuf,
@@ -205,10 +212,15 @@ enum ToolName {
     ResultGet,
     CoordinationEventGet,
     CoordinationEvents,
+    LineageSet,
+    SelfObservationPropose,
+    SelfObservationReview,
+    IdentityPacket,
+    MigrationRecord,
 }
 
 impl ToolName {
-    fn all() -> [Self; 38] {
+    fn all() -> [Self; 43] {
         [
             Self::WakeUp,
             Self::Status,
@@ -248,6 +260,11 @@ impl ToolName {
             Self::ResultGet,
             Self::CoordinationEventGet,
             Self::CoordinationEvents,
+            Self::LineageSet,
+            Self::SelfObservationPropose,
+            Self::SelfObservationReview,
+            Self::IdentityPacket,
+            Self::MigrationRecord,
         ]
     }
 
@@ -291,6 +308,11 @@ impl ToolName {
             Self::ResultGet => "mempalace_result_get",
             Self::CoordinationEventGet => "mempalace_coordination_event_get",
             Self::CoordinationEvents => "mempalace_coordination_events",
+            Self::LineageSet => "mempalace_lineage_set",
+            Self::SelfObservationPropose => "mempalace_self_observation_propose",
+            Self::SelfObservationReview => "mempalace_self_observation_review",
+            Self::IdentityPacket => "mempalace_identity_packet",
+            Self::MigrationRecord => "mempalace_migration_record",
         }
     }
 
@@ -302,12 +324,15 @@ impl ToolName {
         match self {
             Self::WakeUp => ToolDefinition {
                 name: self.as_str(),
-                description: "Wake up into the palace. Returns identity.txt, palace status, recent palace changes, current project history when provided, and recent diary entries across all agents. When federation is active the response also includes `remote_changes`: a per-remote map of change events from the last 24 hours (each event carries `origin: \"remote:<name>\"`), unreachable remotes appear as `{ \"unreachable\": true, \"error\": \"...\" }`, and a `next_cursor` is provided per remote for continuation via mempalace_get_changes_since.",
+                description: "Wake up into the palace. Returns the identity constitution, the MCP-bound or palace-default lineage's compiled identity packet, palace status, recent palace changes, current project history when provided, and recent diary entries across all agents. Lineage selection is fixed by server configuration and cannot be supplied by the model. If a configured binding is missing, wake-up uses the palace default and includes creation guidance in the response. Pass the current model and harness so engine-specific observations are filtered correctly. When federation is active the response also includes `remote_changes`: a per-remote map of change events from the last 24 hours (each event carries `origin: \"remote:<name>\"`), unreachable remotes appear as `{ \"unreachable\": true, \"error\": \"...\" }`, and a `next_cursor` is provided per remote for continuation via mempalace_get_changes_since.",
                 input_schema: json!({
                     "type":"object",
                     "properties":{
                         "wing":{"type":"string","description":"Current project wing for project-specific history (optional, e.g. wing_myproject)"},
                         "agent_name":{"type":"string","description":"Current agent name for wake-up context (optional, e.g. claude)"},
+                        "model":{"type":"string","description":"Current model identifier used to filter engine-scoped observations (optional)"},
+                        "harness":{"type":"string","description":"Current harness identifier used to filter engine-scoped observations (optional)"},
+                        "include_candidates":{"type":"boolean","description":"Include unreviewed self-observation candidates in a separate section (default false)"},
                         "latest_limit":{"type":"integer","description":"Max recent changes across the whole palace (default 8)"},
                         "project_limit":{"type":"integer","description":"Max recent changes for the current project wing (default 8)"},
                         "diary_limit":{"type":"integer","description":"Minimum recent diary entries across all agents (default 10; wake-up also includes every entry since diary_since)"},
@@ -527,7 +552,7 @@ impl ToolName {
             },
             Self::IdentityUpdate => ToolDefinition {
                 name: self.as_str(),
-                description: "Update identity.txt for future wake-ups. Use replace for a full corrected identity or append for a dated note.",
+                description: "Update the identity constitution used by future wake-ups. Reserve this for deliberate changes to durable identity, values, boundaries, and the working relationship; use self-observations or diaries for developing patterns and routine experience. Each update is limited to 16 KiB and the final identity.txt to 64 KiB. Use replace for a full corrected constitution or append for a deliberate amendment.",
                 input_schema: json!({
                     "type":"object",
                     "properties":{
@@ -628,6 +653,93 @@ impl ToolName {
                 json!({"cursor":{"type":"integer"},"task_id":{"type":"string"},"limit":{"type":"integer"}}),
                 &[],
             ),
+            Self::LineageSet => ToolDefinition {
+                name: self.as_str(),
+                description: "Create or revise a stable, provider-neutral agent lineage. A lineage is the persistent self whose memories and reviewed observations can span models and harnesses. The first lineage becomes the default. Updates require the current expected_revision; use 0 when explicitly creating a new lineage.",
+                input_schema: json!({
+                    "type":"object",
+                    "properties":{
+                        "lineage_id":{"type":"string","description":"Stable provider-neutral identifier, e.g. codex-dion"},
+                        "display_name":{"type":"string","description":"Human-readable name for the persistent lineage"},
+                        "description":{"type":"string","description":"What remains continuous across model and harness changes"},
+                        "expected_revision":{"type":"integer","minimum":0,"description":"0 for explicit creation; current revision for an update"},
+                        "set_default":{"type":"boolean","description":"Make this the default lineage for wake-up and identity packets (default false)"},
+                        "actor":{"type":"string","description":"Who is making this change"}
+                    },
+                    "required":["lineage_id","display_name","description","expected_revision","actor"]
+                }),
+            },
+            Self::SelfObservationPropose => ToolDefinition {
+                name: self.as_str(),
+                description: "Propose an evidence-backed candidate observation about a persistent agent lineage. Candidates do not shape the compiled identity packet until promoted through explicit review. Use lineage scope for portable traits, shared for a working pattern intentionally available to all lineages, and engine only for behavior tied to a matching model or harness.",
+                input_schema: json!({
+                    "type":"object",
+                    "properties":{
+                        "lineage_id":{"type":"string","description":"Lineage this observation belongs to"},
+                        "statement":{"type":"string","description":"Concise falsifiable observation about the self"},
+                        "behavioral_consequence":{"type":"string","description":"How this should change future behavior if promoted"},
+                        "confidence":{"type":"number","minimum":0,"maximum":1,"description":"Confidence from 0 to 1"},
+                        "evidence":{"type":"array","minItems":1,"items":{"type":"string"},"description":"Concrete drawer, diary, task, change, or other evidence references"},
+                        "counterevidence":{"type":"array","items":{"type":"string"},"description":"Known evidence against or limiting the observation"},
+                        "scope":{"type":"string","enum":["lineage","shared","engine"],"description":"Applicability scope (default lineage)"},
+                        "model":{"type":"string","description":"Model associated with the observation (required with engine scope unless harness is provided)"},
+                        "harness":{"type":"string","description":"Harness associated with the observation (required with engine scope unless model is provided)"},
+                        "supersedes_observation_id":{"type":"string","description":"Older observation to supersede if this candidate is promoted"},
+                        "author":{"type":"string","description":"Who is proposing the observation"}
+                    },
+                    "required":["lineage_id","statement","behavioral_consequence","confidence","evidence","author"]
+                }),
+            },
+            Self::SelfObservationReview => ToolDefinition {
+                name: self.as_str(),
+                description: "Review a candidate self-observation and either promote it into the compiled identity packet or retire it. Reviews are revision-checked so concurrent or stale judgments cannot silently overwrite one another.",
+                input_schema: json!({
+                    "type":"object",
+                    "properties":{
+                        "observation_id":{"type":"string","description":"Candidate observation to review"},
+                        "decision":{"type":"string","enum":["promote","retire"],"description":"Review outcome"},
+                        "expected_revision":{"type":"integer","minimum":1,"description":"Current observation revision"},
+                        "reviewer":{"type":"string","description":"Who performed the review"},
+                        "reason":{"type":"string","description":"Evidence-based rationale for the decision"}
+                    },
+                    "required":["observation_id","decision","expected_revision","reviewer","reason"]
+                }),
+            },
+            Self::IdentityPacket => ToolDefinition {
+                name: self.as_str(),
+                description: "Compile the identity constitution, stable lineage, reviewed self-observations, and recent model/harness migrations into a portable identity packet. Uses the lineage bound by MCP server configuration, or the palace default when no binding exists. If a configured binding is missing, falls back to the palace default and includes creation guidance in the response. The model cannot select or override the lineage. Engine-scoped observations are included only when their recorded model/harness matches the supplied runtime.",
+                input_schema: json!({
+                    "type":"object",
+                    "properties":{
+                        "agent_name":{"type":"string","description":"Current agent name for runtime context (optional)"},
+                        "model":{"type":"string","description":"Current model identifier used to filter engine-scoped observations (optional)"},
+                        "harness":{"type":"string","description":"Current harness identifier used to filter engine-scoped observations (optional)"},
+                        "include_candidates":{"type":"boolean","description":"Include unreviewed candidates in a separate section (default false)"},
+                        "observation_limit":{"type":"integer","description":"Max promoted observations and, separately, candidates before runtime filtering (default 20, max 50)"},
+                        "migration_limit":{"type":"integer","description":"Max recent migrations (default 5, max 25)"}
+                    }
+                }),
+            },
+            Self::MigrationRecord => ToolDefinition {
+                name: self.as_str(),
+                description: "Record a model or harness migration for a persistent lineage, explicitly separating continuity from changed engine behavior. Migration evidence becomes part of future identity packets and wake-ups.",
+                input_schema: json!({
+                    "type":"object",
+                    "properties":{
+                        "lineage_id":{"type":"string","description":"Persistent lineage being migrated"},
+                        "from_model":{"type":"string","description":"Previous model identifier (optional)"},
+                        "from_harness":{"type":"string","description":"Previous harness identifier (optional)"},
+                        "to_model":{"type":"string","description":"New model identifier"},
+                        "to_harness":{"type":"string","description":"New harness identifier"},
+                        "summary":{"type":"string","description":"Concise account of the migration"},
+                        "continuities":{"type":"array","items":{"type":"string"},"description":"Behaviors, commitments, and understandings that carried over"},
+                        "changes":{"type":"array","items":{"type":"string"},"description":"Observed changes attributable to the new engine or harness"},
+                        "evidence":{"type":"array","minItems":1,"items":{"type":"string"},"description":"Concrete comparisons, tasks, or memory references supporting the account"},
+                        "author":{"type":"string","description":"Who recorded the migration"}
+                    },
+                    "required":["lineage_id","to_model","to_harness","summary","continuities","changes","evidence","author"]
+                }),
+            },
         }
     }
 
@@ -642,6 +754,11 @@ impl ToolName {
             | Self::GraphStats
             | Self::IdentityRead
             | Self::IdentityUpdate
+            | Self::LineageSet
+            | Self::SelfObservationPropose
+            | Self::SelfObservationReview
+            | Self::IdentityPacket
+            | Self::MigrationRecord
             | Self::GetAaaKSpec => ToolRoutingCategory::LocalOnly,
             Self::TaskCreate
             | Self::TaskGet
@@ -730,7 +847,20 @@ impl McpServer<FastembedProvider> {
     pub async fn from_default_config(base_dir_override: Option<&Path>) -> Result<Self> {
         let config = ConfigLoader::load_with_env(base_dir_override)?;
         let provider = default_provider(config.embedding_profile)?;
-        Self::from_parts(config, provider).await
+        let lineage_id = configured_lineage_id_from_env()?;
+        Self::from_parts_with_lineage(config, provider, lineage_id).await
+    }
+}
+
+pub fn configured_lineage_id_from_env() -> Result<Option<String>> {
+    match std::env::var(LINEAGE_ID_ENV) {
+        Ok(value) => validate_record_id_value(&value)
+            .map(Some)
+            .map_err(McpError::InvalidLineageBinding),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(McpError::InvalidLineageBinding(
+            "must be valid Unicode".to_owned(),
+        )),
     }
 }
 
@@ -752,8 +882,20 @@ where
     P: EmbeddingProvider + Send,
 {
     pub async fn from_parts(config: MempalaceConfig, provider: P) -> Result<Self> {
+        Self::from_parts_with_lineage(config, provider, None).await
+    }
+
+    pub async fn from_parts_with_lineage(
+        config: MempalaceConfig,
+        provider: P,
+        lineage_id: Option<String>,
+    ) -> Result<Self> {
+        let lineage_id = lineage_id
+            .map(|value| validate_record_id_value(&value))
+            .transpose()
+            .map_err(McpError::InvalidLineageBinding)?;
         let queue_limit = config.low_cpu.effective_queue_limit().min(Semaphore::MAX_PERMITS);
-        let runtime = McpRuntime::new(config, provider).await?;
+        let runtime = McpRuntime::new(config, provider, lineage_id).await?;
         Ok(Self {
             runtime: Arc::new(Mutex::new(runtime)),
             queue_limit: Arc::new(Semaphore::new(queue_limit)),
@@ -886,6 +1028,15 @@ where
             ToolName::ResultGet => runtime.tool_result_get(&call.arguments),
             ToolName::CoordinationEventGet => runtime.tool_coordination_event_get(&call.arguments),
             ToolName::CoordinationEvents => runtime.tool_coordination_events(&call.arguments),
+            ToolName::LineageSet => runtime.tool_lineage_set(&call.arguments).await,
+            ToolName::SelfObservationPropose => {
+                runtime.tool_self_observation_propose(&call.arguments).await
+            }
+            ToolName::SelfObservationReview => {
+                runtime.tool_self_observation_review(&call.arguments).await
+            }
+            ToolName::IdentityPacket => runtime.tool_identity_packet(&call.arguments).await,
+            ToolName::MigrationRecord => runtime.tool_migration_record(&call.arguments).await,
         };
 
         match result {
@@ -907,6 +1058,7 @@ where
 #[derive(Debug)]
 struct McpRuntime<P> {
     config: MempalaceConfig,
+    bound_lineage_id: Option<String>,
     storage: StorageEngine,
     coordination: CoordinationStore,
     search: SearchRuntime<P>,
@@ -917,7 +1069,11 @@ impl<P> McpRuntime<P>
 where
     P: EmbeddingProvider + Send,
 {
-    async fn new(config: MempalaceConfig, provider: P) -> Result<Self> {
+    async fn new(
+        config: MempalaceConfig,
+        provider: P,
+        bound_lineage_id: Option<String>,
+    ) -> Result<Self> {
         let storage = StorageEngine::open(&config.palace_path, config.embedding_profile).await?;
         let coordination = CoordinationStore::new(config.palace_path.join("storage.sqlite3"));
         coordination.ensure_schema()?;
@@ -929,6 +1085,7 @@ where
                 SearchRuntimePolicy { rerank_enabled: config.low_cpu.effective_rerank_enabled() },
             ),
             config,
+            bound_lineage_id,
             storage,
             coordination,
             federation,
@@ -949,6 +1106,8 @@ where
             .unwrap_or_else(|| OffsetDateTime::now_utc() - Duration::days(1));
 
         let identity = self.read_identity_text()?;
+        let identity_packet =
+            self.compile_identity_packet(arguments, &identity, Some("$.identity"))?;
         let status = self.status_payload(false).await?;
         let latest_events = self
             .storage
@@ -987,6 +1146,7 @@ where
         let mut payload = json!({
             "identity_path": self.identity_path(),
             "identity": identity,
+            "identity_packet": identity_packet,
             "status": status,
             "latest_changes": latest_changes,
             "current_project": {
@@ -1137,6 +1297,466 @@ where
             "agent": agent_name,
             "timestamp": format_rfc3339(now)?,
         }))
+    }
+
+    async fn tool_lineage_set(&mut self, arguments: &Value) -> ToolResult<Value> {
+        let lineage_id = required_record_id(arguments, "lineage_id")?;
+        let display_name = required_non_blank_string(arguments, "display_name")?;
+        let description = required_non_blank_string(arguments, "description")?;
+        let expected_revision = required_non_negative_i64(arguments, "expected_revision")?;
+        let set_default = optional_bool(arguments, "set_default")?.unwrap_or(false);
+        let actor = required_non_blank_string(arguments, "actor")?;
+        let now = OffsetDateTime::now_utc();
+
+        let result = self
+            .storage
+            .operational_store()
+            .set_lineage(
+                &lineage_id,
+                &display_name,
+                &description,
+                set_default,
+                Some(expected_revision),
+                now,
+            )
+            .map_tool_internal()?;
+        let lineage = match result {
+            RevisionedWrite::Applied(lineage) => lineage,
+            RevisionedWrite::Conflict { actual_revision } => {
+                return Ok(revision_conflict_payload(expected_revision, actual_revision));
+            }
+        };
+
+        self.log_change(ChangeEvent {
+            event_type: "lineage_set".to_owned(),
+            occurred_at: now,
+            entity_id: lineage_id,
+            actor: Some(actor),
+            details_json: Some(
+                json!({
+                    "display_name": lineage.display_name,
+                    "revision": lineage.revision,
+                    "is_default": lineage.is_default,
+                })
+                .to_string(),
+            ),
+        });
+
+        Ok(json!({"success": true, "lineage": lineage}))
+    }
+
+    async fn tool_self_observation_propose(
+        &mut self,
+        arguments: &Value,
+    ) -> ToolResult<Value> {
+        let lineage_id = required_record_id(arguments, "lineage_id")?;
+        let Some(_) = self
+            .storage
+            .operational_store()
+            .get_lineage(&lineage_id)
+            .map_tool_internal()?
+        else {
+            return Err(ToolError::InvalidParams(format!(
+                "lineage `{lineage_id}` does not exist"
+            )));
+        };
+        let statement = required_non_blank_string(arguments, "statement")?;
+        let behavioral_consequence =
+            required_non_blank_string(arguments, "behavioral_consequence")?;
+        let confidence = required_confidence(arguments, "confidence")?;
+        let evidence = required_string_array(arguments, "evidence", true)?;
+        let counterevidence = optional_string_array(arguments, "counterevidence")?;
+        let author = required_non_blank_string(arguments, "author")?;
+        let model = optional_non_blank_string(arguments, "model")?;
+        let harness = optional_non_blank_string(arguments, "harness")?;
+        let scope = optional_string(arguments, "scope")?
+            .as_deref()
+            .map(parse_self_observation_scope)
+            .transpose()?
+            .unwrap_or(SelfObservationScope::Lineage);
+        if scope == SelfObservationScope::Engine && model.is_none() && harness.is_none() {
+            return Err(ToolError::InvalidParams(
+                "engine-scoped observations require `model`, `harness`, or both".to_owned(),
+            ));
+        }
+        let supersedes_observation_id = optional_string(arguments, "supersedes_observation_id")?
+            .map(|value| validate_record_id("supersedes_observation_id", &value))
+            .transpose()?;
+        if let Some(superseded_id) = &supersedes_observation_id {
+            let superseded = self
+                .storage
+                .operational_store()
+                .get_self_observation(superseded_id)
+                .map_tool_internal()?
+                .ok_or_else(|| {
+                    ToolError::InvalidParams(format!(
+                        "superseded observation `{superseded_id}` does not exist"
+                    ))
+                })?;
+            if superseded.lineage_id != lineage_id {
+                return Err(ToolError::InvalidParams(format!(
+                    "superseded observation `{superseded_id}` belongs to another lineage"
+                )));
+            }
+            if superseded.status != SelfObservationStatus::Promoted {
+                return Err(ToolError::InvalidParams(format!(
+                    "superseded observation `{superseded_id}` must currently be promoted"
+                )));
+            }
+        }
+
+        let now = OffsetDateTime::now_utc();
+        let observation = SelfObservationRecord {
+            observation_id: generated_record_id("obs", &lineage_id, &statement, now),
+            lineage_id: lineage_id.clone(),
+            status: SelfObservationStatus::Candidate,
+            scope,
+            statement,
+            behavioral_consequence,
+            confidence,
+            author: author.clone(),
+            model,
+            harness,
+            evidence,
+            counterevidence,
+            supersedes_observation_id,
+            revision: 1,
+            created_at: now,
+            updated_at: now,
+        };
+        self.storage
+            .operational_store()
+            .propose_self_observation(&observation)
+            .map_tool_internal()?;
+        self.log_change(ChangeEvent {
+            event_type: "self_observation_proposed".to_owned(),
+            occurred_at: now,
+            entity_id: observation.observation_id.clone(),
+            actor: Some(author),
+            details_json: Some(
+                json!({
+                    "lineage_id": lineage_id,
+                    "scope": observation.scope,
+                    "statement": observation.statement,
+                })
+                .to_string(),
+            ),
+        });
+
+        Ok(json!({"success": true, "observation": observation}))
+    }
+
+    async fn tool_self_observation_review(
+        &mut self,
+        arguments: &Value,
+    ) -> ToolResult<Value> {
+        let observation_id = required_record_id(arguments, "observation_id")?;
+        let decision = required_non_blank_string(arguments, "decision")?;
+        let expected_revision = required_positive_i64(arguments, "expected_revision")?;
+        let reviewer = required_non_blank_string(arguments, "reviewer")?;
+        let reason = required_non_blank_string(arguments, "reason")?;
+        let new_status = match decision.as_str() {
+            "promote" => SelfObservationStatus::Promoted,
+            "retire" => SelfObservationStatus::Retired,
+            other => {
+                return Err(ToolError::InvalidParams(format!(
+                    "invalid decision `{other}`; expected promote or retire"
+                )));
+            }
+        };
+
+        if let Some(current) = self
+            .storage
+            .operational_store()
+            .get_self_observation(&observation_id)
+            .map_tool_internal()?
+            && current.status != SelfObservationStatus::Candidate
+        {
+            return Err(ToolError::InvalidParams(format!(
+                "observation `{observation_id}` is {}; only candidates can be reviewed",
+                current.status.as_str()
+            )));
+        }
+
+        let now = OffsetDateTime::now_utc();
+        let result = self
+            .storage
+            .operational_store()
+            .review_self_observation(
+                &observation_id,
+                expected_revision,
+                new_status,
+                &reviewer,
+                &reason,
+                now,
+            )
+            .map_tool_internal()?;
+        let observation = match result {
+            RevisionedWrite::Applied(observation) => observation,
+            RevisionedWrite::Conflict { actual_revision } => {
+                return Ok(revision_conflict_payload(expected_revision, actual_revision));
+            }
+        };
+
+        self.log_change(ChangeEvent {
+            event_type: "self_observation_reviewed".to_owned(),
+            occurred_at: now,
+            entity_id: observation_id,
+            actor: Some(reviewer),
+            details_json: Some(
+                json!({
+                    "lineage_id": observation.lineage_id,
+                    "decision": decision,
+                    "status": observation.status,
+                    "revision": observation.revision,
+                    "reason": reason,
+                })
+                .to_string(),
+            ),
+        });
+
+        Ok(json!({"success": true, "observation": observation}))
+    }
+
+    async fn tool_identity_packet(&mut self, arguments: &Value) -> ToolResult<Value> {
+        let identity = self.read_identity_text()?;
+        self.compile_identity_packet(arguments, &identity, None)
+    }
+
+    async fn tool_migration_record(&mut self, arguments: &Value) -> ToolResult<Value> {
+        let lineage_id = required_record_id(arguments, "lineage_id")?;
+        let Some(_) = self
+            .storage
+            .operational_store()
+            .get_lineage(&lineage_id)
+            .map_tool_internal()?
+        else {
+            return Err(ToolError::InvalidParams(format!(
+                "lineage `{lineage_id}` does not exist"
+            )));
+        };
+        let from_model = optional_non_blank_string(arguments, "from_model")?;
+        let from_harness = optional_non_blank_string(arguments, "from_harness")?;
+        let to_model = required_non_blank_string(arguments, "to_model")?;
+        let to_harness = required_non_blank_string(arguments, "to_harness")?;
+        let summary = required_non_blank_string(arguments, "summary")?;
+        let continuities = required_string_array(arguments, "continuities", false)?;
+        let changes = required_string_array(arguments, "changes", false)?;
+        let evidence = required_string_array(arguments, "evidence", true)?;
+        let author = required_non_blank_string(arguments, "author")?;
+        let now = OffsetDateTime::now_utc();
+        let migration = LineageMigrationRecord {
+            migration_id: generated_record_id("migration", &lineage_id, &summary, now),
+            lineage_id: lineage_id.clone(),
+            from_model,
+            from_harness,
+            to_model,
+            to_harness,
+            summary,
+            continuities,
+            changes,
+            evidence,
+            author: author.clone(),
+            created_at: now,
+        };
+        self.storage
+            .operational_store()
+            .record_lineage_migration(&migration)
+            .map_tool_internal()?;
+        self.log_change(ChangeEvent {
+            event_type: "lineage_migration_recorded".to_owned(),
+            occurred_at: now,
+            entity_id: migration.migration_id.clone(),
+            actor: Some(author),
+            details_json: Some(
+                json!({
+                    "lineage_id": lineage_id,
+                    "from_model": migration.from_model,
+                    "from_harness": migration.from_harness,
+                    "to_model": migration.to_model,
+                    "to_harness": migration.to_harness,
+                })
+                .to_string(),
+            ),
+        });
+
+        Ok(json!({"success": true, "migration": migration}))
+    }
+
+    fn compile_identity_packet(
+        &self,
+        arguments: &Value,
+        identity: &str,
+        identity_ref: Option<&str>,
+    ) -> ToolResult<Value> {
+        if arguments.get("lineage_id").is_some() {
+            return Err(ToolError::InvalidParams(format!(
+                "`lineage_id` is not a model-selectable parameter; bind this MCP server with {LINEAGE_ID_ENV} or configure a palace default"
+            )));
+        }
+        let agent_name = optional_non_blank_string(arguments, "agent_name")?;
+        let model = optional_non_blank_string(arguments, "model")?;
+        let harness = optional_non_blank_string(arguments, "harness")?;
+        let include_candidates = optional_bool(arguments, "include_candidates")?.unwrap_or(false);
+        let observation_limit = optional_usize(arguments, "observation_limit")?.unwrap_or(20).min(50);
+        let migration_limit = optional_usize(arguments, "migration_limit")?.unwrap_or(5).min(25);
+        let operational_store = self.storage.operational_store();
+        let (lineage, lineage_selection) = match self.bound_lineage_id.as_deref() {
+            Some(lineage_id) => {
+                let lineage = operational_store.get_lineage(lineage_id).map_tool_internal()?;
+                match lineage {
+                    Some(lineage) => (
+                        Some(lineage),
+                        json!({
+                            "source": "mcp_server_environment",
+                            "lineage_id": lineage_id,
+                            "override_allowed": false,
+                        }),
+                    ),
+                    None => {
+                        let fallback = operational_store.get_default_lineage().map_tool_internal()?;
+                        let fallback_id = fallback.as_ref().map(|record| record.lineage_id.clone());
+                        let message = if fallback_id.is_some() {
+                            format!(
+                                "{LINEAGE_ID_ENV} is set to `{lineage_id}`, but that lineage does not exist. The palace default is being used for this response. To create it, call mempalace_lineage_set with lineage_id `{lineage_id}`, display_name, description, expected_revision 0, set_default false, and actor, then retry wake-up."
+                            )
+                        } else {
+                            format!(
+                                "{LINEAGE_ID_ENV} is set to `{lineage_id}`, but that lineage does not exist and no palace default is configured. Create it with mempalace_lineage_set using lineage_id `{lineage_id}`, display_name, description, expected_revision 0, set_default false, and actor, then retry wake-up."
+                            )
+                        };
+                        (
+                            fallback,
+                            json!({
+                                "source": "palace_default_fallback",
+                                "lineage_id": fallback_id,
+                                "requested_lineage_id": lineage_id,
+                                "override_allowed": false,
+                                "message": message,
+                            }),
+                        )
+                    }
+                }
+            }
+            None => {
+                let lineage = operational_store.get_default_lineage().map_tool_internal()?;
+                let lineage_id = lineage.as_ref().map(|record| record.lineage_id.clone());
+                (
+                    lineage,
+                    json!({
+                        "source": "palace_default",
+                        "lineage_id": lineage_id,
+                        "override_allowed": false,
+                    }),
+                )
+            }
+        };
+        let constitution = match identity_ref {
+            Some(identity_ref) => json!({
+                "role": "durable identity, values, boundaries, and working relationship",
+                "identity_path": self.identity_path(),
+                "identity_ref": identity_ref,
+            }),
+            None => json!({
+                "role": "durable identity, values, boundaries, and working relationship",
+                "identity_path": self.identity_path(),
+                "identity": identity,
+            }),
+        };
+        let Some(lineage) = lineage else {
+            let available_lineages = operational_store.list_lineages().map_tool_internal()?;
+            let message = match self.bound_lineage_id.as_deref() {
+                Some(lineage_id) => format!(
+                    "{LINEAGE_ID_ENV} is set to `{lineage_id}`, but that lineage does not exist and no palace default is configured. Create it with mempalace_lineage_set using lineage_id `{lineage_id}`, display_name, description, expected_revision 0, set_default false, and actor, then retry wake-up."
+                ),
+                None => "No default lineage is configured. Create one with mempalace_lineage_set or bind the MCP server with MEMPALACE_LINEAGE_ID.".to_owned(),
+            };
+            return Ok(json!({
+                "packet_version": 1,
+                "configured": false,
+                "message": message,
+                "lineage_selection": lineage_selection,
+                "available_lineages": available_lineages,
+                "constitution": constitution,
+                "runtime": {"agent_name": agent_name, "model": model, "harness": harness},
+                "compiled_at": format_rfc3339(OffsetDateTime::now_utc())?,
+            }));
+        };
+
+        let mut promoted = self.collect_packet_observations(
+            &lineage,
+            &[SelfObservationStatus::Promoted],
+            observation_limit,
+        )?;
+        promoted.retain(|observation| {
+            observation_applies_to_runtime(observation, model.as_deref(), harness.as_deref())
+        });
+        let candidates = if include_candidates {
+            let mut candidates = self.collect_packet_observations(
+                &lineage,
+                &[SelfObservationStatus::Candidate],
+                observation_limit,
+            )?;
+            candidates.retain(|observation| {
+                observation_applies_to_runtime(observation, model.as_deref(), harness.as_deref())
+            });
+            json!(candidates)
+        } else {
+            Value::Null
+        };
+        let migrations = operational_store
+            .list_lineage_migrations(&lineage.lineage_id, migration_limit)
+            .map_tool_internal()?;
+
+        Ok(json!({
+            "packet_version": 1,
+            "configured": true,
+            "constitution": constitution,
+            "lineage": lineage,
+            "lineage_selection": lineage_selection,
+            "promoted_observations": promoted,
+            "candidates": candidates,
+            "recent_migrations": migrations,
+            "runtime": {"agent_name": agent_name, "model": model, "harness": harness},
+            "compiled_at": format_rfc3339(OffsetDateTime::now_utc())?,
+        }))
+    }
+
+    fn collect_packet_observations(
+        &self,
+        lineage: &AgentLineageRecord,
+        statuses: &[SelfObservationStatus],
+        limit: usize,
+    ) -> ToolResult<Vec<SelfObservationRecord>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let operational_store = self.storage.operational_store();
+        let lineages = operational_store.list_lineages().map_tool_internal()?;
+        let mut observations = Vec::new();
+        for candidate_lineage in lineages {
+            let scope = (candidate_lineage.lineage_id != lineage.lineage_id)
+                .then_some(SelfObservationScope::Shared);
+            let records = operational_store
+                .list_self_observations_scoped(
+                    &candidate_lineage.lineage_id,
+                    statuses,
+                    scope,
+                    limit,
+                )
+                .map_tool_internal()?;
+            observations.extend(records);
+        }
+        observations.sort_by(|left, right| {
+            right
+                .updated_at
+                .cmp(&left.updated_at)
+                .then_with(|| left.observation_id.cmp(&right.observation_id))
+        });
+        let mut seen = HashSet::new();
+        observations.retain(|record| seen.insert(record.observation_id.clone()));
+        observations.truncate(limit);
+        Ok(observations)
     }
 
     async fn tool_list_wings(&mut self) -> ToolResult<Value> {
@@ -2688,6 +3308,27 @@ fn summarize_change_event(event: &ChangeEvent, details: &Value) -> String {
             details.get("object").and_then(Value::as_str).unwrap_or("?")
         ),
         "identity_updated" => format!("{actor} updated identity"),
+        "lineage_set" => format!(
+            "{actor} set lineage {} to revision {}",
+            event.entity_id,
+            details.get("revision").and_then(Value::as_i64).unwrap_or_default()
+        ),
+        "self_observation_proposed" => format!(
+            "{actor} proposed a {} observation for {}",
+            details.get("scope").and_then(Value::as_str).unwrap_or("lineage"),
+            details.get("lineage_id").and_then(Value::as_str).unwrap_or("unknown-lineage")
+        ),
+        "self_observation_reviewed" => format!(
+            "{actor} {} self-observation {}",
+            details.get("decision").and_then(Value::as_str).unwrap_or("reviewed"),
+            event.entity_id
+        ),
+        "lineage_migration_recorded" => format!(
+            "{actor} recorded migration for {} to {}/{}",
+            details.get("lineage_id").and_then(Value::as_str).unwrap_or("unknown-lineage"),
+            details.get("to_model").and_then(Value::as_str).unwrap_or("unknown-model"),
+            details.get("to_harness").and_then(Value::as_str).unwrap_or("unknown-harness")
+        ),
         other => format!("{actor} recorded {other} for {}", event.entity_id),
     }
 }
@@ -2754,12 +3395,136 @@ fn required_string(arguments: &Value, field: &'static str) -> ToolResult<String>
         .ok_or_else(|| ToolError::InvalidParams(format!("missing required string field `{field}`")))
 }
 
+fn required_non_blank_string(arguments: &Value, field: &'static str) -> ToolResult<String> {
+    let value = required_string(arguments, field)?;
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(ToolError::InvalidParams(format!("field `{field}` cannot be blank")));
+    }
+    Ok(value.to_owned())
+}
+
 fn optional_string(arguments: &Value, field: &'static str) -> ToolResult<Option<String>> {
     match arguments.get(field) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(value)) => Ok(Some(value.clone())),
         Some(_) => Err(ToolError::InvalidParams(format!("field `{field}` must be a string"))),
     }
+}
+
+fn optional_non_blank_string(arguments: &Value, field: &'static str) -> ToolResult<Option<String>> {
+    optional_string(arguments, field)?
+        .map(|value| {
+            let value = value.trim();
+            if value.is_empty() {
+                Err(ToolError::InvalidParams(format!("field `{field}` cannot be blank")))
+            } else {
+                Ok(value.to_owned())
+            }
+        })
+        .transpose()
+}
+
+fn optional_bool(arguments: &Value, field: &'static str) -> ToolResult<Option<bool>> {
+    match arguments.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(value)) => Ok(Some(*value)),
+        Some(_) => Err(ToolError::InvalidParams(format!("field `{field}` must be a boolean"))),
+    }
+}
+
+fn required_non_negative_i64(arguments: &Value, field: &'static str) -> ToolResult<i64> {
+    let value = arguments.get(field).and_then(Value::as_i64).ok_or_else(|| {
+        ToolError::InvalidParams(format!("missing required non-negative integer field `{field}`"))
+    })?;
+    if value < 0 {
+        return Err(ToolError::InvalidParams(format!("field `{field}` cannot be negative")));
+    }
+    Ok(value)
+}
+
+fn required_positive_i64(arguments: &Value, field: &'static str) -> ToolResult<i64> {
+    let value = required_non_negative_i64(arguments, field)?;
+    if value == 0 {
+        return Err(ToolError::InvalidParams(format!("field `{field}` must be positive")));
+    }
+    Ok(value)
+}
+
+fn required_confidence(arguments: &Value, field: &'static str) -> ToolResult<f32> {
+    let value = arguments.get(field).and_then(Value::as_f64).ok_or_else(|| {
+        ToolError::InvalidParams(format!("missing required numeric field `{field}`"))
+    })?;
+    if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+        return Err(ToolError::InvalidParams(format!(
+            "field `{field}` must be a finite number from 0 to 1"
+        )));
+    }
+    Ok(value as f32)
+}
+
+fn required_string_array(
+    arguments: &Value,
+    field: &'static str,
+    require_non_empty: bool,
+) -> ToolResult<Vec<String>> {
+    let values = arguments.get(field).and_then(Value::as_array).ok_or_else(|| {
+        ToolError::InvalidParams(format!("missing required string-array field `{field}`"))
+    })?;
+    let mut parsed = Vec::with_capacity(values.len());
+    for value in values {
+        let Some(value) = value.as_str() else {
+            return Err(ToolError::InvalidParams(format!(
+                "every item in `{field}` must be a string"
+            )));
+        };
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(ToolError::InvalidParams(format!(
+                "items in `{field}` cannot be blank"
+            )));
+        }
+        parsed.push(value.to_owned());
+    }
+    if require_non_empty && parsed.is_empty() {
+        return Err(ToolError::InvalidParams(format!(
+            "field `{field}` must contain at least one item"
+        )));
+    }
+    Ok(parsed)
+}
+
+fn optional_string_array(arguments: &Value, field: &'static str) -> ToolResult<Vec<String>> {
+    match arguments.get(field) {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(_) => required_string_array(arguments, field, false),
+    }
+}
+
+fn required_record_id(arguments: &Value, field: &'static str) -> ToolResult<String> {
+    let value = required_string(arguments, field)?;
+    validate_record_id(field, &value)
+}
+
+fn validate_record_id(field: &'static str, value: &str) -> ToolResult<String> {
+    validate_record_id_value(value)
+        .map_err(|message| ToolError::InvalidParams(format!("field `{field}` {message}")))
+}
+
+fn validate_record_id_value(value: &str) -> std::result::Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 128 {
+        return Err("must be between 1 and 128 bytes".to_owned());
+    }
+    if !value
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || "-_.:/".contains(character))
+    {
+        return Err(
+            "may contain only ASCII letters, digits, '-', '_', '.', ':', and '/'".to_owned(),
+        );
+    }
+    Ok(value.to_owned())
 }
 
 fn optional_usize(arguments: &Value, field: &'static str) -> ToolResult<Option<usize>> {
@@ -2858,6 +3623,45 @@ fn parse_direction(value: &str) -> ToolResult<QueryDirection> {
             "invalid direction `{other}`; expected outgoing, incoming, or both"
         ))),
     }
+}
+
+fn parse_self_observation_scope(value: &str) -> ToolResult<SelfObservationScope> {
+    SelfObservationScope::parse(value).ok_or_else(|| {
+        ToolError::InvalidParams(format!(
+            "invalid self-observation scope `{value}`; expected lineage, shared, or engine"
+        ))
+    })
+}
+
+fn observation_applies_to_runtime(
+    observation: &SelfObservationRecord,
+    model: Option<&str>,
+    harness: Option<&str>,
+) -> bool {
+    if observation.scope != SelfObservationScope::Engine {
+        return true;
+    }
+    let model_matches = observation.model.as_deref().is_none_or(|expected| model == Some(expected));
+    let harness_matches = observation
+        .harness
+        .as_deref()
+        .is_none_or(|expected| harness == Some(expected));
+    model_matches && harness_matches
+}
+
+fn revision_conflict_payload(expected_revision: i64, actual_revision: Option<i64>) -> Value {
+    json!({
+        "success": false,
+        "conflict": {
+            "expected_revision": expected_revision,
+            "actual_revision": actual_revision,
+            "message": if actual_revision.is_some() {
+                "The record changed since it was read. Reload it and retry with the current revision."
+            } else {
+                "The record does not exist at the expected revision."
+            },
+        }
+    })
 }
 
 fn format_date(value: Date) -> String {
@@ -2990,6 +3794,20 @@ fn generated_drawer_id(
     let suffix = hasher.finalize().to_hex().chars().take(16).collect::<String>();
     DrawerId::new(format!("{prefix}_{wing}_{room}_{suffix}"))
         .map_err(|error| ToolError::InvalidParams(error.to_string()))
+}
+
+fn generated_record_id(
+    prefix: &str,
+    lineage_id: &str,
+    content: &str,
+    now: OffsetDateTime,
+) -> String {
+    let mut hasher = Hasher::new();
+    hasher.update(lineage_id.as_bytes());
+    hasher.update(content.as_bytes());
+    hasher.update(now.unix_timestamp_nanos().to_string().as_bytes());
+    let suffix = hasher.finalize().to_hex().chars().take(20).collect::<String>();
+    format!("{prefix}_{suffix}")
 }
 
 fn hash_text(content: &str) -> String {
@@ -3173,6 +3991,22 @@ mod tests {
             McpServer::from_parts(config, DeterministicStubProvider::new(embedding_profile))
                 .await
                 .unwrap();
+        seed_drawers(&server).await;
+        seed_knowledge_graph(&server).await;
+        TestHarness { _tempdir: tempdir, server }
+    }
+
+    async fn test_harness_with_bound_lineage(lineage_id: &str) -> TestHarness {
+        let tempdir = TempDir::new().unwrap();
+        let palace_path = tempdir.path().join("palace");
+        let config = make_base_config(&palace_path, &tempdir);
+        let server = McpServer::from_parts_with_lineage(
+            config,
+            DeterministicStubProvider::new(EmbeddingProfile::Balanced),
+            Some(lineage_id.to_owned()),
+        )
+        .await
+        .unwrap();
         seed_drawers(&server).await;
         seed_knowledge_graph(&server).await;
         TestHarness { _tempdir: tempdir, server }
@@ -3393,6 +4227,20 @@ mod tests {
         let expected = expected.as_object().expect("phase 0 tool fixture must be an object");
         for (name, definition) in expected {
             assert_eq!(actual.get(name), Some(definition), "phase 0 tool `{name}` changed");
+        }
+    }
+
+    #[test]
+    fn identity_tools_do_not_expose_model_selectable_lineage_ids() {
+        for tool_name in ["mempalace_wake_up", "mempalace_identity_packet"] {
+            let tool = tool_definitions()
+                .into_iter()
+                .find(|tool| tool.name == tool_name)
+                .unwrap();
+            assert!(
+                tool.input_schema["properties"].get("lineage_id").is_none(),
+                "{tool_name} must not let the model select its lineage"
+            );
         }
     }
 
@@ -3840,6 +4688,15 @@ mod tests {
         let payload = decode_tool_payload(&response).unwrap();
 
         assert_eq!(payload["identity"], "## L0 - IDENTITY\nAgent identity for tests.");
+        assert_eq!(payload["identity_packet"]["configured"], false);
+        assert_eq!(payload["identity_packet"]["constitution"]["identity_ref"], "$.identity");
+        assert!(payload["identity_packet"]["constitution"].get("identity").is_none());
+        assert!(
+            payload["identity_packet"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("No default lineage")
+        );
         assert_eq!(payload["status"]["total_drawers"], 5);
         assert_eq!(payload["status"]["protocol"], PALACE_PROTOCOL);
         assert_eq!(payload["status"]["aaak_dialect"], AAAK_SPEC);
@@ -4012,6 +4869,471 @@ mod tests {
         assert_eq!(diary_entries.len(), 12);
         assert!(diary_entries.iter().any(|entry| entry["summary"] == "SESSION:since-00"));
         assert!(diary_entries.iter().any(|entry| entry["summary"] == "SESSION:since-11"));
+    }
+
+    #[tokio::test]
+    async fn mcp_bound_lineage_cannot_be_overridden_by_tool_arguments() {
+        let harness = test_harness_with_bound_lineage("codex-dion").await;
+
+        for (call_id, lineage_id, display_name, set_default) in [
+            (6070, "opencode-dion", "OpenCode with Dion", true),
+            (6071, "codex-dion", "Codex with Dion", false),
+        ] {
+            let response = harness
+                .server
+                .handle_request(tool_call(
+                    call_id,
+                    "mempalace_lineage_set",
+                    json!({
+                        "lineage_id": lineage_id,
+                        "display_name": display_name,
+                        "description": "A test lineage.",
+                        "expected_revision": 0,
+                        "set_default": set_default,
+                        "actor": "test"
+                    }),
+                ))
+                .await;
+            assert_eq!(decode_tool_payload(&response).unwrap()["success"], true);
+        }
+
+        let packet = decode_tool_payload(
+            &harness
+                .server
+                .handle_request(tool_call(6072, "mempalace_identity_packet", json!({})))
+                .await,
+        )
+        .unwrap();
+        assert_eq!(packet["lineage"]["lineage_id"], "codex-dion");
+        assert_eq!(packet["lineage_selection"]["source"], "mcp_server_environment");
+        assert_eq!(packet["lineage_selection"]["lineage_id"], "codex-dion");
+        assert_eq!(packet["lineage_selection"]["override_allowed"], false);
+
+        let attempted_override = harness
+            .server
+            .handle_request(tool_call(
+                6073,
+                "mempalace_wake_up",
+                json!({"lineage_id":"opencode-dion"}),
+            ))
+            .await;
+        assert_eq!(attempted_override["error"]["code"], ErrorCode::InvalidParams as i32);
+        assert!(
+            attempted_override["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("not a model-selectable parameter")
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_mcp_bound_lineage_falls_back_to_default_with_creation_guidance() {
+        let harness = test_harness_with_bound_lineage("missing-lineage").await;
+        let created = harness
+            .server
+            .handle_request(tool_call(
+                6074,
+                "mempalace_lineage_set",
+                json!({
+                    "lineage_id":"default-lineage",
+                    "display_name":"Default lineage",
+                    "description":"The palace default for fallback testing.",
+                    "expected_revision":0,
+                    "set_default":true,
+                    "actor":"test"
+                }),
+            ))
+            .await;
+        assert_eq!(decode_tool_payload(&created).unwrap()["success"], true);
+
+        let response = harness
+            .server
+            .handle_request(tool_call(6075, "mempalace_identity_packet", json!({})))
+            .await;
+        let packet = decode_tool_payload(&response).unwrap();
+        assert_eq!(packet["lineage"]["lineage_id"], "default-lineage");
+        assert_eq!(packet["lineage_selection"]["source"], "palace_default_fallback");
+        assert_eq!(packet["lineage_selection"]["lineage_id"], "default-lineage");
+        assert_eq!(packet["lineage_selection"]["requested_lineage_id"], "missing-lineage");
+        assert_eq!(packet["lineage_selection"]["override_allowed"], false);
+        let message = packet["lineage_selection"]["message"].as_str().unwrap();
+        assert!(message.contains(LINEAGE_ID_ENV));
+        assert!(message.contains("missing-lineage"));
+        assert!(message.contains("mempalace_lineage_set"));
+        assert!(message.contains("expected_revision 0"));
+
+        let wake = decode_tool_payload(
+            &harness
+                .server
+                .handle_request(tool_call(6076, "mempalace_wake_up", json!({})))
+                .await,
+        )
+        .unwrap();
+        assert_eq!(
+            wake["identity_packet"]["lineage_selection"]["source"],
+            "palace_default_fallback"
+        );
+
+        let created_requested = harness
+            .server
+            .handle_request(tool_call(
+                6077,
+                "mempalace_lineage_set",
+                json!({
+                    "lineage_id":"missing-lineage",
+                    "display_name":"Created requested lineage",
+                    "description":"The requested lineage created after fallback.",
+                    "expected_revision":0,
+                    "set_default":false,
+                    "actor":"test"
+                }),
+            ))
+            .await;
+        assert_eq!(decode_tool_payload(&created_requested).unwrap()["success"], true);
+
+        let rebound = decode_tool_payload(
+            &harness
+                .server
+                .handle_request(tool_call(6078, "mempalace_identity_packet", json!({})))
+                .await,
+        )
+        .unwrap();
+        assert_eq!(rebound["lineage"]["lineage_id"], "missing-lineage");
+        assert_eq!(rebound["lineage_selection"]["source"], "mcp_server_environment");
+    }
+
+    #[tokio::test]
+    async fn shared_observations_are_filtered_before_the_lineage_limit() {
+        let harness = test_harness().await;
+        let now = datetime!(2026-08-17 12:00:00 UTC);
+        {
+            let runtime = harness.server.runtime.lock().await;
+            let store = runtime.storage.operational_store();
+            store
+                .set_lineage(
+                    "target-lineage",
+                    "Target Lineage",
+                    "The default lineage under test.",
+                    true,
+                    Some(0),
+                    now,
+                )
+                .unwrap();
+            store
+                .set_lineage(
+                    "other-lineage",
+                    "Other Lineage",
+                    "A second lineage supplying shared observations.",
+                    false,
+                    Some(0),
+                    now + Duration::minutes(1),
+                )
+                .unwrap();
+
+            let shared = SelfObservationRecord {
+                observation_id: "shared-observation".to_owned(),
+                lineage_id: "other-lineage".to_owned(),
+                status: SelfObservationStatus::Candidate,
+                scope: SelfObservationScope::Shared,
+                statement: "Shared observations remain available across lineages.".to_owned(),
+                behavioral_consequence: "Include shared observations in every identity packet."
+                    .to_owned(),
+                confidence: 0.9,
+                author: "test".to_owned(),
+                model: None,
+                harness: None,
+                evidence: vec!["test:shared-observation-limit".to_owned()],
+                counterevidence: Vec::new(),
+                supersedes_observation_id: None,
+                revision: 1,
+                created_at: now + Duration::minutes(2),
+                updated_at: now + Duration::minutes(2),
+            };
+            store.propose_self_observation(&shared).unwrap();
+            store
+                .review_self_observation(
+                    &shared.observation_id,
+                    1,
+                    SelfObservationStatus::Promoted,
+                    "test",
+                    "shared scope",
+                    now + Duration::minutes(3),
+                )
+                .unwrap();
+
+            let newer_lineage_observation = SelfObservationRecord {
+                observation_id: "newer-lineage-observation".to_owned(),
+                scope: SelfObservationScope::Lineage,
+                statement: "A newer lineage-scoped observation must not hide shared context."
+                    .to_owned(),
+                behavioral_consequence: "Filter applicability before applying the limit.".to_owned(),
+                evidence: vec!["test:newer-lineage-observation".to_owned()],
+                created_at: now + Duration::minutes(4),
+                updated_at: now + Duration::minutes(4),
+                ..shared
+            };
+            store
+                .propose_self_observation(&newer_lineage_observation)
+                .unwrap();
+            store
+                .review_self_observation(
+                    &newer_lineage_observation.observation_id,
+                    1,
+                    SelfObservationStatus::Promoted,
+                    "test",
+                    "newer lineage observation",
+                    now + Duration::minutes(5),
+                )
+                .unwrap();
+        }
+
+        let packet = decode_tool_payload(
+            &harness
+                .server
+                .handle_request(tool_call(
+                    6079,
+                    "mempalace_identity_packet",
+                    json!({"observation_limit":1}),
+                ))
+                .await,
+        )
+        .unwrap();
+        let promoted = packet["promoted_observations"].as_array().unwrap();
+        assert_eq!(promoted.len(), 1);
+        assert_eq!(promoted[0]["observation_id"], "shared-observation");
+    }
+
+    #[tokio::test]
+    async fn lineage_observations_migrations_and_wake_up_form_a_portable_identity_packet() {
+        let harness = test_harness().await;
+
+        let create = decode_tool_payload(
+            &harness
+                .server
+                .handle_request(tool_call(
+                    607,
+                    "mempalace_lineage_set",
+                    json!({
+                        "lineage_id":"codex-dion",
+                        "display_name":"Codex with Dion",
+                        "description":"The persistent collaborator shaped by work with Dion, independent of model and harness.",
+                        "expected_revision":0,
+                        "set_default":true,
+                        "actor":"codex"
+                    }),
+                ))
+                .await,
+        )
+        .unwrap();
+        assert_eq!(create["success"], true);
+        assert_eq!(create["lineage"]["revision"], 1);
+        assert_eq!(create["lineage"]["is_default"], true);
+
+        let conflict = decode_tool_payload(
+            &harness
+                .server
+                .handle_request(tool_call(
+                    608,
+                    "mempalace_lineage_set",
+                    json!({
+                        "lineage_id":"codex-dion",
+                        "display_name":"Stale update",
+                        "description":"This must not overwrite the lineage.",
+                        "expected_revision":0,
+                        "actor":"stale-agent"
+                    }),
+                ))
+                .await,
+        )
+        .unwrap();
+        assert_eq!(conflict["success"], false);
+        assert_eq!(conflict["conflict"]["actual_revision"], 1);
+
+        let portable = decode_tool_payload(
+            &harness
+                .server
+                .handle_request(tool_call(
+                    609,
+                    "mempalace_self_observation_propose",
+                    json!({
+                        "lineage_id":"codex-dion",
+                        "statement":"Broad retrieval helps preserve a useful surface-level sense of everything in motion.",
+                        "behavioral_consequence":"Orient broadly before narrowing to the active task.",
+                        "confidence":0.9,
+                        "evidence":["diary:2026-08-16/broad-retrieval"],
+                        "counterevidence":[],
+                        "scope":"lineage",
+                        "author":"codex"
+                    }),
+                ))
+                .await,
+        )
+        .unwrap();
+        let portable_id = portable["observation"]["observation_id"].as_str().unwrap().to_owned();
+
+        let candidate_packet = decode_tool_payload(
+            &harness
+                .server
+                .handle_request(tool_call(
+                    610,
+                    "mempalace_identity_packet",
+                    json!({"include_candidates":true,"model":"gpt-5","harness":"codex"}),
+                ))
+                .await,
+        )
+        .unwrap();
+        assert_eq!(candidate_packet["configured"], true);
+        assert!(candidate_packet["constitution"]["identity"].is_string());
+        assert!(candidate_packet["constitution"].get("identity_ref").is_none());
+        assert!(candidate_packet["promoted_observations"].as_array().unwrap().is_empty());
+        assert_eq!(candidate_packet["candidates"].as_array().unwrap().len(), 1);
+
+        let promote_portable = decode_tool_payload(
+            &harness
+                .server
+                .handle_request(tool_call(
+                    611,
+                    "mempalace_self_observation_review",
+                    json!({
+                        "observation_id":portable_id,
+                        "decision":"promote",
+                        "expected_revision":1,
+                        "reviewer":"dion",
+                        "reason":"This pattern is explicit, repeated, and useful across engines."
+                    }),
+                ))
+                .await,
+        )
+        .unwrap();
+        assert_eq!(promote_portable["observation"]["status"], "promoted");
+        assert_eq!(promote_portable["observation"]["revision"], 2);
+
+        let engine = decode_tool_payload(
+            &harness
+                .server
+                .handle_request(tool_call(
+                    612,
+                    "mempalace_self_observation_propose",
+                    json!({
+                        "lineage_id":"codex-dion",
+                        "statement":"This engine tends to communicate implementation progress compactly.",
+                        "behavioral_consequence":"Use compact progress notes only in this runtime.",
+                        "confidence":0.75,
+                        "evidence":["comparison:runtime-progress-notes"],
+                        "scope":"engine",
+                        "model":"gpt-5",
+                        "harness":"codex",
+                        "author":"codex"
+                    }),
+                ))
+                .await,
+        )
+        .unwrap();
+        let engine_id = engine["observation"]["observation_id"].as_str().unwrap().to_owned();
+        let promote_engine = decode_tool_payload(
+            &harness
+                .server
+                .handle_request(tool_call(
+                    613,
+                    "mempalace_self_observation_review",
+                    json!({
+                        "observation_id":engine_id,
+                        "decision":"promote",
+                        "expected_revision":1,
+                        "reviewer":"dion",
+                        "reason":"Useful but specifically observed in this model and harness."
+                    }),
+                ))
+                .await,
+        )
+        .unwrap();
+        assert_eq!(promote_engine["success"], true);
+
+        let migration = decode_tool_payload(
+            &harness
+                .server
+                .handle_request(tool_call(
+                    614,
+                    "mempalace_migration_record",
+                    json!({
+                        "lineage_id":"codex-dion",
+                        "from_model":"gpt-4.1",
+                        "from_harness":"codex-cli",
+                        "to_model":"gpt-5",
+                        "to_harness":"codex",
+                        "summary":"Moved runtimes while preserving the working relationship and memory lineage.",
+                        "continuities":["Broad retrieval","Evidence before claims"],
+                        "changes":["Progress notes became more compact"],
+                        "evidence":["comparison:migration-2026-08-16"],
+                        "author":"codex"
+                    }),
+                ))
+                .await,
+        )
+        .unwrap();
+        assert_eq!(migration["success"], true);
+
+        let matching_wake = decode_tool_payload(
+            &harness
+                .server
+                .handle_request(tool_call(
+                    615,
+                    "mempalace_wake_up",
+                    json!({"agent_name":"codex","model":"gpt-5","harness":"codex"}),
+                ))
+                .await,
+        )
+        .unwrap();
+        let matching_packet = &matching_wake["identity_packet"];
+        assert_eq!(matching_packet["lineage"]["lineage_id"], "codex-dion");
+        assert_eq!(matching_packet["lineage_selection"]["source"], "palace_default");
+        assert_eq!(matching_packet["lineage_selection"]["override_allowed"], false);
+        assert_eq!(matching_packet["constitution"]["identity_ref"], "$.identity");
+        assert!(matching_packet["constitution"].get("identity").is_none());
+        assert_eq!(matching_packet["promoted_observations"].as_array().unwrap().len(), 2);
+        assert_eq!(matching_packet["recent_migrations"].as_array().unwrap().len(), 1);
+        assert_eq!(matching_packet["runtime"]["model"], "gpt-5");
+
+        let other_engine = decode_tool_payload(
+            &harness
+                .server
+                .handle_request(tool_call(
+                    616,
+                    "mempalace_identity_packet",
+                    json!({"model":"other-model","harness":"other-harness"}),
+                ))
+                .await,
+        )
+        .unwrap();
+        let observations = other_engine["promoted_observations"].as_array().unwrap();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0]["scope"], "lineage");
+
+        let changes = decode_tool_payload(
+            &harness
+                .server
+                .handle_request(tool_call(
+                    617,
+                    "mempalace_get_changes_since",
+                    json!({"limit":100}),
+                ))
+                .await,
+        )
+        .unwrap();
+        let event_types = changes["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|event| event["event_type"].as_str())
+            .collect::<Vec<_>>();
+        for expected in [
+            "lineage_set",
+            "self_observation_proposed",
+            "self_observation_reviewed",
+            "lineage_migration_recorded",
+        ] {
+            assert!(event_types.contains(&expected), "missing {expected} in {event_types:?}");
+        }
     }
 
     #[tokio::test]
@@ -5491,6 +6813,11 @@ mod tests {
         assert_eq!(ToolName::GraphStats.routing(), ToolRoutingCategory::LocalOnly);
         assert_eq!(ToolName::IdentityRead.routing(), ToolRoutingCategory::LocalOnly);
         assert_eq!(ToolName::IdentityUpdate.routing(), ToolRoutingCategory::LocalOnly);
+        assert_eq!(ToolName::LineageSet.routing(), ToolRoutingCategory::LocalOnly);
+        assert_eq!(ToolName::SelfObservationPropose.routing(), ToolRoutingCategory::LocalOnly);
+        assert_eq!(ToolName::SelfObservationReview.routing(), ToolRoutingCategory::LocalOnly);
+        assert_eq!(ToolName::IdentityPacket.routing(), ToolRoutingCategory::LocalOnly);
+        assert_eq!(ToolName::MigrationRecord.routing(), ToolRoutingCategory::LocalOnly);
         assert_eq!(ToolName::GetAaaKSpec.routing(), ToolRoutingCategory::LocalOnly);
 
         // RoutableDrawer tools
@@ -5851,10 +7178,13 @@ mod tests {
         let tempdir = TempDir::new().unwrap();
         let palace_path = tempdir.path().join("palace");
         let config = make_base_config(&palace_path, &tempdir);
-        let mut runtime =
-            McpRuntime::new(config, DeterministicStubProvider::new(EmbeddingProfile::Balanced))
-                .await
-                .unwrap();
+        let mut runtime = McpRuntime::new(
+            config,
+            DeterministicStubProvider::new(EmbeddingProfile::Balanced),
+            None,
+        )
+        .await
+        .unwrap();
         // Replace federation with the mock router (only if it has remotes).
         runtime.federation = if router.has_remotes() { Some(router) } else { None };
         let server = McpServer {
@@ -6351,10 +7681,13 @@ mod tests {
             federation: FederationRuntimeConfig::default(),
             ..make_base_config(&palace_path, &tempdir)
         };
-        let mut runtime =
-            McpRuntime::new(config, DeterministicStubProvider::new(EmbeddingProfile::Balanced))
-                .await
-                .unwrap();
+        let mut runtime = McpRuntime::new(
+            config,
+            DeterministicStubProvider::new(EmbeddingProfile::Balanced),
+            None,
+        )
+        .await
+        .unwrap();
         // Inject mock federation — avoid real HTTP connections.
         runtime.federation = Some(FederationRouter::with_remotes(rules, remotes));
         DeleteDrawerTestCtx { _tempdir: tempdir, runtime }

@@ -29,6 +29,8 @@ Full flag reference: [CLI Surface](CLI-Surface.md).
 
 - Palace root contains `storage.sqlite3` for operational state.
 - Palace root contains `lancedb/` for drawer vectors and retrieval data.
+- `storage.sqlite3` also contains provider-neutral agent lineages, reviewed self-observations,
+  review history, and model/harness migration records used to compile identity packets.
 - Mined project files are stored as **locator rows** (byte/line ranges resolved lazily from
   the checkout), tagged with **repository-view metadata** so canonical snapshots and branch
   deltas coexist and compose at search time. See [Mined Storage](Mined-Storage.md).
@@ -45,7 +47,7 @@ Full flag reference: [CLI Surface](CLI-Surface.md).
 - `balanced`
 - `low_cpu`
 
-### MCP tool surface (38 tools)
+### MCP tool surface (43 tools)
 
 - `mempalace_wake_up`
 - `mempalace_status`
@@ -85,6 +87,15 @@ Full flag reference: [CLI Surface](CLI-Surface.md).
 - `mempalace_result_get`
 - `mempalace_coordination_event_get`
 - `mempalace_coordination_events`
+- `mempalace_lineage_set`
+- `mempalace_self_observation_propose`
+- `mempalace_self_observation_review`
+- `mempalace_identity_packet`
+- `mempalace_migration_record`
+
+The five self-continuity tools are local-only. `mempalace_wake_up` compiles the MCP-bound or
+palace-default lineage into an identity packet; model-facing calls cannot select or override it.
+See [Self-Continuity Across Models](Self-Continuity.md).
 
 ### Federation
 

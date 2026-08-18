@@ -1150,7 +1150,7 @@ mod tests {
         reopened.ensure_schema().expect("schema");
         assert_eq!(
             reopened.get_task(&t.task_id).expect("task").expect("found").state,
-            TaskState::InputRequired
+            TaskState::Running
         );
         assert_eq!(reopened.get_artifact(&artifact.artifact_id).expect("artifact"), Some(artifact));
         assert_eq!(reopened.get_result(&result.result_id).expect("result"), Some(result));

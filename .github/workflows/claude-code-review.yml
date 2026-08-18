@@ -3,45 +3,31 @@ name: Claude Code Review
 on:
   pull_request:
     types: [opened, synchronize, ready_for_review, reopened]
-
-concurrency:
-  group: claude-code-review-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
-
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+    # Optional: Only run on specific file changes
+    # paths:
+    #   - "src/**/*.ts"
+    #   - "src/**/*.tsx"
+    #   - "src/**/*.js"
+    #   - "src/**/*.jsx"
 
 jobs:
   claude-review:
-    name: Claude Code Review
-    runs-on: ubuntu-latest
+    # Optional: Filter by PR author
+    # if: |
+    #   github.event.pull_request.user.login == 'external-contributor' ||
+    #   github.event.pull_request.user.login == 'new-developer' ||
+    #   github.event.pull_request.author_association == 'FIRST_TIME_CONTRIBUTOR'
 
-    # Fork PRs and Dependabot-triggered PRs run without repository secrets, with a
-    # read-only GITHUB_TOKEN, and without OIDC, so the action can neither authenticate
-    # nor publish. Without this guard every Dependabot bump leaves a red check that no
-    # change to this repo can fix — and .github/dependabot.yml keeps the github-actions
-    # ecosystem on a weekly schedule, so that is a recurring appointment, not a corner
-    # case. A skipped job reports neutral, which is the honest result for "could not run".
-    #
-    # Both tests are load-bearing. Dependabot branches live in this repository, so the
-    # fork test alone matches them and lets them through; a human fork PR is conversely
-    # not dependabot[bot]. The actor is checked rather than pull_request.user.login
-    # because GitHub withholds the secrets based on who triggered the run — when a human
-    # reopens or pushes to a Dependabot PR the secrets come back and the review can run.
-    if: >-
-      github.event.pull_request.head.repo.full_name == github.repository &&
-      github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-latest
     permissions:
       contents: read
-      # write, not read: publishing the review needs it. With read the action fetches the diff,
-      # is denied when it tries to post, and still exits 0 — a green check with no review.
-      pull-requests: write
+      pull-requests: read
       issues: read
       id-token: write
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
@@ -50,43 +36,10 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          # Actuarius opens trusted same-repository PRs that should receive review.
-          # Keep this explicit rather than allowing every bot to invoke the action.
-          allowed_bots: 'actuarius-bot'
           plugin_marketplaces: 'https://github.com/anthropics/claude-code.git'
           plugins: 'code-review@claude-code-plugins'
-
-          # Creates the tracking comment the github_comment MCP server updates, matching
-          # examples/pr-review-comprehensive.yml. Also makes a stalled review visible: the
-          # comment appears early, so "nothing posted" stops being indistinguishable from
-          # "not started".
-          track_progress: true
-          prompt: '/code-review:code-review ${{ github.repository }}/pull/${{ github.event.pull_request.number }}'
-
-          # Required for the review to be published, not optional polish. Two independent
-          # permission layers govern this: the `permissions:` block above decides what the GitHub
-          # token may do, while this decides what the agent may invoke. Miss either and the
-          # action reviews the diff, is denied when it goes to post, and still exits 0 — a green
-          # check with no review.
-          #
-          # Inline comments go through the action's own MCP server, not the REST API. Without
-          # that tool the review completes and then fails once per finding.
-          #
-          # Deliberately no `Bash(gh api:*)`. This job holds a pull-requests:write token on
-          # same-repo PRs while reading a diff it does not control, and `gh api` takes any
-          # endpoint and method — a prompt injection in reviewed content would get an
-          # unrestricted authenticated client, able to close PRs or rewrite their descriptions
-          # rather than merely publish a review.
-          #
-          # `--allowed-tools` REPLACES the action's defaults rather than extending them, so this
-          # list must name everything the review needs — including the file-reading tools and the
-          # action's own MCP servers, which are otherwise present by default.
-          #
-          # Both MCP servers are gated on this list: the inline comment server is installed only
-          # when a `mcp__github_inline_comment__` tool is allowed, and in agent mode — which this
-          # is, since a prompt is supplied — the github_comment server needs a
-          # `mcp__github_comment__` tool allowed too. That second one publishes the review
-          # summary.
-          claude_args: '--allowed-tools "mcp__github_inline_comment__create_inline_comment,mcp__github_comment__update_claude_comment,Read,Grep,Glob,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"'
+          prompt: '/code-review:code-review --comment ${{ github.repository }}/pull/${{ github.event.pull_request.number }}'
+          claude_args: '--allowedTools "mcp__github_inline_comment__create_inline_comment"'
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://code.claude.com/docs/en/cli-reference for available options
+

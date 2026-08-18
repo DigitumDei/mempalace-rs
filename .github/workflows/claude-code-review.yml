@@ -15,6 +15,22 @@ jobs:
   claude-review:
     name: Claude Code Review
     runs-on: ubuntu-latest
+
+    # Fork PRs and Dependabot-triggered PRs run without repository secrets, with a
+    # read-only GITHUB_TOKEN, and without OIDC, so the action can neither authenticate
+    # nor publish. Without this guard every Dependabot bump leaves a red check that no
+    # change to this repo can fix — and .github/dependabot.yml keeps the github-actions
+    # ecosystem on a weekly schedule, so that is a recurring appointment, not a corner
+    # case. A skipped job reports neutral, which is the honest result for "could not run".
+    #
+    # Both tests are load-bearing. Dependabot branches live in this repository, so the
+    # fork test alone matches them and lets them through; a human fork PR is conversely
+    # not dependabot[bot]. The actor is checked rather than pull_request.user.login
+    # because GitHub withholds the secrets based on who triggered the run — when a human
+    # reopens or pushes to a Dependabot PR the secrets come back and the review can run.
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.actor != 'dependabot[bot]'
     permissions:
       contents: read
       # write, not read: publishing the review needs it. With read the action fetches the diff,

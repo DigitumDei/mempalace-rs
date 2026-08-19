@@ -749,7 +749,7 @@ impl ToolName {
             ),
             Self::DelegationSpanStart => coordination_definition(
                 self,
-                "Start a delegation span recording one delegated run against a coordination task. depth and fan_out_index are derived from the span tree, never caller-supplied. Declared budgets are stored, not enforced: the host runtime enforces budgets during execution. Replaying the same delegator and idempotency_key returns the committed span.",
+                "Start a delegation span recording one delegated run against a coordination task. depth and fan_out_index are derived from the span tree, never caller-supplied. A child span's task_id must match its parent span's task_id, and a terminal (closed) parent cannot gain new children. Declared budgets are stored, not enforced: the host runtime enforces budgets during execution. Replaying the same delegator and idempotency_key returns the committed span.",
                 json!({"task_id":{"type":"string"},"parent_span_id":{"type":"string"},"delegator":{"type":"string"},"delegate":{"type":"string"},"budgets":{},"idempotency_key":{"type":"string"}}),
                 &["task_id", "delegator", "delegate", "idempotency_key"],
             ),
@@ -761,7 +761,7 @@ impl ToolName {
             ),
             Self::DelegationSpanClose => coordination_definition(
                 self,
-                "Close a running span with a terminal status and an explicit stop reason, using compare-and-swap revision semantics. Recording budget_exhausted, max_depth_reached, or max_fan_out_reached is how a curtailed run stays visible rather than looking merely unfinished.",
+                "Close a running span with a terminal status and an explicit stop reason, using compare-and-swap revision semantics. status and stop_reason must be a coherent pair (e.g. completed only pairs with completed; failed pairs with error/budget_exhausted/max_depth_reached/max_fan_out_reached; cancelled pairs with cancelled/human_stop; expired pairs with budget_exhausted) — incoherent combinations are rejected. Recording budget_exhausted, max_depth_reached, or max_fan_out_reached is how a curtailed run stays visible rather than looking merely unfinished. actor is persisted as closed_by.",
                 json!({"span_id":{"type":"string"},"expected_revision":{"type":"integer"},"status":{"type":"string","enum":["completed","failed","cancelled","expired"]},"stop_reason":{"type":"string","enum":["completed","budget_exhausted","max_depth_reached","max_fan_out_reached","cancelled","error","human_stop"]},"actor":{"type":"string"}}),
                 &["span_id", "expected_revision", "status", "stop_reason", "actor"],
             ),
@@ -773,7 +773,7 @@ impl ToolName {
             ),
             Self::DelegationCheckpointAppend => coordination_definition(
                 self,
-                "Append a bounded checkpoint to a span. Summaries are capped at 8 KiB by design: a checkpoint is a note about what happened, not the thing that happened. Store anything larger as an artifact and pass artifact_ref. Do not persist secrets or complete transcripts.",
+                "Append a bounded checkpoint to a span. Summaries are capped at 8 KiB per checkpoint and 256 KiB cumulative per span, by design: a checkpoint is a note about what happened, not the thing that happened, and the cumulative cap prevents reassembling an unbounded transcript by chunking. Store anything larger as an artifact and pass artifact_ref, which must belong to the same coordination task as the span. Rejected once the span is terminal (closed). Do not persist secrets or complete transcripts.",
                 json!({"span_id":{"type":"string"},"checkpoint_type":{"type":"string","enum":["turn","tool_call","token_usage","retry","human_approval","claim","handoff"]},"summary":{"type":"string"},"artifact_ref":{"type":"string"},"actor":{"type":"string"},"idempotency_key":{"type":"string"}}),
                 &["span_id", "checkpoint_type", "summary", "actor", "idempotency_key"],
             ),
@@ -4909,6 +4909,24 @@ mod tests {
         let closed = decode_tool_payload(&closed).expect("closed span");
         assert_eq!(closed["success"], true);
         assert_eq!(closed["span"]["stop_reason"], "budget_exhausted");
+        assert_eq!(closed["span"]["closed_by"], "worker-1");
+
+        // A contradictory status/stop_reason pair is rejected at the tool layer too.
+        let contradiction = harness
+            .server
+            .handle_request(tool_call(
+                949,
+                "mempalace_delegation_span_close",
+                json!({
+                    "span_id":root_id, "expected_revision":0, "status":"completed",
+                    "stop_reason":"error", "actor":"worker-1"
+                }),
+            ))
+            .await;
+        assert!(
+            contradiction.get("error").is_some(),
+            "completed status paired with an error stop reason must be rejected"
+        );
 
         // Re-closing at the now-stale revision is an explicit conflict.
         let conflict = harness

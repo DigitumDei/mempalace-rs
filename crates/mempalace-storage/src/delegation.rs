@@ -24,6 +24,10 @@ use crate::{Result, StorageError};
 /// A checkpoint is a note about what happened, not the thing that happened: anything larger
 /// belongs in an immutable artifact, referenced by ID.
 const MAX_SUMMARY_BYTES: usize = 8 * 1024;
+/// Bounds total checkpoint content per span, not just each individual checkpoint. Without this,
+/// a caller could still persist an arbitrarily large transcript by chunking it into many
+/// under-the-cap checkpoints, defeating the point of the per-checkpoint bound.
+const MAX_SPAN_SUMMARY_BYTES: usize = 256 * 1024;
 const MAX_KEY_BYTES: usize = 256;
 const MAX_BUDGET_BYTES: usize = 64 * 1024;
 
@@ -199,6 +203,8 @@ pub struct Span {
     pub budgets: Option<Value>,
     pub status: SpanStatus,
     pub stop_reason: Option<StopReason>,
+    /// Actor that closed the span, present once it is terminal.
+    pub closed_by: Option<String>,
     pub revision: i64,
     #[serde(with = "time::serde::rfc3339")]
     pub started_at: OffsetDateTime,
@@ -271,8 +277,9 @@ impl DelegationStore {
 CREATE TABLE IF NOT EXISTS delegation_spans (
  span_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, parent_span_id TEXT, delegator TEXT NOT NULL,
  delegate TEXT NOT NULL, depth INTEGER NOT NULL, fan_out_index INTEGER NOT NULL, budgets_json TEXT,
- status TEXT NOT NULL, stop_reason TEXT, revision INTEGER NOT NULL, idempotency_key TEXT NOT NULL,
- started_at TEXT NOT NULL, ended_at TEXT, UNIQUE(delegator, idempotency_key),
+ status TEXT NOT NULL, stop_reason TEXT, closed_by TEXT, revision INTEGER NOT NULL,
+ idempotency_key TEXT NOT NULL, started_at TEXT NOT NULL, ended_at TEXT,
+ UNIQUE(delegator, idempotency_key),
  FOREIGN KEY(task_id) REFERENCES coordination_tasks(task_id),
  FOREIGN KEY(parent_span_id) REFERENCES delegation_spans(span_id));
 CREATE INDEX IF NOT EXISTS idx_delegation_spans_task ON delegation_spans(task_id, started_at);
@@ -311,6 +318,25 @@ CREATE INDEX IF NOT EXISTS idx_delegation_checkpoints_span
         let (depth, fan_out_index) = match &input.parent_span_id {
             Some(parent_id) => {
                 let parent = require_span(&tx, parent_id)?;
+                // A child span must stay inside its parent's task: otherwise a task-A trace can
+                // pick up a task-B descendant, and list_spans_for_task (which filters strictly on
+                // task_id) disagrees with trace() (which walks parent_span_id with no task
+                // filter) about what belongs to which run.
+                if parent.task_id != input.task_id {
+                    return Err(StorageError::Invariant(format!(
+                        "span `{parent_id}` belongs to task `{}`, not `{}`",
+                        parent.task_id, input.task_id
+                    )));
+                }
+                // A closed run should not keep growing. Without this, a new child span could be
+                // created under an already-terminal parent — the same guarantee close_span's own
+                // terminal guard enforces for the span being closed.
+                if parent.status.terminal() {
+                    return Err(StorageError::Invariant(format!(
+                        "span `{parent_id}` is already {} and cannot gain new children",
+                        parent.status.as_str()
+                    )));
+                }
                 let siblings: i64 = tx.query_row(
                     "SELECT COUNT(*) FROM delegation_spans WHERE parent_span_id=?1",
                     [parent_id],
@@ -331,8 +357,9 @@ CREATE INDEX IF NOT EXISTS idx_delegation_checkpoints_span
         let id = format!("span_{}", Uuid::new_v4().simple());
         tx.execute(
             "INSERT INTO delegation_spans(span_id,task_id,parent_span_id,delegator,delegate,depth,\
-             fan_out_index,budgets_json,status,stop_reason,revision,idempotency_key,started_at,ended_at)\
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'running',NULL,0,?9,?10,NULL)",
+             fan_out_index,budgets_json,status,stop_reason,closed_by,revision,idempotency_key,\
+             started_at,ended_at)\
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'running',NULL,NULL,0,?9,?10,NULL)",
             params![
                 id,
                 input.task_id,
@@ -388,7 +415,56 @@ CREATE INDEX IF NOT EXISTS idx_delegation_checkpoints_span
             tx.commit()?;
             return Ok(existing);
         }
-        require_span(&tx, &input.span_id)?;
+        let span = require_span(&tx, &input.span_id)?;
+        // A closed span's `ended_at` should be the true end of the run. Accepting late
+        // checkpoints would let a trace keep changing after it claims to have stopped, and would
+        // let occurred_at fall after ended_at, corrupting duration and ordering analysis.
+        if span.status.terminal() {
+            return Err(StorageError::Invariant(format!(
+                "span `{}` is already {} and cannot gain new checkpoints",
+                input.span_id,
+                span.status.as_str()
+            )));
+        }
+        if let Some(artifact_id) = &input.artifact_ref {
+            // The FK only proves the artifact exists, not that it belongs to this run. Without
+            // this check, a trace export could point a consumer at another task's content.
+            let artifact_task_id: Option<String> = tx
+                .query_row(
+                    "SELECT task_id FROM coordination_artifacts WHERE artifact_id=?1",
+                    [artifact_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            match artifact_task_id {
+                Some(task_id) if task_id == span.task_id => {}
+                Some(task_id) => {
+                    return Err(StorageError::Invariant(format!(
+                        "artifact `{artifact_id}` belongs to task `{task_id}`, not span task `{}`",
+                        span.task_id
+                    )));
+                }
+                None => {
+                    return Err(StorageError::Invariant(format!(
+                        "artifact `{artifact_id}` not found"
+                    )));
+                }
+            }
+        }
+        // The per-checkpoint cap alone does not bound a transcript split across many checkpoints.
+        // A cumulative cap is what actually makes storing one structurally impractical.
+        let existing_summary_bytes: i64 = tx.query_row(
+            "SELECT COALESCE(SUM(LENGTH(summary)),0) FROM delegation_checkpoints WHERE span_id=?1",
+            [&input.span_id],
+            |r| r.get(0),
+        )?;
+        if existing_summary_bytes as usize + input.summary.len() > MAX_SPAN_SUMMARY_BYTES {
+            return Err(StorageError::Invariant(format!(
+                "span `{}` has reached its {MAX_SPAN_SUMMARY_BYTES}-byte cumulative checkpoint \
+                 summary bound; store further content as an artifact instead",
+                input.span_id
+            )));
+        }
         let now = OffsetDateTime::now_utc();
         let id = format!("checkpoint_{}", Uuid::new_v4().simple());
         tx.execute(
@@ -433,6 +509,13 @@ CREATE INDEX IF NOT EXISTS idx_delegation_checkpoints_span
                 "close_span requires a terminal status; `running` is not one".into(),
             ));
         }
+        if !status_matches_stop_reason(status, stop_reason) {
+            return Err(StorageError::Invariant(format!(
+                "status `{}` is not consistent with stop_reason `{}`",
+                status.as_str(),
+                stop_reason.as_str()
+            )));
+        }
         let mut conn = self.connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let Some(current) = get_span_tx(&tx, span_id)? else {
@@ -449,12 +532,13 @@ CREATE INDEX IF NOT EXISTS idx_delegation_checkpoints_span
         }
         let now = OffsetDateTime::now_utc();
         let updated = tx.execute(
-            "UPDATE delegation_spans SET status=?2, stop_reason=?3, revision=?4, ended_at=?5 \
-             WHERE span_id=?1 AND revision=?6",
+            "UPDATE delegation_spans SET status=?2, stop_reason=?3, closed_by=?4, revision=?5, \
+             ended_at=?6 WHERE span_id=?1 AND revision=?7",
             params![
                 span_id,
                 status.as_str(),
                 stop_reason.as_str(),
+                actor,
                 current.revision + 1,
                 format_time(now)?,
                 expected_revision,
@@ -506,7 +590,7 @@ CREATE INDEX IF NOT EXISTS idx_delegation_checkpoints_span
 }
 
 const SPAN_COLUMNS: &str = "SELECT span_id,task_id,parent_span_id,delegator,delegate,depth,\
-fan_out_index,budgets_json,status,stop_reason,revision,started_at,ended_at FROM delegation_spans";
+fan_out_index,budgets_json,status,stop_reason,closed_by,revision,started_at,ended_at FROM delegation_spans";
 const CHECKPOINT_COLUMNS: &str = "SELECT checkpoint_id,sequence,span_id,checkpoint_type,summary,\
 artifact_ref,actor,occurred_at FROM delegation_checkpoints";
 
@@ -549,8 +633,8 @@ fn span_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Span> {
     let budgets: Option<String> = r.get(7)?;
     let status: String = r.get(8)?;
     let stop_reason: Option<String> = r.get(9)?;
-    let started: String = r.get(11)?;
-    let ended: Option<String> = r.get(12)?;
+    let started: String = r.get(12)?;
+    let ended: Option<String> = r.get(13)?;
     Ok(Span {
         span_id: r.get(0)?,
         task_id: r.get(1)?,
@@ -562,7 +646,8 @@ fn span_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Span> {
         budgets: budgets.map(|v| serde_json::from_str(&v)).transpose().map_err(sql_conv)?,
         status: SpanStatus::parse(&status).map_err(sql_conv)?,
         stop_reason: stop_reason.map(|v| StopReason::parse(&v)).transpose().map_err(sql_conv)?,
-        revision: r.get(10)?,
+        closed_by: r.get(10)?,
+        revision: r.get(11)?,
         started_at: parse_time(started).map_err(sql_conv)?,
         ended_at: parse_time_opt(ended).map_err(sql_conv)?,
     })
@@ -607,6 +692,25 @@ fn checkpoint_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Checkpoint> {
         actor: r.get(6)?,
         occurred_at: parse_time(at).map_err(sql_conv)?,
     })
+}
+
+/// Whether a terminal status is a coherent outcome for a stop reason. Without this, contradictory
+/// records such as `status: completed` with `stop_reason: error` would make outcome and budget
+/// telemetry ambiguous for every trace consumer.
+fn status_matches_stop_reason(status: SpanStatus, reason: StopReason) -> bool {
+    matches!(
+        (status, reason),
+        (SpanStatus::Completed, StopReason::Completed)
+            | (
+                SpanStatus::Failed,
+                StopReason::Error
+                    | StopReason::BudgetExhausted
+                    | StopReason::MaxDepthReached
+                    | StopReason::MaxFanOutReached
+            )
+            | (SpanStatus::Cancelled, StopReason::Cancelled | StopReason::HumanStop)
+            | (SpanStatus::Expired, StopReason::BudgetExhausted)
+    )
 }
 
 fn validate_actor(value: &str, name: &str) -> Result<()> {
@@ -904,5 +1008,139 @@ mod tests {
         assert_eq!(spans.len(), 2);
         assert!(spans.iter().any(|span| span.span_id == first.span_id));
         assert!(spans.iter().any(|span| span.span_id == second.span_id));
+    }
+
+    #[test]
+    fn a_child_span_must_belong_to_its_parents_task() {
+        let (_dir, c, d) = store();
+        let task_a = task(&c, "t-a");
+        let task_b = task(&c, "t-b");
+        let root_a = root_span(&d, &task_a, "span-root-a");
+
+        let mismatched = d.start_span(&NewSpan {
+            task_id: task_b,
+            parent_span_id: Some(root_a.span_id.clone()),
+            delegator: "worker-1".into(),
+            delegate: "worker-2".into(),
+            budgets: None,
+            idempotency_key: "span-cross-task".into(),
+        });
+        assert!(mismatched.is_err(), "a child span must stay inside its parent's task");
+    }
+
+    #[test]
+    fn a_terminal_span_cannot_gain_new_children_or_checkpoints() {
+        let (_dir, c, d) = store();
+        let task_id = task(&c, "t1");
+        let root = root_span(&d, &task_id, "span-root");
+        d.close_span(&root.span_id, root.revision, SpanStatus::Completed, StopReason::Completed, "worker-1")
+            .expect("close");
+
+        let child = d.start_span(&NewSpan {
+            task_id: task_id.clone(),
+            parent_span_id: Some(root.span_id.clone()),
+            delegator: "worker-1".into(),
+            delegate: "worker-2".into(),
+            budgets: None,
+            idempotency_key: "span-late-child".into(),
+        });
+        assert!(child.is_err(), "a closed span must not gain new children");
+
+        let checkpoint = d.append_checkpoint(&NewCheckpoint {
+            span_id: root.span_id,
+            checkpoint_type: CheckpointType::Turn,
+            summary: "late arrival".into(),
+            artifact_ref: None,
+            actor: "worker-1".into(),
+            idempotency_key: "cp-late".into(),
+        });
+        assert!(checkpoint.is_err(), "a closed span must not gain new checkpoints");
+    }
+
+    #[test]
+    fn closing_actor_is_persisted() {
+        let (_dir, c, d) = store();
+        let task_id = task(&c, "t1");
+        let root = root_span(&d, &task_id, "span-root");
+        let RevisionedWrite::Applied(closed) = d
+            .close_span(&root.span_id, root.revision, SpanStatus::Completed, StopReason::Completed, "worker-9")
+            .expect("close")
+        else {
+            panic!("expected applied")
+        };
+        assert_eq!(closed.closed_by.as_deref(), Some("worker-9"));
+        let reloaded = d.get_span(&closed.span_id).expect("get").expect("present");
+        assert_eq!(reloaded.closed_by.as_deref(), Some("worker-9"));
+    }
+
+    #[test]
+    fn checkpoint_artifacts_must_belong_to_the_spans_task() {
+        let (_dir, c, d) = store();
+        let task_a = task(&c, "t-a");
+        let task_b = task(&c, "t-b");
+        let root_a = root_span(&d, &task_a, "span-root-a");
+        let artifact_b = c
+            .put_artifact(&crate::coordination::NewArtifact {
+                task_id: task_b,
+                created_by: "worker-1".into(),
+                role: "partial_result".into(),
+                media_type: "text/plain".into(),
+                content: "belongs to task b".into(),
+                idempotency_key: "artifact-b".into(),
+            })
+            .expect("artifact");
+
+        let stray = d.append_checkpoint(&NewCheckpoint {
+            span_id: root_a.span_id,
+            checkpoint_type: CheckpointType::ToolCall,
+            summary: "points at the wrong task's artifact".into(),
+            artifact_ref: Some(artifact_b.artifact_id),
+            actor: "worker-1".into(),
+            idempotency_key: "cp-stray-artifact".into(),
+        });
+        assert!(stray.is_err(), "a checkpoint must not reference another task's artifact");
+    }
+
+    #[test]
+    fn chunked_checkpoints_cannot_reassemble_an_unbounded_transcript() {
+        let (_dir, c, d) = store();
+        let task_id = task(&c, "t1");
+        let root = root_span(&d, &task_id, "span-root");
+        let chunk = "x".repeat(MAX_SUMMARY_BYTES);
+        let mut appended = 0usize;
+        loop {
+            let result = d.append_checkpoint(&NewCheckpoint {
+                span_id: root.span_id.clone(),
+                checkpoint_type: CheckpointType::Turn,
+                summary: chunk.clone(),
+                artifact_ref: None,
+                actor: "worker-1".into(),
+                idempotency_key: format!("cp-chunk-{appended}"),
+            });
+            match result {
+                Ok(_) => appended += 1,
+                Err(_) => break,
+            }
+            assert!(appended < 1000, "the cumulative cap should have been hit long before this");
+        }
+        assert!(
+            appended * MAX_SUMMARY_BYTES < 10 * MAX_SPAN_SUMMARY_BYTES,
+            "chunking must not be able to reassemble an effectively unbounded transcript"
+        );
+    }
+
+    #[test]
+    fn contradictory_status_and_stop_reason_are_rejected() {
+        let (_dir, c, d) = store();
+        let task_id = task(&c, "t1");
+        let root = root_span(&d, &task_id, "span-root");
+        let contradiction = d.close_span(
+            &root.span_id,
+            root.revision,
+            SpanStatus::Completed,
+            StopReason::Error,
+            "worker-1",
+        );
+        assert!(contradiction.is_err(), "completed status paired with an error stop reason is incoherent");
     }
 }

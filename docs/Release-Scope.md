@@ -105,7 +105,7 @@ The five self-continuity tools are local-only. `mempalace_wake_up` compiles the 
 palace-default lineage into an identity packet; model-facing calls cannot select or override it.
 See [Self-Continuity Across Models](Self-Continuity.md).
 
-The fourteen coordination tools and the eight skill-registry tools are local-only and are not
+The fifteen coordination tools and the eight skill-registry tools are local-only and are not
 federated. See [Native Coordination](Coordination.md) and [Skill Registry](Skill-Registry.md).
 
 ### Federation

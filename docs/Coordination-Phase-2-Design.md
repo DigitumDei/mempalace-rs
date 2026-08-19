@@ -1,14 +1,14 @@
 # Coordination Phase 2 — design proposal
 
-**Status: partially implemented.** The skill registry described below has shipped — see
-[Skill-Registry.md](Skill-Registry.md) for the behaviour that actually exists. Delegation-loop
-telemetry remains a proposal. This document proposes a storage and MCP surface design for
-[issue #101](https://github.com/DigitumDei/mempalace-rs/issues/101), the way
-[Coordination-Phase-0.md](Coordination-Phase-0.md) proposed the Phase 1 design that shipped in
-[Coordination.md](Coordination.md).
+**Status: implemented.** Both halves have shipped. This document is kept as the design record
+for [issue #101](https://github.com/DigitumDei/mempalace-rs/issues/101), the way
+[Coordination-Phase-0.md](Coordination-Phase-0.md) is kept as the record behind the Phase 1
+design that shipped in [Coordination.md](Coordination.md).
 
-Where this design and `Skill-Registry.md` disagree, the latter is authoritative: two open
-questions below were resolved during implementation (see "Open questions").
+**For the behaviour that actually exists, read [Skill-Registry.md](Skill-Registry.md) and
+[Delegation-Telemetry.md](Delegation-Telemetry.md).** Where they disagree with this document,
+they are authoritative: all four open questions below were resolved during implementation, and
+two of those resolutions changed the design (see "Open questions").
 
 Phase 2 has two independent halves per issue #101: a versioned, governed **skill registry**,
 and **delegation-loop telemetry**. They share no tables but do share two design precedents
@@ -163,13 +163,20 @@ pattern as `mempalace_task_transition`), `mempalace_delegation_trace_get`.
 1. **Resolved — no separate `validated` status.** Validation evidence is an append to
    `skill_outcomes`, and promotion checks for at least one row against that exact version.
    Fewer states, same guarantee.
-2. Should `delegation_spans.task_id` be mandatory (every span wraps exactly one coordination
-   task) or optional, for delegation that predates task creation? Phase 1's task model already
-   has `parent_id`/`dependencies`; a mandatory FK keeps one source of truth for the delegation
-   tree instead of two overlapping parent-pointer systems.
-3. What is the bounded size for `delegation_checkpoints.summary`? Phase 1 caps artifact/payload
-   content at 1 MiB; checkpoint summaries should likely be far smaller (a few KB) since they
-   are meant to avoid transcript-scale content by construction.
+2. **Resolved — `task_id` is mandatory.** Every span references a real coordination task, so
+   the task tree stays the single source of truth for what work exists and there is no second,
+   competing record of the work itself.
+
+   This produced an unplanned change: `depth` and `fan_out_index` are **derived** from the span
+   tree rather than accepted from the caller. The proposal listed them as plain fields, but a
+   caller-supplied depth is exactly the number a host would compare against `max_depth` — so
+   trusting it would have made the budget telemetry unfalsifiable. Deriving them is
+   recordkeeping, not enforcement, and so stays inside the product boundary.
+3. **Resolved — 8 KiB.** Far below Phase 1's 1 MiB payload cap, because a checkpoint is a note
+   about what happened rather than the thing that happened. `artifact_ref` carries the overflow.
+   The cap is also the enforceable half of "no complete traces by default": it makes storing a
+   transcript structurally impractical, where refusing *secrets* remains a caller responsibility
+   MemPalace cannot detect.
 4. **Resolved — `instructions_ref` is an opaque reference string.** It holds either a repo path
    (Phase 0's skill package, `skills/coordinate-with-mempalace/SKILL.md`) or a drawer ID; the
    registry stores the reference and provenance rather than copying instruction bodies, so

@@ -1,6 +1,7 @@
 //! Storage layer for MemPalace Rust crates.
 
 mod coordination;
+mod delegation;
 mod engine;
 mod error;
 mod lance;
@@ -12,6 +13,10 @@ mod types;
 pub use coordination::{
     Artifact, CoordinationCursor, CoordinationEvent, CoordinationEventPage, CoordinationStore,
     InboxPage, Message, NewArtifact, NewMessage, NewTask, NewTaskResult, Task, TaskResult, TaskState,
+};
+pub use delegation::{
+    Checkpoint, CheckpointType, DelegationStore, NewCheckpoint, NewSpan, Span, SpanStatus,
+    StopReason, Trace, TraceNode,
 };
 pub use engine::StorageEngine;
 pub use error::{Result, StorageError};

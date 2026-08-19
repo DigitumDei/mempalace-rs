@@ -25,9 +25,10 @@ use mempalace_search::{SearchRuntime, SearchRuntimePolicy};
 use mempalace_storage::{
     AgentLineageRecord, ChangeEvent, ChangeLogStore, CoordinationCursor, CoordinationStore,
     DiaryStore, DrawerFilter, DrawerStore, DuplicateStrategy, IngestCommitRequest,
-    LineageMigrationRecord, NewArtifact, NewMessage, NewSkill, NewSkillOutcome, NewTask,
-    NewTaskResult, RevisionedWrite, SelfModelStore, SelfObservationRecord, SelfObservationScope,
-    SelfObservationStatus, SkillScope, SkillStatus, SkillStore, StorageEngine, TaskState,
+    DelegationStore, LineageMigrationRecord, NewArtifact, NewCheckpoint, NewMessage, NewSkill,
+    NewSkillOutcome, NewSpan, NewTask, NewTaskResult, RevisionedWrite, SelfModelStore,
+    SelfObservationRecord, SelfObservationScope, SelfObservationStatus, SkillScope, SkillStatus,
+    SkillStore, SpanStatus, StopReason, StorageEngine, TaskState,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -220,6 +221,13 @@ enum ToolName {
     SkillPromote,
     SkillRetire,
     SkillReviews,
+    DelegationSpanStart,
+    DelegationSpanGet,
+    DelegationSpanClose,
+    DelegationSpansForTask,
+    DelegationCheckpointAppend,
+    DelegationCheckpointGet,
+    DelegationTrace,
     LineageSet,
     SelfObservationPropose,
     SelfObservationReview,
@@ -228,7 +236,7 @@ enum ToolName {
 }
 
 impl ToolName {
-    fn all() -> [Self; 51] {
+    fn all() -> [Self; 58] {
         [
             Self::WakeUp,
             Self::Status,
@@ -276,6 +284,13 @@ impl ToolName {
             Self::SkillPromote,
             Self::SkillRetire,
             Self::SkillReviews,
+            Self::DelegationSpanStart,
+            Self::DelegationSpanGet,
+            Self::DelegationSpanClose,
+            Self::DelegationSpansForTask,
+            Self::DelegationCheckpointAppend,
+            Self::DelegationCheckpointGet,
+            Self::DelegationTrace,
             Self::LineageSet,
             Self::SelfObservationPropose,
             Self::SelfObservationReview,
@@ -332,6 +347,13 @@ impl ToolName {
             Self::SkillPromote => "mempalace_skill_promote",
             Self::SkillRetire => "mempalace_skill_retire",
             Self::SkillReviews => "mempalace_skill_reviews",
+            Self::DelegationSpanStart => "mempalace_delegation_span_start",
+            Self::DelegationSpanGet => "mempalace_delegation_span_get",
+            Self::DelegationSpanClose => "mempalace_delegation_span_close",
+            Self::DelegationSpansForTask => "mempalace_delegation_spans_for_task",
+            Self::DelegationCheckpointAppend => "mempalace_delegation_checkpoint_append",
+            Self::DelegationCheckpointGet => "mempalace_delegation_checkpoint_get",
+            Self::DelegationTrace => "mempalace_delegation_trace",
             Self::LineageSet => "mempalace_lineage_set",
             Self::SelfObservationPropose => "mempalace_self_observation_propose",
             Self::SelfObservationReview => "mempalace_self_observation_review",
@@ -725,6 +747,48 @@ impl ToolName {
                 json!({"skill_id":{"type":"string"},"version":{"type":"integer"}}),
                 &["skill_id", "version"],
             ),
+            Self::DelegationSpanStart => coordination_definition(
+                self,
+                "Start a delegation span recording one delegated run against a coordination task. depth and fan_out_index are derived from the span tree, never caller-supplied. Declared budgets are stored, not enforced: the host runtime enforces budgets during execution. Replaying the same delegator and idempotency_key returns the committed span.",
+                json!({"task_id":{"type":"string"},"parent_span_id":{"type":"string"},"delegator":{"type":"string"},"delegate":{"type":"string"},"budgets":{},"idempotency_key":{"type":"string"}}),
+                &["task_id", "delegator", "delegate", "idempotency_key"],
+            ),
+            Self::DelegationSpanGet => coordination_definition(
+                self,
+                "Retrieve a delegation span authoritatively by exact ID; returns found:false for a miss.",
+                json!({"span_id":{"type":"string"}}),
+                &["span_id"],
+            ),
+            Self::DelegationSpanClose => coordination_definition(
+                self,
+                "Close a running span with a terminal status and an explicit stop reason, using compare-and-swap revision semantics. Recording budget_exhausted, max_depth_reached, or max_fan_out_reached is how a curtailed run stays visible rather than looking merely unfinished.",
+                json!({"span_id":{"type":"string"},"expected_revision":{"type":"integer"},"status":{"type":"string","enum":["completed","failed","cancelled","expired"]},"stop_reason":{"type":"string","enum":["completed","budget_exhausted","max_depth_reached","max_fan_out_reached","cancelled","error","human_stop"]},"actor":{"type":"string"}}),
+                &["span_id", "expected_revision", "status", "stop_reason", "actor"],
+            ),
+            Self::DelegationSpansForTask => coordination_definition(
+                self,
+                "List every delegation span recorded against one task, oldest first. More than one root span for a task is how repeated delegation of already-delegated work becomes visible.",
+                json!({"task_id":{"type":"string"}}),
+                &["task_id"],
+            ),
+            Self::DelegationCheckpointAppend => coordination_definition(
+                self,
+                "Append a bounded checkpoint to a span. Summaries are capped at 8 KiB by design: a checkpoint is a note about what happened, not the thing that happened. Store anything larger as an artifact and pass artifact_ref. Do not persist secrets or complete transcripts.",
+                json!({"span_id":{"type":"string"},"checkpoint_type":{"type":"string","enum":["turn","tool_call","token_usage","retry","human_approval","claim","handoff"]},"summary":{"type":"string"},"artifact_ref":{"type":"string"},"actor":{"type":"string"},"idempotency_key":{"type":"string"}}),
+                &["span_id", "checkpoint_type", "summary", "actor", "idempotency_key"],
+            ),
+            Self::DelegationCheckpointGet => coordination_definition(
+                self,
+                "Retrieve a checkpoint authoritatively by exact ID; returns found:false for a miss.",
+                json!({"checkpoint_id":{"type":"string"}}),
+                &["checkpoint_id"],
+            ),
+            Self::DelegationTrace => coordination_definition(
+                self,
+                "Reconstruct a delegated run from durable state: the root span, every descendant span, and each of their checkpoints in order. Returns a flat node list carrying parent_span_id so a consumer can rebuild the tree. This is the export path for trace visualization; no transcript is involved.",
+                json!({"root_span_id":{"type":"string"}}),
+                &["root_span_id"],
+            ),
             Self::LineageSet => ToolDefinition {
                 name: self.as_str(),
                 description: "Create or revise a stable, provider-neutral agent lineage. A lineage is the persistent self whose memories and reviewed observations can span models and harnesses. The first lineage becomes the default. Updates require the current expected_revision; use 0 when explicitly creating a new lineage.",
@@ -854,7 +918,14 @@ impl ToolName {
             | Self::SkillRecordOutcome
             | Self::SkillPromote
             | Self::SkillRetire
-            | Self::SkillReviews => ToolRoutingCategory::LocalOnly,
+            | Self::SkillReviews
+            | Self::DelegationSpanStart
+            | Self::DelegationSpanGet
+            | Self::DelegationSpanClose
+            | Self::DelegationSpansForTask
+            | Self::DelegationCheckpointAppend
+            | Self::DelegationCheckpointGet
+            | Self::DelegationTrace => ToolRoutingCategory::LocalOnly,
             Self::Search
             | Self::ListWings
             | Self::ListRooms
@@ -1116,6 +1187,19 @@ where
             ToolName::SkillPromote => runtime.tool_skill_promote(&call.arguments),
             ToolName::SkillRetire => runtime.tool_skill_retire(&call.arguments),
             ToolName::SkillReviews => runtime.tool_skill_reviews(&call.arguments),
+            ToolName::DelegationSpanStart => runtime.tool_delegation_span_start(&call.arguments),
+            ToolName::DelegationSpanGet => runtime.tool_delegation_span_get(&call.arguments),
+            ToolName::DelegationSpanClose => runtime.tool_delegation_span_close(&call.arguments),
+            ToolName::DelegationSpansForTask => {
+                runtime.tool_delegation_spans_for_task(&call.arguments)
+            }
+            ToolName::DelegationCheckpointAppend => {
+                runtime.tool_delegation_checkpoint_append(&call.arguments)
+            }
+            ToolName::DelegationCheckpointGet => {
+                runtime.tool_delegation_checkpoint_get(&call.arguments)
+            }
+            ToolName::DelegationTrace => runtime.tool_delegation_trace(&call.arguments),
             ToolName::LineageSet => runtime.tool_lineage_set(&call.arguments).await,
             ToolName::SelfObservationPropose => {
                 runtime.tool_self_observation_propose(&call.arguments).await
@@ -1150,6 +1234,7 @@ struct McpRuntime<P> {
     storage: StorageEngine,
     coordination: CoordinationStore,
     skills: SkillStore,
+    delegation: DelegationStore,
     search: SearchRuntime<P>,
     federation: Option<FederationRouter>,
 }
@@ -1168,6 +1253,8 @@ where
         coordination.ensure_schema()?;
         let skills = SkillStore::new(config.palace_path.join("storage.sqlite3"));
         skills.ensure_schema()?;
+        let delegation = DelegationStore::new(config.palace_path.join("storage.sqlite3"));
+        delegation.ensure_schema()?;
         let router = FederationRouter::new(config.federation.clone());
         let federation = if router.has_remotes() { Some(router) } else { None };
         Ok(Self {
@@ -1180,6 +1267,7 @@ where
             storage,
             coordination,
             skills,
+            delegation,
             federation,
         })
     }
@@ -3379,6 +3467,68 @@ where
                 .map_tool_internal()?
         ))
     }
+
+    fn tool_delegation_span_start(&self, arguments: &Value) -> ToolResult<Value> {
+        let input: NewSpan = parse_coordination_input(arguments)?;
+        Ok(json!(self.delegation.start_span(&input).map_tool_internal()?))
+    }
+    fn tool_delegation_span_get(&self, arguments: &Value) -> ToolResult<Value> {
+        exact_result(
+            self.delegation
+                .get_span(&required_string(arguments, "span_id")?)
+                .map_tool_internal()?,
+        )
+    }
+    fn tool_delegation_span_close(&self, arguments: &Value) -> ToolResult<Value> {
+        let status: SpanStatus =
+            serde_json::from_value(json!(required_string(arguments, "status")?))
+                .map_err(|error| ToolError::InvalidParams(error.to_string()))?;
+        let stop_reason: StopReason =
+            serde_json::from_value(json!(required_string(arguments, "stop_reason")?))
+                .map_err(|error| ToolError::InvalidParams(error.to_string()))?;
+        let expected_revision = required_i64(arguments, "expected_revision")?;
+        let result = self
+            .delegation
+            .close_span(
+                &required_string(arguments, "span_id")?,
+                expected_revision,
+                status,
+                stop_reason,
+                &required_string(arguments, "actor")?,
+            )
+            .map_tool_internal()?;
+        Ok(match result {
+            RevisionedWrite::Applied(span) => json!({"success": true, "span": span}),
+            RevisionedWrite::Conflict { actual_revision } => {
+                revision_conflict_payload(expected_revision, actual_revision)
+            }
+        })
+    }
+    fn tool_delegation_spans_for_task(&self, arguments: &Value) -> ToolResult<Value> {
+        Ok(json!(
+            self.delegation
+                .list_spans_for_task(&required_string(arguments, "task_id")?)
+                .map_tool_internal()?
+        ))
+    }
+    fn tool_delegation_checkpoint_append(&self, arguments: &Value) -> ToolResult<Value> {
+        let input: NewCheckpoint = parse_coordination_input(arguments)?;
+        Ok(json!(self.delegation.append_checkpoint(&input).map_tool_internal()?))
+    }
+    fn tool_delegation_checkpoint_get(&self, arguments: &Value) -> ToolResult<Value> {
+        exact_result(
+            self.delegation
+                .get_checkpoint(&required_string(arguments, "checkpoint_id")?)
+                .map_tool_internal()?,
+        )
+    }
+    fn tool_delegation_trace(&self, arguments: &Value) -> ToolResult<Value> {
+        exact_result(
+            self.delegation
+                .trace(&required_string(arguments, "root_span_id")?)
+                .map_tool_internal()?,
+        )
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -4654,6 +4804,145 @@ mod tests {
         assert_eq!(reviews[0]["from_status"], "candidate");
         assert_eq!(reviews[0]["to_status"], "promoted");
         assert_eq!(reviews[0]["reviewer"], "reviewer-b");
+    }
+
+    #[tokio::test]
+    async fn delegation_trace_reconstructs_a_run_and_keeps_budget_stops_visible() {
+        let harness = test_harness().await;
+        let task = harness
+            .server
+            .handle_request(tool_call(
+                940,
+                "mempalace_task_create",
+                json!({
+                    "title":"Investigate", "description":"delegated work", "created_by":"manager",
+                    "idempotency_key":"delegation-task-1"
+                }),
+            ))
+            .await;
+        let task_id = decode_tool_payload(&task).expect("task")["task_id"]
+            .as_str()
+            .expect("task id")
+            .to_owned();
+
+        let root = harness
+            .server
+            .handle_request(tool_call(
+                941,
+                "mempalace_delegation_span_start",
+                json!({
+                    "task_id":task_id, "delegator":"manager", "delegate":"worker-1",
+                    "budgets":{"max_depth":2,"max_tokens":1000}, "idempotency_key":"span-root"
+                }),
+            ))
+            .await;
+        let root = decode_tool_payload(&root).expect("root span");
+        let root_id = root["span_id"].as_str().expect("span id").to_owned();
+        assert_eq!(root["depth"], 0);
+        assert_eq!(root["status"], "running");
+
+        // Depth is derived from the tree, not taken from the caller.
+        let child = harness
+            .server
+            .handle_request(tool_call(
+                942,
+                "mempalace_delegation_span_start",
+                json!({
+                    "task_id":task_id, "parent_span_id":root_id, "delegator":"worker-1",
+                    "delegate":"worker-2", "idempotency_key":"span-child"
+                }),
+            ))
+            .await;
+        let child = decode_tool_payload(&child).expect("child span");
+        assert_eq!(child["depth"], 1);
+        assert_eq!(child["fan_out_index"], 0);
+        let child_id = child["span_id"].as_str().expect("child id").to_owned();
+        let child_revision = child["revision"].as_i64().expect("child revision");
+
+        harness
+            .server
+            .handle_request(tool_call(
+                943,
+                "mempalace_delegation_checkpoint_append",
+                json!({
+                    "span_id":root_id, "checkpoint_type":"tool_call",
+                    "summary":"searched the palace, 3 hits", "actor":"worker-1",
+                    "idempotency_key":"cp-1"
+                }),
+            ))
+            .await;
+
+        // A transcript-sized summary is refused by design.
+        let oversized = harness
+            .server
+            .handle_request(tool_call(
+                944,
+                "mempalace_delegation_checkpoint_append",
+                json!({
+                    "span_id":root_id, "checkpoint_type":"turn", "summary":"x".repeat(9000),
+                    "actor":"worker-1", "idempotency_key":"cp-big"
+                }),
+            ))
+            .await;
+        assert!(oversized.get("error").is_some(), "8 KiB summary cap must hold at the tool layer");
+
+        // Budget exhaustion is recorded as an explicit stop reason.
+        let closed = harness
+            .server
+            .handle_request(tool_call(
+                945,
+                "mempalace_delegation_span_close",
+                json!({
+                    "span_id":child_id, "expected_revision":child_revision, "status":"failed",
+                    "stop_reason":"budget_exhausted", "actor":"worker-1"
+                }),
+            ))
+            .await;
+        let closed = decode_tool_payload(&closed).expect("closed span");
+        assert_eq!(closed["success"], true);
+        assert_eq!(closed["span"]["stop_reason"], "budget_exhausted");
+
+        // Re-closing at the now-stale revision is an explicit conflict.
+        let conflict = harness
+            .server
+            .handle_request(tool_call(
+                946,
+                "mempalace_delegation_span_close",
+                json!({
+                    "span_id":child_id, "expected_revision":child_revision, "status":"completed",
+                    "stop_reason":"completed", "actor":"worker-1"
+                }),
+            ))
+            .await;
+        let conflict = decode_tool_payload(&conflict).expect("conflict");
+        assert_eq!(conflict["success"], false);
+
+        // The whole run reconstructs from durable state alone.
+        let trace = harness
+            .server
+            .handle_request(tool_call(
+                947,
+                "mempalace_delegation_trace",
+                json!({"root_span_id":root_id}),
+            ))
+            .await;
+        let trace = decode_tool_payload(&trace).expect("trace");
+        assert_eq!(trace["found"], true);
+        let nodes = trace["value"]["nodes"].as_array().expect("nodes");
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[0]["span"]["span_id"], root_id.as_str());
+        assert_eq!(nodes[0]["checkpoints"].as_array().expect("checkpoints").len(), 1);
+        assert_eq!(nodes[1]["span"]["parent_span_id"], root_id.as_str());
+
+        let missing = harness
+            .server
+            .handle_request(tool_call(
+                948,
+                "mempalace_delegation_trace",
+                json!({"root_span_id":"span_missing"}),
+            ))
+            .await;
+        assert_eq!(decode_tool_payload(&missing).expect("missing")["found"], false);
     }
 
     #[tokio::test]

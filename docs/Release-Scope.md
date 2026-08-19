@@ -47,7 +47,7 @@ Full flag reference: [CLI Surface](CLI-Surface.md).
 - `balanced`
 - `low_cpu`
 
-### MCP tool surface (51 tools)
+### MCP tool surface (58 tools)
 
 - `mempalace_wake_up`
 - `mempalace_status`
@@ -95,6 +95,13 @@ Full flag reference: [CLI Surface](CLI-Surface.md).
 - `mempalace_skill_promote`
 - `mempalace_skill_retire`
 - `mempalace_skill_reviews`
+- `mempalace_delegation_span_start`
+- `mempalace_delegation_span_get`
+- `mempalace_delegation_span_close`
+- `mempalace_delegation_spans_for_task`
+- `mempalace_delegation_checkpoint_append`
+- `mempalace_delegation_checkpoint_get`
+- `mempalace_delegation_trace`
 - `mempalace_lineage_set`
 - `mempalace_self_observation_propose`
 - `mempalace_self_observation_review`
@@ -105,8 +112,10 @@ The five self-continuity tools are local-only. `mempalace_wake_up` compiles the 
 palace-default lineage into an identity packet; model-facing calls cannot select or override it.
 See [Self-Continuity Across Models](Self-Continuity.md).
 
-The fourteen coordination tools and the eight skill-registry tools are local-only and are not
-federated. See [Native Coordination](Coordination.md) and [Skill Registry](Skill-Registry.md).
+The fourteen coordination tools, the eight skill-registry tools, and the seven
+delegation-telemetry tools are local-only and are not federated. See
+[Native Coordination](Coordination.md), [Skill Registry](Skill-Registry.md), and
+[Delegation Telemetry](Delegation-Telemetry.md).
 
 ### Federation
 

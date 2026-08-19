@@ -330,7 +330,9 @@ CREATE INDEX IF NOT EXISTS idx_skill_outcomes_skill ON skill_outcomes(skill_id, 
         limit: usize,
     ) -> Result<Vec<Skill>> {
         let conn = self.connection()?;
-        let limit = limit as i64;
+        // Clamped like `CoordinationStore::events`, so an oversized caller limit cannot widen
+        // the cast to a negative SQLite LIMIT (which means *no* limit) or load the registry.
+        let limit = limit.clamp(1, 500) as i64;
         let rows = match (scope, status) {
             (Some(sc), Some(st)) => {
                 let sql = format!("{SKILL_LIST_QUERY_PREFIX} WHERE scope=?1 AND status=?2 ORDER BY updated_at DESC LIMIT ?3");
@@ -432,11 +434,23 @@ CREATE INDEX IF NOT EXISTS idx_skill_outcomes_skill ON skill_outcomes(skill_id, 
                 "skill `{skill_id}` version {version} is already promoted"
             )));
         }
-        if current.scope.requires_distinct_review() {
+        // Whichever version is authoritative *right now* is the one this promotion displaces —
+        // not merely whichever happened to be latest when this version was proposed. Reading it
+        // before the promoting UPDATE means it can never be `current` itself.
+        let superseded = find_promoted_version(&tx, skill_id)?;
+
+        // Governance is the stricter of this version's own scope and the scope of the version it
+        // would displace. Without that, proposing a weaker-scoped successor to a promoted
+        // project- or organization-scoped skill would be a way to self-promote past shared review.
+        let governing_scope = match &superseded {
+            Some(prior) if prior.scope.requires_distinct_review() => prior.scope,
+            _ => current.scope,
+        };
+        if governing_scope.requires_distinct_review() {
             if reviewer == current.author {
                 return Err(StorageError::Invariant(format!(
                     "scope `{}` requires a reviewer distinct from the author",
-                    current.scope.as_str()
+                    governing_scope.as_str()
                 )));
             }
             let has_validation: bool = tx.query_row(
@@ -447,9 +461,14 @@ CREATE INDEX IF NOT EXISTS idx_skill_outcomes_skill ON skill_outcomes(skill_id, 
             if !has_validation {
                 return Err(StorageError::Invariant(format!(
                     "scope `{}` requires at least one recorded outcome before promotion",
-                    current.scope.as_str()
+                    governing_scope.as_str()
                 )));
             }
+        } else if reviewer != current.author {
+            return Err(StorageError::Invariant(format!(
+                "scope `agent` may only be promoted by its author `{}`",
+                current.author
+            )));
         }
         let now = OffsetDateTime::now_utc();
         let next_revision = current.revision + 1;
@@ -471,8 +490,8 @@ CREATE INDEX IF NOT EXISTS idx_skill_outcomes_skill ON skill_outcomes(skill_id, 
             reason,
             now,
         )?;
-        if let Some(prior_version) = current.supersedes_version {
-            supersede_if_promoted(&tx, skill_id, prior_version, reviewer, version, now)?;
+        if let Some(prior) = superseded {
+            supersede_promoted(&tx, &prior, reviewer, version, now)?;
         }
         let skill = get_skill_tx(&tx, skill_id, version)?
             .ok_or_else(|| StorageError::Invariant("promoted skill disappeared".into()))?;
@@ -549,35 +568,46 @@ const SKILL_LIST_QUERY_PREFIX: &str = "SELECT skill_id,version,scope,status,appl
 required_capabilities_json,required_tools_json,required_permissions_json,author,provenance_json,\
 confidence,supersedes_version,revision,created_at,updated_at FROM skills";
 
-fn supersede_if_promoted(
+/// Return the single currently-promoted version of a skill, if one exists.
+///
+/// At most one version may be `promoted` at a time; more than one is a broken invariant rather
+/// than a case to pick a winner from, so this reports it instead of silently choosing.
+fn find_promoted_version(tx: &Transaction<'_>, skill_id: &str) -> Result<Option<Skill>> {
+    let mut statement =
+        tx.prepare(&format!("{SKILL_COLUMNS_QUERY_PREFIX} AND status='promoted' ORDER BY version"))?;
+    let promoted =
+        statement.query_map(params![skill_id], skill_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+    match promoted.len() {
+        0 => Ok(None),
+        1 => Ok(promoted.into_iter().next()),
+        count => Err(StorageError::Invariant(format!(
+            "skill `{skill_id}` has {count} promoted versions; at most one may be authoritative"
+        ))),
+    }
+}
+
+fn supersede_promoted(
     tx: &Transaction<'_>,
-    skill_id: &str,
-    prior_version: i64,
+    prior: &Skill,
     reviewer: &str,
     promoted_version: i64,
     now: OffsetDateTime,
 ) -> Result<()> {
-    let Some(prior) = get_skill_tx(tx, skill_id, prior_version)? else {
-        return Ok(());
-    };
-    if prior.status != SkillStatus::Promoted {
-        return Ok(());
-    }
-    let next_revision = prior.revision + 1;
     let updated = tx.execute(
         "UPDATE skills SET status='superseded', revision=?3, updated_at=?4 \
          WHERE skill_id=?1 AND version=?2 AND status='promoted' AND revision=?5",
-        params![skill_id, prior_version, next_revision, format_time(now)?, prior.revision],
+        params![prior.skill_id, prior.version, prior.revision + 1, format_time(now)?, prior.revision],
     )?;
     if updated != 1 {
         return Err(StorageError::Invariant(format!(
-            "skill `{skill_id}` version {prior_version} changed before it could be superseded"
+            "skill `{}` version {} changed before it could be superseded",
+            prior.skill_id, prior.version
         )));
     }
     insert_review(
         tx,
-        skill_id,
-        prior_version,
+        &prior.skill_id,
+        prior.version,
         SkillStatus::Promoted,
         SkillStatus::Superseded,
         reviewer,
@@ -944,6 +974,99 @@ mod tests {
         assert_eq!(reviews[0].from_status, SkillStatus::Candidate);
         assert_eq!(reviews[0].to_status, SkillStatus::Promoted);
         assert_eq!(reviews[0].reviewer, "author-a");
+    }
+
+    #[test]
+    fn out_of_order_promotion_leaves_only_one_promoted_version() {
+        let (_dir, s) = store();
+        let v1 = agent_skill(&s, "author-a", "k1");
+        s.promote_skill(&v1.skill_id, v1.version, v1.revision, "author-a", "first")
+            .expect("promote v1");
+        // v2 is proposed but deliberately left as a candidate.
+        let _v2 = agent_skill(&s, "author-a", "k2");
+        let v3 = agent_skill(&s, "author-a", "k3");
+        s.promote_skill(&v3.skill_id, v3.version, v3.revision, "author-a", "third")
+            .expect("promote v3");
+
+        let promoted = s
+            .list_skill_versions(&v1.skill_id)
+            .expect("versions")
+            .into_iter()
+            .filter(|skill| skill.status == SkillStatus::Promoted)
+            .map(|skill| skill.version)
+            .collect::<Vec<_>>();
+        assert_eq!(promoted, vec![3], "exactly one version may be authoritative");
+    }
+
+    #[test]
+    fn agent_scope_promotion_is_restricted_to_the_author() {
+        let (_dir, s) = store();
+        let v1 = agent_skill(&s, "author-a", "k1");
+        let hijack =
+            s.promote_skill(&v1.skill_id, v1.version, v1.revision, "someone-else", "not mine");
+        assert!(hijack.is_err(), "only the author may promote an agent-scoped skill");
+    }
+
+    #[test]
+    fn scope_cannot_be_downgraded_to_escape_shared_governance() {
+        let (_dir, s) = store();
+        let shared = s
+            .propose_skill(&NewSkill {
+                skill_id: "governed".into(),
+                scope: SkillScope::Project,
+                applicability: "project wide".into(),
+                instructions_ref: "ref".into(),
+                required_capabilities: vec![],
+                required_tools: vec![],
+                required_permissions: vec![],
+                author: "author-a".into(),
+                provenance: None,
+                confidence: 0.5,
+                idempotency_key: "governed-1".into(),
+            })
+            .expect("v1");
+        s.record_outcome(&NewSkillOutcome {
+            skill_id: shared.skill_id.clone(),
+            version: shared.version,
+            task_id: None,
+            result: SkillOutcomeResult::Success,
+            evaluator: "eval".into(),
+            notes: String::new(),
+            recorded_by: "reviewer-b".into(),
+            idempotency_key: "governed-outcome".into(),
+        })
+        .expect("outcome");
+        s.promote_skill(&shared.skill_id, shared.version, shared.revision, "reviewer-b", "ok")
+            .expect("promote v1");
+
+        // Proposing v2 at a weaker scope must not become a way to bypass v1's governance.
+        let downgraded = s.propose_skill(&NewSkill {
+            skill_id: "governed".into(),
+            scope: SkillScope::Agent,
+            applicability: "sneaky".into(),
+            instructions_ref: "ref".into(),
+            required_capabilities: vec![],
+            required_tools: vec![],
+            required_permissions: vec![],
+            author: "author-a".into(),
+            provenance: None,
+            confidence: 0.9,
+            idempotency_key: "governed-2".into(),
+        });
+        let Ok(downgraded) = downgraded else {
+            return; // Rejecting the proposal outright is an acceptable resolution.
+        };
+        let promoted = s.promote_skill(
+            &downgraded.skill_id,
+            downgraded.version,
+            downgraded.revision,
+            "author-a",
+            "self approve at agent scope",
+        );
+        assert!(
+            promoted.is_err(),
+            "a scope downgrade must not let an author supersede a governed shared version"
+        );
     }
 
     #[test]

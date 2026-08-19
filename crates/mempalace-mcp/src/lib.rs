@@ -697,8 +697,8 @@ impl ToolName {
             ),
             Self::SkillList => coordination_definition(
                 self,
-                "Discover skills filtered by scope and/or status. Discovery only: dereference a specific version with mempalace_skill_get before treating it as authoritative.",
-                json!({"scope":{"type":"string","enum":["agent","project","organization"]},"status":{"type":"string","enum":["candidate","promoted","superseded","retired"]},"limit":{"type":"integer"}}),
+                "Discover skills filtered by scope and/or status. Discovery only: dereference a specific version with mempalace_skill_get before treating it as authoritative. limit is clamped to 1..=500.",
+                json!({"scope":{"type":"string","enum":["agent","project","organization"]},"status":{"type":"string","enum":["candidate","promoted","superseded","retired"]},"limit":{"type":"integer","minimum":1,"maximum":500}}),
                 &[],
             ),
             Self::SkillRecordOutcome => coordination_definition(
@@ -709,7 +709,7 @@ impl ToolName {
             ),
             Self::SkillPromote => coordination_definition(
                 self,
-                "Promote a candidate skill version to authoritative for its scope, using compare-and-swap revision semantics. Agent-scoped skills may be self-promoted by their author. Project- and organization-scoped skills require a reviewer distinct from the author and at least one recorded outcome. Promoting a new version atomically supersedes the prior promoted version.",
+                "Promote a candidate skill version to authoritative for its scope, using compare-and-swap revision semantics. Agent-scoped skills may be promoted only by their own author. Project- and organization-scoped skills require a reviewer distinct from the author and at least one recorded outcome. Promotion atomically supersedes whichever version is authoritative at that moment, and governance is the stricter of this version's scope and the displaced version's scope — so a weaker-scoped successor cannot escape shared review.",
                 json!({"skill_id":{"type":"string"},"version":{"type":"integer"},"expected_revision":{"type":"integer"},"reviewer":{"type":"string"},"reason":{"type":"string"}}),
                 &["skill_id", "version", "expected_revision", "reviewer", "reason"],
             ),

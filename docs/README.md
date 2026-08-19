@@ -11,6 +11,7 @@ This directory documents the Rust release surface that exists in `mempalace-rs/`
 - [Release Scope](Release-Scope.md) — what is in and out of the shipped surface
 - [Coordination Phase 0](Coordination-Phase-0.md) — experimental coordination skill, measurements, limitations, and Phase 1 decision
 - [Native Coordination](Coordination.md) — transactional tasks, messages, results, artifacts, leases, cursors, and recovery
+- [Coordination Phase 2 Design](Coordination-Phase-2-Design.md) — proposal for a versioned skill registry and delegation-loop telemetry (not yet implemented)
 - [CLI Surface](CLI-Surface.md) — every `mempalace-cli` command and flag
 - [Config Schema](Config-Schema.md) — `config.json`, `projects.json`, `mempalace.yaml`, env overrides
 - [Mined Storage](Mined-Storage.md) — locator model, repository views, stale semantics, discovery rules

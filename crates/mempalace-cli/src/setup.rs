@@ -20,15 +20,8 @@ use std::process::Command;
 use serde_json::{Value, json};
 
 /// All tool keys handled by `setup`, in display order.
-const ALL_TOOLS: &[&str] = &[
-    "claude",
-    "codex",
-    "gemini",
-    "opencode",
-    "copilot",
-    "antigravity",
-    "jules",
-];
+const ALL_TOOLS: &[&str] =
+    &["claude", "codex", "gemini", "opencode", "copilot", "antigravity", "jules"];
 
 /// Options parsed from the `setup` subcommand.
 pub struct SetupOptions {
@@ -78,10 +71,7 @@ pub struct SetupReport {
 pub fn run_setup(opts: &SetupOptions) -> SetupReport {
     let mcp_path = resolve_mcp_binary(opts.mcp_path.as_deref());
     let mcp_present = mcp_path.as_ref().map(|p| p.is_file()).unwrap_or(false);
-    let mcp_str = mcp_path
-        .as_ref()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_default();
+    let mcp_str = mcp_path.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
 
     let selected: Vec<&'static str> = match &opts.only {
         Some(list) => ALL_TOOLS
@@ -92,10 +82,8 @@ pub fn run_setup(opts: &SetupOptions) -> SetupReport {
         None => ALL_TOOLS.to_vec(),
     };
 
-    let outcomes = selected
-        .into_iter()
-        .map(|key| handle_tool(key, &mcp_str, opts.dry_run))
-        .collect();
+    let outcomes =
+        selected.into_iter().map(|key| handle_tool(key, &mcp_str, opts.dry_run)).collect();
 
     SetupReport {
         mcp_path: mcp_path.unwrap_or_default(),
@@ -116,9 +104,8 @@ impl SetupReport {
             format!("  MCP server: {}", self.mcp_path.display()),
         ];
         if !self.mcp_binary_present {
-            lines.push(
-                "  ! binary not found at that path yet — tools are pointed here;".to_owned(),
-            );
+            lines
+                .push("  ! binary not found at that path yet — tools are pointed here;".to_owned());
             lines.push("    install mempalace-mcp there for them to launch it.".to_owned());
         }
         lines.push(String::new());
@@ -146,7 +133,11 @@ impl SetupReport {
 
 fn handle_tool(key: &'static str, mcp: &str, dry_run: bool) -> ToolOutcome {
     if mcp.is_empty() {
-        return outcome(key, Status::Failed, "could not resolve a mempalace-mcp path (no home directory; pass --mcp-path)");
+        return outcome(
+            key,
+            Status::Failed,
+            "could not resolve a mempalace-mcp path (no home directory; pass --mcp-path)",
+        );
     }
     match key {
         "jules" => {
@@ -219,7 +210,11 @@ fn configure_claude(bin: &Path, mcp: &str, dry_run: bool) -> ToolOutcome {
         Ok(out) if out.status.success() => {
             outcome("claude", Status::Configured, "registered via `claude mcp add --scope user`")
         }
-        Ok(out) => outcome("claude", Status::Failed, format!("`claude mcp add` failed: {}", stderr_snippet(&out))),
+        Ok(out) => outcome(
+            "claude",
+            Status::Failed,
+            format!("`claude mcp add` failed: {}", stderr_snippet(&out)),
+        ),
         Err(e) => outcome("claude", Status::Failed, format!("could not run claude: {e}")),
     }
 }
@@ -234,14 +229,22 @@ fn configure_codex(bin: &Path, mcp: &str, dry_run: bool) -> ToolOutcome {
     }
     if let Ok(out) = run_tool(bin, &["mcp", "get", "mempalace"]) {
         if out.status.success() {
-            return outcome("codex", Status::AlreadyConfigured, "already registered (~/.codex/config.toml)");
+            return outcome(
+                "codex",
+                Status::AlreadyConfigured,
+                "already registered (~/.codex/config.toml)",
+            );
         }
     }
     match run_tool(bin, &["mcp", "add", "mempalace", "--", mcp]) {
         Ok(out) if out.status.success() => {
             outcome("codex", Status::Configured, "registered via `codex mcp add`")
         }
-        Ok(out) => outcome("codex", Status::Failed, format!("`codex mcp add` failed: {}", stderr_snippet(&out))),
+        Ok(out) => outcome(
+            "codex",
+            Status::Failed,
+            format!("`codex mcp add` failed: {}", stderr_snippet(&out)),
+        ),
         Err(e) => outcome("codex", Status::Failed, format!("could not run codex: {e}")),
     }
 }
@@ -268,7 +271,11 @@ fn configure_gemini(bin: &Path, mcp: &str, dry_run: bool) -> ToolOutcome {
         Ok(out) if out.status.success() => {
             outcome("gemini", Status::Configured, "registered via `gemini mcp add -s user`")
         }
-        Ok(out) => outcome("gemini", Status::Failed, format!("`gemini mcp add` failed: {}", stderr_snippet(&out))),
+        Ok(out) => outcome(
+            "gemini",
+            Status::Failed,
+            format!("`gemini mcp add` failed: {}", stderr_snippet(&out)),
+        ),
         Err(e) => outcome("gemini", Status::Failed, format!("could not run gemini: {e}")),
     }
 }
@@ -295,7 +302,11 @@ fn list_contains_server(stdout: &str, name: &str) -> bool {
 
 fn configure_opencode(mcp: &str, dry_run: bool) -> ToolOutcome {
     let Some(path) = opencode_config_path() else {
-        return outcome("opencode", Status::Failed, "could not resolve the opencode config directory");
+        return outcome(
+            "opencode",
+            Status::Failed,
+            "could not resolve the opencode config directory",
+        );
     };
     // opencode: top-level "mcp", stdio server is type "local" with command as
     // a single [exe, ...args] array.
@@ -341,10 +352,7 @@ fn configure_antigravity(mcp: &str, dry_run: bool) -> ToolOutcome {
 /// Fold several per-file outcomes (one tool writing multiple config files) into
 /// one. Prefer the most "positive" status so a success isn't hidden by a
 /// best-effort secondary write; concatenate the details.
-fn combine_outcomes(
-    key: &'static str,
-    outcomes: impl Iterator<Item = ToolOutcome>,
-) -> ToolOutcome {
+fn combine_outcomes(key: &'static str, outcomes: impl Iterator<Item = ToolOutcome>) -> ToolOutcome {
     let list: Vec<ToolOutcome> = outcomes.collect();
     let has = |s: Status| list.iter().any(|o| o.status == s);
     let status = if has(Status::Configured) {
@@ -377,14 +385,21 @@ fn apply_json(
             return outcome(
                 key,
                 Status::Failed,
-                format!("{} is not valid JSON ({e}); add mempalace manually to avoid clobbering it", path.display()),
+                format!(
+                    "{} is not valid JSON ({e}); add mempalace manually to avoid clobbering it",
+                    path.display()
+                ),
             );
         }
     };
 
     let (merged, changed) = upsert_mcp_entry(existing, top_key, "mempalace", &entry);
     if !changed {
-        return outcome(key, Status::AlreadyConfigured, format!("already present in {}", path.display()));
+        return outcome(
+            key,
+            Status::AlreadyConfigured,
+            format!("already present in {}", path.display()),
+        );
     }
     if dry_run {
         return outcome(key, Status::WouldConfigure, format!("would write {}", path.display()));
@@ -432,7 +447,12 @@ fn write_json(path: &Path, value: &Value) -> io::Result<()> {
 
 /// Upsert `top_key -> name -> entry` into a JSON object, preserving every other
 /// key. Returns the merged value and whether it changed (idempotency signal).
-fn upsert_mcp_entry(existing: Option<Value>, top_key: &str, name: &str, entry: &Value) -> (Value, bool) {
+fn upsert_mcp_entry(
+    existing: Option<Value>,
+    top_key: &str,
+    name: &str,
+    entry: &Value,
+) -> (Value, bool) {
     let mut root = match existing {
         Some(Value::Object(map)) => map,
         _ => serde_json::Map::new(),
@@ -526,11 +546,7 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
 /// `CreateProcess` rejects them with "%1 is not a valid Win32 application"
 /// (os error 193). Trying `""` first would therefore shadow the usable `.cmd`.
 fn lookup_in_paths(name: &str, path_var: &OsStr, windows: bool) -> Option<PathBuf> {
-    let exts: &[&str] = if windows {
-        &[".exe", ".cmd", ".bat"]
-    } else {
-        &[""]
-    };
+    let exts: &[&str] = if windows { &[".exe", ".cmd", ".bat"] } else { &[""] };
     for dir in std::env::split_paths(path_var) {
         for ext in exts {
             let candidate = dir.join(format!("{name}{ext}"));
@@ -621,7 +637,8 @@ mod tests {
 
     #[test]
     fn upsert_detects_changed_command() {
-        let (first, _) = upsert_mcp_entry(None, "mcpServers", "mempalace", &json!({ "command": "/old" }));
+        let (first, _) =
+            upsert_mcp_entry(None, "mcpServers", "mempalace", &json!({ "command": "/old" }));
         let (merged, changed) =
             upsert_mcp_entry(Some(first), "mcpServers", "mempalace", &json!({ "command": "/new" }));
         assert!(changed, "a different command must count as a change");
@@ -681,11 +698,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nested").join("opencode.json");
 
-        let first = apply_json("opencode", &path, "mcp", json!({ "type": "local", "command": ["/m"] }), false);
+        let first = apply_json(
+            "opencode",
+            &path,
+            "mcp",
+            json!({ "type": "local", "command": ["/m"] }),
+            false,
+        );
         assert_eq!(first.status, Status::Configured);
         assert!(path.is_file(), "config file created (with parent dirs)");
 
-        let again = apply_json("opencode", &path, "mcp", json!({ "type": "local", "command": ["/m"] }), false);
+        let again = apply_json(
+            "opencode",
+            &path,
+            "mcp",
+            json!({ "type": "local", "command": ["/m"] }),
+            false,
+        );
         assert_eq!(again.status, Status::AlreadyConfigured, "second run is a no-op");
     }
 
@@ -712,7 +741,10 @@ mod tests {
     #[test]
     fn gemini_list_matches_name_as_token_not_substring() {
         // Exact name (with trailing detail) and decorated lines match.
-        assert!(list_contains_server("mempalace  stdio  /home/u/.mempalace/bin/mempalace-mcp", "mempalace"));
+        assert!(list_contains_server(
+            "mempalace  stdio  /home/u/.mempalace/bin/mempalace-mcp",
+            "mempalace"
+        ));
         assert!(list_contains_server("  * mempalace: connected", "mempalace"));
         assert!(list_contains_server("other\nmempalace ok", "mempalace"));
         // A different, longer name must NOT match.
@@ -729,7 +761,10 @@ mod tests {
         let home = dir.path();
         // Gemini-CLI-only home: ~/.gemini/config exists, but no antigravity-cli/.
         std::fs::create_dir_all(home.join(".gemini").join("config")).unwrap();
-        assert!(!antigravity_home_marker(home), "shared ~/.gemini/config must NOT imply antigravity");
+        assert!(
+            !antigravity_home_marker(home),
+            "shared ~/.gemini/config must NOT imply antigravity"
+        );
         // A real Antigravity home has ~/.gemini/antigravity-cli/.
         std::fs::create_dir_all(home.join(".gemini").join("antigravity-cli")).unwrap();
         assert!(antigravity_home_marker(home));

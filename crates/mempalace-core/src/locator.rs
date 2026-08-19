@@ -9,8 +9,8 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::hash::hash_bytes;
 use crate::DrawerRecord;
+use crate::hash::hash_bytes;
 
 /// Pinpoints a chunk within a source file on the owning palace host.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -162,12 +162,7 @@ mod tests {
     use super::*;
     use crate::{DrawerId, RoomId, WingId};
 
-    fn make_locator(
-        root: &str,
-        file_hash: &str,
-        byte_start: u64,
-        byte_end: u64,
-    ) -> SourceLocator {
+    fn make_locator(root: &str, file_hash: &str, byte_start: u64, byte_end: u64) -> SourceLocator {
         SourceLocator {
             byte_start,
             byte_end,
@@ -281,18 +276,8 @@ mod tests {
         let name = path.file_name().unwrap().to_str().unwrap();
 
         let mut records = vec![
-            make_record(
-                "wing/room/0001",
-                name,
-                "",
-                Some(make_locator(root, &hash, 0, 3)),
-            ),
-            make_record(
-                "wing/room/0002",
-                name,
-                "",
-                Some(make_locator(root, &hash, 3, 6)),
-            ),
+            make_record("wing/room/0001", name, "", Some(make_locator(root, &hash, 0, 3))),
+            make_record("wing/room/0002", name, "", Some(make_locator(root, &hash, 3, 6))),
             make_record("wing/room/0003", name, "no locator", None),
         ];
 

@@ -8,7 +8,10 @@
 
 use std::path::PathBuf;
 
-use mempalace_config::{FederationRuntimeConfig, LowCpuRuntimeConfig, MaintenanceRuntimeConfig, MempalaceConfig, ServerRuntimeConfig};
+use mempalace_config::{
+    FederationRuntimeConfig, LowCpuRuntimeConfig, MaintenanceRuntimeConfig, MempalaceConfig,
+    ServerRuntimeConfig,
+};
 use mempalace_core::EmbeddingProfile;
 use mempalace_embeddings::DeterministicStubProvider;
 use mempalace_server::{TokenRegistry, build_router};
@@ -65,10 +68,7 @@ fn test_config(tempdir: &TempDir) -> MempalaceConfig {
 }
 
 /// Spawn the server on an ephemeral port and return the bound address.
-async fn spawn_server(
-    config: MempalaceConfig,
-    token_file: PathBuf,
-) -> std::net::SocketAddr {
+async fn spawn_server(config: MempalaceConfig, token_file: PathBuf) -> std::net::SocketAddr {
     let tokens = TokenRegistry::load(token_file).unwrap();
     let provider = DeterministicStubProvider::new(EmbeddingProfile::Balanced);
     let (router, _state) = build_router(config, provider, tokens).await.unwrap();
@@ -104,18 +104,10 @@ async fn serve_e2e_health_info_drawers_changes() {
     assert_eq!(info_no_auth.status(), 401, "info without token should be 401");
 
     // ── 3. GET /v1/info with valid token → 200, federation_api_version = 1 ──
-    let info = client
-        .get(format!("{base}/v1/info"))
-        .bearer_auth(TEST_TOKEN)
-        .send()
-        .await
-        .unwrap();
+    let info = client.get(format!("{base}/v1/info")).bearer_auth(TEST_TOKEN).send().await.unwrap();
     assert_eq!(info.status(), 200, "info with token should return 200");
     let info_body: serde_json::Value = info.json().await.unwrap();
-    assert_eq!(
-        info_body["federation_api_version"], 1,
-        "federation_api_version must be 1"
-    );
+    assert_eq!(info_body["federation_api_version"], 1, "federation_api_version must be 1");
 
     // ── 4. POST /v1/drawers (add) ────────────────────────────────────────────
     let add_resp = client
@@ -145,29 +137,17 @@ async fn serve_e2e_health_info_drawers_changes() {
     assert_eq!(search_resp.status(), 200, "search should return 200");
     let search_body: serde_json::Value = search_resp.json().await.unwrap();
     let results = search_body["results"].as_array().unwrap();
-    assert!(
-        !results.is_empty(),
-        "search results should not be empty"
-    );
-    let found = results.iter().any(|r| {
-        r["drawer_id"].as_str().unwrap_or("") == drawer_id
-    });
+    assert!(!results.is_empty(), "search results should not be empty");
+    let found = results.iter().any(|r| r["drawer_id"].as_str().unwrap_or("") == drawer_id);
     assert!(found, "search should find the drawer we just added (id={drawer_id})");
 
     // ── 6. GET /v1/changes → contains drawer_added event ─────────────────────
-    let changes_resp = client
-        .get(format!("{base}/v1/changes"))
-        .bearer_auth(TEST_TOKEN)
-        .send()
-        .await
-        .unwrap();
+    let changes_resp =
+        client.get(format!("{base}/v1/changes")).bearer_auth(TEST_TOKEN).send().await.unwrap();
     assert_eq!(changes_resp.status(), 200, "changes should return 200");
     let changes_body: serde_json::Value = changes_resp.json().await.unwrap();
     let events = changes_body["events"].as_array().unwrap();
-    assert!(
-        !events.is_empty(),
-        "changes feed should have at least one event"
-    );
+    assert!(!events.is_empty(), "changes feed should have at least one event");
     let has_drawer_added = events.iter().any(|e| {
         e["event_type"].as_str().unwrap_or("") == "drawer_added"
             && e["entity_id"].as_str().unwrap_or("") == drawer_id

@@ -10,7 +10,10 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use mempalace_config::{FederationRuntimeConfig, LowCpuRuntimeConfig, MaintenanceRuntimeConfig, MempalaceConfig, ServerRuntimeConfig};
+use mempalace_config::{
+    FederationRuntimeConfig, LowCpuRuntimeConfig, MaintenanceRuntimeConfig, MempalaceConfig,
+    ServerRuntimeConfig,
+};
 use mempalace_core::EmbeddingProfile;
 use mempalace_embeddings::DeterministicStubProvider;
 use mempalace_federation::{
@@ -178,10 +181,12 @@ async fn round_trip_drawers_and_changes() {
     client.rooms(Some("wing_rt")).await.unwrap();
 
     // changes → events contain drawer_added with our entity_id
-    let changes = client.changes(ChangesQuery { since: None, limit: None, cursor: None }).await.unwrap();
-    let has_event = changes.events.iter().any(|ev| {
-        ev.event_type == "drawer_added" && ev.entity_id == drawer_id
-    });
+    let changes =
+        client.changes(ChangesQuery { since: None, limit: None, cursor: None }).await.unwrap();
+    let has_event = changes
+        .events
+        .iter()
+        .any(|ev| ev.event_type == "drawer_added" && ev.entity_id == drawer_id);
     assert!(has_event, "changes feed must contain a drawer_added event for our drawer");
 
     // delete_drawer → Ok
@@ -219,11 +224,7 @@ async fn kg_round_trip() {
 
     // kg_query → facts count >= 1
     let query_val = client
-        .kg_query(KgQueryRequest {
-            entity: "alice".to_owned(),
-            as_of: None,
-            direction: None,
-        })
+        .kg_query(KgQueryRequest { entity: "alice".to_owned(), as_of: None, direction: None })
         .await
         .unwrap();
     let count = query_val["count"].as_u64().unwrap_or(0);
@@ -469,8 +470,7 @@ async fn ingest_batch_round_trip() {
                 relative_path: "src/beta.rs".to_owned(),
                 content_hash: "contenthash_beta_002".to_owned(),
                 file_hash: Some(
-                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                        .to_owned(),
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
                 ),
                 chunks: vec![IngestChunkDto {
                     chunk_index: 0,
@@ -514,10 +514,7 @@ async fn ingest_batch_round_trip() {
         })
         .await
         .unwrap();
-    assert!(
-        !search_resp.results.is_empty(),
-        "search must find the alpha chunk after ingest_batch"
-    );
+    assert!(!search_resp.results.is_empty(), "search must find the alpha chunk after ingest_batch");
     let top = &search_resp.results[0];
     assert!(
         top.content.contains("frombulation"),
@@ -574,18 +571,17 @@ async fn ingest_batch_route_missing_returns_404() {
     // Stub server: answers /v1/info correctly but 404s /v1/ingest/batch.
     // This mirrors an old server that doesn't yet implement the bulk-ingest
     // endpoint (the plan notes: "old servers 404 → RemoteRejected").
-    let app = axum::Router::new()
-        .route(
-            "/v1/info",
-            axum::routing::get(|| async {
-                axum::Json(serde_json::json!({
-                    "server_version": "1.0.0-stub",
-                    "federation_api_version": 1u32,
-                    "embedding_profile": "balanced",
-                    "capabilities": ["drawers", "kg"]
-                }))
-            }),
-        );
+    let app = axum::Router::new().route(
+        "/v1/info",
+        axum::routing::get(|| async {
+            axum::Json(serde_json::json!({
+                "server_version": "1.0.0-stub",
+                "federation_api_version": 1u32,
+                "embedding_profile": "balanced",
+                "capabilities": ["drawers", "kg"]
+            }))
+        }),
+    );
     // All other routes fall through to the default 404 handler.
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

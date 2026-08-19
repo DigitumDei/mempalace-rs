@@ -35,8 +35,8 @@ pub use error::{RemoteError, Result};
 
 use mempalace_federation::{
     AddDrawerRequest, AddDrawerResponse, ChangesQuery, ChangesResponse, CheckDuplicateRequest,
-    CheckDuplicateResponse, DrawerSearchRequest, DrawerSearchResponse, IngestBatchRequest,
-    IngestBatchResponse, InfoResponse, KgAddFactRequest, KgInvalidateRequest, KgQueryRequest,
+    CheckDuplicateResponse, DrawerSearchRequest, DrawerSearchResponse, InfoResponse,
+    IngestBatchRequest, IngestBatchResponse, KgAddFactRequest, KgInvalidateRequest, KgQueryRequest,
     ListDrawersQuery, ListDrawersResponse,
 };
 

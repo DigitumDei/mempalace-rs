@@ -33,28 +33,96 @@ const LARGE_FILE_TRUNCATION_BYTES: usize = 200_000;
 
 const PROJECT_READABLE_EXTENSIONS: &[&str] = &[
     // Text / markup
-    ".txt", ".md", ".html", ".xml", ".csv", ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg",
-    ".conf", ".properties",
+    ".txt",
+    ".md",
+    ".html",
+    ".xml",
+    ".csv",
+    ".json",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".ini",
+    ".cfg",
+    ".conf",
+    ".properties",
     // Web / frontend
-    ".js", ".ts", ".jsx", ".tsx", ".css", ".vue", ".svelte", ".astro",
+    ".js",
+    ".ts",
+    ".jsx",
+    ".tsx",
+    ".css",
+    ".vue",
+    ".svelte",
+    ".astro",
     // Systems languages
-    ".rs", ".c", ".h", ".cc", ".cpp", ".cxx", ".hh", ".hpp", ".m", ".mm", ".zig", ".nim",
+    ".rs",
+    ".c",
+    ".h",
+    ".cc",
+    ".cpp",
+    ".cxx",
+    ".hh",
+    ".hpp",
+    ".m",
+    ".mm",
+    ".zig",
+    ".nim",
     // JVM / Android
-    ".java", ".kt", ".kts", ".scala", ".sbt", ".groovy", ".gradle",
+    ".java",
+    ".kt",
+    ".kts",
+    ".scala",
+    ".sbt",
+    ".groovy",
+    ".gradle",
     // .NET
-    ".cs", ".fs", ".fsi", ".fsx",
+    ".cs",
+    ".fs",
+    ".fsi",
+    ".fsx",
     // Scripting / dynamic
-    ".py", ".rb", ".php", ".lua", ".pl", ".pm", ".r", ".jl", ".dart",
+    ".py",
+    ".rb",
+    ".php",
+    ".lua",
+    ".pl",
+    ".pm",
+    ".r",
+    ".jl",
+    ".dart",
     // Shell
-    ".sh", ".bash", ".zsh", ".fish", ".ps1", ".psm1", ".psd1", ".bat", ".cmd",
+    ".sh",
+    ".bash",
+    ".zsh",
+    ".fish",
+    ".ps1",
+    ".psm1",
+    ".psd1",
+    ".bat",
+    ".cmd",
     // Functional / BEAM
-    ".ex", ".exs", ".erl", ".hrl", ".clj", ".cljc", ".cljs", ".edn",
+    ".ex",
+    ".exs",
+    ".erl",
+    ".hrl",
+    ".clj",
+    ".cljc",
+    ".cljs",
+    ".edn",
     // Mobile / other
-    ".swift", ".go",
+    ".swift",
+    ".go",
     // SQL / data
     ".sql",
     // IaC / config
-    ".tf", ".tfvars", ".hcl", ".proto", ".graphql", ".gql", ".dockerfile",
+    ".tf",
+    ".tfvars",
+    ".hcl",
+    ".proto",
+    ".graphql",
+    ".gql",
+    ".dockerfile",
 ];
 const CONVO_EXTENSIONS: &[&str] = &[".txt", ".md", ".json", ".jsonl"];
 const DEFAULT_SKIP_DIRS: &[&str] = &[
@@ -679,10 +747,7 @@ pub async fn ingest_project<P: EmbeddingProvider>(
         .project_dir
         .canonicalize()
         .map_err(|source| IngestError::Io { path: request.project_dir.clone(), source })?;
-    let derived_wing = request
-        .wing
-        .clone()
-        .unwrap_or_else(|| derived_project_wing(&root));
+    let derived_wing = request.wing.clone().unwrap_or_else(|| derived_project_wing(&root));
     let project_id = derive_project_id(&root, &derived_wing, None);
     let config = ConfigLoader::resolve_project_config(
         &root,
@@ -714,9 +779,8 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
         .map_err(|source| IngestError::Io { path: request.project_dir.clone(), source })?;
     let wing_name = request.wing.clone().unwrap_or_else(|| config.wing.clone());
     let wing_id = wing_id(&wing_name)?;
-    let repo_id = project_id
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| derive_repo_id(&root, &wing_name));
+    let repo_id =
+        project_id.map(ToOwned::to_owned).unwrap_or_else(|| derive_repo_id(&root, &wing_name));
     let project_root_key = stable_project_root_key(&repo_id);
     let legacy_root_key = hash_text(&root.to_string_lossy());
     // An explicit canonical view always wins, including for direct library
@@ -748,9 +812,7 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
 
     // Build repository-view metadata for project-mined drawers.
     let default_branch = detect_default_branch(&root);
-    let merge_base = default_branch
-        .as_ref()
-        .and_then(|b| compute_merge_base(&root, b));
+    let merge_base = default_branch.as_ref().and_then(|b| compute_merge_base(&root, b));
     let worktree_id = hash_text(&root.to_string_lossy());
     let view_metadata = mempalace_core::RepositoryViewMetadata {
         repo_id: repo_id.clone(),
@@ -795,7 +857,14 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
         match prepare_file_chunks(file, &routing_fingerprint, &config.rooms) {
             Ok(prepared) => {
                 let sk = branch_name.as_deref().map_or_else(
-                    || project_source_key(ingest_kind, &project_root_key, &wing_name, &file.relative_path),
+                    || {
+                        project_source_key(
+                            ingest_kind,
+                            &project_root_key,
+                            &wing_name,
+                            &file.relative_path,
+                        )
+                    },
                     |branch| {
                         project_branch_source_key(
                             ingest_kind,
@@ -864,13 +933,9 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
                 }
 
                 // Convert PreparedChunk → Chunk and build the locator context.
-                let (chunks_with_room, maybe_ctx_storage) = prepared_chunks_to_ingest(
-                    &prepared,
-                    &resolve_root,
-                    commit_hash.as_deref(),
-                );
-                let ctx_borrow =
-                    maybe_ctx_storage.as_ref().map(PreparedLocatorStorage::as_ctx);
+                let (chunks_with_room, maybe_ctx_storage) =
+                    prepared_chunks_to_ingest(&prepared, &resolve_root, commit_hash.as_deref());
+                let ctx_borrow = maybe_ctx_storage.as_ref().map(PreparedLocatorStorage::as_ctx);
 
                 let source_drawers = build_drawers(
                     provider,
@@ -949,33 +1014,35 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
                         .await?
                         .into_iter()
                         .filter_map(|drawer| {
-                            drawer.view_metadata.as_ref().is_some_and(|metadata| {
-                                metadata.repo_id == view_metadata.repo_id
-                                    && metadata.path_state == "deleted"
-                            }).then_some(drawer.source_file)
+                            drawer
+                                .view_metadata
+                                .as_ref()
+                                .is_some_and(|metadata| {
+                                    metadata.repo_id == view_metadata.repo_id
+                                        && metadata.path_state == "deleted"
+                                })
+                                .then_some(drawer.source_file)
                         }),
                 );
             }
             tombstones
         };
-        let tombstone_embedding = if deleted_paths
-            .iter()
-            .any(|path| !existing_tombstones.contains(path))
-        {
-            embed_chunks(
-                provider,
-                &[Chunk {
-                    content: "Deleted branch path tombstone".to_owned(),
-                    date_hint: None,
-                    room_hint: Some("general".to_owned()),
-                    byte_range: None,
-                    chunk_index: 0,
-                }],
-                request.max_embed_batch_size,
-            )
-        } else {
-            Ok(Vec::new())
-        }?;
+        let tombstone_embedding =
+            if deleted_paths.iter().any(|path| !existing_tombstones.contains(path)) {
+                embed_chunks(
+                    provider,
+                    &[Chunk {
+                        content: "Deleted branch path tombstone".to_owned(),
+                        date_hint: None,
+                        room_hint: Some("general".to_owned()),
+                        byte_range: None,
+                        chunk_index: 0,
+                    }],
+                    request.max_embed_batch_size,
+                )
+            } else {
+                Ok(Vec::new())
+            }?;
         for relative_path in &deleted_paths {
             let source_key = project_branch_source_key(
                 ingest_kind,
@@ -1028,18 +1095,11 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
     // rules, the tracked-index-only population, or symlink rejection no longer
     // appears in `files`, so its previously mined rows and drawers must be
     // removed rather than left searchable.
-    if branch_name.is_none()
-        && discovery_complete
-        && request.limit.is_none()
-        && !request.dry_run
-    {
+    if branch_name.is_none() && discovery_complete && request.limit.is_none() && !request.dry_run {
         let current_rel_paths: BTreeSet<&str> =
             files.iter().map(|file| file.relative_path.as_str()).collect();
         let legacy_prefix = format!("{ingest_kind}:{wing_name}:{legacy_root_key}:");
-        for key in engine
-            .operational_store()
-            .ingested_source_keys_with_prefix(&legacy_prefix)?
-        {
+        for key in engine.operational_store().ingested_source_keys_with_prefix(&legacy_prefix)? {
             let rel = key.splitn(4, ':').nth(3).unwrap_or("");
             if !current_rel_paths.contains(rel) {
                 engine.remove_source_key(&key).await?;
@@ -1047,10 +1107,7 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
             }
         }
         let stable_prefix = format!("{ingest_kind}:{wing_name}:{project_root_key}:");
-        for key in engine
-            .operational_store()
-            .ingested_source_keys_with_prefix(&stable_prefix)?
-        {
+        for key in engine.operational_store().ingested_source_keys_with_prefix(&stable_prefix)? {
             // Key format: projects:{wing}:{root_key}:{rel_path}. Split off the
             // first 3 ':'-delimited segments to recover the relative path.
             let rel = key.splitn(4, ':').nth(3).unwrap_or("");
@@ -1070,8 +1127,7 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
             || format!("{ingest_kind}:{wing_name}:{project_root_key}:"),
             |branch| format!("{ingest_kind}:{wing_name}:{project_root_key}:{branch}:"),
         );
-        let stale_keys =
-            engine.operational_store().ingested_source_keys_with_prefix(&prefix)?;
+        let stale_keys = engine.operational_store().ingested_source_keys_with_prefix(&prefix)?;
         for key in stale_keys {
             // Key format: projects-branch:{wing}:{root_key}:{branch}:{rel_path}
             // Split off the first 4 ':'-delimited segments to get rel_path.
@@ -1371,8 +1427,7 @@ fn prepare_file_chunks(
     rooms: &[ProjectRoomConfig],
 ) -> Result<PreparedFileChunks> {
     let document = read_text_document(&file.absolute_path)?;
-    let content_hash =
-        project_ingest_content_hash(&document.content_hash, routing_fingerprint);
+    let content_hash = project_ingest_content_hash(&document.content_hash, routing_fingerprint);
 
     // Below the minimum size gate → return with empty chunks.
     if document.content.trim().len() < PROJECT_MIN_CHUNK_SIZE {
@@ -1385,11 +1440,7 @@ fn prepare_file_chunks(
         });
     }
 
-    let room = detect_project_room(
-        Path::new(&file.relative_path),
-        &document.content,
-        rooms,
-    );
+    let room = detect_project_room(Path::new(&file.relative_path), &document.content, rooms);
 
     let raw_chunks = chunk_project_text(&document.content, document.valid_utf8);
 
@@ -1571,24 +1622,18 @@ pub fn detect_checkout_view(root: &Path) -> CheckoutView {
     let current_branch = resolve_current_branch(&toplevel);
 
     match (default_branch, current_branch) {
-        (Some(ref base), Some(ref current)) if branch_name(base) == current => CheckoutView::Canonical,
+        (Some(ref base), Some(ref current)) if branch_name(base) == current => {
+            CheckoutView::Canonical
+        }
         (Some(base), Some(view_name)) => {
             let merge_base = compute_merge_base(&toplevel, &base);
-            CheckoutView::Branch {
-                view_name,
-                base_ref: Some(base),
-                merge_base,
-            }
+            CheckoutView::Branch { view_name, base_ref: Some(base), merge_base }
         }
         (Some(base), None) => {
             // Detached HEAD: use a stable hash of the toplevel path as a view identity.
             let view_name = format!("detached-{}", &hash_text(&toplevel.to_string_lossy())[..12]);
             let merge_base = compute_merge_base(&toplevel, &base);
-            CheckoutView::Branch {
-                view_name,
-                base_ref: Some(base),
-                merge_base,
-            }
+            CheckoutView::Branch { view_name, base_ref: Some(base), merge_base }
         }
         // Without a known integration ref there is no safe delta baseline.
         // Preserve the pre-view behavior and mine the checkout in full.
@@ -1657,15 +1702,7 @@ fn git_delta_paths(root: &Path, merge_base: &str) -> Option<Vec<String>> {
     // NUL-separated, unquoted paths so filenames with spaces or non-ASCII
     // bytes survive regardless of the user's core.quotePath setting.
     let diff_out = Command::new("git")
-        .args([
-            "-C",
-            &root_str,
-            "diff",
-            "--name-only",
-            "--diff-filter=d",
-            "-z",
-            merge_base,
-        ])
+        .args(["-C", &root_str, "diff", "--name-only", "--diff-filter=d", "-z", merge_base])
         .output()
         .ok()?;
     if !diff_out.status.success() {
@@ -1677,15 +1714,7 @@ fn git_delta_paths(root: &Path, merge_base: &str) -> Option<Vec<String>> {
     // Keep both streams repo-relative before compute_branch_delta narrows them
     // to the project root.
     let untracked_out = Command::new("git")
-        .args([
-            "-C",
-            &root_str,
-            "ls-files",
-            "--full-name",
-            "--others",
-            "--exclude-standard",
-            "-z",
-        ])
+        .args(["-C", &root_str, "ls-files", "--full-name", "--others", "--exclude-standard", "-z"])
         .output()
         .ok()?;
     if !untracked_out.status.success() {
@@ -1710,12 +1739,11 @@ fn git_delta_paths(root: &Path, merge_base: &str) -> Option<Vec<String>> {
 
 /// Return project-root-relative paths deleted from HEAD since the merge-base.
 fn compute_deleted_branch_paths(root: &Path) -> Result<BTreeSet<String>> {
-    let default_ref = detect_default_branch(root).ok_or_else(|| {
-        IngestError::BranchDeltaUnavailable {
+    let default_ref =
+        detect_default_branch(root).ok_or_else(|| IngestError::BranchDeltaUnavailable {
             reason: "not a git repository or no default branch (origin/HEAD, main, master) found"
                 .to_owned(),
-        }
-    })?;
+        })?;
     let merge_base = compute_merge_base(root, &default_ref).ok_or_else(|| {
         IngestError::BranchDeltaUnavailable {
             reason: format!("could not compute merge-base between '{default_ref}' and HEAD"),
@@ -1776,39 +1804,30 @@ fn git_repo_toplevel(root: &Path) -> Option<PathBuf> {
 /// of files that differ from the merge-base with the default branch (including
 /// untracked files).  Paths outside the project root are dropped.
 fn compute_branch_delta(root: &Path) -> Result<Vec<String>> {
-    let default_ref = detect_default_branch(root).ok_or_else(|| {
-        IngestError::BranchDeltaUnavailable {
+    let default_ref =
+        detect_default_branch(root).ok_or_else(|| IngestError::BranchDeltaUnavailable {
             reason: "not a git repository or no default branch (origin/HEAD, main, master) found"
                 .to_owned(),
-        }
-    })?;
+        })?;
 
     let merge_base = compute_merge_base(root, &default_ref).ok_or_else(|| {
         IngestError::BranchDeltaUnavailable {
-            reason: format!(
-                "could not compute merge-base between '{default_ref}' and HEAD"
-            ),
+            reason: format!("could not compute merge-base between '{default_ref}' and HEAD"),
         }
     })?;
 
     let repo_paths = git_delta_paths(root, &merge_base).ok_or_else(|| {
-        IngestError::BranchDeltaUnavailable {
-            reason: "git diff / ls-files failed".to_owned(),
-        }
+        IngestError::BranchDeltaUnavailable { reason: "git diff / ls-files failed".to_owned() }
     })?;
 
     // Re-relativize paths from repo-root to project-root.
-    let repo_root = git_repo_toplevel(root).ok_or_else(|| {
-        IngestError::BranchDeltaUnavailable {
-            reason: "git rev-parse --show-toplevel failed".to_owned(),
-        }
+    let repo_root = git_repo_toplevel(root).ok_or_else(|| IngestError::BranchDeltaUnavailable {
+        reason: "git rev-parse --show-toplevel failed".to_owned(),
     })?;
 
     // repo_root from git uses forward slashes on all platforms for the purpose
     // of path computation below; canonicalize both for comparison.
-    let repo_root_canon = repo_root
-        .canonicalize()
-        .unwrap_or_else(|_| repo_root.clone());
+    let repo_root_canon = repo_root.canonicalize().unwrap_or_else(|_| repo_root.clone());
     let project_root_canon = root.to_path_buf();
 
     let mut result = Vec::new();
@@ -1883,10 +1902,7 @@ pub fn prepare_project_batch(request: &ProjectIngestRequest) -> Result<PreparedP
         .project_dir
         .canonicalize()
         .map_err(|source| IngestError::Io { path: request.project_dir.clone(), source })?;
-    let derived_wing = request
-        .wing
-        .clone()
-        .unwrap_or_else(|| derived_project_wing(&root));
+    let derived_wing = request.wing.clone().unwrap_or_else(|| derived_project_wing(&root));
     let project_id = derive_project_id(&root, &derived_wing, None);
     let config = ConfigLoader::resolve_project_config(
         &root,
@@ -1915,9 +1931,8 @@ pub fn prepare_project_batch_with_config(
     let routing_fingerprint = project_routing_fingerprint(&config.rooms);
     let commit_hash = resolve_commit_hash(&root);
 
-    let repo_id = project_id
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| derive_repo_id(&root, &wing_name));
+    let repo_id =
+        project_id.map(ToOwned::to_owned).unwrap_or_else(|| derive_repo_id(&root, &wing_name));
     let default_branch = detect_default_branch(&root);
     let current_branch = resolve_current_branch(&root);
 
@@ -1927,11 +1942,8 @@ pub fn prepare_project_batch_with_config(
     summary.secret_path_skips = discovered.skips;
     // Remote mine callers resolve the checkout view before preparing the batch.
     // Preserve it so their summaries match local mine output.
-    summary.view_name = request
-        .view
-        .as_deref()
-        .filter(|view| *view != "canonical")
-        .map(str::to_owned);
+    summary.view_name =
+        request.view.as_deref().filter(|view| *view != "canonical").map(str::to_owned);
 
     let files_to_process: Vec<ProjectSource> =
         apply_limit(discovered.files, request.limit).collect();
@@ -2018,8 +2030,7 @@ pub fn derive_repo_id(root: &Path, wing: &str) -> String {
         });
 
     match url.as_deref().filter(|s| !s.is_empty()) {
-        Some(u) => normalize_git_remote_url(u)
-            .unwrap_or_else(|| format!("wing:{wing}")),
+        Some(u) => normalize_git_remote_url(u).unwrap_or_else(|| format!("wing:{wing}")),
         None => format!("wing:{wing}"),
     }
 }
@@ -2194,10 +2205,7 @@ fn record_secret_skip(
     skips: &mut Vec<ProjectSourceSkip>,
 ) {
     if let Eligibility::Secret(kind) = eligibility {
-        skips.push(ProjectSourceSkip {
-            relative_path,
-            reason: kind.as_str().to_owned(),
-        });
+        skips.push(ProjectSourceSkip { relative_path, reason: kind.as_str().to_owned() });
     }
 }
 
@@ -2214,17 +2222,13 @@ fn read_prefix(path: &Path, limit: usize) -> Option<Vec<u8>> {
 /// Returns `true` if the file looks like binary (NUL byte in the first `BINARY_SNIFF_BYTES`).
 /// I/O error → `false` (treat as text; the subsequent read_text_document call will handle it).
 fn looks_binary(path: &Path) -> bool {
-    read_prefix(path, BINARY_SNIFF_BYTES)
-        .map(|buf| buf.contains(&0u8))
-        .unwrap_or(false)
+    read_prefix(path, BINARY_SNIFF_BYTES).map(|buf| buf.contains(&0u8)).unwrap_or(false)
 }
 
 /// For an extensionless file that is NOT in the basename allowlist: returns `true` if the
 /// first bytes start with `#!`.  I/O error → `false`.
 fn has_shebang(path: &Path) -> bool {
-    read_prefix(path, SHEBANG_READ_BYTES)
-        .map(|buf| buf.starts_with(b"#!"))
-        .unwrap_or(false)
+    read_prefix(path, SHEBANG_READ_BYTES).map(|buf| buf.starts_with(b"#!")).unwrap_or(false)
 }
 
 /// Discover the safe set of eligible project sources under `root`.
@@ -2497,13 +2501,11 @@ fn discover_git_index_sources(root: &Path) -> Result<ProjectSourceDiscovery> {
             skipped += 1;
             continue;
         }
-        let file_name =
-            relative.file_name().and_then(|value| value.to_str()).unwrap_or_default();
+        let file_name = relative.file_name().and_then(|value| value.to_str()).unwrap_or_default();
         match project_eligibility(&absolute, file_name) {
-            Eligibility::Eligible => sources.push(ProjectSource {
-                absolute_path: absolute,
-                relative_path: relative_str,
-            }),
+            Eligibility::Eligible => {
+                sources.push(ProjectSource { absolute_path: absolute, relative_path: relative_str })
+            }
             eligibility => {
                 skipped += 1;
                 record_secret_skip(eligibility, relative_str, &mut skips);
@@ -2579,8 +2581,7 @@ fn project_eligibility(path: &Path, file_name: &str) -> Eligibility {
     let has_ext = !raw_ext.is_empty();
     let normalized_suffix = format!(".{}", raw_ext.to_ascii_lowercase());
     let accepted = (has_ext && PROJECT_READABLE_EXTENSIONS.contains(&normalized_suffix.as_str()))
-        || (!has_ext
-            && (PROJECT_READABLE_BASENAMES.contains(&file_name) || has_shebang(path)));
+        || (!has_ext && (PROJECT_READABLE_BASENAMES.contains(&file_name) || has_shebang(path)));
     // Binary sniff: exclude files with a NUL byte in the first 8 KiB even
     // when the extension claims text (misnamed binaries).
     if !accepted || looks_binary(path) {
@@ -2778,9 +2779,8 @@ fn discover_files(
     }
     let mut stack = vec![root.to_path_buf()];
     // Pre-compute linked worktree paths so we can skip them during the walk.
-    let worktree_skip = skip_linked_worktrees
-        .then(|| linked_worktree_paths(&root))
-        .unwrap_or_default();
+    let worktree_skip =
+        skip_linked_worktrees.then(|| linked_worktree_paths(&root)).unwrap_or_default();
 
     while let Some(dir) = stack.pop() {
         // Nested `.gitignore`/`.mempalaceignore` files apply to the entries of
@@ -2944,9 +2944,8 @@ impl IgnoreMatcher {
             .filter(|o| o.status.success())
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned());
         let Some(toplevel) = output else { return String::new() };
-        let toplevel = Path::new(&toplevel)
-            .canonicalize()
-            .unwrap_or_else(|_| PathBuf::from(toplevel));
+        let toplevel =
+            Path::new(&toplevel).canonicalize().unwrap_or_else(|_| PathBuf::from(toplevel));
         let root_canon = self.root.canonicalize().unwrap_or_else(|_| self.root.clone());
         match root_canon.strip_prefix(&toplevel) {
             Ok(rest) if !rest.as_os_str().is_empty() => {
@@ -2991,8 +2990,11 @@ impl IgnoreMatcher {
         // `.gitignore`, which beats `info/exclude`, which beats the global
         // excludes file.
         self.rules.sort_by(|left, right| {
-            (left.tier, left.scope_depth, left.order)
-                .cmp(&(right.tier, right.scope_depth, right.order))
+            (left.tier, left.scope_depth, left.order).cmp(&(
+                right.tier,
+                right.scope_depth,
+                right.order,
+            ))
         });
     }
 
@@ -3102,11 +3104,7 @@ fn parse_ignore_pattern(line: &str) -> Option<IgnorePattern> {
     // open a real pattern (gitignore(5)). For any other character the backslash
     // is part of the glob itself and must survive for the matcher: `\*` targets
     // a file literally named `*`, it must not become an ignore-everything `*`.
-    let rest = if rest.starts_with("\\#") || rest.starts_with("\\!") {
-        &rest[1..]
-    } else {
-        rest
-    };
+    let rest = if rest.starts_with("\\#") || rest.starts_with("\\!") { &rest[1..] } else { rest };
     if rest.is_empty() {
         return None;
     }
@@ -4234,9 +4232,8 @@ pub fn project_root_relative(root: &Path) -> Option<String> {
     if !output.status.success() {
         return None;
     }
-    let git_root = PathBuf::from(String::from_utf8(output.stdout).ok()?.trim())
-        .canonicalize()
-        .ok()?;
+    let git_root =
+        PathBuf::from(String::from_utf8(output.stdout).ok()?.trim()).canonicalize().ok()?;
     let canonical_root = root.canonicalize().ok()?;
     let relative = canonical_root.strip_prefix(git_root).ok()?;
     let value = relative.to_string_lossy().replace('\\', "/");
@@ -4438,11 +4435,9 @@ mod tests {
         EmbeddingProvider, EmbeddingRequest, EmbeddingResponse, StartupValidation,
         StartupValidationStatus,
     };
-    use mempalace_storage::{
-        DrawerFilter, DrawerStore, DuplicateStrategy, IngestCommitRequest,
-    };
+    use mempalace_storage::{DrawerFilter, DrawerStore, DuplicateStrategy, IngestCommitRequest};
     use serde_json::json;
-    use tempfile::{tempdir, Builder};
+    use tempfile::{Builder, tempdir};
 
     use super::*;
 
@@ -4594,10 +4589,10 @@ mod tests {
                     date_hint: None,
                     byte_range: None,
                 },
-],
-            None,           // locator_ctx
-            None,           // view
-            None,           // view_metadata
+            ],
+            None, // locator_ctx
+            None, // view
+            None, // view_metadata
         )
         .unwrap();
 
@@ -4723,7 +4718,8 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: false,
-        view: None,},
+                view: None,
+            },
         )
         .await
         .unwrap();
@@ -4930,7 +4926,8 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: false,
-        view: None,},
+                view: None,
+            },
         )
         .await
         .unwrap();
@@ -4946,7 +4943,8 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: false,
-        view: None,},
+                view: None,
+            },
         )
         .await
         .unwrap();
@@ -4970,7 +4968,8 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: false,
-        view: None,},
+                view: None,
+            },
         )
         .await
         .unwrap();
@@ -5025,7 +5024,8 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: false,
-        view: None,},
+                view: None,
+            },
         )
         .await
         .unwrap();
@@ -5073,7 +5073,8 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: false,
-        view: None,},
+                view: None,
+            },
         )
         .await
         .unwrap();
@@ -5092,7 +5093,8 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: false,
-        view: None,},
+                view: None,
+            },
         )
         .await
         .unwrap();
@@ -5141,7 +5143,8 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: false,
-        view: None,},
+                view: None,
+            },
         )
         .await
         .unwrap();
@@ -5163,7 +5166,8 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: false,
-        view: None,},
+                view: None,
+            },
         )
         .await
         .unwrap();
@@ -5224,11 +5228,8 @@ mod tests {
         let tempdir = tempdir().unwrap();
         let project_dir = tempdir.path().join("project");
         fs::create_dir_all(project_dir.join("src")).unwrap();
-        fs::write(
-            project_dir.join("mempalace.yaml"),
-            "wing: loctest\nrooms:\n  - name: general\n",
-        )
-        .unwrap();
+        fs::write(project_dir.join("mempalace.yaml"), "wing: loctest\nrooms:\n  - name: general\n")
+            .unwrap();
 
         // Build a file large enough to produce at least two chunks (> 1600 chars).
         let line = "The quick brown fox jumps over the lazy dog. ";
@@ -5253,12 +5254,17 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: false,
-        view: None,},
+                view: None,
+            },
         )
         .await
         .unwrap();
 
-        assert!(summary.drawers_written >= 2, "expected >=2 chunks, got {}", summary.drawers_written);
+        assert!(
+            summary.drawers_written >= 2,
+            "expected >=2 chunks, got {}",
+            summary.drawers_written
+        );
 
         let drawers = engine
             .drawer_store()
@@ -5301,11 +5307,8 @@ mod tests {
         let tempdir = tempdir().unwrap();
         let project_dir = tempdir.path().join("project");
         fs::create_dir_all(&project_dir).unwrap();
-        fs::write(
-            project_dir.join("mempalace.yaml"),
-            "wing: lwtest\nrooms:\n  - name: general\n",
-        )
-        .unwrap();
+        fs::write(project_dir.join("mempalace.yaml"), "wing: lwtest\nrooms:\n  - name: general\n")
+            .unwrap();
 
         let line = "Content line with enough text to fill the chunk buffer here. ";
         let body = format!("\n\n\n{}", line.repeat(20)); // leading newlines
@@ -5329,7 +5332,8 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: false,
-        view: None,},
+                view: None,
+            },
         )
         .await
         .unwrap();
@@ -5360,11 +5364,8 @@ mod tests {
         let tempdir = tempdir().unwrap();
         let project_dir = tempdir.path().join("project");
         fs::create_dir_all(&project_dir).unwrap();
-        fs::write(
-            project_dir.join("mempalace.yaml"),
-            "wing: bintest\nrooms:\n  - name: general\n",
-        )
-        .unwrap();
+        fs::write(project_dir.join("mempalace.yaml"), "wing: bintest\nrooms:\n  - name: general\n")
+            .unwrap();
 
         // Latin-1 bytes that are not valid UTF-8, long enough to meet min chunk size.
         let mut raw: Vec<u8> = b"Hello world invalid ".to_vec();
@@ -5389,7 +5390,8 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: false,
-        view: None,},
+                view: None,
+            },
         )
         .await
         .unwrap();
@@ -5447,7 +5449,8 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: false,
-        view: None,},
+                view: None,
+            },
         )
         .await
         .unwrap();
@@ -5468,8 +5471,11 @@ mod tests {
             // file_hash must be hash of FULL bytes.
             assert_eq!(loc.file_hash, expected_file_hash);
             // Byte ranges must lie within the first 200 000 bytes.
-            assert!(loc.byte_end <= LARGE_FILE_TRUNCATION_BYTES as u64,
-                "byte_end {} exceeds truncation boundary", loc.byte_end);
+            assert!(
+                loc.byte_end <= LARGE_FILE_TRUNCATION_BYTES as u64,
+                "byte_end {} exceeds truncation boundary",
+                loc.byte_end
+            );
             // Slice must be valid.
             let start = loc.byte_start as usize;
             let end = loc.byte_end as usize;
@@ -5484,11 +5490,8 @@ mod tests {
         let tempdir = tempdir().unwrap();
         let project_dir = tempdir.path().join("project");
         fs::create_dir_all(&project_dir).unwrap();
-        fs::write(
-            project_dir.join("mempalace.yaml"),
-            "wing: gitless\nrooms:\n  - name: general\n",
-        )
-        .unwrap();
+        fs::write(project_dir.join("mempalace.yaml"), "wing: gitless\nrooms:\n  - name: general\n")
+            .unwrap();
         let line = "Some content for the locator test. ";
         fs::write(project_dir.join("notes.txt"), line.repeat(30)).unwrap();
 
@@ -5508,7 +5511,8 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: false,
-        view: None,},
+                view: None,
+            },
         )
         .await
         .unwrap();
@@ -5536,11 +5540,8 @@ mod tests {
         let tempdir = tempdir().unwrap();
         let project_dir = tempdir.path().join("project");
         fs::create_dir_all(&project_dir).unwrap();
-        fs::write(
-            project_dir.join("mempalace.yaml"),
-            "wing: ridx\nrooms:\n  - name: general\n",
-        )
-        .unwrap();
+        fs::write(project_dir.join("mempalace.yaml"), "wing: ridx\nrooms:\n  - name: general\n")
+            .unwrap();
         let body = "Stable content for reindex test.\n".repeat(30);
         fs::write(project_dir.join("stable.txt"), &body).unwrap();
 
@@ -5561,7 +5562,8 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: false,
-        view: None,},
+                view: None,
+            },
         )
         .await
         .unwrap();
@@ -5580,12 +5582,15 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: false,
-        view: None,},
+                view: None,
+            },
         )
         .await
         .unwrap();
-        assert_eq!(second.skipped_unchanged, second.discovered_files,
-            "unchanged run: all files should be skipped");
+        assert_eq!(
+            second.skipped_unchanged, second.discovered_files,
+            "unchanged run: all files should be skipped"
+        );
         assert_eq!(second.ingested_files, 0);
 
         // Third run with reindex=true: must re-ingest all.
@@ -5601,7 +5606,8 @@ mod tests {
                 reindex: true,
                 max_embed_batch_size: None,
                 branch: false,
-        view: None,},
+                view: None,
+            },
         )
         .await
         .unwrap();
@@ -5679,7 +5685,11 @@ mod tests {
         assert!(!names.contains(&"data.h"), "binary data.h must be excluded: {names:?}");
         assert!(names.contains(&"clean.h"), "clean.h must be included: {names:?}");
         // ignored_files must include the binary file.
-        assert!(report.ignored_files >= 1, "ignored_files should be >= 1, got {}", report.ignored_files);
+        assert!(
+            report.ignored_files >= 1,
+            "ignored_files should be >= 1, got {}",
+            report.ignored_files
+        );
     }
 
     /// .env and .env.local are never discovered — even if they start with #!.
@@ -5849,11 +5859,8 @@ mod tests {
         // Every secret-shaped path is counted as a skip and recorded with a
         // reason.
         assert_eq!(discovery.skipped, 7, "skipped = {}", discovery.skipped);
-        let recorded: Vec<(&str, &str)> = discovery
-            .skips
-            .iter()
-            .map(|s| (s.relative_path.as_str(), s.reason.as_str()))
-            .collect();
+        let recorded: Vec<(&str, &str)> =
+            discovery.skips.iter().map(|s| (s.relative_path.as_str(), s.reason.as_str())).collect();
         assert_eq!(recorded.len(), 7);
         for (path, reason) in &recorded {
             assert!(!names.contains(path), "{path} must not be discovered");
@@ -5888,11 +5895,8 @@ mod tests {
         let names: Vec<_> = discovery.sources.iter().map(|s| s.relative_path.as_str()).collect();
         assert_eq!(names, vec!["main.rs"]);
         assert_eq!(discovery.skipped, 3);
-        let recorded: Vec<(&str, &str)> = discovery
-            .skips
-            .iter()
-            .map(|s| (s.relative_path.as_str(), s.reason.as_str()))
-            .collect();
+        let recorded: Vec<(&str, &str)> =
+            discovery.skips.iter().map(|s| (s.relative_path.as_str(), s.reason.as_str())).collect();
         assert_eq!(
             recorded,
             vec![
@@ -5993,7 +5997,9 @@ mod tests {
 
         // Write a non-UTF-8 file.
         let mut non_utf8 = vec![0xFF, 0xFE];
-        non_utf8.extend_from_slice(b" binary content here  binary content here  binary content here  extra");
+        non_utf8.extend_from_slice(
+            b" binary content here  binary content here  binary content here  extra",
+        );
         fs::write(project_dir.join("src/binary.rs"), &non_utf8).unwrap();
 
         let request = ProjectIngestRequest::new(&project_dir);
@@ -6041,7 +6047,8 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: false,
-        view: None,},
+                view: None,
+            },
         )
         .await
         .unwrap();
@@ -6097,7 +6104,8 @@ mod tests {
         );
 
         let engine = open_engine(&tempdir.path().join("palace")).await;
-        let mut provider = FakeEmbeddingProvider::new(EmbeddingProfile::Balanced.metadata().dimensions);
+        let mut provider =
+            FakeEmbeddingProvider::new(EmbeddingProfile::Balanced.metadata().dimensions);
         let legacy_drawers = build_drawers(
             &mut provider,
             &wing_id(wing_name).unwrap(),
@@ -6131,25 +6139,25 @@ mod tests {
             .await
             .unwrap();
 
-        ingest_project(
-            &engine,
-            &mut provider,
-            &ProjectIngestRequest::new(&project_dir),
-        )
-        .await
-        .unwrap();
+        ingest_project(&engine, &mut provider, &ProjectIngestRequest::new(&project_dir))
+            .await
+            .unwrap();
 
         assert!(engine.operational_store().get_ingested_file(&legacy_key).unwrap().is_none());
-        assert!(engine
-            .operational_store()
-            .committed_drawer_ids_for_source_key(&legacy_key)
-            .unwrap()
-            .is_empty());
-        assert!(!engine
-            .operational_store()
-            .committed_drawer_ids_for_source_key(&stable_key)
-            .unwrap()
-            .is_empty());
+        assert!(
+            engine
+                .operational_store()
+                .committed_drawer_ids_for_source_key(&legacy_key)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !engine
+                .operational_store()
+                .committed_drawer_ids_for_source_key(&stable_key)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// A canonical re-mine must not treat an index path missing from this
@@ -6330,11 +6338,13 @@ mod tests {
         );
         // The eligible file's row survives the purge.
         let keep_key = project_source_key("projects", &project_root_key, wing_name, "keep.md");
-        assert!(!engine
-            .operational_store()
-            .committed_drawer_ids_for_source_key(&keep_key)
-            .unwrap()
-            .is_empty());
+        assert!(
+            !engine
+                .operational_store()
+                .committed_drawer_ids_for_source_key(&keep_key)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// The stable sweep must be scoped to the current project identity: re-mining
@@ -6348,13 +6358,8 @@ mod tests {
         for dir in [&project_a, &project_b] {
             fs::create_dir_all(dir).unwrap();
             let keep_md =
-                "# keep\n\nThis eligible file must survive the scoped canonical sweep.\n"
-                    .repeat(4);
-            git_init_with_commit(
-                dir,
-                "main",
-                &[("keep.md", keep_md.as_str())],
-            );
+                "# keep\n\nThis eligible file must survive the scoped canonical sweep.\n".repeat(4);
+            git_init_with_commit(dir, "main", &[("keep.md", keep_md.as_str())]);
         }
 
         let wing_name = "sweepisolation";
@@ -6431,16 +6436,19 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(!engine
-            .operational_store()
-            .committed_drawer_ids_for_source_key(&key_a)
-            .unwrap()
-            .is_empty());
-        assert!(!engine
-            .operational_store()
-            .committed_drawer_ids_for_source_key(&key_b)
-            .unwrap()
-            .is_empty(),
+        assert!(
+            !engine
+                .operational_store()
+                .committed_drawer_ids_for_source_key(&key_a)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !engine
+                .operational_store()
+                .committed_drawer_ids_for_source_key(&key_b)
+                .unwrap()
+                .is_empty(),
             "project B's rows must be untouched by project A's canonical sweep"
         );
     }
@@ -6458,7 +6466,8 @@ mod tests {
 
         // Non-UTF-8 content long enough to produce chunks.
         let mut non_utf8 = vec![0xFF, 0xFE];
-        let fill: Vec<u8> = b" non utf8 filler content here  non utf8 filler content here  ".repeat(15).to_vec();
+        let fill: Vec<u8> =
+            b" non utf8 filler content here  non utf8 filler content here  ".repeat(15).to_vec();
         non_utf8.extend(fill);
         fs::write(project_dir.join("data.rs"), &non_utf8).unwrap();
 
@@ -6521,16 +6530,28 @@ mod tests {
     /// Initialize a git repo at `dir` with a single commit on branch `main`.
     fn git_init_with_commit(dir: &Path, branch: &str, files: &[(&str, &str)]) {
         let run = |args: &[&str]| {
-            let status = Command::new("git")
-                .args(args)
-                .current_dir(dir)
-                .status()
-                .unwrap();
+            let status = Command::new("git").args(args).current_dir(dir).status().unwrap();
             assert!(status.success(), "git {args:?} failed");
         };
         run(&["init", "-b", branch]);
-        run(&["-c", "user.email=test@test.com", "-c", "user.name=Test", "config", "user.email", "test@test.com"]);
-        run(&["-c", "user.email=test@test.com", "-c", "user.name=Test", "config", "user.name", "Test"]);
+        run(&[
+            "-c",
+            "user.email=test@test.com",
+            "-c",
+            "user.name=Test",
+            "config",
+            "user.email",
+            "test@test.com",
+        ]);
+        run(&[
+            "-c",
+            "user.email=test@test.com",
+            "-c",
+            "user.name=Test",
+            "config",
+            "user.name",
+            "Test",
+        ]);
         for (path, content) in files {
             let full = dir.join(path);
             if let Some(parent) = full.parent() {
@@ -6541,11 +6562,7 @@ mod tests {
             // `mempalace.yaml`) can't silently block staging the fixture file.
             run(&["add", "-f", path]);
         }
-        run(&[
-            "-c", "user.email=test@test.com",
-            "-c", "user.name=Test",
-            "commit", "-m", "initial",
-        ]);
+        run(&["-c", "user.email=test@test.com", "-c", "user.name=Test", "commit", "-m", "initial"]);
     }
 
     #[tokio::test]
@@ -6571,11 +6588,7 @@ mod tests {
 
         // Create and switch to feature branch.
         let run_git = |args: &[&str]| {
-            Command::new("git")
-                .args(args)
-                .current_dir(&repo_dir)
-                .status()
-                .unwrap();
+            Command::new("git").args(args).current_dir(&repo_dir).status().unwrap();
         };
         run_git(&["checkout", "-b", "feature"]);
 
@@ -6601,7 +6614,8 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: true,
-        view: None,},
+                view: None,
+            },
         )
         .await
         .unwrap();
@@ -6622,8 +6636,7 @@ mod tests {
             "feature",
             "base.rs",
         );
-        let stored_base =
-            engine.operational_store().get_ingested_file(&sk_base).unwrap();
+        let stored_base = engine.operational_store().get_ingested_file(&sk_base).unwrap();
         assert!(stored_base.is_some(), "base.rs must be stored under projects-branch key");
 
         let sk_stable = project_branch_source_key(
@@ -6633,8 +6646,7 @@ mod tests {
             "feature",
             "stable.rs",
         );
-        let stored_stable =
-            engine.operational_store().get_ingested_file(&sk_stable).unwrap();
+        let stored_stable = engine.operational_store().get_ingested_file(&sk_stable).unwrap();
         assert!(stored_stable.is_none(), "stable.rs must NOT be stored (not in delta)");
     }
 
@@ -6658,11 +6670,7 @@ mod tests {
         );
 
         let run_git = |args: &[&str]| {
-            Command::new("git")
-                .args(args)
-                .current_dir(&repo_dir)
-                .status()
-                .unwrap();
+            Command::new("git").args(args).current_dir(&repo_dir).status().unwrap();
         };
         run_git(&["checkout", "-b", "feature"]);
 
@@ -6690,7 +6698,8 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: true,
-        view: None,},
+                view: None,
+            },
         )
         .await
         .unwrap();
@@ -6713,7 +6722,8 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: true,
-        view: None,},
+                view: None,
+            },
         )
         .await
         .unwrap();
@@ -6760,10 +6770,7 @@ mod tests {
             .unwrap();
         assert!(!tombstone_drawers.is_empty());
         assert!(tombstone_drawers.iter().all(|drawer| {
-            drawer
-                .view_metadata
-                .as_ref()
-                .is_some_and(|metadata| metadata.path_state == "deleted")
+            drawer.view_metadata.as_ref().is_some_and(|metadata| metadata.path_state == "deleted")
         }));
 
         let third = ingest_project(
@@ -6808,11 +6815,7 @@ mod tests {
         );
 
         let run_git = |args: &[&str]| {
-            Command::new("git")
-                .args(args)
-                .current_dir(&repo_dir)
-                .status()
-                .unwrap();
+            Command::new("git").args(args).current_dir(&repo_dir).status().unwrap();
         };
         run_git(&["checkout", "-b", "feature"]);
 
@@ -6841,7 +6844,8 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: true,
-        view: None,},
+                view: None,
+            },
         )
         .await
         .unwrap();
@@ -6858,16 +6862,9 @@ mod tests {
         let tempdir = tempdir().unwrap();
         let project_dir = tempdir.path().join("notgit");
         fs::create_dir_all(&project_dir).unwrap();
-        fs::write(
-            project_dir.join("mempalace.yaml"),
-            "wing: test\nrooms:\n  - name: general\n",
-        )
-        .unwrap();
-        fs::write(
-            project_dir.join("main.rs"),
-            "fn main() {}\n".repeat(10),
-        )
-        .unwrap();
+        fs::write(project_dir.join("mempalace.yaml"), "wing: test\nrooms:\n  - name: general\n")
+            .unwrap();
+        fs::write(project_dir.join("main.rs"), "fn main() {}\n".repeat(10)).unwrap();
 
         let engine = open_engine(tempdir.path()).await;
         let mut provider =
@@ -6885,7 +6882,8 @@ mod tests {
                 reindex: false,
                 max_embed_batch_size: None,
                 branch: true,
-        view: None,},
+                view: None,
+            },
         )
         .await;
 
@@ -6903,22 +6901,12 @@ mod tests {
         let root = tempdir.path().to_path_buf();
 
         // Initialise a git repo with a single commit.
-        git_init_with_commit(
-            &root,
-            "main",
-            &[("main.rs", "fn main() {}\n")],
-        );
+        git_init_with_commit(&root, "main", &[("main.rs", "fn main() {}\n")]);
 
         let worktree_dir = root.join("worktree");
         // Create a linked worktree (the directory must not exist beforehand).
         let status = Command::new("git")
-            .args([
-                "worktree",
-                "add",
-                "-b",
-                "linked",
-                worktree_dir.to_str().unwrap(),
-            ])
+            .args(["worktree", "add", "-b", "linked", worktree_dir.to_str().unwrap()])
             .current_dir(&root)
             .status()
             .unwrap();
@@ -6942,10 +6930,7 @@ mod tests {
         let names: Vec<_> = report.files.iter().map(|f| f.relative_path.as_str()).collect();
 
         // main.rs in the main worktree must be discovered.
-        assert!(
-            names.contains(&"main.rs"),
-            "main.rs should be discovered: {names:?}"
-        );
+        assert!(names.contains(&"main.rs"), "main.rs should be discovered: {names:?}");
         // sibling.rs in a normal subdirectory must be discovered.
         assert!(
             names.contains(&"sibling/sibling.rs"),
@@ -6986,13 +6971,7 @@ mod tests {
 
         let worktree_dir = root.join("worktree");
         let status = Command::new("git")
-            .args([
-                "worktree",
-                "add",
-                "-b",
-                "linked",
-                worktree_dir.to_str().unwrap(),
-            ])
+            .args(["worktree", "add", "-b", "linked", worktree_dir.to_str().unwrap()])
             .current_dir(&root)
             .status()
             .unwrap();
@@ -7028,14 +7007,12 @@ mod tests {
     fn linked_worktree_paths_accept_non_utf8_and_newline_paths() {
         use std::os::unix::ffi::OsStrExt as _;
 
-        let output = b"worktree /repo\0HEAD abc\0\0worktree /repo/linked\nbranch-\xff\0HEAD def\0\0";
+        let output =
+            b"worktree /repo\0HEAD abc\0\0worktree /repo/linked\nbranch-\xff\0HEAD def\0\0";
         let paths = parse_linked_worktree_paths(output);
 
         assert_eq!(paths.len(), 1);
-        assert_eq!(
-            paths.first().unwrap().as_os_str().as_bytes(),
-            b"/repo/linked\nbranch-\xff"
-        );
+        assert_eq!(paths.first().unwrap().as_os_str().as_bytes(), b"/repo/linked\nbranch-\xff");
     }
 
     #[test]
@@ -7450,7 +7427,10 @@ mod tests {
         git_init_with_commit(
             &repo,
             "main",
-            &[("generated/schema.rs", "const SCHEMA: &str = \"v1\";\n"), ("keep.rs", "fn keep() {}\n")],
+            &[
+                ("generated/schema.rs", "const SCHEMA: &str = \"v1\";\n"),
+                ("keep.rs", "fn keep() {}\n"),
+            ],
         );
         fs::write(repo.join(".gitignore"), "generated/\n").unwrap();
 
@@ -7499,11 +7479,8 @@ mod tests {
         let external = tempdir.path().join("external.md");
         fs::write(&external, "external secret-like content\n").unwrap();
         symlink(&external, repo.join("link.md")).unwrap();
-        let status = Command::new("git")
-            .args(["add", "-f", "link.md"])
-            .current_dir(&repo)
-            .status()
-            .unwrap();
+        let status =
+            Command::new("git").args(["add", "-f", "link.md"]).current_dir(&repo).status().unwrap();
         assert!(status.success(), "git add tracked symlink failed");
 
         let report = discover_project_branch_sources(&repo).unwrap();
@@ -7564,7 +7541,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn unreadable_configured_global_excludes_does_not_abort_discovery() {
         let tempdir = tempdir().unwrap();
@@ -7602,10 +7578,7 @@ mod tests {
         git_init_with_commit(
             &root,
             "main",
-            &[
-                ("tracked.md", "tracked\n"),
-                ("notes.md", "notes\n"),
-            ],
+            &[("tracked.md", "tracked\n"), ("notes.md", "notes\n")],
         );
 
         // The tracked symlink points at an eligible file outside the repo. If
@@ -7662,11 +7635,8 @@ mod tests {
         fs::create_dir_all(&external_dir).unwrap();
         fs::write(external_dir.join("credentials.md"), &secret).unwrap();
         symlink(external_dir.join("credentials.md"), root.join("link.md")).unwrap();
-        let status = Command::new("git")
-            .args(["add", "-f", "link.md"])
-            .current_dir(&root)
-            .status()
-            .unwrap();
+        let status =
+            Command::new("git").args(["add", "-f", "link.md"]).current_dir(&root).status().unwrap();
         assert!(status.success(), "git add symlink failed");
 
         let engine = open_engine(&tempdir.path().join("palace")).await;
@@ -7892,11 +7862,7 @@ mod tests {
     fn filesystem_discovery_supports_globs_and_doublestar() {
         let tempdir = tempdir().unwrap();
         let root = tempdir.path();
-        fs::write(
-            root.join(".gitignore"),
-            "doc/*.md\n**/cache/tmp?.md\na/**/b/m.md\n",
-        )
-        .unwrap();
+        fs::write(root.join(".gitignore"), "doc/*.md\n**/cache/tmp?.md\na/**/b/m.md\n").unwrap();
         fs::create_dir_all(root.join("doc").join("nested")).unwrap();
         fs::write(root.join("doc").join("readme.md"), "r").unwrap();
         fs::write(root.join("doc").join("nested").join("readme.md"), "r2").unwrap();

@@ -4132,6 +4132,7 @@ dependencies = [
  "arrow-array",
  "arrow-schema",
  "async-trait",
+ "blake3",
  "futures",
  "lancedb",
  "mempalace-core",

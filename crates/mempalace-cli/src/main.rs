@@ -17,7 +17,6 @@ use mempalace_embeddings::{
     DeterministicStubProvider, EmbeddingProvider, FastembedProvider, FastembedProviderConfig,
     env_flag, log_startup_validation,
 };
-use mempalace_server::{TokenRegistry, build_router};
 use mempalace_federation::{IngestBatchRequest, IngestBatchResponse};
 use mempalace_ingest::{
     ConversationExtractMode, ConversationIngestRequest, IngestError, IngestSummary,
@@ -28,6 +27,7 @@ use mempalace_ingest::{
 };
 use mempalace_remote::{RemoteApi, RemoteClient, RemoteEndpoint, RemoteError};
 use mempalace_search::{Layer1Config, SearchRuntime, SearchRuntimePolicy, WakeUpRequest};
+use mempalace_server::{TokenRegistry, build_router};
 use mempalace_storage::{
     DrawerFilter, DrawerStore, IngestManifestStore, MaintenanceSettings, StorageEngine,
     StorageLayout,
@@ -178,9 +178,16 @@ enum Commands {
         dir: PathBuf,
         #[arg(long, help = "Auto-accept detected rooms")]
         yes: bool,
-        #[arg(long = "repo-config", help = "Also write a portable repository-local mempalace.yaml")]
+        #[arg(
+            long = "repo-config",
+            help = "Also write a portable repository-local mempalace.yaml"
+        )]
         repo_config: bool,
-        #[arg(long = "project-id", alias = "project", help = "Explicit stable project ID for repositories without a usable origin")]
+        #[arg(
+            long = "project-id",
+            alias = "project",
+            help = "Explicit stable project ID for repositories without a usable origin"
+        )]
         project_id: Option<String>,
     },
     /// Mine files into the palace.
@@ -198,11 +205,18 @@ enum Commands {
         limit: usize,
         #[arg(long = "dry-run")]
         dry_run: bool,
-        #[arg(long = "reindex", help = "Re-process all discovered files even if their content hash is unchanged (migration path from content rows to locator rows)")]
+        #[arg(
+            long = "reindex",
+            help = "Re-process all discovered files even if their content hash is unchanged (migration path from content rows to locator rows)"
+        )]
         reindex: bool,
         #[arg(long, value_enum, default_value_t = CliExtractMode::Exchange)]
         extract: CliExtractMode,
-        #[arg(long, conflicts_with = "full", help = "Mine only files changed vs the merge-base with the default branch (local branch-delta mining). When omitted, the checkout type is detected automatically: canonical checkouts perform a full mine, non-canonical checkouts perform a branch-delta mine.")]
+        #[arg(
+            long,
+            conflicts_with = "full",
+            help = "Mine only files changed vs the merge-base with the default branch (local branch-delta mining). When omitted, the checkout type is detected automatically: canonical checkouts perform a full mine, non-canonical checkouts perform a branch-delta mine."
+        )]
         branch: bool,
         #[arg(
             long = "batch-size",
@@ -210,9 +224,15 @@ enum Commands {
             help = "Largest batch to process at once; lower it to bound peak memory/CPU on low-spec machines. Local mine: chunks embedded per batch (default: a file's chunks together). Remote mine: files per request (default: 64). 0 or omitted keeps the default."
         )]
         batch_size: Option<usize>,
-        #[arg(long, help = "Explicit view/ref name for this mine. Overrides automatic detection. Use 'canonical' to force a full canonical mine.")]
+        #[arg(
+            long,
+            help = "Explicit view/ref name for this mine. Overrides automatic detection. Use 'canonical' to force a full canonical mine."
+        )]
         view: Option<String>,
-        #[arg(long, help = "Force a full canonical mine, ignoring automatic branch detection. Equivalent to --view canonical.")]
+        #[arg(
+            long,
+            help = "Force a full canonical mine, ignoring automatic branch detection. Equivalent to --view canonical."
+        )]
         full: bool,
     },
     /// Inspect and manage centralized project declarations.
@@ -250,9 +270,15 @@ enum Commands {
             help = "Restrict to source paths under this normalized prefix, matched against paths relative to the mined project root, e.g. crates/legacy/. Without --view this narrows the canonical snapshot only. Requires --project-id"
         )]
         source_prefix: Option<String>,
-        #[arg(long = "dry-run", help = "Preview only; never delete (the default when --yes is absent)")]
+        #[arg(
+            long = "dry-run",
+            help = "Preview only; never delete (the default when --yes is absent)"
+        )]
         dry_run: bool,
-        #[arg(long, help = "Actually delete the matched sources; without this, prune only previews")]
+        #[arg(
+            long,
+            help = "Actually delete the matched sources; without this, prune only previews"
+        )]
         yes: bool,
     },
     /// Find anything, exact words.
@@ -264,7 +290,10 @@ enum Commands {
         room: Option<String>,
         #[arg(long = "results", default_value_t = 5)]
         results: usize,
-        #[arg(long, help = "Use a branch view composed over canonical data; use 'full' to search every stored repository view")]
+        #[arg(
+            long,
+            help = "Use a branch view composed over canonical data; use 'full' to search every stored repository view"
+        )]
         view: Option<String>,
     },
     /// Show what's been filed.
@@ -277,11 +306,21 @@ enum Commands {
     },
     /// Wire the mempalace MCP server into your installed AI coding tools.
     Setup {
-        #[arg(long = "dry-run", help = "Preview what would change without writing anything or running tool commands")]
+        #[arg(
+            long = "dry-run",
+            help = "Preview what would change without writing anything or running tool commands"
+        )]
         dry_run: bool,
-        #[arg(long = "mcp-path", help = "Path to the mempalace-mcp binary (default: ~/.mempalace/bin/mempalace-mcp[.exe])")]
+        #[arg(
+            long = "mcp-path",
+            help = "Path to the mempalace-mcp binary (default: ~/.mempalace/bin/mempalace-mcp[.exe])"
+        )]
         mcp_path: Option<PathBuf>,
-        #[arg(long, value_delimiter = ',', help = "Limit to specific tools (comma-separated): claude,codex,gemini,opencode,copilot,antigravity,jules")]
+        #[arg(
+            long,
+            value_delimiter = ',',
+            help = "Limit to specific tools (comma-separated): claude,codex,gemini,opencode,copilot,antigravity,jules"
+        )]
         tools: Option<Vec<String>>,
     },
     /// Deferred in Rust Phase 9. See the linked decision record.
@@ -309,7 +348,10 @@ enum Commands {
     Serve {
         #[arg(long, help = "Bind address, e.g. 127.0.0.1:8765 (default: from config)")]
         bind: Option<SocketAddr>,
-        #[arg(long = "token-file", help = "Path to the bearer token JSON file (default: ~/.mempalace/server_tokens.json)")]
+        #[arg(
+            long = "token-file",
+            help = "Path to the bearer token JSON file (default: ~/.mempalace/server_tokens.json)"
+        )]
         token_file: Option<PathBuf>,
     },
 }
@@ -476,26 +518,38 @@ where
             context,
             validation_provider_factory,
         ),
-        Commands::Mine { dir, mode, wing, project_id, agent, limit, dry_run, reindex, extract, branch, batch_size, view, full } => {
-            execute_mine(
-                &dir,
-                mode,
-                wing,
-                project_id,
-                agent,
-                limit,
-                dry_run,
-                reindex,
-                extract,
-                branch,
-                batch_size,
-                view,
-                full,
-                cli.palace.as_deref(),
-                context,
-                provider_factory,
-            )
-        }
+        Commands::Mine {
+            dir,
+            mode,
+            wing,
+            project_id,
+            agent,
+            limit,
+            dry_run,
+            reindex,
+            extract,
+            branch,
+            batch_size,
+            view,
+            full,
+        } => execute_mine(
+            &dir,
+            mode,
+            wing,
+            project_id,
+            agent,
+            limit,
+            dry_run,
+            reindex,
+            extract,
+            branch,
+            batch_size,
+            view,
+            full,
+            cli.palace.as_deref(),
+            context,
+            provider_factory,
+        ),
         Commands::Project { command } => execute_project_command(command, context),
         Commands::Prune { project_id, wing, kind, view, source_prefix, dry_run, yes } => {
             execute_prune(
@@ -531,13 +585,9 @@ where
         Commands::Split { .. } => Ok(deferred_command("split")),
         Commands::Compress { .. } => Ok(deferred_command("compress")),
         Commands::Maintain => execute_maintain(cli.palace.as_deref(), context),
-        Commands::Serve { bind, token_file } => execute_serve(
-            bind,
-            token_file,
-            cli.palace.as_deref(),
-            context,
-            provider_factory,
-        ),
+        Commands::Serve { bind, token_file } => {
+            execute_serve(bind, token_file, cli.palace.as_deref(), context, provider_factory)
+        }
     }
 }
 
@@ -600,7 +650,8 @@ where
         )
         .map_err(config_error)?
     };
-    let derived_project_id = derive_project_id(&project_dir, &project_config.wing, explicit_project_id);
+    let derived_project_id =
+        derive_project_id(&project_dir, &project_config.wing, explicit_project_id);
     let project_id = if explicit_project_id.filter(|id| !id.trim().is_empty()).is_some() {
         derived_project_id
     } else {
@@ -618,13 +669,9 @@ where
             .map_err(config_error)?
             .projects
             .contains_key(&project_id)
-        && ConfigLoader::find_project_id(
-            context.config_base_dir.as_deref(),
-            &project_dir,
-            None,
-        )
-        .map_err(config_error)?
-        .is_none()
+        && ConfigLoader::find_project_id(context.config_base_dir.as_deref(), &project_dir, None)
+            .map_err(config_error)?
+            .is_none()
     {
         return Ok(CliOutput::failure(
             1,
@@ -725,25 +772,19 @@ fn execute_project_command(
                 &project_config.wing,
                 explicit_project_id.as_deref(),
             );
-            let project_id = if explicit_project_id
-                .as_deref()
-                .filter(|id| !id.trim().is_empty())
-                .is_some()
-            {
-                derived_project_id
-            } else {
-                ConfigLoader::find_project_id(
-                    context.config_base_dir.as_deref(),
-                    &project_dir,
-                    Some(&derived_project_id),
-                )
-                .map_err(config_error)?
-                .unwrap_or(derived_project_id)
-            };
-            if explicit_project_id
-                .as_deref()
-                .filter(|id| !id.trim().is_empty())
-                .is_none()
+            let project_id =
+                if explicit_project_id.as_deref().filter(|id| !id.trim().is_empty()).is_some() {
+                    derived_project_id
+                } else {
+                    ConfigLoader::find_project_id(
+                        context.config_base_dir.as_deref(),
+                        &project_dir,
+                        Some(&derived_project_id),
+                    )
+                    .map_err(config_error)?
+                    .unwrap_or(derived_project_id)
+                };
+            if explicit_project_id.as_deref().filter(|id| !id.trim().is_empty()).is_none()
                 && project_id.starts_with("wing:")
                 && ConfigLoader::load_project_registry(context.config_base_dir.as_deref())
                     .map_err(config_error)?
@@ -827,9 +868,7 @@ fn execute_project_command(
                 format!("  Wing: {}", project_config.wing),
                 "  Rooms:".to_owned(),
             ];
-            lines.extend(project_config.rooms.iter().map(|room| {
-                format!("    - {}", room.name)
-            }));
+            lines.extend(project_config.rooms.iter().map(|room| format!("    - {}", room.name)));
             if let Some(routing) = project_config.routing {
                 lines.push(format!("  Routing: {:?}", routing.mode));
             }
@@ -895,12 +934,9 @@ fn execute_project_command(
             };
             let path = target_dir.join("mempalace.yaml");
             write_project_config(&path, &target_dir, &project_config, true).map_err(io_error)?;
-            Ok(CliOutput::success(format!(
-                "Exported project {project_id} to {}\n",
-                path.display()
-            )))
+            Ok(CliOutput::success(format!("Exported project {project_id} to {}\n", path.display())))
         }
-}
+    }
 }
 
 /// Delete mined project/source data selected by a structured scope.
@@ -1181,71 +1217,65 @@ where
     let runtime = build_runtime(&config).map_err(runtime_error)?;
 
     // ── Auto-detect checkout view (projects mode only) ─────────────────────
-    let (effective_branch, effective_view, automatically_detected_branch) = if mode == CliMode::Projects {
-        let checkout_view = mempalace_ingest::detect_checkout_view(&source_dir);
-        let (detected_branch, is_auto) = match &checkout_view {
-            mempalace_ingest::CheckoutView::Canonical => (false, true),
-            mempalace_ingest::CheckoutView::Branch { .. } => {
-                (true, true)
-            }
-            mempalace_ingest::CheckoutView::NonGit => (false, false),
-        };
+    let (effective_branch, effective_view, automatically_detected_branch) =
+        if mode == CliMode::Projects {
+            let checkout_view = mempalace_ingest::detect_checkout_view(&source_dir);
+            let (detected_branch, is_auto) = match &checkout_view {
+                mempalace_ingest::CheckoutView::Canonical => (false, true),
+                mempalace_ingest::CheckoutView::Branch { .. } => (true, true),
+                mempalace_ingest::CheckoutView::NonGit => (false, false),
+            };
 
-        // Override logic:
-        // --full forces canonical mode
-        // --view overrides automatic detection
-        // --branch flag still works as before
-        let final_branch = if full || explicit_view.as_deref() == Some("canonical") {
-            false
-        } else if branch || explicit_view.is_some() {
-            true
-        } else if is_auto {
-            detected_branch
-        } else {
-            branch
-        };
+            // Override logic:
+            // --full forces canonical mode
+            // --view overrides automatic detection
+            // --branch flag still works as before
+            let final_branch = if full || explicit_view.as_deref() == Some("canonical") {
+                false
+            } else if branch || explicit_view.is_some() {
+                true
+            } else if is_auto {
+                detected_branch
+            } else {
+                branch
+            };
 
-        // Resolve the effective view name for the ingest request
-        let final_view = if full || !final_branch {
-            None
-        } else {
-            explicit_view.clone().or_else(|| {
-                if is_auto {
-                    match &checkout_view {
-                        mempalace_ingest::CheckoutView::Branch { view_name, .. } => {
-                            Some(view_name.clone())
+            // Resolve the effective view name for the ingest request
+            let final_view = if full || !final_branch {
+                None
+            } else {
+                explicit_view.clone().or_else(|| {
+                    if is_auto {
+                        match &checkout_view {
+                            mempalace_ingest::CheckoutView::Branch { view_name, .. } => {
+                                Some(view_name.clone())
+                            }
+                            _ => None,
                         }
-                        _ => None,
+                    } else {
+                        None
                     }
-                } else {
-                    None
-                }
-            })
-        };
+                })
+            };
 
-        (
-            final_branch,
-            final_view,
-            is_auto && detected_branch && !branch && explicit_view.is_none() && !full,
-        )
-    } else {
-        (branch, None, false)
-    };
+            (
+                final_branch,
+                final_view,
+                is_auto && detected_branch && !branch && explicit_view.is_none() && !full,
+            )
+        } else {
+            (branch, None, false)
+        };
 
     // ── Routing decision (projects mode only) ────────────────────────────────
     if mode == CliMode::Projects {
         let derived_wing = wing.clone().unwrap_or_else(|| wing_name_for_dir(&source_dir));
-        let candidate_project_id = derive_project_id(
-            &source_dir,
-            &derived_wing,
-            explicit_project_id.as_deref(),
-        );
+        let candidate_project_id =
+            derive_project_id(&source_dir, &derived_wing, explicit_project_id.as_deref());
         let project_config = if let Some(project_id) = explicit_project_id.as_deref() {
-            match ConfigLoader::load_project_by_id(
-                context.config_base_dir.as_deref(),
-                project_id,
-            )
-            .map_err(config_error)? {
+            match ConfigLoader::load_project_by_id(context.config_base_dir.as_deref(), project_id)
+                .map_err(config_error)?
+            {
                 Some(config) => config,
                 None => {
                     return Ok(CliOutput::failure(
@@ -1275,9 +1305,7 @@ where
             .map_err(config_error)?
             .unwrap_or_else(|| derive_project_id(&source_dir, &project_config.wing, None))
         };
-        let wing_name = wing
-            .clone()
-            .unwrap_or_else(|| project_config.wing.clone());
+        let wing_name = wing.clone().unwrap_or_else(|| project_config.wing.clone());
 
         let project_routing = if wing
             .as_deref()
@@ -1431,12 +1459,9 @@ where
     let mut provider = provider_factory(config.embedding_profile, default_embedding_cache_dir())
         .map_err(provider_error)?;
 
-    let max_embed_batch_size = batch_size.filter(|&n| n > 0).or_else(|| {
-        config
-            .low_cpu
-            .enabled
-            .then(|| config.low_cpu.effective_ingest_batch_size())
-    });
+    let max_embed_batch_size = batch_size
+        .filter(|&n| n > 0)
+        .or_else(|| config.low_cpu.enabled.then(|| config.low_cpu.effective_ingest_batch_size()));
 
     let summary = runtime
         .block_on(ingest_conversations(
@@ -1526,12 +1551,9 @@ where
         .map_err(storage_error)?;
     let mut provider = provider_factory(config.embedding_profile, default_embedding_cache_dir())
         .map_err(provider_error)?;
-    let max_embed_batch_size = batch_size.filter(|&n| n > 0).or_else(|| {
-        config
-            .low_cpu
-            .enabled
-            .then(|| config.low_cpu.effective_ingest_batch_size())
-    });
+    let max_embed_batch_size = batch_size
+        .filter(|&n| n > 0)
+        .or_else(|| config.low_cpu.enabled.then(|| config.low_cpu.effective_ingest_batch_size()));
 
     let summary = runtime
         .block_on(ingest_project_with_config(
@@ -1609,15 +1631,15 @@ fn execute_remote_mine(
     // ── 1. Prepare the batch (no embedding, no storage) ─────────────────────
     let prepared = match prepare_project_batch_with_config(
         &ProjectIngestRequest {
-        project_dir: source_dir.to_path_buf(),
-        wing: wing_override.clone(),
-        agent: agent.to_owned(),
-        limit: if limit == 0 { None } else { Some(limit) },
-        dry_run: false,
-        reindex: false,
-        max_embed_batch_size: None,
-        branch: false,
-        view,
+            project_dir: source_dir.to_path_buf(),
+            wing: wing_override.clone(),
+            agent: agent.to_owned(),
+            limit: if limit == 0 { None } else { Some(limit) },
+            dry_run: false,
+            reindex: false,
+            max_embed_batch_size: None,
+            branch: false,
+            view,
         },
         project_config,
         project_id,
@@ -1635,27 +1657,26 @@ fn execute_remote_mine(
 
     // ── 2. Resolve the remote config entry ──────────────────────────────────
     let remote_name = rule.remote.as_deref().unwrap_or("remote");
-    let resolved_remote =
-        match config.federation.remotes.get(remote_name) {
-            Some(r) => r,
-            None => {
-                let msg = format!(
-                    "federation config error: route for wing '{}' refers to remote '{}', \
+    let resolved_remote = match config.federation.remotes.get(remote_name) {
+        Some(r) => r,
+        None => {
+            let msg = format!(
+                "federation config error: route for wing '{}' refers to remote '{}', \
                      but no such remote is defined in config.federation.remotes\n",
-                    prepared.wing, remote_name
-                );
-                let output = if dual_write {
-                    format!("  Remote replication: failed — {msg}")
-                } else {
-                    format!("{msg}")
-                };
-                return if dual_write {
-                    Ok(CliOutput::success(output))
-                } else {
-                    Ok(CliOutput::failure(1, output))
-                };
-            }
-        };
+                prepared.wing, remote_name
+            );
+            let output = if dual_write {
+                format!("  Remote replication: failed — {msg}")
+            } else {
+                format!("{msg}")
+            };
+            return if dual_write {
+                Ok(CliOutput::success(output))
+            } else {
+                Ok(CliOutput::failure(1, output))
+            };
+        }
+    };
     let remote_url = resolved_remote.url.clone();
 
     // ── 3. Non-default-branch warning text (computed early for dry-run) ─────
@@ -1682,10 +1703,7 @@ fn execute_remote_mine(
             format!("  Remote: {} ({})", remote_name, remote_url),
             format!("  Wing: {}", prepared.wing),
             format!("  Repo ID: {}", prepared.repo_id),
-            format!(
-                "  Commit: {}",
-                prepared.commit_hash.as_deref().unwrap_or("<none>")
-            ),
+            format!("  Commit: {}", prepared.commit_hash.as_deref().unwrap_or("<none>")),
             format!("  Files to send: {}", prepared.files.len()),
             format!("  Total chunks: {total_chunks}"),
             format!("  Max files/batch: {max_files_per_batch}"),
@@ -1809,60 +1827,59 @@ fn execute_remote_mine(
             files: batch_files,
         };
 
-        let resp: IngestBatchResponse =
-            match runtime.block_on(api.ingest_batch(req)) {
-                Ok(resp) => resp,
-                Err(e) => {
-                    let msg = format!(
-                        "remote '{}' transport error after {} batch(es): {e}",
-                        remote_name, batches_sent
+        let resp: IngestBatchResponse = match runtime.block_on(api.ingest_batch(req)) {
+            Ok(resp) => resp,
+            Err(e) => {
+                let msg = format!(
+                    "remote '{}' transport error after {} batch(es): {e}",
+                    remote_name, batches_sent
+                );
+                if dual_write && batches_sent > 0 {
+                    // Some batches completed — render partial summary showing
+                    // what was achieved before the transport interruption.
+                    let partial = render_remote_mine_summary(
+                        source_dir,
+                        remote_name,
+                        &remote_url,
+                        &wing,
+                        &repo_id,
+                        ingested_count,
+                        skipped_count,
+                        failed_count,
+                        total_drawers_written,
+                        &all_warnings,
+                        &failed_files,
+                        &prepared.summary.secret_path_skips,
+                        branch_warning.as_deref(),
+                        view_name.as_deref(),
+                        true,
+                        true,
                     );
-                    if dual_write && batches_sent > 0 {
-                        // Some batches completed — render partial summary showing
-                        // what was achieved before the transport interruption.
-                        let partial = render_remote_mine_summary(
-                            source_dir,
-                            remote_name,
-                            &remote_url,
-                            &wing,
-                            &repo_id,
-                            ingested_count,
-                            skipped_count,
-                            failed_count,
-                            total_drawers_written,
-                            &all_warnings,
-                            &failed_files,
-                            &prepared.summary.secret_path_skips,
-                            branch_warning.as_deref(),
-                            view_name.as_deref(),
-                            true,
-                            true,
-                        );
-                        let with_error = format!(
-                            "{}\n  {}\n  Note: remote replication was incomplete — {msg}.\n",
-                            partial.trim(),
-                            "─".repeat(SEARCH_HEADER_WIDTH),
-                        );
-                        return Ok(CliOutput::success(with_error));
-                    }
-                    let output = if dual_write {
-                        format!(
-                            "  Remote replication: failed — {msg}\n\
-                             Note: the local mine completed successfully; remote replication was incomplete.\n"
-                        )
-                    } else {
-                        format!(
-                            "{msg}\n\
-                             Note: writes do not fall back to local.\n"
-                        )
-                    };
-                    return if dual_write {
-                        Ok(CliOutput::success(output))
-                    } else {
-                        Ok(CliOutput::failure(1, output))
-                    };
+                    let with_error = format!(
+                        "{}\n  {}\n  Note: remote replication was incomplete — {msg}.\n",
+                        partial.trim(),
+                        "─".repeat(SEARCH_HEADER_WIDTH),
+                    );
+                    return Ok(CliOutput::success(with_error));
                 }
-            };
+                let output = if dual_write {
+                    format!(
+                        "  Remote replication: failed — {msg}\n\
+                             Note: the local mine completed successfully; remote replication was incomplete.\n"
+                    )
+                } else {
+                    format!(
+                        "{msg}\n\
+                             Note: writes do not fall back to local.\n"
+                    )
+                };
+                return if dual_write {
+                    Ok(CliOutput::success(output))
+                } else {
+                    Ok(CliOutput::failure(1, output))
+                };
+            }
+        };
 
         batches_sent += 1;
 
@@ -1877,10 +1894,8 @@ fn execute_remote_mine(
                 }
                 _ => {
                     failed_count += 1;
-                    failed_files.push((
-                        file_result.relative_path,
-                        file_result.error.unwrap_or_default(),
-                    ));
+                    failed_files
+                        .push((file_result.relative_path, file_result.error.unwrap_or_default()));
                 }
             }
         }
@@ -2162,9 +2177,7 @@ fn execute_maintain(
         small_fragment_threshold: config.maintenance.small_fragment_threshold as u64,
     };
 
-    let summary = runtime
-        .block_on(engine.run_maintenance(&settings))
-        .map_err(storage_error)?;
+    let summary = runtime.block_on(engine.run_maintenance(&settings)).map_err(storage_error)?;
 
     let status_label = match summary.status {
         mempalace_storage::MaintenanceRunStatus::Success => "SUCCESS",
@@ -2197,7 +2210,9 @@ fn execute_maintain(
 
     for result in &summary.tier_results {
         let tier_name = match result.tier {
-            mempalace_storage::MaintenanceTier::VectorIndexOptimization => "Vector Index Optimization",
+            mempalace_storage::MaintenanceTier::VectorIndexOptimization => {
+                "Vector Index Optimization"
+            }
             mempalace_storage::MaintenanceTier::FragmentCompaction => "Fragment Compaction",
             mempalace_storage::MaintenanceTier::VersionRetention => "Version Retention",
         };
@@ -2361,13 +2376,9 @@ where
     P: EmbeddingProvider + Send + Sync + 'static,
 {
     let (router, _state) = build_router(config, provider, tokens).await?;
-    let listener =
-        tokio::net::TcpListener::bind(bind).await.map_err(|source| {
-            mempalace_server::ServerError::Io {
-                path: PathBuf::from(bind.to_string()),
-                source,
-            }
-        })?;
+    let listener = tokio::net::TcpListener::bind(bind).await.map_err(|source| {
+        mempalace_server::ServerError::Io { path: PathBuf::from(bind.to_string()), source }
+    })?;
     eprintln!(
         "Listening on http://{}",
         listener.local_addr().map_err(|source| mempalace_server::ServerError::Io {
@@ -2443,9 +2454,11 @@ fn render_secret_skip_lines(skips: &[ProjectSourceSkip]) -> Vec<String> {
     }
     let mut lines = Vec::with_capacity(skips.len() + 1);
     lines.push(format!("  Secrets withheld: {}", skips.len()));
-    lines.extend(skips.iter().map(|skip| {
-        format!("    {} — secret-shaped path ({})", skip.relative_path, skip.reason)
-    }));
+    lines.extend(
+        skips.iter().map(|skip| {
+            format!("    {} — secret-shaped path ({})", skip.relative_path, skip.reason)
+        }),
+    );
     lines
 }
 
@@ -2960,9 +2973,11 @@ mod tests {
         let config_root = temp_config_root("wing-only-id");
         let context = CliContext::for_tests(config_root.clone());
 
-        let first_init = run_cli(["init", first.to_str().unwrap()], &context, stub_provider).unwrap();
+        let first_init =
+            run_cli(["init", first.to_str().unwrap()], &context, stub_provider).unwrap();
         assert_eq!(first_init.exit_code, 0);
-        let second_init = run_cli(["init", second.to_str().unwrap()], &context, stub_provider).unwrap();
+        let second_init =
+            run_cli(["init", second.to_str().unwrap()], &context, stub_provider).unwrap();
         assert_eq!(second_init.exit_code, 1);
         assert!(second_init.stderr.contains("pass --project-id"));
 
@@ -3297,12 +3312,9 @@ mod tests {
         // A present-but-empty scope value is rejected rather than silently
         // widening the scope (an empty --source-prefix would otherwise prune the
         // whole project).
-        let empty = run_cli(
-            ["prune", "--project-id", "p", "--source-prefix", ""],
-            &context,
-            stub_provider,
-        )
-        .unwrap();
+        let empty =
+            run_cli(["prune", "--project-id", "p", "--source-prefix", ""], &context, stub_provider)
+                .unwrap();
         assert_eq!(empty.exit_code, 2);
         assert!(empty.stderr.contains("--source-prefix must not be empty"), "{}", empty.stderr);
 
@@ -3381,11 +3393,7 @@ mod tests {
             ],
         );
         let run_git = |args: &[&str]| {
-            std::process::Command::new("git")
-                .args(args)
-                .current_dir(&repo_dir)
-                .status()
-                .unwrap();
+            std::process::Command::new("git").args(args).current_dir(&repo_dir).status().unwrap();
         };
         run_git(&["checkout", "-b", "feature"]);
         fs::write(repo_dir.join("base.rs"), "fn base() -> i32 { 99 }\n".repeat(20)).unwrap();
@@ -3564,8 +3572,22 @@ mod tests {
 
         // No per-file failures, but replication_incomplete=true → "partial — transport interrupted".
         let output = render_remote_mine_summary(
-            src, "hub", "http://example.com", "wing_test", "repo-1",
-            5, 0, 0, 5, &[], &[], &[], None, Some("feature-x"), true, true,
+            src,
+            "hub",
+            "http://example.com",
+            "wing_test",
+            "repo-1",
+            5,
+            0,
+            0,
+            5,
+            &[],
+            &[],
+            &[],
+            None,
+            Some("feature-x"),
+            true,
+            true,
         );
         assert!(
             output.contains("replication: partial"),
@@ -3582,8 +3604,22 @@ mod tests {
 
         // No per-file failures, replication_incomplete=false → "succeeded".
         let output = render_remote_mine_summary(
-            src, "hub", "http://example.com", "wing_test", "repo-1",
-            5, 0, 0, 5, &[], &[], &[], None, None, true, false,
+            src,
+            "hub",
+            "http://example.com",
+            "wing_test",
+            "repo-1",
+            5,
+            0,
+            0,
+            5,
+            &[],
+            &[],
+            &[],
+            None,
+            None,
+            true,
+            false,
         );
         assert!(
             output.contains("replication: succeeded"),
@@ -3592,8 +3628,22 @@ mod tests {
 
         // Per-file failures, replication_incomplete=false → "partial — some files had errors".
         let output = render_remote_mine_summary(
-            src, "hub", "http://example.com", "wing_test", "repo-1",
-            3, 0, 2, 3, &[], &[("bad.rs".into(), "err".into())], &[], None, None, true, false,
+            src,
+            "hub",
+            "http://example.com",
+            "wing_test",
+            "repo-1",
+            3,
+            0,
+            2,
+            3,
+            &[],
+            &[("bad.rs".into(), "err".into())],
+            &[],
+            None,
+            None,
+            true,
+            false,
         );
         assert!(
             output.contains("replication: partial"),
@@ -3606,8 +3656,22 @@ mod tests {
 
         // Both incomplete AND per-file failures → "partial — transport interrupted".
         let output = render_remote_mine_summary(
-            src, "hub", "http://example.com", "wing_test", "repo-1",
-            3, 0, 2, 3, &[], &[("bad.rs".into(), "err".into())], &[], None, None, true, true,
+            src,
+            "hub",
+            "http://example.com",
+            "wing_test",
+            "repo-1",
+            3,
+            0,
+            2,
+            3,
+            &[],
+            &[("bad.rs".into(), "err".into())],
+            &[],
+            None,
+            None,
+            true,
+            true,
         );
         assert!(
             output.contains("replication: partial"),
@@ -3628,8 +3692,22 @@ mod tests {
 
         // Non dual_write: no replication label at all.
         let output = render_remote_mine_summary(
-            src, "hub", "http://example.com", "wing_test", "repo-1",
-            5, 0, 0, 5, &[], &[], &[], None, None, false, false,
+            src,
+            "hub",
+            "http://example.com",
+            "wing_test",
+            "repo-1",
+            5,
+            0,
+            0,
+            5,
+            &[],
+            &[],
+            &[],
+            None,
+            None,
+            false,
+            false,
         );
         assert!(
             !output.contains("replication:"),
@@ -3637,8 +3715,22 @@ mod tests {
         );
         assert!(
             render_remote_mine_summary(
-                src, "hub", "http://example.com", "wing_test", "repo-1",
-                5, 0, 0, 5, &[], &[], &[], None, Some("feature-x"), false, false,
+                src,
+                "hub",
+                "http://example.com",
+                "wing_test",
+                "repo-1",
+                5,
+                0,
+                0,
+                5,
+                &[],
+                &[],
+                &[],
+                None,
+                Some("feature-x"),
+                false,
+                false,
             )
             .contains("View: feature-x"),
         );
@@ -3698,12 +3790,9 @@ mod tests {
         let config_root = temp_config_root("secret-mine");
         let context = CliContext::for_tests(config_root.clone());
         run_cli(["init", project_dir.to_str().unwrap(), "--yes"], &context, stub_provider).unwrap();
-        let output = run_cli(
-            ["mine", project_dir.to_str().unwrap(), "--dry-run"],
-            &context,
-            stub_provider,
-        )
-        .unwrap();
+        let output =
+            run_cli(["mine", project_dir.to_str().unwrap(), "--dry-run"], &context, stub_provider)
+                .unwrap();
 
         assert_eq!(output.exit_code, 0, "mine failed: {:?}", output.stderr);
         assert!(
@@ -3821,17 +3910,14 @@ mod tests {
         let config_root = temp_config_root("central-registry-mine");
         let context = CliContext::for_tests(config_root.clone());
 
-        let init = run_cli(["init", project_dir.to_str().unwrap()], &context, stub_provider)
-            .unwrap();
+        let init =
+            run_cli(["init", project_dir.to_str().unwrap()], &context, stub_provider).unwrap();
         assert_eq!(init.exit_code, 0);
         assert!(!project_dir.join("mempalace.yaml").exists());
 
-        let mine = run_cli(
-            ["mine", project_dir.to_str().unwrap(), "--dry-run"],
-            &context,
-            stub_provider,
-        )
-        .unwrap();
+        let mine =
+            run_cli(["mine", project_dir.to_str().unwrap(), "--dry-run"], &context, stub_provider)
+                .unwrap();
         assert_eq!(mine.exit_code, 0);
         assert!(mine.stdout.contains("Dry run: yes"));
 
@@ -3867,31 +3953,24 @@ mod tests {
         assert!(list.stdout.contains("Projects: 1"));
         assert!(list.stdout.contains(project_id));
 
-        let show = run_cli(
-            ["project", "show", project_dir.to_str().unwrap()],
-            &context,
-            stub_provider,
-        )
-        .unwrap();
+        let show =
+            run_cli(["project", "show", project_dir.to_str().unwrap()], &context, stub_provider)
+                .unwrap();
         assert!(show.stdout.contains("wing_registered"));
 
-        let export = run_cli(
-            ["project", "export", project_id, "--repo-config"],
-            &context,
-            stub_provider,
-        )
-        .unwrap();
+        let export =
+            run_cli(["project", "export", project_id, "--repo-config"], &context, stub_provider)
+                .unwrap();
         assert_eq!(export.exit_code, 0);
-        assert!(fs::read_to_string(project_dir.join("mempalace.yaml"))
-            .unwrap()
-            .contains("wing_registered"));
+        assert!(
+            fs::read_to_string(project_dir.join("mempalace.yaml"))
+                .unwrap()
+                .contains("wing_registered")
+        );
 
-        let show_after_export = run_cli(
-            ["project", "show", project_dir.to_str().unwrap()],
-            &context,
-            stub_provider,
-        )
-        .unwrap();
+        let show_after_export =
+            run_cli(["project", "show", project_dir.to_str().unwrap()], &context, stub_provider)
+                .unwrap();
         assert!(show_after_export.stdout.contains("Project: local/project-alpha"));
 
         let remove = run_cli(["project", "remove", project_id], &context, stub_provider).unwrap();
@@ -4034,8 +4113,7 @@ mod tests {
         fs::create_dir_all(workspace.path().join("client")).unwrap();
         fs::write(workspace.path().join("frontend").join("index.ts"), "export const x = 1;\n")
             .unwrap();
-        fs::write(workspace.path().join("client").join("app.ts"), "export const y = 2;\n")
-            .unwrap();
+        fs::write(workspace.path().join("client").join("app.ts"), "export const y = 2;\n").unwrap();
 
         let detection = detect_rooms(workspace.path()).unwrap();
         let frontend = detection.rooms.iter().find(|room| room.name == "frontend").unwrap();
@@ -4060,10 +4138,19 @@ mod tests {
 
         let detection = detect_rooms(&repo).unwrap();
         let names: Vec<_> = detection.rooms.iter().map(|room| room.name.clone()).collect();
-        assert!(names.iter().any(|name| name == &"documentation"), "documentation room missing: {names:?}");
+        assert!(
+            names.iter().any(|name| name == &"documentation"),
+            "documentation room missing: {names:?}"
+        );
         assert!(names.iter().any(|name| name == &"src"), "src room missing: {names:?}");
-        assert!(!names.iter().any(|name| name == &"ignored"), "ignored room must not be derived: {names:?}");
-        assert!(!names.iter().any(|name| name == &"untracked"), "untracked room must not be derived: {names:?}");
+        assert!(
+            !names.iter().any(|name| name == &"ignored"),
+            "ignored room must not be derived: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|name| name == &"untracked"),
+            "untracked room must not be derived: {names:?}"
+        );
         assert_eq!(detection.file_count, 2, "count must cover only eligible tracked sources");
     }
 
@@ -4088,9 +4175,18 @@ mod tests {
 
         let detection = detect_rooms(&repo).unwrap();
         let names: Vec<_> = detection.rooms.iter().map(|room| room.name.clone()).collect();
-        assert!(names.iter().any(|name| name == &"documentation"), "documentation room missing: {names:?}");
-        assert!(!names.iter().any(|name| name == &"linked_wt"), "linked worktree room must not be derived: {names:?}");
-        assert!(!names.iter().any(|name| name == &"planning"), "worktree content room must not be derived: {names:?}");
+        assert!(
+            names.iter().any(|name| name == &"documentation"),
+            "documentation room missing: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|name| name == &"linked_wt"),
+            "linked worktree room must not be derived: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|name| name == &"planning"),
+            "worktree content room must not be derived: {names:?}"
+        );
         assert_eq!(detection.file_count, 1, "linked-worktree files must not be counted");
     }
 
@@ -4106,7 +4202,10 @@ mod tests {
         let detection = detect_rooms(root).unwrap();
         let names: Vec<_> = detection.rooms.iter().map(|room| room.name.clone()).collect();
         assert!(names.iter().any(|name| name == &"src"), "src room missing: {names:?}");
-        assert!(!names.iter().any(|name| name == &"ignored"), "ignored room must not be derived: {names:?}");
+        assert!(
+            !names.iter().any(|name| name == &"ignored"),
+            "ignored room must not be derived: {names:?}"
+        );
         assert_eq!(detection.file_count, 1, "ignored files must not be counted");
     }
 
@@ -4158,12 +4257,9 @@ mod tests {
         assert_eq!(init.exit_code, 0, "{}", init.stderr);
         assert!(init.stdout.contains("(2 files found"), "init: {}", init.stdout);
 
-        let register = run_cli(
-            ["project", "register", repo.to_str().unwrap()],
-            &context,
-            stub_provider,
-        )
-        .unwrap();
+        let register =
+            run_cli(["project", "register", repo.to_str().unwrap()], &context, stub_provider)
+                .unwrap();
         assert_eq!(register.exit_code, 0, "{}", register.stderr);
         assert!(
             register.stdout.contains("(2 files found"),
@@ -4200,11 +4296,8 @@ mod tests {
     /// Initialize a bare git repo at `dir` with an initial commit on `main`.
     fn git_init_repo(dir: &Path, files: &[(&str, &str)]) {
         let run = |args: &[&str]| {
-            let status = std::process::Command::new("git")
-                .args(args)
-                .current_dir(dir)
-                .status()
-                .unwrap();
+            let status =
+                std::process::Command::new("git").args(args).current_dir(dir).status().unwrap();
             assert!(status.success(), "git {args:?} failed in {}", dir.display());
         };
         run(&["init", "-b", "main"]);
@@ -4220,11 +4313,7 @@ mod tests {
             // `mempalace.yaml`) can't silently block staging the fixture file.
             run(&["add", "-f", path]);
         }
-        run(&[
-            "-c", "user.email=test@test.com",
-            "-c", "user.name=Test",
-            "commit", "-m", "initial",
-        ]);
+        run(&["-c", "user.email=test@test.com", "-c", "user.name=Test", "commit", "-m", "initial"]);
     }
 
     #[test]
@@ -4245,11 +4334,7 @@ mod tests {
 
         // Create feature branch, modify one file.
         let run_git = |args: &[&str]| {
-            std::process::Command::new("git")
-                .args(args)
-                .current_dir(&repo_dir)
-                .status()
-                .unwrap();
+            std::process::Command::new("git").args(args).current_dir(&repo_dir).status().unwrap();
         };
         run_git(&["checkout", "-b", "feature"]);
         let changed = "fn base() -> i32 { 99 }\n".repeat(20);
@@ -4258,12 +4343,9 @@ mod tests {
         let config_root = temp_config_root("mine-branch-e2e");
         let context = CliContext::for_tests(config_root.clone());
 
-        let output = run_cli(
-            ["mine", repo_dir.to_str().unwrap(), "--branch"],
-            &context,
-            stub_provider,
-        )
-        .unwrap();
+        let output =
+            run_cli(["mine", repo_dir.to_str().unwrap(), "--branch"], &context, stub_provider)
+                .unwrap();
 
         assert_eq!(output.exit_code, 0, "branch mine failed: {:?}", output.stderr);
         // The modified file (base.rs) must be counted as ingested.
@@ -4275,12 +4357,9 @@ mod tests {
 
         // Second run after reverting to original should show Sources removed: 1.
         fs::write(repo_dir.join("base.rs"), &base_content).unwrap();
-        let second = run_cli(
-            ["mine", repo_dir.to_str().unwrap(), "--branch"],
-            &context,
-            stub_provider,
-        )
-        .unwrap();
+        let second =
+            run_cli(["mine", repo_dir.to_str().unwrap(), "--branch"], &context, stub_provider)
+                .unwrap();
         assert_eq!(second.exit_code, 0, "second branch mine failed: {:?}", second.stderr);
         assert!(
             second.stdout.contains("Sources removed: 1"),
@@ -4322,7 +4401,9 @@ mod tests {
 
         assert_eq!(output.exit_code, 1, "expected the guard to fire: {output:?}");
         assert!(
-            output.stderr.contains("automatic branch mining requires an existing canonical snapshot"),
+            output
+                .stderr
+                .contains("automatic branch mining requires an existing canonical snapshot"),
             "unexpected stderr: {}",
             output.stderr
         );
@@ -4406,11 +4487,8 @@ mod tests {
         let config_root = temp_config_root("branch-no-git");
         let context = CliContext::for_tests(config_root.clone());
 
-        let result = run_cli(
-            ["mine", project_dir.to_str().unwrap(), "--branch"],
-            &context,
-            stub_provider,
-        );
+        let result =
+            run_cli(["mine", project_dir.to_str().unwrap(), "--branch"], &context, stub_provider);
 
         // Either a clap Err or an Ok with non-zero exit code — both count as failure.
         match result {
@@ -4500,7 +4578,10 @@ mod tests {
     }
 
     /// Build a `MempalaceConfig` pointing at the given palace dir with stub embeddings.
-    fn remote_test_config(palace_dir: PathBuf, token_file: PathBuf) -> mempalace_config::MempalaceConfig {
+    fn remote_test_config(
+        palace_dir: PathBuf,
+        token_file: PathBuf,
+    ) -> mempalace_config::MempalaceConfig {
         use mempalace_config::{
             FederationRuntimeConfig, LowCpuRuntimeConfig, MaintenanceRuntimeConfig,
             ServerRuntimeConfig,
@@ -4532,17 +4613,13 @@ mod tests {
         let config = remote_test_config(palace_dir, token_file.clone());
 
         // Build a dedicated tokio runtime to host the server.
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .unwrap();
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
 
         let tokens = rt.block_on(async { TokenRegistry::load(token_file).unwrap() });
         let provider = DeterministicStubProvider::new(EmbeddingProfile::Balanced);
         let (router, _state) = rt.block_on(build_router(config, provider, tokens)).unwrap();
 
-        let listener =
-            rt.block_on(tokio::net::TcpListener::bind("127.0.0.1:0")).unwrap();
+        let listener = rt.block_on(tokio::net::TcpListener::bind("127.0.0.1:0")).unwrap();
         let addr = rt.block_on(async { listener.local_addr().unwrap() });
 
         rt.spawn(async move {
@@ -4562,9 +4639,10 @@ mod tests {
     /// guard in the dual-write path.
     fn spawn_no_ingest_server(token: &str) -> std::net::SocketAddr {
         use axum::{
-            Router, middleware,
+            Router,
             extract::State,
             http::{StatusCode, header},
+            middleware,
             response::IntoResponse,
             routing::get,
         };
@@ -4621,12 +4699,8 @@ mod tests {
             .layer(middleware::from_fn_with_state(state.clone(), auth))
             .with_state(state);
 
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let listener =
-            rt.block_on(tokio::net::TcpListener::bind("127.0.0.1:0")).unwrap();
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        let listener = rt.block_on(tokio::net::TcpListener::bind("127.0.0.1:0")).unwrap();
         let addr = rt.block_on(async { listener.local_addr().unwrap() });
         rt.spawn(async move {
             axum::serve(listener, router).await.unwrap();
@@ -4722,9 +4796,7 @@ mod tests {
         fs::create_dir_all(&project_dir).unwrap();
         write_file(
             &project_dir.join("backend/auth.rs"),
-            "Auth login flow keeps auth checks in the backend service.\n"
-                .repeat(5)
-                .as_str(),
+            "Auth login flow keeps auth checks in the backend service.\n".repeat(5).as_str(),
         );
         write_file(
             &project_dir.join("docs/roadmap.md"),
@@ -4745,12 +4817,8 @@ mod tests {
         );
 
         let context = CliContext::for_tests(config_root.clone());
-        let output = run_cli(
-            ["mine", project_dir.to_str().unwrap()],
-            &context,
-            stub_provider,
-        )
-        .unwrap();
+        let output =
+            run_cli(["mine", project_dir.to_str().unwrap()], &context, stub_provider).unwrap();
 
         assert_eq!(output.exit_code, 0, "remote mine failed: stderr={:?}", output.stderr);
         assert!(
@@ -4799,12 +4867,9 @@ mod tests {
         );
 
         let context = CliContext::for_tests(config_root.clone());
-        let output = run_cli(
-            ["mine", project_dir.to_str().unwrap(), "--dry-run"],
-            &context,
-            stub_provider,
-        )
-        .unwrap();
+        let output =
+            run_cli(["mine", project_dir.to_str().unwrap(), "--dry-run"], &context, stub_provider)
+                .unwrap();
 
         assert_eq!(output.exit_code, 0, "dry-run should succeed without server: {:?}", output);
         assert!(
@@ -4851,11 +4916,7 @@ mod tests {
         );
 
         let context = CliContext::for_tests(config_root.clone());
-        let result = run_cli(
-            ["mine", project_dir.to_str().unwrap()],
-            &context,
-            stub_provider,
-        );
+        let result = run_cli(["mine", project_dir.to_str().unwrap()], &context, stub_provider);
 
         // Should fail through legacy CliOutput path with exit code 1.
         let output = result.expect("remote-only must return Ok(CliOutput), not Err");
@@ -4901,12 +4962,8 @@ mod tests {
         );
 
         let context = CliContext::for_tests(config_root.clone());
-        let output = run_cli(
-            ["mine", project_dir.to_str().unwrap()],
-            &context,
-            stub_provider,
-        )
-        .unwrap();
+        let output =
+            run_cli(["mine", project_dir.to_str().unwrap()], &context, stub_provider).unwrap();
 
         // Must succeed locally despite remote being unreachable.
         assert_eq!(output.exit_code, 0, "combined mine failed: stderr={:?}", output.stderr);
@@ -4916,7 +4973,8 @@ mod tests {
             output.stdout
         );
         assert!(
-            output.stdout.contains("replication: failed") || output.stdout.contains("replication: skipped"),
+            output.stdout.contains("replication: failed")
+                || output.stdout.contains("replication: skipped"),
             "remote replication failure must be reported: {}",
             output.stdout
         );
@@ -4940,9 +4998,7 @@ mod tests {
         fs::create_dir_all(&project_dir).unwrap();
         write_file(
             &project_dir.join("backend/auth.rs"),
-            "Auth login flow keeps auth checks in the backend service.\n"
-                .repeat(5)
-                .as_str(),
+            "Auth login flow keeps auth checks in the backend service.\n".repeat(5).as_str(),
         );
         write_file(
             &project_dir.join("docs/roadmap.md"),
@@ -4969,12 +5025,8 @@ mod tests {
         );
 
         let context = CliContext::for_tests(config_root.clone());
-        let output = run_cli(
-            ["mine", project_dir.to_str().unwrap()],
-            &context,
-            stub_provider,
-        )
-        .unwrap();
+        let output =
+            run_cli(["mine", project_dir.to_str().unwrap()], &context, stub_provider).unwrap();
 
         assert_eq!(output.exit_code, 0, "combined mine failed: stderr={:?}", output.stderr);
         assert!(
@@ -5017,11 +5069,7 @@ mod tests {
         );
 
         let context = CliContext::for_tests(config_root.clone());
-        let result = run_cli(
-            ["mine", project_dir.to_str().unwrap()],
-            &context,
-            stub_provider,
-        );
+        let result = run_cli(["mine", project_dir.to_str().unwrap()], &context, stub_provider);
 
         // Must fail through legacy CliOutput path with exit code 1.
         let output = result.expect("legacy remote-only must return Ok(CliOutput), not Err");
@@ -5045,11 +5093,13 @@ mod tests {
         run_cli(["init", project_dir.to_str().unwrap(), "--yes"], &context, stub_provider).unwrap();
 
         // First mine populates the palace.
-        let first = run_cli(["mine", project_dir.to_str().unwrap()], &context, stub_provider).unwrap();
+        let first =
+            run_cli(["mine", project_dir.to_str().unwrap()], &context, stub_provider).unwrap();
         assert_eq!(first.exit_code, 0);
 
         // Second mine without --reindex skips all three unchanged fixture files.
-        let second = run_cli(["mine", project_dir.to_str().unwrap()], &context, stub_provider).unwrap();
+        let second =
+            run_cli(["mine", project_dir.to_str().unwrap()], &context, stub_provider).unwrap();
         assert_eq!(second.exit_code, 0);
         assert!(
             second.stdout.contains("Files skipped unchanged: 3"),
@@ -5059,19 +5109,20 @@ mod tests {
         assert!(second.stdout.contains("Files ingested: 0"), "second run: {:?}", second.stdout);
 
         // --reindex forces re-ingestion of all three files despite unchanged hashes.
-        let reindex = run_cli(
-            ["mine", project_dir.to_str().unwrap(), "--reindex"],
-            &context,
-            stub_provider,
-        )
-        .unwrap();
+        let reindex =
+            run_cli(["mine", project_dir.to_str().unwrap(), "--reindex"], &context, stub_provider)
+                .unwrap();
         assert_eq!(reindex.exit_code, 0);
         assert!(
             reindex.stdout.contains("Files skipped unchanged: 0"),
             "reindex run must skip nothing: {:?}",
             reindex.stdout
         );
-        assert!(reindex.stdout.contains("Files ingested: 3"), "reindex output: {:?}", reindex.stdout);
+        assert!(
+            reindex.stdout.contains("Files ingested: 3"),
+            "reindex output: {:?}",
+            reindex.stdout
+        );
 
         remove_dir_all_if_exists(&config_root);
     }
@@ -5080,10 +5131,7 @@ mod tests {
     /// first ingest batch are fast; the third is the second ingest batch) to
     /// exceed the client's 5-second timeout, causing a deterministic transport
     /// failure. Subsequent requests respond normally, so a retry works.
-    fn spawn_self_destruct_server(
-        palace_dir: PathBuf,
-        token: &str,
-    ) -> std::net::SocketAddr {
+    fn spawn_self_destruct_server(palace_dir: PathBuf, token: &str) -> std::net::SocketAddr {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -5091,19 +5139,14 @@ mod tests {
         let token_file = write_test_token_file(token_dir.path(), token);
         let config = remote_test_config(palace_dir, token_file.clone());
 
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .unwrap();
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
 
         let addr = rt.block_on(async {
             let tokens = mempalace_server::TokenRegistry::load(token_file).unwrap();
-            let provider = mempalace_embeddings::DeterministicStubProvider::new(
-                EmbeddingProfile::Balanced,
-            );
-            let (router, _state) = mempalace_server::build_router(config, provider, tokens)
-                .await
-                .unwrap();
+            let provider =
+                mempalace_embeddings::DeterministicStubProvider::new(EmbeddingProfile::Balanced);
+            let (router, _state) =
+                mempalace_server::build_router(config, provider, tokens).await.unwrap();
 
             let counter = Arc::new(AtomicUsize::new(0));
             let app = router.layer(axum::middleware::from_fn({
@@ -5180,12 +5223,7 @@ mod tests {
 
         let context = CliContext::for_tests(config_root.clone());
         let output = run_cli(
-            [
-                "mine",
-                project_dir.to_str().unwrap(),
-                "--batch-size",
-                "1",
-            ],
+            ["mine", project_dir.to_str().unwrap(), "--batch-size", "1"],
             &context,
             stub_provider,
         )
@@ -5273,9 +5311,16 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(first_output.exit_code, 0, "first mine must exit 0: stderr={:?}", first_output.stderr);
-        assert!(first_output.stdout.contains("Files ingested: 3"), "local mine must ingest 3: {}",
-            first_output.stdout);
+        assert_eq!(
+            first_output.exit_code, 0,
+            "first mine must exit 0: stderr={:?}",
+            first_output.stderr
+        );
+        assert!(
+            first_output.stdout.contains("Files ingested: 3"),
+            "local mine must ingest 3: {}",
+            first_output.stdout
+        );
         assert!(
             first_output.stdout.contains("replication: partial"),
             "first mine must report partial replication: {}",
@@ -5295,7 +5340,11 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(second_output.exit_code, 0, "second mine must exit 0: stderr={:?}", second_output.stderr);
+        assert_eq!(
+            second_output.exit_code, 0,
+            "second mine must exit 0: stderr={:?}",
+            second_output.stderr
+        );
 
         // Local mine re-ingests nothing because files are unchanged.
         assert!(
@@ -5363,11 +5412,7 @@ mod tests {
 
         // Create feature branch.
         let run_git = |args: &[&str]| {
-            std::process::Command::new("git")
-                .args(args)
-                .current_dir(&repo_dir)
-                .status()
-                .unwrap();
+            std::process::Command::new("git").args(args).current_dir(&repo_dir).status().unwrap();
         };
         run_git(&["checkout", "-b", "feature"]);
         let changed = "fn base() -> i32 { 99 }\n".repeat(20);
@@ -5392,12 +5437,9 @@ mod tests {
         );
 
         let context = CliContext::for_tests(config_root.clone());
-        let output = run_cli(
-            ["mine", repo_dir.to_str().unwrap(), "--branch"],
-            &context,
-            stub_provider,
-        )
-        .unwrap();
+        let output =
+            run_cli(["mine", repo_dir.to_str().unwrap(), "--branch"], &context, stub_provider)
+                .unwrap();
 
         // Must exit 0 and ingest the changed file locally.
         assert_eq!(
@@ -5540,18 +5582,15 @@ mod tests {
         .unwrap();
 
         // Write project config.
-        let yaml = "wing: wing_project_alpha\nrooms:\n  - name: general\n    description: General files\n";
+        let yaml =
+            "wing: wing_project_alpha\nrooms:\n  - name: general\n    description: General files\n";
         fs::write(project_dir.join("mempalace.yaml"), yaml).unwrap();
 
         let context = CliContext::for_tests(config_root.clone());
 
         // First mine must succeed locally.
-        let mine = run_cli(
-            ["mine", project_dir.to_str().unwrap()],
-            &context,
-            stub_provider,
-        )
-        .unwrap();
+        let mine =
+            run_cli(["mine", project_dir.to_str().unwrap()], &context, stub_provider).unwrap();
         assert_eq!(mine.exit_code, 0, "local mine must succeed: stderr={:?}", mine.stderr);
         assert!(
             mine.stdout.contains("Files ingested: 3"),
@@ -5595,9 +5634,7 @@ mod tests {
         fs::create_dir_all(&project_dir).unwrap();
         write_file(
             &project_dir.join("backend/auth.rs"),
-            "Auth login flow keeps auth checks in the backend service.\n"
-                .repeat(5)
-                .as_str(),
+            "Auth login flow keeps auth checks in the backend service.\n".repeat(5).as_str(),
         );
         write_file(
             &project_dir.join("docs/roadmap.md"),
@@ -5623,12 +5660,8 @@ mod tests {
         );
 
         let context = CliContext::for_tests(config_root.clone());
-        let output = run_cli(
-            ["mine", project_dir.to_str().unwrap()],
-            &context,
-            stub_provider,
-        )
-        .unwrap();
+        let output =
+            run_cli(["mine", project_dir.to_str().unwrap()], &context, stub_provider).unwrap();
 
         // Exit code 0 — local success even though remote is unsupported.
         assert_eq!(output.exit_code, 0, "combined mine failed: stderr={:?}", output.stderr);
@@ -5708,12 +5741,8 @@ mod tests {
         fs::write(project_dir.join("mempalace.yaml"), yaml).unwrap();
 
         let context = CliContext::for_tests(config_root.clone());
-        let output = run_cli(
-            ["mine", project_dir.to_str().unwrap()],
-            &context,
-            stub_provider,
-        )
-        .unwrap();
+        let output =
+            run_cli(["mine", project_dir.to_str().unwrap()], &context, stub_provider).unwrap();
 
         // Must exit 0 and ingest locally.
         assert_eq!(
@@ -5797,10 +5826,7 @@ mod tests {
         let palace_path = config_root.join("palace");
 
         // Write config.json with maintenance disabled.
-        write_file(
-            &config_root.join("config.json"),
-            r#"{"maintenance":{"enabled":false}}"#,
-        );
+        write_file(&config_root.join("config.json"), r#"{"maintenance":{"enabled":false}}"#);
 
         // Initialise an empty palace.
         tokio::runtime::Runtime::new()
@@ -5838,12 +5864,7 @@ mod tests {
         let config_root = tempdir.path().to_path_buf();
 
         let context = CliContext::for_tests(config_root);
-        let output = run_cli(
-            ["maintain"],
-            &context,
-            stub_provider,
-        )
-        .unwrap();
+        let output = run_cli(["maintain"], &context, stub_provider).unwrap();
 
         assert_eq!(output.exit_code, 1);
         assert!(
@@ -5872,56 +5893,54 @@ mod tests {
         // Initialise a palace and insert drawers in multiple batches to create
         // multiple LanceDB versions and small fragments, giving every tier
         // real work.
-        tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(async {
-                let engine = mempalace_storage::StorageEngine::open(
-                    &palace_path,
-                    mempalace_core::EmbeddingProfile::Balanced,
-                )
-                .await
-                .unwrap();
-                let dim = mempalace_core::EmbeddingProfile::Balanced.metadata().dimensions;
-                for batch in 0..10 {
-                    let records: Vec<_> = (0..4)
-                        .map(|i| {
-                            let id = mempalace_core::DrawerId::new(
-                                &format!("wing/room/b{batch}_{i:04}"),
-                            )
-                            .unwrap();
-                            let wing = mempalace_core::WingId::new("wing").unwrap();
-                            let room = mempalace_core::RoomId::new("room").unwrap();
-                            let mut embedding = vec![0.1_f32; dim];
-                            embedding[0] = (i as f32) * 0.01;
-                            mempalace_core::DrawerRecord {
-                                id,
-                                wing,
-                                room,
-                                hall: None,
-                                date: None,
-                                source_file: "test.txt".to_owned(),
-                                chunk_index: i,
-                                ingest_mode: "test".to_owned(),
-                                extract_mode: None,
-                                added_by: "tester".to_owned(),
-                                filed_at: time::OffsetDateTime::UNIX_EPOCH,
-                                importance: None,
-                                emotional_weight: None,
-                                weight: None,
-                                content: format!("payload-{batch}-{i}"),
-                                content_hash: format!("hash-{batch}-{i}"),
-                                embedding,
-                                locator: None,
-                                view_metadata: None,
-                            }
-                        })
-                        .collect();
-                    engine.drawer_store()
-                        .put_drawers(&records, mempalace_storage::DuplicateStrategy::Error)
-                        .await
-                        .unwrap();
-                }
-            });
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let engine = mempalace_storage::StorageEngine::open(
+                &palace_path,
+                mempalace_core::EmbeddingProfile::Balanced,
+            )
+            .await
+            .unwrap();
+            let dim = mempalace_core::EmbeddingProfile::Balanced.metadata().dimensions;
+            for batch in 0..10 {
+                let records: Vec<_> = (0..4)
+                    .map(|i| {
+                        let id =
+                            mempalace_core::DrawerId::new(&format!("wing/room/b{batch}_{i:04}"))
+                                .unwrap();
+                        let wing = mempalace_core::WingId::new("wing").unwrap();
+                        let room = mempalace_core::RoomId::new("room").unwrap();
+                        let mut embedding = vec![0.1_f32; dim];
+                        embedding[0] = (i as f32) * 0.01;
+                        mempalace_core::DrawerRecord {
+                            id,
+                            wing,
+                            room,
+                            hall: None,
+                            date: None,
+                            source_file: "test.txt".to_owned(),
+                            chunk_index: i,
+                            ingest_mode: "test".to_owned(),
+                            extract_mode: None,
+                            added_by: "tester".to_owned(),
+                            filed_at: time::OffsetDateTime::UNIX_EPOCH,
+                            importance: None,
+                            emotional_weight: None,
+                            weight: None,
+                            content: format!("payload-{batch}-{i}"),
+                            content_hash: format!("hash-{batch}-{i}"),
+                            embedding,
+                            locator: None,
+                            view_metadata: None,
+                        }
+                    })
+                    .collect();
+                engine
+                    .drawer_store()
+                    .put_drawers(&records, mempalace_storage::DuplicateStrategy::Error)
+                    .await
+                    .unwrap();
+            }
+        });
 
         let context = CliContext::for_tests(config_root);
         let output = run_cli(
@@ -5985,52 +6004,49 @@ mod tests {
         );
 
         // Create multi-version fixture so pruning has versions to examine.
-        tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(async {
-                let engine = mempalace_storage::StorageEngine::open(
-                    &palace_path,
-                    mempalace_core::EmbeddingProfile::Balanced,
-                )
-                .await
-                .unwrap();
-                let dim = mempalace_core::EmbeddingProfile::Balanced.metadata().dimensions;
-                for batch in 0..8 {
-                    let id = mempalace_core::DrawerId::new(
-                        &format!("wing/room/v{batch}_0000"),
-                    )
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let engine = mempalace_storage::StorageEngine::open(
+                &palace_path,
+                mempalace_core::EmbeddingProfile::Balanced,
+            )
+            .await
+            .unwrap();
+            let dim = mempalace_core::EmbeddingProfile::Balanced.metadata().dimensions;
+            for batch in 0..8 {
+                let id =
+                    mempalace_core::DrawerId::new(&format!("wing/room/v{batch}_0000")).unwrap();
+                let wing = mempalace_core::WingId::new("wing").unwrap();
+                let room = mempalace_core::RoomId::new("room").unwrap();
+                let mut embedding = vec![0.1_f32; dim];
+                embedding[0] = (batch as f32) * 0.01;
+                let record = mempalace_core::DrawerRecord {
+                    id,
+                    wing,
+                    room,
+                    hall: None,
+                    date: None,
+                    source_file: "test.txt".to_owned(),
+                    chunk_index: batch,
+                    ingest_mode: "test".to_owned(),
+                    extract_mode: None,
+                    added_by: "tester".to_owned(),
+                    filed_at: time::OffsetDateTime::UNIX_EPOCH,
+                    importance: None,
+                    emotional_weight: None,
+                    weight: None,
+                    content: format!("payload-{batch}"),
+                    content_hash: format!("hash-{batch}"),
+                    embedding,
+                    locator: None,
+                    view_metadata: None,
+                };
+                engine
+                    .drawer_store()
+                    .put_drawers(&[record], mempalace_storage::DuplicateStrategy::Error)
+                    .await
                     .unwrap();
-                    let wing = mempalace_core::WingId::new("wing").unwrap();
-                    let room = mempalace_core::RoomId::new("room").unwrap();
-                    let mut embedding = vec![0.1_f32; dim];
-                    embedding[0] = (batch as f32) * 0.01;
-                    let record = mempalace_core::DrawerRecord {
-                        id,
-                        wing,
-                        room,
-                        hall: None,
-                        date: None,
-                        source_file: "test.txt".to_owned(),
-                        chunk_index: batch,
-                        ingest_mode: "test".to_owned(),
-                        extract_mode: None,
-                        added_by: "tester".to_owned(),
-                        filed_at: time::OffsetDateTime::UNIX_EPOCH,
-                        importance: None,
-                        emotional_weight: None,
-                        weight: None,
-                        content: format!("payload-{batch}"),
-                        content_hash: format!("hash-{batch}"),
-                        embedding,
-                        locator: None,
-                        view_metadata: None,
-                    };
-                    engine.drawer_store()
-                        .put_drawers(&[record], mempalace_storage::DuplicateStrategy::Error)
-                        .await
-                        .unwrap();
-                }
-            });
+            }
+        });
 
         let context = CliContext::for_tests(config_root);
         let output = run_cli(
@@ -6069,23 +6085,22 @@ mod tests {
             r#"{"maintenance":{"enabled":true,"idle_secs":300}}"#,
         );
 
-        tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(async {
-                let engine = mempalace_storage::StorageEngine::open(
-                    &palace_path,
-                    mempalace_core::EmbeddingProfile::Balanced,
-                )
-                .await
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let engine = mempalace_storage::StorageEngine::open(
+                &palace_path,
+                mempalace_core::EmbeddingProfile::Balanced,
+            )
+            .await
+            .unwrap();
+            // Claim from a different holder so the CLI's own engine
+            // cannot acquire the lease.
+            engine
+                .operational_store()
+                .try_claim_lease("cli-test-holder", time::Duration::minutes(5))
                 .unwrap();
-                // Claim from a different holder so the CLI's own engine
-                // cannot acquire the lease.
-                engine.operational_store()
-                    .try_claim_lease("cli-test-holder", time::Duration::minutes(5))
-                    .unwrap();
-                // Engine is dropped here, closing LanceDB/SQLite handles,
-                // but the lease persists in SQLite.
-            });
+            // Engine is dropped here, closing LanceDB/SQLite handles,
+            // but the lease persists in SQLite.
+        });
 
         let context = CliContext::for_tests(config_root);
         let output = run_cli(

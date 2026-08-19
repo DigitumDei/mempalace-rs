@@ -281,10 +281,8 @@ pub trait IngestManifestStore {
     /// Live (latest committed run) drawer ids for every key in `source_keys`,
     /// gathered over a single connection. Used by scoped prune to avoid a fresh
     /// connection per source.
-    fn committed_drawer_ids_for_source_keys(
-        &self,
-        source_keys: &[String],
-    ) -> Result<Vec<DrawerId>>;
+    fn committed_drawer_ids_for_source_keys(&self, source_keys: &[String])
+    -> Result<Vec<DrawerId>>;
     fn get_ingested_file(&self, source_key: &str) -> Result<Option<IngestFileRecord>>;
     fn ingested_source_keys_with_prefix(&self, prefix: &str) -> Result<Vec<String>>;
     /// Return `(source_key, drawer_count)` for every mined source whose key
@@ -644,8 +642,7 @@ impl DiaryStore for SqliteOperationalStore {
             return Ok(Vec::new());
         }
         let connection = self.open_connection()?;
-        let placeholders =
-            std::iter::repeat_n("?", entry_ids.len()).collect::<Vec<_>>().join(", ");
+        let placeholders = std::iter::repeat_n("?", entry_ids.len()).collect::<Vec<_>>().join(", ");
         let sql = format!(
             "SELECT entry_id, summary FROM diary_summaries WHERE entry_id IN ({placeholders})"
         );
@@ -670,7 +667,8 @@ impl DiaryStore for SqliteOperationalStore {
 
     fn delete_diary_summary(&self, entry_id: &DrawerId) -> Result<()> {
         let connection = self.open_connection()?;
-        connection.execute("DELETE FROM diary_summaries WHERE entry_id = ?1", [entry_id.as_str()])?;
+        connection
+            .execute("DELETE FROM diary_summaries WHERE entry_id = ?1", [entry_id.as_str()])?;
         Ok(())
     }
 }
@@ -1142,32 +1140,29 @@ impl SqliteOperationalStore {
         )?;
 
         let runs = statement
-            .query_map(
-                params![IngestRunStatus::Failed.as_str(), encode_time(older_than)],
-                |row| {
-                    Ok(IngestRun {
-                        id: row.get(0)?,
-                        ingest_kind: row.get(1)?,
-                        source_key: row.get(2)?,
-                        status: parse_status(row.get::<_, String>(3)?)?,
-                        created_at: decode_time(row.get(4)?).map_err(|err| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                4,
-                                rusqlite::types::Type::Text,
-                                Box::new(err),
-                            )
-                        })?,
-                        updated_at: decode_time(row.get(5)?).map_err(|err| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                5,
-                                rusqlite::types::Type::Text,
-                                Box::new(err),
-                            )
-                        })?,
-                        failed_reason: row.get(6)?,
-                    })
-                },
-            )?
+            .query_map(params![IngestRunStatus::Failed.as_str(), encode_time(older_than)], |row| {
+                Ok(IngestRun {
+                    id: row.get(0)?,
+                    ingest_kind: row.get(1)?,
+                    source_key: row.get(2)?,
+                    status: parse_status(row.get::<_, String>(3)?)?,
+                    created_at: decode_time(row.get(4)?).map_err(|err| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            4,
+                            rusqlite::types::Type::Text,
+                            Box::new(err),
+                        )
+                    })?,
+                    updated_at: decode_time(row.get(5)?).map_err(|err| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            5,
+                            rusqlite::types::Type::Text,
+                            Box::new(err),
+                        )
+                    })?,
+                    failed_reason: row.get(6)?,
+                })
+            })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
         let mut retryable = Vec::with_capacity(runs.len());
@@ -2191,13 +2186,16 @@ impl MaintenanceLeaseStore for SqliteOperationalStore {
                 |row| {
                     let holder: String = row.get(0)?;
                     let expires_at: String = row.get(1)?;
-                    Ok((holder, decode_time(expires_at).map_err(|err| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            1,
-                            rusqlite::types::Type::Text,
-                            Box::new(err),
-                        )
-                    })?))
+                    Ok((
+                        holder,
+                        decode_time(expires_at).map_err(|err| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                1,
+                                rusqlite::types::Type::Text,
+                                Box::new(err),
+                            )
+                        })?,
+                    ))
                 },
             )
             .optional()?;
@@ -3430,10 +3428,7 @@ VALUES ('chat/file.txt', 'legacy-hash', '2026-04-11T12:00:00Z', 'convos', 2);
         );
 
         // The existing valid summary was not overwritten.
-        assert_eq!(
-            store.get_diary_summary(&did).unwrap(),
-            Some("a".repeat(400))
-        );
+        assert_eq!(store.get_diary_summary(&did).unwrap(), Some("a".repeat(400)));
     }
 
     #[test]
@@ -3457,10 +3452,7 @@ VALUES ('chat/file.txt', 'legacy-hash', '2026-04-11T12:00:00Z', 'convos', 2);
             &"x".repeat(401),
             datetime!(2026-07-01 00:00:00 UTC),
         );
-        assert!(
-            result.is_err(),
-            "expected error for overlong summary in create_pending_diary_run"
-        );
+        assert!(result.is_err(), "expected error for overlong summary in create_pending_diary_run");
         let err = result.unwrap_err().to_string();
         assert!(
             err.contains("diary summary exceeds maximum length of 400"),
@@ -3528,7 +3520,8 @@ VALUES ('chat/file.txt', 'legacy-hash', '2026-04-11T12:00:00Z', 'convos', 2);
         store.store_diary_summary(&id_a, "summary a").unwrap();
         store.store_diary_summary(&id_b, "summary b").unwrap();
 
-        let results = store.get_diary_summaries(&[id_a.clone(), id_b.clone(), id_c.clone()]).unwrap();
+        let results =
+            store.get_diary_summaries(&[id_a.clone(), id_b.clone(), id_c.clone()]).unwrap();
         assert_eq!(results.len(), 2, "only stored entries should be returned");
         assert!(results.contains(&(id_a, "summary a".to_owned())));
         assert!(results.contains(&(id_b, "summary b".to_owned())));
@@ -3555,10 +3548,7 @@ VALUES ('chat/file.txt', 'legacy-hash', '2026-04-11T12:00:00Z', 'convos', 2);
             "INSERT INTO diary_summaries (entry_id, summary) VALUES (?1, ?2)",
             rusqlite::params!["diary/too-long", &"x".repeat(401)],
         );
-        assert!(
-            result.is_err(),
-            "CHECK constraint should reject summary longer than 400 chars"
-        );
+        assert!(result.is_err(), "CHECK constraint should reject summary longer than 400 chars");
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains("CHECK constraint") || err_msg.contains("constraint failed"),
@@ -3674,8 +3664,7 @@ INSERT INTO diary_summaries (entry_id, summary) VALUES ('diary/long', 'x' || 'y'
         store.ensure_schema().unwrap();
 
         let conn = store.open_connection().unwrap();
-        let expires_at = OffsetDateTime::from_unix_timestamp(1_767_996_800)
-            .unwrap()
+        let expires_at = OffsetDateTime::from_unix_timestamp(1_767_996_800).unwrap()
             + Duration::milliseconds(120);
         conn.execute(
             "UPDATE maintenance_leases SET holder = 'worker-a', expires_at = ?1 WHERE lease_id = 'maintenance'",
@@ -3713,10 +3702,7 @@ INSERT INTO diary_summaries (entry_id, summary) VALUES ('diary/long', 'x' || 'y'
 
         let status_after = store.lease_status().unwrap().unwrap();
         assert_eq!(status_after.0, "worker-a");
-        assert!(
-            status_after.1 > status_before.1,
-            "expiry should be extended after renewal"
-        );
+        assert!(status_after.1 > status_before.1, "expiry should be extended after renewal");
     }
 
     #[test]

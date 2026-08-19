@@ -226,10 +226,7 @@ pub(crate) fn resolve_federation_config(
         if remotes.contains_key(&raw.name) {
             return Err(MempalaceError::ConfigParse {
                 path: config_path.to_path_buf(),
-                message: format!(
-                    "federation.remotes contains duplicate name `{}`",
-                    raw.name
-                ),
+                message: format!("federation.remotes contains duplicate name `{}`", raw.name),
             });
         }
 
@@ -237,10 +234,7 @@ pub(crate) fn resolve_federation_config(
         if url.is_empty() {
             return Err(MempalaceError::ConfigParse {
                 path: config_path.to_path_buf(),
-                message: format!(
-                    "federation.remotes.{}.url must not be empty",
-                    raw.name
-                ),
+                message: format!("federation.remotes.{}.url must not be empty", raw.name),
             });
         }
         if !url.starts_with("http://") && !url.starts_with("https://") {
@@ -263,13 +257,9 @@ pub(crate) fn resolve_federation_config(
         }
 
         let token = resolve_token(&raw.name, raw.token_env.as_deref(), raw.token, &env_lookup);
-        let timeout =
-            Duration::from_millis(raw.timeout_ms.unwrap_or(DEFAULT_REMOTE_TIMEOUT_MS));
+        let timeout = Duration::from_millis(raw.timeout_ms.unwrap_or(DEFAULT_REMOTE_TIMEOUT_MS));
 
-        remotes.insert(
-            raw.name.clone(),
-            ResolvedRemote { name: raw.name, url, token, timeout },
-        );
+        remotes.insert(raw.name.clone(), ResolvedRemote { name: raw.name, url, token, timeout });
     }
 
     // ── 2. Resolve wing rules ─────────────────────────────────────────────────
@@ -282,12 +272,8 @@ pub(crate) fn resolve_federation_config(
                  diary routing to this wing is always hard-overridden to Local"
             );
         }
-        let resolved = resolve_rule(
-            &format!("federation.wings.{wing_name}"),
-            rule,
-            &remotes,
-            config_path,
-        )?;
+        let resolved =
+            resolve_rule(&format!("federation.wings.{wing_name}"), rule, &remotes, config_path)?;
         wings.insert(wing_name.clone(), resolved);
     }
 
@@ -333,9 +319,7 @@ fn resolve_rule(
                     if !remotes.contains_key(r.as_str()) {
                         return Err(MempalaceError::ConfigParse {
                             path: config_path.to_path_buf(),
-                            message: format!(
-                                "{field_path} references unknown remote `{r}`"
-                            ),
+                            message: format!("{field_path} references unknown remote `{r}`"),
                         });
                     }
                     r.clone()
@@ -366,9 +350,7 @@ fn infer_single_remote(
         1 => Ok(remotes.keys().next().expect("len is 1").clone()),
         0 => Err(MempalaceError::ConfigParse {
             path: config_path.to_path_buf(),
-            message: format!(
-                "{field_path} requires a remote but none are configured"
-            ),
+            message: format!("{field_path} requires a remote but none are configured"),
         }),
         _ => Err(MempalaceError::ConfigParse {
             path: config_path.to_path_buf(),
@@ -676,7 +658,11 @@ mod tests {
                 let mut m = BTreeMap::new();
                 m.insert(
                     "wing_teamdocs".to_owned(),
-                    RouteRuleV1 { mode: RouteMode::Remote, remote: Some("foo".to_owned()), write: None },
+                    RouteRuleV1 {
+                        mode: RouteMode::Remote,
+                        remote: Some("foo".to_owned()),
+                        write: None,
+                    },
                 );
                 m
             },
@@ -929,18 +915,9 @@ mod tests {
     // ── 8. RouteMode / WriteTarget serde round-trip ───────────────────────────
     #[test]
     fn route_mode_serde_roundtrip() {
-        assert_eq!(
-            serde_json::from_str::<RouteMode>("\"local\"").unwrap(),
-            RouteMode::Local
-        );
-        assert_eq!(
-            serde_json::from_str::<RouteMode>("\"remote\"").unwrap(),
-            RouteMode::Remote
-        );
-        assert_eq!(
-            serde_json::from_str::<RouteMode>("\"combined\"").unwrap(),
-            RouteMode::Combined
-        );
+        assert_eq!(serde_json::from_str::<RouteMode>("\"local\"").unwrap(), RouteMode::Local);
+        assert_eq!(serde_json::from_str::<RouteMode>("\"remote\"").unwrap(), RouteMode::Remote);
+        assert_eq!(serde_json::from_str::<RouteMode>("\"combined\"").unwrap(), RouteMode::Combined);
         assert_eq!(serde_json::to_string(&RouteMode::Local).unwrap(), "\"local\"");
         assert_eq!(serde_json::to_string(&RouteMode::Remote).unwrap(), "\"remote\"");
         assert_eq!(serde_json::to_string(&RouteMode::Combined).unwrap(), "\"combined\"");
@@ -948,18 +925,9 @@ mod tests {
 
     #[test]
     fn write_target_serde_roundtrip() {
-        assert_eq!(
-            serde_json::from_str::<WriteTarget>("\"local\"").unwrap(),
-            WriteTarget::Local
-        );
-        assert_eq!(
-            serde_json::from_str::<WriteTarget>("\"remote\"").unwrap(),
-            WriteTarget::Remote
-        );
-        assert_eq!(
-            serde_json::from_str::<WriteTarget>("\"both\"").unwrap(),
-            WriteTarget::Both
-        );
+        assert_eq!(serde_json::from_str::<WriteTarget>("\"local\"").unwrap(), WriteTarget::Local);
+        assert_eq!(serde_json::from_str::<WriteTarget>("\"remote\"").unwrap(), WriteTarget::Remote);
+        assert_eq!(serde_json::from_str::<WriteTarget>("\"both\"").unwrap(), WriteTarget::Both);
         assert_eq!(serde_json::to_string(&WriteTarget::Local).unwrap(), "\"local\"");
         assert_eq!(serde_json::to_string(&WriteTarget::Remote).unwrap(), "\"remote\"");
         assert_eq!(serde_json::to_string(&WriteTarget::Both).unwrap(), "\"both\"");
@@ -972,12 +940,14 @@ mod tests {
         assert_eq!(val["status"], "skipped");
 
         // Replicated
-        let val = serde_json::to_value(ReplicationStatus::Replicated { remote: "hub".to_owned() }).unwrap();
+        let val = serde_json::to_value(ReplicationStatus::Replicated { remote: "hub".to_owned() })
+            .unwrap();
         assert_eq!(val["status"], "replicated");
         assert_eq!(val["remote"], "hub");
 
         // Converged
-        let val = serde_json::to_value(ReplicationStatus::Converged { remote: "hub".to_owned() }).unwrap();
+        let val = serde_json::to_value(ReplicationStatus::Converged { remote: "hub".to_owned() })
+            .unwrap();
         assert_eq!(val["status"], "converged");
         assert_eq!(val["remote"], "hub");
 
@@ -985,7 +955,8 @@ mod tests {
         let val = serde_json::to_value(ReplicationStatus::Failed {
             remote: "hub".to_owned(),
             reason: "timeout".to_owned(),
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(val["status"], "failed");
         assert_eq!(val["remote"], "hub");
         assert_eq!(val["reason"], "timeout");
@@ -1537,7 +1508,8 @@ mod tests {
     // ── 14. Project YAML with write:"both" ─────────────────────────────────────
     #[test]
     fn project_yaml_with_write_both_parses() {
-        let yaml = "wing: project_gamma\nrouting:\n  mode: combined\n  remote: hub\n  write: both\n";
+        let yaml =
+            "wing: project_gamma\nrouting:\n  mode: combined\n  remote: hub\n  write: both\n";
         let config: crate::config::ProjectConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(config.wing, "project_gamma");
         let routing = config.routing.unwrap();

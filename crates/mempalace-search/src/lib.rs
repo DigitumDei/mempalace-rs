@@ -224,21 +224,15 @@ where
             view: query.view.clone(),
             ..DrawerFilter::default()
         };
-        let overlay = query
-            .view
-            .as_deref()
-            .filter(|view| *view != "canonical" && *view != "full");
+        let overlay = query.view.as_deref().filter(|view| *view != "canonical" && *view != "full");
 
         // Search wider until overlay filtering leaves a complete result window.
         // A low-scoring branch replacement must shadow its canonical path without
         // causing unrelated later candidates to disappear from the response.
         let max_candidate_limit = query.limit.saturating_mul(10).max(query.limit);
-        let mut candidate_limit = if rerank_enabled {
-            query.limit.saturating_mul(2)
-        } else {
-            query.limit
-        }
-        .min(max_candidate_limit);
+        let mut candidate_limit =
+            if rerank_enabled { query.limit.saturating_mul(2) } else { query.limit }
+                .min(max_candidate_limit);
         let mut matches;
         loop {
             // LanceDB has no offset paging for vector queries, so each bounded
@@ -309,8 +303,7 @@ where
 
         // Resolve locator-backed records in place BEFORE ranking so that
         // rerank's lexical_overlap_score operates on real text.
-        let mut records: Vec<DrawerRecord> =
-            matches.iter().map(|m| m.record.clone()).collect();
+        let mut records: Vec<DrawerRecord> = matches.iter().map(|m| m.record.clone()).collect();
         let stale_flags = resolve_records(&mut records);
         // Write resolved content back into the matches.
         for (m, resolved) in matches.iter_mut().zip(records.into_iter()) {
@@ -334,9 +327,11 @@ where
                     .as_ref()
                     .and_then(|vm| vm.view_name.clone())
                     .or_else(|| {
-                        entry.record.hall.as_ref().and_then(|h| {
-                            h.strip_prefix("view:").map(|v| v.to_owned())
-                        })
+                        entry
+                            .record
+                            .hall
+                            .as_ref()
+                            .and_then(|h| h.strip_prefix("view:").map(|v| v.to_owned()))
                     });
                 SearchResult {
                     drawer_id: Some(entry.record.id.clone()),
@@ -454,10 +449,7 @@ fn visible_in_view(
         .is_some_and(|name| name == view)
         || record.hall.as_deref() == Some(view_hall);
     if selected_branch
-        && record
-            .view_metadata
-            .as_ref()
-            .is_some_and(|metadata| metadata.path_state == "deleted")
+        && record.view_metadata.as_ref().is_some_and(|metadata| metadata.path_state == "deleted")
     {
         return false;
     }
@@ -605,14 +597,17 @@ async fn list_layer_drawers<S>(
 where
     S: DrawerStore,
 {
-    let mut drawers =
-        store.list_drawers(&DrawerFilter { wing, ..DrawerFilter::default() }).await?;
+    let mut drawers = store.list_drawers(&DrawerFilter { wing, ..DrawerFilter::default() }).await?;
     // Resolve locator-backed records so wake_up/AAaK rendering sees real text.
     resolve_records(&mut drawers);
     Ok(drawers)
 }
 
-fn rank_matches(matches: Vec<DrawerMatch>, stale_flags: Vec<bool>, limit: usize) -> Vec<RankedMatch> {
+fn rank_matches(
+    matches: Vec<DrawerMatch>,
+    stale_flags: Vec<bool>,
+    limit: usize,
+) -> Vec<RankedMatch> {
     let mut ranked = matches
         .into_iter()
         .zip(stale_flags)
@@ -629,7 +624,12 @@ fn rank_matches(matches: Vec<DrawerMatch>, stale_flags: Vec<bool>, limit: usize)
     ranked
 }
 
-fn rerank_matches(query: &str, matches: Vec<DrawerMatch>, stale_flags: Vec<bool>, limit: usize) -> Vec<RankedMatch> {
+fn rerank_matches(
+    query: &str,
+    matches: Vec<DrawerMatch>,
+    stale_flags: Vec<bool>,
+    limit: usize,
+) -> Vec<RankedMatch> {
     let query_terms = normalized_terms(query);
     let mut ranked = matches
         .into_iter()
@@ -832,7 +832,11 @@ mod tests {
         }
     }
 
-    fn project_record(mut record: DrawerRecord, view: Option<&str>, path_state: &str) -> DrawerRecord {
+    fn project_record(
+        mut record: DrawerRecord,
+        view: Option<&str>,
+        path_state: &str,
+    ) -> DrawerRecord {
         record.ingest_mode = if view.is_some() { "projects-branch" } else { "projects" }.to_owned();
         record.hall = view.map(|view| format!("view:{view}"));
         record.view_metadata = Some(RepositoryViewMetadata {
@@ -958,10 +962,7 @@ mod tests {
     fn filter_matches(drawer: &DrawerRecord, filter: &DrawerFilter) -> bool {
         if filter.branch_view_only
             && !filter.view.as_deref().is_some_and(|view| {
-                drawer
-                    .view_metadata
-                    .as_ref()
-                    .and_then(|metadata| metadata.view_name.as_deref())
+                drawer.view_metadata.as_ref().and_then(|metadata| metadata.view_name.as_deref())
                     == Some(view)
             })
         {
@@ -978,15 +979,15 @@ mod tests {
                 true
             } else {
                 match filter.view.as_deref() {
-                None | Some("canonical") => drawer.ingest_mode != "projects-branch",
-                Some(view) => {
-                    let selected = drawer
+                    None | Some("canonical") => drawer.ingest_mode != "projects-branch",
+                    Some(view) => {
+                        let selected = drawer
                             .view_metadata
                             .as_ref()
                             .and_then(|metadata| metadata.view_name.as_deref())
                             == Some(view);
-                    drawer.ingest_mode != "projects-branch" || selected
-                }
+                        drawer.ingest_mode != "projects-branch" || selected
+                    }
                 }
             }
     }
@@ -1126,7 +1127,8 @@ mod tests {
             room: None,
             limit: 5,
             profile: EmbeddingProfile::Balanced,
-                view: None,};
+            view: None,
+        };
 
         let results = runtime.search(&store, &query).await.unwrap();
         assert_eq!(results.len(), 2);
@@ -1155,7 +1157,8 @@ mod tests {
                     room: None,
                     limit: 5,
                     profile: EmbeddingProfile::Balanced,
-                view: None,},
+                    view: None,
+                },
             )
             .await
             .unwrap_err();
@@ -1177,7 +1180,8 @@ mod tests {
                     room: None,
                     limit: 0,
                     profile: EmbeddingProfile::Balanced,
-                view: None,},
+                    view: None,
+                },
             )
             .await
             .unwrap();
@@ -1198,7 +1202,8 @@ mod tests {
                     room: None,
                     limit: 5,
                     profile: EmbeddingProfile::LowCpu,
-                view: None,},
+                    view: None,
+                },
             )
             .await
             .unwrap_err();
@@ -1237,7 +1242,8 @@ mod tests {
             room: None,
             limit: 5,
             profile: EmbeddingProfile::Balanced,
-                view: None,};
+            view: None,
+        };
 
         let results = runtime.search(&store, &query).await.unwrap();
         assert_eq!(
@@ -1271,7 +1277,8 @@ mod tests {
             room: None,
             limit: 3,
             profile: EmbeddingProfile::Balanced,
-                view: None,};
+            view: None,
+        };
 
         let results = runtime.search(&store, &query).await.unwrap();
         assert_eq!(results.len(), 3);
@@ -1322,7 +1329,8 @@ mod tests {
                     room: None,
                     limit: 1,
                     profile: EmbeddingProfile::Balanced,
-                view: None,},
+                    view: None,
+                },
             )
             .await
             .unwrap();
@@ -1369,7 +1377,8 @@ mod tests {
             room: None,
             limit: 1,
             profile: EmbeddingProfile::Balanced,
-                view: None,};
+            view: None,
+        };
 
         let reranked = runtime.search(&store, &query).await.unwrap();
         let semantic = runtime.search_semantic(&store, &query).await.unwrap();
@@ -1419,7 +1428,8 @@ mod tests {
                     room: None,
                     limit: 1,
                     profile: EmbeddingProfile::Balanced,
-                view: None,},
+                    view: None,
+                },
             )
             .await
             .unwrap();
@@ -1444,7 +1454,8 @@ mod tests {
                     room: None,
                     limit: 5,
                     profile: EmbeddingProfile::Balanced,
-                view: None,},
+                    view: None,
+                },
             )
             .await
             .unwrap_err();
@@ -1471,7 +1482,8 @@ mod tests {
                     room: Some(RoomId::new("auth-migration").unwrap()),
                     limit: 5,
                     profile: EmbeddingProfile::Balanced,
-                view: None,},
+                    view: None,
+                },
             )
             .await
             .unwrap();
@@ -1495,7 +1507,8 @@ mod tests {
                     room: Some(RoomId::new("auth-migration").unwrap()),
                     limit: 5,
                     profile: EmbeddingProfile::Balanced,
-                view: None,},
+                    view: None,
+                },
             )
             .await
             .unwrap();
@@ -1509,24 +1522,32 @@ mod tests {
         let mut runtime = SearchRuntime::new(StubProvider { response: vec![embedding(0.0)] });
         let store = StubStore {
             drawers: vec![
-                project_record(record(
-                    "wing_a/backend/0001",
-                    "wing_a",
-                    "backend",
-                    "main.rs",
-                    "Canonical backend code.",
-                    Some(0.5),
-                    datetime!(2026-04-11 09:00:00 UTC),
-                ), None, "present"),
-                project_record(record(
-                    "wing_a/backend/0002",
-                    "wing_a",
-                    "backend",
-                    "main.rs",
-                    "Branch-specific backend code.",
-                    Some(0.5),
-                    datetime!(2026-04-11 09:00:00 UTC),
-                ), Some("feature-x"), "present"),
+                project_record(
+                    record(
+                        "wing_a/backend/0001",
+                        "wing_a",
+                        "backend",
+                        "main.rs",
+                        "Canonical backend code.",
+                        Some(0.5),
+                        datetime!(2026-04-11 09:00:00 UTC),
+                    ),
+                    None,
+                    "present",
+                ),
+                project_record(
+                    record(
+                        "wing_a/backend/0002",
+                        "wing_a",
+                        "backend",
+                        "main.rs",
+                        "Branch-specific backend code.",
+                        Some(0.5),
+                        datetime!(2026-04-11 09:00:00 UTC),
+                    ),
+                    Some("feature-x"),
+                    "present",
+                ),
             ],
         };
 
@@ -1554,24 +1575,32 @@ mod tests {
         let mut runtime = SearchRuntime::new(StubProvider { response: vec![embedding(0.0)] });
         let store = StubStore {
             drawers: vec![
-                project_record(record(
-                    "wing_a/backend/0001",
-                    "wing_a",
-                    "backend",
-                    "main.rs",
-                    "Canonical backend code.",
-                    Some(0.5),
-                    datetime!(2026-04-11 09:00:00 UTC),
-                ), None, "present"),
-                project_record(record(
-                    "wing_a/backend/0002",
-                    "wing_a",
-                    "backend",
-                    "main.rs",
-                    "Branch-specific backend code.",
-                    Some(0.5),
-                    datetime!(2026-04-11 09:00:00 UTC),
-                ), Some("feature-x"), "present"),
+                project_record(
+                    record(
+                        "wing_a/backend/0001",
+                        "wing_a",
+                        "backend",
+                        "main.rs",
+                        "Canonical backend code.",
+                        Some(0.5),
+                        datetime!(2026-04-11 09:00:00 UTC),
+                    ),
+                    None,
+                    "present",
+                ),
+                project_record(
+                    record(
+                        "wing_a/backend/0002",
+                        "wing_a",
+                        "backend",
+                        "main.rs",
+                        "Branch-specific backend code.",
+                        Some(0.5),
+                        datetime!(2026-04-11 09:00:00 UTC),
+                    ),
+                    Some("feature-x"),
+                    "present",
+                ),
             ],
         };
 
@@ -1599,24 +1628,32 @@ mod tests {
         let mut runtime = SearchRuntime::new(StubProvider { response: vec![embedding(0.0)] });
         let store = StubStore {
             drawers: vec![
-                project_record(record(
-                    "wing_a/backend/0001",
-                    "wing_a",
-                    "backend",
-                    "main.rs",
-                    "Canonical backend code.",
-                    Some(0.1),
-                    datetime!(2026-04-11 09:00:00 UTC),
-                ), None, "present"),
-                project_record(record(
-                    "wing_a/backend/0002",
-                    "wing_a",
-                    "backend",
-                    "main.rs",
-                    "Unrelated branch replacement.",
-                    Some(0.9),
-                    datetime!(2026-04-11 09:00:00 UTC),
-                ), Some("feature-x"), "present"),
+                project_record(
+                    record(
+                        "wing_a/backend/0001",
+                        "wing_a",
+                        "backend",
+                        "main.rs",
+                        "Canonical backend code.",
+                        Some(0.1),
+                        datetime!(2026-04-11 09:00:00 UTC),
+                    ),
+                    None,
+                    "present",
+                ),
+                project_record(
+                    record(
+                        "wing_a/backend/0002",
+                        "wing_a",
+                        "backend",
+                        "main.rs",
+                        "Unrelated branch replacement.",
+                        Some(0.9),
+                        datetime!(2026-04-11 09:00:00 UTC),
+                    ),
+                    Some("feature-x"),
+                    "present",
+                ),
             ],
         };
 
@@ -1724,24 +1761,32 @@ mod tests {
         let mut runtime = SearchRuntime::new(StubProvider { response: vec![embedding(0.0)] });
         let store = StubStore {
             drawers: vec![
-                project_record(record(
-                    "wing_a/backend/0001",
-                    "wing_a",
-                    "backend",
-                    "deleted.rs",
-                    "Canonical deleted file.",
-                    Some(0.1),
-                    datetime!(2026-04-11 09:00:00 UTC),
-                ), None, "present"),
-                project_record(record(
-                    "wing_a/general/0002",
-                    "wing_a",
-                    "general",
-                    "deleted.rs",
-                    "Deleted branch path tombstone",
-                    Some(0.9),
-                    datetime!(2026-04-11 09:00:00 UTC),
-                ), Some("feature-x"), "deleted"),
+                project_record(
+                    record(
+                        "wing_a/backend/0001",
+                        "wing_a",
+                        "backend",
+                        "deleted.rs",
+                        "Canonical deleted file.",
+                        Some(0.1),
+                        datetime!(2026-04-11 09:00:00 UTC),
+                    ),
+                    None,
+                    "present",
+                ),
+                project_record(
+                    record(
+                        "wing_a/general/0002",
+                        "wing_a",
+                        "general",
+                        "deleted.rs",
+                        "Deleted branch path tombstone",
+                        Some(0.9),
+                        datetime!(2026-04-11 09:00:00 UTC),
+                    ),
+                    Some("feature-x"),
+                    "deleted",
+                ),
             ],
         };
 
@@ -2057,17 +2102,15 @@ mod tests {
             ],
         };
 
-        let expected = "## L0 — IDENTITY\nReady.\n\n## L1 — AAAK STORY\n\n[alpha]\n  ... (more in L3 search)";
+        let expected =
+            "## L0 — IDENTITY\nReady.\n\n## L1 — AAAK STORY\n\n[alpha]\n  ... (more in L3 search)";
         let rendered = runtime
             .wake_up(
                 &store,
                 &WakeUpRequest {
                     wing: Some(WingId::new("wing_code").unwrap()),
                     identity: IdentitySource::Inline("## L0 — IDENTITY\nReady.".to_owned()),
-                    layer1: Layer1Config {
-                        max_drawers: 2,
-                        max_chars: super::char_count(expected),
-                    },
+                    layer1: Layer1Config { max_drawers: 2, max_chars: super::char_count(expected) },
                     format: WakeUpFormat::AaaK,
                 },
             )
@@ -2083,8 +2126,7 @@ mod tests {
     async fn wake_up_aaak_honors_full_output_budget_end_to_end() {
         let runtime = SearchRuntime::new(StubProvider { response: vec![embedding(0.0)] });
         let store = sample_store();
-        let expected =
-            "## L0 — IDENTITY\nReady.\n\n## L1 — AAAK STORY\n\n[auth-migration]\n  ... (more in L3 search)";
+        let expected = "## L0 — IDENTITY\nReady.\n\n## L1 — AAAK STORY\n\n[auth-migration]\n  ... (more in L3 search)";
 
         let rendered = runtime
             .wake_up(
@@ -2092,10 +2134,7 @@ mod tests {
                 &WakeUpRequest {
                     wing: Some(WingId::new("wing_code").unwrap()),
                     identity: IdentitySource::Inline("## L0 — IDENTITY\nReady.".to_owned()),
-                    layer1: Layer1Config {
-                        max_drawers: 3,
-                        max_chars: super::char_count(expected),
-                    },
+                    layer1: Layer1Config { max_drawers: 3, max_chars: super::char_count(expected) },
                     format: WakeUpFormat::AaaK,
                 },
             )
@@ -2166,7 +2205,8 @@ mod tests {
                     room: None,
                     limit: 5,
                     profile: EmbeddingProfile::Balanced,
-                view: None,},
+                    view: None,
+                },
             )
             .await
             .unwrap();
@@ -2187,7 +2227,8 @@ mod tests {
                     room: None,
                     limit: 2,
                     profile: EmbeddingProfile::Balanced,
-                view: None,},
+                    view: None,
+                },
             )
             .await
             .unwrap();
@@ -2559,7 +2600,8 @@ mod tests {
             room: None,
             limit: 5,
             profile: EmbeddingProfile::Balanced,
-                view: None,};
+            view: None,
+        };
 
         let results = runtime.search(&store, &query).await.unwrap();
 
@@ -2612,7 +2654,8 @@ mod tests {
             room: None,
             limit: 5,
             profile: EmbeddingProfile::Balanced,
-                view: None,};
+            view: None,
+        };
 
         let results = runtime.search(&store, &query).await.unwrap();
         assert_eq!(results.len(), 1);

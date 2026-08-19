@@ -141,14 +141,14 @@ claude mcp add mempalace -- ~/.mempalace/bin/mempalace-mcp
 
 ### Cline / Cursor / Any MCP host
 
-Point your MCP client at the `mempalace-mcp` binary. No arguments needed — the server speaks stdio MCP and exposes all 28 tools on `initialize`.
+Point your MCP client at the `mempalace-mcp` binary. No arguments needed — the server speaks stdio MCP and exposes all 43 tools on `initialize`.
 
 To give different MCP clients distinct persistent selves, set `MEMPALACE_LINEAGE_ID` in each
 server registration. Lineage selection is then fixed by the host and cannot be overridden by a
 model tool call. If the selected lineage does not exist yet, wake-up uses the palace default and
 explains how to create the requested lineage with `mempalace_lineage_set`. See [Self-continuity](Self-Continuity.md#binding-a-lineage-to-an-mcp-client) for Codex and OpenCode examples.
 
-Your AI now has access to `mempalace_search`, `mempalace_add_drawer`, `mempalace_kg_query`, and 25 more tools. Ask it anything about your project — it can search your palace on demand. The full list is in [Release Scope](Release-Scope.md#mcp-tool-surface-28-tools).
+Your AI now has access to `mempalace_search`, `mempalace_add_drawer`, `mempalace_kg_query`, and 40 more tools. Ask it anything about your project — it can search your palace on demand. The full list is in [Release Scope](Release-Scope.md#mcp-tool-surface-43-tools).
 
 ## Next steps
 

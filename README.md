@@ -43,7 +43,7 @@ MemPalace provides a palace-style memory store with:
 - Semantic search via local embeddings (no external API calls)
 - A knowledge graph for structured facts, relationships, and timelines
 - An AAAK dialect for compact, human-readable memory storage
-- An MCP server (`mempalace-mcp`) for agent integration (43 tools)
+- An MCP server (`mempalace-mcp`) for agent integration (51 tools)
 - Provider-neutral agent lineages and reviewed identity packets that preserve a coherent self
   across model and harness changes
 - A CLI (`mempalace-cli`) for direct palace management
@@ -143,7 +143,7 @@ Full index: [docs/README.md](docs/README.md).
 - [Operator guide](docs/Operator-Standard.md) — deployment, maintenance, troubleshooting, storage recovery
 - [CLI surface](docs/CLI-Surface.md) — all commands and flags
 - [Config schema](docs/Config-Schema.md) — `~/.mempalace/config.json`
-- [Release scope](docs/Release-Scope.md) — what ships, what's deferred, the 43 MCP tools
+- [Release scope](docs/Release-Scope.md) — what ships, what's deferred, the 51 MCP tools
 - [Self-continuity](docs/Self-Continuity.md) — lineages, reviewed self-observations, identity
   packets, and model/harness migrations
 - [Low-CPU mode](docs/Operator-Low-CPU.md) — constrained environments

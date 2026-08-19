@@ -757,9 +757,9 @@ mod tests {
     use tempfile::TempDir;
 
     fn store() -> (TempDir, SkillStore) {
-        let dir = TempDir::new().unwrap();
+        let dir = TempDir::new().expect("temp dir");
         let store = SkillStore::new(dir.path().join("storage.sqlite3"));
-        store.ensure_schema().unwrap();
+        store.ensure_schema().expect("schema");
         (dir, store)
     }
 
@@ -777,7 +777,7 @@ mod tests {
             confidence: 0.8,
             idempotency_key: key.into(),
         })
-        .unwrap()
+        .expect("proposed skill")
     }
 
     #[test]
@@ -797,10 +797,10 @@ mod tests {
     fn exact_get_is_authoritative_and_never_falls_back() {
         let (_dir, s) = store();
         let v1 = agent_skill(&s, "author-a", "k1");
-        let fetched = s.get_skill(&v1.skill_id, v1.version).unwrap().unwrap();
+        let fetched = s.get_skill(&v1.skill_id, v1.version).expect("get").expect("present");
         assert_eq!(fetched, v1);
-        assert!(s.get_skill(&v1.skill_id, 999).unwrap().is_none());
-        assert!(s.get_skill("no-such-skill", 1).unwrap().is_none());
+        assert!(s.get_skill(&v1.skill_id, 999).expect("get").is_none());
+        assert!(s.get_skill("no-such-skill", 1).expect("get").is_none());
     }
 
     #[test]
@@ -809,7 +809,7 @@ mod tests {
         let v1 = agent_skill(&s, "author-a", "k1");
         let promoted = s
             .promote_skill(&v1.skill_id, v1.version, v1.revision, "author-a", "looks good")
-            .unwrap();
+            .expect("promote");
         let RevisionedWrite::Applied(promoted) = promoted else { panic!("expected applied") };
         assert_eq!(promoted.status, SkillStatus::Promoted);
         assert_eq!(promoted.revision, v1.revision + 1);
@@ -832,7 +832,7 @@ mod tests {
                 confidence: 0.5,
                 idempotency_key: "shared-1".into(),
             })
-            .unwrap();
+            .expect("proposed skill");
 
         // Same author cannot self-promote a shared-scope skill.
         let err = s.promote_skill(&v1.skill_id, v1.version, v1.revision, "author-a", "self-approve");
@@ -852,11 +852,11 @@ mod tests {
             recorded_by: "reviewer-b".into(),
             idempotency_key: "outcome-1".into(),
         })
-        .unwrap();
+        .expect("outcome");
 
         let promoted = s
             .promote_skill(&v1.skill_id, v1.version, v1.revision, "reviewer-b", "validated")
-            .unwrap();
+            .expect("promote");
         assert!(matches!(promoted, RevisionedWrite::Applied(ref sk) if sk.status == SkillStatus::Promoted));
     }
 
@@ -865,18 +865,18 @@ mod tests {
         let (_dir, s) = store();
         let v1 = agent_skill(&s, "author-a", "k1");
         let RevisionedWrite::Applied(v1) =
-            s.promote_skill(&v1.skill_id, v1.version, v1.revision, "author-a", "first").unwrap()
+            s.promote_skill(&v1.skill_id, v1.version, v1.revision, "author-a", "first").expect("promote")
         else {
             panic!("expected applied")
         };
         let v2 = agent_skill(&s, "author-a", "k2");
         let RevisionedWrite::Applied(v2) =
-            s.promote_skill(&v2.skill_id, v2.version, v2.revision, "author-a", "second").unwrap()
+            s.promote_skill(&v2.skill_id, v2.version, v2.revision, "author-a", "second").expect("promote")
         else {
             panic!("expected applied")
         };
         assert_eq!(v2.status, SkillStatus::Promoted);
-        let v1_after = s.get_skill(&v1.skill_id, v1.version).unwrap().unwrap();
+        let v1_after = s.get_skill(&v1.skill_id, v1.version).expect("get").expect("present");
         assert_eq!(v1_after.status, SkillStatus::Superseded);
     }
 
@@ -887,7 +887,7 @@ mod tests {
         let result = s.promote_skill(&v1.skill_id, v1.version, v1.revision + 5, "author-a", "wrong revision");
         assert!(matches!(result, Ok(RevisionedWrite::Conflict { .. })));
         // The skill must remain untouched by the rejected write.
-        let unchanged = s.get_skill(&v1.skill_id, v1.version).unwrap().unwrap();
+        let unchanged = s.get_skill(&v1.skill_id, v1.version).expect("get").expect("present");
         assert_eq!(unchanged.status, SkillStatus::Candidate);
         assert_eq!(unchanged.revision, v1.revision);
     }
@@ -897,7 +897,7 @@ mod tests {
         let (_dir, s) = store();
         let v1 = agent_skill(&s, "author-a", "k1");
         let RevisionedWrite::Applied(retired) =
-            s.retire_skill(&v1.skill_id, v1.version, v1.revision, "author-a", "no longer needed").unwrap()
+            s.retire_skill(&v1.skill_id, v1.version, v1.revision, "author-a", "no longer needed").expect("retire")
         else {
             panic!("expected applied")
         };
@@ -920,8 +920,8 @@ mod tests {
             recorded_by: "worker-1".into(),
             idempotency_key: "outcome-dup".into(),
         };
-        let first = s.record_outcome(&outcome).unwrap();
-        let replay = s.record_outcome(&outcome).unwrap();
+        let first = s.record_outcome(&outcome).expect("first outcome");
+        let replay = s.record_outcome(&outcome).expect("replayed outcome");
         assert_eq!(first, replay);
         // A distinct idempotency key against a nonexistent version is rejected, not replayed.
         assert!(
@@ -938,8 +938,8 @@ mod tests {
     fn review_trail_records_every_lifecycle_transition() {
         let (_dir, s) = store();
         let v1 = agent_skill(&s, "author-a", "k1");
-        s.promote_skill(&v1.skill_id, v1.version, v1.revision, "author-a", "go").unwrap();
-        let reviews = s.list_skill_reviews(&v1.skill_id, v1.version).unwrap();
+        s.promote_skill(&v1.skill_id, v1.version, v1.revision, "author-a", "go").expect("promote");
+        let reviews = s.list_skill_reviews(&v1.skill_id, v1.version).expect("reviews");
         assert_eq!(reviews.len(), 1);
         assert_eq!(reviews[0].from_status, SkillStatus::Candidate);
         assert_eq!(reviews[0].to_status, SkillStatus::Promoted);
@@ -950,7 +950,7 @@ mod tests {
     fn list_skills_filters_by_scope_and_status() {
         let (_dir, s) = store();
         let agent_v1 = agent_skill(&s, "author-a", "k1");
-        s.promote_skill(&agent_v1.skill_id, agent_v1.version, agent_v1.revision, "author-a", "go").unwrap();
+        s.promote_skill(&agent_v1.skill_id, agent_v1.version, agent_v1.revision, "author-a", "go").expect("promote");
         s.propose_skill(&NewSkill {
             skill_id: "other-shared".into(),
             scope: SkillScope::Organization,
@@ -964,13 +964,13 @@ mod tests {
             confidence: 0.3,
             idempotency_key: "org-1".into(),
         })
-        .unwrap();
+        .expect("proposed skill");
 
-        let promoted_agent = s.list_skills(Some(SkillScope::Agent), Some(SkillStatus::Promoted), 10).unwrap();
+        let promoted_agent = s.list_skills(Some(SkillScope::Agent), Some(SkillStatus::Promoted), 10).expect("list");
         assert_eq!(promoted_agent.len(), 1);
         assert_eq!(promoted_agent[0].skill_id, "coordinate-with-mempalace");
 
-        let candidates = s.list_skills(None, Some(SkillStatus::Candidate), 10).unwrap();
+        let candidates = s.list_skills(None, Some(SkillStatus::Candidate), 10).expect("list");
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].skill_id, "other-shared");
     }

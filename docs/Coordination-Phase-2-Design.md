@@ -1,11 +1,14 @@
 # Coordination Phase 2 — design proposal
 
-**Status: proposal, not implemented.** This document proposes a storage and MCP surface
-design for [issue #101](https://github.com/DigitumDei/mempalace-rs/issues/101), the way
-[Coordination-Phase-0.md](Coordination-Phase-0.md) proposed the Phase 1 design that shipped
-in [Coordination.md](Coordination.md). Nothing described here exists in code yet; update this
-doc's status line and [docs/README.md](README.md) once implementation lands, per the
-documentation rule in [CLAUDE.md](../CLAUDE.md).
+**Status: partially implemented.** The skill registry described below has shipped — see
+[Skill-Registry.md](Skill-Registry.md) for the behaviour that actually exists. Delegation-loop
+telemetry remains a proposal. This document proposes a storage and MCP surface design for
+[issue #101](https://github.com/DigitumDei/mempalace-rs/issues/101), the way
+[Coordination-Phase-0.md](Coordination-Phase-0.md) proposed the Phase 1 design that shipped in
+[Coordination.md](Coordination.md).
+
+Where this design and `Skill-Registry.md` disagree, the latter is authoritative: two open
+questions below were resolved during implementation (see "Open questions").
 
 Phase 2 has two independent halves per issue #101: a versioned, governed **skill registry**,
 and **delegation-loop telemetry**. They share no tables but do share two design precedents
@@ -155,12 +158,11 @@ pattern as `mempalace_task_transition`), `mempalace_delegation_trace_get`.
   (like Phase 1's actor-assertion boundary), not something MemPalace can detect and block.
 - No federation change — both halves are local-only tables, matching Phase 1.
 
-## Open questions to resolve before implementation
+## Open questions
 
-1. Is `validated` a distinct status between `candidate` and `promoted`, or is validation
-   evidence just an unordered append to `skill_outcomes` with promotion checking for at least
-   one row? The proposal above assumes the latter (fewer states, same guarantee) but should be
-   confirmed against how strict the "configured validation" acceptance criterion needs to be.
+1. **Resolved — no separate `validated` status.** Validation evidence is an append to
+   `skill_outcomes`, and promotion checks for at least one row against that exact version.
+   Fewer states, same guarantee.
 2. Should `delegation_spans.task_id` be mandatory (every span wraps exactly one coordination
    task) or optional, for delegation that predates task creation? Phase 1's task model already
    has `parent_id`/`dependencies`; a mandatory FK keeps one source of truth for the delegation
@@ -168,7 +170,7 @@ pattern as `mempalace_task_transition`), `mempalace_delegation_trace_get`.
 3. What is the bounded size for `delegation_checkpoints.summary`? Phase 1 caps artifact/payload
    content at 1 MiB; checkpoint summaries should likely be far smaller (a few KB) since they
    are meant to avoid transcript-scale content by construction.
-4. Does skill `instructions_ref` point at a drawer, a repo file path, or support both? Phase 0's
-   skill package (`skills/coordinate-with-mempalace/`) is a repo-checked-in directory, not a
-   drawer — the registry needs to represent that as a first-class provenance source, not force
-   everything into a drawer reference.
+4. **Resolved — `instructions_ref` is an opaque reference string.** It holds either a repo path
+   (Phase 0's skill package, `skills/coordinate-with-mempalace/SKILL.md`) or a drawer ID; the
+   registry stores the reference and provenance rather than copying instruction bodies, so
+   neither source is privileged.

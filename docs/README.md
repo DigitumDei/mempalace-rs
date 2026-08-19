@@ -12,7 +12,8 @@ This directory documents the Rust release surface that exists in `mempalace-rs/`
 - [Coordination Phase 0](Coordination-Phase-0.md) — experimental coordination skill, measurements, limitations, and Phase 1 decision
 - [Native Coordination](Coordination.md) — transactional tasks, messages, results, artifacts, leases, cursors, and recovery
 - [Skill Registry](Skill-Registry.md) — versioned, governed reusable procedures with scope-gated promotion and outcome history
-- [Coordination Phase 2 Design](Coordination-Phase-2-Design.md) — design proposal behind the skill registry, and the not-yet-implemented delegation-loop telemetry
+- [Delegation Telemetry](Delegation-Telemetry.md) — delegated-run spans, derived depth/fan-out, bounded checkpoints, stop reasons, trace export
+- [Coordination Phase 2 Design](Coordination-Phase-2-Design.md) — the design proposal behind the skill registry and delegation telemetry
 - [CLI Surface](CLI-Surface.md) — every `mempalace-cli` command and flag
 - [Config Schema](Config-Schema.md) — `config.json`, `projects.json`, `mempalace.yaml`, env overrides
 - [Mined Storage](Mined-Storage.md) — locator model, repository views, stale semantics, discovery rules

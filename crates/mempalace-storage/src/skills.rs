@@ -124,6 +124,10 @@ impl SkillOutcomeResult {
 pub struct NewSkill {
     pub skill_id: String,
     pub scope: SkillScope,
+    /// Owning project wing. Required for `project` scope, and rejected for the others, which
+    /// are not project-bound.
+    #[serde(default)]
+    pub wing: Option<String>,
     pub applicability: String,
     pub instructions_ref: String,
     #[serde(default)]
@@ -145,6 +149,8 @@ pub struct Skill {
     pub skill_id: String,
     pub version: i64,
     pub scope: SkillScope,
+    /// Owning project wing, present only for `project` scope.
+    pub wing: Option<String>,
     pub status: SkillStatus,
     pub applicability: String,
     pub instructions_ref: String,
@@ -224,13 +230,14 @@ impl SkillStore {
         conn.execute_batch(
             r#"
 CREATE TABLE IF NOT EXISTS skills (
- skill_id TEXT NOT NULL, version INTEGER NOT NULL, scope TEXT NOT NULL, status TEXT NOT NULL,
- applicability TEXT NOT NULL, instructions_ref TEXT NOT NULL, required_capabilities_json TEXT NOT NULL,
+ skill_id TEXT NOT NULL, version INTEGER NOT NULL, scope TEXT NOT NULL, wing TEXT,
+ status TEXT NOT NULL, applicability TEXT NOT NULL, instructions_ref TEXT NOT NULL, required_capabilities_json TEXT NOT NULL,
  required_tools_json TEXT NOT NULL, required_permissions_json TEXT NOT NULL, author TEXT NOT NULL,
  provenance_json TEXT, confidence REAL NOT NULL, supersedes_version INTEGER, revision INTEGER NOT NULL,
  idempotency_key TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
  PRIMARY KEY(skill_id, version), UNIQUE(author, idempotency_key));
 CREATE INDEX IF NOT EXISTS idx_skills_scope_status ON skills(scope, status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_skills_wing ON skills(wing, status, updated_at DESC);
 CREATE TABLE IF NOT EXISTS skill_reviews (
  review_id TEXT PRIMARY KEY, skill_id TEXT NOT NULL, version INTEGER NOT NULL, from_status TEXT NOT NULL,
  to_status TEXT NOT NULL, reviewer TEXT NOT NULL, reason TEXT NOT NULL, occurred_at TEXT NOT NULL,
@@ -260,6 +267,23 @@ CREATE INDEX IF NOT EXISTS idx_skill_outcomes_skill ON skill_outcomes(skill_id, 
         if !(0.0..=1.0).contains(&input.confidence) {
             return Err(StorageError::Invariant("confidence must be within 0.0..=1.0".into()));
         }
+        // `project` scope is meaningless without a project to scope to: without this, a
+        // project-scoped skill would be authoritative in every wing of a shared palace.
+        let wing = match (input.scope, input.wing.as_deref().map(str::trim)) {
+            (SkillScope::Project, None | Some("")) => {
+                return Err(StorageError::Invariant(
+                    "scope `project` requires a `wing` identifying the owning project".into(),
+                ));
+            }
+            (SkillScope::Project, Some(wing)) => Some(wing.to_owned()),
+            (scope, Some(wing)) if !wing.is_empty() => {
+                return Err(StorageError::Invariant(format!(
+                    "scope `{}` is not project-bound and must not carry a wing (got `{wing}`)",
+                    scope.as_str()
+                )));
+            }
+            _ => None,
+        };
         let mut conn = self.connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some(skill) = find_skill_by_key(&tx, &input.author, &input.idempotency_key)? {
@@ -276,16 +300,29 @@ CREATE INDEX IF NOT EXISTS idx_skill_outcomes_skill ON skill_outcomes(skill_id, 
             .flatten();
         let version = max_version.unwrap_or(0) + 1;
         let supersedes_version = max_version;
+        // A skill belongs to one project for its whole life. Letting a later version move to a
+        // different wing would be the same class of hole as a scope downgrade: a way to hand an
+        // established skill_id to another project without review.
+        if let Some(prior_version) = max_version {
+            let prior = require_skill(&tx, &input.skill_id, prior_version)?;
+            if prior.wing != wing {
+                return Err(StorageError::Invariant(format!(
+                    "skill `{}` is bound to wing {:?}; a new version cannot move it to {:?}",
+                    input.skill_id, prior.wing, wing
+                )));
+            }
+        }
         let now = OffsetDateTime::now_utc();
         tx.execute(
-            "INSERT INTO skills(skill_id,version,scope,status,applicability,instructions_ref,\
+            "INSERT INTO skills(skill_id,version,scope,wing,status,applicability,instructions_ref,\
              required_capabilities_json,required_tools_json,required_permissions_json,author,\
              provenance_json,confidence,supersedes_version,revision,idempotency_key,created_at,updated_at)\
-             VALUES(?1,?2,?3,'candidate',?4,?5,?6,?7,?8,?9,?10,?11,?12,0,?13,?14,?14)",
+             VALUES(?1,?2,?3,?4,'candidate',?5,?6,?7,?8,?9,?10,?11,?12,?13,0,?14,?15,?15)",
             params![
                 input.skill_id,
                 version,
                 input.scope.as_str(),
+                wing,
                 input.applicability,
                 input.instructions_ref,
                 serde_json::to_string(&input.required_capabilities)?,
@@ -320,44 +357,52 @@ CREATE INDEX IF NOT EXISTS idx_skill_outcomes_skill ON skill_outcomes(skill_id, 
         statement.query_map(params![skill_id], skill_row)?.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
     }
 
-    /// List skills filtered by scope and/or status, newest-updated first, for discovery.
-    /// This is discovery only; callers must dereference a specific version with `get_skill`
-    /// before treating it as authoritative.
+    /// List skills for discovery, newest-updated first.
+    ///
+    /// Supplying `wing` excludes project-scoped skills owned by *other* wings, while keeping
+    /// agent- and organization-scoped skills, which are not project-bound. Omitting `wing` spans
+    /// every project and is an administrative view, not what a project-scoped agent should use.
+    ///
+    /// Discovery only: dereference a specific version with [`Self::get_skill`] before treating
+    /// it as authoritative.
     pub fn list_skills(
         &self,
         scope: Option<SkillScope>,
         status: Option<SkillStatus>,
+        wing: Option<&str>,
         limit: usize,
     ) -> Result<Vec<Skill>> {
         let conn = self.connection()?;
-        let limit = limit as i64;
-        let rows = match (scope, status) {
-            (Some(sc), Some(st)) => {
-                let sql = format!("{SKILL_LIST_QUERY_PREFIX} WHERE scope=?1 AND status=?2 ORDER BY updated_at DESC LIMIT ?3");
-                conn.prepare(&sql)?
-                    .query_map(params![sc.as_str(), st.as_str(), limit], skill_row)?
-                    .collect::<rusqlite::Result<Vec<_>>>()?
-            }
-            (Some(sc), None) => {
-                let sql = format!("{SKILL_LIST_QUERY_PREFIX} WHERE scope=?1 ORDER BY updated_at DESC LIMIT ?2");
-                conn.prepare(&sql)?
-                    .query_map(params![sc.as_str(), limit], skill_row)?
-                    .collect::<rusqlite::Result<Vec<_>>>()?
-            }
-            (None, Some(st)) => {
-                let sql = format!("{SKILL_LIST_QUERY_PREFIX} WHERE status=?1 ORDER BY updated_at DESC LIMIT ?2");
-                conn.prepare(&sql)?
-                    .query_map(params![st.as_str(), limit], skill_row)?
-                    .collect::<rusqlite::Result<Vec<_>>>()?
-            }
-            (None, None) => {
-                let sql = format!("{SKILL_LIST_QUERY_PREFIX} ORDER BY updated_at DESC LIMIT ?1");
-                conn.prepare(&sql)?
-                    .query_map(params![limit], skill_row)?
-                    .collect::<rusqlite::Result<Vec<_>>>()?
-            }
-        };
-        Ok(rows)
+        // Clamped like `CoordinationStore::events`, so an oversized caller limit cannot widen
+        // the cast to a negative SQLite LIMIT (which means *no* limit) or load the registry.
+        let limit = limit.clamp(1, 500) as i64;
+        let mut predicates: Vec<String> = Vec::new();
+        let mut bindings: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(scope) = scope {
+            bindings.push(Box::new(scope.as_str().to_owned()));
+            predicates.push(format!("scope=?{}", bindings.len()));
+        }
+        if let Some(status) = status {
+            bindings.push(Box::new(status.as_str().to_owned()));
+            predicates.push(format!("status=?{}", bindings.len()));
+        }
+        if let Some(wing) = wing {
+            bindings.push(Box::new(wing.to_owned()));
+            predicates.push(format!("(wing IS NULL OR wing=?{})", bindings.len()));
+        }
+        bindings.push(Box::new(limit));
+        let sql = format!(
+            "{SKILL_LIST_QUERY_PREFIX}{}{} ORDER BY updated_at DESC LIMIT ?{}",
+            if predicates.is_empty() { "" } else { " WHERE " },
+            predicates.join(" AND "),
+            bindings.len(),
+        );
+        let parameters =
+            bindings.iter().map(AsRef::as_ref).collect::<Vec<&dyn rusqlite::ToSql>>();
+        conn.prepare(&sql)?
+            .query_map(parameters.as_slice(), skill_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     /// Attach validation or field evidence to a skill version without changing its status.
@@ -432,11 +477,23 @@ CREATE INDEX IF NOT EXISTS idx_skill_outcomes_skill ON skill_outcomes(skill_id, 
                 "skill `{skill_id}` version {version} is already promoted"
             )));
         }
-        if current.scope.requires_distinct_review() {
+        // Whichever version is authoritative *right now* is the one this promotion displaces —
+        // not merely whichever happened to be latest when this version was proposed. Reading it
+        // before the promoting UPDATE means it can never be `current` itself.
+        let superseded = find_promoted_version(&tx, skill_id)?;
+
+        // Governance is the stricter of this version's own scope and the scope of the version it
+        // would displace. Without that, proposing a weaker-scoped successor to a promoted
+        // project- or organization-scoped skill would be a way to self-promote past shared review.
+        let governing_scope = match &superseded {
+            Some(prior) if prior.scope.requires_distinct_review() => prior.scope,
+            _ => current.scope,
+        };
+        if governing_scope.requires_distinct_review() {
             if reviewer == current.author {
                 return Err(StorageError::Invariant(format!(
                     "scope `{}` requires a reviewer distinct from the author",
-                    current.scope.as_str()
+                    governing_scope.as_str()
                 )));
             }
             let has_validation: bool = tx.query_row(
@@ -447,9 +504,14 @@ CREATE INDEX IF NOT EXISTS idx_skill_outcomes_skill ON skill_outcomes(skill_id, 
             if !has_validation {
                 return Err(StorageError::Invariant(format!(
                     "scope `{}` requires at least one recorded outcome before promotion",
-                    current.scope.as_str()
+                    governing_scope.as_str()
                 )));
             }
+        } else if reviewer != current.author {
+            return Err(StorageError::Invariant(format!(
+                "scope `agent` may only be promoted by its author `{}`",
+                current.author
+            )));
         }
         let now = OffsetDateTime::now_utc();
         let next_revision = current.revision + 1;
@@ -471,8 +533,8 @@ CREATE INDEX IF NOT EXISTS idx_skill_outcomes_skill ON skill_outcomes(skill_id, 
             reason,
             now,
         )?;
-        if let Some(prior_version) = current.supersedes_version {
-            supersede_if_promoted(&tx, skill_id, prior_version, reviewer, version, now)?;
+        if let Some(prior) = superseded {
+            supersede_promoted(&tx, &prior, reviewer, version, now)?;
         }
         let skill = get_skill_tx(&tx, skill_id, version)?
             .ok_or_else(|| StorageError::Invariant("promoted skill disappeared".into()))?;
@@ -542,42 +604,53 @@ CREATE INDEX IF NOT EXISTS idx_skill_outcomes_skill ON skill_outcomes(skill_id, 
     }
 }
 
-const SKILL_COLUMNS_QUERY_PREFIX: &str = "SELECT skill_id,version,scope,status,applicability,instructions_ref,\
+const SKILL_COLUMNS_QUERY_PREFIX: &str = "SELECT skill_id,version,scope,wing,status,applicability,instructions_ref,\
 required_capabilities_json,required_tools_json,required_permissions_json,author,provenance_json,\
 confidence,supersedes_version,revision,created_at,updated_at FROM skills WHERE skill_id=?1";
-const SKILL_LIST_QUERY_PREFIX: &str = "SELECT skill_id,version,scope,status,applicability,instructions_ref,\
+const SKILL_LIST_QUERY_PREFIX: &str = "SELECT skill_id,version,scope,wing,status,applicability,instructions_ref,\
 required_capabilities_json,required_tools_json,required_permissions_json,author,provenance_json,\
 confidence,supersedes_version,revision,created_at,updated_at FROM skills";
 
-fn supersede_if_promoted(
+/// Return the single currently-promoted version of a skill, if one exists.
+///
+/// At most one version may be `promoted` at a time; more than one is a broken invariant rather
+/// than a case to pick a winner from, so this reports it instead of silently choosing.
+fn find_promoted_version(tx: &Transaction<'_>, skill_id: &str) -> Result<Option<Skill>> {
+    let mut statement =
+        tx.prepare(&format!("{SKILL_COLUMNS_QUERY_PREFIX} AND status='promoted' ORDER BY version"))?;
+    let promoted =
+        statement.query_map(params![skill_id], skill_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+    match promoted.len() {
+        0 => Ok(None),
+        1 => Ok(promoted.into_iter().next()),
+        count => Err(StorageError::Invariant(format!(
+            "skill `{skill_id}` has {count} promoted versions; at most one may be authoritative"
+        ))),
+    }
+}
+
+fn supersede_promoted(
     tx: &Transaction<'_>,
-    skill_id: &str,
-    prior_version: i64,
+    prior: &Skill,
     reviewer: &str,
     promoted_version: i64,
     now: OffsetDateTime,
 ) -> Result<()> {
-    let Some(prior) = get_skill_tx(tx, skill_id, prior_version)? else {
-        return Ok(());
-    };
-    if prior.status != SkillStatus::Promoted {
-        return Ok(());
-    }
-    let next_revision = prior.revision + 1;
     let updated = tx.execute(
         "UPDATE skills SET status='superseded', revision=?3, updated_at=?4 \
          WHERE skill_id=?1 AND version=?2 AND status='promoted' AND revision=?5",
-        params![skill_id, prior_version, next_revision, format_time(now)?, prior.revision],
+        params![prior.skill_id, prior.version, prior.revision + 1, format_time(now)?, prior.revision],
     )?;
     if updated != 1 {
         return Err(StorageError::Invariant(format!(
-            "skill `{skill_id}` version {prior_version} changed before it could be superseded"
+            "skill `{}` version {} changed before it could be superseded",
+            prior.skill_id, prior.version
         )));
     }
     insert_review(
         tx,
-        skill_id,
-        prior_version,
+        &prior.skill_id,
+        prior.version,
         SkillStatus::Promoted,
         SkillStatus::Superseded,
         reviewer,
@@ -637,28 +710,29 @@ fn find_skill_by_key(tx: &Transaction<'_>, author: &str, key: &str) -> Result<Op
 }
 fn skill_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Skill> {
     let scope: String = r.get(2)?;
-    let status: String = r.get(3)?;
-    let capabilities: String = r.get(6)?;
-    let tools: String = r.get(7)?;
-    let permissions: String = r.get(8)?;
-    let provenance: Option<String> = r.get(10)?;
-    let created: String = r.get(14)?;
-    let updated: String = r.get(15)?;
+    let status: String = r.get(4)?;
+    let capabilities: String = r.get(7)?;
+    let tools: String = r.get(8)?;
+    let permissions: String = r.get(9)?;
+    let provenance: Option<String> = r.get(11)?;
+    let created: String = r.get(15)?;
+    let updated: String = r.get(16)?;
     Ok(Skill {
         skill_id: r.get(0)?,
         version: r.get(1)?,
         scope: SkillScope::parse(&scope).map_err(sql_conv)?,
+        wing: r.get(3)?,
         status: SkillStatus::parse(&status).map_err(sql_conv)?,
-        applicability: r.get(4)?,
-        instructions_ref: r.get(5)?,
+        applicability: r.get(5)?,
+        instructions_ref: r.get(6)?,
         required_capabilities: serde_json::from_str(&capabilities).map_err(sql_conv)?,
         required_tools: serde_json::from_str(&tools).map_err(sql_conv)?,
         required_permissions: serde_json::from_str(&permissions).map_err(sql_conv)?,
-        author: r.get(9)?,
+        author: r.get(10)?,
         provenance: provenance.map(|v| serde_json::from_str(&v)).transpose().map_err(sql_conv)?,
-        confidence: r.get(11)?,
-        supersedes_version: r.get(12)?,
-        revision: r.get(13)?,
+        confidence: r.get(12)?,
+        supersedes_version: r.get(13)?,
+        revision: r.get(14)?,
         created_at: parse_time(created).map_err(sql_conv)?,
         updated_at: parse_time(updated).map_err(sql_conv)?,
     })
@@ -767,6 +841,7 @@ mod tests {
         s.propose_skill(&NewSkill {
             skill_id: "coordinate-with-mempalace".into(),
             scope: SkillScope::Agent,
+            wing: None,
             applicability: "when coordinating multiple workers".into(),
             instructions_ref: "skills/coordinate-with-mempalace/SKILL.md".into(),
             required_capabilities: vec!["coordination".into()],
@@ -822,6 +897,7 @@ mod tests {
             .propose_skill(&NewSkill {
                 skill_id: "shared-skill".into(),
                 scope: SkillScope::Project,
+                wing: Some("wing_alpha".into()),
                 applicability: "applies project-wide".into(),
                 instructions_ref: "ref".into(),
                 required_capabilities: vec![],
@@ -947,6 +1023,202 @@ mod tests {
     }
 
     #[test]
+    fn out_of_order_promotion_leaves_only_one_promoted_version() {
+        let (_dir, s) = store();
+        let v1 = agent_skill(&s, "author-a", "k1");
+        s.promote_skill(&v1.skill_id, v1.version, v1.revision, "author-a", "first")
+            .expect("promote v1");
+        // v2 is proposed but deliberately left as a candidate.
+        let _v2 = agent_skill(&s, "author-a", "k2");
+        let v3 = agent_skill(&s, "author-a", "k3");
+        s.promote_skill(&v3.skill_id, v3.version, v3.revision, "author-a", "third")
+            .expect("promote v3");
+
+        let promoted = s
+            .list_skill_versions(&v1.skill_id)
+            .expect("versions")
+            .into_iter()
+            .filter(|skill| skill.status == SkillStatus::Promoted)
+            .map(|skill| skill.version)
+            .collect::<Vec<_>>();
+        assert_eq!(promoted, vec![3], "exactly one version may be authoritative");
+    }
+
+    #[test]
+    fn agent_scope_promotion_is_restricted_to_the_author() {
+        let (_dir, s) = store();
+        let v1 = agent_skill(&s, "author-a", "k1");
+        let hijack =
+            s.promote_skill(&v1.skill_id, v1.version, v1.revision, "someone-else", "not mine");
+        assert!(hijack.is_err(), "only the author may promote an agent-scoped skill");
+    }
+
+    #[test]
+    fn scope_cannot_be_downgraded_to_escape_shared_governance() {
+        let (_dir, s) = store();
+        let shared = s
+            .propose_skill(&NewSkill {
+                skill_id: "governed".into(),
+                scope: SkillScope::Project,
+                wing: Some("wing_alpha".into()),
+                applicability: "project wide".into(),
+                instructions_ref: "ref".into(),
+                required_capabilities: vec![],
+                required_tools: vec![],
+                required_permissions: vec![],
+                author: "author-a".into(),
+                provenance: None,
+                confidence: 0.5,
+                idempotency_key: "governed-1".into(),
+            })
+            .expect("v1");
+        s.record_outcome(&NewSkillOutcome {
+            skill_id: shared.skill_id.clone(),
+            version: shared.version,
+            task_id: None,
+            result: SkillOutcomeResult::Success,
+            evaluator: "eval".into(),
+            notes: String::new(),
+            recorded_by: "reviewer-b".into(),
+            idempotency_key: "governed-outcome".into(),
+        })
+        .expect("outcome");
+        s.promote_skill(&shared.skill_id, shared.version, shared.revision, "reviewer-b", "ok")
+            .expect("promote v1");
+
+        // Proposing v2 at a weaker scope must not become a way to bypass v1's governance.
+        let downgraded = s.propose_skill(&NewSkill {
+            skill_id: "governed".into(),
+            scope: SkillScope::Agent,
+            wing: None,
+            applicability: "sneaky".into(),
+            instructions_ref: "ref".into(),
+            required_capabilities: vec![],
+            required_tools: vec![],
+            required_permissions: vec![],
+            author: "author-a".into(),
+            provenance: None,
+            confidence: 0.9,
+            idempotency_key: "governed-2".into(),
+        });
+        let Ok(downgraded) = downgraded else {
+            return; // Rejecting the proposal outright is an acceptable resolution.
+        };
+        let promoted = s.promote_skill(
+            &downgraded.skill_id,
+            downgraded.version,
+            downgraded.revision,
+            "author-a",
+            "self approve at agent scope",
+        );
+        assert!(
+            promoted.is_err(),
+            "a scope downgrade must not let an author supersede a governed shared version"
+        );
+    }
+
+
+    #[test]
+    fn project_scope_requires_a_wing_and_others_reject_one() {
+        let (_dir, s) = store();
+        let missing = s.propose_skill(&NewSkill {
+            skill_id: "needs-wing".into(),
+            scope: SkillScope::Project,
+            wing: None,
+            applicability: "a".into(),
+            instructions_ref: "r".into(),
+            required_capabilities: vec![],
+            required_tools: vec![],
+            required_permissions: vec![],
+            author: "author-a".into(),
+            provenance: None,
+            confidence: 0.5,
+            idempotency_key: "k1".into(),
+        });
+        assert!(missing.is_err(), "project scope without a wing is meaningless");
+
+        let stray = s.propose_skill(&NewSkill {
+            skill_id: "not-project".into(),
+            scope: SkillScope::Organization,
+            wing: Some("wing_alpha".into()),
+            applicability: "a".into(),
+            instructions_ref: "r".into(),
+            required_capabilities: vec![],
+            required_tools: vec![],
+            required_permissions: vec![],
+            author: "author-a".into(),
+            provenance: None,
+            confidence: 0.5,
+            idempotency_key: "k2".into(),
+        });
+        assert!(stray.is_err(), "a non-project scope must not carry a wing");
+    }
+
+    #[test]
+    fn discovery_hides_project_skills_owned_by_other_wings() {
+        let (_dir, s) = store();
+        let project_skill = |id: &str, wing: &str, key: &str| NewSkill {
+            skill_id: id.into(),
+            scope: SkillScope::Project,
+            wing: Some(wing.into()),
+            applicability: "a".into(),
+            instructions_ref: "r".into(),
+            required_capabilities: vec![],
+            required_tools: vec![],
+            required_permissions: vec![],
+            author: "author-a".into(),
+            provenance: None,
+            confidence: 0.5,
+            idempotency_key: key.into(),
+        };
+        s.propose_skill(&project_skill("alpha-deploy", "wing_alpha", "k1")).expect("alpha");
+        s.propose_skill(&project_skill("beta-deploy", "wing_beta", "k2")).expect("beta");
+        s.propose_skill(&NewSkill {
+            skill_id: "palace-wide".into(),
+            scope: SkillScope::Organization,
+            wing: None,
+            applicability: "a".into(),
+            instructions_ref: "r".into(),
+            required_capabilities: vec![],
+            required_tools: vec![],
+            required_permissions: vec![],
+            author: "author-a".into(),
+            provenance: None,
+            confidence: 0.5,
+            idempotency_key: "k3".into(),
+        })
+        .expect("org");
+
+        let seen = s.list_skills(None, None, Some("wing_alpha"), 50).expect("list");
+        let ids = seen.iter().map(|sk| sk.skill_id.as_str()).collect::<Vec<_>>();
+        assert!(ids.contains(&"alpha-deploy"), "own project skill must be visible");
+        assert!(ids.contains(&"palace-wide"), "non-project-bound skills stay visible");
+        assert!(!ids.contains(&"beta-deploy"), "another project's skill must not appear");
+    }
+
+    #[test]
+    fn a_later_version_cannot_move_a_skill_to_another_wing() {
+        let (_dir, s) = store();
+        let base = |wing: &str, key: &str| NewSkill {
+            skill_id: "bound".into(),
+            scope: SkillScope::Project,
+            wing: Some(wing.into()),
+            applicability: "a".into(),
+            instructions_ref: "r".into(),
+            required_capabilities: vec![],
+            required_tools: vec![],
+            required_permissions: vec![],
+            author: "author-a".into(),
+            provenance: None,
+            confidence: 0.5,
+            idempotency_key: key.into(),
+        };
+        s.propose_skill(&base("wing_alpha", "k1")).expect("v1");
+        let moved = s.propose_skill(&base("wing_beta", "k2"));
+        assert!(moved.is_err(), "a skill stays bound to one project across its versions");
+    }
+
+    #[test]
     fn list_skills_filters_by_scope_and_status() {
         let (_dir, s) = store();
         let agent_v1 = agent_skill(&s, "author-a", "k1");
@@ -954,6 +1226,7 @@ mod tests {
         s.propose_skill(&NewSkill {
             skill_id: "other-shared".into(),
             scope: SkillScope::Organization,
+            wing: None,
             applicability: "org wide".into(),
             instructions_ref: "ref".into(),
             required_capabilities: vec![],
@@ -966,11 +1239,11 @@ mod tests {
         })
         .expect("proposed skill");
 
-        let promoted_agent = s.list_skills(Some(SkillScope::Agent), Some(SkillStatus::Promoted), 10).expect("list");
+        let promoted_agent = s.list_skills(Some(SkillScope::Agent), Some(SkillStatus::Promoted), None, 10).expect("list");
         assert_eq!(promoted_agent.len(), 1);
         assert_eq!(promoted_agent[0].skill_id, "coordinate-with-mempalace");
 
-        let candidates = s.list_skills(None, Some(SkillStatus::Candidate), 10).expect("list");
+        let candidates = s.list_skills(None, Some(SkillStatus::Candidate), None, 10).expect("list");
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].skill_id, "other-shared");
     }

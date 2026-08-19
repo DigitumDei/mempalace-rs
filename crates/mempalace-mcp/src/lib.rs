@@ -679,8 +679,8 @@ impl ToolName {
             ),
             Self::SkillPropose => coordination_definition(
                 self,
-                "Propose a reusable procedure as a candidate skill version. The version is derived automatically as one past the highest existing version for skill_id; it is never caller-supplied. Replaying the same author and idempotency_key returns the committed version. Candidates are not authoritative until promoted.",
-                json!({"skill_id":{"type":"string"},"scope":{"type":"string","enum":["agent","project","organization"]},"applicability":{"type":"string"},"instructions_ref":{"type":"string"},"required_capabilities":{"type":"array","items":{"type":"string"}},"required_tools":{"type":"array","items":{"type":"string"}},"required_permissions":{"type":"array","items":{"type":"string"}},"author":{"type":"string"},"provenance":{},"confidence":{"type":"number","minimum":0,"maximum":1},"idempotency_key":{"type":"string"}}),
+                "Propose a reusable procedure as a candidate skill version. The version is derived automatically as one past the highest existing version for skill_id; it is never caller-supplied. `scope: project` requires a `wing` naming the owning project, and the other scopes must omit it; a skill stays bound to that wing for its whole life. Replaying the same author and idempotency_key returns the committed version. Candidates are not authoritative until promoted.",
+                json!({"skill_id":{"type":"string"},"scope":{"type":"string","enum":["agent","project","organization"]},"wing":{"type":"string","description":"Owning project wing, e.g. wing_myproject. Required for project scope, rejected otherwise."},"applicability":{"type":"string"},"instructions_ref":{"type":"string"},"required_capabilities":{"type":"array","items":{"type":"string"}},"required_tools":{"type":"array","items":{"type":"string"}},"required_permissions":{"type":"array","items":{"type":"string"}},"author":{"type":"string"},"provenance":{},"confidence":{"type":"number","minimum":0,"maximum":1},"idempotency_key":{"type":"string"}}),
                 &["skill_id", "scope", "applicability", "instructions_ref", "author", "confidence", "idempotency_key"],
             ),
             Self::SkillGet => coordination_definition(
@@ -697,8 +697,8 @@ impl ToolName {
             ),
             Self::SkillList => coordination_definition(
                 self,
-                "Discover skills filtered by scope and/or status. Discovery only: dereference a specific version with mempalace_skill_get before treating it as authoritative. limit is clamped to 1..=500.",
-                json!({"scope":{"type":"string","enum":["agent","project","organization"]},"status":{"type":"string","enum":["candidate","promoted","superseded","retired"]},"limit":{"type":"integer","minimum":1,"maximum":500}}),
+                "Discover skills filtered by scope, status, and/or wing. Supplying `wing` hides project-scoped skills owned by other projects while keeping agent- and organization-scoped ones; omitting it spans every project and is an administrative view. Discovery only: dereference a specific version with mempalace_skill_get before treating it as authoritative. limit is clamped to 1..=500.",
+                json!({"scope":{"type":"string","enum":["agent","project","organization"]},"status":{"type":"string","enum":["candidate","promoted","superseded","retired"]},"wing":{"type":"string","description":"Current project wing, e.g. wing_myproject"},"limit":{"type":"integer","minimum":1,"maximum":500}}),
                 &[],
             ),
             Self::SkillRecordOutcome => coordination_definition(
@@ -3321,9 +3321,17 @@ where
             .map(|value| serde_json::from_value::<SkillStatus>(json!(value)))
             .transpose()
             .map_err(|error| ToolError::InvalidParams(error.to_string()))?;
+        let wing = optional_non_blank_string(arguments, "wing")?
+            .map(|value| parse_wing_id(&value))
+            .transpose()?;
         Ok(json!(
             self.skills
-                .list_skills(scope, status, optional_usize(arguments, "limit")?.unwrap_or(50))
+                .list_skills(
+                    scope,
+                    status,
+                    wing.as_ref().map(|wing| wing.as_str()),
+                    optional_usize(arguments, "limit")?.unwrap_or(50),
+                )
                 .map_tool_internal()?
         ))
     }
@@ -4531,7 +4539,7 @@ mod tests {
                 id,
                 "mempalace_skill_propose",
                 json!({
-                    "skill_id":"shared-procedure", "scope":"project",
+                    "skill_id":"shared-procedure", "scope":"project", "wing":"wing_alpha",
                     "applicability":"when handing off between workers",
                     "instructions_ref":"skills/coordinate-with-mempalace/SKILL.md",
                     "author":"author-a", "confidence":0.7, "idempotency_key":key

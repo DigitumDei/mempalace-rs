@@ -32,6 +32,21 @@ audit trail rather than deleting it.
 
 Skill scopes are `agent`, `project`, and `organization`.
 
+`project` scope requires a **`wing`** naming the owning project (for example
+`wing_myproject`); `agent` and `organization` scope must omit it, because neither is
+project-bound. A skill stays bound to its wing for its whole life — a later version cannot move
+it to another project, which would otherwise be a way to hand an established `skill_id` to a
+different project without review.
+
+A palace holds many projects side by side, so a project-scoped skill that carried no project
+identity would be authoritative everywhere, which is `organization` scope wearing the wrong
+name. Passing `wing` to discovery hides project-scoped skills owned by *other* wings while
+keeping agent- and organization-scoped ones visible. Omitting `wing` spans every project and is
+an administrative view, not what a project-scoped agent should use.
+
+`skill_id` remains a palace-wide identifier, like a package name — two projects wanting their
+own `deploy` skill should name them distinctly.
+
 ## Promotion governance
 
 Promotion is where "a candidate must not silently become an authoritative shared procedure" is
@@ -71,15 +86,16 @@ small and the source of truth stays where it is authored.
 
 The local skill-registry tool surface is:
 
-- `mempalace_skill_propose`, `mempalace_skill_get`, `mempalace_skill_versions`,
-  `mempalace_skill_list`
+- `mempalace_skill_propose` (takes `wing` for project scope), `mempalace_skill_get`,
+  `mempalace_skill_versions`, `mempalace_skill_list` (takes `wing` to scope discovery)
 - `mempalace_skill_record_outcome`
 - `mempalace_skill_promote`, `mempalace_skill_retire`
 - `mempalace_skill_reviews`
 
-`mempalace_skill_list` is discovery only. Resolve a specific version with
-`mempalace_skill_get` before treating a skill as authoritative, for the same reason semantic
-search is not authoritative delivery in [Native Coordination](Coordination.md).
+`mempalace_skill_list` is discovery only, and its `limit` is clamped to `1..=500`. Resolve a
+specific version with `mempalace_skill_get` before treating a skill as authoritative, for the
+same reason semantic search is not authoritative delivery in
+[Native Coordination](Coordination.md).
 
 `mempalace_skill_promote` and `mempalace_skill_retire` return
 `{"success": false, "conflict": {...}}` on a revision mismatch, matching the conflict shape used

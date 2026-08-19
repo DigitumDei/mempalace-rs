@@ -5,6 +5,7 @@ mod engine;
 mod error;
 mod lance;
 mod maintenance;
+mod skills;
 mod sqlite;
 mod types;
 
@@ -18,6 +19,10 @@ pub use lance::{FragmentStats, LanceDrawerStore, OptimizeMetrics, PruneMetrics, 
 pub use maintenance::{
     MaintenanceAbortReason, MaintenanceOutcome, MaintenanceRunStatus, MaintenanceRunSummary,
     MaintenanceSettings, MaintenanceSkipReason, MaintenanceTier, MaintenanceTierResult,
+};
+pub use skills::{
+    NewSkill, NewSkillOutcome, Skill, SkillOutcome, SkillOutcomeResult, SkillReview, SkillScope,
+    SkillStatus, SkillStore,
 };
 pub use sqlite::{
     ChangeCursor, ChangeEvent, ChangeLogStore, ChangePage, DiaryStore, EntityRegistryStore,

@@ -25,9 +25,9 @@ use mempalace_search::{SearchRuntime, SearchRuntimePolicy};
 use mempalace_storage::{
     AgentLineageRecord, ChangeEvent, ChangeLogStore, CoordinationCursor, CoordinationStore,
     DiaryStore, DrawerFilter, DrawerStore, DuplicateStrategy, IngestCommitRequest,
-    LineageMigrationRecord, NewArtifact, NewMessage, NewTask, NewTaskResult, RevisionedWrite,
-    SelfModelStore, SelfObservationRecord, SelfObservationScope, SelfObservationStatus,
-    StorageEngine, TaskState,
+    LineageMigrationRecord, NewArtifact, NewMessage, NewSkill, NewSkillOutcome, NewTask,
+    NewTaskResult, RevisionedWrite, SelfModelStore, SelfObservationRecord, SelfObservationScope,
+    SelfObservationStatus, SkillScope, SkillStatus, SkillStore, StorageEngine, TaskState,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -212,6 +212,14 @@ enum ToolName {
     ResultGet,
     CoordinationEventGet,
     CoordinationEvents,
+    SkillPropose,
+    SkillGet,
+    SkillVersions,
+    SkillList,
+    SkillRecordOutcome,
+    SkillPromote,
+    SkillRetire,
+    SkillReviews,
     LineageSet,
     SelfObservationPropose,
     SelfObservationReview,
@@ -220,7 +228,7 @@ enum ToolName {
 }
 
 impl ToolName {
-    fn all() -> [Self; 43] {
+    fn all() -> [Self; 51] {
         [
             Self::WakeUp,
             Self::Status,
@@ -260,6 +268,14 @@ impl ToolName {
             Self::ResultGet,
             Self::CoordinationEventGet,
             Self::CoordinationEvents,
+            Self::SkillPropose,
+            Self::SkillGet,
+            Self::SkillVersions,
+            Self::SkillList,
+            Self::SkillRecordOutcome,
+            Self::SkillPromote,
+            Self::SkillRetire,
+            Self::SkillReviews,
             Self::LineageSet,
             Self::SelfObservationPropose,
             Self::SelfObservationReview,
@@ -308,6 +324,14 @@ impl ToolName {
             Self::ResultGet => "mempalace_result_get",
             Self::CoordinationEventGet => "mempalace_coordination_event_get",
             Self::CoordinationEvents => "mempalace_coordination_events",
+            Self::SkillPropose => "mempalace_skill_propose",
+            Self::SkillGet => "mempalace_skill_get",
+            Self::SkillVersions => "mempalace_skill_versions",
+            Self::SkillList => "mempalace_skill_list",
+            Self::SkillRecordOutcome => "mempalace_skill_record_outcome",
+            Self::SkillPromote => "mempalace_skill_promote",
+            Self::SkillRetire => "mempalace_skill_retire",
+            Self::SkillReviews => "mempalace_skill_reviews",
             Self::LineageSet => "mempalace_lineage_set",
             Self::SelfObservationPropose => "mempalace_self_observation_propose",
             Self::SelfObservationReview => "mempalace_self_observation_review",
@@ -653,6 +677,54 @@ impl ToolName {
                 json!({"cursor":{"type":"integer"},"task_id":{"type":"string"},"limit":{"type":"integer"}}),
                 &[],
             ),
+            Self::SkillPropose => coordination_definition(
+                self,
+                "Propose a reusable procedure as a candidate skill version. The version is derived automatically as one past the highest existing version for skill_id; it is never caller-supplied. `scope: project` requires a `wing` naming the owning project, and the other scopes must omit it; a skill stays bound to that wing for its whole life. Replaying the same author and idempotency_key returns the committed version. Candidates are not authoritative until promoted.",
+                json!({"skill_id":{"type":"string"},"scope":{"type":"string","enum":["agent","project","organization"]},"wing":{"type":"string","description":"Owning project wing, e.g. wing_myproject. Required for project scope, rejected otherwise."},"applicability":{"type":"string"},"instructions_ref":{"type":"string"},"required_capabilities":{"type":"array","items":{"type":"string"}},"required_tools":{"type":"array","items":{"type":"string"}},"required_permissions":{"type":"array","items":{"type":"string"}},"author":{"type":"string"},"provenance":{},"confidence":{"type":"number","minimum":0,"maximum":1},"idempotency_key":{"type":"string"}}),
+                &["skill_id", "scope", "applicability", "instructions_ref", "author", "confidence", "idempotency_key"],
+            ),
+            Self::SkillGet => coordination_definition(
+                self,
+                "Retrieve one skill version authoritatively by exact skill_id and version; returns found:false for a miss. Never falls back to semantic search.",
+                json!({"skill_id":{"type":"string"},"version":{"type":"integer"}}),
+                &["skill_id", "version"],
+            ),
+            Self::SkillVersions => coordination_definition(
+                self,
+                "List every version of one skill, newest first, with its lifecycle status.",
+                json!({"skill_id":{"type":"string"}}),
+                &["skill_id"],
+            ),
+            Self::SkillList => coordination_definition(
+                self,
+                "Discover skills filtered by scope, status, and/or wing. Supplying `wing` hides project-scoped skills owned by other projects while keeping agent- and organization-scoped ones; omitting it spans every project and is an administrative view. Discovery only: dereference a specific version with mempalace_skill_get before treating it as authoritative. limit is clamped to 1..=500.",
+                json!({"scope":{"type":"string","enum":["agent","project","organization"]},"status":{"type":"string","enum":["candidate","promoted","superseded","retired"]},"wing":{"type":"string","description":"Current project wing, e.g. wing_myproject"},"limit":{"type":"integer","minimum":1,"maximum":500}}),
+                &[],
+            ),
+            Self::SkillRecordOutcome => coordination_definition(
+                self,
+                "Record a success, failure, or partial outcome against one specific skill version, optionally tied to a coordination task. Idempotent on recorded_by and idempotency_key. Shared-scope promotion requires at least one recorded outcome.",
+                json!({"skill_id":{"type":"string"},"version":{"type":"integer"},"task_id":{"type":"string"},"result":{"type":"string","enum":["success","failure","partial"]},"evaluator":{"type":"string"},"notes":{"type":"string"},"recorded_by":{"type":"string"},"idempotency_key":{"type":"string"}}),
+                &["skill_id", "version", "result", "evaluator", "recorded_by", "idempotency_key"],
+            ),
+            Self::SkillPromote => coordination_definition(
+                self,
+                "Promote a candidate skill version to authoritative for its scope, using compare-and-swap revision semantics. Agent-scoped skills may be promoted only by their own author. Project- and organization-scoped skills require a reviewer distinct from the author and at least one recorded outcome. Promotion atomically supersedes whichever version is authoritative at that moment, and governance is the stricter of this version's scope and the displaced version's scope — so a weaker-scoped successor cannot escape shared review.",
+                json!({"skill_id":{"type":"string"},"version":{"type":"integer"},"expected_revision":{"type":"integer"},"reviewer":{"type":"string"},"reason":{"type":"string"}}),
+                &["skill_id", "version", "expected_revision", "reviewer", "reason"],
+            ),
+            Self::SkillRetire => coordination_definition(
+                self,
+                "Retire a non-terminal skill version using compare-and-swap revision semantics. Retirement preserves the version and its audit history rather than deleting it.",
+                json!({"skill_id":{"type":"string"},"version":{"type":"integer"},"expected_revision":{"type":"integer"},"reviewer":{"type":"string"},"reason":{"type":"string"}}),
+                &["skill_id", "version", "expected_revision", "reviewer", "reason"],
+            ),
+            Self::SkillReviews => coordination_definition(
+                self,
+                "Read the append-only lifecycle review trail for one skill version, oldest first. Each entry identifies the reviewer and the status transition.",
+                json!({"skill_id":{"type":"string"},"version":{"type":"integer"}}),
+                &["skill_id", "version"],
+            ),
             Self::LineageSet => ToolDefinition {
                 name: self.as_str(),
                 description: "Create or revise a stable, provider-neutral agent lineage. A lineage is the persistent self whose memories and reviewed observations can span models and harnesses. The first lineage becomes the default. Updates require the current expected_revision; use 0 when explicitly creating a new lineage.",
@@ -774,7 +846,15 @@ impl ToolName {
             | Self::ResultPut
             | Self::ResultGet
             | Self::CoordinationEventGet
-            | Self::CoordinationEvents => ToolRoutingCategory::LocalOnly,
+            | Self::CoordinationEvents
+            | Self::SkillPropose
+            | Self::SkillGet
+            | Self::SkillVersions
+            | Self::SkillList
+            | Self::SkillRecordOutcome
+            | Self::SkillPromote
+            | Self::SkillRetire
+            | Self::SkillReviews => ToolRoutingCategory::LocalOnly,
             Self::Search
             | Self::ListWings
             | Self::ListRooms
@@ -1028,6 +1108,14 @@ where
             ToolName::ResultGet => runtime.tool_result_get(&call.arguments),
             ToolName::CoordinationEventGet => runtime.tool_coordination_event_get(&call.arguments),
             ToolName::CoordinationEvents => runtime.tool_coordination_events(&call.arguments),
+            ToolName::SkillPropose => runtime.tool_skill_propose(&call.arguments),
+            ToolName::SkillGet => runtime.tool_skill_get(&call.arguments),
+            ToolName::SkillVersions => runtime.tool_skill_versions(&call.arguments),
+            ToolName::SkillList => runtime.tool_skill_list(&call.arguments),
+            ToolName::SkillRecordOutcome => runtime.tool_skill_record_outcome(&call.arguments),
+            ToolName::SkillPromote => runtime.tool_skill_promote(&call.arguments),
+            ToolName::SkillRetire => runtime.tool_skill_retire(&call.arguments),
+            ToolName::SkillReviews => runtime.tool_skill_reviews(&call.arguments),
             ToolName::LineageSet => runtime.tool_lineage_set(&call.arguments).await,
             ToolName::SelfObservationPropose => {
                 runtime.tool_self_observation_propose(&call.arguments).await
@@ -1061,6 +1149,7 @@ struct McpRuntime<P> {
     bound_lineage_id: Option<String>,
     storage: StorageEngine,
     coordination: CoordinationStore,
+    skills: SkillStore,
     search: SearchRuntime<P>,
     federation: Option<FederationRouter>,
 }
@@ -1077,6 +1166,8 @@ where
         let storage = StorageEngine::open(&config.palace_path, config.embedding_profile).await?;
         let coordination = CoordinationStore::new(config.palace_path.join("storage.sqlite3"));
         coordination.ensure_schema()?;
+        let skills = SkillStore::new(config.palace_path.join("storage.sqlite3"));
+        skills.ensure_schema()?;
         let router = FederationRouter::new(config.federation.clone());
         let federation = if router.has_remotes() { Some(router) } else { None };
         Ok(Self {
@@ -1088,6 +1179,7 @@ where
             bound_lineage_id,
             storage,
             coordination,
+            skills,
             federation,
         })
     }
@@ -3198,6 +3290,103 @@ where
                 .map_tool_internal()?
         ))
     }
+
+    fn tool_skill_propose(&self, arguments: &Value) -> ToolResult<Value> {
+        let input: NewSkill = parse_coordination_input(arguments)?;
+        Ok(json!(self.skills.propose_skill(&input).map_tool_internal()?))
+    }
+    fn tool_skill_get(&self, arguments: &Value) -> ToolResult<Value> {
+        exact_result(
+            self.skills
+                .get_skill(
+                    &required_string(arguments, "skill_id")?,
+                    required_i64(arguments, "version")?,
+                )
+                .map_tool_internal()?,
+        )
+    }
+    fn tool_skill_versions(&self, arguments: &Value) -> ToolResult<Value> {
+        Ok(json!(
+            self.skills
+                .list_skill_versions(&required_string(arguments, "skill_id")?)
+                .map_tool_internal()?
+        ))
+    }
+    fn tool_skill_list(&self, arguments: &Value) -> ToolResult<Value> {
+        let scope = optional_string(arguments, "scope")?
+            .map(|value| serde_json::from_value::<SkillScope>(json!(value)))
+            .transpose()
+            .map_err(|error| ToolError::InvalidParams(error.to_string()))?;
+        let status = optional_string(arguments, "status")?
+            .map(|value| serde_json::from_value::<SkillStatus>(json!(value)))
+            .transpose()
+            .map_err(|error| ToolError::InvalidParams(error.to_string()))?;
+        let wing = optional_non_blank_string(arguments, "wing")?
+            .map(|value| parse_wing_id(&value))
+            .transpose()?;
+        Ok(json!(
+            self.skills
+                .list_skills(
+                    scope,
+                    status,
+                    wing.as_ref().map(|wing| wing.as_str()),
+                    optional_usize(arguments, "limit")?.unwrap_or(50),
+                )
+                .map_tool_internal()?
+        ))
+    }
+    fn tool_skill_record_outcome(&self, arguments: &Value) -> ToolResult<Value> {
+        let input: NewSkillOutcome = parse_coordination_input(arguments)?;
+        Ok(json!(self.skills.record_outcome(&input).map_tool_internal()?))
+    }
+    fn tool_skill_promote(&self, arguments: &Value) -> ToolResult<Value> {
+        let expected_revision = required_i64(arguments, "expected_revision")?;
+        let result = self
+            .skills
+            .promote_skill(
+                &required_string(arguments, "skill_id")?,
+                required_i64(arguments, "version")?,
+                expected_revision,
+                &required_string(arguments, "reviewer")?,
+                &required_string(arguments, "reason")?,
+            )
+            .map_tool_internal()?;
+        Ok(match result {
+            RevisionedWrite::Applied(skill) => json!({"success": true, "skill": skill}),
+            RevisionedWrite::Conflict { actual_revision } => {
+                revision_conflict_payload(expected_revision, actual_revision)
+            }
+        })
+    }
+    fn tool_skill_retire(&self, arguments: &Value) -> ToolResult<Value> {
+        let expected_revision = required_i64(arguments, "expected_revision")?;
+        let result = self
+            .skills
+            .retire_skill(
+                &required_string(arguments, "skill_id")?,
+                required_i64(arguments, "version")?,
+                expected_revision,
+                &required_string(arguments, "reviewer")?,
+                &required_string(arguments, "reason")?,
+            )
+            .map_tool_internal()?;
+        Ok(match result {
+            RevisionedWrite::Applied(skill) => json!({"success": true, "skill": skill}),
+            RevisionedWrite::Conflict { actual_revision } => {
+                revision_conflict_payload(expected_revision, actual_revision)
+            }
+        })
+    }
+    fn tool_skill_reviews(&self, arguments: &Value) -> ToolResult<Value> {
+        Ok(json!(
+            self.skills
+                .list_skill_reviews(
+                    &required_string(arguments, "skill_id")?,
+                    required_i64(arguments, "version")?,
+                )
+                .map_tool_internal()?
+        ))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -4340,6 +4529,139 @@ mod tests {
             decode_tool_payload(&exact_result_response).expect("exact result")["found"],
             true
         );
+    }
+
+    #[tokio::test]
+    async fn skill_tools_enforce_scope_gated_promotion_and_exact_retrieval() {
+        let harness = test_harness().await;
+        let propose = |id: i64, key: &str| {
+            tool_call(
+                id,
+                "mempalace_skill_propose",
+                json!({
+                    "skill_id":"shared-procedure", "scope":"project", "wing":"wing_alpha",
+                    "applicability":"when handing off between workers",
+                    "instructions_ref":"skills/coordinate-with-mempalace/SKILL.md",
+                    "author":"author-a", "confidence":0.7, "idempotency_key":key
+                }),
+            )
+        };
+
+        let created = harness.server.handle_request(propose(920, "skill-1")).await;
+        let skill = decode_tool_payload(&created).expect("skill payload");
+        assert_eq!(skill["version"], 1);
+        assert_eq!(skill["status"], "candidate");
+        let revision = skill["revision"].as_i64().expect("revision");
+
+        // Replaying the same author and idempotency key returns the committed version.
+        let replay = harness.server.handle_request(propose(921, "skill-1")).await;
+        assert_eq!(decode_tool_payload(&replay).expect("replay")["version"], 1);
+
+        // Project scope refuses author self-promotion.
+        let self_promote = harness
+            .server
+            .handle_request(tool_call(
+                922,
+                "mempalace_skill_promote",
+                json!({
+                    "skill_id":"shared-procedure", "version":1, "expected_revision":revision,
+                    "reviewer":"author-a", "reason":"self approve"
+                }),
+            ))
+            .await;
+        assert!(self_promote.get("error").is_some(), "author must not self-promote project scope");
+
+        // A distinct reviewer still needs recorded validation evidence.
+        let no_evidence = harness
+            .server
+            .handle_request(tool_call(
+                923,
+                "mempalace_skill_promote",
+                json!({
+                    "skill_id":"shared-procedure", "version":1, "expected_revision":revision,
+                    "reviewer":"reviewer-b", "reason":"no evidence yet"
+                }),
+            ))
+            .await;
+        assert!(no_evidence.get("error").is_some(), "promotion needs a recorded outcome");
+
+        harness
+            .server
+            .handle_request(tool_call(
+                924,
+                "mempalace_skill_record_outcome",
+                json!({
+                    "skill_id":"shared-procedure", "version":1, "result":"success",
+                    "evaluator":"integration-suite", "recorded_by":"reviewer-b",
+                    "idempotency_key":"outcome-1"
+                }),
+            ))
+            .await;
+
+        let promoted = harness
+            .server
+            .handle_request(tool_call(
+                925,
+                "mempalace_skill_promote",
+                json!({
+                    "skill_id":"shared-procedure", "version":1, "expected_revision":revision,
+                    "reviewer":"reviewer-b", "reason":"validated"
+                }),
+            ))
+            .await;
+        let promoted = decode_tool_payload(&promoted).expect("promoted payload");
+        assert_eq!(promoted["success"], true);
+        assert_eq!(promoted["skill"]["status"], "promoted");
+
+        // A stale revision is an explicit conflict, not a silent overwrite.
+        let conflict = harness
+            .server
+            .handle_request(tool_call(
+                926,
+                "mempalace_skill_retire",
+                json!({
+                    "skill_id":"shared-procedure", "version":1, "expected_revision":revision,
+                    "reviewer":"reviewer-b", "reason":"stale"
+                }),
+            ))
+            .await;
+        let conflict = decode_tool_payload(&conflict).expect("conflict payload");
+        assert_eq!(conflict["success"], false);
+        assert!(conflict["conflict"]["actual_revision"].is_i64());
+
+        // Exact retrieval is authoritative and reports a miss explicitly.
+        let exact = harness
+            .server
+            .handle_request(tool_call(
+                927,
+                "mempalace_skill_get",
+                json!({"skill_id":"shared-procedure","version":1}),
+            ))
+            .await;
+        assert_eq!(decode_tool_payload(&exact).expect("exact")["found"], true);
+        let missing = harness
+            .server
+            .handle_request(tool_call(
+                928,
+                "mempalace_skill_get",
+                json!({"skill_id":"shared-procedure","version":99}),
+            ))
+            .await;
+        assert_eq!(decode_tool_payload(&missing).expect("missing")["found"], false);
+
+        // The lifecycle transition is visible in the append-only review trail.
+        let reviews = harness
+            .server
+            .handle_request(tool_call(
+                929,
+                "mempalace_skill_reviews",
+                json!({"skill_id":"shared-procedure","version":1}),
+            ))
+            .await;
+        let reviews = decode_tool_payload(&reviews).expect("reviews payload");
+        assert_eq!(reviews[0]["from_status"], "candidate");
+        assert_eq!(reviews[0]["to_status"], "promoted");
+        assert_eq!(reviews[0]["reviewer"], "reviewer-b");
     }
 
     #[tokio::test]

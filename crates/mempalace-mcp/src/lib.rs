@@ -4267,6 +4267,7 @@ fn fixture_root() -> PathBuf {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use std::collections::BTreeMap;

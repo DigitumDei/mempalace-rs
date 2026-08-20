@@ -592,6 +592,7 @@ fn not_installed(key: &'static str) -> ToolOutcome {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use std::ffi::OsString;

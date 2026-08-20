@@ -54,6 +54,8 @@ Host:
 Required outcomes:
 
 - `workspace-build` passes (`cargo check --workspace --all-targets --locked`).
+- `clippy` passes (`cargo clippy --workspace --all-targets --locked`). The workspace denies
+  `unwrap_used` among others, so this is a build-breaking gate, not advisory.
 - Every per-package test job passes. `release-gate` aggregates them and is the single
   required predecessor of the release builds.
 - `embedding-baselines` passes.

@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used)]
+
 use std::io::{BufRead, BufReader as StdBufReader, Write};
 use std::process::{Command, Stdio};
 

@@ -18,6 +18,56 @@ const MAX_TASK_TEXT_BYTES: usize = 1024 * 1024;
 /// task and event created before this stage upgraded its schema reads back with this wing.
 pub const UNSCOPED_WING: &str = "wing_unscoped";
 
+// ─── Conflict-error message fragments ──────────────────────────────────────────
+//
+// Every `StorageError::Invariant` this module can raise for a claim/renew/transition/
+// acknowledge conflict is built *from* one of the constants below, rather than from an inline
+// string literal at the call site. That is deliberate, not decorative: the federation server
+// (`coordination_storage_error` in `crates/mempalace-server/src/lib.rs`) matches on these exact
+// constants to decide whether a coordination write comes back as a 409 revision conflict, a 409
+// lease/state conflict, or something else, because `Result<Task>` here does not (yet — see
+// Phase 3 Stage 4 in docs/Coordination-Phase-3-Design.md) carry a typed `RevisionedWrite`-style
+// conflict the way `skills.rs`/`delegation.rs` do. Public and pinned here so that rewording one
+// of these messages is a compile error at its construction site (rename or remove the constant)
+// rather than a silent server-side reclassification of a retryable 409 into a non-retryable 400
+// the next time someone tidies up the prose. `error_messages_start_with_their_constants` (in
+// this file's test module) drives every path below and asserts the produced message actually
+// starts with its constant, so a call site that stops building from the constant — or a
+// constant whose text no longer matches what gets produced — fails loudly here instead of
+// silently on the server.
+/// Produced by [`CoordinationStore::claim_task`] when another worker holds a live lease.
+pub const LEASE_HELD_BY_ANOTHER_WORKER: &str = "task lease is held by another worker";
+/// Produced by [`CoordinationStore::claim_task`] when the task is already in a terminal state.
+pub const TERMINAL_TASK_CANNOT_BE_CLAIMED: &str = "terminal task cannot be claimed";
+/// Produced by [`CoordinationStore::claim_task`] when the task's `expires_at` has passed; the
+/// task is transitioned to [`TaskState::Expired`] in the same transaction before this is
+/// returned.
+pub const TASK_HAS_EXPIRED: &str = "task has expired";
+/// Leading fragment of the message [`CoordinationStore::claim_task`],
+/// [`CoordinationStore::renew_lease`], and [`CoordinationStore::transition_task`] all produce
+/// (via the shared `stale` helper) when the caller's `expected_revision` no longer matches the
+/// record's current revision. The full message is
+/// `"{STALE_REVISION_PREFIX}{expected}{STALE_REVISION_SEPARATOR}{actual}"`.
+pub const STALE_REVISION_PREFIX: &str = "stale revision: expected ";
+/// Separator between the expected and actual revision in the message [`STALE_REVISION_PREFIX`]
+/// documents.
+pub const STALE_REVISION_SEPARATOR: &str = ", current ";
+/// Leading fragment of the message [`CoordinationStore::transition_task`] produces when `to` is
+/// not a valid transition from the task's current state; the full message is
+/// `"{INVALID_TRANSITION_PREFIX}{from} -> {to}"`.
+pub const INVALID_TRANSITION_PREFIX: &str = "invalid transition ";
+/// Produced by [`CoordinationStore::transition_task`] when the caller is neither the task's
+/// current owner nor requesting cancellation.
+pub const ONLY_OWNER_MAY_TRANSITION: &str = "only the owner may transition this task";
+/// Produced by [`CoordinationStore::renew_lease`] when the caller does not hold the task's
+/// current lease.
+pub const ONLY_LEASE_OWNER_MAY_RENEW: &str = "only the lease owner may renew";
+/// Produced by [`CoordinationStore::renew_lease`] when the task's lease has already expired.
+pub const LEASE_HAS_EXPIRED: &str = "lease has expired";
+/// Produced by [`CoordinationStore::acknowledge_message`] when the caller is not the message's
+/// addressed recipient.
+pub const ONLY_RECIPIENT_MAY_ACKNOWLEDGE: &str = "only the recipient may acknowledge";
+
 /// Durable task lifecycle state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -380,7 +430,7 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
             return Err(stale(expected_revision, task.revision));
         }
         if task.state.terminal() {
-            return Err(StorageError::Invariant("terminal task cannot be claimed".into()));
+            return Err(StorageError::Invariant(TERMINAL_TASK_CANNOT_BE_CLAIMED.into()));
         }
         if task.expires_at.is_some_and(|v| v <= now) {
             let next = task.revision + 1;
@@ -403,12 +453,12 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
                 now,
             )?;
             tx.commit()?;
-            return Err(StorageError::Invariant("task has expired".into()));
+            return Err(StorageError::Invariant(TASK_HAS_EXPIRED.into()));
         }
         if task.owner.as_deref().is_some_and(|owner| owner != worker)
             && task.lease_expires_at.is_some_and(|expiry| expiry > now)
         {
-            return Err(StorageError::Invariant("task lease is held by another worker".into()));
+            return Err(StorageError::Invariant(LEASE_HELD_BY_ANOTHER_WORKER.into()));
         }
         let next = task.revision + 1;
         let expiry = now + ttl;
@@ -455,10 +505,10 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
             return Err(stale(expected_revision, task.revision));
         }
         if task.owner.as_deref() != Some(worker) {
-            return Err(StorageError::Invariant("only the lease owner may renew".into()));
+            return Err(StorageError::Invariant(ONLY_LEASE_OWNER_MAY_RENEW.into()));
         }
         if task.lease_expires_at.is_none_or(|v| v <= now) {
-            return Err(StorageError::Invariant("lease has expired".into()));
+            return Err(StorageError::Invariant(LEASE_HAS_EXPIRED.into()));
         }
         let next = task.revision + 1;
         tx.execute("UPDATE coordination_tasks SET revision=?2,lease_expires_at=?3,updated_at=?4 WHERE task_id=?1",params![id,next,format_time(now+ttl)?,format_time(now)?])?;
@@ -500,7 +550,7 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
         }
         if !allowed_transition(task.state, to) {
             return Err(StorageError::Invariant(format!(
-                "invalid transition {} -> {}",
+                "{INVALID_TRANSITION_PREFIX}{} -> {}",
                 task.state.as_str(),
                 to.as_str()
             )));
@@ -509,7 +559,7 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
             && task.owner.as_deref() != Some(actor)
             && to != TaskState::Cancelled
         {
-            return Err(StorageError::Invariant("only the owner may transition this task".into()));
+            return Err(StorageError::Invariant(ONLY_OWNER_MAY_TRANSITION.into()));
         }
         let next = task.revision + 1;
         let clear = to.terminal();
@@ -626,7 +676,7 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
         let msg = get_message_tx(&tx, id)?
             .ok_or_else(|| StorageError::Invariant(format!("message `{id}` not found")))?;
         if msg.recipient != actor {
-            return Err(StorageError::Invariant("only the recipient may acknowledge".into()));
+            return Err(StorageError::Invariant(ONLY_RECIPIENT_MAY_ACKNOWLEDGE.into()));
         }
         if msg.acknowledged_at.is_some() {
             tx.commit()?;
@@ -874,7 +924,9 @@ fn bounded_text(value: &str, name: &str) -> Result<()> {
     }
 }
 fn stale(expected: i64, actual: i64) -> StorageError {
-    StorageError::Invariant(format!("stale revision: expected {expected}, current {actual}"))
+    StorageError::Invariant(format!(
+        "{STALE_REVISION_PREFIX}{expected}{STALE_REVISION_SEPARATOR}{actual}"
+    ))
 }
 fn allowed_transition(from: TaskState, to: TaskState) -> bool {
     if from.terminal() {
@@ -1248,6 +1300,131 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
         let event = events.events.first().expect("event").clone();
         assert_eq!(s.get_event(&event.event_id).expect("exact event"), Some(event));
         assert_eq!(s.get_event("event_missing").expect("missing event"), None);
+    }
+    /// Unwraps a `StorageError::Invariant`, panicking with the actual variant otherwise.
+    fn expect_invariant(err: &StorageError) -> &str {
+        match err {
+            StorageError::Invariant(msg) => msg.as_str(),
+            other => panic!("expected StorageError::Invariant, got {other:?}"),
+        }
+    }
+    /// Drives every conflict-shaped `Invariant` error this module can produce and asserts the
+    /// resulting message starts with the `pub const` the federation server
+    /// (`coordination_storage_error` in `crates/mempalace-server/src/lib.rs`) matches on to
+    /// classify HTTP status. This is what keeps that classification honest without the server
+    /// re-deriving message text of its own: a construction site that stops building its message
+    /// from the constant, or a constant whose text no longer matches what actually gets
+    /// produced, fails right here — loudly, at build/test time — instead of the server silently
+    /// reclassifying a retryable 409 conflict as a non-retryable 400.
+    #[test]
+    fn conflict_error_messages_start_with_their_pinned_constants() {
+        let (_d, s) = store();
+
+        // `stale()` is shared by claim/renew/transition; claiming with a revision one ahead of
+        // the freshly created task's `0` exercises it directly.
+        let t = task(&s);
+        let err = s
+            .claim_task(&t.task_id, "worker-a", t.revision + 1, Duration::minutes(1))
+            .expect_err("claiming at the wrong revision must fail");
+        let msg = expect_invariant(&err);
+        assert!(msg.starts_with(STALE_REVISION_PREFIX), "{msg}");
+        assert!(msg.contains(STALE_REVISION_SEPARATOR), "{msg}");
+
+        // terminal task cannot be claimed: cancel first (Pending -> Cancelled is legal), then
+        // try to claim the now-terminal task at its new, correct revision.
+        let cancelled = s
+            .transition_task(&t.task_id, "manager", t.revision, TaskState::Cancelled, None)
+            .expect("cancel");
+        let err = s
+            .claim_task(&t.task_id, "worker-a", cancelled.revision, Duration::minutes(1))
+            .expect_err("a terminal task must not be claimable");
+        assert!(expect_invariant(&err).starts_with(TERMINAL_TASK_CANNOT_BE_CLAIMED));
+
+        // task has expired: create a task whose `expires_at` is already in the past, then claim.
+        let expiring = s
+            .create_task(&NewTask {
+                title: "expiring".into(),
+                description: "d".into(),
+                created_by: "manager".into(),
+                wing: "wing_test".into(),
+                idempotency_key: "pin-expiring-1".into(),
+                parent_id: None,
+                dependencies: vec![],
+                budget: None,
+                expires_at: Some(OffsetDateTime::now_utc() - Duration::seconds(1)),
+            })
+            .expect("expiring task");
+        let err = s
+            .claim_task(&expiring.task_id, "worker-a", expiring.revision, Duration::minutes(1))
+            .expect_err("claiming a task past its expires_at must fail");
+        assert!(expect_invariant(&err).starts_with(TASK_HAS_EXPIRED));
+
+        // task lease is held by another worker: worker-a claims, worker-b tries at the correct
+        // (post-claim) revision while worker-a's lease is still live.
+        let leased = task_with_wing(&s, "wing_test", "pin-leased-1");
+        let claimed_leased =
+            s.claim_task(&leased.task_id, "worker-a", leased.revision, Duration::minutes(5)).expect("claim");
+        let err = s
+            .claim_task(&leased.task_id, "worker-b", claimed_leased.revision, Duration::minutes(5))
+            .expect_err("a live lease held by another worker must block a second claim");
+        assert!(expect_invariant(&err).starts_with(LEASE_HELD_BY_ANOTHER_WORKER));
+
+        // invalid transition: Pending -> Completed is not an allowed edge.
+        let pending = task_with_wing(&s, "wing_test", "pin-invalid-transition-1");
+        let err = s
+            .transition_task(&pending.task_id, "manager", pending.revision, TaskState::Completed, None)
+            .expect_err("pending -> completed is not an allowed transition");
+        assert!(expect_invariant(&err).starts_with(INVALID_TRANSITION_PREFIX));
+
+        // only the owner may transition: worker-a owns the (now Running) task; worker-b tries a
+        // non-cancel transition.
+        let owned = task_with_wing(&s, "wing_test", "pin-owner-transition-1");
+        let claimed_owned =
+            s.claim_task(&owned.task_id, "worker-a", owned.revision, Duration::minutes(5)).expect("claim");
+        let err = s
+            .transition_task(&owned.task_id, "worker-b", claimed_owned.revision, TaskState::Completed, None)
+            .expect_err("a non-owner, non-cancel transition must fail");
+        assert!(expect_invariant(&err).starts_with(ONLY_OWNER_MAY_TRANSITION));
+
+        // only the lease owner may renew: worker-b tries to renew worker-a's lease.
+        let renewed = task_with_wing(&s, "wing_test", "pin-renew-owner-1");
+        let claimed_renewed = s
+            .claim_task(&renewed.task_id, "worker-a", renewed.revision, Duration::minutes(5))
+            .expect("claim");
+        let err = s
+            .renew_lease(&renewed.task_id, "worker-b", claimed_renewed.revision, Duration::minutes(5))
+            .expect_err("a non-owner renew must fail");
+        assert!(expect_invariant(&err).starts_with(ONLY_LEASE_OWNER_MAY_RENEW));
+
+        // lease has expired: claim with a 1ms TTL, sleep past it, then try to renew.
+        let lease_expiry = task_with_wing(&s, "wing_test", "pin-lease-expiry-1");
+        let claimed_lease_expiry = s
+            .claim_task(&lease_expiry.task_id, "worker-a", lease_expiry.revision, Duration::milliseconds(1))
+            .expect("claim");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let err = s
+            .renew_lease(&lease_expiry.task_id, "worker-a", claimed_lease_expiry.revision, Duration::minutes(5))
+            .expect_err("renewing an already-expired lease must fail");
+        assert!(expect_invariant(&err).starts_with(LEASE_HAS_EXPIRED));
+
+        // only the recipient may acknowledge: message addressed to "b", acknowledged by someone
+        // else.
+        let messaging = task_with_wing(&s, "wing_test", "pin-ack-owner-1");
+        let message = s
+            .send_message(&NewMessage {
+                task_id: messaging.task_id,
+                sender: "a".into(),
+                recipient: "b".into(),
+                kind: "status".into(),
+                payload: serde_json::json!({}),
+                idempotency_key: "pin-ack-message-1".into(),
+                envelope_version: 1,
+            })
+            .expect("send");
+        let err = s
+            .acknowledge_message(&message.message_id, "not-b")
+            .expect_err("acknowledging as a non-recipient must fail");
+        assert!(expect_invariant(&err).starts_with(ONLY_RECIPIENT_MAY_ACKNOWLEDGE));
     }
     #[test]
     fn similar_messages_with_distinct_keys_survive_and_ack_is_authorized() {

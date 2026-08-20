@@ -112,10 +112,15 @@ The five self-continuity tools are local-only. `mempalace_wake_up` compiles the 
 palace-default lineage into an identity packet; model-facing calls cannot select or override it.
 See [Self-Continuity Across Models](Self-Continuity.md).
 
-The fifteen coordination tools, the eight skill-registry tools, and the seven
-delegation-telemetry tools are local-only and are not federated. See
-[Native Coordination](Coordination.md), [Skill Registry](Skill-Registry.md), and
-[Delegation Telemetry](Delegation-Telemetry.md).
+The eight skill-registry tools and the seven delegation-telemetry tools are local-only and
+are not federated. The fifteen coordination tools are still local-only MCP tools, but as of
+issue #102 Stage 3 the records they operate on (tasks, messages, artifacts, results, audit
+events) are also reachable over the federation REST API, server-side and opt-in per wing —
+`mempalace-server` exposes `/v1/coordination/*` under the same scoped-token authorization as
+every other route. The MCP tools themselves do not route through federation yet; that is a
+later stage (`RemoteApi`, `FederationRouter`, MCP dispatch). See
+[Native Coordination](Coordination.md), [Federation](Federation.md#part-7--federated-coordination),
+[Skill Registry](Skill-Registry.md), and [Delegation Telemetry](Delegation-Telemetry.md).
 
 ### Federation
 
@@ -127,7 +132,10 @@ Added after the initial v1 freeze; now part of the shipped surface.
 - `mempalace-federation` — shared wire DTOs.
 - REST surface under `/v1`: `info`, `drawers` (search, check_duplicate, add, list,
   get, delete), `kg` (query, facts, facts/invalidate, timeline, stats), `taxonomy`,
-  `wings`, `rooms`, `changes`, and `ingest/batch` (bulk mined-chunk ingest).
+  `wings`, `rooms`, `changes`, `ingest/batch` (bulk mined-chunk ingest), and — added in
+  issue #102 Stage 3 — `coordination` (tasks: create/get/claim/renew/transition; messages:
+  send/get/ack, inbox; artifacts: put/get; results: put/get; events: the cursor-paginated
+  audit feed). See [Federation §1.4](Federation.md#14-rest-surface).
 - Client routing (`federation` config section): per-wing and KG `local` / `remote`
   / `combined` modes with `write` target `local` / `remote` / `both`;
   local-first dual-write with best-effort remote replication in `both` mode;

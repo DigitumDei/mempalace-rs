@@ -158,9 +158,26 @@ requires `Authorization: Bearer <token>`.
 | `GET /v1/rooms` | List rooms |
 | `GET /v1/changes` | Change-event feed (cursor-paginated) |
 | `POST /v1/ingest/batch` | Bulk mined-chunk ingest (16 MiB body limit) |
+| `POST /v1/coordination/tasks` | Create a task |
+| `GET /v1/coordination/tasks/{id}` | Get one task |
+| `POST /v1/coordination/tasks/{id}/claim` | Claim a task (or reclaim an expired lease) |
+| `POST /v1/coordination/tasks/{id}/renew` | Renew a live lease |
+| `POST /v1/coordination/tasks/{id}/transition` | Transition a task's lifecycle state |
+| `POST /v1/coordination/messages` | Send an addressed message |
+| `GET /v1/coordination/messages/{id}` | Get one message |
+| `POST /v1/coordination/messages/{id}/ack` | Acknowledge a message |
+| `GET /v1/coordination/inbox` | Read an addressed inbox (cursor-paginated) |
+| `POST /v1/coordination/artifacts` | Store an immutable artifact |
+| `GET /v1/coordination/artifacts/{id}` | Get one artifact |
+| `POST /v1/coordination/results` | Store an immutable task result |
+| `GET /v1/coordination/results/{id}` | Get one task result |
+| `GET /v1/coordination/events` | Coordination audit-event feed (cursor-paginated) |
 
 `GET /v1/info` advertises a `capabilities` list; the `"ingest"` capability is what
-a client checks before attempting federated mining. The wire DTOs live in the
+a client checks before attempting federated mining, and the `"coordination"`
+capability (added in issue #102 Stage 3) is what a client would check before
+calling any `/v1/coordination/*` route — see
+[Part 7](#part-7--federated-coordination). The wire DTOs live in the
 `mempalace-federation` crate and are shared verbatim by server and client.
 
 ### 1.5 Authorization scopes
@@ -169,8 +186,10 @@ A token with no `scopes` field (§1.1) may do anything any route allows. A scope
 token is restricted to an `(operation, wing)` combination granted by at least one
 of its scope entries. `operations` is closed: `read`, `write`, `delete`, `ingest`,
 `coordination_read`, `coordination_write`, `coordination_claim`. The three
-`coordination_*` operations have no routes yet — they exist so the token file
-format is stable ahead of the coordination REST routes.
+`coordination_*` operations gate the `/v1/coordination/*` routes added in issue
+#102 Stage 3 — see [Part 7](#part-7--federated-coordination) for how wing
+authorization, actor identity, and cursors work on those routes specifically;
+the group rules below (A–D) describe the routes that existed before Stage 3.
 
 Every route requires an operation; most also involve a wing. Routes fall into
 four groups, and each group is authorized differently:
@@ -615,6 +634,136 @@ Notes:
 - The stub maps keyword-less text to a single vector, so give demo files distinct
   keyword clusters if you want them to rank apart.
 
+## Part 7 — Federated coordination
+
+Issue #102 Stage 3 exposes [native coordination](Coordination.md) — tasks, addressed
+messages, immutable artifacts and results, and the audit-event feed — over the same
+`/v1/coordination/*` REST surface and scoped-token authorization used by everything
+else in this guide.
+
+> **This is server-side only.** `mempalace-server` serves these routes today.
+> Nothing on the client side consumes them yet — `RemoteApi`, `FederationRouter`,
+> and the coordination MCP tools (`mempalace_task_create` and friends) still talk to
+> the local palace exclusively. Routing an MCP coordination call to a remote peer is
+> Stage 4; see [Coordination-Phase-3-Design.md](Coordination-Phase-3-Design.md). Until
+> then, exercise this surface directly over REST (`curl`, or your own client against
+> `mempalace-federation`'s DTOs), exactly as Part 6 does for drawers.
+
+### Wing is the authorization key
+
+A task's `wing` is what every coordination authorization check is ultimately about,
+because messages, artifacts, and results carry no wing column of their own — they
+reach it through their mandatory `task_id`, same as locally (see
+[Coordination.md](Coordination.md)). Three rules cover all fourteen routes:
+
+- **Task creation reads the wing from the request body.** `POST /v1/coordination/tasks`
+  authorizes `(coordination_write, wing)` directly, the same as `POST /v1/drawers`
+  does for `write` — a mismatched wing is a plain **403**.
+- **Every other route resolves the wing from the target record first.** `GET`/`claim`/
+  `renew`/`transition` on a task look the task up and authorize against its `wing`;
+  sending a message, filing an artifact, or storing a result looks up the `task_id`
+  named in the request body and authorizes against *its* `wing`; getting one message,
+  artifact, or result looks up that record and then its owning task. A caller who
+  cannot see the resolved wing gets **404, not 403** — identical in spirit to
+  `GET /v1/drawers/{id}` (§1.5) — so the response is never an existence oracle for a
+  task in a wing the caller cannot see. A missing record and a wing-invisible record
+  return the exact same 404 body; there is no way to tell them apart from outside.
+- **The event feed and the inbox are aggregates, not lookups.** `GET /v1/coordination/events`
+  and `GET /v1/coordination/inbox` can return rows from many tasks and many wings in
+  one page, so — like `GET /v1/changes` and `GET /v1/rooms` — they filter their
+  response down to the wings the caller can see rather than rejecting the request.
+  An explicit `?wing=` filter that the caller cannot see yields an empty page, not a
+  403. Every `coordination_events` row carries its own `wing` column, materialised
+  from the owning task at write time and defaulting to `wing_unscoped` for rows that
+  predate wings (see [Coordination.md](Coordination.md)) — so, unlike the generic
+  `/v1/changes` feed, there is no "wing could not be determined" case to reason
+  about; filtering fails closed simply because an unlisted wing is never in the
+  visible set.
+
+### Actor identity is derived, not claimed
+
+Locally, a caller supplies its own actor string (`created_by`, `sender`, `worker`,
+`actor`) and the host runtime is trusted to have asserted it truthfully. Over HTTP
+that trust boundary does not exist, so the authenticated token identity is
+authoritative: every actor-shaped field in a coordination request body is optional
+and is treated as a *claim*, not a fact. The server computes the actual actor as
+
+```
+identity                      if the field is absent, or equals the identity
+{identity}:{claimed}          if the field is present and differs from the identity
+```
+
+— the identical rule `POST /v1/drawers` already applies to `added_by`. A token
+authenticated as `ci` that posts `{"created_by": "alice"}` gets a task recorded as
+`created_by: "ci:alice"`, never `"alice"` — a remote caller cannot impersonate a
+local actor. This applies to `created_by` (tasks, artifacts, results), `sender`
+(messages), `worker` (claim/renew), and `actor` (transition, message ack).
+`recipient` on a message is **not** rewritten this way: it addresses a message to
+someone, and does not itself assert who the caller is, so it is stored verbatim —
+matching local behaviour. (Whoever later acknowledges that message still has their
+own actor identity-derived, and storage requires it to equal `recipient` before the
+acknowledgement is accepted.)
+
+### Cursors are opaque strings with no clock in them
+
+`next_cursor` on `GET /v1/coordination/events` and `GET /v1/coordination/inbox` is a
+string that encodes only `coordination_events.sequence` / the message's local
+sequence — an `AUTOINCREMENT` integer, already monotonic per palace. Pass it back
+verbatim; do not parse it, and do not do arithmetic on it. This is deliberately
+**not** the `"{rfc3339}|{rowid}"` shape `encode_cursor` uses for `GET /v1/changes`
+(§1.4): that format carries a timestamp because `/v1/changes` supports a `since`
+parameter and therefore needs time ordering, while the coordination feeds have no
+`since` — a bare sequence satisfies "cursors support restart-safe delivery without
+relying on synchronized clocks" more directly than reusing a timestamp-bearing
+format would. Cursors are per-origin: a cursor from one palace means nothing to
+another, so a client combining several remotes keeps one cursor per remote (as
+`mempalace_get_changes_since` already does for the generic feed) rather than
+comparing or merge-sorting them.
+
+### Lease and expiry clocks belong to the palace that owns the task
+
+`POST /v1/coordination/tasks/{id}/claim` and `.../renew` take a `lease_seconds`
+duration, never a timestamp. Expiry — both for that lease and for a task's own
+`expires_at` — is evaluated entirely by `CoordinationStore` using the palace's own
+clock at the moment of the call. No route accepts or forwards a caller-supplied
+timestamp for a lease or expiry decision, so nothing here depends on clocks being
+synchronised across machines. This matches the non-goal in
+[Coordination-Phase-3-Design.md](Coordination-Phase-3-Design.md): a task is
+authoritative in exactly one palace, and that palace's clock is the only one that
+gets a vote.
+
+### Revision and lease conflicts
+
+A `claim`/`renew`/`transition` whose `expected_revision` no longer matches the
+task's current revision, or that otherwise conflicts with the task's current state
+or lease ownership, returns **409** with one of two `code` values in the body:
+
+- `"revision_conflict"` — the expected revision is stale. The body also carries
+  `expected_revision` and `actual_revision` (both integers), so the caller can
+  decide whether to reload and retry without a second round trip. Retry is the
+  caller's decision; the server never retries a conflicting write on its behalf.
+- `"coordination_conflict"` — the write is not permitted regardless of revision:
+  another worker's lease has not expired yet, the task is in a terminal state, the
+  requested state transition is not a valid one, or the caller is not the current
+  owner. `expected_revision`/`actual_revision` are both `null` here — reloading
+  will not change the outcome.
+
+### A minimal example
+
+```bash
+# Create a task in wing_myproject
+curl -s -X POST http://127.0.0.1:8765/v1/coordination/tasks \
+  -H "Authorization: Bearer dev-token" -H "Content-Type: application/json" \
+  -d '{"title":"index the repo","description":"...","wing":"wing_myproject","idempotency_key":"job-1"}'
+# → {"task_id":"task_...","state":"pending","revision":0,"created_by":"dev",...}
+
+# Claim it (worker identity comes from the token; expected_revision is CAS)
+curl -s -X POST http://127.0.0.1:8765/v1/coordination/tasks/task_.../claim \
+  -H "Authorization: Bearer dev-token" -H "Content-Type: application/json" \
+  -d '{"expected_revision":0,"lease_seconds":300}'
+# → {"state":"running","revision":1,"owner":"dev",...}
+```
+
 ## Troubleshooting
 
 ### `remote '<name>' is unreachable ... writes do not fall back to local`
@@ -651,3 +800,25 @@ and `DELETE /v1/drawers/{id}` mask this as 404 instead — see the same section.
 ### `version != 1` on the server
 The server only accepts config schema version `1`. See
 [Config Schema](Config-Schema.md).
+
+### A coordination write returns 409 with code `revision_conflict`
+The `expected_revision` you sent no longer matches the task's current revision —
+another writer moved it since you last read it. The response body's
+`actual_revision` field is the current value; `GET` the task (or use it directly)
+and retry with that revision if the retry is still appropriate. See
+[Part 7 → Revision and lease conflicts](#revision-and-lease-conflicts).
+
+### A coordination write returns 409 with code `coordination_conflict`
+The write is not permitted regardless of revision: another worker's lease on the
+task has not expired, the task is in a terminal state, the requested state
+transition is invalid, or you are not the task's current owner. Retrying with a
+fresher revision will not change the outcome — wait for the lease to expire (or
+have the current owner release it) before claiming, or re-check the task's state
+before transitioning. See [Part 7 → Revision and lease conflicts](#revision-and-lease-conflicts).
+
+### A coordination route returns 404 for a task/message/artifact/result I know exists
+Your token's `scopes` do not grant it visibility into that record's wing. Per
+design this looks identical to the record genuinely not existing — see
+[Part 7 → Wing is the authorization key](#wing-is-the-authorization-key) — so check
+the token's `scopes` entry for the wing in question rather than assuming the ID is
+wrong.

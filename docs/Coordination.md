@@ -1,6 +1,6 @@
 # Native local coordination
 
-MemPalace stores durable coordination state in the palace's local `storage.sqlite3`. It provides persistence and concurrency control; the host agent runtime still owns worker spawning, scheduling, tool execution, and live budget enforcement. Coordination is local-only and is not federated.
+MemPalace stores durable coordination state in the palace's local `storage.sqlite3`. It provides persistence and concurrency control; the host agent runtime still owns worker spawning, scheduling, tool execution, and live budget enforcement. Federation is opt-in and, as of issue #102 Stage 3, server-side only: `mempalace-server` exposes tasks, messages, artifacts, results, and audit events over `/v1/coordination/*` to a caller holding the right scoped token, under the same wing-scoped authorization as the rest of the federation REST surface. The MCP tools documented on this page, and the CLI, still read and write the local palace exclusively — nothing here routes a call to a remote palace yet. That routing (`RemoteApi`, `FederationRouter`, MCP dispatch) is a later stage. See [Federation → Part 7, Federated coordination](Federation.md#part-7--federated-coordination) for the wire behaviour that exists today.
 
 ## Data and guarantees
 
@@ -34,6 +34,8 @@ The native local tool surface is:
 - `mempalace_coordination_event_get`, `mempalace_coordination_events` (takes an optional `wing` filter)
 
 Treat returned cursors as opaque and persist them with worker state. After restart, retrieve known task, message, result, and artifact IDs directly, then continue the inbox or event stream from the stored cursor.
+
+This tool surface always operates on the local palace. For the server-side REST equivalent — used by a remote federation peer, not by these MCP tools — see [Federation → Part 7, Federated coordination](Federation.md#part-7--federated-coordination).
 
 ## Recovery and maintenance
 

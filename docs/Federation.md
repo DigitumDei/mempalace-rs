@@ -69,17 +69,22 @@ Authentication is bearer-token based. The token file is a JSON array of entries:
 ```json
 [
   { "token": "alice-secret-token", "name": "alice", "enabled": true },
-  { "token": "bob-secret-token",   "name": "bob",   "enabled": false }
+  { "token": "bob-secret-token",   "name": "bob",   "enabled": false },
+  { "token": "ci-secret-token",    "name": "ci",     "enabled": true,
+    "scopes": [ { "wings": ["wing_myproject"], "operations": ["read", "coordination_read"] } ] }
 ]
 ```
 
 - `token` — the bearer secret a client must present.
 - `name` — the identity recorded as `added_by` on writes from that token.
 - `enabled` — `false` treats the entry as if it did not exist (instant revoke).
+- `scopes` — optional; restricts what the token may do. Absent (like `alice` and `bob` above)
+  means unrestricted access, exactly as before this field existed. See
+  [1.5 Authorization scopes](#15-authorization-scopes) for the full shape and rules.
 
 Tokens are hashed in memory; the raw secret is not retained after load. The file
-is hot-reloaded — editing it (e.g. flipping `enabled`) takes effect on the next
-request without restarting the server. The default path is
+is hot-reloaded — editing it (e.g. flipping `enabled`, or narrowing `scopes`) takes
+effect on the next request without restarting the server. The default path is
 `~/.mempalace/server_tokens.json`.
 
 ### 1.2 Configure the server section (optional but recommended)
@@ -157,6 +162,65 @@ requires `Authorization: Bearer <token>`.
 `GET /v1/info` advertises a `capabilities` list; the `"ingest"` capability is what
 a client checks before attempting federated mining. The wire DTOs live in the
 `mempalace-federation` crate and are shared verbatim by server and client.
+
+### 1.5 Authorization scopes
+
+A token with no `scopes` field (§1.1) may do anything any route allows. A scoped
+token is restricted to an `(operation, wing)` combination granted by at least one
+of its scope entries. `operations` is closed: `read`, `write`, `delete`, `ingest`,
+`coordination_read`, `coordination_write`, `coordination_claim`. The three
+`coordination_*` operations have no routes yet — they exist so the token file
+format is stable ahead of the coordination REST routes.
+
+Every route requires an operation; most also involve a wing. Routes fall into
+four groups, and each group is authorized differently:
+
+- **Wing is in the request — enforce `(operation, wing)` directly.**
+  `POST /v1/drawers/search`, `GET /v1/drawers` (wing optional in both — when
+  given it is enforced outright; when absent, see the next bullet), and
+  `POST /v1/drawers` and `POST /v1/ingest/batch` (wing required). A mismatched
+  wing is a plain **403**.
+- **The wing needs a lookup first.** `GET /v1/drawers/{id}` and
+  `DELETE /v1/drawers/{id}` resolve the drawer, then authorize. A caller without
+  access gets a **404**, not a 403 — the same masking the diary guard already
+  applies to `GET /v1/drawers/{id}` (see `route_drawers_get` in
+  `crates/mempalace-server/src/lib.rs`), so the response never becomes an
+  existence oracle for wings the caller cannot see.
+- **Aggregate routes filter instead of rejecting.** `GET /v1/taxonomy`,
+  `GET /v1/wings`, `GET /v1/rooms`, `GET /v1/changes`, and
+  `POST /v1/drawers/check_duplicate` require `read`, then filter their response
+  down to the wings the token can see — a token scoped to one wing gets that
+  wing's slice, not a 403. This is also what a wing-absent
+  `POST /v1/drawers/search` or `GET /v1/drawers` does with its results.
+  `check_duplicate` belongs here despite having no wing in its own request:
+  its response carries `wing`/`room` per match and an `is_duplicate` boolean,
+  either of which would otherwise let a token learn about content in a wing it
+  cannot read; `is_duplicate` is computed *after* filtering, not before, so
+  the boolean itself cannot leak that either. `GET /v1/changes` matters most —
+  it is the federated change feed. Not every event carries a determinable
+  wing (KG facts, identity updates, lineage records and self-observations
+  never do; some `drawer_deleted` events written before this scoping model
+  existed, or via a remote-fallback delete with no local record of the
+  drawer, don't either). The feed fails **closed** on those: an event whose
+  wing can't be determined is hidden from a scoped token unless its type is
+  one of the seven with no wing concept at all (matching the Group D list
+  below); an unrestricted token still sees everything.
+- **No wing concept — operation only.** `POST /v1/kg/query`, `GET /v1/kg/timeline`,
+  `GET /v1/kg/stats`, `POST /v1/kg/facts`, and `POST /v1/kg/facts/invalidate`
+  check only the operation. KG facts are entity-scoped, not wing-scoped — this is
+  the same rule `resolve_kg_route` in `mempalace-config` already applies by
+  skipping the wing lookup for KG routing. `GET /v1/info` requires any
+  authenticated token and no specific operation; `GET /v1/health` stays
+  unauthenticated.
+
+The diary guard is unaffected by any of this: it is a content rule (wing
+`wing_agents`, room `diary`, or a `diary:`-prefixed source), not an identity
+rule, and it applies to every token regardless of scope.
+
+`wings` in a scope entry accepts the literal `"*"` for every wing; other entries
+are normalised at load with the same rule `WingId::normalized` uses elsewhere, so
+a token file entry naming `"myproject"` authorizes a request naming
+`wing_myproject`.
 
 ## Part 2 — Configuring a client
 
@@ -519,6 +583,15 @@ unauthenticated (fine against a server with an unauthenticated entry, otherwise
 ### A remote-routed write returns 422
 The target is diary-shaped (`wing_agents` / `diary` room / `diary:` source). Diary
 is local-only by design; no config can federate it.
+
+### A request returns 403 with code `forbidden`
+The token authenticated fine but its `scopes` do not grant the operation or wing
+the request needs — distinct from a 401, which means the token itself was
+missing, unrecognised, or disabled. Check the token's `scopes` entry in the
+server's token file: either the `operations` list is missing the one the route
+needs, or none of its `wings` cover the target wing (`"*"` covers every wing).
+See [1.5 Authorization scopes](#15-authorization-scopes). `GET /v1/drawers/{id}`
+and `DELETE /v1/drawers/{id}` mask this as 404 instead — see the same section.
 
 ### `version != 1` on the server
 The server only accepts config schema version `1`. See

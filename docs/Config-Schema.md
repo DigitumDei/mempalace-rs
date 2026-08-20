@@ -314,6 +314,18 @@ federation HTTP server started by `mempalace serve`.
 }
 ```
 
+The file at `server.token_file` is a separate JSON document — a plain array of
+token entries, not a field of `config.json`. Its shape (`token`/`name`/
+`enabled`/`scopes`):
+
+```jsonc
+[
+  { "token": "alice-secret-token", "name": "alice", "enabled": true },
+  { "token": "ci-secret-token", "name": "ci", "enabled": true,
+    "scopes": [ { "wings": ["wing_myproject"], "operations": ["read", "coordination_read"] } ] }
+]
+```
+
 ### Field Definitions
 
 #### `server.bind`
@@ -326,6 +338,31 @@ federation HTTP server started by `mempalace serve`.
 
 - Type: string (path, `~/`-prefixed strings are expanded)
 - Optional. Default: `~/.mempalace/server_tokens.json`
+- Each element of the array is a token entry:
+  - `token` — string, the bearer secret a client must present.
+  - `name` — string, the identity recorded as `added_by` / `ChangeEvent.actor`
+    on writes from that token.
+  - `enabled` — boolean; `false` treats the entry as if it did not exist
+    (instant revoke). The file is hot-reloaded on mtime change.
+  - `scopes` — optional array of `{ "wings": [...], "operations": [...] }`
+    grants; see [Federation → 1.5 Authorization scopes](Federation.md#15-authorization-scopes)
+    for the full authorization model this drives. In this schema:
+    - Absent, or explicit JSON `null` — the token is **unrestricted**: every
+      operation on every wing. This grandfathers token files written before
+      this field existed, so existing deployments keep working unchanged.
+    - `[]` (an explicit empty array) — a deliberate lockout: no access at
+      all. This is **not** a synonym for absent.
+    - `wings` accepts the literal `"*"` for every wing; other entries are
+      normalised at load with the same rule `WingId::normalized` uses
+      elsewhere, so `"myproject"` and `"wing_myproject"` name the same wing.
+    - `operations` is a closed enum: `read`, `write`, `delete`, `ingest`,
+      `coordination_read`, `coordination_write`, `coordination_claim`. The
+      three `coordination_*` operations have no routes yet — they exist so
+      this file format does not change again when Stage 3 adds them.
+    - Validation: an `operations` string outside that enum, or a malformed
+      `wings` entry, fails the token file load — same fail-closed behaviour
+      as any other malformed reload (see `TokenRegistry` in
+      `crates/mempalace-server/src/lib.rs`).
 
 #### `server.checkouts`
 
@@ -379,7 +416,10 @@ The optional `federation` section of `~/.mempalace/config.json` controls routing
 - Optional; defaults to empty
 - Each remote object:
   - `name`: unique string identifier referenced by routing rules and `remote` fields elsewhere
-  - `url`: must be an `http://` or `https://` URL — any other scheme fails config load
+  - `url`: must be an `http://` or `https://` URL — any other scheme fails config load. Plain
+    `http://` is further restricted to loopback hosts (`localhost`, `127.0.0.1`, `::1`); an
+    `http://` URL targeting any other host also fails config load — use `https://` for anything
+    that isn't local dev.
   - `token`: inline bearer token string (optional)
   - `token_env`: name of an environment variable holding the bearer token (optional, preferred over `token` — keeps secrets out of config.json)
   - Token resolution: the environment variable value wins if both are set; if `token_env` is set but the variable is not present in the environment, the config loader warns and falls back to the inline `token` (or proceeds unauthenticated if neither is set)
@@ -388,6 +428,8 @@ The optional `federation` section of `~/.mempalace/config.json` controls routing
 Validation:
 - Duplicate `name` values across remotes fail config load.
 - `url` must parse as a valid `http` or `https` URL; other schemes fail config load.
+- A plain `http://` URL fails config load unless its host is `localhost`, `127.0.0.1`, or `::1`
+  — bearer tokens must not cross a non-loopback link unencrypted.
 
 #### `federation.default_mode`
 
@@ -417,26 +459,32 @@ Validation:
 
 ### Resolution Precedence
 
-Routes are resolved in this order (first match wins):
+Routes are resolved in this order (first match wins). The diary hard-override
+is checked **first** and short-circuits every rule below it — the code
+evaluates it before even looking at `federation.wings`, not as a final
+override layered on top of the other four steps:
 
-1. Explicit per-wing rule in `federation.wings`
-2. Project `mempalace.yaml` `routing` block for the wing declared in that file
-3. `federation.default_mode`
-4. `local` (hard default when no federation config is present)
-
-**Hard overrides — always local regardless of config:**
-The following are unconditionally resolved to local storage; any config rule that attempts to route them remote is warned about and ignored:
-- Wing `wing_agents`
-- Room `diary` (within any wing)
-- Any source whose name begins with `diary:` prefix
+1. **Diary hard-override — always local, regardless of config.** Any of: wing
+   `wing_agents`, room `diary` (within any wing), or a source whose name
+   begins with `diary:`. Unconditionally resolved to local storage; any
+   config rule that attempts to route diary content remote is warned about
+   and ignored.
+2. Explicit per-wing rule in `federation.wings`
+3. Project `mempalace.yaml` `routing` block for the wing declared in that file
+4. `federation.default_mode`
+5. `local` (hard default when no federation config is present)
 
 ### Validation Errors vs. Warnings
 
 Config load fails with a precise error message for:
 - Unknown remote reference in a routing rule (name not present in `federation.remotes`)
 - Duplicate remote names in `federation.remotes`
-- Non-`http`/`https` URL in a remote definition
+- Non-`http`/`https` URL in a remote definition, or a plain `http://` URL targeting a
+  non-loopback host
 - `remote` field missing or ambiguous when `mode` is `remote` or `combined` and multiple remotes are configured
+- (`server.token_file`, not a `federation.*` field, but the same fail-closed loading behaviour)
+  an `operations` entry in a token's `scopes` outside the closed enum — see
+  [Server Config → `server.token_file`](#servertoken_file)
 
 Config load succeeds with a warning (does not fail) for:
 - `token_env` set but the named environment variable is absent at startup

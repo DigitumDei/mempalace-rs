@@ -100,6 +100,11 @@ pub enum ServerError {
     /// Bearer token was missing, unrecognised, or disabled.
     #[error("unauthorized")]
     Unauthorized,
+    /// Bearer token is valid but its scopes do not permit the requested
+    /// operation or wing. Distinct from `Unauthorized`: this means "I know who
+    /// you are, and you may not do this," not "I don't know who you are."
+    #[error("forbidden")]
+    Forbidden,
     /// The requested resource was not found.
     #[error("not found: {0}")]
     NotFound(String),
@@ -167,6 +172,11 @@ impl IntoResponse for ServerError {
             Self::Unauthorized => {
                 (StatusCode::UNAUTHORIZED, "unauthorized", "missing or invalid token".to_owned())
             }
+            Self::Forbidden => (
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "token does not have the required scope for this operation".to_owned(),
+            ),
             Self::NotFound(msg) => (StatusCode::NOT_FOUND, "not_found", msg.clone()),
             Self::DiaryNotFederated => (
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -234,6 +244,89 @@ impl IntoResponse for ServerError {
 
 // ─── Token auth ──────────────────────────────────────────────────────────────
 
+/// A single scoped-access operation a bearer token may be granted.
+///
+/// Closed set: deserialization fails (and so does the whole token-file load —
+/// see [`TokenRegistry::read_file`]) on any string that is not one of these
+/// variants. That is deliberate — the registry already fails closed on
+/// malformed reloads, and a silently-ignored typo in a token file (e.g.
+/// `"reed"` instead of `"read"`) would otherwise grant less access than the
+/// operator intended without any signal.
+///
+/// `CoordinationRead`, `CoordinationWrite` and `CoordinationClaim` have no
+/// routes yet — they exist so the token file format is stable ahead of the
+/// coordination REST routes (issue #102 Stage 3), which will require them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Operation {
+    Read,
+    Write,
+    Delete,
+    Ingest,
+    CoordinationRead,
+    CoordinationWrite,
+    CoordinationClaim,
+}
+
+/// Raw (pre-normalisation) form of a token-file scope entry, as deserialized
+/// from JSON. See [`TokenScopeEntry`] for the normalised form used at
+/// authorization time.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct RawTokenScope {
+    wings: Vec<String>,
+    operations: Vec<Operation>,
+}
+
+/// A single scoped-access grant: a set of operations permitted on a set of
+/// wings. One token may carry several of these; a request is authorized if
+/// any one of them covers it.
+#[derive(Debug, Clone)]
+struct TokenScopeEntry {
+    /// Wings this grant covers. Normalised at load time with
+    /// [`WingId::normalized`] so `"myproject"` in the token file and
+    /// `"wing_myproject"` in a request are recognised as the same wing (see
+    /// `normalize_scope_wing`). The literal `"*"` is kept as-is and matches
+    /// every wing.
+    wings: Vec<String>,
+    /// Operations this grant permits.
+    operations: Vec<Operation>,
+}
+
+/// Normalises one `wings` entry from a token file. `"*"` is preserved
+/// verbatim; everything else goes through [`WingId::normalized`] so short
+/// forms (`"myproject"`) and prefixed forms (`"wing_myproject"`) in the token
+/// file resolve to the same wing a request names.
+fn normalize_scope_wing(raw: &str) -> Result<String, ServerError> {
+    let trimmed = raw.trim();
+    if trimmed == "*" {
+        return Ok("*".to_owned());
+    }
+    WingId::normalized(trimmed)
+        .map(|wing| wing.as_str().to_owned())
+        .map_err(|err| ServerError::TokenFile(format!("invalid wing `{raw}` in token scope: {err}")))
+}
+
+/// Wings visible to a token for a given operation. Returned by
+/// [`AuthIdentity::visible_wings`] and used by the aggregate routes (Group C:
+/// taxonomy, wings, rooms, changes) to *filter* their response to what the
+/// caller can see, rather than rejecting the request outright.
+enum WingVisibility {
+    /// Every wing is visible (unrestricted token, or a scope entry granting
+    /// the operation on `"*"`).
+    All,
+    /// Only these wings are visible.
+    Only(std::collections::BTreeSet<String>),
+}
+
+impl WingVisibility {
+    fn contains(&self, wing: &str) -> bool {
+        match self {
+            WingVisibility::All => true,
+            WingVisibility::Only(wings) => wings.contains(wing),
+        }
+    }
+}
+
 /// A single entry in the bearer-token file as stored on disk.
 #[derive(Debug, Clone, serde::Deserialize)]
 struct TokenEntry {
@@ -243,6 +336,14 @@ struct TokenEntry {
     name: String,
     /// If `false`, the token is treated as non-existent during auth.
     enabled: bool,
+    /// Scoped-access grants. `None` (the field absent, or explicit JSON
+    /// `null`) means the token predates scoping and keeps unrestricted
+    /// access — this grandfathering rule is what keeps existing
+    /// `server_tokens.json` files working unchanged. `Some(vec![])` — an
+    /// explicit empty array — is a deliberate lockout with no access at all,
+    /// and is NOT a synonym for absent.
+    #[serde(default)]
+    scopes: Option<Vec<RawTokenScope>>,
 }
 
 /// An in-memory token entry with its bearer token pre-hashed.
@@ -257,6 +358,9 @@ struct TokenRegistryEntry {
     enabled: bool,
     /// BLAKE3 hash of the bearer token.
     token_hash: blake3::Hash,
+    /// Resolved scopes; see [`TokenEntry::scopes`] for the `None` vs
+    /// `Some(vec![])` distinction.
+    scopes: Option<Vec<TokenScopeEntry>>,
 }
 
 /// In-memory registry of bearer tokens loaded from a JSON file.
@@ -303,10 +407,27 @@ impl TokenRegistry {
                     entry.name
                 )));
             }
+            let scopes = entry
+                .scopes
+                .map(|raw_scopes| {
+                    raw_scopes
+                        .into_iter()
+                        .map(|raw| {
+                            let wings = raw
+                                .wings
+                                .iter()
+                                .map(|w| normalize_scope_wing(w))
+                                .collect::<Result<Vec<_>, _>>()?;
+                            Ok(TokenScopeEntry { wings, operations: raw.operations })
+                        })
+                        .collect::<Result<Vec<_>, ServerError>>()
+                })
+                .transpose()?;
             entries.push(TokenRegistryEntry {
                 name: entry.name,
                 enabled: entry.enabled,
                 token_hash: blake3::hash(entry.token.as_bytes()),
+                scopes,
             });
         }
         let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
@@ -377,8 +498,9 @@ impl TokenRegistry {
     }
 
     /// Authenticates `presented` token using constant-time comparison on BLAKE3
-    /// hashes. Returns `Some(name)` for an enabled, matching token; `None` otherwise.
-    pub fn authenticate(&self, presented: &str) -> Option<String> {
+    /// hashes. Returns the resolved [`AuthIdentity`] (name plus scopes) for an
+    /// enabled, matching token; `None` otherwise.
+    pub fn authenticate(&self, presented: &str) -> Option<AuthIdentity> {
         if presented.trim().is_empty() {
             return None;
         }
@@ -391,7 +513,7 @@ impl TokenRegistry {
             }
             let eq: bool = presented_hash.as_bytes().ct_eq(entry.token_hash.as_bytes()).into();
             if eq {
-                return Some(entry.name.clone());
+                return Some(AuthIdentity(entry.name.clone(), entry.scopes.clone()));
             }
         }
         None
@@ -399,11 +521,73 @@ impl TokenRegistry {
 }
 
 /// Extension type inserted into axum request extensions by the auth middleware.
+///
+/// Widened for scoped tokens (issue #102 Stage 2) to carry the token's
+/// resolved scopes alongside its identity name. The identity string stays the
+/// first tuple field so existing call sites (`auth.0.0`, used for `added_by`
+/// and `ChangeEvent.actor` provenance) keep compiling unchanged.
 #[derive(Debug, Clone)]
 pub struct AuthIdentity(
     /// The authenticated identity name.
     pub String,
+    /// Resolved scopes. `None` means unrestricted (grandfathered); see
+    /// [`TokenEntry::scopes`] for the full `None` vs `Some(vec![])` rule.
+    Option<Vec<TokenScopeEntry>>,
 );
+
+impl AuthIdentity {
+    /// The authenticated identity name.
+    pub fn name(&self) -> &str {
+        &self.0
+    }
+
+    /// True when this identity may perform `op` at all, independent of wing.
+    ///
+    /// This is the check used for operations with no wing concept (Group D:
+    /// the KG routes — KG facts are entity-scoped, not wing-scoped, matching
+    /// `resolve_kg_route` in `mempalace-config`, which deliberately skips the
+    /// wing lookup entirely) and as the coarse per-route gate applied by
+    /// `operation_gate` before any wing-specific check runs: a scope entry
+    /// grants the operation if it appears in its `operations` list, no matter
+    /// which wings that entry covers.
+    fn allows_operation(&self, op: Operation) -> bool {
+        match &self.1 {
+            None => true,
+            Some(scopes) => scopes.iter().any(|s| s.operations.contains(&op)),
+        }
+    }
+
+    /// True when this identity may perform `op` specifically on `wing`.
+    fn allows_wing(&self, op: Operation, wing: &str) -> bool {
+        match &self.1 {
+            None => true,
+            Some(scopes) => scopes.iter().any(|s| {
+                s.operations.contains(&op) && s.wings.iter().any(|w| w == "*" || w == wing)
+            }),
+        }
+    }
+
+    /// The set of wings visible to this identity for `op`. Used by aggregate
+    /// (Group C) routes to filter their response rather than reject it.
+    fn visible_wings(&self, op: Operation) -> WingVisibility {
+        match &self.1 {
+            None => WingVisibility::All,
+            Some(scopes) => {
+                let mut wings = std::collections::BTreeSet::new();
+                for scope in scopes {
+                    if !scope.operations.contains(&op) {
+                        continue;
+                    }
+                    if scope.wings.iter().any(|w| w == "*") {
+                        return WingVisibility::All;
+                    }
+                    wings.extend(scope.wings.iter().cloned());
+                }
+                WingVisibility::Only(wings)
+            }
+        }
+    }
+}
 
 // ─── Server state ─────────────────────────────────────────────────────────────
 
@@ -579,33 +763,63 @@ where
     // Unauthenticated routes
     let public = Router::new().route("/v1/health", get(route_health));
 
-    // Authenticated routes — wrapped with the auth middleware.
+    // Authenticated routes — wrapped with the auth middleware, and each with a
+    // per-route operation gate (see "Route authorization" below) declaring the
+    // operation that route requires. `/v1/info` carries no gate: any
+    // authenticated token may call it.
     //
     // The ingest/batch route gets a 16 MiB body limit (vs axum's 2 MiB default)
     // and is merged in as a separate sub-router so the limit is scoped to it
     // only; all other routes keep the default.
     let ingest_route = Router::new()
-        .route("/v1/ingest/batch", post(route_ingest_batch::<P>))
+        .route(
+            "/v1/ingest/batch",
+            post(route_ingest_batch::<P>).layer(middleware::from_fn(require_ingest)),
+        )
         .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
         .layer(middleware::from_fn_with_state(Arc::clone(&state), auth_middleware::<P>));
 
     let protected = Router::new()
         .route("/v1/info", get(route_info::<P>))
-        .route("/v1/drawers/search", post(route_drawers_search::<P>))
-        .route("/v1/drawers/check_duplicate", post(route_drawers_check_duplicate::<P>))
-        .route("/v1/drawers", post(route_drawers_add::<P>))
-        .route("/v1/drawers", get(route_drawers_list::<P>))
-        .route("/v1/drawers/{id}", get(route_drawers_get::<P>))
-        .route("/v1/drawers/{id}", delete(route_drawers_delete::<P>))
-        .route("/v1/kg/query", post(route_kg_query::<P>))
-        .route("/v1/kg/facts", post(route_kg_add::<P>))
-        .route("/v1/kg/facts/invalidate", post(route_kg_invalidate::<P>))
-        .route("/v1/kg/timeline", get(route_kg_timeline::<P>))
-        .route("/v1/kg/stats", get(route_kg_stats::<P>))
-        .route("/v1/taxonomy", get(route_taxonomy::<P>))
-        .route("/v1/wings", get(route_wings::<P>))
-        .route("/v1/rooms", get(route_rooms::<P>))
-        .route("/v1/changes", get(route_changes::<P>))
+        .route(
+            "/v1/drawers/search",
+            post(route_drawers_search::<P>).layer(middleware::from_fn(require_read)),
+        )
+        .route(
+            "/v1/drawers/check_duplicate",
+            post(route_drawers_check_duplicate::<P>).layer(middleware::from_fn(require_read)),
+        )
+        .route(
+            "/v1/drawers",
+            post(route_drawers_add::<P>).layer(middleware::from_fn(require_write)),
+        )
+        .route(
+            "/v1/drawers",
+            get(route_drawers_list::<P>).layer(middleware::from_fn(require_read)),
+        )
+        .route(
+            "/v1/drawers/{id}",
+            get(route_drawers_get::<P>).layer(middleware::from_fn(require_read)),
+        )
+        .route(
+            "/v1/drawers/{id}",
+            delete(route_drawers_delete::<P>).layer(middleware::from_fn(require_delete)),
+        )
+        .route("/v1/kg/query", post(route_kg_query::<P>).layer(middleware::from_fn(require_read)))
+        .route("/v1/kg/facts", post(route_kg_add::<P>).layer(middleware::from_fn(require_write)))
+        .route(
+            "/v1/kg/facts/invalidate",
+            post(route_kg_invalidate::<P>).layer(middleware::from_fn(require_write)),
+        )
+        .route(
+            "/v1/kg/timeline",
+            get(route_kg_timeline::<P>).layer(middleware::from_fn(require_read)),
+        )
+        .route("/v1/kg/stats", get(route_kg_stats::<P>).layer(middleware::from_fn(require_read)))
+        .route("/v1/taxonomy", get(route_taxonomy::<P>).layer(middleware::from_fn(require_read)))
+        .route("/v1/wings", get(route_wings::<P>).layer(middleware::from_fn(require_read)))
+        .route("/v1/rooms", get(route_rooms::<P>).layer(middleware::from_fn(require_read)))
+        .route("/v1/changes", get(route_changes::<P>).layer(middleware::from_fn(require_read)))
         .layer(middleware::from_fn_with_state(Arc::clone(&state), auth_middleware::<P>));
 
     let router = public.merge(protected).merge(ingest_route).with_state(Arc::clone(&state));
@@ -630,9 +844,61 @@ where
 
     match token.and_then(|t| state.tokens.authenticate(t)) {
         Some(identity) => {
-            request.extensions_mut().insert(AuthIdentity(identity));
+            request.extensions_mut().insert(identity);
             next.run(request).await
         }
+        None => ServerError::Unauthorized.into_response(),
+    }
+}
+
+// ─── Route authorization ───────────────────────────────────────────────────────
+//
+// Two layers do the work, matching the route groups in
+// docs/Coordination-Phase-3-Design.md (Stage 2):
+//
+// 1. Operation gate (this section) — attached per-route via
+//    `MethodRouter::layer` above, so the required operation is declared right
+//    next to the route registration rather than threaded through every
+//    handler signature. It runs after `auth_middleware` (which has already
+//    inserted `AuthIdentity` into the request extensions) and rejects with
+//    403 before the handler runs at all if the identity is not granted the
+//    operation by any scope entry. This alone is sufficient for routes with
+//    no wing concept at all (Group D: the KG routes).
+// 2. Wing check inside the handler — for routes where the wing is only known
+//    once the body is parsed or a resource is looked up (Group A-body:
+//    `POST /v1/drawers`, `POST /v1/ingest/batch`; Group B: get/delete by id),
+//    or where the route aggregates across wings and must filter its response
+//    rather than reject the request (Group C: taxonomy/wings/rooms/changes,
+//    and — despite having no wing in its own request — `check_duplicate`,
+//    because its response can still reveal which wing a match lives in).
+//    These call `AuthIdentity::allows_wing` or `AuthIdentity::visible_wings`
+//    directly inside the handler; see each one.
+
+async fn require_read(request: Request<Body>, next: Next) -> Response {
+    operation_gate(Operation::Read, request, next).await
+}
+
+async fn require_write(request: Request<Body>, next: Next) -> Response {
+    operation_gate(Operation::Write, request, next).await
+}
+
+async fn require_delete(request: Request<Body>, next: Next) -> Response {
+    operation_gate(Operation::Delete, request, next).await
+}
+
+async fn require_ingest(request: Request<Body>, next: Next) -> Response {
+    operation_gate(Operation::Ingest, request, next).await
+}
+
+/// Shared implementation for the per-route operation gates above. A missing
+/// `AuthIdentity` extension falls back to 401 defensively; it should be
+/// unreachable in practice because every route these gates are attached to
+/// also runs behind `auth_middleware`, which always runs first (see
+/// `build_router`) and rejects unauthenticated requests before routing.
+async fn operation_gate(op: Operation, request: Request<Body>, next: Next) -> Response {
+    match request.extensions().get::<AuthIdentity>() {
+        Some(identity) if identity.allows_operation(op) => next.run(request).await,
+        Some(_) => ServerError::Forbidden.into_response(),
         None => ServerError::Unauthorized.into_response(),
     }
 }
@@ -752,6 +1018,7 @@ where
 
 async fn route_drawers_search<P>(
     State(state): State<Arc<ServerState<P>>>,
+    auth: axum::extract::Extension<AuthIdentity>,
     Json(body): Json<DrawerSearchRequest>,
 ) -> Result<impl IntoResponse, ServerError>
 where
@@ -769,6 +1036,17 @@ where
     let wing = body.wing.as_deref().map(WingId::new).transpose()?;
     let room = body.room.as_deref().map(RoomId::new).transpose()?;
     let view = body.view.clone();
+
+    // Group A: wing is optional here. When given, it must be authorized
+    // outright (403 on mismatch). When absent this is a cross-wing read, so
+    // instead of rejecting we filter the results below to what the token can
+    // see (Group C-style filtering), matching Group A's documented rule.
+    if let Some(w) = &wing {
+        if !auth.0.allows_wing(Operation::Read, w.as_str()) {
+            return Err(ServerError::Forbidden);
+        }
+    }
+    let visibility = wing.is_none().then(|| auth.0.visible_wings(Operation::Read));
 
     let results = {
         let mut search = state.search.lock().await;
@@ -790,6 +1068,7 @@ where
     let results: Vec<RemoteDrawerResult> = results
         .into_iter()
         .filter(|r| !is_diary_wing_or_room(r.wing.as_str(), r.room.as_str()))
+        .filter(|r| visibility.as_ref().map(|v| v.contains(r.wing.as_str())).unwrap_or(true))
         .enumerate()
         .map(|(index, result)| RemoteDrawerResult {
             drawer_id: result
@@ -823,14 +1102,15 @@ async fn route_drawers_add<P>(
 where
     P: EmbeddingProvider + Send + Sync + 'static,
 {
-    let identity = auth.0.0;
     if body.content.len() > MAX_DRAWER_CONTENT_BYTES {
         return Err(ServerError::InvalidParams(format!(
             "content must be at most {MAX_DRAWER_CONTENT_BYTES} bytes"
         )));
     }
 
-    // Reject diary-shaped writes
+    // Reject diary-shaped writes. A content rule, not an identity rule: it
+    // runs before and independent of the scope check below, and applies
+    // regardless of what the token is scoped to.
     if is_diary_wing_or_room(&body.wing, &body.room) {
         return Err(ServerError::DiaryNotFederated);
     }
@@ -842,6 +1122,13 @@ where
 
     let wing = WingId::new(&body.wing)?;
     let room = RoomId::new(&body.room)?;
+
+    // Group A: wing is required and body-derived, so it can only be checked
+    // here, not in the per-route operation gate.
+    if !auth.0.allows_wing(Operation::Write, wing.as_str()) {
+        return Err(ServerError::Forbidden);
+    }
+    let identity = auth.0.0;
 
     // Duplicate check
     let duplicates = find_duplicates(&state, &body.content, DEFAULT_DUPLICATE_THRESHOLD).await?;
@@ -906,6 +1193,7 @@ where
 
 async fn route_drawers_check_duplicate<P>(
     State(state): State<Arc<ServerState<P>>>,
+    auth: axum::extract::Extension<AuthIdentity>,
     Json(body): Json<CheckDuplicateRequest>,
 ) -> Result<impl IntoResponse, ServerError>
 where
@@ -917,15 +1205,26 @@ where
         )));
     }
 
+    // Group C, not operation-only: there is no wing in the request (the
+    // whole point is to search across all of them), so this is authorized
+    // like the aggregate routes — require `read` (enforced by the per-route
+    // gate before this handler runs), then filter matches to visible wings
+    // rather than reject. Without this a scoped token could post arbitrary
+    // content and learn, from the returned `matches` (which carry `wing` and
+    // `room`) or even just the `is_duplicate` boolean, whether near-identical
+    // content exists in a wing it cannot read — so `is_duplicate` below is
+    // computed strictly AFTER filtering, not before.
+    let visibility = auth.0.visible_wings(Operation::Read);
+
     let threshold = body.threshold.unwrap_or(DEFAULT_DUPLICATE_THRESHOLD);
     let matches = find_duplicates(&state, &body.content, threshold).await?;
-    // Filter diary matches
+    // Filter diary matches and matches outside the token's visible wings.
     let matches: Vec<Value> = matches
         .into_iter()
         .filter(|m| {
             let wing = m.get("wing").and_then(Value::as_str).unwrap_or("");
             let room = m.get("room").and_then(Value::as_str).unwrap_or("");
-            !is_diary_wing_or_room(wing, room)
+            !is_diary_wing_or_room(wing, room) && visibility.contains(wing)
         })
         .collect();
     let is_duplicate = !matches.is_empty();
@@ -936,6 +1235,7 @@ where
 
 async fn route_drawers_get<P>(
     State(state): State<Arc<ServerState<P>>>,
+    auth: axum::extract::Extension<AuthIdentity>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ServerError>
 where
@@ -950,6 +1250,14 @@ where
         .ok_or_else(|| ServerError::NotFound(format!("drawer {id} not found")))?;
 
     if is_diary_wing_or_room(drawer.wing.as_str(), drawer.room.as_str()) {
+        return Err(ServerError::NotFound(format!("drawer {id} not found")));
+    }
+
+    // Group B: the wing is only known after this lookup. A caller without
+    // read access to it gets the same 404 as a genuinely missing drawer
+    // (matching the diary masking immediately above), so the response is
+    // never an existence oracle for wings the caller cannot see.
+    if !auth.0.allows_wing(Operation::Read, drawer.wing.as_str()) {
         return Err(ServerError::NotFound(format!("drawer {id} not found")));
     }
 
@@ -970,7 +1278,6 @@ async fn route_drawers_delete<P>(
 where
     P: EmbeddingProvider + Send + Sync + 'static,
 {
-    let identity = auth.0.0;
     let drawer_id = DrawerId::new(&id)?;
 
     // Check the drawer exists and is not a diary drawer
@@ -985,6 +1292,13 @@ where
         return Err(ServerError::NotFound(format!("drawer {id} not found")));
     }
 
+    // Group B: the wing is only known after the lookup above. Masked as 404,
+    // not 403 — see the identical rule and rationale in `route_drawers_get`.
+    if !auth.0.allows_wing(Operation::Delete, drawer.wing.as_str()) {
+        return Err(ServerError::NotFound(format!("drawer {id} not found")));
+    }
+    let identity = auth.0.0;
+
     let deleted =
         state.storage.drawer_store().delete_drawers(std::slice::from_ref(&drawer_id)).await?;
 
@@ -997,7 +1311,11 @@ where
         occurred_at: OffsetDateTime::now_utc(),
         entity_id: id,
         actor: Some(identity),
-        details_json: None,
+        // wing/room recorded so `/v1/changes` (Group C) can filter deletion
+        // events by scope the same way it already filters `drawer_added`.
+        details_json: Some(
+            json!({"wing": drawer.wing.as_str(), "room": drawer.room.as_str()}).to_string(),
+        ),
     })?;
 
     Ok(Json(json!({"success": true})))
@@ -1007,6 +1325,7 @@ where
 
 async fn route_drawers_list<P>(
     State(state): State<Arc<ServerState<P>>>,
+    auth: axum::extract::Extension<AuthIdentity>,
     Query(params): Query<ListDrawersQuery>,
 ) -> Result<impl IntoResponse, ServerError>
 where
@@ -1016,12 +1335,22 @@ where
     let wing = params.wing.as_deref().map(WingId::new).transpose()?;
     let room = params.room.as_deref().map(RoomId::new).transpose()?;
 
-    // Over-fetch from storage to compensate for diary rows that are filtered
-    // out below — otherwise a page whose first `limit` rows contain diary
-    // entries would silently return fewer than `limit` non-diary results to
-    // the client, with no cursor to continue from.  The 2x factor is a
-    // heuristic; if diary entries ever exceed it the result will be shorter
-    // than `limit`, but that is rare and strictly better than the
+    // Group A: wing is optional here, from the query string (same rule as
+    // search's body-derived wing). Enforce outright when given; when absent,
+    // filter below instead of rejecting.
+    if let Some(w) = &wing {
+        if !auth.0.allows_wing(Operation::Read, w.as_str()) {
+            return Err(ServerError::Forbidden);
+        }
+    }
+    let visibility = wing.is_none().then(|| auth.0.visible_wings(Operation::Read));
+
+    // Over-fetch from storage to compensate for diary rows and scope-invisible
+    // rows that are filtered out below — otherwise a page whose first `limit`
+    // rows contain filtered entries would silently return fewer than `limit`
+    // results to the client, with no cursor to continue from.  The 2x factor
+    // is a heuristic; if filtered entries ever exceed it the result will be
+    // shorter than `limit`, but that is rare and strictly better than the
     // unbounded-load-all-then-take approach.
     let storage_limit = limit.saturating_mul(2);
     let drawers = state
@@ -1038,6 +1367,7 @@ where
     let mut drawers_filtered: Vec<DrawerRecord> = drawers
         .into_iter()
         .filter(|d| !is_diary_wing_or_room(d.wing.as_str(), d.room.as_str()))
+        .filter(|d| visibility.as_ref().map(|v| v.contains(d.wing.as_str())).unwrap_or(true))
         .take(limit)
         .collect();
 
@@ -1237,15 +1567,24 @@ where
 
 async fn route_taxonomy<P>(
     State(state): State<Arc<ServerState<P>>>,
+    auth: axum::extract::Extension<AuthIdentity>,
 ) -> Result<impl IntoResponse, ServerError>
 where
     P: EmbeddingProvider + Send + Sync + 'static,
 {
+    // Group C: require read (enforced by the per-route gate before this
+    // handler runs), then filter to the wings the token can see rather than
+    // rejecting outright — a token scoped to one wing must get that wing's
+    // taxonomy, not a 403.
+    let visibility = auth.0.visible_wings(Operation::Read);
     let drawers = state.storage.drawer_store().list_drawers(&DrawerFilter::default()).await?;
     let mut taxonomy =
         std::collections::BTreeMap::<String, std::collections::BTreeMap<String, usize>>::new();
     for drawer in &drawers {
         if is_diary_wing_or_room(drawer.wing.as_str(), drawer.room.as_str()) {
+            continue;
+        }
+        if !visibility.contains(drawer.wing.as_str()) {
             continue;
         }
         *taxonomy
@@ -1261,14 +1600,20 @@ where
 
 async fn route_wings<P>(
     State(state): State<Arc<ServerState<P>>>,
+    auth: axum::extract::Extension<AuthIdentity>,
 ) -> Result<impl IntoResponse, ServerError>
 where
     P: EmbeddingProvider + Send + Sync + 'static,
 {
+    // Group C filtering — see the identical comment in `route_taxonomy`.
+    let visibility = auth.0.visible_wings(Operation::Read);
     let drawers = state.storage.drawer_store().list_drawers(&DrawerFilter::default()).await?;
     let mut wings = std::collections::BTreeMap::<String, usize>::new();
     for drawer in &drawers {
         if is_diary_wing_or_room(drawer.wing.as_str(), drawer.room.as_str()) {
+            continue;
+        }
+        if !visibility.contains(drawer.wing.as_str()) {
             continue;
         }
         *wings.entry(drawer.wing.as_str().to_owned()).or_default() += 1;
@@ -1287,11 +1632,16 @@ pub struct RoomsQuery {
 
 async fn route_rooms<P>(
     State(state): State<Arc<ServerState<P>>>,
+    auth: axum::extract::Extension<AuthIdentity>,
     Query(params): Query<RoomsQuery>,
 ) -> Result<impl IntoResponse, ServerError>
 where
     P: EmbeddingProvider + Send + Sync + 'static,
 {
+    // Group C filtering — see the identical comment in `route_taxonomy`. This
+    // applies even when the caller passes an explicit `?wing=`: a mismatched
+    // scope filters the result to empty rather than rejecting the request.
+    let visibility = auth.0.visible_wings(Operation::Read);
     let wing = params.wing.as_deref().map(WingId::new).transpose()?;
     let drawers = state
         .storage
@@ -1301,6 +1651,9 @@ where
     let mut rooms = std::collections::BTreeMap::<String, usize>::new();
     for drawer in &drawers {
         if is_diary_wing_or_room(drawer.wing.as_str(), drawer.room.as_str()) {
+            continue;
+        }
+        if !visibility.contains(drawer.wing.as_str()) {
             continue;
         }
         *rooms.entry(drawer.room.as_str().to_owned()).or_default() += 1;
@@ -1315,11 +1668,17 @@ where
 
 async fn route_changes<P>(
     State(state): State<Arc<ServerState<P>>>,
+    auth: axum::extract::Extension<AuthIdentity>,
     Query(params): Query<ChangesQuery>,
 ) -> Result<impl IntoResponse, ServerError>
 where
     P: EmbeddingProvider + Send + Sync + 'static,
 {
+    // Group C filtering — see the comment in `route_taxonomy`. This is the
+    // federated change feed, so it matters most here: a token scoped to one
+    // wing must not see other wings' events go by.
+    let visibility = auth.0.visible_wings(Operation::Read);
+
     let limit = params.limit.unwrap_or(DEFAULT_PAGE_LIMIT).max(1).min(MAX_PAGE_LIMIT);
 
     let since = params
@@ -1344,6 +1703,7 @@ where
         .events
         .into_iter()
         .filter(|ev| !is_diary_change_event(ev))
+        .filter(|ev| change_event_visible(ev, &visibility))
         .map(change_event_to_dto)
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -1360,15 +1720,23 @@ async fn route_ingest_batch<P>(
 where
     P: EmbeddingProvider + Send + Sync + 'static,
 {
-    let identity = auth.0.0;
-
     // ── Validate wing ──────────────────────────────────────────────────────────
     let wing = WingId::new(&body.wing)?;
 
     // ── Diary guard: wing-level ───────────────────────────────────────────────
+    // A content rule, not an identity rule — runs before and independent of
+    // the scope check below, regardless of what the token is scoped to.
     if is_diary_wing_or_room(wing.as_str(), "") {
         return Err(ServerError::DiaryNotFederated);
     }
+
+    // ── Scope check ────────────────────────────────────────────────────────────
+    // Group A: wing is required and body-derived, so — like `POST /v1/drawers`
+    // — it can only be checked here, not in the per-route operation gate.
+    if !auth.0.allows_wing(Operation::Ingest, wing.as_str()) {
+        return Err(ServerError::Forbidden);
+    }
+    let identity = auth.0.0;
 
     // ── Request-level validation ──────────────────────────────────────────────
     if body.files.is_empty() {
@@ -1906,6 +2274,74 @@ fn is_diary_change_event(event: &ChangeEvent) -> bool {
     false
 }
 
+/// Best-effort wing extraction for `route_changes`'s Group C scope filtering.
+///
+/// Only a subset of change-log event types carry wing information: drawer
+/// writes/deletes record it in `details_json.wing`, and mined-batch events
+/// record it as the `mine_batch:{wing}` prefix of `entity_id` (parseable
+/// safely because a `WingId` never contains `:`). Event types with no wing
+/// concept at all return `None` here — see [`WINGLESS_EVENT_TYPES`] and
+/// [`change_event_visible`] for how `None` is handled; this function only
+/// extracts, it does not decide visibility.
+fn change_event_wing(event: &ChangeEvent) -> Option<String> {
+    if let Some(wing) = event.entity_id.strip_prefix("mine_batch:") {
+        return Some(wing.to_owned());
+    }
+    let details = event.details_json.as_deref()?;
+    let value: Value = serde_json::from_str(details).ok()?;
+    value.get("wing").and_then(Value::as_str).map(str::to_owned)
+}
+
+/// Change-log event types with no wing concept at all — palace-level or
+/// agent-level, never wing-scoped anywhere else in the system. These are the
+/// only event types allowed to stay visible to a scoped token when
+/// [`change_event_wing`] cannot determine a wing, matching the same
+/// entity-scoped-not-wing-scoped rationale the Group D KG routes use (see
+/// `route_kg_query` and friends).
+///
+/// This list must stay in sync with every event type actually written via
+/// `append_event`/`log_change` across the workspace that does not carry a
+/// wing. Adding a new wingless event type elsewhere means adding it here too;
+/// forgetting to would make it wrongly disappear from a scoped token's feed,
+/// which is the safe direction to fail in — see `change_event_visible`.
+const WINGLESS_EVENT_TYPES: &[&str] = &[
+    "kg_fact_added",
+    "kg_fact_invalidated",
+    "identity_updated",
+    "lineage_set",
+    "lineage_migration_recorded",
+    "self_observation_proposed",
+    "self_observation_reviewed",
+];
+
+/// Whether `event` is visible to a token with the given `visibility`, for
+/// `route_changes`'s Group C filtering.
+///
+/// Fails **closed**: when [`change_event_wing`] cannot determine a wing, the
+/// event is hidden from a scoped token unless its `event_type` is on
+/// [`WINGLESS_EVENT_TYPES`]. An unrestricted token (`WingVisibility::All` —
+/// absent `scopes`, or a scope entry granting `read` on `"*"`) still sees
+/// everything regardless, so grandfathering is unaffected.
+///
+/// This matters because not every writer of `drawer_deleted` events records a
+/// wing (older events, and some remote-fallback paths in `mempalace-mcp`,
+/// have no local record of it to record), and because `entity_id` alone can
+/// leak a wing in plaintext — drawer ids built by `mined_drawer_id`
+/// (`crates/mempalace-core/src/hash.rs`) embed `{wing}/{room}/...` directly.
+/// Defaulting an unrecognised shape to "visible" would hand a scoped token
+/// exactly the cross-wing leak scoping exists to prevent, so the default here
+/// is the opposite of `change_event_wing`'s old (and wrong) fail-open
+/// behaviour.
+fn change_event_visible(event: &ChangeEvent, visibility: &WingVisibility) -> bool {
+    match change_event_wing(event) {
+        Some(wing) => visibility.contains(&wing),
+        None => {
+            matches!(visibility, WingVisibility::All)
+                || WINGLESS_EVENT_TYPES.contains(&event.event_type.as_str())
+        }
+    }
+}
+
 /// Converts a storage `ChangeEvent` to the federation wire DTO.
 fn change_event_to_dto(event: ChangeEvent) -> Result<ChangeEventDto, ServerError> {
     let details = event.details_json.as_deref().map(serde_json::from_str::<Value>).transpose()?;
@@ -2178,6 +2614,22 @@ mod tests {
     const ALICE_TOKEN: &str = "alice-secret-token";
     const BOB_TOKEN: &str = "bob-secret-token";
     const BAD_TOKEN: &str = "bad-token-xyz";
+    // Scoped-token fixtures (issue #102 Stage 2). `alice` above stays
+    // unrestricted (no `scopes` field) and is the grandfathering baseline;
+    // these add the scope shapes the authorization tests below need.
+    /// Scoped to `wing_alpha` only, with every operation used by the routes
+    /// that exist in Stage 2 (`coordination_*` excluded — no routes yet).
+    const SCOPED_ALPHA_TOKEN: &str = "scoped-alpha-secret-token";
+    /// Scoped to `wing_alpha` only, `read` alone — for wrong-operation checks.
+    const READONLY_ALPHA_TOKEN: &str = "readonly-alpha-secret-token";
+    /// Explicit `"scopes": []` — a deliberate lockout, distinct from a token
+    /// with no `scopes` field at all.
+    const LOCKED_TOKEN: &str = "locked-secret-token";
+    /// Scoped to `"*"` (every wing), `read` only.
+    const WILDCARD_TOKEN: &str = "wildcard-secret-token";
+    /// Scoped to the short-form wing name `"myproject"`, which normalizes to
+    /// `wing_myproject` at load time.
+    const SHORT_WING_TOKEN: &str = "short-wing-secret-token";
 
     fn restrict_token_file(path: &std::path::Path) {
         #[cfg(unix)]
@@ -2219,15 +2671,8 @@ mod tests {
 
         // Write token file
         let token_file = tempdir.path().join("tokens.json");
-        std::fs::write(
-            &token_file,
-            serde_json::to_string(&serde_json::json!([
-                {"token": ALICE_TOKEN, "name": "alice", "enabled": true},
-                {"token": BOB_TOKEN, "name": "bob", "enabled": false},
-            ]))
-            .unwrap(),
-        )
-        .unwrap();
+        std::fs::write(&token_file, serde_json::to_string(&default_tokens_json()).unwrap())
+            .unwrap();
         restrict_token_file(&token_file);
 
         let config = MempalaceConfig {
@@ -2252,6 +2697,37 @@ mod tests {
         let provider = DeterministicStubProvider::new(EmbeddingProfile::Balanced);
         let (router, state) = build_router(config, provider, tokens).await.unwrap();
         Harness { router, state, _tempdir: tempdir }
+    }
+
+    /// The token-file fixture shared by every test in this module (extended
+    /// in Stage 2 with scoped entries — see the constants above). Factored
+    /// out so the hot-reload test can rewrite just one token's scopes on disk
+    /// without hand-duplicating the rest of the fixture.
+    fn default_tokens_json() -> Value {
+        serde_json::json!([
+            {"token": ALICE_TOKEN, "name": "alice", "enabled": true},
+            {"token": BOB_TOKEN, "name": "bob", "enabled": false},
+            {
+                "token": SCOPED_ALPHA_TOKEN, "name": "scoped_alpha", "enabled": true,
+                "scopes": [{
+                    "wings": ["wing_alpha"],
+                    "operations": ["read", "write", "delete", "ingest"],
+                }],
+            },
+            {
+                "token": READONLY_ALPHA_TOKEN, "name": "readonly_alpha", "enabled": true,
+                "scopes": [{"wings": ["wing_alpha"], "operations": ["read"]}],
+            },
+            {"token": LOCKED_TOKEN, "name": "locked", "enabled": true, "scopes": []},
+            {
+                "token": WILDCARD_TOKEN, "name": "wildcard", "enabled": true,
+                "scopes": [{"wings": ["*"], "operations": ["read"]}],
+            },
+            {
+                "token": SHORT_WING_TOKEN, "name": "short_wing", "enabled": true,
+                "scopes": [{"wings": ["myproject"], "operations": ["read", "write"]}],
+            },
+        ])
     }
 
     /// Helper: build a JSON request with bearer auth.
@@ -2360,12 +2836,12 @@ mod tests {
         .unwrap();
         restrict_token_file(&token_file);
         let registry = TokenRegistry::load(token_file.clone()).unwrap();
-        assert_eq!(registry.authenticate(ALICE_TOKEN).as_deref(), Some("alice"));
-        assert_eq!(registry.authenticate(""), None);
+        assert_eq!(registry.authenticate(ALICE_TOKEN).as_ref().map(AuthIdentity::name), Some("alice"));
+        assert!(registry.authenticate("").is_none());
 
         std::thread::sleep(std::time::Duration::from_millis(1100));
         std::fs::write(&token_file, "not valid json").unwrap();
-        assert_eq!(registry.authenticate(ALICE_TOKEN), None);
+        assert!(registry.authenticate(ALICE_TOKEN).is_none());
     }
 
     #[test]
@@ -2382,13 +2858,13 @@ mod tests {
         .unwrap();
         restrict_token_file(&token_file);
         let registry = TokenRegistry::load(token_file.clone()).unwrap();
-        assert_eq!(registry.authenticate(ALICE_TOKEN).as_deref(), Some("alice"));
+        assert_eq!(registry.authenticate(ALICE_TOKEN).as_ref().map(AuthIdentity::name), Some("alice"));
 
         std::thread::sleep(std::time::Duration::from_millis(1100));
         std::fs::remove_file(&token_file).unwrap();
         std::fs::create_dir(&token_file).unwrap();
         restrict_token_file(&token_file);
-        assert_eq!(registry.authenticate(ALICE_TOKEN), None);
+        assert!(registry.authenticate(ALICE_TOKEN).is_none());
         {
             let guard = registry.inner.read().unwrap();
             assert!(guard.entries.is_empty());
@@ -2405,7 +2881,7 @@ mod tests {
         )
         .unwrap();
         restrict_token_file(&token_file);
-        assert_eq!(registry.authenticate(ALICE_TOKEN).as_deref(), Some("alice"));
+        assert_eq!(registry.authenticate(ALICE_TOKEN).as_ref().map(AuthIdentity::name), Some("alice"));
     }
 
     // ─── 3. Add + search + get ────────────────────────────────────────────────
@@ -2774,6 +3250,763 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    // ─── Scoped-token authorization (issue #102 Stage 2) ─────────────────────
+
+    /// Seeds one drawer in `wing_alpha` (room `alpha-room`) and one in
+    /// `wing_beta` (room `beta-room`) via the unrestricted `alice` token, for
+    /// Group C filtering tests and Group B wrong/right-wing tests. Returns
+    /// the two drawer ids `(alpha_id, beta_id)`.
+    async fn seed_two_wings(harness: &Harness) -> (String, String) {
+        let mut ids = Vec::with_capacity(2);
+        for (wing, room, content) in [
+            ("wing_alpha", "alpha-room", "alpha wing content about rust programming patterns"),
+            ("wing_beta", "beta-room", "beta wing content about javascript tooling ecosystems"),
+        ] {
+            let resp = harness
+                .router
+                .clone()
+                .oneshot(authed_json_request(
+                    Method::POST,
+                    "/v1/drawers",
+                    ALICE_TOKEN,
+                    json!({"wing": wing, "room": room, "content": content}),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "seeding {wing} failed");
+            let body = body_json(resp).await;
+            ids.push(body["drawer_id"].as_str().unwrap().to_owned());
+        }
+        (ids[0].clone(), ids[1].clone())
+    }
+
+    // Grandfathering (absent `scopes` = unrestricted), one route per group.
+
+    #[tokio::test]
+    async fn grandfathered_token_covers_group_a_write() {
+        let harness = make_harness().await;
+        let resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/drawers",
+                ALICE_TOKEN,
+                json!({"wing": "wing_any", "room": "r", "content": "grandfathering group a write proof"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn grandfathered_token_covers_group_b_get() {
+        let harness = make_harness().await;
+        let add_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/drawers",
+                ALICE_TOKEN,
+                json!({"wing": "wing_any", "room": "r", "content": "grandfathering group b get proof"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(add_resp.status(), StatusCode::OK);
+        let drawer_id = body_json(add_resp).await["drawer_id"].as_str().unwrap().to_owned();
+
+        let get_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_get(&format!("/v1/drawers/{drawer_id}"), ALICE_TOKEN))
+            .await
+            .unwrap();
+        assert_eq!(get_resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn grandfathered_token_covers_group_d_kg_query() {
+        let harness = make_harness().await;
+        let resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/kg/query",
+                ALICE_TOKEN,
+                json!({"entity": "GrandfatherProof", "direction": "outgoing"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+    // Group C's grandfathering is covered by the `alice` assertions inside
+    // the `group_c_*_filters_to_visible_wings` tests below.
+
+    // `scopes: []` is a deliberate lockout, distinct from absent `scopes`.
+
+    #[tokio::test]
+    async fn empty_scopes_denied_distinct_from_absent_scopes() {
+        let harness = make_harness().await;
+
+        // Absent scopes (alice): unrestricted.
+        let alice_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/kg/query",
+                ALICE_TOKEN,
+                json!({"entity": "ScopeDistinctionProof", "direction": "outgoing"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(alice_resp.status(), StatusCode::OK, "absent scopes must be unrestricted");
+
+        // Explicit empty scopes (locked): denied, on the exact same route.
+        let locked_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/kg/query",
+                LOCKED_TOKEN,
+                json!({"entity": "ScopeDistinctionProof", "direction": "outgoing"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            locked_resp.status(),
+            StatusCode::FORBIDDEN,
+            "`scopes: []` must not behave like absent scopes"
+        );
+    }
+
+    #[tokio::test]
+    async fn locked_token_denied_on_group_a() {
+        let harness = make_harness().await;
+        let resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/drawers/search",
+                LOCKED_TOKEN,
+                json!({"query": "anything"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    // Group A: wrong wing -> 403, right wing -> 200. Covers both the
+    // body-derived wing routes named explicitly in the design doc
+    // (`POST /v1/drawers`, `POST /v1/ingest/batch`) plus search (body,
+    // optional wing) and list (query, optional wing).
+
+    #[tokio::test]
+    async fn scoped_token_group_a_search_wing_enforcement() {
+        let harness = make_harness().await;
+
+        let wrong = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/drawers/search",
+                SCOPED_ALPHA_TOKEN,
+                json!({"query": "anything", "wing": "wing_beta"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(wrong.status(), StatusCode::FORBIDDEN, "wrong wing must be 403 on Group A");
+
+        let right = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/drawers/search",
+                SCOPED_ALPHA_TOKEN,
+                json!({"query": "anything", "wing": "wing_alpha"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(right.status(), StatusCode::OK, "right wing must be 200");
+    }
+
+    #[tokio::test]
+    async fn scoped_token_group_a_add_wing_enforcement() {
+        let harness = make_harness().await;
+
+        let wrong = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/drawers",
+                SCOPED_ALPHA_TOKEN,
+                json!({"wing": "wing_beta", "room": "r", "content": "wrong wing add attempt content"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(wrong.status(), StatusCode::FORBIDDEN);
+
+        let right = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/drawers",
+                SCOPED_ALPHA_TOKEN,
+                json!({"wing": "wing_alpha", "room": "r", "content": "right wing add attempt content"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(right.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn scoped_token_group_a_ingest_wing_enforcement() {
+        let harness = make_harness().await;
+        let file = |path: &str| {
+            json!({
+                "relative_path": path,
+                "content_hash": format!("ch-{path}"),
+                "chunks": [{"chunk_index": 0, "room": "backend", "text": "ingest scope enforcement content"}],
+            })
+        };
+
+        let wrong = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/ingest/batch",
+                SCOPED_ALPHA_TOKEN,
+                json!({"wing": "wing_beta", "repo_id": "github.com/acme/x", "files": [file("a.rs")]}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(wrong.status(), StatusCode::FORBIDDEN);
+
+        let right = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/ingest/batch",
+                SCOPED_ALPHA_TOKEN,
+                json!({"wing": "wing_alpha", "repo_id": "github.com/acme/x", "files": [file("b.rs")]}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(right.status(), StatusCode::OK);
+        let body = body_json(right).await;
+        assert_eq!(body["files"][0]["status"], "ingested");
+    }
+
+    #[tokio::test]
+    async fn scoped_token_group_a_list_query_wing_enforcement() {
+        let harness = make_harness().await;
+        seed_two_wings(&harness).await;
+
+        let wrong = harness
+            .router
+            .clone()
+            .oneshot(authed_get("/v1/drawers?wing=wing_beta", SCOPED_ALPHA_TOKEN))
+            .await
+            .unwrap();
+        assert_eq!(wrong.status(), StatusCode::FORBIDDEN);
+
+        let right = harness
+            .router
+            .clone()
+            .oneshot(authed_get("/v1/drawers?wing=wing_alpha", SCOPED_ALPHA_TOKEN))
+            .await
+            .unwrap();
+        assert_eq!(right.status(), StatusCode::OK);
+        let body = body_json(right).await;
+        assert_eq!(body["drawers"].as_array().unwrap().len(), 1);
+    }
+
+    // Group B: wrong wing -> 404 (not 403); right wing -> 200.
+
+    #[tokio::test]
+    async fn scoped_token_group_b_get_wrong_wing_returns_404() {
+        let harness = make_harness().await;
+        let (_alpha_id, beta_id) = seed_two_wings(&harness).await;
+
+        let resp = harness
+            .router
+            .clone()
+            .oneshot(authed_get(&format!("/v1/drawers/{beta_id}"), SCOPED_ALPHA_TOKEN))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "Group B masks scope denial as 404, not 403, matching the diary guard"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_token_group_b_get_right_wing_returns_200() {
+        let harness = make_harness().await;
+        let (alpha_id, _beta_id) = seed_two_wings(&harness).await;
+
+        let resp = harness
+            .router
+            .clone()
+            .oneshot(authed_get(&format!("/v1/drawers/{alpha_id}"), SCOPED_ALPHA_TOKEN))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn scoped_token_group_b_delete_wrong_wing_returns_404_and_does_not_delete() {
+        let harness = make_harness().await;
+        let (_alpha_id, beta_id) = seed_two_wings(&harness).await;
+
+        let del_req = Request::builder()
+            .method(Method::DELETE)
+            .uri(format!("/v1/drawers/{beta_id}"))
+            .header(header::AUTHORIZATION, format!("Bearer {SCOPED_ALPHA_TOKEN}"))
+            .body(Body::empty())
+            .unwrap();
+        let del_resp = harness.router.clone().oneshot(del_req).await.unwrap();
+        assert_eq!(del_resp.status(), StatusCode::NOT_FOUND);
+
+        // Confirm the denied delete did not actually remove the drawer.
+        let get_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_get(&format!("/v1/drawers/{beta_id}"), ALICE_TOKEN))
+            .await
+            .unwrap();
+        assert_eq!(get_resp.status(), StatusCode::OK, "denied delete must not have removed the drawer");
+    }
+
+    // Wrong operation with the right wing -> 403.
+
+    #[tokio::test]
+    async fn readonly_scope_wrong_operation_returns_403() {
+        let harness = make_harness().await;
+        let resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/drawers",
+                READONLY_ALPHA_TOKEN,
+                json!({"wing": "wing_alpha", "room": "r", "content": "readonly write attempt content"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "a read-only token must not be able to write, even to its own wing"
+        );
+    }
+
+    // `"*"` wing works.
+
+    #[tokio::test]
+    async fn wildcard_wing_scope_allows_any_wing() {
+        let harness = make_harness().await;
+        seed_two_wings(&harness).await;
+
+        for wing in ["wing_alpha", "wing_beta"] {
+            let resp = harness
+                .router
+                .clone()
+                .oneshot(authed_get(&format!("/v1/drawers?wing={wing}"), WILDCARD_TOKEN))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "wildcard scope must authorize {wing}");
+        }
+    }
+
+    // Wing spelling normalisation: a token scoped to a short-form wing name
+    // authorizes a request naming the `wing_`-prefixed form.
+
+    #[tokio::test]
+    async fn wing_scope_short_form_normalizes_to_prefixed_request_wing() {
+        let harness = make_harness().await;
+
+        let right = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/drawers",
+                SHORT_WING_TOKEN,
+                json!({"wing": "wing_myproject", "room": "r", "content": "short form wing normalization proof"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            right.status(),
+            StatusCode::OK,
+            "`myproject` in the token file must authorize `wing_myproject` in the request"
+        );
+
+        let wrong = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/drawers",
+                SHORT_WING_TOKEN,
+                json!({"wing": "wing_otherproject", "room": "r", "content": "short form wing normalization negative proof"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(wrong.status(), StatusCode::FORBIDDEN);
+    }
+
+    // Group C: filter aggregate routes to visible wings rather than reject.
+
+    #[tokio::test]
+    async fn group_c_taxonomy_filters_to_visible_wings() {
+        let harness = make_harness().await;
+        seed_two_wings(&harness).await;
+
+        let scoped =
+            harness.router.clone().oneshot(authed_get("/v1/taxonomy", SCOPED_ALPHA_TOKEN)).await.unwrap();
+        assert_eq!(scoped.status(), StatusCode::OK);
+        let scoped_body = body_json(scoped).await;
+        let taxonomy = scoped_body["taxonomy"].as_object().unwrap();
+        assert!(taxonomy.contains_key("wing_alpha"));
+        assert!(!taxonomy.contains_key("wing_beta"), "scoped token must not see wing_beta in taxonomy");
+
+        let alice =
+            harness.router.clone().oneshot(authed_get("/v1/taxonomy", ALICE_TOKEN)).await.unwrap();
+        let alice_body = body_json(alice).await;
+        let alice_taxonomy = alice_body["taxonomy"].as_object().unwrap();
+        assert!(alice_taxonomy.contains_key("wing_alpha"));
+        assert!(
+            alice_taxonomy.contains_key("wing_beta"),
+            "unrestricted (grandfathered) token must see both wings"
+        );
+    }
+
+    #[tokio::test]
+    async fn group_c_wings_filters_to_visible_wings() {
+        let harness = make_harness().await;
+        seed_two_wings(&harness).await;
+
+        let scoped =
+            harness.router.clone().oneshot(authed_get("/v1/wings", SCOPED_ALPHA_TOKEN)).await.unwrap();
+        let scoped_body = body_json(scoped).await;
+        let wings = scoped_body["wings"].as_object().unwrap();
+        assert!(wings.contains_key("wing_alpha"));
+        assert!(!wings.contains_key("wing_beta"));
+
+        let alice = harness.router.clone().oneshot(authed_get("/v1/wings", ALICE_TOKEN)).await.unwrap();
+        let alice_body = body_json(alice).await;
+        let alice_wings = alice_body["wings"].as_object().unwrap();
+        assert!(alice_wings.contains_key("wing_alpha"));
+        assert!(alice_wings.contains_key("wing_beta"));
+    }
+
+    #[tokio::test]
+    async fn group_c_rooms_filters_to_visible_wings() {
+        let harness = make_harness().await;
+        seed_two_wings(&harness).await;
+
+        let scoped =
+            harness.router.clone().oneshot(authed_get("/v1/rooms", SCOPED_ALPHA_TOKEN)).await.unwrap();
+        let scoped_body = body_json(scoped).await;
+        let rooms = scoped_body["rooms"].as_object().unwrap();
+        assert!(rooms.contains_key("alpha-room"));
+        assert!(!rooms.contains_key("beta-room"), "scoped token must not see wing_beta's rooms");
+
+        let alice = harness.router.clone().oneshot(authed_get("/v1/rooms", ALICE_TOKEN)).await.unwrap();
+        let alice_body = body_json(alice).await;
+        let alice_rooms = alice_body["rooms"].as_object().unwrap();
+        assert!(alice_rooms.contains_key("alpha-room"));
+        assert!(alice_rooms.contains_key("beta-room"));
+    }
+
+    #[tokio::test]
+    async fn group_c_changes_filters_to_visible_wings() {
+        let harness = make_harness().await;
+        let (alpha_id, beta_id) = seed_two_wings(&harness).await;
+
+        let scoped = harness
+            .router
+            .clone()
+            .oneshot(authed_get("/v1/changes?limit=50", SCOPED_ALPHA_TOKEN))
+            .await
+            .unwrap();
+        let scoped_body = body_json(scoped).await;
+        let scoped_events = scoped_body["events"].as_array().unwrap();
+        assert!(scoped_events.iter().any(|e| e["entity_id"] == alpha_id));
+        assert!(
+            !scoped_events.iter().any(|e| e["entity_id"] == beta_id),
+            "scoped token must not see wing_beta's change events: {scoped_events:?}"
+        );
+
+        let alice =
+            harness.router.clone().oneshot(authed_get("/v1/changes?limit=50", ALICE_TOKEN)).await.unwrap();
+        let alice_body = body_json(alice).await;
+        let alice_events = alice_body["events"].as_array().unwrap();
+        assert!(alice_events.iter().any(|e| e["entity_id"] == alpha_id));
+        assert!(alice_events.iter().any(|e| e["entity_id"] == beta_id));
+    }
+
+    // `/v1/changes` must fail CLOSED: an event whose wing cannot be
+    // determined (e.g. an older or remote-fallback `drawer_deleted` with no
+    // wing in `details_json`) must be hidden from a scoped token, not shown
+    // by default. An unrestricted token must still see it.
+    #[tokio::test]
+    async fn changes_hides_wingless_event_from_scoped_token_but_not_unrestricted() {
+        let harness = make_harness().await;
+
+        // Inject a wing-less `drawer_deleted` event directly into the change
+        // log, bypassing the server's own routes (which always record wing
+        // on delete) to simulate the shape an older palace, or the
+        // mempalace-mcp remote-fallback delete path, could already contain.
+        harness
+            .state
+            .storage
+            .operational_store()
+            .append_event(&ChangeEvent {
+                event_type: "drawer_deleted".to_owned(),
+                occurred_at: OffsetDateTime::now_utc(),
+                entity_id: "wingless-drawer-deletion-id".to_owned(),
+                actor: None,
+                details_json: None,
+            })
+            .unwrap();
+
+        let scoped = harness
+            .router
+            .clone()
+            .oneshot(authed_get("/v1/changes?limit=50", SCOPED_ALPHA_TOKEN))
+            .await
+            .unwrap();
+        let scoped_body = body_json(scoped).await;
+        let scoped_events = scoped_body["events"].as_array().unwrap();
+        assert!(
+            !scoped_events.iter().any(|e| e["entity_id"] == "wingless-drawer-deletion-id"),
+            "a wing-less event must fail closed (hidden) for a scoped token: {scoped_events:?}"
+        );
+
+        let alice =
+            harness.router.clone().oneshot(authed_get("/v1/changes?limit=50", ALICE_TOKEN)).await.unwrap();
+        let alice_body = body_json(alice).await;
+        let alice_events = alice_body["events"].as_array().unwrap();
+        assert!(
+            alice_events.iter().any(|e| e["entity_id"] == "wingless-drawer-deletion-id"),
+            "an unrestricted token must still see it (grandfathering unaffected): {alice_events:?}"
+        );
+    }
+
+    // `check_duplicate` is Group C, not operation-only: its response can
+    // reveal cross-wing content, so matches must be filtered to visible
+    // wings, and `is_duplicate` must reflect that filtering, not bypass it.
+    #[tokio::test]
+    async fn check_duplicate_filters_matches_to_visible_wings() {
+        let harness = make_harness().await;
+        seed_two_wings(&harness).await;
+
+        // wing_beta's own content verbatim, to maximize the chance the
+        // deterministic stub embedding reports it as a near-duplicate.
+        let query_content = "beta wing content about javascript tooling ecosystems";
+
+        // Sanity: an unrestricted token does see the wing_beta match.
+        let alice_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/drawers/check_duplicate",
+                ALICE_TOKEN,
+                json!({"content": query_content}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(alice_resp.status(), StatusCode::OK);
+        let alice_body = body_json(alice_resp).await;
+        let alice_matches = alice_body["matches"].as_array().unwrap();
+        assert!(
+            alice_matches.iter().any(|m| m["wing"] == "wing_beta"),
+            "sanity check failed: wing_beta should be a duplicate candidate: {alice_matches:?}"
+        );
+        assert_eq!(alice_body["is_duplicate"], true);
+
+        // The scoped token (wing_alpha only) must see neither the match nor
+        // a true `is_duplicate`, even though the content duplicates a
+        // wing_beta drawer almost exactly.
+        let scoped_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/drawers/check_duplicate",
+                SCOPED_ALPHA_TOKEN,
+                json!({"content": query_content}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(scoped_resp.status(), StatusCode::OK, "must filter, not 403 — the caller does hold read");
+        let scoped_body = body_json(scoped_resp).await;
+        let scoped_matches = scoped_body["matches"].as_array().unwrap();
+        assert!(
+            scoped_matches.iter().all(|m| m["wing"] != "wing_beta"),
+            "cross-wing check_duplicate must filter out wings the token cannot see: {scoped_matches:?}"
+        );
+        assert_eq!(
+            scoped_body["is_duplicate"], false,
+            "is_duplicate must be computed after filtering, not before — otherwise the boolean \
+             alone is a cross-wing content oracle: {scoped_body}"
+        );
+    }
+
+    // An unknown operation string in the token file is a load error.
+
+    #[test]
+    fn token_registry_rejects_unknown_operation() {
+        let tempdir = TempDir::new().unwrap();
+        let token_file = tempdir.path().join("tokens.json");
+        std::fs::write(
+            &token_file,
+            serde_json::to_string(&serde_json::json!([
+                {
+                    "token": "x", "name": "bad_op", "enabled": true,
+                    "scopes": [{"wings": ["*"], "operations": ["reed"]}],
+                },
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        restrict_token_file(&token_file);
+
+        let err = TokenRegistry::load(token_file).unwrap_err();
+        assert!(matches!(err, ServerError::TokenFile(_)), "{err}");
+    }
+
+    // 401 (no/invalid token) and 403 (valid token, wrong scope) stay distinct.
+
+    #[tokio::test]
+    async fn unauthorized_and_forbidden_are_distinct_status_codes() {
+        let harness = make_harness().await;
+
+        let no_token_req =
+            Request::builder().method(Method::GET).uri("/v1/kg/stats").body(Body::empty()).unwrap();
+        let no_token_resp = harness.router.clone().oneshot(no_token_req).await.unwrap();
+        assert_eq!(no_token_resp.status(), StatusCode::UNAUTHORIZED);
+
+        let locked_resp =
+            harness.router.clone().oneshot(authed_get("/v1/kg/stats", LOCKED_TOKEN)).await.unwrap();
+        assert_eq!(locked_resp.status(), StatusCode::FORBIDDEN);
+
+        assert_ne!(no_token_resp.status(), locked_resp.status());
+    }
+
+    // Hot reload picks up a scope change (the registry already reloads on
+    // mtime change; this proves it applies to the new scope logic too).
+
+    #[tokio::test]
+    async fn hot_reload_picks_up_scope_change() {
+        let harness = make_harness().await;
+
+        // Initially scoped to wing_alpha only.
+        let before = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/drawers/search",
+                SCOPED_ALPHA_TOKEN,
+                json!({"query": "x", "wing": "wing_beta"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(before.status(), StatusCode::FORBIDDEN);
+
+        // Rewrite the token file, dropping scoped_alpha's `scopes` entirely
+        // (now unrestricted), and wait past the mtime granularity the
+        // registry's reload check relies on.
+        let token_file = harness._tempdir.path().join("tokens.json");
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(
+            &token_file,
+            serde_json::to_string(&serde_json::json!([
+                {"token": ALICE_TOKEN, "name": "alice", "enabled": true},
+                {"token": BOB_TOKEN, "name": "bob", "enabled": false},
+                {"token": SCOPED_ALPHA_TOKEN, "name": "scoped_alpha", "enabled": true},
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        restrict_token_file(&token_file);
+
+        let after = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/drawers/search",
+                SCOPED_ALPHA_TOKEN,
+                json!({"query": "x", "wing": "wing_beta"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(after.status(), StatusCode::OK, "hot reload must pick up the widened scope");
+    }
+
+    // Bonus: a wing-absent search must filter cross-wing candidates to what
+    // the token can see, not merely reject an explicit wrong wing.
+
+    #[tokio::test]
+    async fn search_without_wing_filters_cross_wing_results_to_visible_scope() {
+        let harness = make_harness().await;
+        let (_alpha_id, beta_id) = seed_two_wings(&harness).await;
+
+        // Query with wing_beta's own content verbatim, maximizing the chance
+        // the deterministic stub embedding surfaces it as a top candidate.
+        let query = json!({
+            "query": "beta wing content about javascript tooling ecosystems",
+            "limit": 10,
+        });
+
+        // Sanity: an unrestricted token's unfiltered search does surface it.
+        let alice_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(Method::POST, "/v1/drawers/search", ALICE_TOKEN, query.clone()))
+            .await
+            .unwrap();
+        let alice_body = body_json(alice_resp).await;
+        let alice_results = alice_body["results"].as_array().unwrap();
+        assert!(
+            alice_results.iter().any(|r| r["drawer_id"] == beta_id),
+            "sanity check failed: wing_beta drawer should be a search candidate: {alice_results:?}"
+        );
+
+        // The scoped token, searching the same query with no wing filter,
+        // must never see wing_beta's drawer even though it is a candidate.
+        let scoped_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(Method::POST, "/v1/drawers/search", SCOPED_ALPHA_TOKEN, query))
+            .await
+            .unwrap();
+        let scoped_body = body_json(scoped_resp).await;
+        let scoped_results = scoped_body["results"].as_array().unwrap();
+        assert!(
+            scoped_results.iter().all(|r| r["drawer_id"] != beta_id),
+            "cross-wing search must filter out wings the token cannot see: {scoped_results:?}"
+        );
+        assert!(scoped_results.iter().all(|r| r["wing"] == "wing_alpha"));
     }
 
     // ─── Ingest harness variant ───────────────────────────────────────────────

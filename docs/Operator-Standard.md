@@ -129,10 +129,22 @@ Operational notes:
 - Create the token file first — a JSON array of objects, each with `token`,
   `name`, and `enabled` keys. It is hot-reloaded, so revoking a token (set
   `enabled: false`) takes effect on the next request without a restart.
+- Scope tokens with an optional `scopes` array — restrict a token to specific
+  wings and operations (`read`, `write`, `delete`, `ingest`, plus three
+  `coordination_*` operations reserved for a future release) instead of
+  granting it everything. Omitting `scopes` keeps a token unrestricted, which
+  is why token files written before this field existed still work unchanged;
+  an explicit `"scopes": []` is the opposite — a deliberate lockout with no
+  access at all. Like `enabled`, scope edits are picked up on the next request
+  via the same hot reload — no restart needed to tighten or loosen a token's
+  access. See [Federation → 1.5 Authorization scopes](Federation.md#15-authorization-scopes)
+  for the full model, including which routes reject a wing mismatch outright
+  (403) versus mask it as a 404 or filter it out of an aggregate response.
 - The server speaks **plain HTTP**. On any untrusted network, run it behind a
   TLS-terminating reverse proxy; never expose raw bearer tokens over the wire.
 - `GET /v1/health` is unauthenticated and suitable as a liveness probe; all other
-  routes require `Authorization: Bearer <token>`.
+  routes require `Authorization: Bearer <token>`, and — for a scoped token — the
+  right scope for that route.
 - To resolve mined locator snippets server-side, map wings to local checkout paths
   via `server.checkouts` in `config.json`.
 - Cold cache bootstrap uses the same `MEMPALACE_EMBED_ALLOW_DOWNLOADS` rule as the

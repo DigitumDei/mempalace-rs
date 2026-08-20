@@ -2404,6 +2404,15 @@ where
 
     async fn tool_delete_drawer(&mut self, arguments: &Value) -> ToolResult<Value> {
         let drawer_id = parse_drawer_id(&required_string(arguments, "drawer_id")?)?;
+        // Look the drawer up before deleting so its wing/room can be recorded
+        // on the `drawer_deleted` change event below. There is no way to
+        // recover them afterward, and a `drawer_deleted` event with no wing
+        // is not merely uninformative: the federation server's `/v1/changes`
+        // route fails closed on it for a scoped token (see
+        // `change_event_visible` in `crates/mempalace-server/src/lib.rs` and
+        // docs/Federation.md §1.5), so leaving it out here would make every
+        // local deletion silently invisible to scoped remote readers.
+        let existing = self.storage.drawer_store().get_drawer(&drawer_id).await.map_tool()?;
         let deleted = self
             .storage
             .drawer_store()
@@ -2414,12 +2423,22 @@ where
             // ── Federation fallback ──
             if let Some(router) = &self.federation {
                 if let Some(remote_resp) = router.delete_drawer_remote(drawer_id.as_str()).await? {
+                    // `existing` is almost always `None` here in practice —
+                    // `deleted == 0` means this palace never had the row, so
+                    // there was nothing to look up — but populate wing/room
+                    // when we do happen to have a local record, alongside
+                    // (not instead of) `origin`.
+                    let mut details = json!({"origin": remote_resp["origin"]});
+                    if let (Some(obj), Some(drawer)) = (details.as_object_mut(), &existing) {
+                        obj.insert("wing".to_owned(), json!(drawer.wing.as_str()));
+                        obj.insert("room".to_owned(), json!(drawer.room.as_str()));
+                    }
                     self.log_change(ChangeEvent {
                         event_type: "drawer_deleted".to_owned(),
                         occurred_at: OffsetDateTime::now_utc(),
                         entity_id: drawer_id.as_str().to_owned(),
                         actor: None,
-                        details_json: Some(json!({"origin": remote_resp["origin"]}).to_string()),
+                        details_json: Some(details.to_string()),
                     });
                     return Ok(remote_resp);
                 }
@@ -2444,7 +2463,9 @@ where
             occurred_at: OffsetDateTime::now_utc(),
             entity_id: drawer_id.as_str().to_owned(),
             actor: None,
-            details_json: None,
+            details_json: existing
+                .as_ref()
+                .map(|d| json!({"wing": d.wing.as_str(), "room": d.room.as_str()}).to_string()),
         });
         let mut result = json!({ "success": true, "drawer_id": drawer_id });
         if self.federation.is_some() {
@@ -8733,6 +8754,63 @@ mod tests {
             stored.is_some(),
             "remote-only fallback must NOT remove a locally stored diary summary"
         );
+    }
+
+    #[tokio::test]
+    async fn tool_delete_drawer_local_records_wing_and_room_on_change_event() {
+        // The federation server's `/v1/changes` route now fails closed on a
+        // `drawer_deleted` event whose wing cannot be determined (see
+        // `change_event_visible` in crates/mempalace-server/src/lib.rs and
+        // docs/Federation.md §1.5) — so a local deletion here must record the
+        // drawer's wing/room on the change event, not leave it opaque.
+        let remotes = BTreeMap::new();
+        let mut ctx = make_delete_drawer_ctx(remotes, WriteTarget::Local).await;
+
+        let drawer_id = DrawerId::new("wing-room-recording-001").unwrap();
+        let now = OffsetDateTime::now_utc();
+        let content = "content to be deleted for the wing recording test";
+        ctx.runtime
+            .storage
+            .drawer_store()
+            .put_drawers(
+                &[DrawerRecord {
+                    id: drawer_id.clone(),
+                    wing: WingId::new("wing_alpha").unwrap(),
+                    room: RoomId::new("alpha-room").unwrap(),
+                    hall: None,
+                    date: Some(now.date()),
+                    source_file: "test.txt".to_owned(),
+                    chunk_index: 0,
+                    ingest_mode: "test".to_owned(),
+                    extract_mode: None,
+                    added_by: "test".to_owned(),
+                    filed_at: now,
+                    importance: None,
+                    emotional_weight: None,
+                    weight: None,
+                    content: content.to_owned(),
+                    content_hash: mempalace_core::hash_text(content),
+                    embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
+                    locator: None,
+                    view_metadata: None,
+                }],
+                DuplicateStrategy::Error,
+            )
+            .await
+            .unwrap();
+
+        let result =
+            ctx.runtime.tool_delete_drawer(&json!({"drawer_id": drawer_id.as_str()})).await.unwrap();
+        assert_eq!(result["success"], true);
+
+        let changes = ctx.runtime.tool_get_changes_since(&json!({})).await.unwrap();
+        let events = changes["events"].as_array().unwrap();
+        let deleted_event = events
+            .iter()
+            .find(|e| e["event_type"] == "drawer_deleted" && e["entity_id"] == drawer_id.as_str())
+            .unwrap_or_else(|| panic!("no drawer_deleted event found for {drawer_id}: {events:?}"));
+        assert_eq!(deleted_event["details"]["wing"], "wing_alpha");
+        assert_eq!(deleted_event["details"]["room"], "alpha-room");
     }
 
     async fn test_harness_with_federation(federation: FederationRuntimeConfig) -> TestHarness {

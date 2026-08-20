@@ -88,7 +88,10 @@ impl StorageEngine {
     pub fn signal_activity(&self) {
         let now = Instant::now();
         self.activity_signal.store(true, Ordering::Release);
-        *self.last_activity_at.lock().unwrap() = now;
+        // The mutex only guards a plain `Instant` with no invariant a panic while
+        // holding the lock could corrupt, so recovering the poisoned value is
+        // strictly better than propagating the panic to every future caller.
+        *self.last_activity_at.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = now;
     }
 
     /// Atomically read and clear the activity signal.
@@ -101,7 +104,10 @@ impl StorageEngine {
 
     /// Elapsed wall time since the last activity signal.
     pub fn elapsed_since_last_activity(&self) -> std::time::Duration {
-        Instant::now() - *self.last_activity_at.lock().unwrap()
+        // Same poison-recovery reasoning as `signal_activity`: a plain `Instant`
+        // has no invariant that a panic mid-lock could leave broken.
+        let guard = self.last_activity_at.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        Instant::now() - *guard
     }
 
     pub async fn commit_ingest(&self, request: IngestCommitRequest) -> Result<i64> {
@@ -737,10 +743,18 @@ impl StorageEngine {
 
             #[cfg(test)]
             {
-                if let Some(tx) = self.test_tier_1_notify.lock().unwrap().take() {
+                // Same poison-recovery reasoning as `signal_activity`: these mutexes
+                // only guard `Option<oneshot::...>` test-hook state, and the caller
+                // already tolerates a missed handshake via `let _ =` below, so
+                // recovering from poison is strictly better than panicking here.
+                use std::sync::PoisonError;
+                let notify_tx =
+                    self.test_tier_1_notify.lock().unwrap_or_else(PoisonError::into_inner).take();
+                if let Some(tx) = notify_tx {
                     let _ = tx.send(());
                 }
-                let wait_rx = self.test_tier_1_wait.lock().unwrap().take();
+                let wait_rx =
+                    self.test_tier_1_wait.lock().unwrap_or_else(PoisonError::into_inner).take();
                 if let Some(rx) = wait_rx {
                     let _ = rx.await;
                 }
@@ -1887,6 +1901,7 @@ mod diary_summary_tests {
     };
     use tempfile::tempdir;
     use time::macros::{date, datetime};
+    use time::{Duration, OffsetDateTime};
 
     fn embedding(seed: [f32; 4]) -> Vec<f32> {
         let mut values = Vec::with_capacity(EmbeddingProfile::Balanced.metadata().dimensions);
@@ -2214,10 +2229,13 @@ mod diary_summary_tests {
         let failing = engine.drawer_store().get_drawer(&failing_id).await.unwrap();
         assert!(failing.is_none(), "failing new drawer must not appear in LanceDB");
 
-        // A failed run should exist in the operational store.
+        // A failed run should exist in the operational store. The run's `updated_at` is
+        // set from the real wall clock inside `commit_diary_ingest`, so the cutoff must be
+        // computed relative to `now_utc()` rather than hardcoded — a fixed literal would
+        // stop being "in the future" the day the real clock caught up to it.
         let stale_failed = engine
             .operational_store()
-            .stale_failed_diary_runs(datetime!(2026-08-20 00:00:00 UTC))
+            .stale_failed_diary_runs(OffsetDateTime::now_utc() + Duration::days(1))
             .unwrap();
         assert!(!stale_failed.is_empty(), "a failed diary run should exist");
     }

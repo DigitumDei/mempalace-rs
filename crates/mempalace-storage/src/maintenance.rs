@@ -132,6 +132,7 @@ impl Default for MaintenanceSettings {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

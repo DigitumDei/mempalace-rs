@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use time::macros::date;
 use time::{Date, OffsetDateTime};
 
 use crate::error::{Result, StorageError};
@@ -1126,19 +1127,22 @@ fn truncate_to_cutoff_ties(matches: &mut Vec<DrawerMatch>, limit: usize) {
     matches.truncate(cutoff_len);
 }
 
+// The Unix epoch is a compile-time constant, so this can never fail to construct —
+// unlike `Date::from_calendar_date(1970, ..).unwrap()`, the `date!` macro proves
+// validity at compile time and removes the fallibility entirely.
+const UNIX_EPOCH: Date = date!(1970 - 01 - 01);
+
 fn date_to_days(date: Date) -> i32 {
-    date.to_julian_day()
-        - Date::from_calendar_date(1970, time::Month::January, 1).unwrap().to_julian_day()
+    date.to_julian_day() - UNIX_EPOCH.to_julian_day()
 }
 
 fn days_to_date(days: i32) -> Result<Date> {
-    Date::from_julian_day(
-        days + Date::from_calendar_date(1970, time::Month::January, 1).unwrap().to_julian_day(),
-    )
-    .map_err(|err| StorageError::Invariant(err.to_string()))
+    Date::from_julian_day(days + UNIX_EPOCH.to_julian_day())
+        .map_err(|err| StorageError::Invariant(err.to_string()))
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use tempfile::tempdir;
     use time::macros::{date, datetime};

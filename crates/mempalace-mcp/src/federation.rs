@@ -1460,24 +1460,27 @@ fn search_payload(
 /// Deduplication prefers the first seen (local preferred since it's first).
 /// Truncates to `limit`.
 pub(crate) fn merge_search_results_nway(
-    origins: Vec<(String, Vec<Value>)>,
+    mut origins: Vec<(String, Vec<Value>)>,
     limit: usize,
 ) -> Vec<Value> {
-    if origins.is_empty() {
-        return vec![];
-    }
-    if origins.len() == 1 {
-        let (origin_name, results) = origins.into_iter().next().unwrap();
-        return results
-            .into_iter()
-            .take(limit)
-            .map(|mut v| {
-                if v.get("origin").is_none() {
-                    v["origin"] = json!(origin_name);
-                }
-                v
-            })
-            .collect();
+    match origins.as_slice() {
+        [] => return vec![],
+        [_] => {
+            // The slice pattern proves exactly one origin is present, so
+            // `remove(0)` can never panic — no `.unwrap()` needed to express it.
+            let (origin_name, results) = origins.remove(0);
+            return results
+                .into_iter()
+                .take(limit)
+                .map(|mut v| {
+                    if v.get("origin").is_none() {
+                        v["origin"] = json!(origin_name);
+                    }
+                    v
+                })
+                .collect();
+        }
+        _ => {}
     }
 
     let mut merged: Vec<Value> = Vec::with_capacity(limit);
@@ -1538,6 +1541,7 @@ fn is_duplicate_search_item(
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use std::collections::BTreeMap;

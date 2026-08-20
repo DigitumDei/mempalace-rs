@@ -53,7 +53,8 @@ The workspace denies `unwrap_used`, `todo`, `dbg_macro`, `undocumented_unsafe_bl
 several `explicit_*`/`manual_*` lints; `unsafe_code` is **forbidden** and `missing_docs` warns.
 See `[workspace.lints]` in [Cargo.toml](Cargo.toml).
 
-No CI job runs clippy, so it is easy to regress. Check it yourself before proposing changes:
+The `Clippy` CI job runs this on every push and blocks the release gate. Run it yourself before
+proposing changes so you find problems before CI does:
 
 ```bash
 cargo clippy --workspace --all-targets --locked

@@ -23,7 +23,7 @@
 //! ```
 
 use std::path::{Path as FsPath, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, PoisonError, RwLock};
 use std::time::{Duration, SystemTime};
 
 use axum::body::Body;
@@ -502,15 +502,23 @@ where
         tokio::spawn(async move {
             // Startup maintenance check
             info!("performing startup maintenance check");
-            *task_state.maintenance_status.lock().unwrap() = MaintenanceStatus::Running;
+            // Both mutexes below guard a plain status value with no invariant a panic
+            // could corrupt, so recovering from poison is strictly better than
+            // panicking a second time on every subsequent read/write of this state.
+            *task_state.maintenance_status.lock().unwrap_or_else(PoisonError::into_inner) =
+                MaintenanceStatus::Running;
             match task_state.storage.run_maintenance(&settings).await {
                 Ok(summary) => {
-                    *task_state.last_maintenance_status.lock().unwrap() = Some(summary.clone());
-                    *task_state.maintenance_status.lock().unwrap() = summary_to_status(&summary);
+                    *task_state
+                        .last_maintenance_status
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner) = Some(summary.clone());
+                    *task_state.maintenance_status.lock().unwrap_or_else(PoisonError::into_inner) =
+                        summary_to_status(&summary);
                 }
                 Err(e) => {
                     warn!(error = %e, "startup maintenance run failed");
-                    *task_state.maintenance_status.lock().unwrap() =
+                    *task_state.maintenance_status.lock().unwrap_or_else(PoisonError::into_inner) =
                         MaintenanceStatus::Failed { message: e.to_string() };
                 }
             }
@@ -542,16 +550,25 @@ where
                     continue;
                 }
                 info!("background maintenance check");
-                *task_state.maintenance_status.lock().unwrap() = MaintenanceStatus::Running;
+                *task_state.maintenance_status.lock().unwrap_or_else(PoisonError::into_inner) =
+                    MaintenanceStatus::Running;
                 match task_state.storage.run_maintenance(&settings).await {
                     Ok(summary) => {
-                        *task_state.last_maintenance_status.lock().unwrap() = Some(summary.clone());
-                        *task_state.maintenance_status.lock().unwrap() =
-                            summary_to_status(&summary);
+                        *task_state
+                            .last_maintenance_status
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner) = Some(summary.clone());
+                        *task_state
+                            .maintenance_status
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner) = summary_to_status(&summary);
                     }
                     Err(e) => {
                         warn!(error = %e, "background maintenance run failed");
-                        *task_state.maintenance_status.lock().unwrap() =
+                        *task_state
+                            .maintenance_status
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner) =
                             MaintenanceStatus::Failed { message: e.to_string() };
                     }
                 }
@@ -706,11 +723,11 @@ where
     let last_run = state
         .last_maintenance_status
         .lock()
-        .unwrap()
+        .unwrap_or_else(PoisonError::into_inner)
         .as_ref()
         .and_then(|s| serde_json::to_value(s).ok());
 
-    let status = state.maintenance_status.lock().unwrap().clone();
+    let status = state.maintenance_status.lock().unwrap_or_else(PoisonError::into_inner).clone();
 
     Ok(Json(InfoResponse {
         server_version: BUILD_VERSION.to_owned(),

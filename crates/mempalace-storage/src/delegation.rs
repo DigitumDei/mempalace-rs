@@ -769,6 +769,7 @@ mod tests {
             title: "research".into(),
             description: "do it".into(),
             created_by: "manager".into(),
+            wing: "wing_test".into(),
             idempotency_key: key.into(),
             parent_id: None,
             dependencies: vec![],

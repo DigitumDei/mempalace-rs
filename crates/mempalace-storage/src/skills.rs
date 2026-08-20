@@ -8,6 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
+use mempalace_core::WingId;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -251,6 +252,7 @@ CREATE TABLE IF NOT EXISTS skill_outcomes (
 CREATE INDEX IF NOT EXISTS idx_skill_outcomes_skill ON skill_outcomes(skill_id, version, recorded_at);
 "#,
         )?;
+        backfill_wing_normalisation(&conn)?;
         Ok(())
     }
 
@@ -269,13 +271,19 @@ CREATE INDEX IF NOT EXISTS idx_skill_outcomes_skill ON skill_outcomes(skill_id, 
         }
         // `project` scope is meaningless without a project to scope to: without this, a
         // project-scoped skill would be authoritative in every wing of a shared palace.
+        //
+        // The wing is normalised here, on the way in, the same way task creation normalises it
+        // in `coordination.rs`. Before this fix only the list path
+        // (`SkillStore::list_skills`, called from the MCP layer via `parse_wing_id`) normalised;
+        // propose stored the raw string, so proposing `myproject` and listing `myproject` could
+        // silently never match a skill actually proposed under `wing_myproject`, or vice versa.
         let wing = match (input.scope, input.wing.as_deref().map(str::trim)) {
             (SkillScope::Project, None | Some("")) => {
                 return Err(StorageError::Invariant(
                     "scope `project` requires a `wing` identifying the owning project".into(),
                 ));
             }
-            (SkillScope::Project, Some(wing)) => Some(wing.to_owned()),
+            (SkillScope::Project, Some(wing)) => Some(WingId::normalized(wing)?.to_string()),
             (scope, Some(wing)) if !wing.is_empty() => {
                 return Err(StorageError::Invariant(format!(
                     "scope `{}` is not project-bound and must not carry a wing (got `{wing}`)",
@@ -794,6 +802,27 @@ fn outcome_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<SkillOutcome> {
     })
 }
 
+/// Normalise any `wing` value stored before `propose_skill` started normalising it on the way
+/// in (see the comment at that call site). Done in Rust, not SQL, because `WingId::normalized`
+/// lowercases and substitutes invalid characters — a `'wing_' || wing` string concatenation
+/// would not reproduce that. Idempotent: once every stored wing is already normalised this is a
+/// cheap read with no writes, so it is safe to run on every `ensure_schema` call, matching
+/// `CoordinationStore`'s upgrade-on-every-startup pattern. `wing` is not part of any unique
+/// constraint on `skills`, so merging two raw spellings onto the same normalised value cannot
+/// collide.
+fn backfill_wing_normalisation(conn: &Connection) -> Result<()> {
+    let mut statement = conn.prepare("SELECT DISTINCT wing FROM skills WHERE wing IS NOT NULL")?;
+    let raw_wings = statement
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for raw in raw_wings {
+        let normalized = WingId::normalized(&raw)?.to_string();
+        if normalized != raw {
+            conn.execute("UPDATE skills SET wing=?1 WHERE wing=?2", params![normalized, raw])?;
+        }
+    }
+    Ok(())
+}
 fn validate_actor(v: &str) -> Result<()> {
     if v.trim().is_empty() {
         Err(StorageError::Invariant("actor must not be empty".into()))
@@ -1152,6 +1181,88 @@ mod tests {
             idempotency_key: "k2".into(),
         });
         assert!(stray.is_err(), "a non-project scope must not carry a wing");
+    }
+
+    #[test]
+    fn propose_normalises_the_wing_the_same_way_list_does() {
+        let (_dir, s) = store();
+        let proposed = s
+            .propose_skill(&NewSkill {
+                skill_id: "unprefixed-wing-skill".into(),
+                scope: SkillScope::Project,
+                wing: Some("myproject".into()),
+                applicability: "a".into(),
+                instructions_ref: "r".into(),
+                required_capabilities: vec![],
+                required_tools: vec![],
+                required_permissions: vec![],
+                author: "author-a".into(),
+                provenance: None,
+                confidence: 0.5,
+                idempotency_key: "unprefixed-1".into(),
+            })
+            .expect("proposed with an unprefixed wing");
+        assert_eq!(
+            proposed.wing.as_deref(),
+            Some("wing_myproject"),
+            "propose must normalise the wing the same way task creation does"
+        );
+
+        // Regression: `list_skills` is always called with an already-normalised wing from the
+        // MCP layer (`parse_wing_id`); proposing and listing with the same unprefixed wing must
+        // agree once propose also normalises, matching what a caller who typed `myproject` both
+        // times would expect.
+        let seen = s
+            .list_skills(None, None, Some("wing_myproject"), 50)
+            .expect("list with the normalised spelling");
+        assert!(
+            seen.iter().any(|skill| skill.skill_id == "unprefixed-wing-skill"),
+            "a skill proposed with an unprefixed wing must be found once the filter is normalised the same way"
+        );
+    }
+
+    #[test]
+    fn ensure_schema_backfills_wings_stored_before_propose_normalised_them() {
+        let (dir, s) = store();
+        let path = dir.path().join("storage.sqlite3");
+        // Insert directly, bypassing `propose_skill`, to simulate a row written before this fix
+        // landed — exactly the shape `propose_skill` used to produce for a raw `"myproject"`.
+        {
+            let conn = Connection::open(&path).expect("open");
+            conn.execute(
+                "INSERT INTO skills(skill_id,version,scope,wing,status,applicability,instructions_ref,\
+                 required_capabilities_json,required_tools_json,required_permissions_json,author,\
+                 provenance_json,confidence,supersedes_version,revision,idempotency_key,created_at,updated_at)\
+                 VALUES('legacy-skill',1,'project','myproject','candidate','a','r','[]','[]','[]',\
+                 'author-a',NULL,0.5,NULL,0,'legacy-key','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+                [],
+            )
+            .expect("legacy row with an unnormalised wing");
+        }
+
+        // `ensure_schema` runs on every `McpRuntime::new`, so re-running it (not just the first
+        // call the `store()` helper already made) is the realistic shape of the guarantee.
+        s.ensure_schema().expect("backfill pass");
+
+        let fetched = s.get_skill("legacy-skill", 1).expect("get").expect("found");
+        assert_eq!(
+            fetched.wing.as_deref(),
+            Some("wing_myproject"),
+            "a pre-existing raw wing must be normalised by the backfill"
+        );
+        let seen = s.list_skills(None, None, Some("wing_myproject"), 50).expect("list");
+        assert!(
+            seen.iter().any(|skill| skill.skill_id == "legacy-skill"),
+            "the backfilled skill must now be discoverable under the normalised wing"
+        );
+
+        // Idempotence: running the backfill again over already-normalised data must not error
+        // or change anything further.
+        s.ensure_schema().expect("second backfill pass is a no-op");
+        assert_eq!(
+            s.get_skill("legacy-skill", 1).expect("get").expect("found").wing.as_deref(),
+            Some("wing_myproject")
+        );
     }
 
     #[test]

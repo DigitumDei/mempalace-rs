@@ -11,6 +11,9 @@ MemPalace stores durable coordination state in the palace's local `storage.sqlit
 - Task creation, message send, result, and artifact writes deduplicate only on `(actor, idempotency_key)`. Replaying a key returns the committed record. Similar content with different keys remains distinct.
 - Exact get operations query primary IDs only and return `found: false` on a miss. They never invoke semantic search.
 - Claims, renewals, and transitions use an expected revision. A stale revision fails explicitly. A valid lease excludes other workers; an expired lease can be reclaimed without deleting prior events.
+- Every task belongs to a wing, normalised the same way project wings are normalised everywhere else in the palace, so `myproject` and `wing_myproject` resolve to the same wing. Messages, artifacts, and results carry no wing column of their own and reach it through their mandatory task reference; audit events do carry their own `wing` column, always the owning task's wing materialised inside the same transaction as the mutation, never a value supplied by a caller.
+- `wing_unscoped` is a reserved wing name meaning "created before wings existed." The operational schema upgrades itself in place the first time a palace opens under this code — existing tasks, messages, artifacts, results, and events are untouched and read back with that wing, with no separate migration step or data export/import.
+- `mempalace_coordination_events` and `mempalace_inbox_read` accept an optional wing filter, normalised the same way as task creation, so a filter of `myproject` matches records stored under `wing_myproject`. Omitting the filter is unscoped and spans every wing, matching how visibility already worked before wings existed.
 
 Delivery is at least once with idempotent writes. MemPalace does not promise exactly-once task execution.
 
@@ -24,11 +27,11 @@ Task titles, descriptions, JSON payloads and budgets, and artifact content are l
 
 The native local tool surface is:
 
-- `mempalace_task_create`, `mempalace_task_get`, `mempalace_task_claim`, `mempalace_task_renew`, `mempalace_task_transition`
-- `mempalace_message_send`, `mempalace_message_get`, `mempalace_message_acknowledge`, `mempalace_inbox_read`
+- `mempalace_task_create` (requires `wing`), `mempalace_task_get`, `mempalace_task_claim`, `mempalace_task_renew`, `mempalace_task_transition`
+- `mempalace_message_send`, `mempalace_message_get`, `mempalace_message_acknowledge`, `mempalace_inbox_read` (takes an optional `wing` filter)
 - `mempalace_artifact_put`, `mempalace_artifact_get`
 - `mempalace_result_put`, `mempalace_result_get`
-- `mempalace_coordination_event_get`, `mempalace_coordination_events`
+- `mempalace_coordination_event_get`, `mempalace_coordination_events` (takes an optional `wing` filter)
 
 Treat returned cursors as opaque and persist them with worker state. After restart, retrieve known task, message, result, and artifact IDs directly, then continue the inbox or event stream from the stored cursor.
 

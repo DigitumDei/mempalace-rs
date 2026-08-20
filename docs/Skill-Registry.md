@@ -38,6 +38,12 @@ project-bound. A skill stays bound to its wing for its whole life — a later ve
 it to another project, which would otherwise be a way to hand an established `skill_id` to a
 different project without review.
 
+The wing is normalised the same way on every path that touches it — proposing and discovery
+agree on `myproject` and `wing_myproject` naming the same wing, so a skill proposed under either
+spelling is found by a discovery filter using either spelling. `ensure_schema` backfills any wing
+stored before this normalisation existed, so a skill proposed under a raw, unprefixed wing before
+the fix shipped becomes discoverable the same way once the palace has opened under the new code.
+
 A palace holds many projects side by side, so a project-scoped skill that carried no project
 identity would be authoritative everywhere, which is `organization` scope wearing the wrong
 name. Passing `wing` to discovery hides project-scoped skills owned by *other* wings while

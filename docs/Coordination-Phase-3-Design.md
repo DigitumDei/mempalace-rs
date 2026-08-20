@@ -160,12 +160,26 @@ identity is stored as `{identity}:{claimed}`, never as the claimed name alone. A
 cannot impersonate a local actor, which is the acceptance criterion "free-form actor fields are
 not trusted as identity".
 
-**Cursors become opaque.** `CoordinationCursor(pub i64)` becomes an opaque
-`{rfc3339}|{sequence}` string, reusing the `encode_cursor`/`decode_cursor` shape already used
-by `/v1/changes` (`crates/mempalace-server/src/lib.rs`). Cursors are **per-origin** and are
-never compared or merge-sorted across palaces — a sequence from palace A is meaningless in
-palace B. The MCP tool accepts the opaque string and, for compatibility with the tools shipped
-in Phase 1, also accepts a bare integer, treating it as a local sequence with no timestamp.
+**Cursors become opaque strings, but stay clock-free.** On the wire a coordination cursor is
+an opaque string that the client must not parse or do arithmetic on. Internally it encodes only
+the `coordination_events.sequence` — an `AUTOINCREMENT` integer that is already monotonic
+per-database.
+
+This deliberately does **not** copy the `{rfc3339}|{rowid}` shape used by `/v1/changes`. That
+format carries a timestamp because `/v1/changes` supports a `since` parameter and therefore
+needs time ordering. `/v1/coordination/events` has no `since`, so a timestamp would buy
+nothing and would make the feed depend on a clock — the opposite of the acceptance criterion
+"per-origin cursors support restart-safe delivery without relying on synchronized clocks." A
+bare sequence depends on no clock at all, which satisfies that criterion more directly than
+mirroring the existing format would.
+
+Cursors are **per-origin**: a sequence from palace A is meaningless in palace B, so they are
+never compared or merge-sorted across palaces. Each remote gets only its own cursor, exactly as
+`changes_fanout` already does with its per-remote `BTreeMap`.
+
+`CoordinationCursor` therefore keeps its `i64` payload; only the wire and MCP representation
+becomes an opaque string. For compatibility with the tools shipped in Phase 1, the MCP tool
+also accepts a bare integer.
 
 **Lease clocks belong to the owning origin.** Expiry is always evaluated by the palace that
 owns the task, using its own clock. No caller timestamp is trusted, so nothing depends on

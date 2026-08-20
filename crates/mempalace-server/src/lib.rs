@@ -37,8 +37,8 @@ use blake3::Hasher;
 use mempalace_config::MempalaceConfig;
 use mempalace_core::{
     BUILD_VERSION, DIARY_ROOM, DIARY_TOPIC_PREFIX, DrawerId, DrawerRecord, RoomId,
-    SHARED_AGENT_DIARY_WING, SearchQuery, SourceLocator, WingId, hash_bytes, mined_drawer_id,
-    resolve_records,
+    SHARED_AGENT_DIARY_WING, SearchQuery, SourceLocator, WING_PREFIX, WingId, hash_bytes,
+    mined_drawer_id, resolve_records,
 };
 use mempalace_embeddings::{EmbeddingProvider, EmbeddingRequest};
 use mempalace_federation::{
@@ -282,24 +282,46 @@ struct RawTokenScope {
 /// any one of them covers it.
 #[derive(Debug, Clone)]
 struct TokenScopeEntry {
-    /// Wings this grant covers. Normalised at load time with
-    /// [`WingId::normalized`] so `"myproject"` in the token file and
-    /// `"wing_myproject"` in a request are recognised as the same wing (see
-    /// `normalize_scope_wing`). The literal `"*"` is kept as-is and matches
-    /// every wing.
+    /// Wings this grant covers. Normalised at load time by
+    /// `normalize_scope_wing`: an entry that is already a valid,
+    /// fully-qualified wing id (starts with [`WING_PREFIX`] and passes
+    /// [`WingId::new`]) is kept verbatim; anything else falls back to
+    /// [`WingId::normalized`], so short forms (`"myproject"`) in the token
+    /// file still resolve to the same wing a request names
+    /// (`"wing_myproject"`). See `normalize_scope_wing` for why verbatim
+    /// takes precedence. The literal `"*"` is kept as-is and matches every
+    /// wing.
     wings: Vec<String>,
     /// Operations this grant permits.
     operations: Vec<Operation>,
 }
 
 /// Normalises one `wings` entry from a token file. `"*"` is preserved
-/// verbatim; everything else goes through [`WingId::normalized`] so short
-/// forms (`"myproject"`) and prefixed forms (`"wing_myproject"`) in the token
-/// file resolve to the same wing a request names.
+/// verbatim.
+///
+/// Precedence, in order:
+/// 1. Already a valid, fully-qualified wing id — starts with [`WING_PREFIX`]
+///    (the real prefix constant, not a hardcoded `"wing_"`) and passes
+///    [`WingId::new`] — is kept **verbatim**. This matters because request
+///    paths (e.g. `route_drawers_add`) build the wing they authorize against
+///    with `WingId::new`, which validates but does not transform. `WingId`'s
+///    `validate_id` accepts `is_ascii_alphanumeric()`, which includes
+///    uppercase, so a token file can legitimately name `wing_MyProject`.
+///    Running that through [`WingId::normalized`] would lowercase it to
+///    `wing_myproject`, which then could never match a request naming the
+///    original `wing_MyProject` — silently 403-ing a correctly scoped token.
+/// 2. Otherwise, [`WingId::normalized`], so short forms (`"myproject"`) and
+///    differently-cased or lightly-malformed input in the token file still
+///    resolve to the same wing a request names (`"wing_myproject"`).
 fn normalize_scope_wing(raw: &str) -> Result<String, ServerError> {
     let trimmed = raw.trim();
     if trimmed == "*" {
         return Ok("*".to_owned());
+    }
+    if trimmed.starts_with(WING_PREFIX) {
+        if let Ok(wing) = WingId::new(trimmed) {
+            return Ok(wing.as_str().to_owned());
+        }
     }
     WingId::normalized(trimmed)
         .map(|wing| wing.as_str().to_owned())
@@ -1048,6 +1070,15 @@ where
     }
     let visibility = wing.is_none().then(|| auth.0.visible_wings(Operation::Read));
 
+    // Over-fetch from the search runtime to compensate for diary rows and
+    // scope-invisible rows filtered out below — the runtime ranks and
+    // truncates to the limit it is given, so asking for exactly `limit` and
+    // then filtering could silently return fewer than `limit` results even
+    // though enough visible candidates exist further down the ranking. Same
+    // 2x heuristic as `route_drawers_list`'s `storage_limit`; see the comment
+    // there for the heuristic's own limits.
+    let search_limit = limit.saturating_mul(2);
+
     let results = {
         let mut search = state.search.lock().await;
         search
@@ -1057,7 +1088,7 @@ where
                     text: body.query,
                     wing,
                     room,
-                    limit,
+                    limit: search_limit,
                     profile: state.config.embedding_profile,
                     view,
                 },
@@ -1069,6 +1100,7 @@ where
         .into_iter()
         .filter(|r| !is_diary_wing_or_room(r.wing.as_str(), r.room.as_str()))
         .filter(|r| visibility.as_ref().map(|v| v.contains(r.wing.as_str())).unwrap_or(true))
+        .take(limit)
         .enumerate()
         .map(|(index, result)| RemoteDrawerResult {
             drawer_id: result
@@ -1128,15 +1160,37 @@ where
     if !auth.0.allows_wing(Operation::Write, wing.as_str()) {
         return Err(ServerError::Forbidden);
     }
-    let identity = auth.0.0;
 
-    // Duplicate check
+    // Duplicate check. `find_duplicates` scans every wing, but this handler
+    // has only established that the caller may WRITE `wing` — not that it may
+    // READ whatever wing a near-duplicate happens to live in. Filtering only
+    // the returned `matches` is not enough: the 409 status itself is the
+    // oracle. So, mirroring `route_drawers_check_duplicate` (identical
+    // shape), filter to `visible_wings(Operation::Read)` plus the diary rule
+    // BEFORE deciding whether to return 409 at all. For an unrestricted token
+    // every wing is visible, so behaviour is unchanged.
+    //
+    // Trade-off, deliberate — see docs/Federation.md §1.5: a scoped writer
+    // can now create a drawer that duplicates content in a wing it cannot
+    // read, because that duplicate is invisible to this check. The
+    // alternative — reporting it — would disclose that wing's content to a
+    // caller not authorized to read it, which is worse.
+    let visibility = auth.0.visible_wings(Operation::Read);
     let duplicates = find_duplicates(&state, &body.content, DEFAULT_DUPLICATE_THRESHOLD).await?;
+    let duplicates: Vec<Value> = duplicates
+        .into_iter()
+        .filter(|m| {
+            let dup_wing = m.get("wing").and_then(Value::as_str).unwrap_or("");
+            let dup_room = m.get("room").and_then(Value::as_str).unwrap_or("");
+            !is_diary_wing_or_room(dup_wing, dup_room) && visibility.contains(dup_wing)
+        })
+        .collect();
     if !duplicates.is_empty() {
         return Err(ServerError::Duplicate(
             serde_json::to_value(&duplicates).unwrap_or(Value::Array(vec![])),
         ));
     }
+    let identity = auth.0.0;
 
     // Determine added_by: identity[:claimed]
     let added_by = match &body.added_by {
@@ -2630,6 +2684,10 @@ mod tests {
     /// Scoped to the short-form wing name `"myproject"`, which normalizes to
     /// `wing_myproject` at load time.
     const SHORT_WING_TOKEN: &str = "short-wing-secret-token";
+    /// Scoped to the already-prefixed, mixed-case wing id `"wing_MyProject"`
+    /// verbatim — proves `normalize_scope_wing` keeps a valid fully-qualified
+    /// wing id as-is instead of lowercasing it via `WingId::normalized`.
+    const UPPERCASE_WING_TOKEN: &str = "uppercase-wing-secret-token";
 
     fn restrict_token_file(path: &std::path::Path) {
         #[cfg(unix)]
@@ -2726,6 +2784,10 @@ mod tests {
             {
                 "token": SHORT_WING_TOKEN, "name": "short_wing", "enabled": true,
                 "scopes": [{"wings": ["myproject"], "operations": ["read", "write"]}],
+            },
+            {
+                "token": UPPERCASE_WING_TOKEN, "name": "uppercase_wing", "enabled": true,
+                "scopes": [{"wings": ["wing_MyProject"], "operations": ["read", "write"]}],
             },
         ])
     }
@@ -3282,6 +3344,47 @@ mod tests {
         (ids[0].clone(), ids[1].clone())
     }
 
+    /// Seeds `count` drawers into `wing`, each containing `"rust"` so every
+    /// one lands in the same deterministic-stub embedding bucket (see
+    /// `DeterministicStubProvider::vector_for`) and therefore ties for
+    /// similarity against a matching query. Written via `/v1/ingest/batch`
+    /// rather than `POST /v1/drawers` because the latter runs near-duplicate
+    /// detection — seeding several same-bucket drawers through it would 409
+    /// on everything after the first. Used by the pagination-completeness
+    /// tests below, which need many tied candidates to exercise ranking and
+    /// the over-fetch heuristic.
+    async fn seed_rust_bucket_drawers(harness: &Harness, wing: &str, count: usize) {
+        let files: Vec<Value> = (0..count)
+            .map(|i| {
+                json!({
+                    "relative_path": format!("{wing}/pagination-{i}.txt"),
+                    "content_hash": format!("ch-{wing}-{i}"),
+                    "chunks": [{
+                        "chunk_index": 0,
+                        "room": "pagination",
+                        "text": format!("rust pagination filler content number {i}"),
+                    }],
+                })
+            })
+            .collect();
+        let resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/ingest/batch",
+                ALICE_TOKEN,
+                json!({
+                    "wing": wing,
+                    "repo_id": format!("github.com/acme/{wing}-pagination"),
+                    "files": files,
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "seeding {wing} failed");
+    }
+
     // Grandfathering (absent `scopes` = unrestricted), one route per group.
 
     #[tokio::test]
@@ -3670,6 +3773,73 @@ mod tests {
         assert_eq!(wrong.status(), StatusCode::FORBIDDEN);
     }
 
+    // `normalize_scope_wing` unit coverage: verbatim precedence for an
+    // already-valid, fully-qualified wing id, short-form normalization as a
+    // fallback, and the wildcard passthrough. `WingId::new`'s `validate_id`
+    // accepts uppercase ASCII, so `wing_MyProject` is a legal wing id that
+    // must round-trip unchanged — see the doc comment on
+    // `normalize_scope_wing` for why lowercasing it would strand the scope.
+
+    #[test]
+    fn normalize_scope_wing_keeps_valid_fully_qualified_id_verbatim() {
+        assert_eq!(normalize_scope_wing("wing_MyProject").unwrap(), "wing_MyProject");
+    }
+
+    #[test]
+    fn normalize_scope_wing_normalizes_short_form() {
+        assert_eq!(normalize_scope_wing("myproject").unwrap(), "wing_myproject");
+    }
+
+    #[test]
+    fn normalize_scope_wing_preserves_wildcard() {
+        assert_eq!(normalize_scope_wing("*").unwrap(), "*");
+    }
+
+    // End-to-end proof that the mangling bug is gone: a token scoped to an
+    // already-prefixed, mixed-case wing id authorizes a request naming that
+    // exact wing — and only that exact spelling, not a lowercased alias,
+    // since verbatim and normalized forms are deliberately not both granted
+    // for the same scope entry.
+
+    #[tokio::test]
+    async fn wing_scope_exact_prefixed_form_preserved_verbatim() {
+        let harness = make_harness().await;
+
+        let right = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/drawers",
+                UPPERCASE_WING_TOKEN,
+                json!({"wing": "wing_MyProject", "room": "r", "content": "uppercase wing verbatim proof"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            right.status(),
+            StatusCode::OK,
+            "`wing_MyProject` in the token file must authorize the identical `wing_MyProject` in the request"
+        );
+
+        let lowercased = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/drawers",
+                UPPERCASE_WING_TOKEN,
+                json!({"wing": "wing_myproject", "room": "r", "content": "uppercase wing verbatim negative proof"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            lowercased.status(),
+            StatusCode::FORBIDDEN,
+            "a verbatim-form scope must not also grant the lowercased alias"
+        );
+    }
+
     // Group C: filter aggregate routes to visible wings rather than reject.
 
     #[tokio::test]
@@ -3870,6 +4040,79 @@ mod tests {
         );
     }
 
+    // `route_drawers_add`'s own near-duplicate check has the identical shape:
+    // it scans every wing via `find_duplicates`, so its 409 response (and the
+    // `matches` it carries, with `wing`/`room` per match) would otherwise be
+    // a cross-wing content oracle for a scoped writer. Matches outside the
+    // caller's visible wings must be filtered out before the 409 decision is
+    // made, not after.
+    #[tokio::test]
+    async fn add_drawer_duplicate_check_filters_to_visible_wings() {
+        let harness = make_harness().await;
+        seed_two_wings(&harness).await;
+
+        // wing_beta's own content verbatim, so it is a near-duplicate of the
+        // existing wing_beta drawer regardless of who is asking.
+        let duplicate_content = "beta wing content about javascript tooling ecosystems";
+
+        // Sanity: an unrestricted caller writing the same content to
+        // wing_alpha is still blocked by the wing_beta duplicate — proves
+        // duplicate detection itself still fires when the match IS visible.
+        // 409 means this does not commit anything.
+        let alice_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/drawers",
+                ALICE_TOKEN,
+                json!({"wing": "wing_alpha", "room": "dup-room", "content": duplicate_content}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            alice_resp.status(),
+            StatusCode::CONFLICT,
+            "sanity check failed: an unrestricted caller should see the wing_beta duplicate"
+        );
+
+        // The scoped token (wing_alpha only) writing the identical content to
+        // a wing it CAN write must succeed: the wing_beta duplicate is
+        // outside its visible wings, so it must never surface as a 409 —
+        // that 409 (and its `matches` body) would otherwise let a scoped
+        // writer learn about wing_beta's content.
+        let scoped_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/drawers",
+                SCOPED_ALPHA_TOKEN,
+                json!({"wing": "wing_alpha", "room": "dup-room", "content": duplicate_content}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            scoped_resp.status(),
+            StatusCode::OK,
+            "cross-wing duplicate must not block a write the token is otherwise allowed to make"
+        );
+
+        // The write really did commit — this is the documented trade-off
+        // (docs/Federation.md §1.5): the store now holds duplicate content
+        // across wing_alpha and wing_beta, because reporting the duplicate
+        // would have disclosed wing_beta's content to a caller that cannot
+        // read it.
+        let drawer_id = body_json(scoped_resp).await["drawer_id"].as_str().unwrap().to_owned();
+        let get_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_get(&format!("/v1/drawers/{drawer_id}"), SCOPED_ALPHA_TOKEN))
+            .await
+            .unwrap();
+        assert_eq!(get_resp.status(), StatusCode::OK, "the duplicate-content drawer must have committed");
+    }
+
     // An unknown operation string in the token file is a load error.
 
     #[test]
@@ -4007,6 +4250,84 @@ mod tests {
             "cross-wing search must filter out wings the token cannot see: {scoped_results:?}"
         );
         assert!(scoped_results.iter().all(|r| r["wing"] == "wing_alpha"));
+    }
+
+    // Pagination correctness, not security: scope (and diary) filtering runs
+    // AFTER the storage/search layer has already applied `limit`, so without
+    // an over-fetch a token whose visible results are outranked by invisible
+    // ones could get fewer than `limit` results even though enough visible
+    // candidates exist further down. `route_drawers_list` already over-fetches
+    // 2x and filters before truncating (see the comment on its
+    // `storage_limit`); `route_drawers_search` now follows the same pattern.
+
+    #[tokio::test]
+    async fn search_pagination_reaches_full_page_when_visible_results_rank_below_invisible() {
+        let harness = make_harness().await;
+
+        // Equal-sized groups (3 + 3) in the same embedding bucket, so every
+        // drawer ties for top similarity against a matching query. Tied
+        // matches sort by wing id ascending (`compare_ranked_matches` in
+        // mempalace-search), and "wing_0hidden" < "wing_alpha"
+        // lexicographically, so all 3 invisible drawers rank strictly ahead
+        // of all 3 visible ones. A raw fetch of exactly `limit` (3) would
+        // therefore surface zero visible results; only a >=2x over-fetch
+        // reaches the visible tier.
+        const LIMIT: usize = 3;
+        seed_rust_bucket_drawers(&harness, "wing_0hidden", LIMIT).await;
+        seed_rust_bucket_drawers(&harness, "wing_alpha", LIMIT).await;
+
+        let resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/drawers/search",
+                SCOPED_ALPHA_TOKEN,
+                json!({"query": "rust pagination filler content", "limit": LIMIT}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let results = body["results"].as_array().unwrap();
+        assert_eq!(
+            results.len(),
+            LIMIT,
+            "a scoped token must still get a full page when its visible results rank below \
+             invisible ones: {results:?}"
+        );
+        assert!(results.iter().all(|r| r["wing"] == "wing_alpha"));
+    }
+
+    #[tokio::test]
+    async fn list_pagination_reaches_full_page_when_visible_rows_are_outnumbered_by_invisible_ones() {
+        // Maintenance disabled so no background compaction can reorder rows
+        // mid-test — `list_drawers` has no ranking (a plain storage scan),
+        // so this test relies on insertion order: seeding the 3 invisible
+        // rows before the 3 visible ones puts every invisible row ahead of
+        // every visible one in the raw, un-over-fetched order.
+        let harness = make_harness_with_maintenance_config(false, false).await;
+
+        const LIMIT: usize = 3;
+        seed_rust_bucket_drawers(&harness, "wing_0hidden", LIMIT).await;
+        seed_rust_bucket_drawers(&harness, "wing_alpha", LIMIT).await;
+
+        let resp = harness
+            .router
+            .clone()
+            .oneshot(authed_get(&format!("/v1/drawers?limit={LIMIT}"), SCOPED_ALPHA_TOKEN))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let drawers = body["drawers"].as_array().unwrap();
+        assert_eq!(
+            drawers.len(),
+            LIMIT,
+            "a scoped token must still get a full page when its visible rows are outnumbered by \
+             invisible ones earlier in storage order: {drawers:?}"
+        );
+        assert!(drawers.iter().all(|d| d["wing"] == "wing_alpha"));
     }
 
     // ─── Ingest harness variant ───────────────────────────────────────────────

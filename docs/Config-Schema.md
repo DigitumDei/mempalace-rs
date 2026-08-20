@@ -352,9 +352,16 @@ token entries, not a field of `config.json`. Its shape (`token`/`name`/
       this field existed, so existing deployments keep working unchanged.
     - `[]` (an explicit empty array) — a deliberate lockout: no access at
       all. This is **not** a synonym for absent.
-    - `wings` accepts the literal `"*"` for every wing; other entries are
-      normalised at load with the same rule `WingId::normalized` uses
-      elsewhere, so `"myproject"` and `"wing_myproject"` name the same wing.
+    - `wings` accepts the literal `"*"` for every wing. Other entries are
+      normalised at load, verbatim-first: an entry that is already a valid,
+      fully-qualified wing id (`wing_`-prefixed, passing `WingId::new`) is
+      kept exactly as written — `WingId::new` accepts uppercase and does not
+      transform it, so lowercasing here would strand a scope like
+      `wing_MyProject`. Anything else falls back to the same rule
+      `WingId::normalized` uses elsewhere, so `"myproject"` and
+      `"wing_myproject"` name the same wing. See
+      [Federation → 1.5 Authorization scopes](Federation.md#15-authorization-scopes)
+      for the full precedence rule.
     - `operations` is a closed enum: `read`, `write`, `delete`, `ingest`,
       `coordination_read`, `coordination_write`, `coordination_claim`. The
       three `coordination_*` operations have no routes yet — they exist so

@@ -196,7 +196,18 @@ four groups, and each group is authorized differently:
   its response carries `wing`/`room` per match and an `is_duplicate` boolean,
   either of which would otherwise let a token learn about content in a wing it
   cannot read; `is_duplicate` is computed *after* filtering, not before, so
-  the boolean itself cannot leak that either. `GET /v1/changes` matters most —
+  the boolean itself cannot leak that either. `POST /v1/drawers` applies the
+  identical filter to its own near-duplicate check, before deciding whether
+  to return **409 duplicate**: candidate matches outside the caller's visible
+  wings (and diary matches) are discarded first, because the 409 status and
+  its `matches` body would otherwise let a scoped writer learn about content
+  in a wing it cannot read even though it can only write to a wing it *is*
+  scoped to. This has a real, deliberate cost: a scoped writer can now create
+  a drawer that duplicates content already present in a wing it cannot see,
+  because that duplicate is invisible to the check. The alternative —
+  reporting it — would disclose that wing's content to a caller not
+  authorized to read it, which is worse. For an unrestricted token every wing
+  is visible, so this changes nothing. `GET /v1/changes` matters most —
   it is the federated change feed. Not every event carries a determinable
   wing (KG facts, identity updates, lineage records and self-observations
   never do; some `drawer_deleted` events written before this scoping model
@@ -217,9 +228,14 @@ The diary guard is unaffected by any of this: it is a content rule (wing
 `wing_agents`, room `diary`, or a `diary:`-prefixed source), not an identity
 rule, and it applies to every token regardless of scope.
 
-`wings` in a scope entry accepts the literal `"*"` for every wing; other entries
-are normalised at load with the same rule `WingId::normalized` uses elsewhere, so
-a token file entry naming `"myproject"` authorizes a request naming
+`wings` in a scope entry accepts the literal `"*"` for every wing. Other entries
+are normalised at load, verbatim-first: an entry that is already a valid,
+fully-qualified wing id (has the `wing_` prefix and passes `WingId::new`) is
+kept exactly as written, so a scope naming `wing_MyProject` still authorizes a
+request naming `wing_MyProject` — `WingId::new` accepts uppercase and does not
+transform it, so lowercasing here would silently strand that scope. Anything
+else falls back to the same rule `WingId::normalized` uses elsewhere, so a
+token file entry naming `"myproject"` authorizes a request naming
 `wing_myproject`.
 
 ## Part 2 — Configuring a client

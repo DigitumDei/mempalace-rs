@@ -395,7 +395,14 @@ CREATE INDEX IF NOT EXISTS idx_skill_outcomes_skill ON skill_outcomes(skill_id, 
             predicates.push(format!("status=?{}", bindings.len()));
         }
         if let Some(wing) = wing {
-            bindings.push(Box::new(wing.to_owned()));
+            // Normalised the same way `propose_skill` normalises on write (see the comment
+            // there): without this, a caller going through `SkillStore` directly with an
+            // unprefixed wing (e.g. `myproject`) would never match a skill stored as
+            // `wing_myproject`. The MCP layer already normalises its filter before calling in,
+            // which is exactly why this asymmetry survived — this makes the storage API
+            // self-consistent regardless of caller.
+            let normalized = WingId::normalized(wing)?.to_string();
+            bindings.push(Box::new(normalized));
             predicates.push(format!("(wing IS NULL OR wing=?{})", bindings.len()));
         }
         bindings.push(Box::new(limit));
@@ -604,11 +611,7 @@ CREATE INDEX IF NOT EXISTS idx_skill_outcomes_skill ON skill_outcomes(skill_id, 
     }
 
     fn connection(&self) -> Result<Connection> {
-        let conn = Connection::open(&self.path)?;
-        conn.execute_batch(
-            "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;",
-        )?;
-        Ok(conn)
+        crate::coordination::open_palace_connection(&self.path)
     }
 }
 
@@ -1305,6 +1308,38 @@ mod tests {
         assert!(ids.contains(&"alpha-deploy"), "own project skill must be visible");
         assert!(ids.contains(&"palace-wide"), "non-project-bound skills stay visible");
         assert!(!ids.contains(&"beta-deploy"), "another project's skill must not appear");
+    }
+
+    #[test]
+    fn list_skills_normalises_its_wing_filter_through_skill_store_directly() {
+        // Proposes and lists using the *same* unprefixed wing spelling, both times going
+        // straight through `SkillStore` (never through the MCP layer, which already normalises
+        // its filter and would mask this). Before the fix, `propose_skill` normalised on write
+        // but `list_skills` bound its filter raw, so a caller using `myproject` for both calls
+        // would store `wing_myproject` and then query for `myproject`, and the skill would be
+        // invisible.
+        let (_dir, s) = store();
+        s.propose_skill(&NewSkill {
+            skill_id: "unprefixed-round-trip".into(),
+            scope: SkillScope::Project,
+            wing: Some("myproject".into()),
+            applicability: "a".into(),
+            instructions_ref: "r".into(),
+            required_capabilities: vec![],
+            required_tools: vec![],
+            required_permissions: vec![],
+            author: "author-a".into(),
+            provenance: None,
+            confidence: 0.5,
+            idempotency_key: "unprefixed-round-trip-1".into(),
+        })
+        .expect("propose with unprefixed wing");
+
+        let seen = s.list_skills(None, None, Some("myproject"), 50).expect("list with unprefixed wing");
+        assert!(
+            seen.iter().any(|skill| skill.skill_id == "unprefixed-round-trip"),
+            "a skill proposed and listed with the same unprefixed wing must be visible: {seen:?}"
+        );
     }
 
     #[test]

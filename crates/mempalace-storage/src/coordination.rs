@@ -249,7 +249,7 @@ impl CoordinationStore {
     /// yet when that batch runs, and `CREATE INDEX ... (wing, ...)` against a still-missing
     /// column would fail outright.
     pub fn ensure_schema(&self) -> Result<()> {
-        let conn = self.connection()?;
+        let mut conn = self.connection()?;
         conn.execute_batch(r#"
 CREATE TABLE IF NOT EXISTS coordination_tasks (
  task_id TEXT PRIMARY KEY, title TEXT NOT NULL, description TEXT NOT NULL, state TEXT NOT NULL,
@@ -281,14 +281,27 @@ CREATE TABLE IF NOT EXISTS coordination_events (
  wing TEXT NOT NULL DEFAULT 'wing_unscoped');
 CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(task_id, sequence);
 "#)?;
-        add_column_if_missing(&conn, "coordination_tasks", "wing", "TEXT NOT NULL DEFAULT 'wing_unscoped'")?;
-        add_column_if_missing(&conn, "coordination_events", "wing", "TEXT NOT NULL DEFAULT 'wing_unscoped'")?;
+        // The check-then-act column backfill below must not run concurrently with itself across
+        // processes: two MCP servers opening the same pre-Phase-3 palace at once could both
+        // observe the column absent via `PRAGMA table_info` and both attempt
+        // `ALTER TABLE ... ADD COLUMN`, and the loser would fail `ensure_schema` outright — a
+        // startup failure at the exact moment a palace is upgraded. `BEGIN IMMEDIATE` acquires
+        // the write lock up front, so a second racing connection blocks (up to
+        // `PRAGMA busy_timeout`) until the first commits, then re-checks `PRAGMA table_info`
+        // inside its own transaction and finds the column already present. The duplicate-column
+        // error is also tolerated as a second line of defence (e.g. an external tool holding the
+        // lock differently), since `add_column_if_missing` is meant to be idempotent by
+        // contract, not just serialized by this transaction.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        add_column_if_missing(&tx, "coordination_tasks", "wing", "TEXT NOT NULL DEFAULT 'wing_unscoped'")?;
+        add_column_if_missing(&tx, "coordination_events", "wing", "TEXT NOT NULL DEFAULT 'wing_unscoped'")?;
         // Wing-filtered `events()` calls are a continuously polled feed, so a full scan is a
         // real cost, not a theoretical one. The column is guaranteed to exist by this point on
         // both the fresh and the upgraded path.
-        conn.execute_batch(
+        tx.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_coordination_events_wing ON coordination_events(wing, sequence);",
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -302,6 +315,11 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
             bounded_json(budget)?;
         }
         let wing = WingId::normalized(&input.wing)?.to_string();
+        if wing == UNSCOPED_WING {
+            return Err(StorageError::Invariant(format!(
+                "`{UNSCOPED_WING}` is reserved for tasks migrated from before wings existed; new tasks must specify a real wing"
+            )));
+        }
         let mut conn = self.connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some(task) = find_task_by_key(&tx, &input.created_by, &input.idempotency_key)? {
@@ -770,11 +788,7 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
     }
 
     fn connection(&self) -> Result<Connection> {
-        let conn = Connection::open(&self.path)?;
-        conn.execute_batch(
-            "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;",
-        )?;
-        Ok(conn)
+        open_palace_connection(&self.path)
     }
 }
 
@@ -782,6 +796,13 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
 /// already exists. `table` and `column` are always internal literals, never caller input, so
 /// interpolating them into DDL text carries no injection risk; SQLite has no
 /// `ADD COLUMN IF NOT EXISTS`, so the existence check is done by hand via `PRAGMA table_info`.
+///
+/// Callers are expected to hold a write lock (e.g. a `BEGIN IMMEDIATE` transaction) across the
+/// check-and-act so two processes never race here in the first place. The duplicate-column error
+/// from `ALTER TABLE` is tolerated anyway as a second line of defence: SQLite has no distinct
+/// error code for it (it comes back as a generic `SQLITE_ERROR` with a message), so this matches
+/// on the message text, which is a stable, documented SQLite error string for this exact
+/// condition, not a moving target we control.
 fn add_column_if_missing(conn: &Connection, table: &str, column: &str, ddl: &str) -> Result<()> {
     let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
     let exists = statement
@@ -790,10 +811,40 @@ fn add_column_if_missing(conn: &Connection, table: &str, column: &str, ddl: &str
         .iter()
         .any(|name| name == column);
     if !exists {
-        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {ddl};"))?;
+        if let Err(err) = conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {ddl};")) {
+            let message = err.to_string();
+            if !message.contains("duplicate column name") {
+                return Err(err.into());
+            }
+        }
     }
     Ok(())
 }
+/// Open a connection to the palace database with the pragmas every coordination-family
+/// store depends on.
+///
+/// `journal_mode=WAL` briefly needs an exclusive lock, and SQLite does **not** retry a
+/// journal-mode change through the busy handler when another connection has the database
+/// open - it returns `SQLITE_BUSY` immediately no matter how long the timeout is. Two
+/// processes opening the same palace at once (two MCP runtimes starting together) would
+/// therefore fail outright. WAL is a persistent property of the database file, so a busy
+/// here means another connection is setting it or already has: tolerate that specific
+/// condition and carry on. Matched on the structured error code, never on message text.
+pub(crate) fn open_palace_connection(path: &Path) -> Result<Connection> {
+    let conn = Connection::open(path)?;
+    // Installed through rusqlite's API rather than as a pragma in the batch below, so the
+    // handler exists before the first statement that could contend runs.
+    conn.busy_timeout(std::time::Duration::from_millis(5_000))?;
+    conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+    match conn.execute_batch("PRAGMA journal_mode=WAL;") {
+        Ok(()) => {}
+        Err(rusqlite::Error::SqliteFailure(err, _))
+            if err.code == rusqlite::ErrorCode::DatabaseBusy => {}
+        Err(err) => return Err(err.into()),
+    }
+    Ok(conn)
+}
+
 fn validate_actor(v: &str) -> Result<()> {
     if v.trim().is_empty() {
         Err(StorageError::Invariant("actor must not be empty".into()))
@@ -1459,6 +1510,44 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
     }
 
     #[test]
+    fn concurrent_ensure_schema_on_a_pre_phase3_palace_does_not_fail_the_backfill() {
+        // Simulates two MCP processes opening the same pre-Phase-3 palace at the same instant:
+        // both would see `wing` absent from `PRAGMA table_info` and race to `ALTER TABLE ... ADD
+        // COLUMN`. Before the fix, the loser's `ensure_schema` (and therefore `McpRuntime::new`)
+        // failed outright.
+        let dir = TempDir::new().expect("temp");
+        let path = dir.path().join("palace.sqlite3");
+        {
+            let conn = Connection::open(&path).expect("open");
+            conn.execute_batch(LEGACY_SCHEMA_SQL).expect("legacy schema");
+        }
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut joins = Vec::new();
+        for _ in 0..2 {
+            let path = path.clone();
+            let gate = barrier.clone();
+            joins.push(std::thread::spawn(move || {
+                let store = CoordinationStore::new(path);
+                gate.wait();
+                store.ensure_schema()
+            }));
+        }
+        for join in joins {
+            join.join().expect("racing thread").expect("ensure_schema must not fail under a race");
+        }
+
+        let wing_columns = table_info(&path, "coordination_tasks")
+            .into_iter()
+            .filter(|(name, ..)| name == "wing")
+            .count();
+        assert_eq!(wing_columns, 1, "racing backfills must not duplicate the column");
+
+        let store = CoordinationStore::new(&path);
+        let t = task_with_wing(&store, "race", "concurrent-ensure-schema-1");
+        assert_eq!(t.wing, "wing_race");
+    }
+
+    #[test]
     fn ensure_schema_is_idempotent() {
         let dir = TempDir::new().expect("temp");
         let path = dir.path().join("palace.sqlite3");
@@ -1486,6 +1575,35 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
         assert_eq!(t.wing, "wing_myproject");
         let fetched = s.get_task(&t.task_id).expect("get").expect("found");
         assert_eq!(fetched.wing, "wing_myproject");
+    }
+
+    #[test]
+    fn create_task_rejects_the_reserved_unscoped_wing_in_either_spelling() {
+        let (_d, s) = store();
+        s.create_task(&NewTask {
+            title: "work".into(),
+            description: "do it".into(),
+            created_by: "manager".into(),
+            wing: UNSCOPED_WING.into(),
+            idempotency_key: "reject-prefixed".into(),
+            parent_id: None,
+            dependencies: vec![],
+            budget: None,
+            expires_at: None,
+        })
+        .expect_err("prefixed wing_unscoped must be rejected");
+        s.create_task(&NewTask {
+            title: "work".into(),
+            description: "do it".into(),
+            created_by: "manager".into(),
+            wing: "unscoped".into(),
+            idempotency_key: "reject-unprefixed".into(),
+            parent_id: None,
+            dependencies: vec![],
+            budget: None,
+            expires_at: None,
+        })
+        .expect_err("unprefixed unscoped must be rejected after normalisation");
     }
 
     #[test]

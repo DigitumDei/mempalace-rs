@@ -581,11 +581,7 @@ CREATE INDEX IF NOT EXISTS idx_delegation_checkpoints_span
     }
 
     fn connection(&self) -> Result<Connection> {
-        let conn = Connection::open(&self.path)?;
-        conn.execute_batch(
-            "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;",
-        )?;
-        Ok(conn)
+        crate::coordination::open_palace_connection(&self.path)
     }
 }
 

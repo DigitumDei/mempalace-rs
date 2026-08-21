@@ -21,13 +21,16 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      pull-requests: read
+      # write, not read: publishing the review needs it. With read the action fetches the diff,
+      # is denied when it tries to post, and still exits 0 — a green check with no review, which
+      # is how this went unnoticed.
+      pull-requests: write
       issues: read
       id-token: write
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 1
 
@@ -39,17 +42,42 @@ jobs:
           allowed_bots: 'actuarius-bot'
           plugin_marketplaces: 'https://github.com/anthropics/claude-code.git'
           plugins: 'code-review@claude-code-plugins'
-          prompt: '/code-review:code-review --comment ${{ github.repository }}/pull/${{ github.event.pull_request.number }}'
-          # The reviewer needs to read the code it is reviewing. This allowlist is
-          # exhaustive, not additive: with only the inline-comment tool permitted the
-          # review still ran and still reported success, but every Read/Grep/git call
-          # was denied (28 denials in one run against 1 in a run that worked), so it
-          # had nothing to substantiate and posted no comments at all.
+
+          # Creates the tracking comment the github_comment MCP server updates, matching
+          # examples/pr-review-comprehensive.yml. Also makes a stalled review visible: the
+          # comment appears early, so "nothing posted" stops being indistinguishable from
+          # "not started".
+          track_progress: true
+          prompt: '/code-review:code-review ${{ github.repository }}/pull/${{ github.event.pull_request.number }}'
+
+          # Required for the review to be published, not optional polish. Two independent
+          # permission layers govern this: the `permissions:` block above decides what the GitHub
+          # token may do, while this decides what the agent may invoke. Miss either and the
+          # action reviews the diff, is denied when it goes to post, and still exits 0 — a green
+          # check with no review, which is how this went unnoticed for so long.
           #
-          # Note the plugin below is resolved from a remote marketplace at run time, so
-          # its tool needs can change without this file changing. If reviews go quiet
-          # again, check permission_denials_count in the run log before suspecting auth.
-          claude_args: '--allowedTools "mcp__github_inline_comment__create_inline_comment,Read,Grep,Glob,Bash(git diff:*),Bash(git log:*),Bash(git show:*)"'
+          # Inline comments go through the action's own MCP server, not the REST API. Without
+          # that tool the review completes and then fails once per finding
+          # (permission_denials_count tracked the finding count exactly).
+          #
+          # Deliberately no `Bash(gh api:*)`. This job holds a pull-requests:write token on
+          # same-repo PRs while reading a diff it does not control, and `gh api` takes any
+          # endpoint and method — a prompt injection in reviewed content would get an
+          # unrestricted authenticated client, able to close PRs or rewrite their descriptions
+          # rather than merely publish a review. It would also not have helped: posting never ran
+          # through `gh api` at all.
+          #
+          # Mirrors examples/pr-review-comprehensive.yml in anthropics/claude-code-action.
+          # `--allowed-tools` REPLACES the action's defaults rather than extending them, so this
+          # list must name everything the review needs — including the file-reading tools and the
+          # action's own MCP servers, which are otherwise present by default.
+          #
+          # Both MCP servers are gated on this list (see install-mcp-server.ts): the inline
+          # comment server is installed only when a `mcp__github_inline_comment__` tool is
+          # allowed, and in agent mode — which this is, since a prompt is supplied — the
+          # github_comment server needs a `mcp__github_comment__` tool allowed too. That second
+          # one publishes the review summary, and its absence left a single denial with the
+          # inline comments never written.
+          claude_args: '--allowed-tools "mcp__github_inline_comment__create_inline_comment,mcp__github_comment__update_claude_comment,Read,Grep,Glob,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"'
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://code.claude.com/docs/en/cli-reference for available options
-

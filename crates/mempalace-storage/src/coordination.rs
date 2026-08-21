@@ -1349,9 +1349,10 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
 
         // Establish a live lease with a sane TTL, then try to renew it with an oversized one.
         let renewable = task_with_wing(&s, "wing_test", "oversized-lease-renew-1");
-        let claimed = s
-            .claim_task(&renewable.task_id, "worker-a", renewable.revision, Duration::minutes(5))
-            .expect("claim with a sane ttl");
+        let claimed = applied_task(
+            s.claim_task(&renewable.task_id, "worker-a", renewable.revision, Duration::minutes(5))
+                .expect("claim with a sane ttl"),
+        );
         let err = s
             .renew_lease(&renewable.task_id, "worker-a", claimed.revision, huge)
             .expect_err("an out-of-range renewal TTL must be rejected, not panic");

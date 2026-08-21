@@ -244,11 +244,22 @@ gains coordination categories and — unlike today, where it is dead code called
    `mempalace_task_claim`, `mempalace_message_get`, etc. take a `wing` argument, matching the local
    tool surface unchanged since Phase 1). There is therefore no wing to resolve a route against for
    those calls. They use a **local-first, ID-discovery fallback** instead: local storage first, then
-   — whenever any remote is configured, independent of any specific wing's resolved mode — each
-   remote in name order, exactly mirroring `DeleteDrawer`'s existing "no cross-palace ID mapping"
-   reasoning. "Writes go to the origin that owns the task" (as originally written above) describes
-   this discovery process, not a wing-routed decision. See the `FederationRouter` "Coordination"
-   section comment in `crates/mempalace-mcp/src/federation.rs`.
+   — independent of any specific wing's resolved mode — each remote in name order, exactly
+   mirroring `DeleteDrawer`'s existing "no cross-palace ID mapping" reasoning. "Writes go to the
+   origin that owns the task" (as originally written above) describes this discovery process, not
+   a wing-routed decision. See the `FederationRouter` "Coordination" section comment in
+   `crates/mempalace-mcp/src/federation.rs`.
+   
+   This is independent of *which* wing a record turns out to belong to, but it is **not**
+   independent of whether coordination federation was configured at all. An initial version of
+   this fallback ran whenever *any* remote was configured, for *any* reason — a palace federating
+   drawers only, with no `federation.coordination` entry, would still send a local coordination
+   miss to that remote. `FederationRouter::coordination_federation_enabled()` closes that: the
+   fallback now short-circuits to a local-only result unless `federation.coordination` has at
+   least one entry or `default_mode` (which `resolve_coordination_route` itself falls through to
+   for any wing without an explicit entry) is non-`Local`. See
+   `coordination_fallback_records_zero_remote_calls_without_coordination_federation_config` in
+   `crates/mempalace-mcp/src/federation.rs`.
 
 3. **The typed conflict crosses the wire as a new `mempalace_remote::RemoteRevisionedWrite<T>`,
    not `mempalace_storage::RevisionedWrite<T>`.** `mempalace-remote` deliberately has no dependency

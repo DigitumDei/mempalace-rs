@@ -71,6 +71,31 @@ impl FederationRouter {
         !self.remotes.is_empty()
     }
 
+    /// True when coordination has actually been federated by configuration — as opposed to
+    /// merely having *some* remote configured for other purposes (drawers, KG).
+    ///
+    /// The ID-referencing coordination fallbacks below (`coordination_read_fallback`,
+    /// `coordination_write_fallback`, and the claim/renew/transition equivalents) have no wing
+    /// to resolve a route against — that is the whole reason they exist (see the "Coordination
+    /// (issue #102 Stage 4)" section comment above). Without this check they would fan out to
+    /// every configured remote on every local miss regardless of whether the operator ever
+    /// wrote a `federation.coordination` entry: an operator who federates drawers only, and
+    /// never configures coordination, would still have a local `mempalace_task_get` miss sent
+    /// to their remote. That violates "federation remains disabled unless explicitly
+    /// configured per supported scope/wing" (issue #102's first acceptance criterion) and the
+    /// local-first-by-default invariant this whole crate exists to protect.
+    ///
+    /// True when either an explicit `federation.coordination[wing]` entry exists (some wing was
+    /// deliberately routed) or `default_mode` itself is non-`Local` (coordination falls through
+    /// to it exactly like [`mempalace_config::resolve_coordination_route`] does, so the gate has
+    /// to agree with that fallback, not just the explicit table). This does not depend on which
+    /// wing a task actually belongs to — a coordination ID has no wing until a record naming it
+    /// is found, local or remote — so, unlike a drawer or KG route, this is necessarily an
+    /// all-or-nothing switch for federation being configured at all, not a per-wing decision.
+    pub fn coordination_federation_enabled(&self) -> bool {
+        !self.rules.coordination.is_empty() || self.rules.default_mode != RouteMode::Local
+    }
+
     /// Compute wing availability annotations for the local wing set, keyed by
     /// wing name. `local_wings` is the set of wing names present in the local
     /// palace. Returns a map of `wing_name → "local" | "remote:<name>" | "combined"`.
@@ -1335,6 +1360,9 @@ impl FederationRouter {
         Fut: std::future::Future<Output = mempalace_remote::Result<T>>,
         T: serde::Serialize,
     {
+        if !self.coordination_federation_enabled() {
+            return None;
+        }
         for (name, api) in &self.remotes {
             match op(Arc::clone(api)).await {
                 Ok(dto) => {
@@ -1363,6 +1391,9 @@ impl FederationRouter {
         Fut: std::future::Future<Output = mempalace_remote::Result<T>>,
         T: serde::Serialize,
     {
+        if !self.coordination_federation_enabled() {
+            return Ok(None);
+        }
         for (name, api) in &self.remotes {
             match op(Arc::clone(api)).await {
                 Ok(dto) => {
@@ -1464,6 +1495,9 @@ impl FederationRouter {
         task_id: &str,
         req: TransitionTaskRequest,
     ) -> ToolResult<Option<Value>> {
+        if !self.coordination_federation_enabled() {
+            return Ok(None);
+        }
         for (name, api) in &self.remotes {
             match api.coordination_task_transition(task_id, req.clone()).await {
                 Ok(RemoteRevisionedWrite::Applied(dto)) => {
@@ -1506,6 +1540,9 @@ impl FederationRouter {
                 Output = mempalace_remote::Result<RemoteRevisionedWrite<mempalace_federation::CoordinationTaskDto>>,
             >,
     {
+        if !self.coordination_federation_enabled() {
+            return Ok(None);
+        }
         for (name, api) in &self.remotes {
             match call(Arc::clone(api), task_id.to_owned(), req.clone()).await {
                 Ok(RemoteRevisionedWrite::Applied(dto)) => {
@@ -2302,6 +2339,11 @@ mod tests {
         /// When set, the `changes` call records the incoming cursor here.
         received_cursor: std::sync::Arc<std::sync::Mutex<Option<String>>>,
         received_search_view: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+        /// Bumped by every `coordination_*` method below. Lets a test assert that a
+        /// coordination fallback never touched the remote at all — a plain `None`/`Ok(None)`
+        /// result is not sufficient on its own, since a genuine remote miss produces the exact
+        /// same result after a real round trip.
+        coordination_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl Default for MockRemote {
@@ -2331,6 +2373,7 @@ mod tests {
                 changes_next_cursor: None,
                 received_cursor: std::sync::Arc::new(std::sync::Mutex::new(None)),
                 received_search_view: std::sync::Arc::new(std::sync::Mutex::new(None)),
+                coordination_calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             }
         }
     }
@@ -2486,6 +2529,48 @@ mod tests {
             self.check_fail("ingest_batch")?;
             Ok(mempalace_federation::IngestBatchResponse { files: vec![], warnings: vec![] })
         }
+
+        async fn coordination_task_get(
+            &self,
+            task_id: &str,
+        ) -> mempalace_remote::Result<mempalace_federation::CoordinationTaskDto> {
+            self.coordination_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = task_id;
+            Err(RemoteError::RemoteRejected {
+                remote: "mock".to_owned(),
+                status: 404,
+                body: "not found".to_owned(),
+            })
+        }
+
+        async fn coordination_task_claim(
+            &self,
+            task_id: &str,
+            req: TaskLeaseRequest,
+        ) -> mempalace_remote::Result<
+            RemoteRevisionedWrite<mempalace_federation::CoordinationTaskDto>,
+        > {
+            self.coordination_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = (task_id, req);
+            Err(RemoteError::RemoteRejected {
+                remote: "mock".to_owned(),
+                status: 404,
+                body: "not found".to_owned(),
+            })
+        }
+
+        async fn coordination_message_get(
+            &self,
+            message_id: &str,
+        ) -> mempalace_remote::Result<mempalace_federation::CoordinationMessageDto> {
+            self.coordination_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = message_id;
+            Err(RemoteError::RemoteRejected {
+                remote: "mock".to_owned(),
+                status: 404,
+                body: "not found".to_owned(),
+            })
+        }
     }
 
     impl MockRemote {
@@ -2545,6 +2630,72 @@ mod tests {
             remote: Some(remote_name.to_owned()),
             write: WriteTarget::Both,
         }
+    }
+
+    // ── Coordination federation gate (defect fix) ───────────────────────────────
+
+    /// A local coordination miss must not touch a configured remote at all when coordination
+    /// federation was never configured — no `federation.coordination` entry, and
+    /// `default_mode` is `Local` (the field's own default, so this is also what an operator
+    /// gets by only ever setting `federation.remotes` and, say, a `federation.wings` entry for
+    /// drawers). Before this fix, `coordination_read_fallback`/`coordination_write_fallback`
+    /// (and the claim/renew/transition equivalents) iterated `self.remotes` unconditionally,
+    /// so *any* configured remote — regardless of what it was configured for — would receive
+    /// every local coordination miss.
+    ///
+    /// Asserting the result is `None`/`Ok(None)` alone would not prove anything: a genuine
+    /// remote miss returns exactly the same shape after a real round trip. This asserts the
+    /// stronger, actually-diagnostic property — the mock's `coordination_calls` counter, bumped
+    /// by every `coordination_*` method it implements, must stay at zero.
+    #[tokio::test]
+    async fn coordination_fallback_records_zero_remote_calls_without_coordination_federation_config()
+     {
+        let mock = MockRemote::default();
+        let calls = std::sync::Arc::clone(&mock.coordination_calls);
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+
+        let mut rules_remotes = BTreeMap::new();
+        for name in remotes.keys() {
+            rules_remotes.insert(name.clone(), make_resolved_remote(name));
+        }
+        let rules = FederationRuntimeConfig {
+            remotes: rules_remotes,
+            default_mode: RouteMode::Local,
+            default_remote: None,
+            wings: BTreeMap::new(),
+            kg: None,
+            coordination: BTreeMap::new(),
+        };
+        assert!(
+            rules.coordination.is_empty() && rules.default_mode == RouteMode::Local,
+            "test setup must actually leave coordination federation unconfigured"
+        );
+        let router = FederationRouter::with_remotes(rules, remotes);
+        assert!(
+            !router.coordination_federation_enabled(),
+            "coordination federation must read as disabled under this config"
+        );
+
+        // Reads: task get, message get.
+        assert_eq!(router.coordination_task_get_fallback("task_missing").await, None);
+        assert_eq!(router.coordination_message_get_fallback("msg_missing").await, None);
+
+        // ID-referencing writes: claim, and message send (via coordination_write_fallback).
+        let claim = router
+            .coordination_task_claim_fallback(
+                "task_missing",
+                TaskLeaseRequest {
+                    expected_revision: 0,
+                    lease_seconds: 60,
+                    worker: Some("worker-a".to_owned()),
+                },
+            )
+            .await
+            .expect("gate must short-circuit before any remote call, not error");
+        assert_eq!(claim, None);
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0, "zero coordination calls must have reached the mock remote");
     }
 
     // ── add_drawer_replicate tests ──────────────────────────────────────────────

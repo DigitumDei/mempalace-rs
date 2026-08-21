@@ -849,12 +849,17 @@ request that carries a wing at all — every other coordination tool (`mempalace
 `mempalace_task_claim`, `mempalace_message_send`, and so on) acts on an existing task,
 message, artifact, or result ID, and none of them take a `wing` argument, so there is nothing
 for `resolve_coordination_route` to resolve against. Those ID-keyed tools instead use a
-**local-first, ID-discovery fallback**: local storage is tried first; on a miss, whenever any
-remote is configured, the router tries each remote in name order and uses whichever one
-actually owns the record — mirroring `mempalace_delete_drawer`'s existing "no cross-palace ID
-mapping" reasoning exactly. This fallback fires independent of any wing's resolved mode: it is
-triggered purely by a configured remote existing, not by a `combined`/`remote` rule for a
-specific wing. A read that finds the record on a remote annotates the response with
+**local-first, ID-discovery fallback**: local storage is tried first; on a miss, if coordination
+federation is configured at all, the router tries each remote in name order and uses whichever
+one actually owns the record — mirroring `mempalace_delete_drawer`'s existing "no cross-palace ID
+mapping" reasoning exactly. This fallback fires independent of any *specific* wing's resolved
+mode — it is not gated by a `combined`/`remote` rule for the record's own wing, since that wing
+is not yet known when the fallback starts — but it does require coordination federation to be
+configured at all: either `federation.coordination` has at least one entry, or `default_mode` is
+non-`local` (which is what `resolve_coordination_route` itself falls through to for any wing
+without an explicit entry). A palace that federates drawers only, with an empty
+`federation.coordination` table and `default_mode: local`, never sends a coordination ID lookup
+to any remote — a configured remote alone is not enough. A read that finds the record on a remote annotates the response with
 `origin: "remote:<name>"`; a write that lands on a remote reports `applied_to: "remote:<name>"`.
 `mempalace_inbox_read` and `mempalace_coordination_events` are the exception to the exception:
 being aggregate, cursor-paginated feeds (like `mempalace_get_changes_since`), they always read

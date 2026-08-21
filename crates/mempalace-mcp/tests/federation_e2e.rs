@@ -3258,13 +3258,18 @@ async fn coordination_task_get_falls_back_to_remote_after_local_miss() {
         .unwrap();
 
     // No coordination rule at all for `wing_hubonly` — the fallback is purely ID-discovery,
-    // triggered by the presence of a configured remote, not by any specific wing routing.
+    // triggered by coordination federation being configured at all (here, via a non-Local
+    // `default_mode`), not by any specific wing routing. `default_mode: Local` with an empty
+    // `coordination` table means coordination federation was never configured, and the
+    // fallback must not run in that case — see
+    // `coordination_fallback_records_zero_remote_calls_without_coordination_federation_config`
+    // in `crates/mempalace-mcp/src/federation.rs`.
     let server = mcp_server_with_hub_coordination(
         &local_dir,
         &hub_url,
         BTreeMap::new(),
         BTreeMap::new(),
-        RouteMode::Local,
+        RouteMode::Combined,
     )
     .await;
 
@@ -3313,12 +3318,16 @@ async fn coordination_claim_revision_conflict_via_remote_fallback() {
         .await
         .unwrap();
 
+    // `default_mode: Combined` — coordination federation must be configured for the ID
+    // fallback to run at all (see
+    // `coordination_fallback_records_zero_remote_calls_without_coordination_federation_config`
+    // in `crates/mempalace-mcp/src/federation.rs`).
     let server = mcp_server_with_hub_coordination(
         &local_dir,
         &hub_url,
         BTreeMap::new(),
         BTreeMap::new(),
-        RouteMode::Local,
+        RouteMode::Combined,
     )
     .await;
 

@@ -34,14 +34,51 @@ pub use client::RemoteClient;
 pub use error::{RemoteError, Result};
 
 use mempalace_federation::{
-    AddDrawerRequest, AddDrawerResponse, ChangesQuery, ChangesResponse, CheckDuplicateRequest,
-    CheckDuplicateResponse, DrawerSearchRequest, DrawerSearchResponse, InfoResponse,
-    IngestBatchRequest, IngestBatchResponse, KgAddFactRequest, KgInvalidateRequest, KgQueryRequest,
-    ListDrawersQuery, ListDrawersResponse,
+    AckMessageRequest, AddDrawerRequest, AddDrawerResponse, ChangesQuery, ChangesResponse,
+    CheckDuplicateRequest, CheckDuplicateResponse, CoordinationArtifactDto,
+    CoordinationEventsQuery, CoordinationEventsResponse, CoordinationMessageDto,
+    CoordinationTaskDto, CoordinationTaskResultDto, DrawerSearchRequest, DrawerSearchResponse,
+    InboxPageResponse, InboxQuery, InfoResponse, IngestBatchRequest, IngestBatchResponse,
+    KgAddFactRequest, KgInvalidateRequest, KgQueryRequest, ListDrawersQuery, ListDrawersResponse,
+    NewArtifactRequest, NewMessageRequest, NewTaskRequest, NewTaskResultRequest, TaskLeaseRequest,
+    TransitionTaskRequest,
 };
 
 /// Default per-request timeout for remote calls.
 pub const DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Result of a coordination write that can be rejected by a stale `expected_revision` rather
+/// than a hard failure. The remote reports its actual current revision so the caller can reload
+/// and retry — mirroring `mempalace_storage::RevisionedWrite<T>` (Phase 3 Stage 4) so a
+/// revision conflict has one shape whether it came from local storage or a remote peer.
+///
+/// This crate deliberately does not depend on `mempalace-storage` (it is meant to stay a
+/// lightweight HTTP client), so this is its own type rather than a re-export; the routing layer
+/// (`mempalace-mcp::federation::FederationRouter`), which already depends on both crates, is
+/// where the two shapes are reconciled.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RemoteRevisionedWrite<T> {
+    /// The write was applied; carries the resulting record.
+    Applied(T),
+    /// The remote rejected the write because `expected_revision` no longer matched.
+    Conflict {
+        /// The remote's actual current revision, when it reported one.
+        actual_revision: Option<i64>,
+    },
+}
+
+/// Builds the [`RemoteError`] every coordination method's default trait body returns — see the
+/// `RemoteApi` trait-level comment on why those methods have defaults at all. Shaped like
+/// [`RemoteError::RemoteRejected`] with a synthetic HTTP 501: "this operation is not available"
+/// is conceptually the same rejection a peer that has never heard of `/v1/coordination/*` would
+/// give, just detected locally instead of over the wire.
+fn coordination_unsupported(operation: &str) -> RemoteError {
+    RemoteError::RemoteRejected {
+        remote: "<unbound>".to_owned(),
+        status: 501,
+        body: format!("{operation} is not implemented by this RemoteApi implementation"),
+    }
+}
 
 /// Connection parameters for one remote palace.
 ///
@@ -128,4 +165,142 @@ pub trait RemoteApi: Send + Sync {
     /// source-key derived from `wing`, `repo_id`, and `relative_path`, so that
     /// two clients pushing the same repository converge on identical drawer ids.
     async fn ingest_batch(&self, req: IngestBatchRequest) -> Result<IngestBatchResponse>;
+
+    // ─── Coordination (issue #102 Stage 4) ─────────────────────────────────────
+    //
+    // Every method below has a default body returning `coordination_unsupported` (an
+    // `Err(RemoteError::RemoteRejected)` with a synthetic 501). The trait otherwise has no
+    // defaults, so adding these 14 methods without them would break every existing implementor —
+    // `RemoteClient` plus the test-double mocks in `mempalace-mcp::federation` and
+    // `mempalace-mcp::lib`. Defaults also let a Stage-4-aware client talk cleanly to a
+    // pre-Stage-3 server, or to a test double with no reason to implement coordination.
+    // `RemoteClient` overrides every one of them for real, gated on the `"coordination"`
+    // capability from the cached `/v1/info` handshake — see its `ensure_coordination_capability`.
+
+    /// Create a task (`POST /v1/coordination/tasks`).
+    async fn coordination_task_create(&self, req: NewTaskRequest) -> Result<CoordinationTaskDto> {
+        let _ = req;
+        Err(coordination_unsupported("coordination_task_create"))
+    }
+
+    /// Get one task by exact ID (`GET /v1/coordination/tasks/{id}`).
+    async fn coordination_task_get(&self, task_id: &str) -> Result<CoordinationTaskDto> {
+        let _ = task_id;
+        Err(coordination_unsupported("coordination_task_get"))
+    }
+
+    /// Claim a task, or reclaim an expired lease
+    /// (`POST /v1/coordination/tasks/{id}/claim`).
+    ///
+    /// A stale `expected_revision` is reported by the remote as `409 revision_conflict`; that
+    /// surfaces here as `Ok(RemoteRevisionedWrite::Conflict)` carrying the remote's actual
+    /// revision, not as an `Err` — matching how `mempalace_storage::CoordinationStore` itself
+    /// now reports the same conflict locally (Phase 3 Stage 4). Every other rejection (e.g. a
+    /// live lease held by another worker, a terminal task — `409 coordination_conflict`) has no
+    /// revision pair to report and stays an `Err`. MemPalace never retries a conflicting write
+    /// on the caller's behalf; that decision belongs to the caller.
+    async fn coordination_task_claim(
+        &self,
+        task_id: &str,
+        req: TaskLeaseRequest,
+    ) -> Result<RemoteRevisionedWrite<CoordinationTaskDto>> {
+        let _ = (task_id, req);
+        Err(coordination_unsupported("coordination_task_claim"))
+    }
+
+    /// Renew a live lease (`POST /v1/coordination/tasks/{id}/renew`). See
+    /// [`Self::coordination_task_claim`] for the conflict-shape note.
+    async fn coordination_task_renew(
+        &self,
+        task_id: &str,
+        req: TaskLeaseRequest,
+    ) -> Result<RemoteRevisionedWrite<CoordinationTaskDto>> {
+        let _ = (task_id, req);
+        Err(coordination_unsupported("coordination_task_renew"))
+    }
+
+    /// Transition a task's lifecycle state (`POST /v1/coordination/tasks/{id}/transition`). See
+    /// [`Self::coordination_task_claim`] for the conflict-shape note.
+    async fn coordination_task_transition(
+        &self,
+        task_id: &str,
+        req: TransitionTaskRequest,
+    ) -> Result<RemoteRevisionedWrite<CoordinationTaskDto>> {
+        let _ = (task_id, req);
+        Err(coordination_unsupported("coordination_task_transition"))
+    }
+
+    /// Send an addressed message (`POST /v1/coordination/messages`).
+    async fn coordination_message_send(
+        &self,
+        req: NewMessageRequest,
+    ) -> Result<CoordinationMessageDto> {
+        let _ = req;
+        Err(coordination_unsupported("coordination_message_send"))
+    }
+
+    /// Get one message by exact ID (`GET /v1/coordination/messages/{id}`).
+    async fn coordination_message_get(&self, message_id: &str) -> Result<CoordinationMessageDto> {
+        let _ = message_id;
+        Err(coordination_unsupported("coordination_message_get"))
+    }
+
+    /// Acknowledge a message (`POST /v1/coordination/messages/{id}/ack`).
+    async fn coordination_message_ack(
+        &self,
+        message_id: &str,
+        req: AckMessageRequest,
+    ) -> Result<CoordinationMessageDto> {
+        let _ = (message_id, req);
+        Err(coordination_unsupported("coordination_message_ack"))
+    }
+
+    /// Read an addressed inbox, cursor-paginated (`GET /v1/coordination/inbox`).
+    async fn coordination_inbox(&self, query: InboxQuery) -> Result<InboxPageResponse> {
+        let _ = query;
+        Err(coordination_unsupported("coordination_inbox"))
+    }
+
+    /// Store an immutable artifact (`POST /v1/coordination/artifacts`).
+    async fn coordination_artifact_put(
+        &self,
+        req: NewArtifactRequest,
+    ) -> Result<CoordinationArtifactDto> {
+        let _ = req;
+        Err(coordination_unsupported("coordination_artifact_put"))
+    }
+
+    /// Get one artifact by exact ID (`GET /v1/coordination/artifacts/{id}`).
+    async fn coordination_artifact_get(
+        &self,
+        artifact_id: &str,
+    ) -> Result<CoordinationArtifactDto> {
+        let _ = artifact_id;
+        Err(coordination_unsupported("coordination_artifact_get"))
+    }
+
+    /// Store an immutable task result (`POST /v1/coordination/results`).
+    async fn coordination_result_put(
+        &self,
+        req: NewTaskResultRequest,
+    ) -> Result<CoordinationTaskResultDto> {
+        let _ = req;
+        Err(coordination_unsupported("coordination_result_put"))
+    }
+
+    /// Get one task result by exact ID (`GET /v1/coordination/results/{id}`).
+    async fn coordination_result_get(&self, result_id: &str) -> Result<CoordinationTaskResultDto> {
+        let _ = result_id;
+        Err(coordination_unsupported("coordination_result_get"))
+    }
+
+    /// Read the coordination audit-event feed, cursor-paginated
+    /// (`GET /v1/coordination/events`).
+    async fn coordination_events(
+        &self,
+        query: CoordinationEventsQuery,
+    ) -> Result<CoordinationEventsResponse> {
+        let _ = query;
+        Err(coordination_unsupported("coordination_events"))
+    }
 }

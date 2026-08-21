@@ -187,6 +187,9 @@ synchronised clocks.
 
 ## Stage 4 — Client and routing
 
+**Status: resolved, with deviations recorded below.** Implemented on
+`claude/phase3-stage4-coordination-routing`, stacked on Stages 1–3.
+
 `RemoteApi` gains the coordination methods **with default bodies** returning a
 `RemoteError::RemoteRejected`-style "unsupported" error. The trait has no default bodies today,
 so every added method breaks all four implementors (`RemoteClient` plus three test mocks);
@@ -223,16 +226,90 @@ The 30 coordination, skill and delegation MCP dispatch arms become `async`. `Too
 gains coordination categories and — unlike today, where it is dead code called only from a test
 — is actually consulted by `dispatch_tool`.
 
+### Deviations from this design
+
+1. **`resolve_coordination_route` reads a separate `federation.coordination` table, not
+   `federation.wings`.** This document did not specify which table the function reads from. Reusing
+   `federation.wings` would mean the `WriteTarget::Both` rejection retroactively broke any existing
+   config that legitimately dual-writes drawers for a wing (a documented, encouraged pattern — see
+   the combined-wing team workflow in `Federation.md`), the moment that wing also carried coordination
+   traffic. A dedicated `federation.coordination` table, structurally identical to `wings`, lets an
+   operator configure drawer dual-write and coordination routing for the same wing independently,
+   and lets the `write: both` rejection be enforced once, at config load, without runtime knowledge
+   of which wings will ever host a task. See `crates/mempalace-config/src/federation.rs`.
+
+2. **`resolve_coordination_route` only applies to `mempalace_task_create`.** Every other
+   coordination operation — get/claim/renew/transition, message send/get/ack, artifact/result
+   put/get — is keyed by an existing record's ID with no wing in the request at all (none of
+   `mempalace_task_claim`, `mempalace_message_get`, etc. take a `wing` argument, matching the local
+   tool surface unchanged since Phase 1). There is therefore no wing to resolve a route against for
+   those calls. They use a **local-first, ID-discovery fallback** instead: local storage first, then
+   — whenever any remote is configured, independent of any specific wing's resolved mode — each
+   remote in name order, exactly mirroring `DeleteDrawer`'s existing "no cross-palace ID mapping"
+   reasoning. "Writes go to the origin that owns the task" (as originally written above) describes
+   this discovery process, not a wing-routed decision. See the `FederationRouter` "Coordination"
+   section comment in `crates/mempalace-mcp/src/federation.rs`.
+
+3. **The typed conflict crosses the wire as a new `mempalace_remote::RemoteRevisionedWrite<T>`,
+   not `mempalace_storage::RevisionedWrite<T>`.** `mempalace-remote` deliberately has no dependency
+   on `mempalace-storage` (it is meant to stay a lightweight HTTP client), so it cannot re-export the
+   storage-layer enum. `RemoteRevisionedWrite` mirrors it in shape; `RemoteClient::execute_revisioned`
+   parses a `409` body's `code`/`actual_revision` fields directly (bypassing the generic
+   `RemoteRejected` error path, which would otherwise flatten them into an opaque string) so the
+   revision survives the trip back to the router untouched.
+
+4. **`mempalace_task_claim`/`mempalace_task_renew`/`mempalace_task_transition`'s success shape
+   changed.** Before this stage a successful claim/renew/transition returned the bare task object,
+   and a stale-revision conflict was a JSON-RPC `InternalError` the caller had to catch. Reconciling
+   coordination onto `RevisionedWrite` made it natural — and consistent with
+   `mempalace_skill_promote`/`mempalace_delegation_span_close`, which already do this — to give these
+   three tools the same `{"success": true, "task": {...}}` / `{"success": false, "conflict": {...}}`
+   shape instead. `docs/Coordination.md` does not document exact response shapes per tool, so this
+   is not a documented-behaviour break, but it is a real one for any existing caller that expected a
+   bare task object or an MCP-protocol-level error on conflict.
+
+5. **The capability-gate error is a new `RemoteError::CapabilityMissing` variant, not a
+   `RemoteRejected`-shaped 404.** The design text called for "a clear, non-degradable error naming
+   the remote, not a confusing 404"; reusing `RemoteRejected` with a synthetic 404 status would have
+   produced exactly the confusable shape the design was trying to avoid, so a dedicated variant
+   carries the remote name and the missing capability string instead.
+
 ## Stage 5 — A2A adapter
 
 A new crate, `mempalace-a2a`, depending on `mempalace-storage` and `mempalace-federation` and
 nothing else. It maps discovery and the task/message/artifact lifecycle:
 
 - **Agent Card** ← palace identity, configured wings, and the capability list.
-- **A2A Task** ↔ `coordination_tasks`, with an explicit state mapping table in the docs. The
-  mapping is total in both directions or the adapter rejects the message; no silent coercion.
+- **A2A Task** ↔ `coordination_tasks`, per the state table below.
 - **A2A Message** ↔ `coordination_messages`.
 - **A2A Artifact** ↔ `coordination_artifacts`.
+
+A2A reached v1.0 in 2026 under the Linux Foundation and defines **nine** task states against
+MemPalace's seven, so the mapping is not bijective in either direction:
+
+| A2A | MemPalace | Note |
+|---|---|---|
+| `SUBMITTED` | `Pending` | |
+| `WORKING` | `Running` | |
+| `INPUT_REQUIRED` | `InputRequired` | |
+| `COMPLETED` | `Completed` | |
+| `FAILED` | `Failed` | |
+| `CANCELED` | `Cancelled` | note the spelling difference — A2A uses one `l` |
+| `AUTH_REQUIRED` | `InputRequired` | coerced; both mean "interrupted, awaiting external input" |
+| `REJECTED` | `Failed` | coerced; terminal and unsuccessful |
+| `UNSPECIFIED` | — | rejected as malformed; never coerced |
+| — | `Expired` | outbound only, emitted as `FAILED` |
+
+**This revises the original rule.** Requiring a mapping that is total in both directions is not
+achievable without either adding `AuthRequired`, `Rejected` and an `Expired` analogue to the
+core `TaskState` — which is exactly the "adapters must not dictate the core schema" non-goal —
+or rejecting well-formed A2A messages that carry a legal state. Neither is acceptable.
+
+The rule is therefore: coercion is permitted where it is **documented, deterministic, and
+lossless in audit**. The inbound envelope is already stored verbatim as a
+`role = "protocol_envelope"` artifact, so the original state is always recoverable and the
+coercion is always visible. What remains forbidden is *silent* coercion — discarding the
+original with no record, or coercing a state not named in the table above.
 
 **Isolation rule.** No A2A field may become a column. Fields with no internal home are
 preserved by storing the inbound envelope as an immutable artifact with
@@ -245,13 +322,34 @@ not leak into the core storage schema" being violated.
 ## Stage 6 — MCP Tasks adapter
 
 The MCP Tasks extension left experimental core and became the official
-`io.modelcontextprotocol/tasks` extension in the 2026-07-28 specification, with poll-based
-`tasks/get` and `tasks/update`. That satisfies issue #102's "once its wire model is stable"
-condition. Implement against the published extension specification — read it, do not infer it
-from the core protocol.
+`io.modelcontextprotocol/tasks` extension in the 2026-07-28 specification. That satisfies issue
+#102's "once its wire model is stable" condition. Implement against the published extension
+specification — read it, do not infer it from the core protocol.
 
-Same isolation rule as Stage 5, same envelope-as-artifact mechanism, same requirement that the
-state mapping be total and explicit.
+It defines three methods — `tasks/get`, `tasks/update`, `tasks/cancel` — and a task carrying
+`taskId`, `status`, `statusMessage`, `createdAt`, `lastUpdatedAt`, `ttlMs`, `pollIntervalMs`,
+`result`, `error`, and an `inputRequests` map. A missing client capability is signalled with
+JSON-RPC error `-32003`.
+
+Its status set is smaller than either of the other two — five values, only one of them
+non-terminal:
+
+| MCP Tasks | MemPalace | Note |
+|---|---|---|
+| `working` | `Running` | |
+| `input_required` | `InputRequired` | |
+| `completed` | `Completed` | |
+| `failed` | `Failed` | |
+| `cancelled` | `Cancelled` | two `l`s here, unlike A2A |
+| — | `Pending` | outbound only; emitted as `working`, since MCP has no queued state |
+| — | `Expired` | outbound only; emitted as `failed` |
+
+Inbound is total, so no coercion is needed in that direction. Outbound coerces `Pending` and
+`Expired`, under the same documented-deterministic-auditable rule as Stage 5.
+
+`ttlMs` maps onto the task's existing `expires_at`, and `pollIntervalMs` is adapter policy, not
+stored state — neither becomes a column. Same isolation rule and same envelope-as-artifact
+mechanism as Stage 5.
 
 ## Documentation
 

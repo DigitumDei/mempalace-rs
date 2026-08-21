@@ -18,9 +18,10 @@ use mempalace_core::EmbeddingProfile;
 use mempalace_embeddings::DeterministicStubProvider;
 use mempalace_federation::{
     AddDrawerRequest, ChangesQuery, IngestBatchRequest, IngestChunkDto, IngestFileDto,
-    KgAddFactRequest, KgInvalidateRequest, KgQueryRequest, ListDrawersQuery,
+    KgAddFactRequest, KgInvalidateRequest, KgQueryRequest, ListDrawersQuery, NewArtifactRequest,
+    NewMessageRequest, NewTaskRequest, NewTaskResultRequest, TaskLeaseRequest,
 };
-use mempalace_remote::{RemoteApi, RemoteClient, RemoteEndpoint, RemoteError};
+use mempalace_remote::{RemoteApi, RemoteClient, RemoteEndpoint, RemoteError, RemoteRevisionedWrite};
 use mempalace_server::{TokenRegistry, build_router};
 use tempfile::TempDir;
 
@@ -621,5 +622,329 @@ async fn ingest_batch_route_missing_returns_404() {
         other => {
             panic!("expected RemoteRejected(404) for missing route, got: {other:?}")
         }
+    }
+}
+
+// ─── Test 12: coordination_capability_gate_rejects_unsupported_remote ────────
+
+#[tokio::test]
+async fn coordination_capability_gate_rejects_unsupported_remote() {
+    // Stub server that advertises everything except "coordination" — mirrors a
+    // pre-Stage-3 server the client talks to before it has been upgraded.
+    let app = axum::Router::new().route(
+        "/v1/info",
+        axum::routing::get(|| async {
+            axum::Json(serde_json::json!({
+                "server_version": "1.0.0-pre-stage3",
+                "federation_api_version": 1u32,
+                "embedding_profile": "balanced",
+                "capabilities": ["drawers", "kg", "changes", "ingest"]
+            }))
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let client = client_for(addr, None);
+
+    let result = client
+        .coordination_task_create(NewTaskRequest {
+            title: "t".to_owned(),
+            description: "d".to_owned(),
+            wing: "wing_test".to_owned(),
+            idempotency_key: "k1".to_owned(),
+            created_by: None,
+            parent_id: None,
+            dependencies: Vec::new(),
+            budget: None,
+            expires_at: None,
+        })
+        .await;
+    match result {
+        Err(RemoteError::CapabilityMissing { capability, .. }) => {
+            assert_eq!(capability, "coordination");
+        }
+        other => panic!("expected CapabilityMissing, got: {other:?}"),
+    }
+
+    // The gate must be checked before the request is ever sent — every coordination method
+    // must trip it identically, not just the one exercised above (`coordination_task_get` is a
+    // GET, which would otherwise 404 against this stub and could be confused for "not found").
+    let get_result = client.coordination_task_get("task_missing").await;
+    assert!(
+        matches!(get_result, Err(RemoteError::CapabilityMissing { .. })),
+        "expected CapabilityMissing, got: {get_result:?}"
+    );
+}
+
+// ─── Test 13: coordination_round_trip ─────────────────────────────────────────
+
+#[tokio::test]
+async fn coordination_round_trip() {
+    let tempdir = TempDir::new().unwrap();
+    let token_file = write_token_file(&tempdir);
+    let config = test_config(&tempdir);
+    let addr = spawn_server(config, token_file).await;
+    let client = client_for(addr, Some(TEST_TOKEN));
+
+    let task = client
+        .coordination_task_create(NewTaskRequest {
+            title: "index the repo".to_owned(),
+            description: "d".to_owned(),
+            wing: "wing_rt_coord".to_owned(),
+            idempotency_key: "rt-coord-task-1".to_owned(),
+            created_by: Some("alice".to_owned()),
+            parent_id: None,
+            dependencies: Vec::new(),
+            budget: None,
+            expires_at: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(task.state, mempalace_federation::CoordinationTaskState::Pending);
+    assert_eq!(task.revision, 0);
+
+    let fetched = client.coordination_task_get(&task.task_id).await.unwrap();
+    assert_eq!(fetched.task_id, task.task_id);
+
+    let claimed = match client
+        .coordination_task_claim(
+            &task.task_id,
+            TaskLeaseRequest {
+                expected_revision: 0,
+                lease_seconds: 300,
+                worker: Some("worker-1".to_owned()),
+            },
+        )
+        .await
+        .unwrap()
+    {
+        RemoteRevisionedWrite::Applied(task) => task,
+        other => panic!("expected Applied, got: {other:?}"),
+    };
+    assert_eq!(claimed.revision, 1);
+    assert_eq!(claimed.owner.as_deref(), Some("e2e-test-user:worker-1"));
+
+    let renewed = match client
+        .coordination_task_renew(
+            &task.task_id,
+            TaskLeaseRequest {
+                expected_revision: claimed.revision,
+                lease_seconds: 300,
+                worker: Some("worker-1".to_owned()),
+            },
+        )
+        .await
+        .unwrap()
+    {
+        RemoteRevisionedWrite::Applied(task) => task,
+        other => panic!("expected Applied, got: {other:?}"),
+    };
+    assert_eq!(renewed.revision, 2);
+
+    let message = client
+        .coordination_message_send(NewMessageRequest {
+            task_id: task.task_id.clone(),
+            recipient: "manager".to_owned(),
+            kind: "status".to_owned(),
+            payload: serde_json::json!({"progress": 0.5}),
+            idempotency_key: "rt-coord-msg-1".to_owned(),
+            sender: Some("worker-1".to_owned()),
+            envelope_version: 1,
+        })
+        .await
+        .unwrap();
+    let fetched_message = client.coordination_message_get(&message.message_id).await.unwrap();
+    assert_eq!(fetched_message.message_id, message.message_id);
+
+    let artifact = client
+        .coordination_artifact_put(NewArtifactRequest {
+            task_id: task.task_id.clone(),
+            role: "log".to_owned(),
+            media_type: "text/plain".to_owned(),
+            content: "did the thing".to_owned(),
+            idempotency_key: "rt-coord-artifact-1".to_owned(),
+            created_by: Some("worker-1".to_owned()),
+        })
+        .await
+        .unwrap();
+    let fetched_artifact = client.coordination_artifact_get(&artifact.artifact_id).await.unwrap();
+    assert_eq!(fetched_artifact.content_hash, artifact.content_hash);
+
+    let result = client
+        .coordination_result_put(NewTaskResultRequest {
+            task_id: task.task_id.clone(),
+            payload: serde_json::json!({"answer": 42}),
+            idempotency_key: "rt-coord-result-1".to_owned(),
+            created_by: Some("worker-1".to_owned()),
+        })
+        .await
+        .unwrap();
+    let fetched_result = client.coordination_result_get(&result.result_id).await.unwrap();
+    assert_eq!(fetched_result.result_id, result.result_id);
+
+    let transitioned = match client
+        .coordination_task_transition(
+            &task.task_id,
+            mempalace_federation::TransitionTaskRequest {
+                expected_revision: renewed.revision,
+                state: mempalace_federation::CoordinationTaskState::Completed,
+                actor: Some("worker-1".to_owned()),
+                details: None,
+            },
+        )
+        .await
+        .unwrap()
+    {
+        RemoteRevisionedWrite::Applied(task) => task,
+        other => panic!("expected Applied, got: {other:?}"),
+    };
+    assert_eq!(transitioned.state, mempalace_federation::CoordinationTaskState::Completed);
+
+    let events = client
+        .coordination_events(mempalace_federation::CoordinationEventsQuery {
+            cursor: None,
+            task_id: Some(task.task_id.clone()),
+            wing: None,
+            limit: None,
+        })
+        .await
+        .unwrap();
+    assert!(!events.events.is_empty(), "expected at least one coordination event for the task");
+
+    let inbox = client
+        .coordination_inbox(mempalace_federation::InboxQuery {
+            recipient: "manager".to_owned(),
+            wing: None,
+            cursor: None,
+            limit: None,
+            unacknowledged_only: false,
+        })
+        .await
+        .unwrap();
+    assert!(
+        inbox.messages.iter().any(|m| m.message_id == message.message_id),
+        "expected the sent message in manager's inbox"
+    );
+}
+
+// ─── Test 14: coordination_claim_revision_conflict_surfaces_actual_revision ──
+
+#[tokio::test]
+async fn coordination_claim_revision_conflict_surfaces_actual_revision() {
+    let tempdir = TempDir::new().unwrap();
+    let token_file = write_token_file(&tempdir);
+    let config = test_config(&tempdir);
+    let addr = spawn_server(config, token_file).await;
+    let client = client_for(addr, Some(TEST_TOKEN));
+
+    let task = client
+        .coordination_task_create(NewTaskRequest {
+            title: "stale revision test".to_owned(),
+            description: "d".to_owned(),
+            wing: "wing_rt_conflict".to_owned(),
+            idempotency_key: "rt-conflict-task-1".to_owned(),
+            created_by: None,
+            parent_id: None,
+            dependencies: Vec::new(),
+            budget: None,
+            expires_at: None,
+        })
+        .await
+        .unwrap();
+
+    // First claim at the correct (0) revision succeeds and advances the task to revision 1.
+    let claimed = match client
+        .coordination_task_claim(
+            &task.task_id,
+            TaskLeaseRequest { expected_revision: 0, lease_seconds: 300, worker: None },
+        )
+        .await
+        .unwrap()
+    {
+        RemoteRevisionedWrite::Applied(task) => task,
+        other => panic!("expected Applied, got: {other:?}"),
+    };
+    assert_eq!(claimed.revision, 1);
+
+    // Renewing at the now-stale revision 0 is a revision conflict — reported as
+    // `Ok(RemoteRevisionedWrite::Conflict)` carrying the remote's real current revision, not
+    // as an `Err` a caller would have to parse a message to recover from.
+    let conflict = client
+        .coordination_task_renew(
+            &task.task_id,
+            TaskLeaseRequest { expected_revision: 0, lease_seconds: 300, worker: None },
+        )
+        .await
+        .unwrap();
+    assert_eq!(conflict, RemoteRevisionedWrite::Conflict { actual_revision: Some(1) });
+}
+
+// ─── Test 15: coordination_lease_conflict_is_a_hard_error_not_a_revisioned_conflict ──
+
+#[tokio::test]
+async fn coordination_lease_conflict_is_a_hard_error_not_a_revisioned_conflict() {
+    let tempdir = TempDir::new().unwrap();
+    let token_file = write_token_file(&tempdir);
+    let config = test_config(&tempdir);
+    let addr = spawn_server(config, token_file).await;
+    let client = client_for(addr, Some(TEST_TOKEN));
+
+    let task = client
+        .coordination_task_create(NewTaskRequest {
+            title: "lease conflict test".to_owned(),
+            description: "d".to_owned(),
+            wing: "wing_rt_lease".to_owned(),
+            idempotency_key: "rt-lease-task-1".to_owned(),
+            created_by: None,
+            parent_id: None,
+            dependencies: Vec::new(),
+            budget: None,
+            expires_at: None,
+        })
+        .await
+        .unwrap();
+
+    match client
+        .coordination_task_claim(
+            &task.task_id,
+            TaskLeaseRequest {
+                expected_revision: 0,
+                lease_seconds: 300,
+                worker: Some("worker-a".to_owned()),
+            },
+        )
+        .await
+        .unwrap()
+    {
+        RemoteRevisionedWrite::Applied(task) => assert_eq!(task.revision, 1),
+        other => panic!("expected Applied, got: {other:?}"),
+    }
+
+    // A second worker claiming at the now-*correct* revision hits a live-lease conflict, not a
+    // stale-revision one — this has no revision pair to report, so it must stay an `Err`
+    // (`RemoteRejected`), never a `RemoteRevisionedWrite::Conflict`.
+    let second = client
+        .coordination_task_claim(
+            &task.task_id,
+            TaskLeaseRequest {
+                expected_revision: 1,
+                lease_seconds: 300,
+                worker: Some("worker-b".to_owned()),
+            },
+        )
+        .await;
+    match second {
+        Err(RemoteError::RemoteRejected { status: 409, body, .. }) => {
+            assert!(
+                body.contains("coordination_conflict"),
+                "409 body must carry the coordination_conflict code; got: {body}"
+            );
+        }
+        other => panic!("expected RemoteRejected(409), got: {other:?}"),
     }
 }

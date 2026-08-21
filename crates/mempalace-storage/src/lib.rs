@@ -15,8 +15,7 @@ pub use coordination::{
     INVALID_TRANSITION_PREFIX, InboxPage, LEASE_DURATION_OUT_OF_RANGE, LEASE_HAS_EXPIRED,
     LEASE_HELD_BY_ANOTHER_WORKER, Message, NewArtifact, NewMessage, NewTask, NewTaskResult,
     ONLY_LEASE_OWNER_MAY_RENEW, ONLY_OWNER_MAY_TRANSITION, ONLY_RECIPIENT_MAY_ACKNOWLEDGE,
-    STALE_REVISION_PREFIX, STALE_REVISION_SEPARATOR, TASK_HAS_EXPIRED,
-    TERMINAL_TASK_CANNOT_BE_CLAIMED, Task, TaskResult, TaskState, UNSCOPED_WING,
+    TASK_HAS_EXPIRED, TERMINAL_TASK_CANNOT_BE_CLAIMED, Task, TaskResult, TaskState, UNSCOPED_WING,
 };
 pub use delegation::{
     Checkpoint, CheckpointType, DelegationStore, NewCheckpoint, NewSpan, Span, SpanStatus,

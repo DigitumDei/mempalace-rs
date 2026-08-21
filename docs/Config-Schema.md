@@ -441,7 +441,12 @@ The optional `federation` section of `~/.mempalace/config.json` controls routing
       "wing_bigrepo":  { "mode": "combined", "remote": "work", "write": "local" },
       "wing_shared":   { "mode": "combined", "remote": "work", "write": "both" }
     },
-    "kg": { "mode": "combined", "remote": "work", "write": "remote" }
+    "kg": { "mode": "combined", "remote": "work", "write": "remote" },
+    "coordination": {
+      "wing_teamdocs": { "mode": "remote", "remote": "work" }
+      // "write": "both" would fail config load here, unlike on the "wings" entry above
+      // for the same wing — see federation.coordination below.
+    }
   }
 }
 ```
@@ -495,6 +500,23 @@ Validation:
 - Optional
 - Controls knowledge-graph read/write routing independently of wing routing.
 
+#### `federation.coordination`
+
+- Type: object mapping wing name → routing rule (same shape as a `federation.wings` entry)
+- Optional
+- Controls coordination (tasks, messages, artifacts, results, events — issue #102 Stage 4)
+  routing, **independently of `federation.wings`** — the same wing can have a different
+  `mode`/`write` for its drawers than for its coordination traffic; the two tables are read
+  separately and neither implies the other.
+- `write: both` is a hard config-load error on this table specifically (see Validation Errors
+  below) — legal on the corresponding `federation.wings` entry for the same wing, since drawers
+  have no multi-master restriction.
+- Used only by `mempalace_task_create`, which is the one coordination write that carries a wing
+  in its request. Every other coordination MCP tool acts on an existing record ID with no wing
+  in the request and does not consult this table at all — see [Federation → Client-side
+  coordination routing](Federation.md#client-side-coordination-routing) for the local-first,
+  ID-discovery fallback those tools use instead.
+
 ### Resolution Precedence
 
 Routes are resolved in this order (first match wins). The diary hard-override
@@ -512,6 +534,13 @@ override layered on top of the other four steps:
 4. `federation.default_mode`
 5. `local` (hard default when no federation config is present)
 
+`resolve_coordination_route` follows the same precedence, but reads `federation.coordination`
+in place of step 2 and has no step 3 (no per-project override exists for coordination) — see
+[Federation → Client-side coordination routing](Federation.md#client-side-coordination-routing).
+The diary hard-override still applies unconditionally at step 1, exactly as above; unlike
+`resolve_route`, `resolve_kg_route`(§`federation.kg`) skips that step entirely, because KG facts
+are entity-scoped and have no wing-shaped diary content to protect in the first place.
+
 ### Validation Errors vs. Warnings
 
 Config load fails with a precise error message for:
@@ -520,6 +549,9 @@ Config load fails with a precise error message for:
 - Non-`http`/`https` URL in a remote definition, or a plain `http://` URL targeting a
   non-loopback host
 - `remote` field missing or ambiguous when `mode` is `remote` or `combined` and multiple remotes are configured
+- `write: both` on a `federation.coordination` entry (a task is authoritative in exactly one
+  palace; use `write: local` or `write: remote` instead) — the identical setting on a
+  `federation.wings` entry for the same wing is unaffected and stays legal
 - (`server.token_file`, not a `federation.*` field, but the same fail-closed loading behaviour)
   an `operations` entry in a token's `scopes` outside the closed enum, or a token `name`
   containing `:` — see [Server Config → `server.token_file`](#servertoken_file)

@@ -4,13 +4,15 @@ use std::sync::Arc;
 
 use mempalace_config::{
     FederationRuntimeConfig, ReplicationStatus, ResolvedRouteRule, RouteMode, RouteQuery,
-    WriteTarget, resolve_kg_route, resolve_route,
+    WriteTarget, resolve_coordination_route, resolve_kg_route, resolve_route,
 };
 use mempalace_core::{DIARY_ROOM, DIARY_TOPIC_PREFIX, SHARED_AGENT_DIARY_WING, hash_text};
 use mempalace_federation::{
-    AddDrawerRequest, ChangesQuery, DrawerSearchRequest, RemoteDrawerResult,
+    AckMessageRequest, AddDrawerRequest, ChangesQuery, CoordinationEventsQuery, DrawerSearchRequest,
+    InboxQuery, NewArtifactRequest, NewMessageRequest, NewTaskRequest, NewTaskResultRequest,
+    RemoteDrawerResult, TaskLeaseRequest, TransitionTaskRequest,
 };
-use mempalace_remote::{RemoteApi, RemoteClient, RemoteEndpoint, RemoteError};
+use mempalace_remote::{RemoteApi, RemoteClient, RemoteEndpoint, RemoteError, RemoteRevisionedWrite};
 use serde_json::{Value, json};
 use tokio::task::JoinSet;
 
@@ -1292,6 +1294,456 @@ impl FederationRouter {
             RouteMode::Combined => Ok(merge_kg_stats(local_payload, remote_payload)),
         }
     }
+
+    // ─── Coordination (issue #102 Stage 4) ─────────────────────────────────────
+    //
+    // Unlike drawers/KG, most coordination operations are keyed by an existing record ID
+    // (task_id, message_id, artifact_id, result_id) with no wing supplied in the request at
+    // all — `mempalace_task_claim`, `mempalace_message_get`, and friends never take a `wing`
+    // argument, only local Get/RevisionedWrite tools already return one. There is therefore no
+    // wing to resolve `resolve_coordination_route` against for those calls. `task_create` is
+    // the one exception: `NewTaskRequest.wing` is required, so it is the only coordination
+    // write that goes through ordinary wing-based route resolution (`resolve_coordination_route`
+    // + `resolve_write_target`, mirroring `kg_add_remote` exactly — `write` can only ever be
+    // `Local` or `Remote` here, never `Both`, because a coordination route can never resolve to
+    // `WriteTarget::Both` — `mempalace-config` rejects that at config load).
+    //
+    // Every other coordination call — reads and ID-referencing writes alike — is a local-first,
+    // ID-discovery fallback: the caller (`McpRuntime` in `lib.rs`) tries local storage first; on
+    // a local miss, if any remotes are configured, the methods below try each configured remote
+    // in name order (`self.remotes` is a `BTreeMap`, so iteration order is already name order)
+    // and use whichever one actually has the record — mirroring `delete_drawer_remote`'s
+    // existing "local ID lookup, then all remotes in order" pattern, which exists for the exact
+    // same reason (no cross-palace ID mapping to route by). A `404`-shaped rejection from a
+    // remote means "not this palace, try the next one"; for a **write**, any other error is
+    // terminal and surfaces immediately rather than silently moving on to a different remote —
+    // moving on could create a second, divergent record for the same task on the wrong palace.
+    // For a plain **read**, any error (including an unreachable remote) is skipped the same way
+    // a 404 is: "reads degrade" is the federation-wide rule (see `docs/Federation.md`), and a
+    // down remote must not block discovery through the others.
+
+    /// Try a coordination *read* against each configured remote in name order, returning the
+    /// first success annotated with `origin` (the `remote:`-prefixed form, matching
+    /// `changes_fanout`/`kg_add_remote` rather than the bare form `check_duplicate_all_remotes`
+    /// uses for search results — coordination conflict/response payloads already read more like
+    /// the changes feed's `origin` shape than a search hit). Every error (unreachable, 404, or
+    /// anything else) is logged and treated as "try the next remote" — a plain read degrades
+    /// silently across remotes; `Ok(None)` means no remote had it either.
+    async fn coordination_read_fallback<F, Fut, T>(&self, op: F) -> Option<Value>
+    where
+        F: Fn(Arc<dyn RemoteApi>) -> Fut,
+        Fut: std::future::Future<Output = mempalace_remote::Result<T>>,
+        T: serde::Serialize,
+    {
+        for (name, api) in &self.remotes {
+            match op(Arc::clone(api)).await {
+                Ok(dto) => {
+                    let mut value = serde_json::to_value(&dto).unwrap_or_else(|_| json!({}));
+                    if let Some(obj) = value.as_object_mut() {
+                        obj.insert("origin".to_owned(), json!(format_remote_origin(name)));
+                    }
+                    return Some(value);
+                }
+                Err(e) => {
+                    tracing::warn!(remote = %name, error = %e, "coordination read fallback failed");
+                }
+            }
+        }
+        None
+    }
+
+    /// Try a coordination *write that references an existing record* against each configured
+    /// remote in name order. A `404` means "not this palace" and moves on to the next; any
+    /// other error stops the search and surfaces as a hard `ToolError` — see the section
+    /// comment above for why a write cannot treat a non-404 failure as skippable the way a read
+    /// does. `Ok(None)` means no remote had the referenced record either.
+    async fn coordination_write_fallback<F, Fut, T>(&self, op: F) -> ToolResult<Option<Value>>
+    where
+        F: Fn(Arc<dyn RemoteApi>) -> Fut,
+        Fut: std::future::Future<Output = mempalace_remote::Result<T>>,
+        T: serde::Serialize,
+    {
+        for (name, api) in &self.remotes {
+            match op(Arc::clone(api)).await {
+                Ok(dto) => {
+                    let mut value = serde_json::to_value(&dto).unwrap_or_else(|_| json!({}));
+                    if let Some(obj) = value.as_object_mut() {
+                        obj.insert("applied_to".to_owned(), json!(format_remote_origin(name)));
+                    }
+                    return Ok(Some(value));
+                }
+                Err(RemoteError::RemoteRejected { status: 404, .. }) => continue,
+                Err(e) => {
+                    return Err(ToolError::Internal(McpError::Federation(format!(
+                        "remote `{name}` rejected the write: {e}"
+                    ))));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Resolve the coordination route for a task's wing (`task_create` only — see the section
+    /// comment above). Thin wrapper so callers do not need to import
+    /// `mempalace_config::resolve_coordination_route` directly.
+    pub fn resolve_coordination_route(&self, wing: &str) -> ResolvedRouteRule {
+        resolve_coordination_route(&self.rules, wing)
+    }
+
+    /// Create a task on the remote a `resolve_coordination_route` + `resolve_write_target`
+    /// resolution selected. Mirrors `kg_add_remote`: the caller has already established the
+    /// write target is `Remote`, so `remote_name` is always `route.remote`.
+    pub async fn coordination_task_create_remote(
+        &self,
+        remote_name: &str,
+        req: NewTaskRequest,
+    ) -> ToolResult<Value> {
+        let Some(api) = self.remotes.get(remote_name) else {
+            return Err(ToolError::Internal(McpError::Federation(format!(
+                "remote `{remote_name}` is not configured"
+            ))));
+        };
+        match api.coordination_task_create(req).await {
+            Ok(dto) => {
+                let mut value = serde_json::to_value(&dto).unwrap_or_else(|_| json!({}));
+                if let Some(obj) = value.as_object_mut() {
+                    obj.insert("applied_to".to_owned(), json!(format_remote_origin(remote_name)));
+                }
+                Ok(value)
+            }
+            Err(e) => Err(ToolError::Internal(McpError::Federation(format!(
+                "remote `{remote_name}` task_create failed: {e}"
+            )))),
+        }
+    }
+
+    /// Fall back to a task GET across remotes after a local miss.
+    pub async fn coordination_task_get_fallback(&self, task_id: &str) -> Option<Value> {
+        let task_id = task_id.to_owned();
+        self.coordination_read_fallback(move |api| {
+            let task_id = task_id.clone();
+            async move { api.coordination_task_get(&task_id).await }
+        })
+        .await
+    }
+
+    /// Fall back to a task claim across remotes after a local miss. `MemPalace never retries a
+    /// conflicting write on the caller's behalf` (see `docs/Federation.md`): a revision
+    /// conflict from the owning remote is surfaced verbatim via
+    /// `revision_conflict_payload`, in the exact shape a local conflict already uses, not
+    /// retried and not treated as "try the next remote" — a 409 means this *is* the owning
+    /// remote, just currently contested.
+    pub async fn coordination_task_claim_fallback(
+        &self,
+        task_id: &str,
+        req: TaskLeaseRequest,
+    ) -> ToolResult<Option<Value>> {
+        self.coordination_task_revisioned_fallback(task_id, req, |api, id, req| async move {
+            api.coordination_task_claim(&id, req).await
+        })
+        .await
+    }
+
+    /// Fall back to a lease renewal across remotes after a local miss. See
+    /// [`Self::coordination_task_claim_fallback`] for the conflict-shape note.
+    pub async fn coordination_task_renew_fallback(
+        &self,
+        task_id: &str,
+        req: TaskLeaseRequest,
+    ) -> ToolResult<Option<Value>> {
+        self.coordination_task_revisioned_fallback(task_id, req, |api, id, req| async move {
+            api.coordination_task_renew(&id, req).await
+        })
+        .await
+    }
+
+    /// Fall back to a state transition across remotes after a local miss. See
+    /// [`Self::coordination_task_claim_fallback`] for the conflict-shape note.
+    pub async fn coordination_task_transition_fallback(
+        &self,
+        task_id: &str,
+        req: TransitionTaskRequest,
+    ) -> ToolResult<Option<Value>> {
+        for (name, api) in &self.remotes {
+            match api.coordination_task_transition(task_id, req.clone()).await {
+                Ok(RemoteRevisionedWrite::Applied(dto)) => {
+                    let mut value = serde_json::to_value(&dto).unwrap_or_else(|_| json!({}));
+                    if let Some(obj) = value.as_object_mut() {
+                        obj.insert("success".to_owned(), json!(true));
+                        obj.insert("applied_to".to_owned(), json!(format_remote_origin(name)));
+                    }
+                    return Ok(Some(value));
+                }
+                Ok(RemoteRevisionedWrite::Conflict { actual_revision }) => {
+                    return Ok(Some(crate::revision_conflict_payload(
+                        req.expected_revision,
+                        actual_revision,
+                    )));
+                }
+                Err(RemoteError::RemoteRejected { status: 404, .. }) => continue,
+                Err(e) => {
+                    return Err(ToolError::Internal(McpError::Federation(format!(
+                        "remote `{name}` rejected the transition: {e}"
+                    ))));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Shared body for [`Self::coordination_task_claim_fallback`] and
+    /// [`Self::coordination_task_renew_fallback`], which are identical except for which
+    /// `RemoteApi` method they call.
+    async fn coordination_task_revisioned_fallback<F, Fut>(
+        &self,
+        task_id: &str,
+        req: TaskLeaseRequest,
+        call: F,
+    ) -> ToolResult<Option<Value>>
+    where
+        F: Fn(Arc<dyn RemoteApi>, String, TaskLeaseRequest) -> Fut,
+        Fut: std::future::Future<
+                Output = mempalace_remote::Result<RemoteRevisionedWrite<mempalace_federation::CoordinationTaskDto>>,
+            >,
+    {
+        for (name, api) in &self.remotes {
+            match call(Arc::clone(api), task_id.to_owned(), req.clone()).await {
+                Ok(RemoteRevisionedWrite::Applied(dto)) => {
+                    let mut value = serde_json::to_value(&dto).unwrap_or_else(|_| json!({}));
+                    if let Some(obj) = value.as_object_mut() {
+                        obj.insert("success".to_owned(), json!(true));
+                        obj.insert("applied_to".to_owned(), json!(format_remote_origin(name)));
+                    }
+                    return Ok(Some(value));
+                }
+                Ok(RemoteRevisionedWrite::Conflict { actual_revision }) => {
+                    return Ok(Some(crate::revision_conflict_payload(
+                        req.expected_revision,
+                        actual_revision,
+                    )));
+                }
+                Err(RemoteError::RemoteRejected { status: 404, .. }) => continue,
+                Err(e) => {
+                    return Err(ToolError::Internal(McpError::Federation(format!(
+                        "remote `{name}` rejected the write: {e}"
+                    ))));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Fall back to sending a message across remotes after the referenced task_id is not found
+    /// locally.
+    pub async fn coordination_message_send_fallback(
+        &self,
+        req: NewMessageRequest,
+    ) -> ToolResult<Option<Value>> {
+        self.coordination_write_fallback(move |api| {
+            let req = req.clone();
+            async move { api.coordination_message_send(req).await }
+        })
+        .await
+    }
+
+    /// Fall back to a message GET across remotes after a local miss.
+    pub async fn coordination_message_get_fallback(&self, message_id: &str) -> Option<Value> {
+        let message_id = message_id.to_owned();
+        self.coordination_read_fallback(move |api| {
+            let message_id = message_id.clone();
+            async move { api.coordination_message_get(&message_id).await }
+        })
+        .await
+    }
+
+    /// Fall back to acknowledging a message across remotes after a local miss.
+    pub async fn coordination_message_ack_fallback(
+        &self,
+        message_id: &str,
+        req: AckMessageRequest,
+    ) -> ToolResult<Option<Value>> {
+        self.coordination_write_fallback(move |api| {
+            let message_id = message_id.to_owned();
+            let req = req.clone();
+            async move { api.coordination_message_ack(&message_id, req).await }
+        })
+        .await
+    }
+
+    /// Fall back to storing an artifact across remotes after the referenced task_id is not
+    /// found locally.
+    pub async fn coordination_artifact_put_fallback(
+        &self,
+        req: NewArtifactRequest,
+    ) -> ToolResult<Option<Value>> {
+        self.coordination_write_fallback(move |api| {
+            let req = req.clone();
+            async move { api.coordination_artifact_put(req).await }
+        })
+        .await
+    }
+
+    /// Fall back to an artifact GET across remotes after a local miss.
+    pub async fn coordination_artifact_get_fallback(&self, artifact_id: &str) -> Option<Value> {
+        let artifact_id = artifact_id.to_owned();
+        self.coordination_read_fallback(move |api| {
+            let artifact_id = artifact_id.clone();
+            async move { api.coordination_artifact_get(&artifact_id).await }
+        })
+        .await
+    }
+
+    /// Fall back to storing a result across remotes after the referenced task_id is not found
+    /// locally.
+    pub async fn coordination_result_put_fallback(
+        &self,
+        req: NewTaskResultRequest,
+    ) -> ToolResult<Option<Value>> {
+        self.coordination_write_fallback(move |api| {
+            let req = req.clone();
+            async move { api.coordination_result_put(req).await }
+        })
+        .await
+    }
+
+    /// Fall back to a result GET across remotes after a local miss.
+    pub async fn coordination_result_get_fallback(&self, result_id: &str) -> Option<Value> {
+        let result_id = result_id.to_owned();
+        self.coordination_read_fallback(move |api| {
+            let result_id = result_id.clone();
+            async move { api.coordination_result_get(&result_id).await }
+        })
+        .await
+    }
+
+    /// Fan out a coordination-events query to ALL configured remotes concurrently, with a
+    /// per-remote opaque cursor — the coordination-feed counterpart of `changes_fanout`, and
+    /// deliberately reusing its exact `{unreachable, error}` isolation contract: one down
+    /// remote never poisons a healthy one. Returns a map of `remote_name → per-remote result`;
+    /// on success the value is `{ "events": [...], "next_cursor": <string|null> }` with each
+    /// event annotated `"origin": "remote:<name>"`.
+    pub async fn coordination_events_fanout(
+        &self,
+        task_id: Option<String>,
+        wing: Option<String>,
+        limit: Option<usize>,
+        cursors: &BTreeMap<String, String>,
+    ) -> BTreeMap<String, Value> {
+        let mut set: JoinSet<(String, Result<Value, String>)> = JoinSet::new();
+        for (name, api) in &self.remotes {
+            let name = name.clone();
+            let api = Arc::clone(api);
+            let query = CoordinationEventsQuery {
+                cursor: cursors.get(&name).cloned(),
+                task_id: task_id.clone(),
+                wing: wing.clone(),
+                limit,
+            };
+            set.spawn(async move {
+                match api.coordination_events(query).await {
+                    Ok(resp) => {
+                        let origin = format_remote_origin(&name);
+                        let events: Vec<Value> = resp
+                            .events
+                            .into_iter()
+                            .map(|evt| {
+                                let mut v =
+                                    serde_json::to_value(&evt).unwrap_or_else(|_| json!({}));
+                                if let Some(obj) = v.as_object_mut() {
+                                    obj.insert("origin".to_owned(), json!(origin));
+                                }
+                                v
+                            })
+                            .collect();
+                        (name, Ok(json!({ "events": events, "next_cursor": resp.next_cursor })))
+                    }
+                    Err(e) => (name, Err(e.to_string())),
+                }
+            });
+        }
+
+        let mut results: BTreeMap<String, Value> = BTreeMap::new();
+        while let Some(res) = set.join_next().await {
+            match res {
+                Ok((name, Ok(payload))) => {
+                    results.insert(name, payload);
+                }
+                Ok((name, Err(msg))) => {
+                    tracing::warn!(remote = %name, "coordination events fan-out failed: {msg}");
+                    results.insert(name, json!({ "unreachable": true, "error": msg }));
+                }
+                Err(join_err) => {
+                    tracing::warn!("coordination events fan-out task panicked: {join_err}");
+                }
+            }
+        }
+        results
+    }
+
+    /// Fan out an inbox read to ALL configured remotes concurrently, with a per-remote opaque
+    /// cursor. Same isolation contract as [`Self::coordination_events_fanout`]/`changes_fanout`.
+    /// Returns a map of `remote_name → per-remote result`; on success the value is
+    /// `{ "messages": [...], "next_cursor": <string|null> }` with each message annotated
+    /// `"origin": "remote:<name>"`.
+    pub async fn coordination_inbox_fanout(
+        &self,
+        recipient: String,
+        wing: Option<String>,
+        limit: Option<usize>,
+        unacknowledged_only: bool,
+        cursors: &BTreeMap<String, String>,
+    ) -> BTreeMap<String, Value> {
+        let mut set: JoinSet<(String, Result<Value, String>)> = JoinSet::new();
+        for (name, api) in &self.remotes {
+            let name = name.clone();
+            let api = Arc::clone(api);
+            let query = InboxQuery {
+                recipient: recipient.clone(),
+                wing: wing.clone(),
+                cursor: cursors.get(&name).cloned(),
+                limit,
+                unacknowledged_only,
+            };
+            set.spawn(async move {
+                match api.coordination_inbox(query).await {
+                    Ok(resp) => {
+                        let origin = format_remote_origin(&name);
+                        let messages: Vec<Value> = resp
+                            .messages
+                            .into_iter()
+                            .map(|msg| {
+                                let mut v =
+                                    serde_json::to_value(&msg).unwrap_or_else(|_| json!({}));
+                                if let Some(obj) = v.as_object_mut() {
+                                    obj.insert("origin".to_owned(), json!(origin));
+                                }
+                                v
+                            })
+                            .collect();
+                        (name, Ok(json!({ "messages": messages, "next_cursor": resp.next_cursor })))
+                    }
+                    Err(e) => (name, Err(e.to_string())),
+                }
+            });
+        }
+
+        let mut results: BTreeMap<String, Value> = BTreeMap::new();
+        while let Some(res) = set.join_next().await {
+            match res {
+                Ok((name, Ok(payload))) => {
+                    results.insert(name, payload);
+                }
+                Ok((name, Err(msg))) => {
+                    tracing::warn!(remote = %name, "coordination inbox fan-out failed: {msg}");
+                    results.insert(name, json!({ "unreachable": true, "error": msg }));
+                }
+                Err(join_err) => {
+                    tracing::warn!("coordination inbox fan-out task panicked: {join_err}");
+                }
+            }
+        }
+        results
+    }
 }
 
 // ─── KG helpers ─────────────────────────────────────────────────────────────
@@ -1818,6 +2270,7 @@ mod tests {
             default_remote: Some("alpha".to_owned()),
             wings: BTreeMap::new(),
             kg: None,
+            coordination: BTreeMap::new(),
         };
         let router_obj = FederationRouter::new(rules);
         let mut wings = BTreeMap::new();
@@ -2073,6 +2526,7 @@ mod tests {
                 remote: remotes.keys().next().cloned(),
                 write: WriteTarget::Remote,
             }),
+            coordination: BTreeMap::new(),
         };
         FederationRouter::with_remotes(rules, remotes)
     }
@@ -3005,6 +3459,7 @@ mod tests {
             default_remote: Some("alpha".to_owned()),
             wings: wings_config,
             kg: None,
+            coordination: BTreeMap::new(),
         };
         let router = FederationRouter::with_remotes(rules, remotes);
 
@@ -3073,6 +3528,7 @@ mod tests {
             default_remote,
             wings,
             kg: None,
+            coordination: BTreeMap::new(),
         };
         FederationRouter::with_remotes(rules, remotes)
     }
@@ -3351,6 +3807,7 @@ mod tests {
             default_remote: Some("ok".to_owned()),
             wings: BTreeMap::new(),
             kg: None,
+            coordination: BTreeMap::new(),
         };
         let router = FederationRouter::with_remotes(rules, remotes);
 

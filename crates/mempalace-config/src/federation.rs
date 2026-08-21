@@ -30,6 +30,20 @@ pub struct FederationConfigV1 {
     /// Routing rule for the knowledge graph.
     #[serde(default)]
     pub kg: Option<RouteRuleV1>,
+    /// Per-wing routing rules for coordination (tasks, messages, artifacts, results, events —
+    /// issue #102 Stage 4). Deliberately a **separate** table from [`Self::wings`], not the
+    /// same one drawer routing reuses: a task is authoritative in exactly one palace (see the
+    /// no-multi-master non-goal in `docs/Coordination-Phase-3-Design.md`), so `write: both` is
+    /// a hard error here even though it is a perfectly normal, encouraged setting on a
+    /// `wings` entry for the same wing (e.g. the combined-wing team workflow in
+    /// `docs/Federation.md`). Sharing one table would force operators to choose between
+    /// dual-written drawers and federated coordination for a wing; a dedicated table lets a
+    /// wing's drawer routing and its coordination routing be configured independently. A wing
+    /// with no entry here still falls through to [`Self::default_mode`], same as an unlisted
+    /// [`Self::wings`] entry — only the diary hard override and the `write: both` rejection are
+    /// coordination-specific; see [`resolve_coordination_route`].
+    #[serde(default)]
+    pub coordination: BTreeMap<String, RouteRuleV1>,
 }
 
 /// File-level configuration for a single named remote server.
@@ -131,6 +145,10 @@ pub struct FederationRuntimeConfig {
     pub wings: BTreeMap<String, ResolvedRouteRule>,
     /// Knowledge-graph routing rule.
     pub kg: Option<ResolvedRouteRule>,
+    /// Per-wing coordination routing rules. See [`FederationConfigV1::coordination`] for why
+    /// this is a separate table from [`Self::wings`]. Every entry here is guaranteed at load
+    /// time to never carry [`WriteTarget::Both`] — see [`resolve_coordination_route`].
+    pub coordination: BTreeMap<String, ResolvedRouteRule>,
 }
 
 impl Default for FederationRuntimeConfig {
@@ -141,6 +159,7 @@ impl Default for FederationRuntimeConfig {
             default_remote: None,
             wings: BTreeMap::new(),
             kg: None,
+            coordination: BTreeMap::new(),
         }
     }
 }
@@ -283,7 +302,41 @@ pub(crate) fn resolve_federation_config(
         Some(rule) => Some(resolve_rule("federation.kg", rule, &remotes, config_path)?),
     };
 
-    // ── 4. Resolve default_mode ───────────────────────────────────────────────
+    // ── 4. Resolve coordination rules ─────────────────────────────────────────
+    // A separate table from `wings` (see `FederationConfigV1::coordination`), and the only one
+    // where `write: both` is a hard error rather than a legal (if unusual) setting — a task is
+    // authoritative in exactly one palace, so replicating claims and leases has no coherent
+    // meaning. Rejected here, at load, so a misconfiguration is caught before any task is ever
+    // created against it, not the first time a write happens to hit that wing.
+    let mut coordination: BTreeMap<String, ResolvedRouteRule> = BTreeMap::new();
+    for (wing_name, rule) in &section.coordination {
+        if wing_name == SHARED_AGENT_DIARY_WING && rule.mode != RouteMode::Local {
+            tracing::warn!(
+                wing = %wing_name,
+                "federation.coordination.{wing_name} has non-Local mode; \
+                 diary routing to this wing is always hard-overridden to Local"
+            );
+        }
+        let resolved = resolve_rule(
+            &format!("federation.coordination.{wing_name}"),
+            rule,
+            &remotes,
+            config_path,
+        )?;
+        if resolved.write == WriteTarget::Both {
+            return Err(MempalaceError::ConfigParse {
+                path: config_path.to_path_buf(),
+                message: format!(
+                    "federation.coordination.{wing_name} may not use write: both — a task is \
+                     authoritative in exactly one palace, so replicating claims and leases has \
+                     no coherent meaning; use write: local or write: remote instead"
+                ),
+            });
+        }
+        coordination.insert(wing_name.clone(), resolved);
+    }
+
+    // ── 5. Resolve default_mode ───────────────────────────────────────────────
     let default_mode = section.default_mode.unwrap_or(RouteMode::Local);
     let default_remote = match default_mode {
         RouteMode::Local => None,
@@ -293,7 +346,7 @@ pub(crate) fn resolve_federation_config(
         }
     };
 
-    Ok(FederationRuntimeConfig { remotes, default_mode, default_remote, wings, kg })
+    Ok(FederationRuntimeConfig { remotes, default_mode, default_remote, wings, kg, coordination })
 }
 
 /// Resolve a single [`RouteRuleV1`] into a [`ResolvedRouteRule`], validating
@@ -464,6 +517,37 @@ pub fn resolve_route(
 pub fn resolve_kg_route(federation: &FederationRuntimeConfig) -> ResolvedRouteRule {
     if let Some(kg) = &federation.kg {
         return kg.clone();
+    }
+    rule_from_default_mode(federation)
+}
+
+/// Resolve the routing rule for a coordination task's wing (issue #102 Stage 4).
+///
+/// Precedence: diary hard-override > explicit `federation.coordination[wing]` rule >
+/// `federation.default_mode` > Local. Keyed on `wing` like [`resolve_route`], reading from the
+/// dedicated [`FederationRuntimeConfig::coordination`] table rather than
+/// [`FederationRuntimeConfig::wings`] — see [`FederationConfigV1::coordination`] for why they
+/// are separate tables. There is no project-routing step: unlike a drawer or a mine, a
+/// coordination task has no repository checkout to read a `mempalace.yaml` override from.
+///
+/// Two things are guaranteed about the result that are not guaranteed by [`resolve_route`]:
+///
+/// - `write` is never [`WriteTarget::Both`] — [`resolve_federation_config`] already rejects any
+///   `federation.coordination` entry that resolves to it, at config load, so this function
+///   itself never needs to re-check.
+/// - **The diary hard-override always applies, unconditionally, exactly like [`resolve_route`]
+///   does.** This is called out because [`resolve_kg_route`] right above deliberately *skips*
+///   the override (KG facts are entity-scoped, not wing-scoped, so there is no wing-shaped
+///   diary content for it to protect) — coordination is the opposite: a task's `wing` is the
+///   central authorization key for the whole feature (see `docs/Federation.md`'s "Wing is the
+///   authorization key"), so `wing_agents` coordination must stay local unconditionally, the
+///   same way the diary is protected everywhere else in the palace.
+pub fn resolve_coordination_route(federation: &FederationRuntimeConfig, wing: &str) -> ResolvedRouteRule {
+    if wing == SHARED_AGENT_DIARY_WING {
+        return local_rule();
+    }
+    if let Some(rule) = federation.coordination.get(wing) {
+        return rule.clone();
     }
     rule_from_default_mode(federation)
 }
@@ -667,6 +751,7 @@ mod tests {
                 m
             },
             kg: None,
+            coordination: BTreeMap::new(),
         };
         let err = resolve_federation_config(Some(section), config_path(), no_env()).unwrap_err();
         let msg = err.to_string();
@@ -695,6 +780,7 @@ mod tests {
                 m
             },
             kg: None,
+            coordination: BTreeMap::new(),
         };
         let fed = resolve_federation_config(Some(section), config_path(), no_env()).unwrap();
         let rule = fed.wings.get("wing_a").unwrap();
@@ -730,6 +816,7 @@ mod tests {
                 m
             },
             kg: None,
+            coordination: BTreeMap::new(),
         };
         let err = resolve_federation_config(Some(section), config_path(), no_env()).unwrap_err();
         assert!(err.to_string().contains("federation.wings.wing_x"), "{err}");
@@ -749,6 +836,7 @@ mod tests {
                 m
             },
             kg: None,
+            coordination: BTreeMap::new(),
         };
         let err = resolve_federation_config(Some(section), config_path(), no_env()).unwrap_err();
         assert!(err.to_string().contains("federation.wings.wing_x"), "{err}");
@@ -777,6 +865,7 @@ mod tests {
             default_mode: Some(RouteMode::Remote),
             wings: BTreeMap::new(),
             kg: None,
+            coordination: BTreeMap::new(),
         };
         let err = resolve_federation_config(Some(section), config_path(), no_env()).unwrap_err();
         assert!(err.to_string().contains("federation.default_mode"), "{err}");
@@ -795,6 +884,7 @@ mod tests {
             default_mode: Some(RouteMode::Remote),
             wings: BTreeMap::new(),
             kg: None,
+            coordination: BTreeMap::new(),
         };
         let fed = resolve_federation_config(Some(section), config_path(), no_env()).unwrap();
         assert_eq!(fed.default_mode, RouteMode::Remote);
@@ -815,6 +905,7 @@ mod tests {
             default_mode: None,
             wings: BTreeMap::new(),
             kg: None,
+            coordination: BTreeMap::new(),
         };
         let env = fake_env(&[("MY_TOKEN_VAR", "env-tok")]);
         let fed = resolve_federation_config(Some(section), config_path(), env).unwrap();
@@ -834,6 +925,7 @@ mod tests {
             default_mode: None,
             wings: BTreeMap::new(),
             kg: None,
+            coordination: BTreeMap::new(),
         };
         let fed = resolve_federation_config(Some(section), config_path(), no_env()).unwrap();
         assert_eq!(fed.remotes["r"].token.as_deref(), Some("inline-tok"));
@@ -852,6 +944,7 @@ mod tests {
             default_mode: None,
             wings: BTreeMap::new(),
             kg: None,
+            coordination: BTreeMap::new(),
         };
         let fed = resolve_federation_config(Some(section), config_path(), no_env()).unwrap();
         assert_eq!(fed.remotes["r"].token, None);
@@ -870,6 +963,7 @@ mod tests {
             default_mode: None,
             wings: BTreeMap::new(),
             kg: None,
+            coordination: BTreeMap::new(),
         };
         let err = resolve_federation_config(Some(section), config_path(), no_env()).unwrap_err();
         assert!(err.to_string().contains("must use https://"), "{err}");
@@ -888,6 +982,7 @@ mod tests {
             default_mode: None,
             wings: BTreeMap::new(),
             kg: None,
+            coordination: BTreeMap::new(),
         };
         let fed = resolve_federation_config(Some(section), config_path(), no_env()).unwrap();
         assert_eq!(fed.remotes["r"].url, "http://127.0.0.1:8765");
@@ -907,6 +1002,7 @@ mod tests {
             default_mode: None,
             wings: BTreeMap::new(),
             kg: None,
+            coordination: BTreeMap::new(),
         };
         let fed = resolve_federation_config(Some(section), config_path(), no_env()).unwrap();
         assert_eq!(fed.remotes["r"].timeout, Duration::from_millis(5_000));
@@ -1000,6 +1096,7 @@ mod tests {
             default_remote: None,
             wings: BTreeMap::new(),
             kg: None,
+            coordination: BTreeMap::new(),
         }
     }
 
@@ -1368,6 +1465,7 @@ mod tests {
                     remote: Some("work".to_owned()),
                     write: WriteTarget::Local,
                 }),
+                coordination: BTreeMap::new(),
                 ..base
             }
         };
@@ -1400,6 +1498,7 @@ mod tests {
                     remote: Some("work".to_owned()),
                     write: WriteTarget::Both,
                 }),
+                coordination: BTreeMap::new(),
                 ..base
             }
         };
@@ -1464,6 +1563,7 @@ mod tests {
                 m
             },
             kg: None,
+            coordination: BTreeMap::new(),
         };
         let fed = resolve_federation_config(Some(section), config_path(), no_env()).unwrap();
         let rule = fed.wings.get("wing_local").unwrap();
@@ -1496,6 +1596,7 @@ mod tests {
                 m
             },
             kg: None,
+            coordination: BTreeMap::new(),
         };
         let fed = resolve_federation_config(Some(section), config_path(), no_env()).unwrap();
         let rule = fed.wings.get("wing_remote").unwrap();
@@ -1542,11 +1643,165 @@ mod tests {
                     remote: Some("hub".to_owned()),
                     write: WriteTarget::Both,
                 }),
+                coordination: BTreeMap::new(),
             }
         };
         let result = resolve_kg_route(&fed);
         assert_eq!(result.mode, RouteMode::Combined);
         assert_eq!(result.remote.as_deref(), Some("hub"));
         assert_eq!(result.write, WriteTarget::Both);
+    }
+
+    // ── 16. resolve_coordination_route (issue #102 Stage 4) ────────────────────
+
+    /// `write: both` on a `federation.coordination` entry is a hard config-load error — a task
+    /// is authoritative in exactly one palace, so replicating claims and leases has no coherent
+    /// meaning. This is a genuine divergence from `federation.wings`, where the identical
+    /// setting is legal (and encouraged for dual-written drawers), so the check must live on
+    /// the `coordination` table specifically, not be a blanket ban on `WriteTarget::Both`.
+    #[test]
+    fn coordination_write_both_fails_config_load() {
+        let section = FederationConfigV1 {
+            remotes: vec![RemoteConfigV1 {
+                name: "hub".to_owned(),
+                url: "https://palace.example".to_owned(),
+                token: None,
+                token_env: None,
+                timeout_ms: None,
+            }],
+            default_mode: None,
+            wings: BTreeMap::new(),
+            kg: None,
+            coordination: {
+                let mut m = BTreeMap::new();
+                m.insert(
+                    "wing_team".to_owned(),
+                    RouteRuleV1 {
+                        mode: RouteMode::Combined,
+                        remote: Some("hub".to_owned()),
+                        write: Some(WriteTarget::Both),
+                    },
+                );
+                m
+            },
+        };
+        let err = resolve_federation_config(Some(section), config_path(), no_env()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("federation.coordination.wing_team"), "{msg}");
+        assert!(msg.contains("write: both") || msg.contains("write:both"), "{msg}");
+    }
+
+    /// The identical `write: both` setting on the ordinary `federation.wings` table for the
+    /// same wing must still load fine — proves the rejection is scoped to `coordination`, not a
+    /// global ban that would break the documented dual-write-drawers workflow.
+    #[test]
+    fn wings_write_both_still_loads_fine_alongside_coordination_table() {
+        let section = FederationConfigV1 {
+            remotes: vec![RemoteConfigV1 {
+                name: "hub".to_owned(),
+                url: "https://palace.example".to_owned(),
+                token: None,
+                token_env: None,
+                timeout_ms: None,
+            }],
+            default_mode: None,
+            wings: {
+                let mut m = BTreeMap::new();
+                m.insert(
+                    "wing_team".to_owned(),
+                    RouteRuleV1 {
+                        mode: RouteMode::Combined,
+                        remote: Some("hub".to_owned()),
+                        write: Some(WriteTarget::Both),
+                    },
+                );
+                m
+            },
+            kg: None,
+            coordination: {
+                let mut m = BTreeMap::new();
+                m.insert(
+                    "wing_team".to_owned(),
+                    RouteRuleV1 { mode: RouteMode::Combined, remote: Some("hub".to_owned()), write: Some(WriteTarget::Remote) },
+                );
+                m
+            },
+        };
+        let fed = resolve_federation_config(Some(section), config_path(), no_env()).unwrap();
+        assert_eq!(fed.wings["wing_team"].write, WriteTarget::Both);
+        assert_eq!(fed.coordination["wing_team"].write, WriteTarget::Remote);
+    }
+
+    /// `wing_agents` coordination is hard-overridden to local even when
+    /// `federation.coordination` explicitly configures it otherwise — unlike `resolve_kg_route`,
+    /// which has no wing concept and so has nothing to protect.
+    #[test]
+    fn resolve_coordination_route_wing_agents_hard_override() {
+        let fed = {
+            let base = work_remote_federation();
+            let mut coordination = BTreeMap::new();
+            coordination.insert(
+                SHARED_AGENT_DIARY_WING.to_owned(),
+                ResolvedRouteRule {
+                    mode: RouteMode::Remote,
+                    remote: Some("work".to_owned()),
+                    write: WriteTarget::Local,
+                },
+            );
+            FederationRuntimeConfig { coordination, ..base }
+        };
+        let result = resolve_coordination_route(&fed, SHARED_AGENT_DIARY_WING);
+        assert_eq!(result.mode, RouteMode::Local);
+        assert_eq!(result.remote, None);
+    }
+
+    /// An explicit `federation.coordination[wing]` entry wins over `default_mode`.
+    #[test]
+    fn resolve_coordination_route_explicit_rule_wins_over_default_mode() {
+        let fed = {
+            let base = work_remote_federation();
+            let mut coordination = BTreeMap::new();
+            coordination.insert(
+                "wing_myproject".to_owned(),
+                ResolvedRouteRule {
+                    mode: RouteMode::Combined,
+                    remote: Some("work".to_owned()),
+                    write: WriteTarget::Remote,
+                },
+            );
+            FederationRuntimeConfig {
+                default_mode: RouteMode::Remote,
+                default_remote: Some("work".to_owned()),
+                coordination,
+                ..base
+            }
+        };
+        let result = resolve_coordination_route(&fed, "wing_myproject");
+        assert_eq!(result.mode, RouteMode::Combined);
+        assert_eq!(result.write, WriteTarget::Remote);
+    }
+
+    /// A wing absent from `federation.coordination` falls through to `default_mode`, exactly
+    /// like an unlisted `federation.wings` entry does for `resolve_route`.
+    #[test]
+    fn resolve_coordination_route_falls_through_to_default_mode() {
+        let fed = FederationRuntimeConfig {
+            default_mode: RouteMode::Remote,
+            default_remote: Some("work".to_owned()),
+            ..work_remote_federation()
+        };
+        let result = resolve_coordination_route(&fed, "wing_unlisted");
+        assert_eq!(result.mode, RouteMode::Remote);
+        assert_eq!(result.remote.as_deref(), Some("work"));
+    }
+
+    /// No coordination rule and no `default_mode` → Local, the same hard default every other
+    /// route function falls back to.
+    #[test]
+    fn resolve_coordination_route_defaults_to_local() {
+        let fed = FederationRuntimeConfig::default();
+        let result = resolve_coordination_route(&fed, "wing_anything");
+        assert_eq!(result.mode, RouteMode::Local);
+        assert_eq!(result.remote, None);
     }
 }

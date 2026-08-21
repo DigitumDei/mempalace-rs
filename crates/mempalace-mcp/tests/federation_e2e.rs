@@ -137,6 +137,79 @@ async fn mcp_server_with_hub(
         default_remote,
         wings: wing_rules,
         kg: kg_rule,
+        coordination: BTreeMap::new(),
+    };
+
+    let config = MempalaceConfig {
+        schema_version: 1,
+        collection_name: "mempalace_drawers".to_owned(),
+        palace_path: local_dir.path().join("palace"),
+        embedding_profile: EmbeddingProfile::Balanced,
+        low_cpu: LowCpuRuntimeConfig::defaults_for_profile(EmbeddingProfile::Balanced),
+        server: ServerRuntimeConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            token_file: local_dir.path().join("server_tokens.json"),
+            checkouts: std::collections::BTreeMap::new(),
+        },
+        maintenance: MaintenanceRuntimeConfig::defaults(),
+        federation,
+    };
+
+    McpServer::from_parts(config, DeterministicStubProvider::new(EmbeddingProfile::Balanced))
+        .await
+        .unwrap()
+}
+
+/// Like [`mcp_server_with_hub`], but also sets `federation.coordination` — used by the
+/// coordination-specific tests below (issue #102 Stage 4), which need a route on that separate
+/// table rather than `federation.wings`.
+#[allow(clippy::too_many_arguments)]
+async fn mcp_server_with_hub_coordination(
+    local_dir: &TempDir,
+    hub_url: &str,
+    wing_rules: BTreeMap<String, ResolvedRouteRule>,
+    coordination_rules: BTreeMap<String, ResolvedRouteRule>,
+    default_mode: RouteMode,
+) -> McpServer<DeterministicStubProvider> {
+    mcp_server_with_hub_multi(local_dir, &[("hub", hub_url)], wing_rules, coordination_rules, default_mode)
+        .await
+}
+
+/// Build an `McpServer` with a federation config registering one or more named remotes, plus
+/// `wings` and `coordination` routing tables — the general form
+/// [`mcp_server_with_hub`]/[`mcp_server_with_hub_coordination`] specialize. Used directly by
+/// tests that need more than one remote (e.g. the events fan-out isolation test).
+async fn mcp_server_with_hub_multi(
+    local_dir: &TempDir,
+    remotes: &[(&str, &str)],
+    wing_rules: BTreeMap<String, ResolvedRouteRule>,
+    coordination_rules: BTreeMap<String, ResolvedRouteRule>,
+    default_mode: RouteMode,
+) -> McpServer<DeterministicStubProvider> {
+    let mut resolved_remotes = BTreeMap::new();
+    for (name, url) in remotes {
+        resolved_remotes.insert(
+            (*name).to_owned(),
+            ResolvedRemote {
+                name: (*name).to_owned(),
+                url: (*url).to_owned(),
+                token: Some(TEST_TOKEN.to_owned()),
+                timeout: Duration::from_secs(5),
+            },
+        );
+    }
+    let default_remote = match default_mode {
+        RouteMode::Local => None,
+        _ => remotes.first().map(|(name, _)| (*name).to_owned()),
+    };
+
+    let federation = FederationRuntimeConfig {
+        remotes: resolved_remotes,
+        default_mode,
+        default_remote,
+        wings: wing_rules,
+        kg: None,
+        coordination: coordination_rules,
     };
 
     let config = MempalaceConfig {
@@ -540,6 +613,7 @@ async fn different_embedding_profiles_per_side() {
         default_remote: None,
         wings: wing_rules,
         kg: None,
+        coordination: BTreeMap::new(),
     };
 
     let local_config = MempalaceConfig {
@@ -682,6 +756,7 @@ async fn remote_down_degrades_reads() {
         default_remote: None,
         wings: wing_rules,
         kg: kg_rule,
+        coordination: BTreeMap::new(),
     };
 
     let config = MempalaceConfig {
@@ -1106,6 +1181,7 @@ async fn wake_up_with_down_remote_marks_unreachable_and_succeeds() {
         default_remote: None,
         wings: BTreeMap::new(),
         kg: None,
+        coordination: BTreeMap::new(),
     };
 
     let config = MempalaceConfig {
@@ -1662,6 +1738,7 @@ async fn add_drawer_both_replication_fails_with_remote_rejection() {
         default_remote: None,
         wings: wing_rules,
         kg: None,
+        coordination: BTreeMap::new(),
     };
 
     let config = MempalaceConfig {
@@ -1846,6 +1923,7 @@ async fn add_drawer_both_near_duplicate_same_wing_room_rejected() {
         default_remote: None,
         wings: wing_rules,
         kg: None,
+        coordination: BTreeMap::new(),
     };
 
     let config = MempalaceConfig {
@@ -1973,6 +2051,7 @@ async fn add_drawer_both_retry_reuses_local_drawer_and_replicates() {
         default_remote: None,
         wings: wing_rules_a,
         kg: None,
+        coordination: BTreeMap::new(),
     };
     let config_a = MempalaceConfig {
         schema_version: 1,
@@ -2052,6 +2131,7 @@ async fn add_drawer_both_retry_reuses_local_drawer_and_replicates() {
         default_remote: None,
         wings: wing_rules_b,
         kg: None,
+        coordination: BTreeMap::new(),
     };
     let config_b = MempalaceConfig {
         schema_version: 1,
@@ -2195,6 +2275,7 @@ async fn add_drawer_both_replication_fails_with_down_remote() {
         default_remote: None,
         wings: wing_rules,
         kg: None,
+        coordination: BTreeMap::new(),
     };
 
     let config = MempalaceConfig {
@@ -2367,6 +2448,7 @@ async fn kg_add_both_replication_fails_with_down_remote() {
         default_remote: None,
         wings: BTreeMap::new(),
         kg: Some(combined_kg_rule_both_write()),
+        coordination: BTreeMap::new(),
     };
 
     let config = MempalaceConfig {
@@ -2592,6 +2674,7 @@ async fn kg_invalidate_both_replication_fails_with_down_remote() {
         default_remote: None,
         wings: BTreeMap::new(),
         kg: Some(combined_kg_rule_both_write()),
+        coordination: BTreeMap::new(),
     };
 
     let config = MempalaceConfig {
@@ -2877,6 +2960,7 @@ async fn kg_add_both_replication_fails_with_remote_rejection() {
         default_remote: None,
         wings: BTreeMap::new(),
         kg: Some(combined_kg_rule_both_write()),
+        coordination: BTreeMap::new(),
     };
 
     let config = MempalaceConfig {
@@ -3000,6 +3084,7 @@ async fn kg_invalidate_both_replication_fails_with_remote_rejection() {
         default_remote: None,
         wings: BTreeMap::new(),
         kg: Some(combined_kg_rule_both_write()),
+        coordination: BTreeMap::new(),
     };
 
     let config = MempalaceConfig {
@@ -3084,4 +3169,262 @@ fn combined_kg_rule_remote_write_for_test() -> ResolvedRouteRule {
         remote: Some("hub".to_owned()),
         write: WriteTarget::Remote,
     }
+}
+
+// ─── Coordination federation tests (issue #102 Stage 4) ───────────────────────
+
+/// `mempalace_task_create` for a wing whose `federation.coordination` rule is `Remote` must
+/// land on the hub, not locally — the one coordination write routed by wing rather than by
+/// ID-discovery fallback.
+#[tokio::test]
+async fn coordination_task_create_routes_to_remote_when_wing_configured_remote() {
+    let local_dir = TempDir::new().unwrap();
+    let hub_dir = TempDir::new().unwrap();
+    let hub_addr = spawn_server(&hub_dir).await;
+    let hub_url = format!("http://{hub_addr}");
+
+    let mut coordination_rules = BTreeMap::new();
+    coordination_rules.insert("wing_coordremote".to_owned(), remote_wing_rule());
+
+    let server = mcp_server_with_hub_coordination(
+        &local_dir,
+        &hub_url,
+        BTreeMap::new(),
+        coordination_rules,
+        RouteMode::Local,
+    )
+    .await;
+
+    let response = call_tool(
+        &server,
+        1,
+        "mempalace_task_create",
+        json!({
+            "title": "index the repo",
+            "description": "d",
+            "wing": "wing_coordremote",
+            "idempotency_key": "e2e-remote-task-1",
+            "created_by": "alice",
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        response["applied_to"], "remote:hub",
+        "task_create for a Remote-routed coordination wing must land on the hub: {response}"
+    );
+    assert!(response["task_id"].as_str().is_some(), "response must carry a task_id: {response}");
+
+    // The local palace must not have created a copy.
+    let local_get =
+        call_tool(&server, 2, "mempalace_task_get", json!({"task_id": response["task_id"]})).await;
+    assert_eq!(local_get["found"], true, "the task must still be discoverable via ID fallback");
+    assert_eq!(
+        local_get["value"]["origin"], "remote:hub",
+        "and must be reported as coming from the hub, not local: {local_get}"
+    );
+}
+
+/// A combined-mode exact-ID read: a task created directly on the hub (bypassing the local MCP
+/// server entirely) is invisible locally, but `mempalace_task_get` still finds it by falling
+/// back to the configured remote — and annotates `origin` so the caller can tell.
+#[tokio::test]
+async fn coordination_task_get_falls_back_to_remote_after_local_miss() {
+    let local_dir = TempDir::new().unwrap();
+    let hub_dir = TempDir::new().unwrap();
+    let hub_addr = spawn_server(&hub_dir).await;
+    let hub_url = format!("http://{hub_addr}");
+
+    let hub_client = RemoteClient::new(RemoteEndpoint {
+        name: "hub".to_owned(),
+        base_url: hub_url.clone(),
+        token: Some(TEST_TOKEN.to_owned()),
+        timeout: Duration::from_secs(5),
+    })
+    .unwrap();
+    let hub_task = hub_client
+        .coordination_task_create(mempalace_federation::NewTaskRequest {
+            title: "hub-only task".to_owned(),
+            description: "d".to_owned(),
+            wing: "wing_hubonly".to_owned(),
+            idempotency_key: "e2e-hubonly-1".to_owned(),
+            created_by: Some("alice".to_owned()),
+            parent_id: None,
+            dependencies: Vec::new(),
+            budget: None,
+            expires_at: None,
+        })
+        .await
+        .unwrap();
+
+    // No coordination rule at all for `wing_hubonly` — the fallback is purely ID-discovery,
+    // triggered by the presence of a configured remote, not by any specific wing routing.
+    let server = mcp_server_with_hub_coordination(
+        &local_dir,
+        &hub_url,
+        BTreeMap::new(),
+        BTreeMap::new(),
+        RouteMode::Local,
+    )
+    .await;
+
+    let response =
+        call_tool(&server, 1, "mempalace_task_get", json!({"task_id": hub_task.task_id})).await;
+    assert_eq!(response["found"], true, "must find the task via remote fallback: {response}");
+    assert_eq!(response["value"]["task_id"], json!(hub_task.task_id));
+    assert_eq!(response["value"]["origin"], "remote:hub");
+
+    // A task_id that exists nowhere still comes back as a clean "not found", not an error.
+    let missing =
+        call_tool(&server, 2, "mempalace_task_get", json!({"task_id": "task_does_not_exist"}))
+            .await;
+    assert_eq!(missing["found"], false, "a genuinely missing task must report found=false");
+}
+
+/// A revision conflict on a remotely-owned task, discovered through the local-first fallback,
+/// surfaces through the MCP tool exactly like a local conflict does — `success: false` with the
+/// remote's actual current revision, not a JSON-RPC error the caller would have to unwrap.
+#[tokio::test]
+async fn coordination_claim_revision_conflict_via_remote_fallback() {
+    let local_dir = TempDir::new().unwrap();
+    let hub_dir = TempDir::new().unwrap();
+    let hub_addr = spawn_server(&hub_dir).await;
+    let hub_url = format!("http://{hub_addr}");
+
+    let hub_client = RemoteClient::new(RemoteEndpoint {
+        name: "hub".to_owned(),
+        base_url: hub_url.clone(),
+        token: Some(TEST_TOKEN.to_owned()),
+        timeout: Duration::from_secs(5),
+    })
+    .unwrap();
+    let hub_task = hub_client
+        .coordination_task_create(mempalace_federation::NewTaskRequest {
+            title: "claim conflict test".to_owned(),
+            description: "d".to_owned(),
+            wing: "wing_conflict".to_owned(),
+            idempotency_key: "e2e-conflict-1".to_owned(),
+            created_by: None,
+            parent_id: None,
+            dependencies: Vec::new(),
+            budget: None,
+            expires_at: None,
+        })
+        .await
+        .unwrap();
+
+    let server = mcp_server_with_hub_coordination(
+        &local_dir,
+        &hub_url,
+        BTreeMap::new(),
+        BTreeMap::new(),
+        RouteMode::Local,
+    )
+    .await;
+
+    // First claim, at the correct revision 0, is discovered on the hub and succeeds.
+    let claimed = call_tool(
+        &server,
+        1,
+        "mempalace_task_claim",
+        json!({
+            "task_id": hub_task.task_id,
+            "worker": "worker-1",
+            "expected_revision": 0,
+            "lease_seconds": 300,
+        }),
+    )
+    .await;
+    assert_eq!(
+        claimed["success"], true,
+        "first claim at the right revision must succeed: {claimed}"
+    );
+    assert_eq!(claimed["applied_to"], "remote:hub");
+
+    // Renewing at the now-stale revision 0 must come back as a typed conflict, not an error.
+    let conflict = call_tool(
+        &server,
+        2,
+        "mempalace_task_renew",
+        json!({
+            "task_id": hub_task.task_id,
+            "worker": "worker-1",
+            "expected_revision": 0,
+            "lease_seconds": 300,
+        }),
+    )
+    .await;
+    assert_eq!(conflict["success"], false, "stale revision must report success=false: {conflict}");
+    assert_eq!(
+        conflict["conflict"]["actual_revision"], 1,
+        "conflict must carry the hub's real current revision: {conflict}"
+    );
+}
+
+/// The coordination-events feed fans out to every configured remote independently — a down
+/// remote is reported as unreachable, while a healthy one alongside it still returns its
+/// events, matching the `{unreachable, error}` isolation contract `changes_fanout` already
+/// guarantees for the generic change feed.
+#[tokio::test]
+async fn coordination_events_fanout_with_one_remote_down_still_returns_the_healthy_one() {
+    let local_dir = TempDir::new().unwrap();
+    let hub_dir = TempDir::new().unwrap();
+    let hub_addr = spawn_server(&hub_dir).await;
+    let hub_url = format!("http://{hub_addr}");
+
+    // A dead address for the second remote — nothing is listening.
+    let dead_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let dead_addr = dead_listener.local_addr().unwrap();
+    drop(dead_listener);
+    let down_url = format!("http://{dead_addr}");
+
+    let hub_client = RemoteClient::new(RemoteEndpoint {
+        name: "hub".to_owned(),
+        base_url: hub_url.clone(),
+        token: Some(TEST_TOKEN.to_owned()),
+        timeout: Duration::from_secs(5),
+    })
+    .unwrap();
+    hub_client
+        .coordination_task_create(mempalace_federation::NewTaskRequest {
+            title: "fanout test".to_owned(),
+            description: "d".to_owned(),
+            wing: "wing_fanout".to_owned(),
+            idempotency_key: "e2e-fanout-1".to_owned(),
+            created_by: None,
+            parent_id: None,
+            dependencies: Vec::new(),
+            budget: None,
+            expires_at: None,
+        })
+        .await
+        .unwrap();
+
+    let server = mcp_server_with_hub_multi(
+        &local_dir,
+        &[("hub", &hub_url), ("down", &down_url)],
+        BTreeMap::new(),
+        BTreeMap::new(),
+        RouteMode::Local,
+    )
+    .await;
+
+    let response =
+        call_tool(&server, 1, "mempalace_coordination_events", json!({"wing": "wing_fanout"}))
+            .await;
+
+    let remote_events = response.get("remote_events").expect("remote_events must be present");
+    assert_eq!(
+        remote_events["down"]["unreachable"], true,
+        "the down remote must be reported unreachable, not fail the whole call: {remote_events}"
+    );
+    let hub_events = remote_events["hub"]["events"].as_array().expect("hub must return events");
+    assert!(
+        !hub_events.is_empty(),
+        "the healthy remote must still return its events despite the other being down: {remote_events}"
+    );
+    assert!(
+        hub_events.iter().all(|e| e["origin"] == "remote:hub"),
+        "hub events must be annotated with origin: {hub_events:?}"
+    );
 }

@@ -62,8 +62,9 @@ use mempalace_storage::{
     CoordinationCursor, CoordinationEvent, CoordinationStore, DrawerFilter, DrawerStore,
     DuplicateStrategy, IngestCommitRequest, IngestManifestStore, MaintenanceAbortReason,
     MaintenanceOutcome, MaintenanceRunSummary, MaintenanceSettings, MaintenanceSkipReason,
-    Message as CoordinationMessage, NewArtifact, NewMessage, NewTask, NewTaskResult, StorageEngine,
-    Task as CoordinationTask, TaskResult as CoordinationTaskResult, TaskState,
+    Message as CoordinationMessage, NewArtifact, NewMessage, NewTask, NewTaskResult,
+    RevisionedWrite, StorageEngine, Task as CoordinationTask,
+    TaskResult as CoordinationTaskResult, TaskState,
 };
 use serde_json::{Value, json};
 use subtle::ConstantTimeEq;
@@ -133,15 +134,15 @@ pub enum ServerError {
     /// a live lease, the task is terminal, or the caller does not own the
     /// task/lease/message it is trying to act on. `code` distinguishes the
     /// two shapes on the wire: `"revision_conflict"` carries both revisions
-    /// (reload and retry with the current one); `"coordination_conflict"`
-    /// carries neither and means the write is not permitted regardless of
-    /// revision (e.g. another worker's lease has not expired). See
-    /// `coordination_storage_error`, which is the sole place this is
-    /// constructed — `mempalace-storage`'s coordination writes are not yet
-    /// reconciled onto the `RevisionedWrite<T>` shape `skills.rs`/
-    /// `delegation.rs` use (tracked as Phase 3 Stage 4), so this classifies
-    /// by matching the `pub const` message fragments `coordination.rs`
-    /// exports for exactly this purpose, not by inline string literals.
+    /// (reload and retry with the current one) and is built directly from the
+    /// typed `RevisionedWrite::Conflict` `claim_task`/`renew_lease`/
+    /// `transition_task` return (see `coordination_revision_conflict`);
+    /// `"coordination_conflict"` carries neither and means the write is not
+    /// permitted regardless of revision (e.g. another worker's lease has not
+    /// expired) — that shape is still classified from the `pub const` message
+    /// fragments `coordination.rs` exports for exactly this purpose (see
+    /// `coordination_storage_error`), because those rejections have no
+    /// revision pair to carry and stay text-classified.
     #[error("{message}")]
     CoordinationConflict {
         /// `"revision_conflict"` or `"coordination_conflict"`.
@@ -2672,44 +2673,34 @@ fn validate_lease_seconds(seconds: i64) -> Result<(), ServerError> {
 }
 
 /// Classifies a `StorageError` from a coordination-store write into the right
-/// HTTP shape. `mempalace-storage`'s coordination writes are not yet
-/// reconciled onto the `RevisionedWrite<T>` shape `skills.rs`/`delegation.rs`
-/// use (tracked as Phase 3 Stage 4 — see
-/// docs/Coordination-Phase-3-Design.md) — every rejection `coordination.rs`
-/// can produce surfaces as a single `StorageError::Invariant(String)`, so this
-/// necessarily classifies by matching on that message text. That coupling is
-/// compile-enforced, not textual: every fragment matched below is a `pub
-/// const` re-exported from `mempalace_storage::coordination`, which builds
-/// its own error text from the same constant (see that module's doc comment
-/// on them, and `error_messages_start_with_their_constants` in its test
-/// module). Renaming or removing one of those constants is a compile error
-/// here; rewording the text it holds moves both sides together, because the
-/// text exists in exactly one place. Every branch below corresponds to one
-/// specific message shape coordination.rs actually emits; an `Invariant`
-/// this function does not recognise, or any non-`Invariant` error, falls
-/// through to the ordinary `ServerError::Storage` 500 mapping.
+/// HTTP shape. As of Phase 3 Stage 4 a stale revision is no longer part of
+/// this function's job — `claim_task`/`renew_lease`/`transition_task` report
+/// it as a typed `RevisionedWrite::Conflict`, handled directly by their route
+/// handlers via `coordination_revision_conflict`. Everything this function
+/// still sees is a genuine `StorageError`: either a lease/state/ownership
+/// conflict `coordination.rs` raises as `StorageError::Invariant(String)`
+/// built from one of its `pub const` message fragments, or some other error
+/// entirely. The `pub const` coupling is compile-enforced, not textual: every
+/// fragment matched below is re-exported from `mempalace_storage::coordination`,
+/// which builds its own error text from the same constant (see that module's
+/// doc comment on them, and `error_messages_start_with_their_constants` in
+/// its test module). Renaming or removing one of those constants is a
+/// compile error here; rewording the text it holds moves both sides
+/// together, because the text exists in exactly one place. Every branch
+/// below corresponds to one specific message shape coordination.rs actually
+/// emits; an `Invariant` this function does not recognise, or any
+/// non-`Invariant` error, falls through to the ordinary `ServerError::Storage`
+/// 500 mapping.
 fn coordination_storage_error(err: mempalace_storage::StorageError) -> ServerError {
     use mempalace_storage::{
         INVALID_TRANSITION_PREFIX, LEASE_HAS_EXPIRED, LEASE_HELD_BY_ANOTHER_WORKER,
         ONLY_LEASE_OWNER_MAY_RENEW, ONLY_OWNER_MAY_TRANSITION, ONLY_RECIPIENT_MAY_ACKNOWLEDGE,
-        STALE_REVISION_PREFIX, STALE_REVISION_SEPARATOR, TASK_HAS_EXPIRED,
-        TERMINAL_TASK_CANNOT_BE_CLAIMED,
+        TASK_HAS_EXPIRED, TERMINAL_TASK_CANNOT_BE_CLAIMED,
     };
 
     let mempalace_storage::StorageError::Invariant(msg) = &err else {
         return ServerError::Storage(err);
     };
-    if let Some(rest) = msg.strip_prefix(STALE_REVISION_PREFIX)
-        && let Some((expected_str, actual_str)) = rest.split_once(STALE_REVISION_SEPARATOR)
-        && let (Ok(expected), Ok(actual)) = (expected_str.parse::<i64>(), actual_str.parse::<i64>())
-    {
-        return ServerError::CoordinationConflict {
-            code: "revision_conflict",
-            message: msg.clone(),
-            expected_revision: Some(expected),
-            actual_revision: Some(actual),
-        };
-    }
     // State/ownership/lease rules `coordination.rs` enforces once the
     // requested revision itself matched — a real conflict with the record's
     // current state, distinct from a stale revision, so it carries no
@@ -2745,6 +2736,31 @@ fn coordination_storage_error(err: mempalace_storage::StorageError) -> ServerErr
     // title/description/payload/artifact content, or a non-positive lease
     // ttl.
     ServerError::InvalidParams(msg.clone())
+}
+
+/// Builds the `409 revision_conflict` response for a typed
+/// `RevisionedWrite::Conflict` returned by `claim_task`/`renew_lease`/
+/// `transition_task`. `actual_revision` is `None` only for the residual
+/// lost-CAS-race case those methods guard defensively (the row changed
+/// between the revision check and the write, inside the same transaction —
+/// should not happen in practice); the response still carries
+/// `expected_revision` so the caller knows what it asked for.
+fn coordination_revision_conflict(
+    expected_revision: i64,
+    actual_revision: Option<i64>,
+) -> ServerError {
+    let message = match actual_revision {
+        Some(actual) => format!("stale revision: expected {expected_revision}, current {actual}"),
+        None => format!(
+            "stale revision: expected {expected_revision}, but the record changed during the write"
+        ),
+    };
+    ServerError::CoordinationConflict {
+        code: "revision_conflict",
+        message,
+        expected_revision: Some(expected_revision),
+        actual_revision,
+    }
 }
 
 /// Encodes a `CoordinationCursor` as an opaque wire string. Deliberately not
@@ -2982,16 +2998,17 @@ where
     )?;
     validate_lease_seconds(body.lease_seconds)?;
     let worker = resolve_coordination_actor(&auth.0.0, &body.worker)?;
-    let task = state
+    let expected_revision = body.expected_revision;
+    let write = state
         .coordination
-        .claim_task(
-            &id,
-            &worker,
-            body.expected_revision,
-            time::Duration::seconds(body.lease_seconds),
-        )
+        .claim_task(&id, &worker, expected_revision, time::Duration::seconds(body.lease_seconds))
         .map_err(coordination_storage_error)?;
-    Ok(Json(task_to_dto(task)?))
+    match write {
+        RevisionedWrite::Applied(task) => Ok(Json(task_to_dto(task)?)),
+        RevisionedWrite::Conflict { actual_revision } => {
+            Err(coordination_revision_conflict(expected_revision, actual_revision))
+        }
+    }
 }
 
 async fn route_coordination_task_renew<P>(
@@ -3012,16 +3029,17 @@ where
     )?;
     validate_lease_seconds(body.lease_seconds)?;
     let worker = resolve_coordination_actor(&auth.0.0, &body.worker)?;
-    let task = state
+    let expected_revision = body.expected_revision;
+    let write = state
         .coordination
-        .renew_lease(
-            &id,
-            &worker,
-            body.expected_revision,
-            time::Duration::seconds(body.lease_seconds),
-        )
+        .renew_lease(&id, &worker, expected_revision, time::Duration::seconds(body.lease_seconds))
         .map_err(coordination_storage_error)?;
-    Ok(Json(task_to_dto(task)?))
+    match write {
+        RevisionedWrite::Applied(task) => Ok(Json(task_to_dto(task)?)),
+        RevisionedWrite::Conflict { actual_revision } => {
+            Err(coordination_revision_conflict(expected_revision, actual_revision))
+        }
+    }
 }
 
 async fn route_coordination_task_transition<P>(
@@ -3041,17 +3059,23 @@ where
         &format!("task {id}"),
     )?;
     let actor = resolve_coordination_actor(&auth.0.0, &body.actor)?;
-    let task = state
+    let expected_revision = body.expected_revision;
+    let write = state
         .coordination
         .transition_task(
             &id,
             &actor,
-            body.expected_revision,
+            expected_revision,
             storage_task_state(body.state),
             body.details,
         )
         .map_err(coordination_storage_error)?;
-    Ok(Json(task_to_dto(task)?))
+    match write {
+        RevisionedWrite::Applied(task) => Ok(Json(task_to_dto(task)?)),
+        RevisionedWrite::Conflict { actual_revision } => {
+            Err(coordination_revision_conflict(expected_revision, actual_revision))
+        }
+    }
 }
 
 // ─── Coordination: messages ─────────────────────────────────────────────────

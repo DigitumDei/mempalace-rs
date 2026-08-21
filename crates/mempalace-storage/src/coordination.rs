@@ -9,6 +9,7 @@ use serde_json::Value;
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
+use crate::types::RevisionedWrite;
 use crate::{Result, StorageError};
 
 const MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
@@ -21,20 +22,27 @@ pub const UNSCOPED_WING: &str = "wing_unscoped";
 // ─── Conflict-error message fragments ──────────────────────────────────────────
 //
 // Every `StorageError::Invariant` this module can raise for a claim/renew/transition/
-// acknowledge conflict is built *from* one of the constants below, rather than from an inline
-// string literal at the call site. That is deliberate, not decorative: the federation server
-// (`coordination_storage_error` in `crates/mempalace-server/src/lib.rs`) matches on these exact
-// constants to decide whether a coordination write comes back as a 409 revision conflict, a 409
-// lease/state conflict, or something else, because `Result<Task>` here does not (yet — see
-// Phase 3 Stage 4 in docs/Coordination-Phase-3-Design.md) carry a typed `RevisionedWrite`-style
-// conflict the way `skills.rs`/`delegation.rs` do. Public and pinned here so that rewording one
-// of these messages is a compile error at its construction site (rename or remove the constant)
-// rather than a silent server-side reclassification of a retryable 409 into a non-retryable 400
-// the next time someone tidies up the prose. `error_messages_start_with_their_constants` (in
-// this file's test module) drives every path below and asserts the produced message actually
-// starts with its constant, so a call site that stops building from the constant — or a
-// constant whose text no longer matches what gets produced — fails loudly here instead of
-// silently on the server.
+// acknowledge conflict that is *not* a stale revision is built *from* one of the constants
+// below, rather than from an inline string literal at the call site. That is deliberate, not
+// decorative: the federation server (`coordination_storage_error` in
+// `crates/mempalace-server/src/lib.rs`) matches on these exact constants to decide whether a
+// coordination write comes back as a 409 lease/state conflict (`code: "coordination_conflict"`)
+// or something else. Public and pinned here so that rewording one of these messages is a
+// compile error at its construction site (rename or remove the constant) rather than a silent
+// server-side reclassification of a retryable 409 into a non-retryable 400 the next time
+// someone tidies up the prose. `error_messages_start_with_their_constants` (in this file's test
+// module) drives every path below and asserts the produced message actually starts with its
+// constant, so a call site that stops building from the constant — or a constant whose text no
+// longer matches what gets produced — fails loudly here instead of silently on the server.
+//
+// A *stale revision* is a different shape of conflict — the caller's `expected_revision` no
+// longer matches the record's current one, and the caller can recover by reloading and
+// retrying with the fresh value. As of Phase 3 Stage 4 (docs/Coordination-Phase-3-Design.md)
+// that case is expressed as a typed [`RevisionedWrite::Conflict`] carrying the actual revision,
+// the same shape `skills.rs`/`delegation.rs` already use, instead of a message fragment a
+// caller would have to parse. The constants below cover only the remaining conflicts — a live
+// lease held by someone else, a terminal task, an invalid transition, wrong-owner/wrong-
+// recipient — which have no revision pair to report and stay text-classified.
 /// Produced by [`CoordinationStore::claim_task`] when another worker holds a live lease.
 pub const LEASE_HELD_BY_ANOTHER_WORKER: &str = "task lease is held by another worker";
 /// Produced by [`CoordinationStore::claim_task`] when the task is already in a terminal state.
@@ -43,15 +51,6 @@ pub const TERMINAL_TASK_CANNOT_BE_CLAIMED: &str = "terminal task cannot be claim
 /// task is transitioned to [`TaskState::Expired`] in the same transaction before this is
 /// returned.
 pub const TASK_HAS_EXPIRED: &str = "task has expired";
-/// Leading fragment of the message [`CoordinationStore::claim_task`],
-/// [`CoordinationStore::renew_lease`], and [`CoordinationStore::transition_task`] all produce
-/// (via the shared `stale` helper) when the caller's `expected_revision` no longer matches the
-/// record's current revision. The full message is
-/// `"{STALE_REVISION_PREFIX}{expected}{STALE_REVISION_SEPARATOR}{actual}"`.
-pub const STALE_REVISION_PREFIX: &str = "stale revision: expected ";
-/// Separator between the expected and actual revision in the message [`STALE_REVISION_PREFIX`]
-/// documents.
-pub const STALE_REVISION_SEPARATOR: &str = ", current ";
 /// Leading fragment of the message [`CoordinationStore::transition_task`] produces when `to` is
 /// not a valid transition from the task's current state; the full message is
 /// `"{INVALID_TRANSITION_PREFIX}{from} -> {to}"`.
@@ -417,13 +416,19 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
     }
 
     /// Atomically claim a task revision, reclaiming an expired lease when needed.
+    ///
+    /// A stale `expected_revision` returns `Ok(`[`RevisionedWrite::Conflict`]`)` carrying the
+    /// task's actual current revision rather than an `Err` — the caller can reload and retry.
+    /// Every other rejection (a live lease held by another worker, a terminal task, the task
+    /// having just expired) is a state conflict, not a revision one, and still surfaces as an
+    /// `Err(StorageError::Invariant(..))` built from one of the `pub const`s above.
     pub fn claim_task(
         &self,
         id: &str,
         worker: &str,
         expected_revision: i64,
         ttl: Duration,
-    ) -> Result<Task> {
+    ) -> Result<RevisionedWrite<Task>> {
         validate_actor(worker)?;
         if ttl <= Duration::ZERO {
             return Err(StorageError::Invariant("lease ttl must be positive".into()));
@@ -433,7 +438,7 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
         let task = require_task(&tx, id)?;
         let now = OffsetDateTime::now_utc();
         if task.revision != expected_revision {
-            return Err(stale(expected_revision, task.revision));
+            return Ok(RevisionedWrite::Conflict { actual_revision: Some(task.revision) });
         }
         if task.state.terminal() {
             return Err(StorageError::Invariant(TERMINAL_TASK_CANNOT_BE_CLAIMED.into()));
@@ -472,7 +477,12 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
             .ok_or_else(|| StorageError::Invariant(LEASE_DURATION_OUT_OF_RANGE.into()))?;
         let changed = tx.execute("UPDATE coordination_tasks SET state='running',revision=?2,owner=?3,lease_expires_at=?4,updated_at=?5 WHERE task_id=?1 AND revision=?6",params![id,next,worker,format_time(expiry)?,format_time(now)?,expected_revision])?;
         if changed != 1 {
-            return Err(StorageError::Invariant("task changed while being claimed".into()));
+            // Lost a race against another writer between the revision check above and this
+            // UPDATE, inside the same `Immediate` transaction — should not happen in practice
+            // (the transaction mode already serializes writers) but is handled defensively, the
+            // same way `skills.rs`/`delegation.rs` treat a zero-row CAS UPDATE. The actual
+            // revision is not re-read here; the caller can `get_task` for it if needed.
+            return Ok(RevisionedWrite::Conflict { actual_revision: None });
         }
         append_event(
             &tx,
@@ -490,17 +500,21 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
         )?;
         let result = require_task(&tx, id)?;
         tx.commit()?;
-        Ok(result)
+        Ok(RevisionedWrite::Applied(result))
     }
 
     /// Renew a live lease using compare-and-swap revision semantics.
+    ///
+    /// See [`Self::claim_task`] for the revision-conflict-vs-state-conflict split: a stale
+    /// `expected_revision` returns `Ok(`[`RevisionedWrite::Conflict`]`)`; not holding the lease,
+    /// or the lease having already expired, remain `Err`.
     pub fn renew_lease(
         &self,
         id: &str,
         worker: &str,
         expected_revision: i64,
         ttl: Duration,
-    ) -> Result<Task> {
+    ) -> Result<RevisionedWrite<Task>> {
         validate_actor(worker)?;
         if ttl <= Duration::ZERO {
             return Err(StorageError::Invariant("lease ttl must be positive".into()));
@@ -510,7 +524,7 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
         let task = require_task(&tx, id)?;
         let now = OffsetDateTime::now_utc();
         if task.revision != expected_revision {
-            return Err(stale(expected_revision, task.revision));
+            return Ok(RevisionedWrite::Conflict { actual_revision: Some(task.revision) });
         }
         if task.owner.as_deref() != Some(worker) {
             return Err(StorageError::Invariant(ONLY_LEASE_OWNER_MAY_RENEW.into()));
@@ -539,10 +553,14 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
         )?;
         let result = require_task(&tx, id)?;
         tx.commit()?;
-        Ok(result)
+        Ok(RevisionedWrite::Applied(result))
     }
 
     /// Transition lifecycle state using an expected revision.
+    ///
+    /// See [`Self::claim_task`] for the revision-conflict-vs-state-conflict split: a stale
+    /// `expected_revision` returns `Ok(`[`RevisionedWrite::Conflict`]`)`; an invalid transition
+    /// or a non-owner caller remain `Err`.
     pub fn transition_task(
         &self,
         id: &str,
@@ -550,14 +568,14 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
         expected_revision: i64,
         to: TaskState,
         details: Option<Value>,
-    ) -> Result<Task> {
+    ) -> Result<RevisionedWrite<Task>> {
         validate_actor(actor)?;
         let mut conn = self.connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let task = require_task(&tx, id)?;
         let now = OffsetDateTime::now_utc();
         if task.revision != expected_revision {
-            return Err(stale(expected_revision, task.revision));
+            return Ok(RevisionedWrite::Conflict { actual_revision: Some(task.revision) });
         }
         if !allowed_transition(task.state, to) {
             return Err(StorageError::Invariant(format!(
@@ -591,7 +609,7 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
         )?;
         let result = require_task(&tx, id)?;
         tx.commit()?;
-        Ok(result)
+        Ok(RevisionedWrite::Applied(result))
     }
 
     /// Send an addressed message idempotently.
@@ -933,11 +951,6 @@ fn bounded_text(value: &str, name: &str) -> Result<()> {
     } else {
         Ok(())
     }
-}
-fn stale(expected: i64, actual: i64) -> StorageError {
-    StorageError::Invariant(format!(
-        "{STALE_REVISION_PREFIX}{expected}{STALE_REVISION_SEPARATOR}{actual}"
-    ))
 }
 fn allowed_transition(from: TaskState, to: TaskState) -> bool {
     if from.terminal() {
@@ -1300,11 +1313,18 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
     fn claim_is_cas_and_expired_lease_is_reclaimable() {
         let (_d, s) = store();
         let t = task(&s);
-        let claimed = s.claim_task(&t.task_id, "a", 0, Duration::milliseconds(1)).expect("claim");
-        assert!(s.claim_task(&t.task_id, "b", 0, Duration::minutes(1)).is_err());
+        let claimed =
+            applied_task(s.claim_task(&t.task_id, "a", 0, Duration::milliseconds(1)).expect("claim"));
+        // "b" reuses the pre-claim revision `0`, which the claim above already advanced past —
+        // a stale revision, reported as a typed conflict rather than an `Err`.
+        assert!(matches!(
+            s.claim_task(&t.task_id, "b", 0, Duration::minutes(1)),
+            Ok(RevisionedWrite::Conflict { actual_revision: Some(rev) }) if rev == claimed.revision
+        ));
         std::thread::sleep(std::time::Duration::from_millis(5));
-        let reclaimed =
-            s.claim_task(&t.task_id, "b", claimed.revision, Duration::minutes(1)).expect("reclaim");
+        let reclaimed = applied_task(
+            s.claim_task(&t.task_id, "b", claimed.revision, Duration::minutes(1)).expect("reclaim"),
+        );
         assert_eq!(reclaimed.owner.as_deref(), Some("b"));
         let events = s.events(None, Some(&t.task_id), None, 20).expect("events");
         assert_eq!(events.events.len(), 3);
@@ -1344,6 +1364,17 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
             other => panic!("expected StorageError::Invariant, got {other:?}"),
         }
     }
+    /// Unwraps `RevisionedWrite::Applied`, panicking with the actual conflict otherwise. Most
+    /// tests below only care about the success path of a claim/renew/transition; this keeps
+    /// them reading the same as before Stage 4 introduced the typed conflict shape.
+    fn applied_task(write: RevisionedWrite<Task>) -> Task {
+        match write {
+            RevisionedWrite::Applied(task) => task,
+            RevisionedWrite::Conflict { actual_revision } => {
+                panic!("expected an applied write, got a conflict (actual_revision={actual_revision:?})")
+            }
+        }
+    }
     /// Drives every conflict-shaped `Invariant` error this module can produce and asserts the
     /// resulting message starts with the `pub const` the federation server
     /// (`coordination_storage_error` in `crates/mempalace-server/src/lib.rs`) matches on to
@@ -1356,21 +1387,13 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
     fn conflict_error_messages_start_with_their_pinned_constants() {
         let (_d, s) = store();
 
-        // `stale()` is shared by claim/renew/transition; claiming with a revision one ahead of
-        // the freshly created task's `0` exercises it directly.
-        let t = task(&s);
-        let err = s
-            .claim_task(&t.task_id, "worker-a", t.revision + 1, Duration::minutes(1))
-            .expect_err("claiming at the wrong revision must fail");
-        let msg = expect_invariant(&err);
-        assert!(msg.starts_with(STALE_REVISION_PREFIX), "{msg}");
-        assert!(msg.contains(STALE_REVISION_SEPARATOR), "{msg}");
-
         // terminal task cannot be claimed: cancel first (Pending -> Cancelled is legal), then
         // try to claim the now-terminal task at its new, correct revision.
-        let cancelled = s
-            .transition_task(&t.task_id, "manager", t.revision, TaskState::Cancelled, None)
-            .expect("cancel");
+        let t = task(&s);
+        let cancelled = applied_task(
+            s.transition_task(&t.task_id, "manager", t.revision, TaskState::Cancelled, None)
+                .expect("cancel"),
+        );
         let err = s
             .claim_task(&t.task_id, "worker-a", cancelled.revision, Duration::minutes(1))
             .expect_err("a terminal task must not be claimable");
@@ -1398,8 +1421,10 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
         // task lease is held by another worker: worker-a claims, worker-b tries at the correct
         // (post-claim) revision while worker-a's lease is still live.
         let leased = task_with_wing(&s, "wing_test", "pin-leased-1");
-        let claimed_leased =
-            s.claim_task(&leased.task_id, "worker-a", leased.revision, Duration::minutes(5)).expect("claim");
+        let claimed_leased = applied_task(
+            s.claim_task(&leased.task_id, "worker-a", leased.revision, Duration::minutes(5))
+                .expect("claim"),
+        );
         let err = s
             .claim_task(&leased.task_id, "worker-b", claimed_leased.revision, Duration::minutes(5))
             .expect_err("a live lease held by another worker must block a second claim");
@@ -1415,8 +1440,10 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
         // only the owner may transition: worker-a owns the (now Running) task; worker-b tries a
         // non-cancel transition.
         let owned = task_with_wing(&s, "wing_test", "pin-owner-transition-1");
-        let claimed_owned =
-            s.claim_task(&owned.task_id, "worker-a", owned.revision, Duration::minutes(5)).expect("claim");
+        let claimed_owned = applied_task(
+            s.claim_task(&owned.task_id, "worker-a", owned.revision, Duration::minutes(5))
+                .expect("claim"),
+        );
         let err = s
             .transition_task(&owned.task_id, "worker-b", claimed_owned.revision, TaskState::Completed, None)
             .expect_err("a non-owner, non-cancel transition must fail");
@@ -1424,9 +1451,10 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
 
         // only the lease owner may renew: worker-b tries to renew worker-a's lease.
         let renewed = task_with_wing(&s, "wing_test", "pin-renew-owner-1");
-        let claimed_renewed = s
-            .claim_task(&renewed.task_id, "worker-a", renewed.revision, Duration::minutes(5))
-            .expect("claim");
+        let claimed_renewed = applied_task(
+            s.claim_task(&renewed.task_id, "worker-a", renewed.revision, Duration::minutes(5))
+                .expect("claim"),
+        );
         let err = s
             .renew_lease(&renewed.task_id, "worker-b", claimed_renewed.revision, Duration::minutes(5))
             .expect_err("a non-owner renew must fail");
@@ -1434,9 +1462,15 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
 
         // lease has expired: claim with a 1ms TTL, sleep past it, then try to renew.
         let lease_expiry = task_with_wing(&s, "wing_test", "pin-lease-expiry-1");
-        let claimed_lease_expiry = s
-            .claim_task(&lease_expiry.task_id, "worker-a", lease_expiry.revision, Duration::milliseconds(1))
-            .expect("claim");
+        let claimed_lease_expiry = applied_task(
+            s.claim_task(
+                &lease_expiry.task_id,
+                "worker-a",
+                lease_expiry.revision,
+                Duration::milliseconds(1),
+            )
+            .expect("claim"),
+        );
         std::thread::sleep(std::time::Duration::from_millis(5));
         let err = s
             .renew_lease(&lease_expiry.task_id, "worker-a", claimed_lease_expiry.revision, Duration::minutes(5))
@@ -1461,6 +1495,55 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
             .acknowledge_message(&message.message_id, "not-b")
             .expect_err("acknowledging as a non-recipient must fail");
         assert!(expect_invariant(&err).starts_with(ONLY_RECIPIENT_MAY_ACKNOWLEDGE));
+    }
+    /// Companion to `conflict_error_messages_start_with_their_pinned_constants`: a stale
+    /// `expected_revision` on claim/renew/transition is no longer a message-based `Invariant` —
+    /// Phase 3 Stage 4 reconciles it onto the typed `RevisionedWrite::Conflict` shape
+    /// `skills.rs`/`delegation.rs` already use, carrying the record's actual current revision so
+    /// a caller can reload and retry without parsing a string. Drives all three call sites, each
+    /// paired with the immediately following successful `Applied` call at the correct revision,
+    /// so the two variants are never confused with each other.
+    #[test]
+    fn claim_renew_transition_revision_conflicts_are_typed() {
+        let (_d, s) = store();
+
+        // claim: expected_revision one ahead of the freshly created task's `0`.
+        let t = task(&s);
+        assert!(matches!(
+            s.claim_task(&t.task_id, "worker-a", t.revision + 1, Duration::minutes(1)),
+            Ok(RevisionedWrite::Conflict { actual_revision: Some(rev) }) if rev == t.revision
+        ));
+        let claimed = applied_task(
+            s.claim_task(&t.task_id, "worker-a", t.revision, Duration::minutes(5)).expect("claim"),
+        );
+        assert_eq!(claimed.owner.as_deref(), Some("worker-a"));
+
+        // renew: stale revision after the claim above advanced it.
+        assert!(matches!(
+            s.renew_lease(&t.task_id, "worker-a", claimed.revision + 1, Duration::minutes(5)),
+            Ok(RevisionedWrite::Conflict { actual_revision: Some(rev) }) if rev == claimed.revision
+        ));
+        let renewed = applied_task(
+            s.renew_lease(&t.task_id, "worker-a", claimed.revision, Duration::minutes(5))
+                .expect("renew"),
+        );
+
+        // transition: stale revision after the renew above advanced it again.
+        assert!(matches!(
+            s.transition_task(
+                &t.task_id,
+                "worker-a",
+                renewed.revision + 1,
+                TaskState::Completed,
+                None
+            ),
+            Ok(RevisionedWrite::Conflict { actual_revision: Some(rev) }) if rev == renewed.revision
+        ));
+        let completed = applied_task(
+            s.transition_task(&t.task_id, "worker-a", renewed.revision, TaskState::Completed, None)
+                .expect("transition"),
+        );
+        assert_eq!(completed.state, TaskState::Completed);
     }
     #[test]
     fn similar_messages_with_distinct_keys_survive_and_ack_is_authorized() {
@@ -1503,9 +1586,10 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
         assert_eq!(child.parent_id.as_deref(), Some(parent.task_id.as_str()));
         assert_eq!(child.dependencies, vec![parent.task_id]);
         assert_eq!(child.budget, Some(serde_json::json!({"tokens": 50})));
-        let cancelled = s
-            .transition_task(&child.task_id, "manager", child.revision, TaskState::Cancelled, None)
-            .expect("cancel");
+        let cancelled = applied_task(
+            s.transition_task(&child.task_id, "manager", child.revision, TaskState::Cancelled, None)
+                .expect("cancel"),
+        );
         assert_eq!(cancelled.state, TaskState::Cancelled);
         assert!(
             s.transition_task(
@@ -1531,7 +1615,12 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
             joins.push(std::thread::spawn(move || {
                 let store = CoordinationStore::new(path);
                 gate.wait();
-                store.claim_task(&task_id, worker, 0, Duration::minutes(1)).is_ok()
+                // Both calls now return `Ok` unconditionally — the loser gets `Ok(Conflict)`,
+                // not `Err` — so only `Applied` counts as a genuine win.
+                matches!(
+                    store.claim_task(&task_id, worker, 0, Duration::minutes(1)),
+                    Ok(RevisionedWrite::Applied(_))
+                )
             }));
         }
         barrier.wait();
@@ -1546,18 +1635,22 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
     fn lifecycle_artifacts_and_restart_recovery_are_durable() {
         let (d, s) = store();
         let t = task(&s);
-        let running = s.claim_task(&t.task_id, "worker", 0, Duration::minutes(1)).expect("claim");
-        let waiting = s
-            .transition_task(&t.task_id, "worker", running.revision, TaskState::InputRequired, None)
-            .expect("input required");
+        let running = applied_task(
+            s.claim_task(&t.task_id, "worker", 0, Duration::minutes(1)).expect("claim"),
+        );
+        let waiting = applied_task(
+            s.transition_task(&t.task_id, "worker", running.revision, TaskState::InputRequired, None)
+                .expect("input required"),
+        );
         assert_eq!(waiting.state, TaskState::InputRequired);
         assert_eq!(waiting.owner.as_deref(), Some("worker"));
         assert!(s
             .transition_task(&t.task_id, "other", waiting.revision, TaskState::Running, None)
             .is_err());
-        let running_again = s
-            .transition_task(&t.task_id, "worker", waiting.revision, TaskState::Running, None)
-            .expect("owner resumes task");
+        let running_again = applied_task(
+            s.transition_task(&t.task_id, "worker", waiting.revision, TaskState::Running, None)
+                .expect("owner resumes task"),
+        );
         assert_eq!(running_again.owner.as_deref(), Some("worker"));
         let artifact = s
             .put_artifact(&NewArtifact {
@@ -1833,7 +1926,9 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
             envelope_version: 1,
         })
         .expect("message");
-        let claimed = s.claim_task(&t.task_id, "worker", t.revision, Duration::minutes(1)).expect("claim");
+        let claimed = applied_task(
+            s.claim_task(&t.task_id, "worker", t.revision, Duration::minutes(1)).expect("claim"),
+        );
         s.put_artifact(&NewArtifact {
             task_id: t.task_id.clone(),
             created_by: "worker".into(),

@@ -641,13 +641,9 @@ messages, immutable artifacts and results, and the audit-event feed — over the
 `/v1/coordination/*` REST surface and scoped-token authorization used by everything
 else in this guide.
 
-> **This is server-side only.** `mempalace-server` serves these routes today.
-> Nothing on the client side consumes them yet — `RemoteApi`, `FederationRouter`,
-> and the coordination MCP tools (`mempalace_task_create` and friends) still talk to
-> the local palace exclusively. Routing an MCP coordination call to a remote peer is
-> Stage 4; see [Coordination-Phase-3-Design.md](Coordination-Phase-3-Design.md). Until
-> then, exercise this surface directly over REST (`curl`, or your own client against
-> `mempalace-federation`'s DTOs), exactly as Part 6 does for drawers.
+As of issue #102 Stage 4, the client side is wired up too: `RemoteApi`, `FederationRouter`,
+and the coordination MCP tools (`mempalace_task_create` and friends) route to a configured
+remote — see [Client-side coordination routing](#client-side-coordination-routing) below.
 
 ### Wing is the authorization key
 
@@ -806,6 +802,79 @@ curl -s -X POST http://127.0.0.1:8765/v1/coordination/tasks/task_.../claim \
 # → {"state":"running","revision":1,"owner":"dev",...}
 ```
 
+### Client-side coordination routing
+
+Issue #102 Stage 4 wires the routes above into `RemoteApi`, `FederationRouter`, and the
+coordination MCP tools (`mempalace_task_create` and friends) documented in
+[Coordination.md](Coordination.md), so an agent talking to its local MCP server can reach a
+configured remote's coordination state the same way it already reaches remote drawers and KG
+facts.
+
+**The capability gate.** Every coordination method on `RemoteClient` checks the cached
+`GET /v1/info` `capabilities` list for `"coordination"` before sending any request. A remote
+that does not advertise it (an older, pre-Stage-3 server) fails with
+`RemoteError::CapabilityMissing { remote, capability }` — a clear, non-degradable error naming
+the remote and the missing capability, not a `404` that could be confused for "the record
+doesn't exist." `RemoteApi`'s coordination methods all have default trait bodies returning this
+same shape, so a test double or a future `RemoteApi` implementor that has no reason to support
+coordination compiles and behaves the same way without implementing any of them.
+
+**A separate routing table, and why.** `resolve_coordination_route(federation, wing)` reads a
+dedicated `federation.coordination` table — the same shape as `federation.wings`, but a
+different table, not a different lookup into the same one. A task is authoritative in exactly
+one palace (see the no-multi-master non-goal in
+[Coordination-Phase-3-Design.md](Coordination-Phase-3-Design.md)), so **`write: both` on a
+`federation.coordination` entry is a hard config-load error** — sharing `federation.wings`
+would mean that error retroactively broke any wing already configured for the documented,
+encouraged dual-write-drawers workflow (see [Part 4](#part-4--branch-aware-mining)) the moment
+that same wing also carried coordination traffic. The diary hard-override still applies exactly
+as it does everywhere else: `wing_agents` coordination is always local, unconditionally,
+regardless of any `federation.coordination` entry.
+
+```jsonc
+{
+  "federation": {
+    "coordination": {
+      "wing_myproject": { "mode": "remote", "remote": "work" },
+      "wing_shared":    { "mode": "combined", "remote": "work", "write": "local" }
+      // "write": "both" here is rejected at config load, even though it is legal
+      // (and common) on the equivalent federation.wings entry for the same wing.
+    }
+  }
+}
+```
+
+**`mempalace_task_create` is the one wing-routed write.** It is also the only coordination
+request that carries a wing at all — every other coordination tool (`mempalace_task_get`,
+`mempalace_task_claim`, `mempalace_message_send`, and so on) acts on an existing task,
+message, artifact, or result ID, and none of them take a `wing` argument, so there is nothing
+for `resolve_coordination_route` to resolve against. Those ID-keyed tools instead use a
+**local-first, ID-discovery fallback**: local storage is tried first; on a miss, whenever any
+remote is configured, the router tries each remote in name order and uses whichever one
+actually owns the record — mirroring `mempalace_delete_drawer`'s existing "no cross-palace ID
+mapping" reasoning exactly. This fallback fires independent of any wing's resolved mode: it is
+triggered purely by a configured remote existing, not by a `combined`/`remote` rule for a
+specific wing. A read that finds the record on a remote annotates the response with
+`origin: "remote:<name>"`; a write that lands on a remote reports `applied_to: "remote:<name>"`.
+`mempalace_inbox_read` and `mempalace_coordination_events` are the exception to the exception:
+being aggregate, cursor-paginated feeds (like `mempalace_get_changes_since`), they always read
+local *and* fan out to every configured remote concurrently with a per-remote cursor, reported
+under `remote_messages`/`remote_events` — never routed by a single wing's rule, and never
+merged into the local page, matching `changes_fanout`'s `{unreachable, error}` isolation
+contract (one down remote never blocks a healthy one). `mempalace_coordination_event_get` — a
+single audit event by exact ID — has no remote counterpart at all: Stage 3 never exposed
+`GET /v1/coordination/events/{id}`, only the paginated feed, so it stays local-only.
+
+**Revision conflicts cross the wire intact.** A `409 revision_conflict` from a remote — from a
+`claim`/`renew`/`transition` discovered via the ID-fallback above — decodes into
+`RemoteRevisionedWrite::Conflict { actual_revision }` rather than an `Err`, and the MCP tool
+reports it via the same `{"success": false, "conflict": {"expected_revision": ..., "actual_revision": ...}}`
+shape a local conflict already uses (see [Part 7 → Revision and lease
+conflicts](#revision-and-lease-conflicts)). A `409 coordination_conflict` (a live lease held by
+someone else, a terminal task, an invalid transition) has no revision pair to report and stays
+a hard error — MemPalace never retries a conflicting write on the caller's behalf, locally or
+federated.
+
 ## Troubleshooting
 
 ### `remote '<name>' is unreachable ... writes do not fall back to local`
@@ -816,6 +885,20 @@ different target. For `write: both`, the local write still succeeds; check the
 
 ### `remote '<name>' does not support the ingest capability`
 The hub is an older build without `POST /v1/ingest/batch`. Upgrade the server.
+
+### `remote '<name>' does not support the 'coordination' capability`
+The hub is an older build without the `/v1/coordination/*` routes (pre-issue-#102-Stage-3).
+Every coordination MCP tool checks this before sending a request — see [Client-side
+coordination routing](#client-side-coordination-routing) — and fails with this error rather
+than a confusing 404. Upgrade the server.
+
+### `federation.coordination.<wing> may not use write: both`
+A hard config-load error: coordination cannot be dual-written to two palaces because a task is
+authoritative in exactly one (see the no-multi-master non-goal in
+[Coordination-Phase-3-Design.md](Coordination-Phase-3-Design.md)). Use `write: local` or
+`write: remote` on the `federation.coordination` entry instead — the identical `write: both`
+setting on the corresponding `federation.wings` entry, for drawers, is unaffected and stays
+legal.
 
 ### Search results from a remote wing are all stale placeholders
 The hub has no `server.checkouts` entry for that wing. Add the mapping and restart

@@ -190,8 +190,19 @@ four groups, and each group is authorized differently:
   `GET /v1/wings`, `GET /v1/rooms`, `GET /v1/changes`, and
   `POST /v1/drawers/check_duplicate` require `read`, then filter their response
   down to the wings the token can see — a token scoped to one wing gets that
-  wing's slice, not a 403. This is also what a wing-absent
-  `POST /v1/drawers/search` or `GET /v1/drawers` does with its results.
+  wing's slice, not a 403. A wing-absent `POST /v1/drawers/search` does the
+  same, filtering ranked candidates after an over-fetch (it has no
+  continuation promise, so a short page is an acceptable trade-off there — see
+  `route_drawers_search` in `crates/mempalace-server/src/lib.rs`). A
+  wing-absent `GET /v1/drawers` cannot use that approach: its `limit`/
+  `next_cursor` shape implies a caller can page through everything it can see,
+  and the store has no cursor-based pagination, so filtering visibility out of
+  an already-`limit`-bounded page could permanently strand authorized rows
+  below the page with no way to reach them. `route_drawers_list` instead
+  pushes the visible-wing set into the storage query itself
+  (`DrawerFilter::wings`, an `IN` match) so storage never returns an
+  invisible-wing row in the first place — visibility is enforced by the query,
+  not by filtering its output.
   `check_duplicate` belongs here despite having no wing in its own request:
   its response carries `wing`/`room` per match and an `is_duplicate` boolean,
   either of which would otherwise let a token learn about content in a wing it
@@ -228,15 +239,43 @@ The diary guard is unaffected by any of this: it is a content rule (wing
 `wing_agents`, room `diary`, or a `diary:`-prefixed source), not an identity
 rule, and it applies to every token regardless of scope.
 
-`wings` in a scope entry accepts the literal `"*"` for every wing. Other entries
-are normalised at load, verbatim-first: an entry that is already a valid,
-fully-qualified wing id (has the `wing_` prefix and passes `WingId::new`) is
-kept exactly as written, so a scope naming `wing_MyProject` still authorizes a
-request naming `wing_MyProject` — `WingId::new` accepts uppercase and does not
-transform it, so lowercasing here would silently strand that scope. Anything
-else falls back to the same rule `WingId::normalized` uses elsewhere, so a
-token file entry naming `"myproject"` authorizes a request naming
-`wing_myproject`.
+`wings` in a scope entry accepts the literal `"*"` for every wing. Other
+entries expand at load time along two independent dimensions, and only one
+of them is aliased: **the prefix is aliased, case is significant.**
+
+- **Prefix.** REST and MCP request paths disagree on whether a wing carries
+  the `wing_` prefix: REST handlers build the wing they authorize against
+  with `WingId::new`, which validates but does not transform, while MCP
+  paths use `WingId::normalized`, which adds the prefix when absent. So
+  `myproject` and `wing_myproject` genuinely name the same wing by
+  convention, and an entry that is a valid `WingId` (passes `WingId::new`)
+  but lacks the prefix expands to **two** aliases: the entry as written, and
+  the entry with `wing_` prepended — case untouched in both.
+- **Case.** `wing_MyProject` and `wing_myproject` are **not** the same wing.
+  `WingId::new`'s validation accepts uppercase ASCII and does not transform
+  it, so a palace can legitimately hold both as two distinct wings storing
+  different data. Folding case into a single alias set — as an earlier
+  version of this fix did — would let a scope written for one silently
+  authorize the other: a privilege escalation inferred from a spelling
+  convention, not a convenience. So an entry that is already a valid
+  `WingId`, prefixed or not, keeps its case exactly as written in every
+  alias it produces. There is no case-insensitive alias, ever.
+- Only when the raw entry is **not** a valid `WingId` at all (e.g. embedded
+  whitespace) does it fall back to `WingId::normalized`, which sanitizes and
+  lowercases, as its single alias — acceptable there because sanitizing
+  malformed input is the whole point of that path and there is no verbatim
+  form worth preserving.
+
+Worked examples:
+
+| Raw entry           | Aliases                                    | Why |
+|----------------------|---------------------------------------------|-----|
+| `wing_MyProject`     | `wing_MyProject`                             | Already prefixed; case is not aliased, so no lowercased sibling. |
+| `MyProject`          | `MyProject`, `wing_MyProject`                | Prefix dimension aliases; case preserved in both. |
+| `project_alpha`      | `project_alpha`, `wing_project_alpha`        | Same as above, already-lowercase case is just not visible. |
+| `My Project` (invalid `WingId`) | `wing_my_project` (via `WingId::normalized`) | No verbatim form exists to preserve, so sanitization applies. |
+
+A request is authorized if it matches any alias a raw entry produces.
 
 ## Part 2 — Configuring a client
 

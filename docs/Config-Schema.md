@@ -352,16 +352,30 @@ token entries, not a field of `config.json`. Its shape (`token`/`name`/
       this field existed, so existing deployments keep working unchanged.
     - `[]` (an explicit empty array) — a deliberate lockout: no access at
       all. This is **not** a synonym for absent.
-    - `wings` accepts the literal `"*"` for every wing. Other entries are
-      normalised at load, verbatim-first: an entry that is already a valid,
-      fully-qualified wing id (`wing_`-prefixed, passing `WingId::new`) is
-      kept exactly as written — `WingId::new` accepts uppercase and does not
-      transform it, so lowercasing here would strand a scope like
-      `wing_MyProject`. Anything else falls back to the same rule
-      `WingId::normalized` uses elsewhere, so `"myproject"` and
-      `"wing_myproject"` name the same wing. See
-      [Federation → 1.5 Authorization scopes](Federation.md#15-authorization-scopes)
-      for the full precedence rule.
+    - `wings` accepts the literal `"*"` for every wing. Other entries expand
+      at load time along two *independent* dimensions, and only one of them
+      is aliased — **the prefix is aliased, case is significant**:
+      - **Prefix**: `myproject` and `wing_myproject` name the same wing by
+        convention (`WingId::normalized`, used by MCP paths, adds the
+        `wing_` prefix when absent; REST paths build a wing verbatim via
+        `WingId::new`, which does not). So an entry that is a valid `WingId`
+        (passes `WingId::new`) but lacks the prefix expands to **two**
+        aliases: itself, and itself with `wing_` prepended.
+      - **Case**: `wing_MyProject` and `wing_myproject` are **not** the same
+        wing — `WingId::new` accepts uppercase and does not transform it, so
+        a palace can hold both as two distinct, independently-stored wings.
+        Folding case here would let a scope silently authorize a wing the
+        operator never named, so an entry that is already a valid `WingId`
+        (prefixed or not) keeps its case exactly as written in every alias
+        it produces. There is no case-insensitive alias.
+      - Only when the raw entry is **not** a valid `WingId` at all (e.g.
+        embedded whitespace) does it fall back to `WingId::normalized`,
+        which sanitizes and lowercases, as a single alias — acceptable there
+        because sanitization is the whole point of that path and there is no
+        verbatim form to preserve.
+      - A request is authorized if it matches any alias a raw entry produces.
+        See [Federation → 1.5 Authorization scopes](Federation.md#15-authorization-scopes)
+        for the full precedence rule and worked examples.
     - `operations` is a closed enum: `read`, `write`, `delete`, `ingest`,
       `coordination_read`, `coordination_write`, `coordination_claim`. The
       three `coordination_*` operations have no routes yet — they exist so
@@ -369,7 +383,13 @@ token entries, not a field of `config.json`. Its shape (`token`/`name`/
     - Validation: an `operations` string outside that enum, or a malformed
       `wings` entry, fails the token file load — same fail-closed behaviour
       as any other malformed reload (see `TokenRegistry` in
-      `crates/mempalace-server/src/lib.rs`).
+      `crates/mempalace-server/src/lib.rs`). **Unknown keys are also
+      rejected** at every level of a token entry (top level and each
+      `scopes` grant): since an absent `scopes` field means unrestricted
+      access, a typo'd key (`"scope"`, `"scopees"`, a trailing space) would
+      otherwise silently produce an unrestricted token instead of the
+      scoped one the operator intended, so the file fails to load with an
+      error naming the offending field instead.
 
 #### `server.checkouts`
 

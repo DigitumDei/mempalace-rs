@@ -272,6 +272,7 @@ enum Operation {
 /// from JSON. See [`TokenScopeEntry`] for the normalised form used at
 /// authorization time.
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawTokenScope {
     wings: Vec<String>,
     operations: Vec<Operation>,
@@ -282,49 +283,75 @@ struct RawTokenScope {
 /// any one of them covers it.
 #[derive(Debug, Clone)]
 struct TokenScopeEntry {
-    /// Wings this grant covers. Normalised at load time by
-    /// `normalize_scope_wing`: an entry that is already a valid,
-    /// fully-qualified wing id (starts with [`WING_PREFIX`] and passes
-    /// [`WingId::new`]) is kept verbatim; anything else falls back to
-    /// [`WingId::normalized`], so short forms (`"myproject"`) in the token
-    /// file still resolve to the same wing a request names
-    /// (`"wing_myproject"`). See `normalize_scope_wing` for why verbatim
-    /// takes precedence. The literal `"*"` is kept as-is and matches every
-    /// wing.
+    /// Wings this grant covers, expanded at load time by
+    /// `normalize_scope_wing` into every spelling that should authorize a
+    /// request. Exactly one dimension is aliased: the `WING_PREFIX` prefix.
+    /// REST handlers (e.g. `route_drawers_add`) build a wing with
+    /// `WingId::new` (validates, does not transform) while MCP paths use
+    /// `WingId::normalized` (which, among other things, adds the prefix if
+    /// absent) — so `myproject` and `wing_myproject` genuinely name the same
+    /// wing by convention, and a raw entry missing the prefix expands to
+    /// both spellings, prefix added verbatim (case preserved).
+    ///
+    /// Case is a different, **not** aliased, dimension: `WingId::new`'s
+    /// `validate_id` accepts uppercase ASCII, so `wing_MyProject` and
+    /// `wing_myproject` can be two distinct, independently-stored wings in
+    /// the same palace, not two spellings of one. Folding case in an
+    /// authorization grant would silently widen it to a wing the operator
+    /// never named — a privilege escalation, not a convenience — so a raw
+    /// entry that is already a valid `WingId` (prefixed or not) keeps its
+    /// case exactly as written, in every alias it expands to. See
+    /// `normalize_scope_wing` for the full precedence. The literal `"*"` is
+    /// kept as-is and matches every wing.
     wings: Vec<String>,
     /// Operations this grant permits.
     operations: Vec<Operation>,
 }
 
-/// Normalises one `wings` entry from a token file. `"*"` is preserved
-/// verbatim.
+/// Expands one `wings` entry from a token file into the set of spellings
+/// that should authorize a request. `"*"` expands to itself only.
 ///
-/// Precedence, in order:
-/// 1. Already a valid, fully-qualified wing id — starts with [`WING_PREFIX`]
-///    (the real prefix constant, not a hardcoded `"wing_"`) and passes
-///    [`WingId::new`] — is kept **verbatim**. This matters because request
-///    paths (e.g. `route_drawers_add`) build the wing they authorize against
-///    with `WingId::new`, which validates but does not transform. `WingId`'s
-///    `validate_id` accepts `is_ascii_alphanumeric()`, which includes
-///    uppercase, so a token file can legitimately name `wing_MyProject`.
-///    Running that through [`WingId::normalized`] would lowercase it to
-///    `wing_myproject`, which then could never match a request naming the
-///    original `wing_MyProject` — silently 403-ing a correctly scoped token.
-/// 2. Otherwise, [`WingId::normalized`], so short forms (`"myproject"`) and
-///    differently-cased or lightly-malformed input in the token file still
-///    resolve to the same wing a request names (`"wing_myproject"`).
-fn normalize_scope_wing(raw: &str) -> Result<String, ServerError> {
+/// Two dimensions, handled differently — aliasing one and never the other is
+/// the whole point of this function:
+///
+/// - **Prefix is aliased.** `myproject` and `wing_myproject` name the same
+///   wing by convention elsewhere in this codebase (`WingId::normalized`
+///   adds `WING_PREFIX` when absent). So when the raw entry is a valid
+///   [`WingId`] (passes [`WingId::new`], which validates but does not
+///   transform) and lacks the prefix, it expands to two aliases: the entry
+///   verbatim, and the entry with `WING_PREFIX` prepended — case untouched
+///   in both. An entry that already has the prefix needs no second alias.
+/// - **Case is never folded.** `validate_id` accepts uppercase ASCII, so
+///   `wing_MyProject` and `wing_myproject` can be two distinct wings holding
+///   different data, not two spellings of one — lowercasing here would let
+///   a scope silently authorize a wing the operator never named. So the
+///   verbatim alias (and its prefixed sibling, if produced) always keep the
+///   exact case of the raw entry; there is no case-insensitive alias.
+///
+/// Only when the raw entry is **not** a valid `WingId` at all — malformed
+/// input, e.g. embedded whitespace — does this fall back to
+/// [`WingId::normalized`], which sanitizes and lowercases, as a single
+/// alias. That lowercasing is acceptable there because sanitization is the
+/// whole point of that path and there is no verbatim form to preserve.
+fn normalize_scope_wing(raw: &str) -> Result<Vec<String>, ServerError> {
     let trimmed = raw.trim();
     if trimmed == "*" {
-        return Ok("*".to_owned());
+        return Ok(vec!["*".to_owned()]);
     }
-    if trimmed.starts_with(WING_PREFIX) {
-        if let Ok(wing) = WingId::new(trimmed) {
-            return Ok(wing.as_str().to_owned());
+    if let Ok(wing) = WingId::new(trimmed) {
+        let verbatim = wing.as_str().to_owned();
+        if verbatim.starts_with(WING_PREFIX) {
+            return Ok(vec![verbatim]);
         }
+        // Prefix dimension only: prepend `WING_PREFIX` verbatim, case
+        // untouched. This is string concatenation, not `WingId::normalized`
+        // — it must not sanitize or lowercase, or it would silently fold
+        // the case dimension this function is required to leave alone.
+        let prefixed = format!("{WING_PREFIX}{verbatim}");
+        return Ok(vec![verbatim, prefixed]);
     }
     WingId::normalized(trimmed)
-        .map(|wing| wing.as_str().to_owned())
+        .map(|wing| vec![wing.as_str().to_owned()])
         .map_err(|err| ServerError::TokenFile(format!("invalid wing `{raw}` in token scope: {err}")))
 }
 
@@ -350,7 +377,15 @@ impl WingVisibility {
 }
 
 /// A single entry in the bearer-token file as stored on disk.
+///
+/// `deny_unknown_fields` is deliberate: an absent `scopes` field means
+/// unrestricted access (see below), so a typo'd key — `"scope"`,
+/// `"scopees"`, a trailing space — would otherwise silently produce an
+/// unrestricted token instead of the operator's intended scoped one. That
+/// fails open on exactly the kind of mistake this format needs to fail
+/// closed on, so an unrecognised key is a load error instead.
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TokenEntry {
     /// The raw bearer token string.
     token: String,
@@ -439,7 +474,10 @@ impl TokenRegistry {
                                 .wings
                                 .iter()
                                 .map(|w| normalize_scope_wing(w))
-                                .collect::<Result<Vec<_>, _>>()?;
+                                .collect::<Result<Vec<Vec<_>>, _>>()?
+                                .into_iter()
+                                .flatten()
+                                .collect();
                             Ok(TokenScopeEntry { wings, operations: raw.operations })
                         })
                         .collect::<Result<Vec<_>, ServerError>>()
@@ -1074,9 +1112,15 @@ where
     // scope-invisible rows filtered out below — the runtime ranks and
     // truncates to the limit it is given, so asking for exactly `limit` and
     // then filtering could silently return fewer than `limit` results even
-    // though enough visible candidates exist further down the ranking. Same
-    // 2x heuristic as `route_drawers_list`'s `storage_limit`; see the comment
-    // there for the heuristic's own limits.
+    // though enough visible candidates exist further down the ranking. This
+    // route still filters visibility post-fetch (unlike `route_drawers_list`,
+    // which now pushes its visible-wing set into the storage query — see the
+    // comment on that route's `restrict_wings`), because search is a ranked
+    // top-K with no continuation promise: a short page here is an acceptable,
+    // bounded trade-off, whereas `route_drawers_list`'s `limit`/`next_cursor`
+    // shape implies the caller can page through everything it can see, which
+    // post-fetch filtering cannot guarantee. Same 2x heuristic as
+    // `route_drawers_list`'s `storage_limit` regardless.
     let search_limit = limit.saturating_mul(2);
 
     let results = {
@@ -1397,21 +1441,50 @@ where
             return Err(ServerError::Forbidden);
         }
     }
-    let visibility = wing.is_none().then(|| auth.0.visible_wings(Operation::Read));
+    // Unlike search (a ranked top-K with no continuation promise), this route
+    // has a `limit`/`next_cursor` shape that implies a caller can page
+    // through everything they can see. The storage layer has no
+    // cursor-based pagination (see the `next_cursor` note below), so
+    // visibility MUST be enforced by the storage query itself, not by
+    // filtering an already-`limit`-bounded result after the fact: filtering
+    // post-fetch can leave authorized rows sitting below the fetch window
+    // with `next_cursor: None` and no way to ever reach them — the same
+    // failure class as an inbox that silently drops mail. Pushing
+    // `wing IN (...)` into `DrawerFilter` (see `DrawerFilter::wings`)
+    // eliminates that: storage never returns an invisible-wing row in the
+    // first place, so no invisible-wing volume can crowd a visible page out.
+    let restrict_wings: Option<Vec<WingId>> = if wing.is_none() {
+        match auth.0.visible_wings(Operation::Read) {
+            WingVisibility::All => None,
+            WingVisibility::Only(wings) => {
+                Some(wings.iter().filter_map(|w| WingId::new(w.as_str()).ok()).collect())
+            }
+        }
+    } else {
+        None
+    };
 
-    // Over-fetch from storage to compensate for diary rows and scope-invisible
-    // rows that are filtered out below — otherwise a page whose first `limit`
-    // rows contain filtered entries would silently return fewer than `limit`
-    // results to the client, with no cursor to continue from.  The 2x factor
-    // is a heuristic; if filtered entries ever exceed it the result will be
-    // shorter than `limit`, but that is rare and strictly better than the
-    // unbounded-load-all-then-take approach.
+    // An empty `Only` set means zero wings are visible — short-circuit
+    // rather than pass an empty `wings` to `DrawerFilter`, which means
+    // "unconstrained" there (see its doc comment), not "match nothing".
+    if restrict_wings.as_ref().is_some_and(Vec::is_empty) {
+        return Ok(Json(ListDrawersResponse { drawers: Value::Array(vec![]), next_cursor: None }));
+    }
+
+    // Over-fetch from storage to compensate for diary rows filtered out
+    // below — visibility is now enforced by the storage query itself (see
+    // above), so this margin only needs to cover the diary-room exclusion,
+    // not scope-invisible wings. The 2x factor is a heuristic; if diary rows
+    // ever exceed it the result will be shorter than `limit`, but that is
+    // rare and strictly better than the unbounded-load-all-then-take
+    // approach.
     let storage_limit = limit.saturating_mul(2);
     let drawers = state
         .storage
         .drawer_store()
         .list_drawers(&DrawerFilter {
             wing,
+            wings: restrict_wings.unwrap_or_default(),
             room,
             limit: Some(storage_limit),
             ..DrawerFilter::default()
@@ -1421,7 +1494,6 @@ where
     let mut drawers_filtered: Vec<DrawerRecord> = drawers
         .into_iter()
         .filter(|d| !is_diary_wing_or_room(d.wing.as_str(), d.room.as_str()))
-        .filter(|d| visibility.as_ref().map(|v| v.contains(d.wing.as_str())).unwrap_or(true))
         .take(limit)
         .collect();
 
@@ -2688,6 +2760,10 @@ mod tests {
     /// verbatim — proves `normalize_scope_wing` keeps a valid fully-qualified
     /// wing id as-is instead of lowercasing it via `WingId::normalized`.
     const UPPERCASE_WING_TOKEN: &str = "uppercase-wing-secret-token";
+    /// Scoped to the unprefixed wing id `"project_gamma"` verbatim — proves
+    /// `normalize_scope_wing` keeps an unprefixed-but-valid entry as a
+    /// matchable alias instead of only its `wing_`-prefixed normalized form.
+    const UNPREFIXED_WING_TOKEN: &str = "unprefixed-wing-secret-token";
 
     fn restrict_token_file(path: &std::path::Path) {
         #[cfg(unix)]
@@ -2789,6 +2865,10 @@ mod tests {
                 "token": UPPERCASE_WING_TOKEN, "name": "uppercase_wing", "enabled": true,
                 "scopes": [{"wings": ["wing_MyProject"], "operations": ["read", "write"]}],
             },
+            {
+                "token": UNPREFIXED_WING_TOKEN, "name": "unprefixed_wing", "enabled": true,
+                "scopes": [{"wings": ["project_gamma"], "operations": ["read", "write"]}],
+            },
         ])
     }
 
@@ -2882,6 +2962,71 @@ mod tests {
 
         let err = TokenRegistry::load(token_file).unwrap_err();
         assert!(err.to_string().contains("must not be empty"), "{err}");
+    }
+
+    // Finding #3 regression: a misspelled `scopes` key must not silently
+    // grant an unrestricted token. Absent `scopes` means unrestricted (see
+    // `TokenEntry::scopes`), so without `deny_unknown_fields` a typo like
+    // `"scope"` would be dropped by serde as an unrecognised field, leaving
+    // `scopes` absent and the token unrestricted — the opposite of what an
+    // operator writing a scoped-token entry intended. The error must also
+    // name the offending field so an operator can actually find the typo.
+
+    #[test]
+    fn token_file_rejects_misspelled_scopes_key() {
+        let tempdir = TempDir::new().unwrap();
+        let token_file = tempdir.path().join("tokens.json");
+        std::fs::write(
+            &token_file,
+            serde_json::to_string(&serde_json::json!([
+                {
+                    "token": "typo-secret-token", "name": "typo", "enabled": true,
+                    // Misspelled: should be "scopes". Absent-`scopes` means
+                    // unrestricted, so this must be a load error, not a
+                    // silently-unrestricted token.
+                    "scope": [{"wings": ["wing_alpha"], "operations": ["read"]}],
+                },
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        restrict_token_file(&token_file);
+
+        let err = TokenRegistry::load(token_file).expect_err(
+            "a misspelled `scopes` key must fail the token file load, not silently grant an \
+             unrestricted token",
+        );
+        assert!(
+            err.to_string().contains("scope"),
+            "the load error must name the offending unrecognised field: {err}"
+        );
+    }
+
+    #[test]
+    fn token_file_accepts_correctly_spelled_scopes_key() {
+        let tempdir = TempDir::new().unwrap();
+        let token_file = tempdir.path().join("tokens.json");
+        std::fs::write(
+            &token_file,
+            serde_json::to_string(&serde_json::json!([
+                {
+                    "token": "spelled-right-secret-token", "name": "spelled_right", "enabled": true,
+                    "scopes": [{"wings": ["wing_alpha"], "operations": ["read"]}],
+                },
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        restrict_token_file(&token_file);
+
+        let registry = TokenRegistry::load(token_file)
+            .expect("a correctly-spelled `scopes` key must still load");
+        let identity = registry
+            .authenticate("spelled-right-secret-token")
+            .expect("the token from a successfully-loaded file must authenticate");
+        assert_eq!(identity.name(), "spelled_right");
+        assert!(identity.allows_wing(Operation::Read, "wing_alpha"));
+        assert!(!identity.allows_wing(Operation::Read, "wing_beta"), "scope must stay restrictive");
     }
 
     #[test]
@@ -3773,36 +3918,75 @@ mod tests {
         assert_eq!(wrong.status(), StatusCode::FORBIDDEN);
     }
 
-    // `normalize_scope_wing` unit coverage: verbatim precedence for an
-    // already-valid, fully-qualified wing id, short-form normalization as a
-    // fallback, and the wildcard passthrough. `WingId::new`'s `validate_id`
-    // accepts uppercase ASCII, so `wing_MyProject` is a legal wing id that
-    // must round-trip unchanged — see the doc comment on
-    // `normalize_scope_wing` for why lowercasing it would strand the scope.
+    // `normalize_scope_wing` unit coverage: two dimensions, aliased
+    // differently. The prefix is aliased (an unprefixed valid entry expands
+    // to itself plus a `WING_PREFIX`-prepended sibling, case untouched);
+    // case is never aliased (an already-valid entry, prefixed or not, keeps
+    // exactly the case it was written with — `wing_MyProject` and
+    // `wing_myproject` can be two distinct wings holding different data, and
+    // folding one into the other in an authorization grant would be a
+    // privilege escalation). See the doc comment on `normalize_scope_wing`
+    // for the full precedence.
 
     #[test]
-    fn normalize_scope_wing_keeps_valid_fully_qualified_id_verbatim() {
-        assert_eq!(normalize_scope_wing("wing_MyProject").unwrap(), "wing_MyProject");
+    fn normalize_scope_wing_prefixed_exact_yields_only_verbatim_case_significant() {
+        // Prefixed exact: nothing to alias on the prefix dimension (already
+        // has `WING_PREFIX`), and the case dimension is never aliased, so
+        // `wing_MyProject` expands to itself alone — NOT also
+        // `wing_myproject`, which the pre-fix version incorrectly added.
+        assert_eq!(normalize_scope_wing("wing_MyProject").unwrap(), vec!["wing_MyProject"]);
     }
 
     #[test]
-    fn normalize_scope_wing_normalizes_short_form() {
-        assert_eq!(normalize_scope_wing("myproject").unwrap(), "wing_myproject");
+    fn normalize_scope_wing_unprefixed_exact_yields_verbatim_and_prefixed_aliases() {
+        // Unprefixed exact. `WingId::new` does not require `WING_PREFIX`, so
+        // `project_alpha` is a valid `WingId` on its own — REST-stored wings
+        // may legitimately be spelled this way — and must be kept verbatim,
+        // with the prefixed spelling added as a second alias (prefix
+        // dimension aliased).
+        assert_eq!(
+            normalize_scope_wing("project_alpha").unwrap(),
+            vec!["project_alpha", "wing_project_alpha"]
+        );
+    }
+
+    #[test]
+    fn normalize_scope_wing_unprefixed_mixed_case_preserves_case_in_both_aliases() {
+        // Pins the split: prefix aliasing still applies to a mixed-case
+        // unprefixed entry, but neither alias it produces folds case —
+        // `MyProject` must not become `myproject` on either spelling.
+        assert_eq!(
+            normalize_scope_wing("MyProject").unwrap(),
+            vec!["MyProject", "wing_MyProject"]
+        );
+    }
+
+    #[test]
+    fn normalize_scope_wing_short_form_prefixes_without_folding_case() {
+        // Short form, already lowercase, so case-preservation is not visible
+        // here — `normalize_scope_wing_unprefixed_mixed_case_preserves_case_in_both_aliases`
+        // above is what actually pins that case is untouched. This test
+        // pins only that the prefix dimension still aliases: `myproject` is
+        // itself a valid `WingId` (verbatim) and gains the `wing_`-prefixed
+        // sibling REST/MCP paths may build.
+        assert_eq!(normalize_scope_wing("myproject").unwrap(), vec!["myproject", "wing_myproject"]);
     }
 
     #[test]
     fn normalize_scope_wing_preserves_wildcard() {
-        assert_eq!(normalize_scope_wing("*").unwrap(), "*");
+        assert_eq!(normalize_scope_wing("*").unwrap(), vec!["*"]);
     }
 
-    // End-to-end proof that the mangling bug is gone: a token scoped to an
+    // End-to-end proof that case is NOT aliased: a token scoped to an
     // already-prefixed, mixed-case wing id authorizes a request naming that
-    // exact wing — and only that exact spelling, not a lowercased alias,
-    // since verbatim and normalized forms are deliberately not both granted
-    // for the same scope entry.
+    // exact wing — and only that exact spelling. A request naming its
+    // lowercased form must be rejected: `wing_MyProject` and
+    // `wing_myproject` can be two distinct, independently-stored wings, and
+    // folding one into the other here would silently widen the grant beyond
+    // what the operator wrote — a privilege escalation, not a convenience.
 
     #[tokio::test]
-    async fn wing_scope_exact_prefixed_form_preserved_verbatim() {
+    async fn wing_scope_exact_prefixed_form_preserved_verbatim_case_significant() {
         let harness = make_harness().await;
 
         let right = harness
@@ -3836,8 +4020,66 @@ mod tests {
         assert_eq!(
             lowercased.status(),
             StatusCode::FORBIDDEN,
-            "a verbatim-form scope must not also grant the lowercased alias"
+            "a verbatim-form scope must not also grant a case-folded alias — \
+             `wing_MyProject` and `wing_myproject` can be two distinct wings"
         );
+    }
+
+    // End-to-end proof of the unprefixed-exact case (finding #2): a scope
+    // entry with no `WING_PREFIX` authorizes a request naming that exact
+    // unprefixed wing, matching how REST paths build wings with `WingId::new`
+    // (verbatim, no transform) rather than `WingId::normalized`.
+
+    #[tokio::test]
+    async fn wing_scope_unprefixed_exact_authorizes_unprefixed_request_wing() {
+        let harness = make_harness().await;
+
+        let unprefixed = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/drawers",
+                UNPREFIXED_WING_TOKEN,
+                json!({"wing": "project_gamma", "room": "r", "content": "unprefixed wing verbatim proof"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            unprefixed.status(),
+            StatusCode::OK,
+            "`project_gamma` in the token file must authorize the identical unprefixed `project_gamma` in the request"
+        );
+
+        let normalized = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/drawers",
+                UNPREFIXED_WING_TOKEN,
+                json!({"wing": "wing_project_gamma", "room": "r", "content": "rust cli tooling ecosystem documentation for the staging cluster"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            normalized.status(),
+            StatusCode::OK,
+            "`project_gamma` in the token file must also authorize its normalized alias `wing_project_gamma`"
+        );
+
+        let wrong = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/drawers",
+                UNPREFIXED_WING_TOKEN,
+                json!({"wing": "wing_otherproject", "room": "r", "content": "unprefixed wing negative proof"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(wrong.status(), StatusCode::FORBIDDEN);
     }
 
     // Group C: filter aggregate routes to visible wings rather than reject.
@@ -4326,6 +4568,49 @@ mod tests {
             LIMIT,
             "a scoped token must still get a full page when its visible rows are outnumbered by \
              invisible ones earlier in storage order: {drawers:?}"
+        );
+        assert!(drawers.iter().all(|d| d["wing"] == "wing_alpha"));
+    }
+
+    // Finding #1 regression: the test above uses equal-sized groups (3 + 3),
+    // which the old `limit * 2` over-fetch-then-filter still happened to
+    // cover. This test seeds far more invisible rows than any fixed
+    // over-fetch multiplier would reach, proving visibility is now enforced
+    // by the storage query itself (`DrawerFilter::wings`) rather than by
+    // filtering an already-limited page — the old code would return zero
+    // rows here, permanently, since `route_drawers_list` has no cursor to
+    // continue from.
+
+    #[tokio::test]
+    async fn list_pagination_reaches_full_page_when_invisible_rows_vastly_outnumber_the_page() {
+        // Maintenance disabled — see the comment on the sibling test above;
+        // insertion order matters here too.
+        let harness = make_harness_with_maintenance_config(false, false).await;
+
+        const LIMIT: usize = 3;
+        // 10 invisible rows is well beyond `LIMIT * 2` (6): the old
+        // over-fetch-then-filter code would fetch only 6 rows from storage,
+        // all invisible, filter every one of them out, and return an empty
+        // page with `next_cursor: None` — the visible rows seeded below
+        // would be unreachable forever.
+        const HIDDEN: usize = 10;
+        seed_rust_bucket_drawers(&harness, "wing_0hidden", HIDDEN).await;
+        seed_rust_bucket_drawers(&harness, "wing_alpha", LIMIT).await;
+
+        let resp = harness
+            .router
+            .clone()
+            .oneshot(authed_get(&format!("/v1/drawers?limit={LIMIT}"), SCOPED_ALPHA_TOKEN))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let drawers = body["drawers"].as_array().unwrap();
+        assert_eq!(
+            drawers.len(),
+            LIMIT,
+            "a scoped token must still get a full page when invisible rows vastly outnumber the \
+             over-fetch window, not a permanently-truncated page: {drawers:?}"
         );
         assert!(drawers.iter().all(|d| d["wing"] == "wing_alpha"));
     }

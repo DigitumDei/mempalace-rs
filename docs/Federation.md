@@ -658,7 +658,12 @@ reach it through their mandatory `task_id`, same as locally (see
 
 - **Task creation reads the wing from the request body.** `POST /v1/coordination/tasks`
   authorizes `(coordination_write, wing)` directly, the same as `POST /v1/drawers`
-  does for `write` — a mismatched wing is a plain **403**.
+  does for `write` — a mismatched wing is a plain **403**. `parent_id` and every
+  entry in `dependencies` are also resolved and authorized (as `coordination_read`)
+  before the task is created: a candidate id in a wing the caller cannot see is
+  rejected with the identical **404** an unauthorized-wing task lookup produces
+  elsewhere on this surface (see the next bullet), specifically so this route
+  cannot be used to probe whether a hidden id in another wing exists.
 - **Every other route resolves the wing from the target record first.** `GET`/`claim`/
   `renew`/`transition` on a task look the task up and authorize against its `wing`;
   sending a message, filing an artifact, or storing a result looks up the `task_id`
@@ -668,6 +673,15 @@ reach it through their mandatory `task_id`, same as locally (see
   `GET /v1/drawers/{id}` (§1.5) — so the response is never an existence oracle for a
   task in a wing the caller cannot see. A missing record and a wing-invisible record
   return the exact same 404 body; there is no way to tell them apart from outside.
+- **`wing_agents` never federates, on any coordination route.** This is the same
+  diary hard-override as everywhere else in this guide (§Concepts), applied
+  unconditionally regardless of the token's scope. `POST /v1/coordination/tasks`
+  with `"wing": "wing_agents"` fails config-independently with **422**
+  `diary_not_federated`, same as `POST /v1/drawers`. Every other route — including
+  a task that somehow already exists in `wing_agents` from before this rule — masks
+  it as a plain **404** on a read, and returns the same 422 on a write (claim,
+  renew, transition, message, artifact, or result). The inbox and event feeds never
+  surface a `wing_agents` row, whether unfiltered or explicitly filtered to it.
 - **The event feed and the inbox are aggregates, not lookups.** `GET /v1/coordination/events`
   and `GET /v1/coordination/inbox` can return rows from many tasks and many wings in
   one page, so — like `GET /v1/changes` and `GET /v1/rooms` — they filter their
@@ -679,6 +693,18 @@ reach it through their mandatory `task_id`, same as locally (see
   `/v1/changes` feed, there is no "wing could not be determined" case to reason
   about; filtering fails closed simply because an unlisted wing is never in the
   visible set.
+- **An idempotency-key replay re-authorizes the record it actually returns.**
+  `POST /v1/coordination/tasks`, `.../messages`, `.../artifacts`, and `.../results`
+  are idempotent on `(actor, idempotency_key)`: replaying a key returns the
+  originally-created record, on whatever wing it actually lives in — which is not
+  necessarily the wing (or task) named in the replay request, e.g. if the caller's
+  scope has since narrowed, or if it reuses a key across two different wings. Before
+  serialising that returned record, the server re-checks the *returned* wing against
+  the caller's current scope. When that check fails, the response is **409**
+  `idempotency_key_conflict`, not the 200 the stale pre-write check might suggest,
+  and not a 404 — acknowledging that the key already exists discloses nothing
+  beyond what the caller already knows about its own identity, but the response
+  names neither the wing nor any field of the record itself.
 
 ### Actor identity is derived, not claimed
 
@@ -698,6 +724,15 @@ authenticated as `ci` that posts `{"created_by": "alice"}` gets a task recorded 
 `created_by: "ci:alice"`, never `"alice"` — a remote caller cannot impersonate a
 local actor. This applies to `created_by` (tasks, artifacts, results), `sender`
 (messages), `worker` (claim/renew), and `actor` (transition, message ack).
+
+A claimed value containing `:` is rejected with **400** rather than folded into
+the `identity:claimed` string: `:` is the delimiter that string uses, so a claim
+containing it would make the encoding ambiguous with a differently-named token —
+e.g. a token named `ci` claiming actor `worker` would otherwise produce
+`ci:worker`, identical to the principal of a distinct token whose *configured*
+`name` literally is `ci:worker`. The other half of that ambiguity is closed by
+rejecting `:` in a token's `name` at token-file load time — see
+[Config Schema → `server.token_file`](Config-Schema.md#servertoken_file).
 `recipient` on a message is **not** rewritten this way: it addresses a message to
 someone, and does not itself assert who the caller is, so it is stored verbatim —
 matching local behaviour. (Whoever later acknowledges that message still has their
@@ -731,6 +766,13 @@ synchronised across machines. This matches the non-goal in
 [Coordination-Phase-3-Design.md](Coordination-Phase-3-Design.md): a task is
 authoritative in exactly one palace, and that palace's clock is the only one that
 gets a vote.
+
+`lease_seconds` must be a positive integer no greater than 100 years' worth of
+seconds; a value outside that range fails with **400** before the request reaches
+storage. This bound exists because `now + lease_seconds` is ordinary date
+arithmetic — a `lease_seconds` large enough to push the result past what a
+timestamp can represent is rejected explicitly rather than the request failing in
+an unspecified way.
 
 ### Revision and lease conflicts
 
@@ -817,8 +859,28 @@ have the current owner release it) before claiming, or re-check the task's state
 before transitioning. See [Part 7 → Revision and lease conflicts](#revision-and-lease-conflicts).
 
 ### A coordination route returns 404 for a task/message/artifact/result I know exists
-Your token's `scopes` do not grant it visibility into that record's wing. Per
-design this looks identical to the record genuinely not existing — see
-[Part 7 → Wing is the authorization key](#wing-is-the-authorization-key) — so check
-the token's `scopes` entry for the wing in question rather than assuming the ID is
-wrong.
+Your token's `scopes` do not grant it visibility into that record's wing, or the
+record lives in `wing_agents` (see [Part 7 → Wing is the authorization
+key](#wing-is-the-authorization-key)). Per design this looks identical to the
+record genuinely not existing, so check the token's `scopes` entry for the wing in
+question rather than assuming the ID is wrong.
+
+### A coordination write returns 409 with code `idempotency_key_conflict`
+You replayed an `idempotency_key` your token has used before, but the record
+storage originally created for it lives in a wing your token cannot currently see
+— most often because its `scopes` narrowed since the original write, or because
+the same key was reused across two different wings. The response deliberately
+does not say which wing or repeat any of the record's content. See [Part 7 → Wing
+is the authorization key](#wing-is-the-authorization-key). Use a distinct
+`idempotency_key` per wing to avoid this.
+
+### A coordination claim/renew returns 400 for `lease_seconds`
+`lease_seconds` must be a positive integer no greater than roughly 100 years'
+worth of seconds. See [Part 7 → Lease and expiry clocks belong to the palace that
+owns the task](#lease-and-expiry-clocks-belong-to-the-palace-that-owns-the-task).
+
+### A coordination write returns 400 for a claimed actor field
+A `created_by`/`sender`/`worker`/`actor` claim containing `:` is rejected — that
+character is reserved for the `identity:claimed` encoding the server builds when
+a claim disagrees with the authenticated token identity. See [Part 7 → Actor
+identity is derived, not claimed](#actor-identity-is-derived-not-claimed).

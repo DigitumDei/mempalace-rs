@@ -67,6 +67,12 @@ pub const LEASE_HAS_EXPIRED: &str = "lease has expired";
 /// Produced by [`CoordinationStore::acknowledge_message`] when the caller is not the message's
 /// addressed recipient.
 pub const ONLY_RECIPIENT_MAY_ACKNOWLEDGE: &str = "only the recipient may acknowledge";
+/// Produced by [`CoordinationStore::claim_task`] and [`CoordinationStore::renew_lease`] when
+/// `now + ttl` would fall outside the range `OffsetDateTime` can represent.
+/// `time::OffsetDateTime`'s `Add<Duration>` panics in that case, so both call sites use
+/// [`OffsetDateTime::checked_add`] and turn `None` into this error instead of aborting the
+/// request.
+pub const LEASE_DURATION_OUT_OF_RANGE: &str = "lease duration is out of range";
 
 /// Durable task lifecycle state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -461,7 +467,9 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
             return Err(StorageError::Invariant(LEASE_HELD_BY_ANOTHER_WORKER.into()));
         }
         let next = task.revision + 1;
-        let expiry = now + ttl;
+        let expiry = now
+            .checked_add(ttl)
+            .ok_or_else(|| StorageError::Invariant(LEASE_DURATION_OUT_OF_RANGE.into()))?;
         let changed = tx.execute("UPDATE coordination_tasks SET state='running',revision=?2,owner=?3,lease_expires_at=?4,updated_at=?5 WHERE task_id=?1 AND revision=?6",params![id,next,worker,format_time(expiry)?,format_time(now)?,expected_revision])?;
         if changed != 1 {
             return Err(StorageError::Invariant("task changed while being claimed".into()));
@@ -511,7 +519,10 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
             return Err(StorageError::Invariant(LEASE_HAS_EXPIRED.into()));
         }
         let next = task.revision + 1;
-        tx.execute("UPDATE coordination_tasks SET revision=?2,lease_expires_at=?3,updated_at=?4 WHERE task_id=?1",params![id,next,format_time(now+ttl)?,format_time(now)?])?;
+        let expiry = now
+            .checked_add(ttl)
+            .ok_or_else(|| StorageError::Invariant(LEASE_DURATION_OUT_OF_RANGE.into()))?;
+        tx.execute("UPDATE coordination_tasks SET revision=?2,lease_expires_at=?3,updated_at=?4 WHERE task_id=?1",params![id,next,format_time(expiry)?,format_time(now)?])?;
         append_event(
             &tx,
             "task",
@@ -1300,6 +1311,31 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
         let event = events.events.first().expect("event").clone();
         assert_eq!(s.get_event(&event.event_id).expect("exact event"), Some(event));
         assert_eq!(s.get_event("event_missing").expect("missing event"), None);
+    }
+    /// A lease TTL large enough that `now + ttl` overflows `OffsetDateTime`'s representable
+    /// range. Regression test for the panic `time::OffsetDateTime`'s `Add<Duration>` raises on
+    /// out-of-range results: both `claim_task` and `renew_lease` must turn this into a returned
+    /// `StorageError::Invariant(LEASE_DURATION_OUT_OF_RANGE)`, not abort the process.
+    #[test]
+    fn oversized_lease_duration_is_rejected_not_a_panic() {
+        let (_d, s) = store();
+        let huge = Duration::seconds(i64::MAX);
+
+        let t = task_with_wing(&s, "wing_test", "oversized-lease-claim-1");
+        let err = s
+            .claim_task(&t.task_id, "worker-a", t.revision, huge)
+            .expect_err("an out-of-range lease TTL must be rejected, not panic");
+        assert!(expect_invariant(&err).starts_with(LEASE_DURATION_OUT_OF_RANGE), "{err}");
+
+        // Establish a live lease with a sane TTL, then try to renew it with an oversized one.
+        let renewable = task_with_wing(&s, "wing_test", "oversized-lease-renew-1");
+        let claimed = s
+            .claim_task(&renewable.task_id, "worker-a", renewable.revision, Duration::minutes(5))
+            .expect("claim with a sane ttl");
+        let err = s
+            .renew_lease(&renewable.task_id, "worker-a", claimed.revision, huge)
+            .expect_err("an out-of-range renewal TTL must be rejected, not panic");
+        assert!(expect_invariant(&err).starts_with(LEASE_DURATION_OUT_OF_RANGE), "{err}");
     }
     /// Unwraps a `StorageError::Invariant`, panicking with the actual variant otherwise.
     fn expect_invariant(err: &StorageError) -> &str {

@@ -33,6 +33,12 @@ jobs:
         uses: actions/checkout@v7
         with:
           fetch-depth: 1
+          # checkout persists its token in .git/config by default. `Read` is allowlisted
+          # below and the inline-comment tool is an egress channel, so a prompt injection in
+          # a reviewed diff could read the token out and post it. The review never needs that
+          # credential: the action authenticates separately, and the diff is fetched through
+          # `gh pr diff` rather than local git.
+          persist-credentials: false
 
       - name: Run Claude Code Review
         id: claude-review

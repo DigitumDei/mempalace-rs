@@ -449,10 +449,13 @@ Through the MCP server, federated wings fan out across reads:
 
 ## Part 6 — Dev testing locally
 
-You can exercise the whole feature on one machine with two palace directories. The
-hub does the embedding, so set `MEMPALACE_STUB_EMBEDDINGS` (deterministic vectors,
-no model download) on the **hub** process — the client never embeds during a
-remote mine.
+You can exercise the whole feature on one machine with two palaces — a hub and a
+client — each with its own `config.json`. Use `MEMPALACE_CONFIG_DIR` to give the
+client its own `~/.mempalace`-shaped directory instead of editing your real one;
+the hub is pointed at directly with `--palace`/`--token-file` and needs no config
+directory of its own. The hub does the embedding, so set
+`MEMPALACE_STUB_EMBEDDINGS` (deterministic vectors, no model download) on the
+**hub** process — the client never embeds during a remote mine.
 
 ```bash
 # 1. Hub palace + token file
@@ -463,14 +466,24 @@ echo '[{"token":"dev-token","name":"dev","enabled":true}]' > /tmp/hub/tokens.jso
 MEMPALACE_STUB_EMBEDDINGS=1 mempalace-cli --palace /tmp/hub/palace serve \
   --bind 127.0.0.1:8765 --token-file /tmp/hub/tokens.json &
 
-# 3. Point a client config at the hub (client uses a different, default palace)
-#    ~/.mempalace/config.json:
-#    { "federation": {
-#        "remotes": [{ "name": "hub", "url": "http://127.0.0.1:8765", "token": "dev-token" }],
-#        "wings": { "wing_demo": { "mode": "remote", "remote": "hub" } } } }
+# 3. Give the client its own config directory instead of touching
+#    ~/.mempalace/config.json — MEMPALACE_CONFIG_DIR redirects config.json,
+#    projects.json, and (by default) the client's own palace under it.
+mkdir -p /tmp/client
+cat > /tmp/client/config.json <<'JSON'
+{
+  "version": 1,
+  "federation": {
+    "remotes": [{ "name": "hub", "url": "http://127.0.0.1:8765", "token": "dev-token" }],
+    "wings": { "wing_demo": { "mode": "remote", "remote": "hub" } }
+  }
+}
+JSON
+export MEMPALACE_CONFIG_DIR=/tmp/client
 
 # 4. Mine a project whose mempalace.yaml declares wing: wing_demo → pushes to the hub.
-#    The client does NOT embed here; the hub does.
+#    The client does NOT embed here; the hub does. MEMPALACE_CONFIG_DIR must be
+#    set in this shell (or exported) so the CLI picks up /tmp/client/config.json.
 mempalace-cli mine /path/to/demo-project
 
 # 5. Verify the hub received it. The CLI's own `search` only reads the LOCAL
@@ -481,8 +494,10 @@ curl -s -X POST http://127.0.0.1:8765/v1/drawers/search \
 ```
 
 To exercise federated **reads** (combined search, wake-up fan-out), point an MCP
-client at `mempalace-mcp` running with the same client config from step 3 — the
-fan-out lives in the MCP server, not the CLI.
+client at `mempalace-mcp` launched with `MEMPALACE_CONFIG_DIR=/tmp/client` in its
+environment (an MCP client typically sets this in its server-launch config, since
+`mempalace-mcp` itself takes no CLI arguments) — the fan-out lives in the MCP
+server, not the CLI.
 
 For non-stale snippet resolution on the hub, add the project path to
 `server.checkouts.wing_demo` in the hub's config and restart `serve`.

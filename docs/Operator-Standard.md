@@ -62,6 +62,13 @@ Default state roots:
 - palace root: `~/.mempalace/palace`
 - default embeddings cache root: platform cache dir under `mempalace/embeddings`
 
+Set `MEMPALACE_CONFIG_DIR` to move the `~/.mempalace` base directory itself
+(`config.json`, `projects.json`, `people_map.json`, and the default
+`server_tokens.json` location all move with it) — see
+[Config-Schema.md](Config-Schema.md#other-environment-variables). This is
+orthogonal to `MEMPALACE_PALACE_PATH`/`--palace`, which move only the palace
+root and take precedence over it for that one path.
+
 Presence checks used by the CLI:
 
 - `storage.sqlite3`

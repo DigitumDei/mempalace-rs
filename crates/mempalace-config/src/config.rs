@@ -15,6 +15,15 @@ use crate::federation::{
 
 pub const DEFAULT_BASE_DIR: &str = "~/.mempalace";
 pub const DEFAULT_COLLECTION_NAME: &str = "mempalace_drawers";
+/// Overrides the `~/.mempalace` base directory used to resolve `config.json`,
+/// `projects.json`, `people_map.json`, and (unless `server.token_file` is set)
+/// `server_tokens.json`. Honoured whenever a caller does not pass an explicit
+/// `base_dir_override` — i.e. by both production binaries. It is independent
+/// of `MEMPALACE_PALACE_PATH`/`MEMPAL_PALACE_PATH`, which overrides only the
+/// palace data directory and always wins for that one path, even when this
+/// variable is also set. See `resolve_paths_with_env` for the precedence
+/// implementation and `docs/Config-Schema.md` for the documented contract.
+pub const CONFIG_DIR_ENV_VAR: &str = "MEMPALACE_CONFIG_DIR";
 const CONFIG_FILE_NAME: &str = "config.json";
 const PROJECT_REGISTRY_FILE_NAME: &str = "projects.json";
 const PROJECT_CONFIG_FILE_NAME: &str = "mempalace.yaml";
@@ -463,6 +472,7 @@ impl ConfigLoader {
     pub fn load_with_env(base_dir_override: Option<&Path>) -> Result<MempalaceConfig> {
         Self::load_from_sources(
             base_dir_override,
+            env::var(CONFIG_DIR_ENV_VAR).ok(),
             // `MEMPAL_PALACE_PATH` is the legacy Python alias; keep it for upgrade compatibility.
             env::var("MEMPALACE_PALACE_PATH").ok().or_else(|| env::var("MEMPAL_PALACE_PATH").ok()),
             env::var("MEMPALACE_EMBEDDING_PROFILE").ok(),
@@ -475,8 +485,10 @@ impl ConfigLoader {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn load_from_sources(
         base_dir_override: Option<&Path>,
+        config_dir_override: Option<String>,
         palace_path_override: Option<String>,
         profile_override: Option<String>,
         maintenance_enabled_override: Option<String>,
@@ -486,7 +498,7 @@ impl ConfigLoader {
         maintenance_tail_threshold_rows_override: Option<String>,
         maintenance_small_fragment_threshold_override: Option<String>,
     ) -> Result<MempalaceConfig> {
-        let paths = resolve_paths(base_dir_override)?;
+        let paths = resolve_paths_with_env(base_dir_override, config_dir_override)?;
         let file = read_config_file(&paths.config_file)?;
         let embedding_profile = resolve_profile(profile_override, file.embedding_profile)?;
 
@@ -768,10 +780,54 @@ impl ConfigLoader {
     }
 }
 
+/// Resolve the base directory and every path derived from it, reading
+/// `MEMPALACE_CONFIG_DIR` from the real process environment. This is the
+/// entry point every production call site uses (both binaries always pass
+/// `base_dir_override: None`); see `resolve_paths_with_env` for the
+/// precedence rule, kept as a pure function so it can be unit-tested without
+/// mutating global environment state.
 fn resolve_paths(base_dir_override: Option<&Path>) -> Result<ResolvedPaths> {
+    resolve_paths_with_env(base_dir_override, env::var(CONFIG_DIR_ENV_VAR).ok())
+}
+
+/// Pure path-resolution logic, parameterized over the `MEMPALACE_CONFIG_DIR`
+/// value instead of reading it directly, so tests can exercise every branch
+/// without calling the (`unsafe` under this workspace's forbidden-lint) env
+/// mutators.
+///
+/// Precedence for the base directory:
+/// 1. `base_dir_override` (an explicit Rust-level override; only test code
+///    and `#[cfg(test)]` call sites ever pass `Some`, so production always
+///    falls through to the next rule).
+/// 2. `MEMPALACE_CONFIG_DIR`, if set to a non-empty value (after trimming
+///    whitespace). `~`-prefixed values are expanded the same way as
+///    `DEFAULT_BASE_DIR`. The directory is not required to exist: a
+///    nonexistent directory resolves the same paths a fresh install would
+///    get, and `config.json`/`projects.json` are treated as absent (falling
+///    through to defaults) until something creates them there — the same
+///    behavior `base_dir_override` already has today.
+/// 3. `DEFAULT_BASE_DIR` (`~/.mempalace`).
+///
+/// This directory backs `config.json`, `projects.json`, `people_map.json`,
+/// and — unless `server.token_file` is set in `config.json` — the default
+/// `server_tokens.json` location, so redirecting it moves all of those
+/// together. It is orthogonal to `MEMPALACE_PALACE_PATH`/`MEMPAL_PALACE_PATH`:
+/// that variable overrides only the resolved `palace_path` and always wins
+/// for that one value, regardless of where `MEMPALACE_CONFIG_DIR` points the
+/// rest of the configuration. Setting `MEMPALACE_CONFIG_DIR` alone (with
+/// `MEMPALACE_PALACE_PATH` unset and no `palace_path` in `config.json`) moves
+/// the palace too, since the default palace path is derived as
+/// `<base_dir>/palace`.
+fn resolve_paths_with_env(
+    base_dir_override: Option<&Path>,
+    config_dir_env: Option<String>,
+) -> Result<ResolvedPaths> {
     let base_dir = match base_dir_override {
         Some(path) => path.to_path_buf(),
-        None => expand_path(DEFAULT_BASE_DIR)?,
+        None => match config_dir_env.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+            Some(value) => expand_path(value)?,
+            None => expand_path(DEFAULT_BASE_DIR)?,
+        },
     };
 
     Ok(ResolvedPaths {
@@ -1174,9 +1230,10 @@ mod tests {
     use mempalace_core::EmbeddingProfile;
 
     use super::{
-        ConfigLoader, DEFAULT_COLLECTION_NAME, DEFAULT_LOW_CPU_INGEST_BATCH_SIZE,
+        ConfigLoader, DEFAULT_BASE_DIR, DEFAULT_COLLECTION_NAME, DEFAULT_LOW_CPU_INGEST_BATCH_SIZE,
         LowCpuConfigFileV1, LowCpuRuntimeConfig, MaintenanceConfigFileV1, MaintenanceRuntimeConfig,
-        ProjectConfig, ProjectRegistryEntryV1, ProjectRoomConfig,
+        ProjectConfig, ProjectRegistryEntryV1, ProjectRoomConfig, expand_path,
+        resolve_paths_with_env,
     };
 
     fn temp_dir() -> PathBuf {
@@ -1214,6 +1271,7 @@ mod tests {
 
         let config = ConfigLoader::load_from_sources(
             Some(&base),
+            None,
             Some("/tmp/custom-palace".to_owned()),
             Some("low_cpu".to_owned()),
             None,
@@ -1231,6 +1289,123 @@ mod tests {
         assert_eq!(config.low_cpu.ingest_batch_size, DEFAULT_LOW_CPU_INGEST_BATCH_SIZE);
 
         fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn config_dir_env_var_redirects_base_dir_when_unset_explicitly() {
+        let base = temp_dir();
+
+        let paths =
+            resolve_paths_with_env(None, Some(base.to_string_lossy().into_owned())).unwrap();
+
+        assert_eq!(paths.base_dir, base);
+        assert_eq!(paths.config_file, base.join("config.json"));
+        assert_eq!(paths.project_registry_file, base.join("projects.json"));
+        assert_eq!(paths.people_map_file, base.join("people_map.json"));
+        assert_eq!(paths.palace_dir, base.join("palace"));
+    }
+
+    #[test]
+    fn config_dir_env_var_unset_preserves_default_base_dir() {
+        let paths = resolve_paths_with_env(None, None).unwrap();
+
+        assert_eq!(paths.base_dir, expand_path(DEFAULT_BASE_DIR).unwrap());
+    }
+
+    #[test]
+    fn config_dir_env_var_blank_value_is_treated_as_unset() {
+        let paths = resolve_paths_with_env(None, Some("   ".to_owned())).unwrap();
+
+        assert_eq!(paths.base_dir, expand_path(DEFAULT_BASE_DIR).unwrap());
+    }
+
+    #[test]
+    fn config_dir_env_var_nonexistent_directory_falls_through_to_defaults() {
+        // The directory does not exist on disk and is never created by path
+        // resolution alone. Loading against it should behave exactly like a
+        // fresh install pointed at an empty directory: no error, and the
+        // (absent) config file's defaults apply.
+        let base = temp_dir();
+        assert!(!base.exists());
+
+        let paths =
+            resolve_paths_with_env(None, Some(base.to_string_lossy().into_owned())).unwrap();
+        assert!(!paths.base_dir.exists());
+
+        let config = ConfigLoader::load_from_sources(
+            None,
+            Some(base.to_string_lossy().into_owned()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(config.palace_path, base.join("palace"));
+        assert_eq!(config.collection_name, DEFAULT_COLLECTION_NAME);
+        assert_eq!(config.embedding_profile, EmbeddingProfile::Balanced);
+        assert_eq!(config.server.token_file, base.join("server_tokens.json"));
+    }
+
+    #[test]
+    fn explicit_base_dir_override_takes_precedence_over_config_dir_env_var() {
+        let explicit = temp_dir();
+        let from_env = temp_dir();
+
+        let paths =
+            resolve_paths_with_env(Some(&explicit), Some(from_env.to_string_lossy().into_owned()))
+                .unwrap();
+
+        assert_eq!(paths.base_dir, explicit);
+        assert_ne!(paths.base_dir, from_env);
+    }
+
+    #[test]
+    fn palace_path_env_var_wins_over_config_dir_env_var_default_palace() {
+        // MEMPALACE_CONFIG_DIR relocates config.json/projects.json/etc. and,
+        // absent any other override, the derived default palace path too.
+        // MEMPALACE_PALACE_PATH must still win for the palace path
+        // specifically, regardless of where MEMPALACE_CONFIG_DIR points.
+        let config_dir = temp_dir();
+        let explicit_palace = temp_dir().join("elsewhere-palace");
+
+        let config = ConfigLoader::load_from_sources(
+            None,
+            Some(config_dir.to_string_lossy().into_owned()),
+            Some(explicit_palace.to_string_lossy().into_owned()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(config.palace_path, explicit_palace);
+    }
+
+    #[test]
+    fn config_dir_env_var_also_relocates_project_registry_and_people_map() {
+        // `ConfigLoader::register_project` / `load_project_registry` and the
+        // people-map path both resolve through `resolve_paths`, the same
+        // function `MEMPALACE_CONFIG_DIR` is read into (see
+        // `resolve_paths_with_env`); this proves the base-dir redirect is
+        // consistent across every file derived from it, not just
+        // `config.json`.
+        let base = temp_dir();
+
+        let paths =
+            resolve_paths_with_env(None, Some(base.to_string_lossy().into_owned())).unwrap();
+
+        assert_eq!(paths.project_registry_file, base.join("projects.json"));
+        assert_eq!(paths.people_map_file, base.join("people_map.json"));
     }
 
     #[test]
@@ -1770,6 +1945,7 @@ mod tests {
 
         let config = ConfigLoader::load_from_sources(
             Some(&base),
+            None,
             Some("/tmp/legacy-palace".to_owned()),
             None,
             None,
@@ -1793,6 +1969,7 @@ mod tests {
 
         let err = ConfigLoader::load_from_sources(
             Some(&base),
+            None,
             None,
             Some("definitely_not_real".to_owned()),
             None,
@@ -2030,6 +2207,7 @@ mod tests {
             Some(&base),
             None,
             None,
+            None,
             Some("false".to_owned()),
             Some("false".to_owned()),
             Some("500".to_owned()),
@@ -2056,6 +2234,7 @@ mod tests {
 
         let err = ConfigLoader::load_from_sources(
             Some(&base),
+            None,
             None,
             None,
             Some("ture".to_owned()),
@@ -2092,6 +2271,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(config.maintenance.small_fragment_threshold, 99);
@@ -2099,6 +2279,7 @@ mod tests {
         // File value + env override → env wins
         let config = ConfigLoader::load_from_sources(
             Some(&base),
+            None,
             None,
             None,
             None,
@@ -2136,6 +2317,7 @@ mod tests {
 
         let config = ConfigLoader::load_from_sources(
             Some(&base),
+            None,
             None,
             None,
             None,

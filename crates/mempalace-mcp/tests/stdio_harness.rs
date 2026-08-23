@@ -274,6 +274,8 @@ fn compiled_binary_honors_config_dir_env_var_for_default_palace_location() {
         .env("HOME", &unused_home)
         .env("MEMPALACE_CONFIG_DIR", &config_dir)
         .env("MEMPALACE_STUB_EMBEDDINGS", "1")
+        .env_remove("MEMPALACE_PALACE_PATH")
+        .env_remove("MEMPAL_PALACE_PATH")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()

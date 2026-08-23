@@ -33,6 +33,8 @@ fn compiled_binary_status_resolves_default_palace_under_config_dir_override() {
         .arg("status")
         .env("HOME", &unused_home)
         .env("MEMPALACE_CONFIG_DIR", &config_dir)
+        .env_remove("MEMPALACE_PALACE_PATH")
+        .env_remove("MEMPAL_PALACE_PATH")
         .output()
         .unwrap();
 
@@ -69,6 +71,7 @@ fn compiled_binary_palace_path_env_var_wins_over_config_dir_default_palace() {
         .env("HOME", &unused_home)
         .env("MEMPALACE_CONFIG_DIR", &config_dir)
         .env("MEMPALACE_PALACE_PATH", &explicit_palace)
+        .env_remove("MEMPAL_PALACE_PATH")
         .output()
         .unwrap();
 

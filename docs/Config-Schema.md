@@ -516,6 +516,16 @@ Validation:
   in the request and does not consult this table at all — see [Federation → Client-side
   coordination routing](Federation.md#client-side-coordination-routing) for the local-first,
   ID-discovery fallback those tools use instead.
+- **Keys must already be in canonical `wing_*` form** (the same form
+  [`WingId::normalized`](Federation.md#wing-is-the-authorization-key) produces — trimmed,
+  lowercased, disallowed characters replaced with `_`, `wing_`-prefixed). A key that is not
+  already canonical (`Secret`, `secret`, `wing secret`, ...) is a load error naming the offending
+  key and the canonical spelling it should use — see Validation Errors below. This is
+  deliberately *not* silently normalised on load: doing so would activate a rule that is inert
+  today (a non-canonical key never matches any resolved, normalised wing, so it currently falls
+  through to `default_mode`), and quietly turning an inert config entry into an active one is the
+  wrong side effect for a routing table that gates data egress. `federation.wings` has no such
+  restriction; leave short or mixed-case drawer-wing keys as they are.
 
 ### Resolution Precedence
 
@@ -541,6 +551,15 @@ The diary hard-override still applies unconditionally at step 1, exactly as abov
 `resolve_route`, `resolve_kg_route`(§`federation.kg`) skips that step entirely, because KG facts
 are entity-scoped and have no wing-shaped diary content to protect in the first place.
 
+The wing `mempalace_task_create` routes on is normalised (via `WingId::normalized`) before either
+the diary check or the `federation.coordination` lookup runs, so a short or mixed-case spelling
+(`"agents"`, `"Wing_Agents"`, `"myproject"`) is routed exactly as its canonical form
+(`wing_agents`, `wing_myproject`) would be — it cannot slip past the `wing_agents` hard override
+or an operator's explicit per-wing pin by arriving unnormalised. `resolve_coordination_route`
+normalises defensively a second time, in case a future caller forgets to; if the given wing
+cannot be normalised at all, it resolves local rather than falling through to `default_mode` —
+failing closed, since this route decision controls whether a task ever leaves the local palace.
+
 ### Validation Errors vs. Warnings
 
 Config load fails with a precise error message for:
@@ -552,6 +571,9 @@ Config load fails with a precise error message for:
 - `write: both` on a `federation.coordination` entry (a task is authoritative in exactly one
   palace; use `write: local` or `write: remote` instead) — the identical setting on a
   `federation.wings` entry for the same wing is unaffected and stays legal
+- A `federation.coordination` key that is not already in canonical `wing_*` form — the error
+  names the offending key and the canonical spelling to use instead. `federation.wings` keys are
+  not checked this way.
 - (`server.token_file`, not a `federation.*` field, but the same fail-closed loading behaviour)
   an `operations` entry in a token's `scopes` outside the closed enum, or a token `name`
   containing `:` — see [Server Config → `server.token_file`](#servertoken_file)

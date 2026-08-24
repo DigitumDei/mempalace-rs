@@ -6,7 +6,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use mempalace_core::{
-    DIARY_ROOM, DIARY_TOPIC_PREFIX, MempalaceError, Result, SHARED_AGENT_DIARY_WING,
+    DIARY_ROOM, DIARY_TOPIC_PREFIX, MempalaceError, Result, SHARED_AGENT_DIARY_WING, WingId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -310,6 +310,35 @@ pub(crate) fn resolve_federation_config(
     // created against it, not the first time a write happens to hit that wing.
     let mut coordination: BTreeMap<String, ResolvedRouteRule> = BTreeMap::new();
     for (wing_name, rule) in &section.coordination {
+        // Reject a non-canonical key at load rather than silently normalising it. Normalising
+        // the key here would *newly activate* a rule that is dead today: an operator with
+        // `coordination: { Secret: { mode: remote } }` currently falls through to
+        // `default_mode` because lookups are keyed on the canonical `wing_*` form (see
+        // `resolve_coordination_route`); quietly canonicalising the key would start routing
+        // that wing as a side effect of this security fix, which is the wrong direction for a
+        // change whose entire point is to stop wings routing somewhere the operator didn't
+        // explicitly pin them. Fail loud instead, the same way `write: both` is rejected below.
+        match WingId::normalized(wing_name) {
+            Ok(canonical) if canonical.as_str() == wing_name.as_str() => {}
+            Ok(canonical) => {
+                return Err(MempalaceError::ConfigParse {
+                    path: config_path.to_path_buf(),
+                    message: format!(
+                        "federation.coordination.{wing_name} is not in canonical wing form; \
+                         use `{canonical}` instead",
+                        canonical = canonical.as_str()
+                    ),
+                });
+            }
+            Err(error) => {
+                return Err(MempalaceError::ConfigParse {
+                    path: config_path.to_path_buf(),
+                    message: format!(
+                        "federation.coordination.{wing_name} is not a valid wing name: {error}"
+                    ),
+                });
+            }
+        }
         if wing_name == SHARED_AGENT_DIARY_WING && rule.mode != RouteMode::Local {
             tracing::warn!(
                 wing = %wing_name,
@@ -543,6 +572,19 @@ pub fn resolve_kg_route(federation: &FederationRuntimeConfig) -> ResolvedRouteRu
 ///   authorization key"), so `wing_agents` coordination must stay local unconditionally, the
 ///   same way the diary is protected everywhere else in the palace.
 pub fn resolve_coordination_route(federation: &FederationRuntimeConfig, wing: &str) -> ResolvedRouteRule {
+    // Defence in depth: normalise here too, even though `mempalace-mcp`'s `tool_task_create`
+    // already normalises before calling in. This function is the actual authorization gate for
+    // coordination egress (see the doc comment above), so it must not trust a caller to have
+    // done that — a future call site that forgets to normalise first must not reopen the
+    // `wing_agents` diary bypass or let an operator's `local` pin be skipped by a short-form
+    // wing string. On a wing that fails to normalise at all, fail CLOSED to `local_rule()`
+    // rather than falling through to `default_mode`: a routing decision that controls whether
+    // data leaves the machine should refuse to route remotely when it cannot even determine the
+    // canonical wing, not default open.
+    let Ok(canonical) = WingId::normalized(wing) else {
+        return local_rule();
+    };
+    let wing = canonical.as_str();
     if wing == SHARED_AGENT_DIARY_WING {
         return local_rule();
     }
@@ -1803,5 +1845,131 @@ mod tests {
         let result = resolve_coordination_route(&fed, "wing_anything");
         assert_eq!(result.mode, RouteMode::Local);
         assert_eq!(result.remote, None);
+    }
+
+    /// Security-fix regression: `resolve_coordination_route` must normalise the wing it is
+    /// given itself (layer 2 of the fix), not merely trust that every caller normalised first.
+    /// A raw, un-normalised spelling of the diary wing must still hit the hard override —
+    /// proves the defensive guard, independent of the `mempalace-mcp` call-site fix.
+    #[test]
+    fn resolve_coordination_route_normalises_raw_diary_wing_spelling() {
+        let fed = FederationRuntimeConfig {
+            default_mode: RouteMode::Remote,
+            default_remote: Some("work".to_owned()),
+            ..work_remote_federation()
+        };
+        for raw_wing in ["agents", "Wing_Agents", " wing_agents "] {
+            let result = resolve_coordination_route(&fed, raw_wing);
+            assert_eq!(result.mode, RouteMode::Local, "raw wing {raw_wing:?} must resolve local");
+            assert_eq!(result.remote, None, "raw wing {raw_wing:?} must resolve local");
+        }
+    }
+
+    /// Security-fix regression: a raw wing spelling that does map to an explicit
+    /// `federation.coordination` entry must still find it after normalisation.
+    #[test]
+    fn resolve_coordination_route_normalises_raw_wing_for_explicit_rule_lookup() {
+        let fed = {
+            let base = work_remote_federation();
+            let mut coordination = BTreeMap::new();
+            coordination.insert(
+                "wing_secret".to_owned(),
+                ResolvedRouteRule { mode: RouteMode::Local, remote: None, write: WriteTarget::Local },
+            );
+            FederationRuntimeConfig {
+                default_mode: RouteMode::Remote,
+                default_remote: Some("work".to_owned()),
+                coordination,
+                ..base
+            }
+        };
+        let result = resolve_coordination_route(&fed, "secret");
+        assert_eq!(result.mode, RouteMode::Local);
+        assert_eq!(result.remote, None);
+    }
+
+    /// Security-fix regression: when the wing string cannot be normalised at all (empty after
+    /// trimming), the function must fail CLOSED to `local_rule()` rather than falling through
+    /// to `default_mode` — a routing decision that controls data egress must refuse to route
+    /// remotely when it cannot even determine the canonical wing.
+    #[test]
+    fn resolve_coordination_route_fails_closed_on_unnormalisable_wing() {
+        let fed = FederationRuntimeConfig {
+            default_mode: RouteMode::Remote,
+            default_remote: Some("work".to_owned()),
+            ..work_remote_federation()
+        };
+        let result = resolve_coordination_route(&fed, "   ");
+        assert_eq!(result.mode, RouteMode::Local);
+        assert_eq!(result.remote, None);
+    }
+
+    /// Security-fix regression (layer 3): a `federation.coordination` key that is not already
+    /// in canonical `wing_*` form must fail config load with a clear error naming the offending
+    /// key and the canonical spelling — mirroring the existing `write: both` rejection just
+    /// above. Silently normalising the key instead would *newly activate* a rule that is dead
+    /// today (see the comment at the call site in `resolve_federation_config`), which is the
+    /// wrong direction for a security fix.
+    #[test]
+    fn coordination_non_canonical_key_fails_config_load() {
+        let section = FederationConfigV1 {
+            remotes: vec![RemoteConfigV1 {
+                name: "hub".to_owned(),
+                url: "https://palace.example".to_owned(),
+                token: None,
+                token_env: None,
+                timeout_ms: None,
+            }],
+            default_mode: None,
+            wings: BTreeMap::new(),
+            kg: None,
+            coordination: {
+                let mut m = BTreeMap::new();
+                m.insert(
+                    "Secret".to_owned(),
+                    RouteRuleV1 {
+                        mode: RouteMode::Remote,
+                        remote: Some("hub".to_owned()),
+                        write: None,
+                    },
+                );
+                m
+            },
+        };
+        let err = resolve_federation_config(Some(section), config_path(), no_env()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("federation.coordination.Secret"), "{msg}");
+        assert!(msg.contains("wing_secret"), "{msg}");
+    }
+
+    /// The canonical form of the same key must load fine.
+    #[test]
+    fn coordination_canonical_key_loads_fine() {
+        let section = FederationConfigV1 {
+            remotes: vec![RemoteConfigV1 {
+                name: "hub".to_owned(),
+                url: "https://palace.example".to_owned(),
+                token: None,
+                token_env: None,
+                timeout_ms: None,
+            }],
+            default_mode: None,
+            wings: BTreeMap::new(),
+            kg: None,
+            coordination: {
+                let mut m = BTreeMap::new();
+                m.insert(
+                    "wing_secret".to_owned(),
+                    RouteRuleV1 {
+                        mode: RouteMode::Remote,
+                        remote: Some("hub".to_owned()),
+                        write: None,
+                    },
+                );
+                m
+            },
+        };
+        let fed = resolve_federation_config(Some(section), config_path(), no_env()).unwrap();
+        assert!(fed.coordination.contains_key("wing_secret"));
     }
 }

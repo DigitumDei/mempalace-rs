@@ -59,7 +59,8 @@ use mempalace_graph::{AddFactRequest, EntityKind, KnowledgeGraphRuntime, QueryDi
 use mempalace_search::{SearchRuntime, SearchRuntimePolicy};
 use mempalace_storage::{
     Artifact as CoordinationArtifact, ChangeCursor, ChangeEvent, ChangeLogStore,
-    CoordinationCursor, CoordinationEvent, CoordinationStore, DrawerFilter, DrawerStore,
+    CoordinationCursor, CoordinationEvent, CoordinationStore, CoordinationVisibility, DrawerFilter,
+    DrawerStore,
     DuplicateStrategy, IngestCommitRequest, IngestManifestStore, MaintenanceAbortReason,
     MaintenanceOutcome, MaintenanceRunSummary, MaintenanceSettings, MaintenanceSkipReason,
     Message as CoordinationMessage, NewArtifact, NewMessage, NewTask, NewTaskResult,
@@ -3192,7 +3193,18 @@ where
         }
         let page = state
             .coordination
-            .inbox(&params.recipient, cursor, Some(wing.as_str()), limit, params.unacknowledged_only)
+            .inbox(
+                &params.recipient,
+                cursor,
+                Some(wing.as_str()),
+                limit,
+                params.unacknowledged_only,
+                // The wing above is already confirmed visible and non-diary by the check just
+                // above, so no further restriction is needed here; `Federated(None)` still
+                // carries the diary exclusion, which is redundant in this branch but keeps every
+                // federation call site going through the same "always excludes diary" path.
+                CoordinationVisibility::Federated(None),
+            )
             .map_err(coordination_storage_error)?;
         let messages =
             page.messages.into_iter().map(message_to_dto).collect::<Result<Vec<_>, _>>()?;
@@ -3202,64 +3214,32 @@ where
         }));
     }
 
-    // No wing filter: cross-wing, so filter to visible wings after the fact
-    // (Group C) rather than reject, and exclude `wing_agents` unconditionally
-    // (the diary hard-override). Over-fetch like `route_drawers_list` — same
-    // 2x heuristic, same limitation if filtered density is high.
-    //
-    // `next_cursor` cannot simply be storage's own page boundary over the
-    // *unfiltered* over-fetched batch: when the loop below stops early —
-    // either because it already collected `limit` visible messages, or
-    // because it broke out with unexamined messages still left in the
-    // batch — storage's boundary describes a point *past* messages this
-    // response never looked at, let alone returned. A client that resumes
-    // from that boundary would silently skip every message between where
-    // the loop actually stopped and where storage's page ended: e.g. two
-    // visible messages with `limit=1` and no third message in the
-    // underlying feed makes storage report `next_cursor: None` (its page
-    // truly is the last one), while the loop below stops after the first
-    // visible message — with `None` returned there would be nothing to
-    // resume from, and the second message is unreachable forever. So the
-    // cursor instead tracks the last message this loop actually examined;
-    // storage's own boundary is used only when the loop consumed the whole
-    // over-fetched batch without reaching `limit`, which is the one case
-    // where "examined everything" and "storage's page boundary" agree.
-    let visibility = auth.0.visible_wings(Operation::CoordinationRead);
-    let storage_limit = limit.saturating_mul(2);
+    // No wing filter: cross-wing. Visibility (including the diary
+    // hard-override) is now enforced inside the storage query itself via
+    // `CoordinationVisibility`, so `next_cursor` is computed only over rows
+    // this caller may see — an invisible row can no longer influence it,
+    // which was the vulnerability this replaced. That also means the
+    // over-fetch/post-filter loop that used to live here (tracking
+    // `last_examined_sequence` to avoid resuming past an unexamined
+    // visible message — see `coordination_inbox_cursor_does_not_skip_the_second_visible_message`)
+    // is no longer needed: storage's own `has_more`/cursor boundary is
+    // already computed over the filtered set, so "examined everything" and
+    // "storage's page boundary" always agree now.
+    let restrict_wings: Option<Vec<String>> = match auth.0.visible_wings(Operation::CoordinationRead)
+    {
+        WingVisibility::All => None,
+        WingVisibility::Only(wings) => Some(wings.into_iter().collect()),
+    };
+    let visibility = match &restrict_wings {
+        None => CoordinationVisibility::Federated(None),
+        Some(wings) => CoordinationVisibility::Federated(Some(wings.as_slice())),
+    };
     let page = state
         .coordination
-        .inbox(&params.recipient, cursor, None, storage_limit, params.unacknowledged_only)
+        .inbox(&params.recipient, cursor, None, limit, params.unacknowledged_only, visibility)
         .map_err(coordination_storage_error)?;
-    let mut wing_cache: std::collections::HashMap<String, Option<String>> =
-        std::collections::HashMap::new();
-    let mut messages = Vec::new();
-    let mut last_examined_sequence: Option<i64> = None;
-    let mut consumed_whole_batch = true;
-    for message in page.messages {
-        if messages.len() >= limit {
-            consumed_whole_batch = false;
-            break;
-        }
-        last_examined_sequence = Some(message.sequence);
-        let task_wing = if let Some(cached) = wing_cache.get(&message.task_id) {
-            cached.clone()
-        } else {
-            let resolved = state.coordination.get_task(&message.task_id)?.map(|t| t.wing);
-            wing_cache.insert(message.task_id.clone(), resolved.clone());
-            resolved
-        };
-        if task_wing
-            .as_deref()
-            .is_some_and(|w| !is_diary_wing_or_room(w, "") && visibility.contains(w))
-        {
-            messages.push(message_to_dto(message)?);
-        }
-    }
-    let next_cursor = if consumed_whole_batch {
-        page.next_cursor.map(encode_coordination_cursor)
-    } else {
-        last_examined_sequence.map(|seq| encode_coordination_cursor(CoordinationCursor(seq)))
-    };
+    let messages = page.messages.into_iter().map(message_to_dto).collect::<Result<Vec<_>, _>>()?;
+    let next_cursor = page.next_cursor.map(encode_coordination_cursor);
     Ok(Json(InboxPageResponse { messages, next_cursor }))
 }
 
@@ -3391,27 +3371,37 @@ where
     // explicit `wing` filter is given but not visible, which yields an empty
     // page, not 403. See the module-level "Wing authorization" note for why
     // this never needs a wingless-event allowlist the way `/v1/changes` does.
-    let visibility = auth.0.visible_wings(Operation::CoordinationRead);
+    //
+    // The filter (including the diary hard-override) is enforced inside the
+    // storage query itself via `CoordinationVisibility`, not by filtering the
+    // already-`LIMIT`-bounded result afterwards: a post-fetch filter still
+    // lets `next_cursor` — derived from unfiltered rows — leak the existence
+    // and volume of records in wings this caller cannot see. Pushing `wing IN
+    // (...)` (and the diary exclusion) into the query, mirroring
+    // `route_drawers_list`'s `DrawerFilter::wings`, means an invisible row
+    // never reaches the LIMIT/cursor computation in the first place. An
+    // explicit `?wing=` naming an invisible or diary wing still yields an
+    // empty page here, not a 403 or an error: it intersects with an empty (or
+    // excluded) set and the query simply returns nothing.
+    let restrict_wings: Option<Vec<String>> = match auth.0.visible_wings(Operation::CoordinationRead)
+    {
+        WingVisibility::All => None,
+        WingVisibility::Only(wings) => Some(wings.into_iter().collect()),
+    };
+    let visibility = match &restrict_wings {
+        None => CoordinationVisibility::Federated(None),
+        Some(wings) => CoordinationVisibility::Federated(Some(wings.as_slice())),
+    };
 
     let page = state.coordination.events(
         cursor,
         params.task_id.as_deref(),
         wing.as_ref().map(WingId::as_str),
         limit,
+        visibility,
     )?;
     let next_cursor = page.next_cursor.map(encode_coordination_cursor);
-    let events = page
-        .events
-        .into_iter()
-        // The diary hard-override applies here too: `wing_agents` events
-        // never federate, regardless of the token's scope or an explicit
-        // `?wing=wing_agents` filter (which, since `event.wing` would then
-        // always equal it, yields an empty page — the same "filters to
-        // empty rather than reject" behaviour every other invisible-wing
-        // filter on this route already has).
-        .filter(|event| !is_diary_wing_or_room(&event.wing, "") && visibility.contains(&event.wing))
-        .map(event_to_dto)
-        .collect::<Result<Vec<_>, _>>()?;
+    let events = page.events.into_iter().map(event_to_dto).collect::<Result<Vec<_>, _>>()?;
     Ok(Json(CoordinationEventsResponse { events, next_cursor }))
 }
 
@@ -7658,6 +7648,218 @@ mod tests {
             .unwrap();
         assert_eq!(events_wing_resp.status(), StatusCode::OK);
         assert!(body_json(events_wing_resp).await["events"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn coordination_events_cursor_does_not_leak_invisible_wing_volume() {
+        let harness = make_harness().await;
+        // wing_secret is invisible to COORD_ALPHA_TOKEN (scoped to wing_alpha only). Seed two
+        // events in it — a pre-fix cursor computed over the unfiltered page would report
+        // `has_more: true` and hand back a real sequence number here, distinguishing "has
+        // events" from "empty" in a single request even though the response's own `events`
+        // list is (correctly) empty either way.
+        let secret_task = create_task(&harness, ALICE_TOKEN, "wing_secret", "leak-secret-1").await;
+        let claim_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                &format!("/v1/coordination/tasks/{secret_task}/claim"),
+                ALICE_TOKEN,
+                json!({"expected_revision": 0, "lease_seconds": 300}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(claim_resp.status(), StatusCode::OK);
+
+        let with_events = harness
+            .router
+            .clone()
+            .oneshot(authed_get(
+                "/v1/coordination/events?wing=wing_secret&limit=1",
+                COORD_ALPHA_TOKEN,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(with_events.status(), StatusCode::OK);
+
+        // A wing that genuinely has zero events must produce the identical body: same empty
+        // list, same null cursor — otherwise the cursor is an existence-and-volume oracle for
+        // wings this token cannot see, exactly the class of leak `4cac227` closed for
+        // `parent_id`/`dependencies`.
+        let without_events = harness
+            .router
+            .clone()
+            .oneshot(authed_get("/v1/coordination/events?wing=wing_ghost&limit=1", COORD_ALPHA_TOKEN))
+            .await
+            .unwrap();
+        assert_eq!(without_events.status(), StatusCode::OK);
+
+        assert_eq!(body_json(with_events).await, body_json(without_events).await);
+    }
+
+    #[tokio::test]
+    async fn coordination_events_cursor_does_not_leak_diary_wing_volume() {
+        let harness = make_harness().await;
+        // Seed two wing_agents events directly through storage — the HTTP create route refuses
+        // to create a task there at all (`coordination_task_create_in_wing_agents_is_rejected_with_422`).
+        let task = harness
+            .state
+            .coordination
+            .create_task(&NewTask {
+                title: "diary-shaped".into(),
+                description: "d".into(),
+                created_by: "alice".into(),
+                wing: "wing_agents".into(),
+                idempotency_key: "leak-diary-1".into(),
+                parent_id: None,
+                dependencies: vec![],
+                budget: None,
+                expires_at: None,
+            })
+            .expect("seed wing_agents task directly through storage");
+        harness
+            .state
+            .coordination
+            .send_message(&NewMessage {
+                task_id: task.task_id.clone(),
+                sender: "alice".into(),
+                recipient: "someone".into(),
+                kind: "status".into(),
+                payload: serde_json::json!({}),
+                idempotency_key: "leak-diary-message-1".into(),
+                envelope_version: 1,
+            })
+            .expect("seed message on the wing_agents task");
+
+        // ALICE_TOKEN is unrestricted, but the diary hard-override still applies unconditionally:
+        // an explicit `?wing=wing_agents` filter must be indistinguishable from a wing with no
+        // events at all, for every caller, not just a narrowly scoped one.
+        let with_events = harness
+            .router
+            .clone()
+            .oneshot(authed_get("/v1/coordination/events?wing=wing_agents&limit=1", ALICE_TOKEN))
+            .await
+            .unwrap();
+        assert_eq!(with_events.status(), StatusCode::OK);
+
+        let without_events = harness
+            .router
+            .clone()
+            .oneshot(authed_get(
+                "/v1/coordination/events?wing=wing_ghost_diary&limit=1",
+                ALICE_TOKEN,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(without_events.status(), StatusCode::OK);
+
+        assert_eq!(body_json(with_events).await, body_json(without_events).await);
+    }
+
+    #[tokio::test]
+    async fn coordination_events_pagination_of_own_wing_is_unaffected_by_interleaved_invisible_rows()
+     {
+        let harness = make_harness().await;
+        // Interleave wing_alpha (visible to COORD_ALPHA_TOKEN) and wing_beta (invisible) task
+        // creation so visible and invisible global sequence numbers alternate. This is the
+        // regression that matters most: a visibility filter applied incorrectly could shift or
+        // miscount the cursor boundary when invisible rows sit *between* visible ones, not just
+        // at the edges of the feed.
+        let alpha1 =
+            create_task(&harness, COORD_ALPHA_TOKEN, "wing_alpha", "interleave-alpha-1").await;
+        let _beta1 = create_task(&harness, ALICE_TOKEN, "wing_beta", "interleave-beta-1").await;
+        let alpha2 =
+            create_task(&harness, COORD_ALPHA_TOKEN, "wing_alpha", "interleave-alpha-2").await;
+        let _beta2 = create_task(&harness, ALICE_TOKEN, "wing_beta", "interleave-beta-2").await;
+        let alpha3 =
+            create_task(&harness, COORD_ALPHA_TOKEN, "wing_alpha", "interleave-alpha-3").await;
+
+        let mut seen = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let uri = match &cursor {
+                Some(c) => format!("/v1/coordination/events?limit=1&cursor={}", urlencoded(c)),
+                None => "/v1/coordination/events?limit=1".to_owned(),
+            };
+            let resp =
+                harness.router.clone().oneshot(authed_get(&uri, COORD_ALPHA_TOKEN)).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let page = body_json(resp).await;
+            let events = page["events"].as_array().unwrap().clone();
+            assert!(events.len() <= 1);
+            seen.extend(events);
+            let next = page["next_cursor"].as_str().map(str::to_owned);
+            assert!(seen.len() <= 20, "paging should terminate well before this");
+            match next {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        assert!(
+            seen.iter().all(|e| e["wing"] == "wing_alpha"),
+            "an invisible wing must never surface, interleaved or not"
+        );
+        assert_eq!(
+            seen.len(),
+            3,
+            "task_created for each of the three alpha tasks, none skipped or duplicated"
+        );
+        assert_eq!(seen[0]["entity_id"], alpha1);
+        assert_eq!(seen[1]["entity_id"], alpha2);
+        assert_eq!(seen[2]["entity_id"], alpha3);
+    }
+
+    #[tokio::test]
+    async fn coordination_inbox_cursor_does_not_leak_invisible_wing_recipient_volume() {
+        let harness = make_harness().await;
+        // wing_secret is invisible to COORD_ALPHA_TOKEN. Seed three messages to a recipient
+        // name COORD_ALPHA_TOKEN merely guesses at — `recipient` is compared against no
+        // identity, by design, so any coordination_read token may probe any recipient string.
+        let secret_task =
+            create_task(&harness, ALICE_TOKEN, "wing_secret", "leak-inbox-secret-1").await;
+        for key in ["leak-inbox-1", "leak-inbox-2", "leak-inbox-3"] {
+            let resp = harness
+                .router
+                .clone()
+                .oneshot(authed_json_request(
+                    Method::POST,
+                    "/v1/coordination/messages",
+                    ALICE_TOKEN,
+                    json!({
+                        "task_id": secret_task, "recipient": "victim_agent", "kind": "status",
+                        "payload": {}, "idempotency_key": key,
+                    }),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+
+        let with_messages = harness
+            .router
+            .clone()
+            .oneshot(authed_get(
+                "/v1/coordination/inbox?recipient=victim_agent&limit=1",
+                COORD_ALPHA_TOKEN,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(with_messages.status(), StatusCode::OK);
+
+        // A recipient with genuinely zero messages must produce the identical body.
+        let without_messages = harness
+            .router
+            .clone()
+            .oneshot(authed_get(
+                "/v1/coordination/inbox?recipient=victim_ghost&limit=1",
+                COORD_ALPHA_TOKEN,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(without_messages.status(), StatusCode::OK);
+
+        assert_eq!(body_json(with_messages).await, body_json(without_messages).await);
     }
 
     #[tokio::test]

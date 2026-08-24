@@ -30,7 +30,8 @@ use mempalace_graph::{
 use mempalace_search::{SearchRuntime, SearchRuntimePolicy};
 use mempalace_storage::{
     AgentLineageRecord, ChangeEvent, ChangeLogStore, CoordinationCursor, CoordinationStore,
-    DiaryStore, DrawerFilter, DrawerStore, DuplicateStrategy, IngestCommitRequest,
+    CoordinationVisibility, DiaryStore, DrawerFilter, DrawerStore, DuplicateStrategy,
+    IngestCommitRequest,
     DelegationStore, LineageMigrationRecord, NewArtifact, NewCheckpoint, NewMessage, NewSkill,
     NewSkillOutcome, NewSpan, NewTask, NewTaskResult, RevisionedWrite, SelfModelStore,
     SelfObservationRecord, SelfObservationScope, SelfObservationStatus, SkillScope, SkillStatus,
@@ -3374,13 +3375,24 @@ where
     /// comment in `federation.rs` for why. `write` can only ever resolve to `Local` or
     /// `Remote` here, never `Both` (rejected at config load).
     async fn tool_task_create(&mut self, arguments: &Value) -> ToolResult<Value> {
-        let input: NewTask = parse_coordination_input(arguments)?;
+        let mut input: NewTask = parse_coordination_input(arguments)?;
+        // Normalise the wing once, up front, and use that canonical value for BOTH the routing
+        // decision and the outgoing request (local or remote). `resolve_coordination_route` is
+        // keyed on the raw string it is given; routing on the un-normalised caller input would
+        // let a short form like `"agents"` slip past the `wing_agents` diary hard-override and
+        // past an operator's explicit `federation.coordination["wing_x"]` pin (see the security
+        // fix notes in `docs/Federation.md`). Layer 2 (`resolve_coordination_route` itself) also
+        // normalises defensively, but this is the fix that matters: it is also what stops the
+        // raw wing from ever reaching the wire.
+        let wing = parse_wing_id(&input.wing)?;
+        input.wing = wing.as_str().to_owned();
         if let Some(router) = &self.federation {
-            let route = router.resolve_coordination_route(&input.wing);
+            let route = router.resolve_coordination_route(input.wing.as_str());
             if router.resolve_write_target(&route) == WriteTarget::Remote {
                 let remote_name = route.remote.clone().unwrap_or_else(|| "remote".to_owned());
-                let req: WireNewTaskRequest = serde_json::from_value(arguments.clone())
+                let mut req: WireNewTaskRequest = serde_json::from_value(arguments.clone())
                     .map_err(|e| ToolError::InvalidParams(e.to_string()))?;
+                req.wing = input.wing.clone();
                 return router.coordination_task_create_remote(&remote_name, req).await;
             }
         }
@@ -3584,6 +3596,11 @@ where
                 wing.as_deref(),
                 limit,
                 unacknowledged_only,
+                // The MCP surface has no HTTP caller identity to scope against — it is the
+                // local agent talking to its own palace — so it is always fully trusted,
+                // diary included. See `CoordinationVisibility::Trusted`'s doc comment: this
+                // variant must never be used for an HTTP-authenticated caller.
+                CoordinationVisibility::Trusted,
             )
             .map_tool_internal()?;
         let mut payload = json!(page);
@@ -3687,6 +3704,8 @@ where
                 task_id.as_deref(),
                 wing.as_deref(),
                 limit,
+                // Fully trusted local caller — see the identical note in `tool_inbox_read`.
+                CoordinationVisibility::Trusted,
             )
             .map_tool_internal()?;
         let mut payload = json!(page);
@@ -5098,6 +5117,139 @@ mod tests {
             .await;
         let task = decode_tool_payload(&created).expect("task payload");
         assert_eq!(task["wing"], "wing_myproject");
+    }
+
+    /// Regression test for the coordination wing-normalisation security fix (Impact A): a
+    /// caller-supplied short/mixed-case spelling of `wing_agents` must still hit the diary
+    /// hard-override and resolve local, even when `default_mode` is `remote`. Before the fix,
+    /// `tool_task_create` routed on the raw, un-normalised wing string, so `"agents"` did not
+    /// `==` `wing_agents`, missed the override, and fell through to `default_mode: remote` —
+    /// shipping the task body to the configured remote before the peer's own normalisation
+    /// could reject it.
+    ///
+    /// Asserts on the mock's call counter, not on the tool's result: a bare "task was created"
+    /// check can pass even when the write went remote (the remote could still accept it, or a
+    /// local fallback could mask it), so the only thing that actually proves the remote was
+    /// never touched is the recording mock's `coordination_calls` counter staying at zero — the
+    /// same pattern `coordination_fallback_records_zero_remote_calls_without_coordination_federation_config`
+    /// in `federation.rs` uses for the sibling ID-discovery fallback.
+    #[tokio::test]
+    async fn task_create_wing_agents_short_form_stays_local_and_never_calls_remote() {
+        for raw_wing in ["agents", "Wing_Agents", " wing_agents "] {
+            let remote = LibMockRemote::default();
+            let calls = std::sync::Arc::clone(&remote.coordination_calls);
+            let mut remotes: BTreeMap<String, Arc<dyn mempalace_remote::RemoteApi>> =
+                BTreeMap::new();
+            remotes.insert("hub".to_owned(), Arc::new(remote));
+            let mut rules_remotes = BTreeMap::new();
+            for name in remotes.keys() {
+                rules_remotes.insert(
+                    name.clone(),
+                    ResolvedRemote {
+                        name: name.clone(),
+                        url: "https://test.example".to_owned(),
+                        token: None,
+                        timeout: std::time::Duration::from_secs(5),
+                    },
+                );
+            }
+            let rules = FederationRuntimeConfig {
+                remotes: rules_remotes,
+                default_mode: RouteMode::Remote,
+                default_remote: Some("hub".to_owned()),
+                wings: BTreeMap::new(),
+                kg: None,
+                coordination: BTreeMap::new(),
+            };
+            let router = FederationRouter::with_remotes(rules, remotes);
+            let harness = test_harness_with_mock_router(router).await;
+
+            let created = harness
+                .server
+                .handle_request(tool_call(
+                    920,
+                    "mempalace_task_create",
+                    json!({
+                        "title":"Research", "description":"Produce a result", "created_by":"manager",
+                        "wing": raw_wing,
+                        "idempotency_key": format!("agents-bypass-{raw_wing}")
+                    }),
+                ))
+                .await;
+            decode_tool_payload(&created).unwrap_or_else(|| {
+                panic!("expected a successful local task for wing {raw_wing:?}, got: {created}")
+            });
+            let observed = calls.load(std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(
+                observed, 0,
+                "wing {raw_wing:?} must resolve local via the wing_agents diary hard-override \
+                 and must never reach the remote, got {observed} remote call(s)"
+            );
+        }
+    }
+
+    /// Regression test for the coordination wing-normalisation security fix (Impact B): an
+    /// operator's explicit `federation.coordination["wing_secret"]: { mode: local }` pin must
+    /// still apply when the caller passes the short form `"secret"`, even though
+    /// `default_mode` is `remote`. Before the fix, routing was keyed on the raw string, so the
+    /// map lookup for `"secret"` missed the canonical `"wing_secret"` key entirely and fell
+    /// through to `default_mode: remote`, silently ignoring the pin and persisting the task on
+    /// the remote with no local record at all.
+    ///
+    /// As above, this asserts on the recording mock's call count, not on the result.
+    #[tokio::test]
+    async fn task_create_respects_an_explicit_local_pin_under_a_short_wing_form() {
+        let remote = LibMockRemote::default();
+        let calls = std::sync::Arc::clone(&remote.coordination_calls);
+        let mut remotes: BTreeMap<String, Arc<dyn mempalace_remote::RemoteApi>> = BTreeMap::new();
+        remotes.insert("hub".to_owned(), Arc::new(remote));
+        let mut rules_remotes = BTreeMap::new();
+        for name in remotes.keys() {
+            rules_remotes.insert(
+                name.clone(),
+                ResolvedRemote {
+                    name: name.clone(),
+                    url: "https://test.example".to_owned(),
+                    token: None,
+                    timeout: std::time::Duration::from_secs(5),
+                },
+            );
+        }
+        let mut coordination = BTreeMap::new();
+        coordination.insert(
+            "wing_secret".to_owned(),
+            ResolvedRouteRule { mode: RouteMode::Local, remote: None, write: WriteTarget::Local },
+        );
+        let rules = FederationRuntimeConfig {
+            remotes: rules_remotes,
+            default_mode: RouteMode::Remote,
+            default_remote: Some("hub".to_owned()),
+            wings: BTreeMap::new(),
+            kg: None,
+            coordination,
+        };
+        let router = FederationRouter::with_remotes(rules, remotes);
+        let harness = test_harness_with_mock_router(router).await;
+
+        let created = harness
+            .server
+            .handle_request(tool_call(
+                921,
+                "mempalace_task_create",
+                json!({
+                    "title":"Research", "description":"Produce a result", "created_by":"manager",
+                    "wing":"secret", "idempotency_key":"secret-local-pin-1"
+                }),
+            ))
+            .await;
+        decode_tool_payload(&created)
+            .unwrap_or_else(|| panic!("expected a successful local task for wing \"secret\", got: {created}"));
+        let observed = calls.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            observed, 0,
+            "an explicit federation.coordination[\"wing_secret\"] local pin must not be bypassed \
+             by the short-form wing spelling \"secret\", got {observed} remote call(s)"
+        );
     }
 
     #[tokio::test]
@@ -8234,6 +8386,11 @@ mod tests {
         changes_next_cursor: Option<String>,
         search_results: Vec<mempalace_federation::RemoteDrawerResult>,
         fail: bool,
+        /// Bumped by every `coordination_*` method this mock implements. Lets a test assert a
+        /// coordination write never reached the remote at all — see
+        /// `MockRemote::coordination_calls` in `federation.rs` for why a bare result check is
+        /// not sufficient on its own.
+        coordination_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl Default for LibMockRemote {
@@ -8243,6 +8400,7 @@ mod tests {
                 changes_next_cursor: None,
                 search_results: vec![],
                 fail: false,
+                coordination_calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             }
         }
     }
@@ -8345,6 +8503,17 @@ mod tests {
             &self,
             _req: mempalace_federation::IngestBatchRequest,
         ) -> mempalace_remote::Result<mempalace_federation::IngestBatchResponse> {
+            Err(mempalace_remote::RemoteError::Unreachable {
+                remote: "mock".to_owned(),
+                message: "not used".to_owned(),
+            })
+        }
+        async fn coordination_task_create(
+            &self,
+            req: mempalace_federation::NewTaskRequest,
+        ) -> mempalace_remote::Result<mempalace_federation::CoordinationTaskDto> {
+            self.coordination_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = req;
             Err(mempalace_remote::RemoteError::Unreachable {
                 remote: "mock".to_owned(),
                 message: "not used".to_owned(),

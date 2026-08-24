@@ -285,6 +285,64 @@ gains coordination categories and — unlike today, where it is dead code called
    produced exactly the confusable shape the design was trying to avoid, so a dedicated variant
    carries the remote name and the missing capability string instead.
 
+6. **Post-implementation fix: `resolve_coordination_route` was keyed on the raw, un-normalised
+   wing string, not the canonical form.** `tool_task_create` called `resolve_coordination_route`
+   with `input.wing` straight off the wire, before `WingId::normalized` ran (normalisation
+   happened only later, inside the local store's own write path, and not at all on the branch
+   that routes remote). Every other routing path in the palace (`tool_add_drawer` → `parse_wing_id`
+   → `resolve_drawer_route`) normalises before routing; coordination's wing-carrying tool did not.
+   Two concrete failures followed: a short/mixed-case spelling of `wing_agents` (`"agents"`,
+   `"Wing_Agents"`) did not `==` the literal compared against in the diary hard-override, so it
+   fell through to `default_mode` and could route the diary wing to a configured remote before the
+   server-side check in [Wing is the authorization key](Federation.md#wing-is-the-authorization-key)
+   ever saw it; and a short-form spelling of an operator's explicit `federation.coordination["wing_x"]:
+   { mode: local }` pin missed the map lookup for the same reason, silently persisting the task
+   remotely instead of honoring the pin. Fixed in three layers: `tool_task_create` now normalises
+   the wing once via `parse_wing_id` and uses that canonical value for both the route decision and
+   the outgoing request (local or remote); `resolve_coordination_route` normalises defensively a
+   second time and fails closed to `local_rule()` — not `default_mode` — on a wing it cannot
+   normalise at all, since a routing decision that gates data egress must refuse to guess; and
+   `resolve_federation_config` now rejects a non-canonical `federation.coordination` key at load
+   rather than silently normalising it, because normalising the key would retroactively activate a
+   rule that is inert in every config written before this fix. See
+   `crates/mempalace-mcp/src/lib.rs` (`tool_task_create`), `crates/mempalace-config/src/federation.rs`
+   (`resolve_coordination_route`, `resolve_federation_config`), and the corresponding tests in both
+   files.
+
+7. **Post-implementation fix: `GET /v1/coordination/events` and `GET /v1/coordination/inbox`
+   computed `next_cursor` over unfiltered rows, leaking cross-wing existence and volume.** Both
+   feeds filtered to the caller's visible wings (and excluded the shared diary wing,
+   `wing_agents`) only *after* storage had already applied its `LIMIT`/cursor boundary to the
+   unfiltered row set. A caller could not see an invisible row in the response, but the
+   *cursor* was still derived from it: an explicit `?wing=` naming a wing the token cannot see
+   returned `next_cursor: null` when that wing had no rows, and a real sequence number when it
+   had two or more — deterministically distinguishable in one request, with no unguessable ID
+   involved, since wing names are operator-chosen. The same shape applied to
+   `GET /v1/coordination/inbox`'s unfiltered branch against a guessed `recipient` string. This is
+   the same failure class deviation 6 and `4cac227` already closed elsewhere on this branch
+   (`parent_id`/`dependencies` in task creation): an existence oracle through a channel that
+   looks unrelated to the actual response body.
+
+   Fixed by pushing wing visibility (and the diary exclusion) into the storage query itself,
+   mirroring `route_drawers_list`'s use of `DrawerFilter::wings`: `CoordinationStore::events` and
+   `CoordinationStore::inbox` now take a `CoordinationVisibility` parameter applied to the SQL
+   predicate before the `LIMIT`/cursor boundary is computed, so an invisible row can never
+   influence `next_cursor`. `CoordinationVisibility` has no "empty means unconstrained" footgun
+   the way `DrawerFilter::wings` does: it is `Trusted` (no restriction at all, including the
+   diary wing — reserved for the local MCP surface, which has no HTTP identity to scope against)
+   or `Federated(Option<&[String]>)`, where `Federated(Some(&[]))` is an explicit, handled
+   "nothing is visible" and the diary wing is always excluded regardless of what the restriction
+   list contains. Pushing filtering into the query also let the inbox route's over-fetch/post-filter
+   loop (added for a different bug — a client silently skipping a visible message when the loop
+   stopped early, tracked by `last_examined_sequence`) be deleted entirely: storage's own
+   `has_more`/cursor boundary is now computed over the already-filtered set, so "examined
+   everything" and "storage's page boundary" always agree.
+   `coordination_inbox_cursor_does_not_skip_the_second_visible_message` still exercises that
+   at-least-once-delivery property and passes unchanged. See
+   `crates/mempalace-storage/src/coordination.rs` (`CoordinationVisibility`, `events`, `inbox`)
+   and `crates/mempalace-server/src/lib.rs` (`route_coordination_events`,
+   `route_coordination_inbox`).
+
 ## Stage 5 — A2A adapter
 
 A new crate, `mempalace-a2a`, depending on `mempalace-storage` and `mempalace-federation` and

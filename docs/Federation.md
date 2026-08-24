@@ -689,6 +689,15 @@ reach it through their mandatory `task_id`, same as locally (see
   `/v1/changes` feed, there is no "wing could not be determined" case to reason
   about; filtering fails closed simply because an unlisted wing is never in the
   visible set.
+- **Filtering happens before the pagination cursor is computed, not after.** Wing
+  visibility (and the `wing_agents` exclusion above) is enforced inside the storage
+  query for both feeds, so an invisible row never reaches the `LIMIT`/cursor
+  boundary in the first place. `next_cursor` is therefore always computed over the
+  rows this caller can actually see: it cannot be used to learn whether a hidden
+  wing has more rows than fit on the current page, or how many rows it has at all.
+  An explicit `?wing=` naming an invisible or diary wing that genuinely has rows
+  returns the identical `next_cursor: null` a wing with zero rows returns. See
+  [Coordination-Phase-3-Design.md](Coordination-Phase-3-Design.md) (deviation 7).
 - **An idempotency-key replay re-authorizes the record it actually returns.**
   `POST /v1/coordination/tasks`, `.../messages`, `.../artifacts`, and `.../results`
   are idempotent on `(actor, idempotency_key)`: replaying a key returns the
@@ -844,6 +853,21 @@ regardless of any `federation.coordination` entry.
 }
 ```
 
+**The routed wing is normalised before either the diary check or the table lookup runs.**
+`mempalace_task_create` calls `WingId::normalized` on the caller-supplied wing once, up front,
+and uses that canonical value for the route decision *and* for the outgoing request (local or
+remote) alike — a short or mixed-case spelling (`"agents"`, `"Wing_Agents"`, `"myproject"`) is
+routed exactly as its canonical form (`wing_agents`, `wing_myproject`) would be. This matters
+because `resolve_coordination_route`'s diary check and its `federation.coordination` map lookup
+are both plain string comparisons against the canonical `wing_*` form; routing on a raw,
+un-normalised string could otherwise let a short-form `wing_agents` spelling slip past the diary
+hard-override, or let a short-form spelling of an operator's explicit `local`-pinned wing miss
+the map and fall through to `default_mode`. `resolve_coordination_route` itself also normalises
+defensively, so the guard holds even if some future caller forgets to normalise first; when the
+given wing cannot be normalised at all, it resolves local rather than falling through to
+`default_mode`, since a routing decision that gates data egress must fail closed, not open, on
+an input it cannot canonicalize.
+
 **`mempalace_task_create` is the one wing-routed write.** It is also the only coordination
 request that carries a wing at all — every other coordination tool (`mempalace_task_get`,
 `mempalace_task_claim`, `mempalace_message_send`, and so on) acts on an existing task,
@@ -904,6 +928,14 @@ authoritative in exactly one (see the no-multi-master non-goal in
 `write: remote` on the `federation.coordination` entry instead — the identical `write: both`
 setting on the corresponding `federation.wings` entry, for drawers, is unaffected and stays
 legal.
+
+### `federation.coordination.<key> is not in canonical wing form`
+A hard config-load error: `federation.coordination` keys must already be in canonical `wing_*`
+form (trimmed, lowercased, `wing_`-prefixed) — the error names the canonical spelling to use.
+This is deliberately not auto-corrected: a non-canonical key never matched any resolved,
+normalised wing before this check existed, so it was already inert (silently falling through to
+`default_mode`), and silently rewriting it would activate a rule that was dead in the config as
+written. Fix the key to its canonical form. `federation.wings` keys are not checked this way.
 
 ### Search results from a remote wing are all stale placeholders
 The hub has no `server.checkouts` entry for that wing. Add the mapping and restart

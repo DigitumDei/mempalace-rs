@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use mempalace_core::WingId;
+use mempalace_core::{SHARED_AGENT_DIARY_WING, WingId};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -275,6 +275,39 @@ pub struct CoordinationEventPage {
 pub struct InboxPage {
     pub messages: Vec<Message>,
     pub next_cursor: Option<CoordinationCursor>,
+}
+
+/// Wing visibility to enforce inside [`CoordinationStore::events`] and
+/// [`CoordinationStore::inbox`] *before* the SQL `LIMIT`/cursor boundary is computed.
+///
+/// This exists because a filter applied only after the query returns still leaks: `next_cursor`
+/// computed over rows the caller cannot see (or over a `has_more` flag derived from them)
+/// reveals the existence and volume of records in wings outside the caller's scope, even when
+/// every row in the *response* is correctly filtered. See
+/// `docs/Coordination-Phase-3-Design.md` for the incident this closes.
+///
+/// There is deliberately no "empty means unconstrained" case here (unlike
+/// [`crate::types::DrawerFilter::wings`]): the two variants below are the only way to express
+/// visibility, and an explicit empty restriction (`Federated(Some(&[]))`) always means "nothing
+/// is visible", never "everything is".
+#[derive(Debug, Clone, Copy)]
+pub enum CoordinationVisibility<'a> {
+    /// No restriction at all, including the shared diary wing
+    /// ([`mempalace_core::SHARED_AGENT_DIARY_WING`]).
+    ///
+    /// Reserved for fully trusted, non-HTTP callers — in practice, the local MCP surface, which
+    /// has no bearer-token identity to scope against. Never construct this for an
+    /// HTTP-authenticated (federation) caller.
+    Trusted,
+    /// Every federation HTTP route, scoped or not. The shared diary wing is always excluded
+    /// here, matching the existing hard override in `is_diary_wing_or_room` — no token, however
+    /// unrestricted, may see it through this feed.
+    ///
+    /// - `None`: every other wing is visible (an unrestricted federation token).
+    /// - `Some(wings)`: only the wings named in `wings` (already normalised) are visible, on top
+    ///   of the diary exclusion above. `Some(&[])` is a deliberate, explicit "nothing is
+    ///   visible" and is handled as such — it is never read as "no restriction".
+    Federated(Option<&'a [String]>),
 }
 
 /// SQLite-backed transactional coordination repository.
@@ -663,18 +696,51 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
         wing: Option<&str>,
         limit: usize,
         unacknowledged_only: bool,
+        visibility: CoordinationVisibility<'_>,
     ) -> Result<InboxPage> {
+        // An explicit, empty restriction means nothing is visible at all — short-circuit before
+        // touching storage rather than build a `t.wing IN ()` clause (which SQLite would treat
+        // differently across builds, and which is misleading to read as "restrict to nothing"
+        // in the first place).
+        if let CoordinationVisibility::Federated(Some(wings)) = visibility {
+            if wings.is_empty() {
+                return Ok(InboxPage { messages: Vec::new(), next_cursor: None });
+            }
+        }
         let conn = self.connection()?;
         let requested = limit.clamp(1, 500);
         let mut sql = "SELECT m.message_id,m.sequence,m.task_id,m.sender,m.recipient,m.kind,m.payload_json,m.envelope_version,m.acknowledged_at,m.acknowledged_by,m.created_at FROM coordination_messages m".to_owned();
         let mut predicates = vec!["m.recipient=?1".to_owned(), "m.sequence>?2".to_owned()];
         let mut bindings: Vec<Box<dyn rusqlite::ToSql>> =
             vec![Box::new(recipient.to_owned()), Box::new(cursor.map_or(0, |c| c.0))];
+        // The task join is needed whenever an explicit wing filter or a `Federated` visibility
+        // restriction requires comparing against the owning task's wing; a `Trusted` caller with
+        // no wing filter never needs it.
+        let needs_task_join = wing.is_some() || !matches!(visibility, CoordinationVisibility::Trusted);
+        if needs_task_join {
+            sql.push_str(" JOIN coordination_tasks t ON t.task_id=m.task_id");
+        }
         if let Some(wing) = wing {
             let normalized = WingId::normalized(wing)?.to_string();
-            sql.push_str(" JOIN coordination_tasks t ON t.task_id=m.task_id");
             bindings.push(Box::new(normalized));
             predicates.push(format!("t.wing=?{}", bindings.len()));
+        }
+        match visibility {
+            CoordinationVisibility::Trusted => {}
+            CoordinationVisibility::Federated(restrict) => {
+                bindings.push(Box::new(SHARED_AGENT_DIARY_WING.to_owned()));
+                predicates.push(format!("t.wing<>?{}", bindings.len()));
+                if let Some(wings) = restrict {
+                    let placeholders = wings
+                        .iter()
+                        .map(|w| {
+                            bindings.push(Box::new(w.clone()));
+                            format!("?{}", bindings.len())
+                        })
+                        .collect::<Vec<_>>();
+                    predicates.push(format!("t.wing IN ({})", placeholders.join(",")));
+                }
+            }
         }
         if unacknowledged_only {
             predicates.push("m.acknowledged_at IS NULL".to_owned());
@@ -824,7 +890,15 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
         task_id: Option<&str>,
         wing: Option<&str>,
         limit: usize,
+        visibility: CoordinationVisibility<'_>,
     ) -> Result<CoordinationEventPage> {
+        // See the identical short-circuit in `inbox`: an explicit, empty restriction means
+        // nothing is visible, and must never fall through to an unconstrained query.
+        if let CoordinationVisibility::Federated(Some(wings)) = visibility {
+            if wings.is_empty() {
+                return Ok(CoordinationEventPage { events: Vec::new(), next_cursor: None });
+            }
+        }
         let conn = self.connection()?;
         let requested = limit.clamp(1, 500);
         let mut predicates = vec!["sequence>?1".to_owned()];
@@ -837,6 +911,23 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
             let normalized = WingId::normalized(wing)?.to_string();
             bindings.push(Box::new(normalized));
             predicates.push(format!("wing=?{}", bindings.len()));
+        }
+        match visibility {
+            CoordinationVisibility::Trusted => {}
+            CoordinationVisibility::Federated(restrict) => {
+                bindings.push(Box::new(SHARED_AGENT_DIARY_WING.to_owned()));
+                predicates.push(format!("wing<>?{}", bindings.len()));
+                if let Some(wings) = restrict {
+                    let placeholders = wings
+                        .iter()
+                        .map(|w| {
+                            bindings.push(Box::new(w.clone()));
+                            format!("?{}", bindings.len())
+                        })
+                        .collect::<Vec<_>>();
+                    predicates.push(format!("wing IN ({})", placeholders.join(",")));
+                }
+            }
         }
         bindings.push(Box::new((requested + 1) as i64));
         let sql = format!(
@@ -1326,7 +1417,8 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
             s.claim_task(&t.task_id, "b", claimed.revision, Duration::minutes(1)).expect("reclaim"),
         );
         assert_eq!(reclaimed.owner.as_deref(), Some("b"));
-        let events = s.events(None, Some(&t.task_id), None, 20).expect("events");
+        let events =
+            s.events(None, Some(&t.task_id), None, 20, CoordinationVisibility::Trusted).expect("events");
         assert_eq!(events.events.len(), 3);
         let event = events.events.first().expect("event").clone();
         assert_eq!(s.get_event(&event.event_id).expect("exact event"), Some(event));
@@ -1724,20 +1816,27 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
             })
             .expect("message");
         }
-        let first = s.inbox("receiver", None, None, 1, false).expect("first inbox page");
+        let first = s
+            .inbox("receiver", None, None, 1, false, CoordinationVisibility::Trusted)
+            .expect("first inbox page");
         assert_eq!(first.messages.len(), 1);
         assert!(first.next_cursor.is_some());
-        let last =
-            s.inbox("receiver", first.next_cursor, None, 1, false).expect("last inbox page");
+        let last = s
+            .inbox("receiver", first.next_cursor, None, 1, false, CoordinationVisibility::Trusted)
+            .expect("last inbox page");
         assert_eq!(last.messages.len(), 1);
         assert_eq!(last.next_cursor, None);
 
-        let first_events = s.events(None, Some(&t.task_id), None, 1).expect("first event page");
+        let first_events = s
+            .events(None, Some(&t.task_id), None, 1, CoordinationVisibility::Trusted)
+            .expect("first event page");
         assert_eq!(first_events.events.len(), 1);
         assert!(first_events.next_cursor.is_some());
         let mut cursor = first_events.next_cursor;
         while cursor.is_some() {
-            let page = s.events(cursor, Some(&t.task_id), None, 500).expect("event page");
+            let page = s
+                .events(cursor, Some(&t.task_id), None, 500, CoordinationVisibility::Trusted)
+                .expect("event page");
             cursor = page.next_cursor;
         }
     }
@@ -1768,7 +1867,9 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
         // palace get a real wing, not the reserved one.
         let fresh = task_with_wing(&store, "alpha", "post-upgrade-1");
         assert_eq!(fresh.wing, "wing_alpha");
-        let events = store.events(None, Some(&fresh.task_id), None, 10).expect("events");
+        let events = store
+            .events(None, Some(&fresh.task_id), None, 10, CoordinationVisibility::Trusted)
+            .expect("events");
         assert_eq!(events.events.first().expect("event").wing, "wing_alpha");
     }
 
@@ -1951,7 +2052,9 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
 
         // Note that none of NewMessage, NewArtifact, or NewTaskResult has a `wing` field at
         // all — there is no code path through which a caller could supply one.
-        let page = s.events(None, Some(&t.task_id), None, 50).expect("events");
+        let page = s
+            .events(None, Some(&t.task_id), None, 50, CoordinationVisibility::Trusted)
+            .expect("events");
         assert_eq!(
             page.events.len(),
             6,
@@ -1992,25 +2095,72 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
 
         // The filter uses the unprefixed spelling; it must still match the normalised,
         // `wing_`-prefixed value that was actually stored.
-        let alpha_events = s.events(None, None, Some("alpha"), 100).expect("alpha events");
+        let alpha_events = s
+            .events(None, None, Some("alpha"), 100, CoordinationVisibility::Trusted)
+            .expect("alpha events");
         assert!(!alpha_events.events.is_empty());
         assert!(
             alpha_events.events.iter().all(|e| e.task_id.as_deref() == Some(alpha.task_id.as_str())),
             "an alpha wing filter must not leak beta's events"
         );
 
-        let alpha_inbox = s.inbox("worker", None, Some("alpha"), 100, false).expect("alpha inbox");
+        let alpha_inbox = s
+            .inbox("worker", None, Some("alpha"), 100, false, CoordinationVisibility::Trusted)
+            .expect("alpha inbox");
         assert_eq!(alpha_inbox.messages.len(), 1);
         assert_eq!(alpha_inbox.messages[0].task_id, alpha.task_id);
 
         // The already-prefixed spelling must match too, on both sides of the earlier asymmetry.
-        let beta_inbox =
-            s.inbox("worker", None, Some("wing_beta"), 100, false).expect("beta inbox");
+        let beta_inbox = s
+            .inbox("worker", None, Some("wing_beta"), 100, false, CoordinationVisibility::Trusted)
+            .expect("beta inbox");
         assert_eq!(beta_inbox.messages.len(), 1);
         assert_eq!(beta_inbox.messages[0].task_id, beta.task_id);
 
         // No filter at all still returns both.
-        let unfiltered = s.inbox("worker", None, None, 100, false).expect("unfiltered inbox");
+        let unfiltered = s
+            .inbox("worker", None, None, 100, false, CoordinationVisibility::Trusted)
+            .expect("unfiltered inbox");
         assert_eq!(unfiltered.messages.len(), 2);
+    }
+
+    /// `Federated(Some(&[]))` is an explicit "nothing is visible" and must short-circuit to an
+    /// empty page for both feeds — never silently read as "unconstrained" the way an empty
+    /// `DrawerFilter::wings` is. Regression test for the shape `CoordinationVisibility` was
+    /// deliberately designed to make impossible to get wrong.
+    #[test]
+    fn federated_visibility_with_empty_wing_list_sees_nothing() {
+        let (_d, s) = store();
+        let t = task_with_wing(&s, "alpha", "empty-visibility-task");
+        s.send_message(&NewMessage {
+            task_id: t.task_id.clone(),
+            sender: "manager".into(),
+            recipient: "worker".into(),
+            kind: "handoff".into(),
+            payload: serde_json::json!({}),
+            idempotency_key: "empty-visibility-msg".into(),
+            envelope_version: 1,
+        })
+        .expect("message");
+
+        let empty: Vec<String> = Vec::new();
+        let events = s
+            .events(None, None, None, 100, CoordinationVisibility::Federated(Some(&empty)))
+            .expect("events");
+        assert!(events.events.is_empty());
+        assert_eq!(events.next_cursor, None);
+
+        let inbox = s
+            .inbox(
+                "worker",
+                None,
+                None,
+                100,
+                false,
+                CoordinationVisibility::Federated(Some(&empty)),
+            )
+            .expect("inbox");
+        assert!(inbox.messages.is_empty());
+        assert_eq!(inbox.next_cursor, None);
     }
 }

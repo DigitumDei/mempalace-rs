@@ -496,6 +496,71 @@ gains coordination categories and — unlike today, where it is dead code called
     `coordination_inbox_remote_cursors_round_trip_paginates_without_repeats` in
     `crates/mempalace-mcp/tests/federation_e2e.rs`.
 
+14. **Post-implementation fix: `mempalace_inbox_read`/`mempalace_coordination_events`'s
+    aggregate fan-outs still queried every configured remote, not just the ones actually named
+    by a `federation.coordination` rule.** `coordination_events_fanout` and
+    `coordination_inbox_fanout` correctly gated on `coordination_federation_enabled()` and the
+    `wing_agents` diary suppression (deviations already covering that), but their loop bodies
+    still iterated `&self.remotes` unfiltered — unlike the three ID-discovery fallbacks
+    (`coordination_read_fallback`, `coordination_write_fallback`,
+    `coordination_task_revisioned_fallback`), which already narrow to
+    `coordination_candidate_remotes()`. Once any wing had a coordination rule, both aggregate
+    tools sent the recipient/wing/task_id filter to every configured remote, including ones
+    wired up only for drawer or KG federation and never referenced by coordination configuration
+    at all — such a remote's correct `CapabilityMissing` decline was then recorded as
+    `{"unreachable": true, ...}`, misreporting "never configured for this" as "currently down".
+
+    This is the third time this exact seam — the candidate-narrowing fallbacks and the
+    aggregate fan-outs living as parallel, hand-synchronised code paths in
+    `crates/mempalace-mcp/src/federation.rs` — was fixed on one family and missed on the other:
+    deviation-adjacent fix `bd7cd21` added the opt-in/diary gate to the fan-outs after it shipped
+    on the fallbacks first, then a later fix added the candidate-set narrowing to the three
+    fallbacks while leaving both fan-outs iterating every configured remote.
+
+    Fixed two ways. First, both fan-out loops now iterate `coordination_candidates()`, a single
+    helper method that yields `self.remotes` filtered to `coordination_candidate_remotes()` — the
+    same set the three fallbacks already used via a hand-copied filter, now backed by one
+    implementation all five loops share, so a future change to the candidate rule (or a fix to a
+    bug in it) reaches every call site at once. This does not stop a *sixth*, not-yet-written
+    aggregate-read call site from re-introducing unfiltered iteration; the mitigation is that
+    there is now exactly one place to update, not five, when adding one. Second, a
+    `CapabilityMissing` remote is now reported as `{"capability_missing": true, "capability":
+    "...", "error": "..."}`, distinguishable from a genuinely unreachable remote's unchanged
+    `{"unreachable": true, "error": "..."}` — see the `CoordinationFanoutFailure` type in
+    `crates/mempalace-mcp/src/federation.rs`. See
+    `inbox_read_and_coordination_events_fanout_only_contact_the_coordination_candidate`/
+    `coordination_fanout_distinguishes_capability_missing_from_unreachable` in
+    `crates/mempalace-mcp/src/lib.rs`, and [docs/Federation.md](Federation.md)'s aggregate
+    fan-out section.
+
+15. **Post-implementation fix: `is_local_record_missing` (the federation-fallback gate for
+    `mempalace_task_claim`/`_renew`/`_transition`, `mempalace_message_send`/`_acknowledge`, and
+    `mempalace_artifact_put`/`mempalace_result_put`) matched a bare `"not found"` string
+    literal, not a pinned constant.** Every other `Invariant` message a federated coordination
+    write can hit (`LEASE_HELD_BY_ANOTHER_WORKER`, `ONLY_RECIPIENT_MAY_ACKNOWLEDGE`,
+    `STALE_REVISION_PREFIX`-adjacent constants, etc.) is a `pub const` in
+    `crates/mempalace-storage/src/coordination.rs` specifically so that rewording the message is
+    a compile error at its construction site, per that module's doc comment. The task/message
+    "not found" messages `require_task`, `task_wing`, and `acknowledge_message`'s own message
+    lookup produce had no such constant — a future rewording of any of them would have silently
+    disabled federation fallback for that path (or, on the server side, silently reclassified a
+    404 as something else) with no compiler signal.
+
+    Fixed by adding `pub const NOT_FOUND_SUFFIX: &str = " not found"` next to the other pinned
+    fragments, rebuilding all three construction sites (`crates/mempalace-storage/src/coordination.rs:772,1084,1091`)
+    from it, and matching against it — instead of the literal — in both
+    `mempalace-mcp`'s `is_local_record_missing` and `mempalace-server`'s
+    `coordination_storage_error`. `conflict_error_messages_start_with_their_pinned_constants` (in
+    `crates/mempalace-storage/src/coordination.rs`) was extended to drive a genuinely-missing
+    task and message through the real storage calls and assert the resulting message ends with
+    the constant, alongside `is_local_record_missing_matches_real_missing_task_and_message_errors`
+    in `crates/mempalace-mcp/src/lib.rs`, which does the same at the MCP layer. Artifacts and
+    results were checked separately: `get_artifact`/`get_result` return `Option`, not an
+    `Invariant`-shaped "not found" at all, so they were never affected by this predicate; the
+    only other "not found" `Invariant` producers in `mempalace-storage`
+    (`delegation.rs`, `skills.rs`) belong to unrelated subsystems `is_local_record_missing` never
+    sees.
+
 ## Stage 5 — A2A adapter
 
 A new crate, `mempalace-a2a`, depending on `mempalace-storage` and `mempalace-federation` and

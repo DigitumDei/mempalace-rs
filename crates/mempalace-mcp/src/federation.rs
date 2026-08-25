@@ -1385,6 +1385,27 @@ impl FederationRouter {
         candidates
     }
 
+    /// The single source of truth for "which configured remotes may actually be asked a
+    /// coordination question" — `self.remotes` narrowed to `coordination_candidate_remotes()`,
+    /// in name order (`self.remotes` is a `BTreeMap`).
+    ///
+    /// This exists because the same narrowing was previously hand-copied at five separate call
+    /// sites — `coordination_read_fallback`, `coordination_write_fallback`,
+    /// `coordination_task_revisioned_fallback`, `coordination_events_fanout`, and
+    /// `coordination_inbox_fanout` — and the fan-out pair drifted out of sync with the other
+    /// three twice in a row: `bd7cd21` added the coordination opt-in/diary gate to the fan-outs
+    /// after it was fixed on the fallbacks first, and `e3fa83b` then added the candidate-set
+    /// narrowing to the three fallbacks while leaving both fan-outs iterating `&self.remotes`
+    /// unfiltered. A single helper cannot stop a future call site from re-introducing the bug in
+    /// a *new* sixth loop, but it does mean the five that exist today share one implementation
+    /// rather than five manually-synchronised copies, so a fix (or a future change to the
+    /// candidate-set rule itself) here reaches all five at once instead of requiring someone to
+    /// remember to update each one by hand.
+    fn coordination_candidates(&self) -> impl Iterator<Item = (&String, &Arc<dyn RemoteApi>)> {
+        let candidates = self.coordination_candidate_remotes();
+        self.remotes.iter().filter(move |(name, _)| candidates.contains(name.as_str()))
+    }
+
     /// Try a coordination *read* against each candidate remote (see
     /// `coordination_candidate_remotes`) in name order, returning the first success annotated
     /// with `origin` (the `remote:`-prefixed form, matching `changes_fanout`/`kg_add_remote`
@@ -1412,11 +1433,7 @@ impl FederationRouter {
         if !self.coordination_federation_enabled() {
             return Ok(None);
         }
-        let candidates = self.coordination_candidate_remotes();
-        for (name, api) in &self.remotes {
-            if !candidates.contains(name.as_str()) {
-                continue;
-            }
+        for (name, api) in self.coordination_candidates() {
             match op(Arc::clone(api)).await {
                 Ok(dto) => {
                     let mut value = serde_json::to_value(&dto).unwrap_or_else(|_| json!({}));
@@ -1466,11 +1483,7 @@ impl FederationRouter {
         if !self.coordination_federation_enabled() {
             return Ok(None);
         }
-        let candidates = self.coordination_candidate_remotes();
-        for (name, api) in &self.remotes {
-            if !candidates.contains(name.as_str()) {
-                continue;
-            }
+        for (name, api) in self.coordination_candidates() {
             match op(Arc::clone(api)).await {
                 Ok(dto) => {
                     let mut value = serde_json::to_value(&dto).unwrap_or_else(|_| json!({}));
@@ -1630,11 +1643,7 @@ impl FederationRouter {
         if !self.coordination_federation_enabled() {
             return Ok(None);
         }
-        let candidates = self.coordination_candidate_remotes();
-        for (name, api) in &self.remotes {
-            if !candidates.contains(name.as_str()) {
-                continue;
-            }
+        for (name, api) in self.coordination_candidates() {
             match call(Arc::clone(api), task_id.to_owned(), req.clone()).await {
                 Ok(RemoteRevisionedWrite::Applied(dto)) => {
                     let task_value = serde_json::to_value(&dto).unwrap_or_else(|_| json!({}));
@@ -1754,12 +1763,20 @@ impl FederationRouter {
         .await
     }
 
-    /// Fan out a coordination-events query to ALL configured remotes concurrently, with a
-    /// per-remote opaque cursor — the coordination-feed counterpart of `changes_fanout`, and
-    /// deliberately reusing its exact `{unreachable, error}` isolation contract: one down
-    /// remote never poisons a healthy one. Returns a map of `remote_name → per-remote result`;
-    /// on success the value is `{ "events": [...], "next_cursor": <string|null> }` with each
-    /// event annotated `"origin": "remote:<name>"`.
+    /// Fan out a coordination-events query, concurrently and with a per-remote opaque cursor, to
+    /// every remote in [`Self::coordination_candidates`] — not `self.remotes` — the
+    /// coordination-feed counterpart of `changes_fanout`, reusing its `{unreachable, error}`
+    /// isolation contract for genuine failures: one down remote never poisons a healthy one. A
+    /// remote configured only for drawer or KG federation, never named by any
+    /// `federation.coordination` rule, is skipped entirely rather than probed — the same
+    /// candidate narrowing the ID-discovery fallbacks above apply, so this aggregate feed cannot
+    /// send a recipient/wing/task_id filter to a palace that has nothing to do with coordination.
+    /// Returns a map of `remote_name → per-remote result`; on success the value is
+    /// `{ "events": [...], "next_cursor": <string|null> }` with each event annotated `"origin":
+    /// "remote:<name>"`. A candidate that answers `CapabilityMissing` — it never actually runs
+    /// coordination, decided live from its own `/v1/info` — is reported as `{"capability_missing":
+    /// true, "capability": "...", "error": "..."}`, distinguishable from a genuinely unreachable
+    /// remote's `{"unreachable": true, "error": "..."}`; see [`CoordinationFanoutFailure`].
     ///
     /// Gated the same way the ID-discovery fallbacks above are (see
     /// `coordination_federation_enabled`'s doc comment): this method, not just its callers, must
@@ -1780,8 +1797,8 @@ impl FederationRouter {
         {
             return BTreeMap::new();
         }
-        let mut set: JoinSet<(String, Result<Value, String>)> = JoinSet::new();
-        for (name, api) in &self.remotes {
+        let mut set: JoinSet<(String, Result<Value, CoordinationFanoutFailure>)> = JoinSet::new();
+        for (name, api) in self.coordination_candidates() {
             let name = name.clone();
             let api = Arc::clone(api);
             let query = CoordinationEventsQuery {
@@ -1808,7 +1825,7 @@ impl FederationRouter {
                             .collect();
                         (name, Ok(json!({ "events": events, "next_cursor": resp.next_cursor })))
                     }
-                    Err(e) => (name, Err(e.to_string())),
+                    Err(e) => (name, Err(CoordinationFanoutFailure::from_remote_error(e))),
                 }
             });
         }
@@ -1819,9 +1836,13 @@ impl FederationRouter {
                 Ok((name, Ok(payload))) => {
                     results.insert(name, payload);
                 }
-                Ok((name, Err(msg))) => {
-                    tracing::warn!(remote = %name, "coordination events fan-out failed: {msg}");
-                    results.insert(name, json!({ "unreachable": true, "error": msg }));
+                Ok((name, Err(failure))) => {
+                    tracing::warn!(
+                        remote = %name,
+                        "coordination events fan-out failed: {}",
+                        failure.message()
+                    );
+                    results.insert(name, failure.into_json());
                 }
                 Err(join_err) => {
                     tracing::warn!("coordination events fan-out task panicked: {join_err}");
@@ -1831,9 +1852,10 @@ impl FederationRouter {
         results
     }
 
-    /// Fan out an inbox read to ALL configured remotes concurrently, with a per-remote opaque
-    /// cursor. Same isolation contract as [`Self::coordination_events_fanout`]/`changes_fanout`,
-    /// and the same coordination-opt-in / diary gate — see that method's doc comment.
+    /// Fan out an inbox read, concurrently and with a per-remote opaque cursor, to every remote
+    /// in [`Self::coordination_candidates`] — not `self.remotes`. Same candidate narrowing,
+    /// isolation contract, and `CapabilityMissing` vs. genuinely-unreachable distinction as
+    /// [`Self::coordination_events_fanout`]/`changes_fanout` — see that method's doc comment.
     /// Returns a map of `remote_name → per-remote result`; on success the value is
     /// `{ "messages": [...], "next_cursor": <string|null> }` with each message annotated
     /// `"origin": "remote:<name>"`.
@@ -1850,8 +1872,8 @@ impl FederationRouter {
         {
             return BTreeMap::new();
         }
-        let mut set: JoinSet<(String, Result<Value, String>)> = JoinSet::new();
-        for (name, api) in &self.remotes {
+        let mut set: JoinSet<(String, Result<Value, CoordinationFanoutFailure>)> = JoinSet::new();
+        for (name, api) in self.coordination_candidates() {
             let name = name.clone();
             let api = Arc::clone(api);
             let query = InboxQuery {
@@ -1879,7 +1901,7 @@ impl FederationRouter {
                             .collect();
                         (name, Ok(json!({ "messages": messages, "next_cursor": resp.next_cursor })))
                     }
-                    Err(e) => (name, Err(e.to_string())),
+                    Err(e) => (name, Err(CoordinationFanoutFailure::from_remote_error(e))),
                 }
             });
         }
@@ -1890,9 +1912,13 @@ impl FederationRouter {
                 Ok((name, Ok(payload))) => {
                     results.insert(name, payload);
                 }
-                Ok((name, Err(msg))) => {
-                    tracing::warn!(remote = %name, "coordination inbox fan-out failed: {msg}");
-                    results.insert(name, json!({ "unreachable": true, "error": msg }));
+                Ok((name, Err(failure))) => {
+                    tracing::warn!(
+                        remote = %name,
+                        "coordination inbox fan-out failed: {}",
+                        failure.message()
+                    );
+                    results.insert(name, failure.into_json());
                 }
                 Err(join_err) => {
                     tracing::warn!("coordination inbox fan-out task panicked: {join_err}");
@@ -1900,6 +1926,49 @@ impl FederationRouter {
             }
         }
         results
+    }
+}
+
+/// Classification of a per-remote failure in a coordination aggregate fan-out
+/// (`coordination_events_fanout`/`coordination_inbox_fanout`), so the two are reported with
+/// distinguishable shapes in the result map instead of both collapsing into `"unreachable":
+/// true`. A candidate remote that declines with `RemoteError::CapabilityMissing` — decided live
+/// from its own `/v1/info` capability list, the same way the ID-discovery write fallbacks
+/// already treat it as "not this palace" rather than a failure — correctly answered "I do not do
+/// coordination"; it is not down, and reporting it as `unreachable` would send an operator
+/// looking for an outage that never happened. Everything else (genuinely unreachable,
+/// unauthorized, version-skewed, malformed response, …) keeps the original `unreachable` shape.
+enum CoordinationFanoutFailure {
+    /// The remote does not advertise the `coordination` capability at all.
+    CapabilityMissing { capability: String, message: String },
+    /// Every other per-remote error.
+    Unreachable(String),
+}
+
+impl CoordinationFanoutFailure {
+    fn from_remote_error(e: RemoteError) -> Self {
+        match &e {
+            RemoteError::CapabilityMissing { capability, .. } => {
+                Self::CapabilityMissing { capability: capability.clone(), message: e.to_string() }
+            }
+            _ => Self::Unreachable(e.to_string()),
+        }
+    }
+
+    /// The underlying error text, for logging regardless of which variant this is.
+    fn message(&self) -> &str {
+        match self {
+            Self::CapabilityMissing { message, .. } | Self::Unreachable(message) => message,
+        }
+    }
+
+    fn into_json(self) -> Value {
+        match self {
+            Self::CapabilityMissing { capability, message } => {
+                json!({ "capability_missing": true, "capability": capability, "error": message })
+            }
+            Self::Unreachable(message) => json!({ "unreachable": true, "error": message }),
+        }
     }
 }
 

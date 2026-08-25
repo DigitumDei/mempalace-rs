@@ -3370,10 +3370,10 @@ async fn coordination_claim_revision_conflict_via_remote_fallback() {
     );
 }
 
-/// The coordination-events feed fans out to every configured remote independently — a down
-/// remote is reported as unreachable, while a healthy one alongside it still returns its
-/// events, matching the `{unreachable, error}` isolation contract `changes_fanout` already
-/// guarantees for the generic change feed.
+/// The coordination-events feed fans out to every coordination *candidate* remote
+/// independently — a down candidate is reported as unreachable, while a healthy one alongside it
+/// still returns its events, matching the `{unreachable, error}` isolation contract
+/// `changes_fanout` already guarantees for the generic change feed.
 ///
 /// Coordination federation must be explicitly configured for the fan-out to run at all (see
 /// `FederationRouter::coordination_federation_enabled` and the aggregate-fan-out gate inside
@@ -3384,6 +3384,17 @@ async fn coordination_claim_revision_conflict_via_remote_fallback() {
 /// started reporting nothing at all). Pinning `wing_fanout` to `remote` in `coordination_rules`
 /// opts coordination in explicitly, the way a real operator would, while leaving the isolation
 /// behaviour under test unchanged.
+///
+/// PR #120 review, finding 1(a): the fan-outs were later narrowed to query only
+/// `coordination_candidate_remotes()`, not every configured remote — a remote never named by any
+/// `federation.coordination` rule (e.g. one wired up only for drawer/KG federation) is now
+/// skipped entirely rather than probed. `down` must therefore be named by a coordination rule of
+/// its own (`wing_fanout_down`, unrelated to the wing actually queried below — the candidate set
+/// is the union across every wing's rule, not just the requested one) for this test to still
+/// exercise "a down *candidate* is isolated, not the whole call" rather than accidentally
+/// degenerating into "a non-candidate is never contacted", which is
+/// `inbox_read_and_coordination_events_fanout_only_contact_the_coordination_candidate`'s job in
+/// `crates/mempalace-mcp/src/lib.rs`, not this test's.
 #[tokio::test]
 async fn coordination_events_fanout_with_one_remote_down_still_returns_the_healthy_one() {
     let local_dir = TempDir::new().unwrap();
@@ -3423,6 +3434,14 @@ async fn coordination_events_fanout_with_one_remote_down_still_returns_the_healt
     coordination_rules.insert(
         "wing_fanout".to_owned(),
         ResolvedRouteRule { mode: RouteMode::Remote, remote: Some("hub".to_owned()), write: WriteTarget::Remote },
+    );
+    // `down` must also be a coordination candidate (named by some wing's rule — any wing,
+    // since the candidate set is the union across all of them) or the aggregate fan-outs'
+    // candidate-narrowing fix (PR #120 review, finding 1a) skips it entirely, and this test
+    // would stop exercising "a down candidate is isolated" at all.
+    coordination_rules.insert(
+        "wing_fanout_down".to_owned(),
+        ResolvedRouteRule { mode: RouteMode::Remote, remote: Some("down".to_owned()), write: WriteTarget::Remote },
     );
     let server = mcp_server_with_hub_multi(
         &local_dir,

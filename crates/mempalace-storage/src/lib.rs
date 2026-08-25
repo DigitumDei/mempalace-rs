@@ -13,8 +13,8 @@ mod types;
 pub use coordination::{
     Artifact, CoordinationCursor, CoordinationEvent, CoordinationEventPage, CoordinationStore,
     CoordinationVisibility, INVALID_TRANSITION_PREFIX, InboxPage, LEASE_DURATION_OUT_OF_RANGE,
-    LEASE_HAS_EXPIRED, LEASE_HELD_BY_ANOTHER_WORKER, Message, NewArtifact, NewMessage, NewTask,
-    NewTaskResult, ONLY_LEASE_OWNER_MAY_RENEW, ONLY_OWNER_MAY_TRANSITION,
+    LEASE_HAS_EXPIRED, LEASE_HELD_BY_ANOTHER_WORKER, Message, NOT_FOUND_SUFFIX, NewArtifact,
+    NewMessage, NewTask, NewTaskResult, ONLY_LEASE_OWNER_MAY_RENEW, ONLY_OWNER_MAY_TRANSITION,
     ONLY_RECIPIENT_MAY_ACKNOWLEDGE, TASK_HAS_EXPIRED, TERMINAL_TASK_CANNOT_BE_CLAIMED, Task,
     TaskResult, TaskState, UNSCOPED_WING,
 };

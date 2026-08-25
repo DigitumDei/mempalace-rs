@@ -932,17 +932,27 @@ true, "task": {...}, "applied_to": "remote:<name>"}` — so a caller never has t
 which palace served the write.
 `mempalace_inbox_read` and `mempalace_coordination_events` are the exception to the exception:
 being aggregate, cursor-paginated feeds (like `mempalace_get_changes_since`), they always read
-local and fan out to every configured remote concurrently with a per-remote cursor, reported
-under `remote_messages`/`remote_events` — never routed by a single wing's rule, and never
-merged into the local page, matching `changes_fanout`'s `{unreachable, error}` isolation
-contract (one down remote never blocks a healthy one). `mempalace_coordination_event_get` — a
-single audit event by exact ID — has no remote counterpart at all: Stage 3 never exposed
-`GET /v1/coordination/events/{id}`, only the paginated feed, so it stays local-only.
+local and fan out concurrently, with a per-remote cursor, to every remote in
+`FederationRouter::coordination_candidates()` — **not** every configured remote; a remote wired
+up only for drawer or KG federation, never named by any `federation.coordination` rule, is
+skipped entirely, the same candidate set the ID-discovery fallbacks above use (see
+`coordination_candidate_remotes`). Results are reported under `remote_messages`/`remote_events`
+— never routed by a single wing's rule, and never merged into the local page — matching
+`changes_fanout`'s `{unreachable, error}` isolation contract for genuine failures (one down
+remote never blocks a healthy one). A candidate that answers `CapabilityMissing` — decided live
+from its own `/v1/info`, so a remote named by a coordination rule can still turn out not to run
+coordination at all — is reported as `{"capability_missing": true, "capability": "coordination",
+"error": "..."}` instead: it declined correctly, it is not down, and conflating the two shapes
+would send an operator investigating a healthy remote for an outage that never happened.
+`mempalace_coordination_event_get` — a single audit event by exact ID — has no remote
+counterpart at all: Stage 3 never exposed `GET /v1/coordination/events/{id}`, only the paginated
+feed, so it stays local-only.
 
 Being aggregate reads, these two never go through `resolve_coordination_route`, so they carry
-their own two guards rather than inheriting its — placed inside
-`FederationRouter::coordination_inbox_fanout`/`coordination_events_fanout` themselves so no
-future call site can add a fan-out read without them:
+their own guards rather than inheriting its — placed inside
+`FederationRouter::coordination_inbox_fanout`/`coordination_events_fanout` themselves (both now
+built on the shared `coordination_candidates()` iterator every candidate-narrowed loop in
+`federation.rs` uses) so no future call site can add a fan-out read without them:
 
 - **The same coordination opt-in gate as the ID-discovery fallbacks.** `has_remotes()` alone
   (true whenever *any* remote is configured for *anything* — drawers, KG, anything) is not
@@ -952,6 +962,9 @@ future call site can add a fan-out read without them:
   `federation.coordination` table and `default_mode: local`, never sends a recipient name or
   wing filter to any remote on `mempalace_inbox_read` or `mempalace_coordination_events` — a
   configured remote alone is not enough, exactly as for the ID-keyed fallbacks above.
+- **Only coordination candidates are contacted at all**, per the candidate-set narrowing
+  described above — a remote configured for drawers/KG only never receives a coordination fan-out
+  query, regardless of `has_remotes()` or `coordination_federation_enabled()`.
 - **`wing_agents` never reaches a remote through either feed.** When the requested `wing`
   normalises (via `WingId::normalized`, so `"agents"`/`"Wing_Agents"`/`" wing_agents "` all
   count) to `wing_agents`, both methods skip the remote fan-out entirely and return an empty

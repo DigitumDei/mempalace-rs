@@ -72,6 +72,21 @@ pub const ONLY_RECIPIENT_MAY_ACKNOWLEDGE: &str = "only the recipient may acknowl
 /// [`OffsetDateTime::checked_add`] and turn `None` into this error instead of aborting the
 /// request.
 pub const LEASE_DURATION_OUT_OF_RANGE: &str = "lease duration is out of range";
+/// Trailing fragment of the message produced when a coordination call references a task or
+/// message id that does not exist locally — built into `"task `{id}`{NOT_FOUND_SUFFIX}"` by the
+/// internal `require_task` helper (used by [`CoordinationStore::claim_task`],
+/// [`CoordinationStore::renew_lease`], [`CoordinationStore::transition_task`],
+/// [`CoordinationStore::send_message`], [`CoordinationStore::put_artifact`], and
+/// [`CoordinationStore::put_result`], plus the internal `task_wing` lookup), and into
+/// `"message `{id}`{NOT_FOUND_SUFFIX}"` by [`CoordinationStore::acknowledge_message`]'s own
+/// message lookup. This is not a claim/renew/transition/acknowledge *conflict* — it is the
+/// signal `mempalace-mcp`'s `is_local_record_missing` and `mempalace-server`'s
+/// `coordination_storage_error` both match on to decide "this record simply is not here, try
+/// federation / answer 404" rather than some other `Invariant`. It is pinned here for the exact
+/// reason the constants above are: rewording the message without also renaming this constant is
+/// now a compile error at every construction site, instead of silently disabling federation
+/// fallback (or misclassifying the HTTP status) for whichever path got reworded.
+pub const NOT_FOUND_SUFFIX: &str = " not found";
 
 /// Durable task lifecycle state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -769,7 +784,7 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
         let mut conn = self.connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let msg = get_message_tx(&tx, id)?
-            .ok_or_else(|| StorageError::Invariant(format!("message `{id}` not found")))?;
+            .ok_or_else(|| StorageError::Invariant(format!("message `{id}`{NOT_FOUND_SUFFIX}")))?;
         if msg.recipient != actor {
             return Err(StorageError::Invariant(ONLY_RECIPIENT_MAY_ACKNOWLEDGE.into()));
         }
@@ -1081,14 +1096,14 @@ fn parse_time_opt(v: Option<String>) -> Result<Option<OffsetDateTime>> {
     v.map(parse_time).transpose()
 }
 fn require_task(tx: &Transaction<'_>, id: &str) -> Result<Task> {
-    get_task_tx(tx, id)?.ok_or_else(|| StorageError::Invariant(format!("task `{id}` not found")))
+    get_task_tx(tx, id)?.ok_or_else(|| StorageError::Invariant(format!("task `{id}`{NOT_FOUND_SUFFIX}")))
 }
 /// Look up just the owning task's wing, for events whose entity isn't a `Task` itself (e.g. a
 /// message acknowledgement, which only has the `Message` on hand).
 fn task_wing(tx: &Transaction<'_>, task_id: &str) -> Result<String> {
     tx.query_row("SELECT wing FROM coordination_tasks WHERE task_id=?1", [task_id], |r| r.get(0))
         .optional()?
-        .ok_or_else(|| StorageError::Invariant(format!("task `{task_id}` not found")))
+        .ok_or_else(|| StorageError::Invariant(format!("task `{task_id}`{NOT_FOUND_SUFFIX}")))
 }
 fn get_task_conn(conn: &Connection, id: &str) -> Result<Option<Task>> {
     let mut s=conn.prepare("SELECT task_id,title,description,state,revision,created_by,owner,parent_id,dependencies_json,budget_json,lease_expires_at,expires_at,created_at,updated_at,wing FROM coordination_tasks WHERE task_id=?1")?;
@@ -1468,14 +1483,18 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
             }
         }
     }
-    /// Drives every conflict-shaped `Invariant` error this module can produce and asserts the
-    /// resulting message starts with the `pub const` the federation server
-    /// (`coordination_storage_error` in `crates/mempalace-server/src/lib.rs`) matches on to
-    /// classify HTTP status. This is what keeps that classification honest without the server
-    /// re-deriving message text of its own: a construction site that stops building its message
-    /// from the constant, or a constant whose text no longer matches what actually gets
-    /// produced, fails right here — loudly, at build/test time — instead of the server silently
-    /// reclassifying a retryable 409 conflict as a non-retryable 400.
+    /// Drives every conflict-shaped `Invariant` error this module can produce, plus the
+    /// record-not-found case (`NOT_FOUND_SUFFIX`), and asserts the resulting message is actually
+    /// built from the matching `pub const` — the same constants [`mempalace-server`'s
+    /// `coordination_storage_error`] matches on to classify HTTP status, and (for
+    /// `NOT_FOUND_SUFFIX` specifically) [`mempalace-mcp`'s `is_local_record_missing`] matches on
+    /// to decide whether a coordination write falls back to a federated remote. This is what
+    /// keeps both of those honest without either re-deriving message text of its own: a
+    /// construction site that stops building its message from the constant, or a constant whose
+    /// text no longer matches what actually gets produced, fails right here — loudly, at
+    /// build/test time — instead of the server silently reclassifying a retryable 409 conflict as
+    /// a non-retryable 400, or the MCP layer silently disabling federation fallback for that
+    /// path.
     #[test]
     fn conflict_error_messages_start_with_their_pinned_constants() {
         let (_d, s) = store();
@@ -1588,6 +1607,24 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
             .acknowledge_message(&message.message_id, "not-b")
             .expect_err("acknowledging as a non-recipient must fail");
         assert!(expect_invariant(&err).starts_with(ONLY_RECIPIENT_MAY_ACKNOWLEDGE));
+
+        // record not found: this is not a claim/renew/transition/acknowledge conflict, but it
+        // shares the same "pin the constant, assert the real message is built from it" purpose —
+        // `mempalace-mcp`'s `is_local_record_missing` and `mempalace-server`'s
+        // `coordination_storage_error` both match on `NOT_FOUND_SUFFIX` to decide "not this
+        // palace, try federation" / "answer 404", so a rewording here must fail this test the
+        // same way a rewording of any conflict constant above would.
+        let err = s
+            .claim_task("does-not-exist", "worker-a", 1, Duration::minutes(1))
+            .expect_err("claiming a nonexistent task must fail");
+        assert!(expect_invariant(&err).ends_with(NOT_FOUND_SUFFIX));
+        assert!(expect_invariant(&err).starts_with("task `does-not-exist`"));
+
+        let err = s
+            .acknowledge_message("does-not-exist", "worker-a")
+            .expect_err("acknowledging a nonexistent message must fail");
+        assert!(expect_invariant(&err).ends_with(NOT_FOUND_SUFFIX));
+        assert!(expect_invariant(&err).starts_with("message `does-not-exist`"));
     }
     /// Companion to `conflict_error_messages_start_with_their_pinned_constants`: a stale
     /// `expected_revision` on claim/renew/transition is no longer a message-based `Invariant` —

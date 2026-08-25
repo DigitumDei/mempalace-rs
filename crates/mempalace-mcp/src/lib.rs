@@ -4333,8 +4333,16 @@ fn wire_task_state(state: TaskState) -> WireTaskState {
 /// whether to fall back to a remote rather than surface the error immediately. Every other
 /// `StorageError` (a lease/state conflict, bad input) is not a "wrong palace" signal and must
 /// propagate as-is.
+///
+/// Matches against [`mempalace_storage::NOT_FOUND_SUFFIX`] rather than a bare `"not found"`
+/// literal, so a future rewording of the underlying message is a compile error at its
+/// construction site instead of silently disabling federation fallback for that path.
 fn is_local_record_missing(err: &mempalace_storage::StorageError) -> bool {
-    matches!(err, mempalace_storage::StorageError::Invariant(msg) if msg.contains("not found"))
+    matches!(
+        err,
+        mempalace_storage::StorageError::Invariant(msg)
+            if msg.contains(mempalace_storage::NOT_FOUND_SUFFIX)
+    )
 }
 
 /// Parses an optional `{remote_name: cursor}` object argument into a per-remote cursor map, the
@@ -5475,6 +5483,218 @@ mod tests {
             "an ordinary wing with coordination federation enabled must still fan out to the \
              configured remote, got {observed} remote call(s)"
         );
+    }
+
+    /// Build a `FederationRouter` wired to two recording mock remotes, only one of which
+    /// ("hub") is named by a `federation.coordination["wing_team"]` rule; the other ("other")
+    /// is configured (present in `self.remotes`) but never referenced by any coordination rule
+    /// — e.g. a remote wired up only for drawer/KG federation. `default_mode: Local` and no
+    /// `default_remote` keep "other" out of the candidate set the same way an operator's config
+    /// would. Returns the router plus each remote's independent `coordination_calls` counter, so
+    /// a test can assert exactly which remote(s) were actually contacted.
+    fn router_with_two_remotes_one_coordination_candidate(
+        hub: LibMockRemote,
+        other: LibMockRemote,
+    ) -> (
+        FederationRouter,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let hub_calls = std::sync::Arc::clone(&hub.coordination_calls);
+        let other_calls = std::sync::Arc::clone(&other.coordination_calls);
+        let mut remotes: BTreeMap<String, Arc<dyn mempalace_remote::RemoteApi>> = BTreeMap::new();
+        remotes.insert("hub".to_owned(), Arc::new(hub));
+        remotes.insert("other".to_owned(), Arc::new(other));
+        let mut rules_remotes = BTreeMap::new();
+        for name in remotes.keys() {
+            rules_remotes.insert(
+                name.clone(),
+                ResolvedRemote {
+                    name: name.clone(),
+                    url: "https://test.example".to_owned(),
+                    token: None,
+                    timeout: std::time::Duration::from_secs(5),
+                },
+            );
+        }
+        let mut coordination = BTreeMap::new();
+        coordination.insert(
+            "wing_team".to_owned(),
+            ResolvedRouteRule {
+                mode: RouteMode::Remote,
+                remote: Some("hub".to_owned()),
+                write: WriteTarget::Remote,
+            },
+        );
+        let rules = FederationRuntimeConfig {
+            remotes: rules_remotes,
+            default_mode: RouteMode::Local,
+            default_remote: None,
+            wings: BTreeMap::new(),
+            kg: None,
+            coordination,
+        };
+        (FederationRouter::with_remotes(rules, remotes), hub_calls, other_calls)
+    }
+
+    /// PR #120 review, finding 1(a): `mempalace_inbox_read` and `mempalace_coordination_events`
+    /// must contact only the remote(s) actually named by a `federation.coordination` rule, not
+    /// every configured remote. Before the fix, both aggregate fan-outs looped over
+    /// `&self.remotes` unfiltered — unlike the ID-discovery fallbacks, which already narrowed to
+    /// `coordination_candidate_remotes()` — so a remote wired up only for drawer/KG federation,
+    /// never named by any coordination rule, still received the recipient/wing/task_id filter.
+    /// Asserts on each mock's independent `coordination_calls` counter, not on the response map,
+    /// so this cannot pass because the shape of an (empty) response happened to look right.
+    #[tokio::test]
+    async fn inbox_read_and_coordination_events_fanout_only_contact_the_coordination_candidate() {
+        let (router, hub_calls, other_calls) = router_with_two_remotes_one_coordination_candidate(
+            LibMockRemote::default(),
+            LibMockRemote::default(),
+        );
+        let harness = test_harness_with_mock_router(router).await;
+
+        let inbox = harness
+            .server
+            .handle_request(tool_call(940, "mempalace_inbox_read", json!({"recipient": "worker"})))
+            .await;
+        decode_tool_payload(&inbox)
+            .unwrap_or_else(|| panic!("expected a successful inbox read, got: {inbox}"));
+        assert_eq!(
+            hub_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "hub is named by federation.coordination and must be contacted exactly once"
+        );
+        assert_eq!(
+            other_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "other is never named by any federation.coordination rule and must not be contacted \
+             by mempalace_inbox_read"
+        );
+
+        let events = harness
+            .server
+            .handle_request(tool_call(941, "mempalace_coordination_events", json!({})))
+            .await;
+        decode_tool_payload(&events)
+            .unwrap_or_else(|| panic!("expected a successful events read, got: {events}"));
+        assert_eq!(
+            hub_calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "hub must be contacted again for mempalace_coordination_events"
+        );
+        assert_eq!(
+            other_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "other must still never be contacted, by either aggregate fan-out"
+        );
+    }
+
+    /// PR #120 review, finding 1(b): a coordination candidate that answers `CapabilityMissing`
+    /// (discovered live from its own `/v1/info` — it was never actually wired up to run
+    /// coordination at all) must be reported distinguishably from a remote that is genuinely
+    /// unreachable. Before the fix, both fan-outs stringified every `Err` the same way and
+    /// always inserted `{"unreachable": true, "error": ...}`, so a candidate that correctly
+    /// declined coordination support looked identical to a remote that was actually down.
+    #[tokio::test]
+    async fn coordination_fanout_distinguishes_capability_missing_from_unreachable() {
+        let mut capability_missing_remote = LibMockRemote::default();
+        capability_missing_remote.coordination_fanout_outcome =
+            LibMockFanoutOutcome::CapabilityMissing;
+        let (router, _calls) = router_with_coordination_config(
+            capability_missing_remote,
+            RouteMode::Remote,
+            BTreeMap::new(),
+        );
+        let harness = test_harness_with_mock_router(router).await;
+        let response = harness
+            .server
+            .handle_request(tool_call(942, "mempalace_inbox_read", json!({"recipient": "worker"})))
+            .await;
+        let payload = decode_tool_payload(&response).expect("inbox payload");
+        let remote_result = payload["remote_messages"]["hub"].clone();
+        assert_eq!(
+            remote_result["capability_missing"], true,
+            "a CapabilityMissing remote must be reported as capability_missing, got: {remote_result}"
+        );
+        assert!(
+            remote_result.get("unreachable").is_none(),
+            "a CapabilityMissing remote must not also be reported as unreachable, got: \
+             {remote_result}"
+        );
+
+        let mut unreachable_remote = LibMockRemote::default();
+        unreachable_remote.coordination_fanout_outcome = LibMockFanoutOutcome::Unreachable;
+        let (router, _calls) =
+            router_with_coordination_config(unreachable_remote, RouteMode::Remote, BTreeMap::new());
+        let harness = test_harness_with_mock_router(router).await;
+        let response = harness
+            .server
+            .handle_request(tool_call(943, "mempalace_inbox_read", json!({"recipient": "worker"})))
+            .await;
+        let payload = decode_tool_payload(&response).expect("inbox payload");
+        let remote_result = payload["remote_messages"]["hub"].clone();
+        assert_eq!(
+            remote_result["unreachable"], true,
+            "a genuinely unreachable remote must still be reported as unreachable, got: \
+             {remote_result}"
+        );
+        assert!(
+            remote_result.get("capability_missing").is_none(),
+            "a genuinely unreachable remote must not be reported as capability_missing, got: \
+             {remote_result}"
+        );
+    }
+
+    /// PR #120 review, finding 2: `is_local_record_missing` must match the real `Invariant`
+    /// error `mempalace_storage::coordination::CoordinationStore` actually produces for a
+    /// genuinely missing task or message — driven through the real storage calls, not a
+    /// hand-built string — and that message must actually be built from
+    /// `mempalace_storage::NOT_FOUND_SUFFIX`, the pinned constant both this predicate and
+    /// `mempalace-server`'s `coordination_storage_error` match against. Before the fix, the
+    /// predicate matched a bare `"not found"` literal with no compile-time link to the
+    /// constructing call sites, so a future rewording of either message would have silently
+    /// disabled federation fallback for that path with no signal here.
+    #[test]
+    fn is_local_record_missing_matches_real_missing_task_and_message_errors() {
+        let tempdir = TempDir::new().unwrap();
+        let store = mempalace_storage::CoordinationStore::new(tempdir.path().join("storage.sqlite3"));
+        store.ensure_schema().unwrap();
+
+        let err = store
+            .claim_task("does-not-exist", "worker-a", 1, Duration::minutes(1))
+            .expect_err("claiming a nonexistent task must fail");
+        assert!(
+            is_local_record_missing(&err),
+            "a genuinely missing task's real storage error must be treated as federatable, got: \
+             {err}"
+        );
+        match &err {
+            mempalace_storage::StorageError::Invariant(msg) => {
+                assert!(
+                    msg.ends_with(mempalace_storage::NOT_FOUND_SUFFIX),
+                    "the real message must be built from NOT_FOUND_SUFFIX, got: {msg}"
+                );
+            }
+            other => panic!("expected StorageError::Invariant, got {other:?}"),
+        }
+
+        let err = store
+            .acknowledge_message("does-not-exist", "worker-a")
+            .expect_err("acknowledging a nonexistent message must fail");
+        assert!(
+            is_local_record_missing(&err),
+            "a genuinely missing message's real storage error must be treated as federatable, \
+             got: {err}"
+        );
+        match &err {
+            mempalace_storage::StorageError::Invariant(msg) => {
+                assert!(
+                    msg.ends_with(mempalace_storage::NOT_FOUND_SUFFIX),
+                    "the real message must be built from NOT_FOUND_SUFFIX, got: {msg}"
+                );
+            }
+            other => panic!("expected StorageError::Invariant, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -8616,6 +8836,25 @@ mod tests {
         /// `MockRemote::coordination_calls` in `federation.rs` for why a bare result check is
         /// not sufficient on its own.
         coordination_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        /// Outcome for `coordination_events`/`coordination_inbox` on this mock — lets a test
+        /// drive the aggregate fan-outs' `CapabilityMissing` vs. genuinely-unreachable
+        /// distinction (finding 1b) without hand-building a non-`Clone` `RemoteError`.
+        coordination_fanout_outcome: LibMockFanoutOutcome,
+    }
+
+    /// Canned outcomes for `LibMockRemote::coordination_events`/`coordination_inbox`.
+    #[derive(Clone, Copy, Default)]
+    enum LibMockFanoutOutcome {
+        /// Returns an empty, successful page.
+        #[default]
+        Success,
+        /// The remote does not advertise the `coordination` capability at all — the "declined,
+        /// not down" case the aggregate fan-outs must report as `capability_missing`, not
+        /// `unreachable`.
+        CapabilityMissing,
+        /// The remote could not be reached — the genuinely-degradable case that must still be
+        /// reported as `unreachable`.
+        Unreachable,
     }
 
     impl Default for LibMockRemote {
@@ -8626,6 +8865,7 @@ mod tests {
                 search_results: vec![],
                 fail: false,
                 coordination_calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                coordination_fanout_outcome: LibMockFanoutOutcome::default(),
             }
         }
     }
@@ -8748,13 +8988,29 @@ mod tests {
         /// `coordination_calls` (like every other `coordination_*` override on this mock) so a
         /// test can assert the gate in `FederationRouter::coordination_inbox_fanout` actually
         /// stopped the call from ever reaching a remote, rather than trusting the response shape.
+        /// Honors `coordination_fanout_outcome` so a test can also drive the `CapabilityMissing`
+        /// vs. genuinely-unreachable distinction (finding 1b).
         async fn coordination_inbox(
             &self,
             query: mempalace_federation::InboxQuery,
         ) -> mempalace_remote::Result<mempalace_federation::InboxPageResponse> {
             self.coordination_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let _ = query;
-            Ok(mempalace_federation::InboxPageResponse { messages: vec![], next_cursor: None })
+            match self.coordination_fanout_outcome {
+                LibMockFanoutOutcome::Success => {
+                    Ok(mempalace_federation::InboxPageResponse { messages: vec![], next_cursor: None })
+                }
+                LibMockFanoutOutcome::CapabilityMissing => {
+                    Err(mempalace_remote::RemoteError::CapabilityMissing {
+                        remote: "mock".to_owned(),
+                        capability: "coordination".to_owned(),
+                    })
+                }
+                LibMockFanoutOutcome::Unreachable => Err(mempalace_remote::RemoteError::Unreachable {
+                    remote: "mock".to_owned(),
+                    message: "mock remote is down".to_owned(),
+                }),
+            }
         }
         /// See [`Self::coordination_inbox`] — same recording purpose, for
         /// `coordination_events_fanout`.
@@ -8764,7 +9020,22 @@ mod tests {
         ) -> mempalace_remote::Result<mempalace_federation::CoordinationEventsResponse> {
             self.coordination_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let _ = query;
-            Ok(mempalace_federation::CoordinationEventsResponse { events: vec![], next_cursor: None })
+            match self.coordination_fanout_outcome {
+                LibMockFanoutOutcome::Success => Ok(mempalace_federation::CoordinationEventsResponse {
+                    events: vec![],
+                    next_cursor: None,
+                }),
+                LibMockFanoutOutcome::CapabilityMissing => {
+                    Err(mempalace_remote::RemoteError::CapabilityMissing {
+                        remote: "mock".to_owned(),
+                        capability: "coordination".to_owned(),
+                    })
+                }
+                LibMockFanoutOutcome::Unreachable => Err(mempalace_remote::RemoteError::Unreachable {
+                    remote: "mock".to_owned(),
+                    message: "mock remote is down".to_owned(),
+                }),
+            }
         }
     }
 

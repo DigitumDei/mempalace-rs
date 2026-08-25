@@ -2732,8 +2732,8 @@ fn validate_lease_seconds(seconds: i64) -> Result<(), ServerError> {
 fn coordination_storage_error(err: mempalace_storage::StorageError) -> ServerError {
     use mempalace_storage::{
         INVALID_TRANSITION_PREFIX, LEASE_HAS_EXPIRED, LEASE_HELD_BY_ANOTHER_WORKER,
-        ONLY_LEASE_OWNER_MAY_RENEW, ONLY_OWNER_MAY_TRANSITION, ONLY_RECIPIENT_MAY_ACKNOWLEDGE,
-        TASK_HAS_EXPIRED, TERMINAL_TASK_CANNOT_BE_CLAIMED,
+        NOT_FOUND_SUFFIX, ONLY_LEASE_OWNER_MAY_RENEW, ONLY_OWNER_MAY_TRANSITION,
+        ONLY_RECIPIENT_MAY_ACKNOWLEDGE, TASK_HAS_EXPIRED, TERMINAL_TASK_CANNOT_BE_CLAIMED,
     };
 
     let mempalace_storage::StorageError::Invariant(msg) = &err else {
@@ -2765,8 +2765,11 @@ fn coordination_storage_error(err: mempalace_storage::StorageError) -> ServerErr
     // message/artifact/result write, the owning task) before calling into
     // storage, so `require_task`'s "not found" should never actually surface
     // here — this only guards the residual race where the row disappears
-    // between that check and the write's own transaction.
-    if msg.contains("not found") {
+    // between that check and the write's own transaction. Matched against the
+    // pinned `NOT_FOUND_SUFFIX` constant, not a bare `"not found"` literal, for the same reason
+    // the conflict prefixes above are pinned: a rewording of the underlying message must be a
+    // compile error here, not a silent reclassification of a 404 into a 400.
+    if msg.contains(NOT_FOUND_SUFFIX) {
         return ServerError::NotFound(msg.clone());
     }
     // Everything else `coordination.rs` raises as `Invariant` is caller input

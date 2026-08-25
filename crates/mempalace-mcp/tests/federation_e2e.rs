@@ -3452,3 +3452,241 @@ async fn coordination_events_fanout_with_one_remote_down_still_returns_the_healt
         "hub events must be annotated with origin: {hub_events:?}"
     );
 }
+
+/// Regression for Codex finding 3832912235: `mempalace_coordination_events` reads a per-remote
+/// `remote_cursors` argument (`parse_cursors_arg`) to continue a federated fan-out page, but
+/// until now its `input_schema` never declared the field — a schema-driven client had no way to
+/// send it back, so every call restarted the hub's paging from the beginning. This proves the
+/// round trip actually works end to end, not just that the schema mentions the field: a real
+/// `next_cursor` taken out of page 1 is fed back as `remote_cursors.hub` and must yield a
+/// disjoint page 2, not a repeat of page 1.
+#[tokio::test]
+async fn coordination_events_remote_cursors_round_trip_paginates_without_repeats() {
+    let local_dir = TempDir::new().unwrap();
+    let hub_dir = TempDir::new().unwrap();
+    let hub_addr = spawn_server(&hub_dir).await;
+    let hub_url = format!("http://{hub_addr}");
+
+    let hub_client = RemoteClient::new(RemoteEndpoint {
+        name: "hub".to_owned(),
+        base_url: hub_url.clone(),
+        token: Some(TEST_TOKEN.to_owned()),
+        timeout: Duration::from_secs(5),
+    })
+    .unwrap();
+    let hub_task = hub_client
+        .coordination_task_create(mempalace_federation::NewTaskRequest {
+            title: "events cursor pagination".to_owned(),
+            description: "d".to_owned(),
+            wing: "wing_events_pages".to_owned(),
+            idempotency_key: "e2e-events-pages-task".to_owned(),
+            created_by: None,
+            parent_id: None,
+            dependencies: Vec::new(),
+            budget: None,
+            expires_at: None,
+        })
+        .await
+        .unwrap();
+    // Task creation already emitted one event; two more messages bring the total to 3, so a
+    // limit=2 first page leaves exactly one event for the second page.
+    for i in 0..2 {
+        hub_client
+            .coordination_message_send(mempalace_federation::NewMessageRequest {
+                task_id: hub_task.task_id.clone(),
+                recipient: "worker-1".to_owned(),
+                kind: "status".to_owned(),
+                payload: json!({"i": i}),
+                idempotency_key: format!("e2e-events-pages-message-{i}"),
+                sender: None,
+                envelope_version: 1,
+            })
+            .await
+            .unwrap();
+    }
+
+    let mut coordination_rules = BTreeMap::new();
+    coordination_rules.insert(
+        "wing_events_pages".to_owned(),
+        ResolvedRouteRule { mode: RouteMode::Remote, remote: Some("hub".to_owned()), write: WriteTarget::Remote },
+    );
+    let server = mcp_server_with_hub_coordination(
+        &local_dir,
+        &hub_url,
+        BTreeMap::new(),
+        coordination_rules,
+        RouteMode::Local,
+    )
+    .await;
+
+    let page1 = call_tool(
+        &server,
+        1,
+        "mempalace_coordination_events",
+        json!({"wing": "wing_events_pages", "limit": 2}),
+    )
+    .await;
+    let page1_remote = page1.get("remote_events").expect("remote_events must be present on page 1");
+    let page1_events =
+        page1_remote["hub"]["events"].as_array().expect("hub must return events on page 1");
+    assert_eq!(page1_events.len(), 2, "first page must return exactly 2 events: {page1_events:?}");
+    let page1_ids: Vec<&str> =
+        page1_events.iter().filter_map(|e| e["event_id"].as_str()).collect();
+    let hub_cursor1 = page1_remote["hub"]["next_cursor"]
+        .as_str()
+        .expect("remote_events.hub.next_cursor must be a string when more events remain")
+        .to_owned();
+
+    let page2 = call_tool(
+        &server,
+        2,
+        "mempalace_coordination_events",
+        json!({
+            "wing": "wing_events_pages",
+            "limit": 2,
+            "remote_cursors": {"hub": hub_cursor1},
+        }),
+    )
+    .await;
+    let page2_remote = page2.get("remote_events").expect("remote_events must be present on page 2");
+    let page2_events =
+        page2_remote["hub"]["events"].as_array().expect("hub must return events on page 2");
+    assert_eq!(
+        page2_events.len(),
+        1,
+        "second page must return the one remaining event: {page2_events:?}"
+    );
+    let page2_ids: Vec<&str> =
+        page2_events.iter().filter_map(|e| e["event_id"].as_str()).collect();
+    assert_ne!(
+        page1_ids, page2_ids,
+        "feeding remote_cursors back must not repeat the first page's events"
+    );
+    for id in &page2_ids {
+        assert!(
+            !page1_ids.contains(id),
+            "event {id} appeared on both pages — remote_cursors round trip did not advance"
+        );
+    }
+    assert!(
+        page2_remote["hub"]["next_cursor"].is_null(),
+        "no events remain after page 2: {page2_remote}"
+    );
+}
+
+/// Companion to the events round trip above, for `mempalace_inbox_read`'s equally undeclared
+/// `remote_cursors` field. Two messages addressed to the same recipient on the hub; a limit=1
+/// first page followed by the real `next_cursor` fed back must reach the second, different
+/// message rather than repeating the first.
+#[tokio::test]
+async fn coordination_inbox_remote_cursors_round_trip_paginates_without_repeats() {
+    let local_dir = TempDir::new().unwrap();
+    let hub_dir = TempDir::new().unwrap();
+    let hub_addr = spawn_server(&hub_dir).await;
+    let hub_url = format!("http://{hub_addr}");
+
+    let hub_client = RemoteClient::new(RemoteEndpoint {
+        name: "hub".to_owned(),
+        base_url: hub_url.clone(),
+        token: Some(TEST_TOKEN.to_owned()),
+        timeout: Duration::from_secs(5),
+    })
+    .unwrap();
+    let hub_task = hub_client
+        .coordination_task_create(mempalace_federation::NewTaskRequest {
+            title: "inbox cursor pagination".to_owned(),
+            description: "d".to_owned(),
+            wing: "wing_inbox_pages".to_owned(),
+            idempotency_key: "e2e-inbox-pages-task".to_owned(),
+            created_by: None,
+            parent_id: None,
+            dependencies: Vec::new(),
+            budget: None,
+            expires_at: None,
+        })
+        .await
+        .unwrap();
+    for i in 0..2 {
+        hub_client
+            .coordination_message_send(mempalace_federation::NewMessageRequest {
+                task_id: hub_task.task_id.clone(),
+                recipient: "worker-1".to_owned(),
+                kind: "status".to_owned(),
+                payload: json!({"i": i}),
+                idempotency_key: format!("e2e-inbox-pages-message-{i}"),
+                sender: None,
+                envelope_version: 1,
+            })
+            .await
+            .unwrap();
+    }
+
+    let mut coordination_rules = BTreeMap::new();
+    coordination_rules.insert(
+        "wing_inbox_pages".to_owned(),
+        ResolvedRouteRule { mode: RouteMode::Remote, remote: Some("hub".to_owned()), write: WriteTarget::Remote },
+    );
+    let server = mcp_server_with_hub_coordination(
+        &local_dir,
+        &hub_url,
+        BTreeMap::new(),
+        coordination_rules,
+        RouteMode::Local,
+    )
+    .await;
+
+    let page1 = call_tool(
+        &server,
+        1,
+        "mempalace_inbox_read",
+        json!({"recipient": "worker-1", "wing": "wing_inbox_pages", "limit": 1}),
+    )
+    .await;
+    let page1_remote =
+        page1.get("remote_messages").expect("remote_messages must be present on page 1");
+    let page1_messages =
+        page1_remote["hub"]["messages"].as_array().expect("hub must return messages on page 1");
+    assert_eq!(
+        page1_messages.len(),
+        1,
+        "first page must return exactly 1 message: {page1_messages:?}"
+    );
+    let page1_ids: Vec<&str> =
+        page1_messages.iter().filter_map(|m| m["message_id"].as_str()).collect();
+    let hub_cursor1 = page1_remote["hub"]["next_cursor"]
+        .as_str()
+        .expect("remote_messages.hub.next_cursor must be a string when more messages remain")
+        .to_owned();
+
+    let page2 = call_tool(
+        &server,
+        2,
+        "mempalace_inbox_read",
+        json!({
+            "recipient": "worker-1",
+            "wing": "wing_inbox_pages",
+            "limit": 1,
+            "remote_cursors": {"hub": hub_cursor1},
+        }),
+    )
+    .await;
+    let page2_remote =
+        page2.get("remote_messages").expect("remote_messages must be present on page 2");
+    let page2_messages =
+        page2_remote["hub"]["messages"].as_array().expect("hub must return messages on page 2");
+    assert_eq!(
+        page2_messages.len(),
+        1,
+        "second page must return the one remaining message: {page2_messages:?}"
+    );
+    let page2_ids: Vec<&str> =
+        page2_messages.iter().filter_map(|m| m["message_id"].as_str()).collect();
+    assert_ne!(
+        page1_ids, page2_ids,
+        "feeding remote_cursors back must not repeat the first page's message"
+    );
+    assert!(
+        page2_remote["hub"]["next_cursor"].is_null(),
+        "no messages remain after page 2: {page2_remote}"
+    );
+}

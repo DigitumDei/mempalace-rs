@@ -697,8 +697,8 @@ impl ToolName {
             ),
             Self::InboxRead => coordination_definition(
                 self,
-                "Read messages addressed to a recipient using an opaque local cursor. Optionally scope to one wing (matched via the sending task, normalised the same way as task creation).",
-                json!({"recipient":{"type":"string"},"cursor":{"type":"integer"},"wing":{"type":"string","description":"Optional wing filter, e.g. wing_myproject. Normalised the same way as task creation."},"limit":{"type":"integer"},"unacknowledged_only":{"type":"boolean"}}),
+                "Read messages addressed to a recipient using an opaque local cursor. Optionally scope to one wing (matched via the sending task, normalised the same way as task creation). When coordination federation is configured for this wing (and it is not the shared diary wing), the local page is read and, concurrently, each configured remote is also queried; remote pages are reported under a top-level `remote_messages` object keyed by remote name, each entry either `{ messages, next_cursor }` or `{ unreachable: true, error }`, mirroring `mempalace_get_changes_since`'s `remotes` field. `remote_messages` is an empty object whenever coordination federation is not configured for this wing (including the diary wing, or when no remotes are configured at all) — its absence of entries does not imply no remotes exist. Persist each remote's `next_cursor` and pass them back via `remote_cursors` to continue paging that remote without re-fetching already-seen messages; the local `cursor` argument is unrelated and only advances the local page.",
+                json!({"recipient":{"type":"string"},"cursor":{"type":"integer"},"wing":{"type":"string","description":"Optional wing filter, e.g. wing_myproject. Normalised the same way as task creation."},"limit":{"type":"integer"},"unacknowledged_only":{"type":"boolean"},"remote_cursors":{"type":"object","description":"Per-remote opaque cursor strings from a previous response's `remote_messages.<name>.next_cursor`. Pass back to continue pagination for specific remotes without re-fetching already-seen messages.","additionalProperties":{"type":"string"}}}),
                 &["recipient"],
             ),
             Self::ArtifactPut => coordination_definition(
@@ -733,8 +733,8 @@ impl ToolName {
             ),
             Self::CoordinationEvents => coordination_definition(
                 self,
-                "Read append-only coordination audit events using an opaque local cursor. Optionally scope to one task and/or one wing (normalised the same way as task creation).",
-                json!({"cursor":{"type":"integer"},"task_id":{"type":"string"},"wing":{"type":"string","description":"Optional wing filter, e.g. wing_myproject. Normalised the same way as task creation."},"limit":{"type":"integer"}}),
+                "Read append-only coordination audit events using an opaque local cursor. Optionally scope to one task and/or one wing (normalised the same way as task creation). When coordination federation is configured for this wing (and it is not the shared diary wing), the local page is read and, concurrently, each configured remote is also queried; remote pages are reported under a top-level `remote_events` object keyed by remote name, each entry either `{ events, next_cursor }` or `{ unreachable: true, error }`, mirroring `mempalace_get_changes_since`'s `remotes` field. `remote_events` is an empty object whenever coordination federation is not configured for this wing (including the diary wing, or when no remotes are configured at all) — its absence of entries does not imply no remotes exist. Persist each remote's `next_cursor` and pass them back via `remote_cursors` to continue paging that remote without re-fetching already-seen events; the local `cursor` argument is unrelated and only advances the local page.",
+                json!({"cursor":{"type":"integer"},"task_id":{"type":"string"},"wing":{"type":"string","description":"Optional wing filter, e.g. wing_myproject. Normalised the same way as task creation."},"limit":{"type":"integer"},"remote_cursors":{"type":"object","description":"Per-remote opaque cursor strings from a previous response's `remote_events.<name>.next_cursor`. Pass back to continue pagination for specific remotes without re-fetching already-seen events.","additionalProperties":{"type":"string"}}}),
                 &[],
             ),
             Self::SkillPropose => coordination_definition(
@@ -3407,7 +3407,7 @@ where
             return Ok(json!({"found": true, "value": task}));
         }
         if let Some(router) = &self.federation {
-            if let Some(value) = router.coordination_task_get_fallback(&id).await {
+            if let Some(value) = router.coordination_task_get_fallback(&id).await? {
                 return Ok(json!({"found": true, "value": value}));
             }
         }
@@ -3550,7 +3550,7 @@ where
             return Ok(json!({"found": true, "value": message}));
         }
         if let Some(router) = &self.federation {
-            if let Some(value) = router.coordination_message_get_fallback(&id).await {
+            if let Some(value) = router.coordination_message_get_fallback(&id).await? {
                 return Ok(json!({"found": true, "value": value}));
             }
         }
@@ -3639,7 +3639,7 @@ where
             return Ok(json!({"found": true, "value": artifact}));
         }
         if let Some(router) = &self.federation {
-            if let Some(value) = router.coordination_artifact_get_fallback(&id).await {
+            if let Some(value) = router.coordination_artifact_get_fallback(&id).await? {
                 return Ok(json!({"found": true, "value": value}));
             }
         }
@@ -3672,7 +3672,7 @@ where
             return Ok(json!({"found": true, "value": result}));
         }
         if let Some(router) = &self.federation {
-            if let Some(value) = router.coordination_result_get_fallback(&id).await {
+            if let Some(value) = router.coordination_result_get_fallback(&id).await? {
                 return Ok(json!({"found": true, "value": value}));
             }
         }
@@ -4957,6 +4957,35 @@ mod tests {
             assert!(
                 tool.input_schema["properties"].get("lineage_id").is_none(),
                 "{tool_name} must not let the model select its lineage"
+            );
+        }
+    }
+
+    /// Regression for Codex finding 3832912235: `tool_inbox_read`/`tool_coordination_events`
+    /// read `remote_cursors` off the arguments (`parse_cursors_arg`), but until now neither
+    /// tool's `input_schema` declared it, so a schema-driven MCP client had no way to know the
+    /// field exists — every subsequent federated page restarted each remote's paging. Both
+    /// `mempalace_inbox_read` and `mempalace_coordination_events` must declare a `remote_cursors`
+    /// object property whose values are strings, matching the `{remote_name: cursor}` shape
+    /// `parse_cursors_arg` actually parses.
+    #[test]
+    fn inbox_read_and_coordination_events_declare_remote_cursors_schema() {
+        for tool_name in ["mempalace_inbox_read", "mempalace_coordination_events"] {
+            let tool = tool_definitions()
+                .into_iter()
+                .find(|tool| tool.name == tool_name)
+                .unwrap_or_else(|| panic!("{tool_name} must be a defined tool"));
+            let remote_cursors = tool.input_schema["properties"]
+                .get("remote_cursors")
+                .unwrap_or_else(|| panic!("{tool_name} must declare `remote_cursors`"));
+            assert_eq!(
+                remote_cursors["type"], "object",
+                "{tool_name}.remote_cursors must be an object: {remote_cursors}"
+            );
+            assert_eq!(
+                remote_cursors["additionalProperties"]["type"], "string",
+                "{tool_name}.remote_cursors values must be declared as strings, matching \
+                 parse_cursors_arg: {remote_cursors}"
             );
         }
     }

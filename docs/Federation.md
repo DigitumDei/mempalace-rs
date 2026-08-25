@@ -740,9 +740,25 @@ rejecting `:` in a token's `name` at token-file load time — see
 [Config Schema → `server.token_file`](Config-Schema.md#servertoken_file).
 `recipient` on a message is **not** rewritten this way: it addresses a message to
 someone, and does not itself assert who the caller is, so it is stored verbatim —
-matching local behaviour. (Whoever later acknowledges that message still has their
-own actor identity-derived, and storage requires it to equal `recipient` before the
-acknowledgement is accepted.)
+matching local behaviour.
+
+`POST /v1/coordination/messages/{id}/ack`'s `actor` field is a deliberate exception
+to the identity-derivation rule above, not an application of it. Storage requires
+the final actor to equal the message's `recipient` **exactly** — and `recipient`,
+per the paragraph above, is itself stored verbatim, never identity-prefixed. Running
+the claimed ack actor through the same `{identity}:{claimed}` rule as every other
+actor field therefore made a federated acknowledgement fail whenever the remote
+token's identity differed from the recipient's name, since a prefixed string can
+never equal an unprefixed one. The server instead uses the claimed actor **as-is**
+when it exactly matches the message's `recipient` — proving you know the
+(unauthenticated) address a message was already sent to, no stronger a claim than
+the sender who chose that address in the first place — and falls back to the
+ordinary `{identity}:{claimed}` derivation for any other claim, so a claim naming
+some unrelated identity still cannot be recorded bare: it is either exactly the
+recipient (allowed) or it gets prefixed and then fails the recipient-equality
+check (rejected), never both. Only `actor` on the ack route works this way; `sender`
+(message send) and every other actor-shaped field still follow the derivation rule
+unconditionally.
 
 ### Cursors are opaque strings with no clock in them
 
@@ -874,17 +890,46 @@ request that carries a wing at all — every other coordination tool (`mempalace
 message, artifact, or result ID, and none of them take a `wing` argument, so there is nothing
 for `resolve_coordination_route` to resolve against. Those ID-keyed tools instead use a
 **local-first, ID-discovery fallback**: local storage is tried first; on a miss, if coordination
-federation is configured at all, the router tries each remote in name order and uses whichever
-one actually owns the record — mirroring `mempalace_delete_drawer`'s existing "no cross-palace ID
-mapping" reasoning exactly. This fallback fires independent of any *specific* wing's resolved
-mode — it is not gated by a `combined`/`remote` rule for the record's own wing, since that wing
-is not yet known when the fallback starts — but it does require coordination federation to be
-configured at all: either `federation.coordination` has at least one entry, or `default_mode` is
-non-`local` (which is what `resolve_coordination_route` itself falls through to for any wing
-without an explicit entry). A palace that federates drawers only, with an empty
-`federation.coordination` table and `default_mode: local`, never sends a coordination ID lookup
-to any remote — a configured remote alone is not enough. A read that finds the record on a remote annotates the response with
-`origin: "remote:<name>"`; a write that lands on a remote reports `applied_to: "remote:<name>"`.
+federation is configured at all, the router tries each **candidate** remote in name order and
+uses whichever one actually owns the record — mirroring `mempalace_delete_drawer`'s existing "no
+cross-palace ID mapping" reasoning exactly. The candidate set is every remote named by a
+`federation.coordination[wing]` rule (across every wing — there is no wing to key a single
+lookup by, so it is the union) plus `default_remote` when `default_mode` is non-`local`; a
+remote configured only for drawer or KG federation, never referenced by coordination
+configuration at all, is skipped entirely rather than probed and misread as a coordination
+failure. This fallback fires independent of any *specific* wing's resolved mode — it is not
+gated by a `combined`/`remote` rule for the record's own wing, since that wing is not yet known
+when the fallback starts — but it does require coordination federation to be configured at all:
+either `federation.coordination` has at least one entry, or `default_mode` is non-`local` (which
+is what `resolve_coordination_route` itself falls through to for any wing without an explicit
+entry). A palace that federates drawers only, with an empty `federation.coordination` table and
+`default_mode: local`, never sends a coordination ID lookup to any remote — a configured remote
+alone is not enough.
+
+**Reads and writes part ways on which per-candidate errors mean "not this palace" versus a hard
+failure.** For a **read** (`mempalace_task_get`, `mempalace_message_get`,
+`mempalace_artifact_get`, `mempalace_result_get`), only a `404`-shaped rejection and a
+genuinely-degradable `Unreachable` remote are skipped in favour of the next candidate — the
+federation-wide "reads degrade" rule, so one down remote never blocks discovery through the
+others. Every other error from a candidate — wrong credentials, an incompatible API version, a
+missing `coordination` capability, or an undecodable response — means that *configured* remote
+is broken, not merely silent about this one record, and is raised as a tool error instead of
+being folded into `{"found": false}`; a caller must be able to tell "this record genuinely does
+not exist anywhere" apart from "your token is wrong" or "this remote can't do coordination at
+all". For a **write** (`mempalace_task_claim`/`_renew`/`_transition`, `mempalace_message_send`,
+`mempalace_message_acknowledge`, `mempalace_artifact_put`, `mempalace_result_put`), a `404` and a
+missing `coordination` capability both mean "not this palace, try the next candidate" — the
+capability list is read live from the candidate's own `/v1/info`, independent of how
+`federation.coordination` describes it, so a candidate remote can still turn out not to run
+coordination at all. Every other error, including an unreachable remote, is terminal for a
+write: unlike a read, a write cannot afford to guess past a candidate it could not get a
+definitive answer from, since guessing wrong could create a second, divergent record for the
+same task on the wrong palace. A read that finds the record on a remote annotates the response
+with `origin: "remote:<name>"`; a write that lands on a remote reports `applied_to:
+"remote:<name>"`. `mempalace_task_claim`/`_renew`/`_transition`'s successful remote response
+nests the task under `"task"`, exactly like the local shape documented below — `{"success":
+true, "task": {...}, "applied_to": "remote:<name>"}` — so a caller never has to special-case
+which palace served the write.
 `mempalace_inbox_read` and `mempalace_coordination_events` are the exception to the exception:
 being aggregate, cursor-paginated feeds (like `mempalace_get_changes_since`), they always read
 local and fan out to every configured remote concurrently with a per-remote cursor, reported
@@ -916,6 +961,17 @@ future call site can add a fan-out read without them:
   (suppressed, not fanned out) rather than falling through un-filtered. A request with no
   `wing` argument at all is unaffected — there is no wing to protect against in an unfiltered
   aggregate read.
+
+**Continuing a federated page uses `remote_cursors`, not `cursor`.** The local `cursor`
+argument on `mempalace_inbox_read`/`mempalace_coordination_events` only advances the local
+page. Each remote's own page is continued independently by echoing back its
+`remote_messages.<name>.next_cursor` / `remote_events.<name>.next_cursor` from the previous
+response inside a `remote_cursors: {"<name>": "<cursor>"}` object argument — the same
+per-remote-map shape `mempalace_get_changes_since`'s `cursors` argument already uses. Treat
+each value as opaque; do not parse it or reuse it against a different remote. `remote_messages`/
+`remote_events` is an empty object whenever coordination federation is not configured for the
+requested wing (including the diary wing) or no remotes are configured at all — an empty map
+there does not mean pagination finished, only that no remote was queried in the first place.
 
 **Revision conflicts cross the wire intact.** A `409 revision_conflict` from a remote — from a
 `claim`/`renew`/`transition` discovered via the ID-fallback above — decodes into

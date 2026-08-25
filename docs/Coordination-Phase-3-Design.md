@@ -373,6 +373,129 @@ gains coordination categories and — unlike today, where it is dead code called
    `wing_blocks_coordination_fanout` and `coordination_events_fanout`/`coordination_inbox_fanout`
    in `crates/mempalace-mcp/src/federation.rs`.
 
+9. **Post-implementation fix: `coordination_read_fallback` treated every remote error as a
+   skippable miss, including `Unauthorized`/`VersionSkew`/`CapabilityMissing` and a malformed
+   response.** The ID-discovery read fallbacks (`tool_task_get`, `tool_message_get`,
+   `tool_artifact_get`, `tool_result_get`) logged and moved on to the next remote for *any*
+   error, not just a `404`. A misconfigured token, an incompatible remote, or a remote that does
+   not support coordination at all was therefore indistinguishable from "the record does not
+   exist" — a caller received `{"found": false}` either way, with no way to tell a genuine miss
+   apart from a broken remote.
+
+   Fixed by narrowing the "try the next remote" set for reads to a `404`-shaped `RemoteRejected`
+   and a genuinely degradable `Unreachable` remote (the federation-wide "reads degrade" rule);
+   every other error — `Unauthorized`, `VersionSkew`, `CapabilityMissing`, `InvalidResponse`, or
+   any other `RemoteRejected` status — now surfaces as a hard `ToolError`, matching the error
+   construction every other federation read path in `crates/mempalace-mcp/src/federation.rs`
+   already uses. `coordination_task_get_fallback`/`coordination_message_get_fallback`/
+   `coordination_artifact_get_fallback`/`coordination_result_get_fallback` changed signature from
+   `Option<Value>` to `ToolResult<Option<Value>>` to carry the new error path; their callers in
+   `crates/mempalace-mcp/src/lib.rs` now propagate it with `?`. See `coordination_read_fallback`
+   and its error-policy doc comment, and the `coordination_read_fallback_surfaces_*` tests, in
+   `crates/mempalace-mcp/src/federation.rs`.
+
+10. **Post-implementation fix: the ID-discovery write fallback (`coordination_write_fallback`
+    and the claim/renew/transition equivalents) iterated every configured remote, not just ones
+    wired up for coordination, and treated `CapabilityMissing` as terminal.** A remote configured
+    only for drawer or KG federation — never referenced by any `federation.coordination` rule —
+    still received every local coordination write miss, in `BTreeMap` name order. If that
+    unrelated remote's name sorted before the actual coordination remote's name and it does not
+    advertise the `coordination` capability (e.g. a pre-Stage-4 server, or one simply never
+    intended for coordination traffic), the resulting `CapabilityMissing` was treated the same as
+    any other non-404 write error: terminal, ending the search before the real owning remote was
+    ever tried.
+
+    Fixed in two parts. First, `FederationRouter::coordination_candidate_remotes` computes the
+    set of remote names actually referenced by `federation.coordination` (across every wing —
+    there is no wing to key a single lookup by, so the *union* across all configured coordination
+    rules is used) plus `default_remote` when `default_mode` is non-`Local`; `coordination_read_fallback`,
+    `coordination_write_fallback`, and `coordination_task_revisioned_fallback` (see deviation 11
+    below) all iterate only that candidate set instead of every configured remote. Second,
+    `CapabilityMissing` from a remote still inside the candidate set is treated the same as a
+    `404` for a *write* — "not this palace" — because the capability list comes live from the
+    remote's own `/v1/info`, independent of what `federation.coordination` says about it, so a
+    candidate can genuinely turn out not to run coordination at all. This is the opposite of
+    deviation 9's read policy on the very same error, deliberately: a write cannot afford to
+    guess past a remote it could not get an answer from (wrong guess risks a second, divergent
+    record for the same task on the wrong palace), so every other error, including an unreachable
+    remote, stays terminal for writes. See `coordination_write_fallback`'s doc comment and the
+    `coordination_write_fallback_reaches_later_remote_past_earlier_capability_missing` test
+    (two remotes, the non-coordination one sorting first) in
+    `crates/mempalace-mcp/src/federation.rs`.
+
+11. **Post-implementation fix: the remote claim/renew/transition envelope flattened the task DTO
+    at the top level instead of nesting it under `task`.** Deviation 4 above documents the local
+    success shape as `{"success": true, "task": {...}}`. The remote fallback paths
+    (`coordination_task_revisioned_fallback`, and `coordination_task_transition_fallback` before
+    it was merged into that same function) instead serialised the task DTO to the top level of
+    the response object and added `success`/`applied_to` beside its fields — e.g.
+    `{"task_id": ..., "success": true, "applied_to": "remote:hub"}` — with no `task` key at all.
+    A client that deserialises against the documented local shape silently loses the task the
+    moment the same operation falls back to a remote.
+
+    **This is a breaking change for any existing caller written against the flattened remote
+    shape** — call it out in the PR description. Fixed by building the same
+    `{"success": true, "task": {...}, "applied_to": "remote:<name>"}` envelope on both paths;
+    `applied_to` stays a sibling of `task` (envelope-level metadata about *how* the write was
+    served, not a property of the task record itself), matching where every other remote
+    annotation in this file (`origin`, `applied_to`) already lives — at the envelope/object level
+    the caller inspects first, not nested inside the payload it annotates. The revision-conflict
+    branch was not affected: it already called the shared `revision_conflict_payload` helper on
+    both local and remote paths, so local and remote conflicts have always agreed. See
+    `coordination_task_revisioned_fallback` and the `coordination_task_write_fallbacks_nest_task_under_task_key`/
+    `coordination_task_write_local_and_remote_envelopes_match` tests in
+    `crates/mempalace-mcp/src/federation.rs`.
+
+12. **Post-implementation fix: `POST /v1/coordination/messages/{id}/ack` ran its claimed
+    `actor` through the same identity-prefixing rule as every other actor-shaped field, which
+    made a federated acknowledgement fail whenever the remote token's identity differed from
+    the message's `recipient`.** `route_coordination_message_send` stores `recipient` verbatim
+    — deviation 3's "Actor identity" note is explicit that `recipient` is not identity-derived,
+    since it addresses a message rather than asserting who the caller is. But
+    `route_coordination_message_ack` derived its `actor` the same way `created_by`/`sender`/
+    `worker` are derived: `{identity}:{claimed}` whenever the claim differed from the
+    authenticated token's identity. Storage's `acknowledge_message` requires the final actor to
+    equal `recipient` **exactly** (`ONLY_RECIPIENT_MAY_ACKNOWLEDGE`). Since a prefixed string
+    can never equal an unprefixed one, the only way the old code could succeed was for the
+    token's own identity to already equal the recipient — which defeats the entire point of
+    routing an acknowledgement through a hub or a token whose configured name is not the
+    recipient's own name, the ordinary shape of a multi-agent deployment.
+
+    Fixed by `resolve_ack_actor`, used only on the ack route: when the claimed actor exactly
+    equals the message's `recipient`, it is used as-is (proving the caller knows the
+    (unauthenticated) address the message was already sent to — no stronger a claim than the
+    sender who chose that address); any other claim — including one that happens to equal the
+    caller's own token identity but not the recipient — still goes through
+    `resolve_coordination_actor`'s ordinary prefixing, so a claim naming an unrelated identity
+    can never be recorded bare. This preserves the impersonation protection
+    `resolve_coordination_actor` exists for: the *only* new thing a caller can achieve is
+    acknowledging with the literal recipient string, which was already knowable from the
+    message itself (or from having addressed it), not from breaking any identity boundary. See
+    `resolve_ack_actor` and the module-level "Actor identity" note in
+    `crates/mempalace-server/src/lib.rs`, and
+    `coordination_message_ack_succeeds_when_claim_matches_recipient_not_identity`/
+    `coordination_message_ack_still_rejects_a_claim_impersonating_someone_else` in the same
+    file's test module.
+
+13. **Post-implementation fix: `mempalace_inbox_read`/`mempalace_coordination_events`'s
+    `input_schema` never declared `remote_cursors`, even though both tools' implementations
+    already read it (`parse_cursors_arg(arguments, "remote_cursors")`).** A schema-driven MCP
+    client has no way to send an argument its declared schema does not mention, so every
+    federated page restarted each remote's paging from the beginning — the field was
+    functional but undiscoverable.
+
+    Fixed by adding `remote_cursors` (an object of string values, matching what
+    `parse_cursors_arg` actually parses: `{"<remote_name>": "<opaque_cursor>"}`) to both tools'
+    `input_schema`, and describing it — and the corresponding `remote_messages`/`remote_events`
+    response fields, including that they are empty objects (not an error) whenever coordination
+    federation is not configured for the requested wing — in both tools' `description`. See
+    `ToolName::definition` for `InboxRead`/`CoordinationEvents` in
+    `crates/mempalace-mcp/src/lib.rs`, the schema assertions in
+    `inbox_read_and_coordination_events_declare_remote_cursors_schema`, and the end-to-end
+    pagination proofs `coordination_events_remote_cursors_round_trip_paginates_without_repeats`/
+    `coordination_inbox_remote_cursors_round_trip_paginates_without_repeats` in
+    `crates/mempalace-mcp/tests/federation_e2e.rs`.
+
 ## Stage 5 — A2A adapter
 
 A new crate, `mempalace-a2a`, depending on `mempalace-storage` and `mempalace-federation` and

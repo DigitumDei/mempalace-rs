@@ -2526,12 +2526,30 @@ where
 // Actor identity. Storage accepts a caller-supplied actor string, which is
 // fine locally where the host runtime asserts it. Over HTTP the authenticated
 // token identity is authoritative: every actor-shaped field on a coordination
-// write DTO (`created_by`, `sender`, `worker`, `actor`) is the caller's
-// *claimed* name, and `resolve_coordination_actor` applies the same
+// write DTO (`created_by`, `sender`, `worker`) is the caller's *claimed*
+// name, and `resolve_coordination_actor` applies the same
 // `{identity}:{claimed}` prefixing rule `route_drawers_add` uses for
 // `added_by`. `recipient` on a message is not an actor field — it addresses a
 // message to someone and does not itself assert who the caller is — so it is
 // taken verbatim, matching local behaviour.
+//
+// The acknowledging `actor` on `POST /v1/coordination/messages/{id}/ack` is a
+// special case of the same rule, not an exception to it: storage requires it
+// to equal the message's `recipient` **exactly** (`ONLY_RECIPIENT_MAY_ACKNOWLEDGE`),
+// and `recipient` is itself stored verbatim/unauthenticated (see above). Running
+// the claimed ack actor through the identity-prefixing rule therefore made every
+// federated acknowledgement fail unless the remote token's identity happened to
+// equal the message's recipient, since `{identity}:{claimed}` can never equal a
+// recipient stored without that prefix. `resolve_ack_actor` fixes this by using
+// the claim verbatim only when it exactly matches the message's own recipient —
+// proving you know the (unauthenticated) address a message was already sent to,
+// which is no stronger a claim than the sender who chose that recipient string
+// in the first place. Any other claimed value — one that is neither the caller's
+// own identity nor the message's recipient — still goes through
+// `resolve_coordination_actor`'s prefixing, so a caller can never cause an
+// unrelated identity's bare name to be recorded or matched: it either gets
+// prefixed (and then correctly fails the recipient-equality check), or it was
+// already the recipient to begin with.
 //
 // Lease clocks. Expiry is evaluated entirely inside `CoordinationStore` using
 // `OffsetDateTime::now_utc()` — this palace's own clock. No route here
@@ -2655,6 +2673,25 @@ fn resolve_coordination_actor(
             Ok(format!("{identity}:{claim}"))
         }
         _ => Ok(identity.to_owned()),
+    }
+}
+
+/// Resolves the acknowledging actor for `POST /v1/coordination/messages/{id}/ack`.
+/// See the module-level "Actor identity" note for why this cannot reuse
+/// [`resolve_coordination_actor`] unconditionally: storage requires the final
+/// actor to equal `recipient` exactly, and `recipient` is stored verbatim, so
+/// a claim that already *is* the recipient is used as-is. Any other claim —
+/// including one that is simply the caller's own token identity — still goes
+/// through the ordinary prefixing rule, so a claim naming an unrelated
+/// identity can never be recorded bare.
+fn resolve_ack_actor(
+    identity: &str,
+    claimed: &Option<String>,
+    recipient: &str,
+) -> Result<String, ServerError> {
+    match claimed {
+        Some(claim) if claim == recipient => Ok(claim.clone()),
+        _ => resolve_coordination_actor(identity, claimed),
     }
 }
 
@@ -3157,7 +3194,7 @@ where
         Operation::CoordinationWrite,
         &format!("message {id}"),
     )?;
-    let actor = resolve_coordination_actor(&auth.0.0, &body.actor)?;
+    let actor = resolve_ack_actor(&auth.0.0, &body.actor, &message.recipient)?;
     let acknowledged =
         state.coordination.acknowledge_message(&id, &actor).map_err(coordination_storage_error)?;
     Ok(Json(message_to_dto(acknowledged)?))
@@ -7094,6 +7131,118 @@ mod tests {
         let messages = inbox["messages"].as_array().unwrap();
         assert!(messages.iter().any(|m| m["message_id"] == message_id
             && m["acknowledged_by"] == "coord_alpha"));
+    }
+
+    /// Regression for Codex finding 3832912248: a federated acknowledgement
+    /// must succeed when the acknowledging token's identity differs from the
+    /// message's recipient, as long as the claimed `actor` equals that
+    /// recipient exactly. `COORD_WIDE_TOKEN`'s identity is `coord_wide`; the
+    /// message here is addressed to `worker-b`, a name that is neither
+    /// `coord_wide` nor any other configured token's identity, so this only
+    /// passes if `route_coordination_message_ack` stops running the ack
+    /// actor through `resolve_coordination_actor`'s identity-prefixing rule
+    /// when the claim already matches the recipient. See
+    /// `resolve_ack_actor`.
+    #[tokio::test]
+    async fn coordination_message_ack_succeeds_when_claim_matches_recipient_not_identity() {
+        let harness = make_harness().await;
+        let task_id =
+            create_task(&harness, COORD_WIDE_TOKEN, "wing_alpha", "ack-identity-mismatch-task")
+                .await;
+
+        let send_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/coordination/messages",
+                COORD_WIDE_TOKEN,
+                json!({
+                    "task_id": task_id,
+                    "recipient": "worker-b",
+                    "kind": "status",
+                    "payload": {"progress": "started"},
+                    "idempotency_key": "ack-identity-mismatch-message",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(send_resp.status(), StatusCode::OK);
+        let message = body_json(send_resp).await;
+        assert_eq!(message["recipient"], "worker-b");
+        let message_id = message["message_id"].as_str().unwrap().to_owned();
+
+        // The authenticated token identity (`coord_wide`) genuinely differs
+        // from the claimed actor (`worker-b`) — the scenario the finding
+        // requires. Before the fix this was mangled to
+        // `coord_wide:worker-b`, which never equals the stored recipient, so
+        // the ack was rejected as a coordination conflict.
+        let ack_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                &format!("/v1/coordination/messages/{message_id}/ack"),
+                COORD_WIDE_TOKEN,
+                json!({"actor": "worker-b"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(ack_resp.status(), StatusCode::OK);
+        let acked = body_json(ack_resp).await;
+        assert_eq!(acked["acknowledged_by"], "worker-b");
+        assert!(acked["acknowledged_at"].is_string());
+    }
+
+    /// Companion to the regression above: a claimed ack actor that is
+    /// neither the caller's own token identity nor the message's recipient
+    /// must still be rejected — proving the fix narrows the bypass to an
+    /// exact recipient match rather than removing `resolve_coordination_actor`'s
+    /// identity-prefixing protection altogether. `coord_wide` claims to be
+    /// `someone_else`, which is not `worker-b` (the actual recipient), so
+    /// `resolve_ack_actor` must still route it through the ordinary
+    /// prefixing rule (`coord_wide:someone_else`), which cannot equal the
+    /// stored recipient either way.
+    #[tokio::test]
+    async fn coordination_message_ack_still_rejects_a_claim_impersonating_someone_else() {
+        let harness = make_harness().await;
+        let task_id =
+            create_task(&harness, COORD_WIDE_TOKEN, "wing_alpha", "ack-impersonation-task").await;
+
+        let send_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/coordination/messages",
+                COORD_WIDE_TOKEN,
+                json!({
+                    "task_id": task_id,
+                    "recipient": "worker-b",
+                    "kind": "status",
+                    "payload": {"progress": "started"},
+                    "idempotency_key": "ack-impersonation-message",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(send_resp.status(), StatusCode::OK);
+        let message_id = body_json(send_resp).await["message_id"].as_str().unwrap().to_owned();
+
+        let ack_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                &format!("/v1/coordination/messages/{message_id}/ack"),
+                COORD_WIDE_TOKEN,
+                json!({"actor": "someone_else"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(ack_resp.status(), StatusCode::CONFLICT);
+        let body = body_json(ack_resp).await;
+        assert_eq!(body["code"], "coordination_conflict");
     }
 
     #[tokio::test]

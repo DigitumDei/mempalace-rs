@@ -1335,56 +1335,128 @@ impl FederationRouter {
     //
     // Every other coordination call — reads and ID-referencing writes alike — is a local-first,
     // ID-discovery fallback: the caller (`McpRuntime` in `lib.rs`) tries local storage first; on
-    // a local miss, if any remotes are configured, the methods below try each configured remote
-    // in name order (`self.remotes` is a `BTreeMap`, so iteration order is already name order)
-    // and use whichever one actually has the record — mirroring `delete_drawer_remote`'s
-    // existing "local ID lookup, then all remotes in order" pattern, which exists for the exact
-    // same reason (no cross-palace ID mapping to route by). A `404`-shaped rejection from a
-    // remote means "not this palace, try the next one"; for a **write**, any other error is
-    // terminal and surfaces immediately rather than silently moving on to a different remote —
-    // moving on could create a second, divergent record for the same task on the wrong palace.
-    // For a plain **read**, any error (including an unreachable remote) is skipped the same way
-    // a 404 is: "reads degrade" is the federation-wide rule (see `docs/Federation.md`), and a
-    // down remote must not block discovery through the others.
+    // a local miss, if any remotes are configured, the methods below try each *candidate* remote
+    // (see `coordination_candidate_remotes` — not every configured remote; a remote never wired
+    // up for coordination at all is skipped entirely) in name order (`self.remotes` is a
+    // `BTreeMap`, so iteration order is already name order) and use whichever one actually has
+    // the record — mirroring `delete_drawer_remote`'s existing "local ID lookup, then all
+    // remotes in order" pattern, which exists for the exact same reason (no cross-palace ID
+    // mapping to route by).
+    //
+    // Reads and writes deliberately part ways on which errors count as "not this palace, try the
+    // next candidate" versus a hard failure — see `coordination_read_fallback` and
+    // `coordination_write_fallback`'s doc comments for the exact split and the reasoning behind
+    // it. In short: a **write** cannot afford to guess past a remote it could not actually get an
+    // answer from (guessing wrong could create a second, divergent record for the same task on
+    // the wrong palace), so only `404`/`CapabilityMissing` are skippable there and everything
+    // else — including an unreachable remote — is terminal. A plain **read** has no such
+    // downside, so it also skips a genuinely degradable `Unreachable` remote (the
+    // federation-wide "reads degrade" rule — see `docs/Federation.md`), but still surfaces
+    // `Unauthorized`/`VersionSkew`/`CapabilityMissing`/malformed-response errors as hard
+    // failures: those mean the configured remote itself is broken, and silently treating that as
+    // "record not found" would hide a real misconfiguration from the caller.
 
-    /// Try a coordination *read* against each configured remote in name order, returning the
-    /// first success annotated with `origin` (the `remote:`-prefixed form, matching
-    /// `changes_fanout`/`kg_add_remote` rather than the bare form `check_duplicate_all_remotes`
-    /// uses for search results — coordination conflict/response payloads already read more like
-    /// the changes feed's `origin` shape than a search hit). Every error (unreachable, 404, or
-    /// anything else) is logged and treated as "try the next remote" — a plain read degrades
-    /// silently across remotes; `Ok(None)` means no remote had it either.
-    async fn coordination_read_fallback<F, Fut, T>(&self, op: F) -> Option<Value>
+    /// Remote names that can actually participate in coordination discovery: every remote
+    /// referenced by an explicit `federation.coordination[wing]` rule (there may be several,
+    /// one per wing, naming different remotes), plus `default_remote` when coordination for an
+    /// unlisted wing would fall through to `default_mode` (mirrors
+    /// `coordination_federation_enabled`'s reasoning — see its doc comment).
+    ///
+    /// The ID-referencing fallbacks below have no wing to resolve a *specific* coordination
+    /// route against (that is their entire reason for existing — see the section comment
+    /// above), so this cannot narrow to "the one remote this call should use" the way a
+    /// wing-based route resolution would. What it *can* do is exclude remotes that were never
+    /// configured for coordination at all — e.g. a remote wired up only for `federation.wings`
+    /// drawer routing — so a task/message/artifact/result lookup or write no longer probes a
+    /// palace that has nothing to do with coordination. Deviation 9 in
+    /// `docs/Coordination-Phase-3-Design.md` records why this candidate set exists.
+    fn coordination_candidate_remotes(&self) -> std::collections::BTreeSet<&str> {
+        let mut candidates = std::collections::BTreeSet::new();
+        for rule in self.rules.coordination.values() {
+            if let Some(name) = &rule.remote {
+                candidates.insert(name.as_str());
+            }
+        }
+        if self.rules.default_mode != RouteMode::Local {
+            if let Some(name) = &self.rules.default_remote {
+                candidates.insert(name.as_str());
+            }
+        }
+        candidates
+    }
+
+    /// Try a coordination *read* against each candidate remote (see
+    /// `coordination_candidate_remotes`) in name order, returning the first success annotated
+    /// with `origin` (the `remote:`-prefixed form, matching `changes_fanout`/`kg_add_remote`
+    /// rather than the bare form `check_duplicate_all_remotes` uses for search results —
+    /// coordination conflict/response payloads already read more like the changes feed's
+    /// `origin` shape than a search hit).
+    ///
+    /// Error policy (deliberately asymmetric with `coordination_write_fallback` — see that
+    /// method's doc comment): a `404` means "not this palace, try the next candidate"; an
+    /// `Unreachable` remote is the one genuinely degradable transport failure and is skipped
+    /// the same way, because a down remote must not block discovery through the others (the
+    /// federation-wide "reads degrade" rule — see `docs/Federation.md`). Every other error —
+    /// `Unauthorized`, `VersionSkew`, `CapabilityMissing`, `InvalidResponse`, `InvalidConfig`,
+    /// or a non-404 `RemoteRejected` — means the *configured* remote itself is broken or
+    /// misconfigured, not merely "not this palace", and is surfaced as a hard `ToolError`
+    /// immediately: silently treating it as a miss would let a caller believe a record does not
+    /// exist when the truth is "your token is wrong" or "this remote is on an incompatible
+    /// version". `Ok(None)` means every candidate was tried and genuinely does not have it.
+    async fn coordination_read_fallback<F, Fut, T>(&self, op: F) -> ToolResult<Option<Value>>
     where
         F: Fn(Arc<dyn RemoteApi>) -> Fut,
         Fut: std::future::Future<Output = mempalace_remote::Result<T>>,
         T: serde::Serialize,
     {
         if !self.coordination_federation_enabled() {
-            return None;
+            return Ok(None);
         }
+        let candidates = self.coordination_candidate_remotes();
         for (name, api) in &self.remotes {
+            if !candidates.contains(name.as_str()) {
+                continue;
+            }
             match op(Arc::clone(api)).await {
                 Ok(dto) => {
                     let mut value = serde_json::to_value(&dto).unwrap_or_else(|_| json!({}));
                     if let Some(obj) = value.as_object_mut() {
                         obj.insert("origin".to_owned(), json!(format_remote_origin(name)));
                     }
-                    return Some(value);
+                    return Ok(Some(value));
+                }
+                Err(RemoteError::RemoteRejected { status: 404, .. }) => continue,
+                Err(e) if e.is_degradable() => {
+                    tracing::warn!(
+                        remote = %name,
+                        error = %e,
+                        "coordination read fallback: remote unreachable, trying next"
+                    );
                 }
                 Err(e) => {
-                    tracing::warn!(remote = %name, error = %e, "coordination read fallback failed");
+                    return Err(ToolError::Internal(McpError::Federation(format!(
+                        "remote `{name}` coordination read failed: {e}"
+                    ))));
                 }
             }
         }
-        None
+        Ok(None)
     }
 
-    /// Try a coordination *write that references an existing record* against each configured
-    /// remote in name order. A `404` means "not this palace" and moves on to the next; any
-    /// other error stops the search and surfaces as a hard `ToolError` — see the section
-    /// comment above for why a write cannot treat a non-404 failure as skippable the way a read
-    /// does. `Ok(None)` means no remote had the referenced record either.
+    /// Try a coordination *write that references an existing record* against each candidate
+    /// remote (see `coordination_candidate_remotes`) in name order.
+    ///
+    /// Error policy (deliberately asymmetric with `coordination_read_fallback` — see that
+    /// method's doc comment): a `404` or `CapabilityMissing` both mean "not this palace, try the
+    /// next candidate" — `CapabilityMissing` is decided live from the remote's `/v1/info`
+    /// capability list, independent of whether `federation.coordination` names it as a
+    /// candidate, so a candidate remote can still turn out to be running a pre-Stage-4 server
+    /// with no coordination support at all; that is exactly the "not this palace" case, not a
+    /// misconfiguration to report. Every other error — including an unreachable remote — stops
+    /// the search and surfaces as a hard `ToolError`: unlike a read, a write cannot afford to
+    /// guess past a remote it could not actually confirm an answer from, because moving on could
+    /// create a second, divergent record for the same task on the wrong palace. `Ok(None)` means
+    /// every candidate was tried and genuinely does not have the referenced record.
     async fn coordination_write_fallback<F, Fut, T>(&self, op: F) -> ToolResult<Option<Value>>
     where
         F: Fn(Arc<dyn RemoteApi>) -> Fut,
@@ -1394,7 +1466,11 @@ impl FederationRouter {
         if !self.coordination_federation_enabled() {
             return Ok(None);
         }
+        let candidates = self.coordination_candidate_remotes();
         for (name, api) in &self.remotes {
+            if !candidates.contains(name.as_str()) {
+                continue;
+            }
             match op(Arc::clone(api)).await {
                 Ok(dto) => {
                     let mut value = serde_json::to_value(&dto).unwrap_or_else(|_| json!({}));
@@ -1404,6 +1480,7 @@ impl FederationRouter {
                     return Ok(Some(value));
                 }
                 Err(RemoteError::RemoteRejected { status: 404, .. }) => continue,
+                Err(RemoteError::CapabilityMissing { .. }) => continue,
                 Err(e) => {
                     return Err(ToolError::Internal(McpError::Federation(format!(
                         "remote `{name}` rejected the write: {e}"
@@ -1449,7 +1526,7 @@ impl FederationRouter {
     }
 
     /// Fall back to a task GET across remotes after a local miss.
-    pub async fn coordination_task_get_fallback(&self, task_id: &str) -> Option<Value> {
+    pub async fn coordination_task_get_fallback(&self, task_id: &str) -> ToolResult<Option<Value>> {
         let task_id = task_id.to_owned();
         self.coordination_read_fallback(move |api| {
             let task_id = task_id.clone();
@@ -1469,9 +1546,13 @@ impl FederationRouter {
         task_id: &str,
         req: TaskLeaseRequest,
     ) -> ToolResult<Option<Value>> {
-        self.coordination_task_revisioned_fallback(task_id, req, |api, id, req| async move {
-            api.coordination_task_claim(&id, req).await
-        })
+        let expected_revision = req.expected_revision;
+        self.coordination_task_revisioned_fallback(
+            task_id,
+            req,
+            expected_revision,
+            |api, id, req| async move { api.coordination_task_claim(&id, req).await },
+        )
         .await
     }
 
@@ -1482,84 +1563,95 @@ impl FederationRouter {
         task_id: &str,
         req: TaskLeaseRequest,
     ) -> ToolResult<Option<Value>> {
-        self.coordination_task_revisioned_fallback(task_id, req, |api, id, req| async move {
-            api.coordination_task_renew(&id, req).await
-        })
+        let expected_revision = req.expected_revision;
+        self.coordination_task_revisioned_fallback(
+            task_id,
+            req,
+            expected_revision,
+            |api, id, req| async move { api.coordination_task_renew(&id, req).await },
+        )
         .await
     }
 
     /// Fall back to a state transition across remotes after a local miss. See
-    /// [`Self::coordination_task_claim_fallback`] for the conflict-shape note.
+    /// [`Self::coordination_task_claim_fallback`] for the conflict-shape note. Thin wrapper over
+    /// [`Self::coordination_task_revisioned_fallback`] — identical control flow to claim/renew,
+    /// generic over the request type so `TransitionTaskRequest` shares the body with
+    /// `TaskLeaseRequest`.
     pub async fn coordination_task_transition_fallback(
         &self,
         task_id: &str,
         req: TransitionTaskRequest,
     ) -> ToolResult<Option<Value>> {
-        if !self.coordination_federation_enabled() {
-            return Ok(None);
-        }
-        for (name, api) in &self.remotes {
-            match api.coordination_task_transition(task_id, req.clone()).await {
-                Ok(RemoteRevisionedWrite::Applied(dto)) => {
-                    let mut value = serde_json::to_value(&dto).unwrap_or_else(|_| json!({}));
-                    if let Some(obj) = value.as_object_mut() {
-                        obj.insert("success".to_owned(), json!(true));
-                        obj.insert("applied_to".to_owned(), json!(format_remote_origin(name)));
-                    }
-                    return Ok(Some(value));
-                }
-                Ok(RemoteRevisionedWrite::Conflict { actual_revision }) => {
-                    return Ok(Some(crate::revision_conflict_payload(
-                        req.expected_revision,
-                        actual_revision,
-                    )));
-                }
-                Err(RemoteError::RemoteRejected { status: 404, .. }) => continue,
-                Err(e) => {
-                    return Err(ToolError::Internal(McpError::Federation(format!(
-                        "remote `{name}` rejected the transition: {e}"
-                    ))));
-                }
-            }
-        }
-        Ok(None)
+        let expected_revision = req.expected_revision;
+        self.coordination_task_revisioned_fallback(
+            task_id,
+            req,
+            expected_revision,
+            |api, id, req| async move { api.coordination_task_transition(&id, req).await },
+        )
+        .await
     }
 
-    /// Shared body for [`Self::coordination_task_claim_fallback`] and
-    /// [`Self::coordination_task_renew_fallback`], which are identical except for which
-    /// `RemoteApi` method they call.
-    async fn coordination_task_revisioned_fallback<F, Fut>(
+    /// Shared body for [`Self::coordination_task_claim_fallback`],
+    /// [`Self::coordination_task_renew_fallback`], and
+    /// [`Self::coordination_task_transition_fallback`] — identical control flow across three
+    /// `RemoteApi` methods that each return `RemoteRevisionedWrite<CoordinationTaskDto>`;
+    /// generic over the request type (`TaskLeaseRequest` for claim/renew, `TransitionTaskRequest`
+    /// for transition) so all three share one body. `expected_revision` is threaded through
+    /// separately rather than pulled generically off `req` so this stays free of a bespoke
+    /// accessor trait for two request shapes.
+    ///
+    /// This is a coordination *write that references an existing record* — see
+    /// `coordination_write_fallback`'s doc comment for the error policy (only the candidate set
+    /// from `coordination_candidate_remotes` is tried; `404`/`CapabilityMissing` mean "not this
+    /// palace"; anything else is terminal). The one addition here is the revision-conflict arm:
+    /// a `409`-shaped conflict from a candidate means this *is* the record's owning remote, just
+    /// currently contested, so it is surfaced verbatim via `revision_conflict_payload` — the
+    /// exact shape a local conflict already uses — rather than treated as "try the next
+    /// candidate" or as a hard error. MemPalace never retries a conflicting write on the
+    /// caller's behalf (see `docs/Federation.md`); the envelope nests the task DTO under `task`
+    /// to match the local success shape (`{"success": true, "task": {...}}`) — see
+    /// `docs/Coordination-Phase-3-Design.md` deviation 9.
+    async fn coordination_task_revisioned_fallback<F, Fut, Req>(
         &self,
         task_id: &str,
-        req: TaskLeaseRequest,
+        req: Req,
+        expected_revision: i64,
         call: F,
     ) -> ToolResult<Option<Value>>
     where
-        F: Fn(Arc<dyn RemoteApi>, String, TaskLeaseRequest) -> Fut,
+        F: Fn(Arc<dyn RemoteApi>, String, Req) -> Fut,
         Fut: std::future::Future<
                 Output = mempalace_remote::Result<RemoteRevisionedWrite<mempalace_federation::CoordinationTaskDto>>,
             >,
+        Req: Clone,
     {
         if !self.coordination_federation_enabled() {
             return Ok(None);
         }
+        let candidates = self.coordination_candidate_remotes();
         for (name, api) in &self.remotes {
+            if !candidates.contains(name.as_str()) {
+                continue;
+            }
             match call(Arc::clone(api), task_id.to_owned(), req.clone()).await {
                 Ok(RemoteRevisionedWrite::Applied(dto)) => {
-                    let mut value = serde_json::to_value(&dto).unwrap_or_else(|_| json!({}));
-                    if let Some(obj) = value.as_object_mut() {
-                        obj.insert("success".to_owned(), json!(true));
-                        obj.insert("applied_to".to_owned(), json!(format_remote_origin(name)));
-                    }
-                    return Ok(Some(value));
+                    let task_value = serde_json::to_value(&dto).unwrap_or_else(|_| json!({}));
+                    return Ok(Some(json!({
+                        "success": true,
+                        "task": task_value,
+                        "applied_to": format_remote_origin(name),
+                    })));
                 }
                 Ok(RemoteRevisionedWrite::Conflict { actual_revision }) => {
                     return Ok(Some(crate::revision_conflict_payload(
-                        req.expected_revision,
+                        expected_revision,
                         actual_revision,
                     )));
                 }
                 Err(RemoteError::RemoteRejected { status: 404, .. }) => continue,
+                Err(RemoteError::CapabilityMissing { .. }) => continue,
                 Err(e) => {
                     return Err(ToolError::Internal(McpError::Federation(format!(
                         "remote `{name}` rejected the write: {e}"
@@ -1584,7 +1676,10 @@ impl FederationRouter {
     }
 
     /// Fall back to a message GET across remotes after a local miss.
-    pub async fn coordination_message_get_fallback(&self, message_id: &str) -> Option<Value> {
+    pub async fn coordination_message_get_fallback(
+        &self,
+        message_id: &str,
+    ) -> ToolResult<Option<Value>> {
         let message_id = message_id.to_owned();
         self.coordination_read_fallback(move |api| {
             let message_id = message_id.clone();
@@ -1621,7 +1716,10 @@ impl FederationRouter {
     }
 
     /// Fall back to an artifact GET across remotes after a local miss.
-    pub async fn coordination_artifact_get_fallback(&self, artifact_id: &str) -> Option<Value> {
+    pub async fn coordination_artifact_get_fallback(
+        &self,
+        artifact_id: &str,
+    ) -> ToolResult<Option<Value>> {
         let artifact_id = artifact_id.to_owned();
         self.coordination_read_fallback(move |api| {
             let artifact_id = artifact_id.clone();
@@ -1644,7 +1742,10 @@ impl FederationRouter {
     }
 
     /// Fall back to a result GET across remotes after a local miss.
-    pub async fn coordination_result_get_fallback(&self, result_id: &str) -> Option<Value> {
+    pub async fn coordination_result_get_fallback(
+        &self,
+        result_id: &str,
+    ) -> ToolResult<Option<Value>> {
         let result_id = result_id.to_owned();
         self.coordination_read_fallback(move |api| {
             let result_id = result_id.clone();
@@ -2383,6 +2484,14 @@ mod tests {
         /// result is not sufficient on its own, since a genuine remote miss produces the exact
         /// same result after a real round trip.
         coordination_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        /// Configures what `coordination_task_get` returns; `NotFound` (the previous hard-coded
+        /// behaviour) unless overridden. Used by the read-fallback error-policy tests.
+        coordination_task_get_outcome: MockCoordOutcome,
+        /// Configures what `coordination_task_claim`/`coordination_task_renew`/
+        /// `coordination_task_transition` return; `NotFound` unless overridden. All three share
+        /// one outcome field because the tests below only ever need one mock remote to behave
+        /// consistently across whichever write is exercised.
+        coordination_task_write_outcome: MockCoordOutcome,
     }
 
     impl Default for MockRemote {
@@ -2413,7 +2522,110 @@ mod tests {
                 received_cursor: std::sync::Arc::new(std::sync::Mutex::new(None)),
                 received_search_view: std::sync::Arc::new(std::sync::Mutex::new(None)),
                 coordination_calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                coordination_task_get_outcome: MockCoordOutcome::NotFound,
+                coordination_task_write_outcome: MockCoordOutcome::NotFound,
             }
+        }
+    }
+
+    /// Canned outcomes for the configurable coordination mock methods below — lets a test drive
+    /// `coordination_read_fallback`/`coordination_write_fallback` through every error variant
+    /// `RemoteError` defines without hand-building a `RemoteError` (not `Clone`) per call.
+    #[derive(Clone)]
+    enum MockCoordOutcome {
+        /// The exact-ID lookup / referenced record was not found on this remote — the
+        /// "not this palace, try the next one" case for both reads and writes.
+        NotFound,
+        /// The remote rejected our credentials — terminal for both reads and writes.
+        Unauthorized,
+        /// The remote speaks an incompatible federation API version — terminal for both.
+        VersionSkew,
+        /// The remote doesn't advertise the `coordination` capability — terminal for reads,
+        /// but "not this palace, try the next one" for writes (finding 2b).
+        CapabilityMissing,
+        /// The remote could not be reached — degradable (skip) for reads, terminal for writes.
+        Unreachable,
+        /// The remote returned an undecodable 2xx body — terminal for both.
+        InvalidResponse,
+        /// The task write applies successfully, returning this DTO.
+        Applied(Box<mempalace_federation::CoordinationTaskDto>),
+        /// The task write hit a stale `expected_revision`.
+        Conflict(Option<i64>),
+    }
+
+    impl MockCoordOutcome {
+        fn into_task_get_result(
+            self,
+        ) -> mempalace_remote::Result<mempalace_federation::CoordinationTaskDto> {
+            match self {
+                Self::Applied(dto) => Ok(*dto),
+                other => Err(other.into_error()),
+            }
+        }
+
+        fn into_task_write_result(
+            self,
+        ) -> mempalace_remote::Result<
+            RemoteRevisionedWrite<mempalace_federation::CoordinationTaskDto>,
+        > {
+            match self {
+                Self::Applied(dto) => Ok(RemoteRevisionedWrite::Applied(*dto)),
+                Self::Conflict(actual_revision) => {
+                    Ok(RemoteRevisionedWrite::Conflict { actual_revision })
+                }
+                other => Err(other.into_error()),
+            }
+        }
+
+        fn into_error(self) -> RemoteError {
+            match self {
+                Self::NotFound => RemoteError::RemoteRejected {
+                    remote: "mock".to_owned(),
+                    status: 404,
+                    body: "not found".to_owned(),
+                },
+                Self::Unauthorized => RemoteError::Unauthorized { remote: "mock".to_owned() },
+                Self::VersionSkew => {
+                    RemoteError::VersionSkew { remote: "mock".to_owned(), ours: 1, theirs: 2 }
+                }
+                Self::CapabilityMissing => RemoteError::CapabilityMissing {
+                    remote: "mock".to_owned(),
+                    capability: "coordination".to_owned(),
+                },
+                Self::Unreachable => RemoteError::Unreachable {
+                    remote: "mock".to_owned(),
+                    message: "mock remote is down".to_owned(),
+                },
+                Self::InvalidResponse => RemoteError::InvalidResponse {
+                    remote: "mock".to_owned(),
+                    message: "undecodable body".to_owned(),
+                },
+                Self::Applied(_) | Self::Conflict(_) => unreachable!(
+                    "into_error is only called for the non-success/non-conflict arms"
+                ),
+            }
+        }
+    }
+
+    /// A minimal but complete `CoordinationTaskDto` for tests that only care about the
+    /// envelope shape, not the task's actual field values.
+    fn make_task_dto(task_id: &str) -> mempalace_federation::CoordinationTaskDto {
+        mempalace_federation::CoordinationTaskDto {
+            task_id: task_id.to_owned(),
+            title: "test task".to_owned(),
+            description: "d".to_owned(),
+            state: mempalace_federation::CoordinationTaskState::Running,
+            revision: 1,
+            created_by: "alice".to_owned(),
+            wing: "wing_team".to_owned(),
+            owner: Some("worker-1".to_owned()),
+            parent_id: None,
+            dependencies: vec![],
+            budget: None,
+            lease_expires_at: Some("2026-01-01T00:05:00Z".to_owned()),
+            expires_at: None,
+            created_at: "2026-01-01T00:00:00Z".to_owned(),
+            updated_at: "2026-01-01T00:00:00Z".to_owned(),
         }
     }
 
@@ -2575,11 +2787,7 @@ mod tests {
         ) -> mempalace_remote::Result<mempalace_federation::CoordinationTaskDto> {
             self.coordination_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let _ = task_id;
-            Err(RemoteError::RemoteRejected {
-                remote: "mock".to_owned(),
-                status: 404,
-                body: "not found".to_owned(),
-            })
+            self.coordination_task_get_outcome.clone().into_task_get_result()
         }
 
         async fn coordination_task_claim(
@@ -2591,11 +2799,31 @@ mod tests {
         > {
             self.coordination_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let _ = (task_id, req);
-            Err(RemoteError::RemoteRejected {
-                remote: "mock".to_owned(),
-                status: 404,
-                body: "not found".to_owned(),
-            })
+            self.coordination_task_write_outcome.clone().into_task_write_result()
+        }
+
+        async fn coordination_task_renew(
+            &self,
+            task_id: &str,
+            req: TaskLeaseRequest,
+        ) -> mempalace_remote::Result<
+            RemoteRevisionedWrite<mempalace_federation::CoordinationTaskDto>,
+        > {
+            self.coordination_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = (task_id, req);
+            self.coordination_task_write_outcome.clone().into_task_write_result()
+        }
+
+        async fn coordination_task_transition(
+            &self,
+            task_id: &str,
+            req: TransitionTaskRequest,
+        ) -> mempalace_remote::Result<
+            RemoteRevisionedWrite<mempalace_federation::CoordinationTaskDto>,
+        > {
+            self.coordination_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = (task_id, req);
+            self.coordination_task_write_outcome.clone().into_task_write_result()
         }
 
         async fn coordination_message_get(
@@ -2717,8 +2945,14 @@ mod tests {
         );
 
         // Reads: task get, message get.
-        assert_eq!(router.coordination_task_get_fallback("task_missing").await, None);
-        assert_eq!(router.coordination_message_get_fallback("msg_missing").await, None);
+        assert_eq!(
+            router.coordination_task_get_fallback("task_missing").await.unwrap(),
+            None
+        );
+        assert_eq!(
+            router.coordination_message_get_fallback("msg_missing").await.unwrap(),
+            None
+        );
 
         // ID-referencing writes: claim, and message send (via coordination_write_fallback).
         let claim = router
@@ -2735,6 +2969,348 @@ mod tests {
         assert_eq!(claim, None);
 
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0, "zero coordination calls must have reached the mock remote");
+    }
+
+    // ── Coordination read-fallback error policy (Codex finding 1) ───────────────
+
+    /// A default-mode-Combined single-remote router: coordination federation reads as enabled,
+    /// and `remote_name` is both the only configured remote and (via `default_remote`) the only
+    /// coordination candidate.
+    fn make_single_remote_coordination_router(
+        remote_name: &str,
+        mock: MockRemote,
+    ) -> FederationRouter {
+        let mut remotes: BTreeMap<String, Arc<dyn RemoteApi>> = BTreeMap::new();
+        remotes.insert(remote_name.to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let mut rules_remotes = BTreeMap::new();
+        rules_remotes.insert(remote_name.to_owned(), make_resolved_remote(remote_name));
+        let rules = FederationRuntimeConfig {
+            remotes: rules_remotes,
+            default_mode: RouteMode::Combined,
+            default_remote: Some(remote_name.to_owned()),
+            wings: BTreeMap::new(),
+            kg: None,
+            coordination: BTreeMap::new(),
+        };
+        FederationRouter::with_remotes(rules, remotes)
+    }
+
+    /// `Unauthorized` from the only candidate remote must surface as a hard `ToolError`, not a
+    /// silent `found: false` — a caller cannot otherwise tell "the record does not exist" apart
+    /// from "your token is wrong". This is Codex finding 1 (id 3832912257): before the fix,
+    /// `coordination_read_fallback` logged and swallowed every error, including this one.
+    #[tokio::test]
+    async fn coordination_read_fallback_surfaces_unauthorized_as_hard_error() {
+        let mut mock = MockRemote::default();
+        mock.coordination_task_get_outcome = MockCoordOutcome::Unauthorized;
+        let router = make_single_remote_coordination_router("alpha", mock);
+
+        let err = router
+            .coordination_task_get_fallback("task_missing")
+            .await
+            .expect_err("Unauthorized must be a hard error, not a swallowed miss");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("alpha"), "error must name the offending remote: {msg}");
+    }
+
+    /// Same as above for `CapabilityMissing` — for a *read*, this means the configured remote
+    /// itself is broken (advertises no coordination support), not "not this palace"; see
+    /// `coordination_write_fallback`'s test below for the deliberately opposite write policy.
+    #[tokio::test]
+    async fn coordination_read_fallback_surfaces_capability_missing_as_hard_error() {
+        let mut mock = MockRemote::default();
+        mock.coordination_task_get_outcome = MockCoordOutcome::CapabilityMissing;
+        let router = make_single_remote_coordination_router("alpha", mock);
+
+        router
+            .coordination_task_get_fallback("task_missing")
+            .await
+            .expect_err("CapabilityMissing must be a hard error for a read");
+    }
+
+    /// Same as above for `VersionSkew`.
+    #[tokio::test]
+    async fn coordination_read_fallback_surfaces_version_skew_as_hard_error() {
+        let mut mock = MockRemote::default();
+        mock.coordination_task_get_outcome = MockCoordOutcome::VersionSkew;
+        let router = make_single_remote_coordination_router("alpha", mock);
+
+        router
+            .coordination_task_get_fallback("task_missing")
+            .await
+            .expect_err("VersionSkew must be a hard error for a read");
+    }
+
+    /// Same as above for `InvalidResponse` (an undecodable 2xx body) — also terminal for a read.
+    #[tokio::test]
+    async fn coordination_read_fallback_surfaces_invalid_response_as_hard_error() {
+        let mut mock = MockRemote::default();
+        mock.coordination_task_get_outcome = MockCoordOutcome::InvalidResponse;
+        let router = make_single_remote_coordination_router("alpha", mock);
+
+        router
+            .coordination_task_get_fallback("task_missing")
+            .await
+            .expect_err("InvalidResponse must be a hard error for a read");
+    }
+
+    /// A genuine 404 ("not this palace") must still be treated as a plain miss, not an error —
+    /// this is the "do not turn every miss into an error" half of finding 1: only widen the
+    /// error surface for the genuinely-broken cases, not for an honest "record not found".
+    #[tokio::test]
+    async fn coordination_read_fallback_genuine_404_miss_stays_found_false() {
+        let mock = MockRemote::default(); // default outcome is NotFound (404)
+        let router = make_single_remote_coordination_router("alpha", mock);
+
+        let result = router
+            .coordination_task_get_fallback("task_missing")
+            .await
+            .expect("a plain 404 must not become an error");
+        assert_eq!(result, None, "a genuine miss must come back as Ok(None), not an error");
+    }
+
+    /// An `Unreachable` remote is the one genuinely degradable read failure and must not block
+    /// discovery — this is the read/write asymmetry the finding calls out explicitly.
+    #[tokio::test]
+    async fn coordination_read_fallback_unreachable_remote_is_skipped_not_errored() {
+        let mut mock = MockRemote::default();
+        mock.coordination_task_get_outcome = MockCoordOutcome::Unreachable;
+        let router = make_single_remote_coordination_router("alpha", mock);
+
+        let result = router
+            .coordination_task_get_fallback("task_missing")
+            .await
+            .expect("an unreachable remote must degrade, not hard-fail a read");
+        assert_eq!(result, None);
+    }
+
+    // ── Coordination write-discovery candidate set + CapabilityMissing (Codex finding 2) ────
+
+    /// Reproduces Codex finding 2 (id 3832912200) exactly: two remotes, with the drawers-only
+    /// one sorting FIRST in `BTreeMap` iteration order ("alpha" < "zeta"). Only "zeta" is wired
+    /// up for coordination (via a `federation.coordination` rule); "alpha" is a remote that
+    /// exists only for other purposes and does not support coordination at all
+    /// (`CapabilityMissing`). A claim for a task that lives on "zeta" must still reach it —
+    /// before the fix, "alpha" sorting first and returning `CapabilityMissing` (a non-404 error)
+    /// terminated the search before "zeta" was ever tried, exactly as the finding describes. A
+    /// single-remote test would never have caught this; two are required.
+    #[tokio::test]
+    async fn coordination_write_fallback_reaches_later_remote_past_earlier_capability_missing() {
+        let mut alpha = MockRemote::default();
+        alpha.coordination_task_write_outcome = MockCoordOutcome::CapabilityMissing;
+        let mut zeta = MockRemote::default();
+        let expected_task = make_task_dto("task-1");
+        zeta.coordination_task_write_outcome =
+            MockCoordOutcome::Applied(Box::new(expected_task.clone()));
+        let zeta_calls = std::sync::Arc::clone(&zeta.coordination_calls);
+
+        let mut remotes: BTreeMap<String, Arc<dyn RemoteApi>> = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(alpha) as Arc<dyn RemoteApi>);
+        remotes.insert("zeta".to_owned(), Arc::new(zeta) as Arc<dyn RemoteApi>);
+        assert_eq!(
+            remotes.keys().collect::<Vec<_>>(),
+            vec!["alpha", "zeta"],
+            "test setup must actually put the drawers-only remote first in iteration order"
+        );
+
+        let mut rules_remotes = BTreeMap::new();
+        rules_remotes.insert("alpha".to_owned(), make_resolved_remote("alpha"));
+        rules_remotes.insert("zeta".to_owned(), make_resolved_remote("zeta"));
+        let mut coordination = BTreeMap::new();
+        coordination.insert(
+            "wing_team".to_owned(),
+            ResolvedRouteRule {
+                mode: RouteMode::Remote,
+                remote: Some("zeta".to_owned()),
+                write: WriteTarget::Remote,
+            },
+        );
+        let mut wings = BTreeMap::new();
+        wings.insert(
+            "wing_drawers".to_owned(),
+            ResolvedRouteRule {
+                mode: RouteMode::Remote,
+                remote: Some("alpha".to_owned()),
+                write: WriteTarget::Remote,
+            },
+        );
+        let rules = FederationRuntimeConfig {
+            remotes: rules_remotes,
+            default_mode: RouteMode::Local,
+            default_remote: None,
+            wings,
+            kg: None,
+            coordination,
+        };
+        let router = FederationRouter::with_remotes(rules, remotes);
+
+        let value = router
+            .coordination_task_claim_fallback(
+                "task-1",
+                TaskLeaseRequest {
+                    expected_revision: 0,
+                    lease_seconds: 60,
+                    worker: Some("worker-1".to_owned()),
+                },
+            )
+            .await
+            .expect("must not hard-error")
+            .expect("claim must reach zeta and succeed");
+
+        assert_eq!(value["applied_to"], "remote:zeta", "the claim must land on zeta: {value}");
+        assert_eq!(
+            zeta_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "zeta must actually have been called"
+        );
+        assert_eq!(value["task"]["task_id"], "task-1");
+    }
+
+    /// A revision conflict from the sole candidate remote must still surface via the shared
+    /// `revision_conflict_payload` shape after the read/write-fallback refactor that merged
+    /// `coordination_task_transition_fallback` into the generic
+    /// `coordination_task_revisioned_fallback` — a regression here would mean the merge changed
+    /// behaviour, not just structure.
+    #[tokio::test]
+    async fn coordination_task_write_conflict_surfaces_revision_conflict_payload() {
+        let mut mock = MockRemote::default();
+        mock.coordination_task_write_outcome = MockCoordOutcome::Conflict(Some(5));
+        let router = make_single_remote_coordination_router("alpha", mock);
+
+        let value = router
+            .coordination_task_claim_fallback(
+                "task-conflict",
+                TaskLeaseRequest {
+                    expected_revision: 2,
+                    lease_seconds: 60,
+                    worker: Some("worker-1".to_owned()),
+                },
+            )
+            .await
+            .expect("must not hard-error")
+            .expect("conflict must still produce a value");
+
+        assert_eq!(value["success"], false);
+        assert_eq!(value["conflict"]["expected_revision"], 2);
+        assert_eq!(value["conflict"]["actual_revision"], 5);
+    }
+
+    // ── Remote task-write envelope must nest under `task` (Codex finding 3) ─────────────────
+
+    /// The remote claim/renew/transition fallbacks must nest the task DTO under `"task"`,
+    /// matching the local success shape `{"success": true, "task": {...}}` exactly — see
+    /// `McpRuntime::tool_task_claim` in `lib.rs`. Before the fix, the DTO was flattened at the
+    /// top level (`{"task_id": ..., "success": true, "applied_to": ...}`), which loses the task
+    /// entirely for a client that deserialises the (now-documented) local shape.
+    #[tokio::test]
+    async fn coordination_task_write_fallbacks_nest_task_under_task_key() {
+        let task = make_task_dto("task-envelope");
+
+        let mut mock_claim = MockRemote::default();
+        mock_claim.coordination_task_write_outcome =
+            MockCoordOutcome::Applied(Box::new(task.clone()));
+        let claim_router = make_single_remote_coordination_router("alpha", mock_claim);
+        let claim = claim_router
+            .coordination_task_claim_fallback(
+                "task-envelope",
+                TaskLeaseRequest {
+                    expected_revision: 0,
+                    lease_seconds: 60,
+                    worker: Some("worker-1".to_owned()),
+                },
+            )
+            .await
+            .expect("must not error")
+            .expect("must find a value");
+
+        let mut mock_renew = MockRemote::default();
+        mock_renew.coordination_task_write_outcome =
+            MockCoordOutcome::Applied(Box::new(task.clone()));
+        let renew_router = make_single_remote_coordination_router("alpha", mock_renew);
+        let renew = renew_router
+            .coordination_task_renew_fallback(
+                "task-envelope",
+                TaskLeaseRequest {
+                    expected_revision: 1,
+                    lease_seconds: 60,
+                    worker: Some("worker-1".to_owned()),
+                },
+            )
+            .await
+            .expect("must not error")
+            .expect("must find a value");
+
+        let mut mock_transition = MockRemote::default();
+        mock_transition.coordination_task_write_outcome =
+            MockCoordOutcome::Applied(Box::new(task.clone()));
+        let transition_router = make_single_remote_coordination_router("alpha", mock_transition);
+        let transition = transition_router
+            .coordination_task_transition_fallback(
+                "task-envelope",
+                TransitionTaskRequest {
+                    expected_revision: 1,
+                    state: mempalace_federation::CoordinationTaskState::Completed,
+                    actor: Some("worker-1".to_owned()),
+                    details: None,
+                },
+            )
+            .await
+            .expect("must not error")
+            .expect("must find a value");
+
+        for (name, value) in [("claim", &claim), ("renew", &renew), ("transition", &transition)] {
+            assert_eq!(value["success"], true, "{name}: envelope must report success");
+            assert!(
+                value.get("task_id").is_none(),
+                "{name}: the task must not be flattened at the top level: {value}"
+            );
+            let nested = value.get("task").unwrap_or_else(|| {
+                panic!("{name}: envelope must carry a non-empty `task`: {value}")
+            });
+            assert_eq!(nested["task_id"], "task-envelope", "{name}: task fields must be reachable under `task`");
+            assert_eq!(nested["wing"], "wing_team", "{name}: task fields must be reachable under `task`");
+            assert_eq!(value["applied_to"], "remote:alpha", "{name}: applied_to stays at envelope level");
+        }
+    }
+
+    /// Local and remote must agree on the success envelope shape so a client cannot tell (and
+    /// does not need to special-case) whether a claim was served locally or via remote
+    /// fallback. Drives the identical assertion helper over both a local-shaped value (built the
+    /// way `tool_task_claim` builds it) and the remote fallback's output, so the two shapes
+    /// cannot silently drift apart again.
+    #[tokio::test]
+    async fn coordination_task_write_local_and_remote_envelopes_match() {
+        fn assert_claim_envelope_shape(value: &Value, expected_task_id: &str) {
+            assert_eq!(value["success"], true);
+            assert!(value.get("task_id").is_none(), "task must be nested, not flattened");
+            let task = value.get("task").expect("envelope must carry `task`");
+            assert_eq!(task["task_id"], expected_task_id);
+        }
+
+        // Local shape, built exactly the way `tool_task_claim` builds
+        // `{"success": true, "task": task}` in lib.rs.
+        let local_task = make_task_dto("task-shared");
+        let local_value = json!({"success": true, "task": local_task});
+        assert_claim_envelope_shape(&local_value, "task-shared");
+
+        // Remote shape, via the real fallback path.
+        let mut mock = MockRemote::default();
+        mock.coordination_task_write_outcome =
+            MockCoordOutcome::Applied(Box::new(make_task_dto("task-shared")));
+        let router = make_single_remote_coordination_router("alpha", mock);
+        let remote_value = router
+            .coordination_task_claim_fallback(
+                "task-shared",
+                TaskLeaseRequest {
+                    expected_revision: 0,
+                    lease_seconds: 60,
+                    worker: Some("worker-1".to_owned()),
+                },
+            )
+            .await
+            .expect("must not error")
+            .expect("must find a value");
+        assert_claim_envelope_shape(&remote_value, "task-shared");
     }
 
     // ── add_drawer_replicate tests ──────────────────────────────────────────────

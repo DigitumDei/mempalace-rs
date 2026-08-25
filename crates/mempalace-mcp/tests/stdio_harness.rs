@@ -254,3 +254,110 @@ fn compiled_binary_rejects_invalid_environment_lineage_id_at_startup() {
     assert!(stderr.contains("InvalidLineageBinding"));
     assert!(stderr.contains("may contain only ASCII letters"));
 }
+
+/// Proves `MEMPALACE_CONFIG_DIR` actually reaches the compiled `mempalace-mcp`
+/// binary in production, not just the config loader in isolation. `HOME`
+/// points at an empty, never-read directory so a passing test can only mean
+/// the binary resolved its base directory from `MEMPALACE_CONFIG_DIR` — with
+/// no `MEMPALACE_PALACE_PATH` and no `config.json` present, the default
+/// palace path is derived from that base directory, so its storage files
+/// landing under `config_dir/palace` is the observable proof.
+#[test]
+fn compiled_binary_honors_config_dir_env_var_for_default_palace_location() {
+    let tempdir = TempDir::new().unwrap();
+    let unused_home = tempdir.path().join("unused-home");
+    std::fs::create_dir_all(&unused_home).unwrap();
+    let config_dir = tempdir.path().join("config-dir");
+    std::fs::create_dir_all(&config_dir).unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_mempalace-mcp"))
+        .env("HOME", &unused_home)
+        .env("MEMPALACE_CONFIG_DIR", &config_dir)
+        .env("MEMPALACE_STUB_EMBEDDINGS", "1")
+        .env_remove("MEMPALACE_PALACE_PATH")
+        .env_remove("MEMPAL_PALACE_PATH")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    {
+        let mut stdin = child.stdin.take().unwrap();
+        writeln!(
+            stdin,
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{}}}}"
+        )
+        .unwrap();
+        writeln!(
+            stdin,
+            "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{{\"name\":\"mempalace_status\",\"arguments\":{{}}}}}}"
+        )
+        .unwrap();
+    }
+
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = StdBufReader::new(stdout);
+    let mut initialize = String::new();
+    let mut status = String::new();
+    reader.read_line(&mut initialize).unwrap();
+    reader.read_line(&mut status).unwrap();
+
+    let initialize: serde_json::Value = serde_json::from_str(initialize.trim()).unwrap();
+    let status: serde_json::Value = serde_json::from_str(status.trim()).unwrap();
+    assert_eq!(initialize["result"]["protocolVersion"], "2024-11-05");
+    assert_eq!(mempalace_mcp::decode_tool_payload(&status).unwrap()["total_drawers"], 0);
+
+    let exit = child.wait().unwrap();
+    assert!(exit.success());
+
+    let palace_dir = config_dir.join("palace");
+    assert!(
+        palace_dir.join("storage.sqlite3").exists(),
+        "expected the default palace under MEMPALACE_CONFIG_DIR/palace to be initialized, got: {:?}",
+        std::fs::read_dir(&config_dir).unwrap().collect::<Vec<_>>()
+    );
+    assert!(!unused_home.join(".mempalace").exists());
+}
+
+/// `MEMPALACE_PALACE_PATH` must still win for the palace location even when
+/// `MEMPALACE_CONFIG_DIR` is also set — the two variables move different
+/// things (config/registry vs. palace data) and only coincide by default.
+#[test]
+fn compiled_binary_palace_path_env_var_wins_over_config_dir_default_palace() {
+    let tempdir = TempDir::new().unwrap();
+    let config_dir = tempdir.path().join("config-dir");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let explicit_palace = tempdir.path().join("explicit-palace");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_mempalace-mcp"))
+        .env("HOME", tempdir.path().join("unused-home"))
+        .env("MEMPALACE_CONFIG_DIR", &config_dir)
+        .env("MEMPALACE_PALACE_PATH", &explicit_palace)
+        .env("MEMPALACE_STUB_EMBEDDINGS", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    {
+        let mut stdin = child.stdin.take().unwrap();
+        writeln!(
+            stdin,
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{{\"name\":\"mempalace_status\",\"arguments\":{{}}}}}}"
+        )
+        .unwrap();
+    }
+
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = StdBufReader::new(stdout);
+    let mut status = String::new();
+    reader.read_line(&mut status).unwrap();
+    let status: serde_json::Value = serde_json::from_str(status.trim()).unwrap();
+    assert_eq!(mempalace_mcp::decode_tool_payload(&status).unwrap()["total_drawers"], 0);
+
+    let exit = child.wait().unwrap();
+    assert!(exit.success());
+
+    assert!(explicit_palace.join("storage.sqlite3").exists());
+    assert!(!config_dir.join("palace").exists());
+}

@@ -6,7 +6,7 @@ use mempalace_config::{
     FederationRuntimeConfig, ReplicationStatus, ResolvedRouteRule, RouteMode, RouteQuery,
     WriteTarget, resolve_coordination_route, resolve_kg_route, resolve_route,
 };
-use mempalace_core::{DIARY_ROOM, DIARY_TOPIC_PREFIX, SHARED_AGENT_DIARY_WING, hash_text};
+use mempalace_core::{DIARY_ROOM, DIARY_TOPIC_PREFIX, SHARED_AGENT_DIARY_WING, WingId, hash_text};
 use mempalace_federation::{
     AckMessageRequest, AddDrawerRequest, ChangesQuery, CoordinationEventsQuery, DrawerSearchRequest,
     InboxQuery, NewArtifactRequest, NewMessageRequest, NewTaskRequest, NewTaskResultRequest,
@@ -1659,6 +1659,14 @@ impl FederationRouter {
     /// remote never poisons a healthy one. Returns a map of `remote_name → per-remote result`;
     /// on success the value is `{ "events": [...], "next_cursor": <string|null> }` with each
     /// event annotated `"origin": "remote:<name>"`.
+    ///
+    /// Gated the same way the ID-discovery fallbacks above are (see
+    /// `coordination_federation_enabled`'s doc comment): this method, not just its callers, must
+    /// refuse to contact any remote when coordination federation was never configured, and must
+    /// refuse to send a `wing_agents`-shaped query to any remote regardless of configuration (see
+    /// [`wing_blocks_coordination_fanout`]). The gate lives here rather than at each call site so
+    /// a future aggregate-read call site cannot forget it — the same reasoning `c1166d7` used for
+    /// pushing the diary/normalisation check into `resolve_coordination_route` itself.
     pub async fn coordination_events_fanout(
         &self,
         task_id: Option<String>,
@@ -1666,6 +1674,11 @@ impl FederationRouter {
         limit: Option<usize>,
         cursors: &BTreeMap<String, String>,
     ) -> BTreeMap<String, Value> {
+        if !self.coordination_federation_enabled()
+            || wing_blocks_coordination_fanout(wing.as_deref())
+        {
+            return BTreeMap::new();
+        }
         let mut set: JoinSet<(String, Result<Value, String>)> = JoinSet::new();
         for (name, api) in &self.remotes {
             let name = name.clone();
@@ -1718,7 +1731,8 @@ impl FederationRouter {
     }
 
     /// Fan out an inbox read to ALL configured remotes concurrently, with a per-remote opaque
-    /// cursor. Same isolation contract as [`Self::coordination_events_fanout`]/`changes_fanout`.
+    /// cursor. Same isolation contract as [`Self::coordination_events_fanout`]/`changes_fanout`,
+    /// and the same coordination-opt-in / diary gate — see that method's doc comment.
     /// Returns a map of `remote_name → per-remote result`; on success the value is
     /// `{ "messages": [...], "next_cursor": <string|null> }` with each message annotated
     /// `"origin": "remote:<name>"`.
@@ -1730,6 +1744,11 @@ impl FederationRouter {
         unacknowledged_only: bool,
         cursors: &BTreeMap<String, String>,
     ) -> BTreeMap<String, Value> {
+        if !self.coordination_federation_enabled()
+            || wing_blocks_coordination_fanout(wing.as_deref())
+        {
+            return BTreeMap::new();
+        }
         let mut set: JoinSet<(String, Result<Value, String>)> = JoinSet::new();
         for (name, api) in &self.remotes {
             let name = name.clone();
@@ -1780,6 +1799,26 @@ impl FederationRouter {
             }
         }
         results
+    }
+}
+
+/// Whether a requested wing must suppress remote coordination fan-out.
+///
+/// `None` (no wing filter) never blocks — an unfiltered aggregate read has no wing to protect
+/// and is unchanged by this fix. A `Some(wing)` blocks when it normalises to
+/// [`SHARED_AGENT_DIARY_WING`] under [`WingId::normalized`] — trimmed, lowercased and prefixed,
+/// so `"agents"`, `"Wing_Agents"` and `" wing_agents "` all match even though none of them `==`
+/// the constant verbatim. This is exactly the bypass `c1166d7` closed on `tool_task_create`; a
+/// verbatim `==` here would silently reopen it on the aggregate-read routes. A wing that fails to
+/// normalise at all (e.g. empty after stripping) fails CLOSED — block rather than fan out —
+/// mirroring `resolve_coordination_route`'s fail-closed direction on the same condition.
+fn wing_blocks_coordination_fanout(wing: Option<&str>) -> bool {
+    match wing {
+        None => false,
+        Some(raw) => match WingId::normalized(raw) {
+            Ok(canonical) => canonical.as_str() == SHARED_AGENT_DIARY_WING,
+            Err(_) => true,
+        },
     }
 }
 

@@ -5252,6 +5252,202 @@ mod tests {
         );
     }
 
+    /// Build a `FederationRouter` wired to a single recording mock remote, for the aggregate
+    /// fan-out gate regression tests below (`mempalace_inbox_read`/`mempalace_coordination_events`
+    /// bypassing `resolve_coordination_route` entirely — see the Codex findings this fixes).
+    /// `default_mode`/`coordination` are the two knobs that decide whether
+    /// `FederationRouter::coordination_federation_enabled()` is true.
+    fn router_with_coordination_config(
+        remote: LibMockRemote,
+        default_mode: RouteMode,
+        coordination: BTreeMap<String, ResolvedRouteRule>,
+    ) -> (FederationRouter, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let calls = std::sync::Arc::clone(&remote.coordination_calls);
+        let mut remotes: BTreeMap<String, Arc<dyn mempalace_remote::RemoteApi>> = BTreeMap::new();
+        remotes.insert("hub".to_owned(), Arc::new(remote));
+        let mut rules_remotes = BTreeMap::new();
+        for name in remotes.keys() {
+            rules_remotes.insert(
+                name.clone(),
+                ResolvedRemote {
+                    name: name.clone(),
+                    url: "https://test.example".to_owned(),
+                    token: None,
+                    timeout: std::time::Duration::from_secs(5),
+                },
+            );
+        }
+        let rules = FederationRuntimeConfig {
+            remotes: rules_remotes,
+            default_mode,
+            default_remote: Some("hub".to_owned()),
+            wings: BTreeMap::new(),
+            kg: None,
+            coordination,
+        };
+        (FederationRouter::with_remotes(rules, remotes), calls)
+    }
+
+    /// Codex P1 finding (comment 3832912220), Part 1: `mempalace_inbox_read`'s aggregate
+    /// fan-out must not contact any remote when coordination federation was never configured,
+    /// even though a remote IS configured (`has_remotes()` is true — the router below has one).
+    /// Before the fix, `tool_inbox_read` gated its fan-out on `has_remotes()` alone, so a palace
+    /// that federates drawers only, with an empty `federation.coordination` table and
+    /// `default_mode: local`, still sent the recipient and wing filter to the remote on every
+    /// inbox read.
+    #[tokio::test]
+    async fn inbox_read_stays_local_without_coordination_federation_configured() {
+        let (router, calls) = router_with_coordination_config(
+            LibMockRemote::default(),
+            RouteMode::Local,
+            BTreeMap::new(),
+        );
+        let harness = test_harness_with_mock_router(router).await;
+        let response = harness
+            .server
+            .handle_request(tool_call(930, "mempalace_inbox_read", json!({"recipient": "worker"})))
+            .await;
+        decode_tool_payload(&response)
+            .unwrap_or_else(|| panic!("expected a successful local inbox read, got: {response}"));
+        let observed = calls.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            observed, 0,
+            "mempalace_inbox_read must not contact a remote configured for drawers only, with \
+             an empty federation.coordination table and default_mode: local, got {observed} \
+             remote call(s)"
+        );
+    }
+
+    /// Codex P1 finding (comment 3832912220), Part 2: `mempalace_coordination_events`
+    /// counterpart of the test above.
+    #[tokio::test]
+    async fn coordination_events_stays_local_without_coordination_federation_configured() {
+        let (router, calls) = router_with_coordination_config(
+            LibMockRemote::default(),
+            RouteMode::Local,
+            BTreeMap::new(),
+        );
+        let harness = test_harness_with_mock_router(router).await;
+        let response = harness
+            .server
+            .handle_request(tool_call(931, "mempalace_coordination_events", json!({})))
+            .await;
+        decode_tool_payload(&response).unwrap_or_else(|| {
+            panic!("expected a successful local coordination events read, got: {response}")
+        });
+        let observed = calls.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            observed, 0,
+            "mempalace_coordination_events must not contact a remote configured for drawers \
+             only, with an empty federation.coordination table and default_mode: local, got \
+             {observed} remote call(s)"
+        );
+    }
+
+    /// Codex P1 finding (comment 3832912230): even with coordination federation properly
+    /// enabled (`default_mode: remote`), `mempalace_inbox_read` must never forward a
+    /// `wing_agents`-shaped filter to any remote — canonical spelling and several non-canonical
+    /// ones (locking in normalise-before-compare, the same bypass class `c1166d7` closed on
+    /// `tool_task_create`). This is a separate test from the gate-only tests above because the
+    /// two guards (coordination opt-in, diary suppression) are independent: a single test
+    /// exercising only one could pass even if the other guard were entirely missing.
+    #[tokio::test]
+    async fn inbox_read_wing_agents_never_fans_out_even_with_coordination_enabled() {
+        for raw_wing in [SHARED_AGENT_DIARY_WING, "agents", "Wing_Agents", " wing_agents "] {
+            let (router, calls) = router_with_coordination_config(
+                LibMockRemote::default(),
+                RouteMode::Remote,
+                BTreeMap::new(),
+            );
+            let harness = test_harness_with_mock_router(router).await;
+            let response = harness
+                .server
+                .handle_request(tool_call(
+                    932,
+                    "mempalace_inbox_read",
+                    json!({"recipient": "worker", "wing": raw_wing}),
+                ))
+                .await;
+            decode_tool_payload(&response).unwrap_or_else(|| {
+                panic!(
+                    "expected a successful local inbox read for wing {raw_wing:?}, got: {response}"
+                )
+            });
+            let observed = calls.load(std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(
+                observed, 0,
+                "wing {raw_wing:?} normalises to wing_agents and must never be forwarded to a \
+                 remote, even with coordination federation enabled, got {observed} remote \
+                 call(s)"
+            );
+        }
+    }
+
+    /// Codex P1 finding (comment 3832912230), `mempalace_coordination_events` counterpart —
+    /// same canonical-plus-non-canonical coverage.
+    #[tokio::test]
+    async fn coordination_events_wing_agents_never_fans_out_even_with_coordination_enabled() {
+        for raw_wing in [SHARED_AGENT_DIARY_WING, "agents", "Wing_Agents", " wing_agents "] {
+            let (router, calls) = router_with_coordination_config(
+                LibMockRemote::default(),
+                RouteMode::Remote,
+                BTreeMap::new(),
+            );
+            let harness = test_harness_with_mock_router(router).await;
+            let response = harness
+                .server
+                .handle_request(tool_call(
+                    933,
+                    "mempalace_coordination_events",
+                    json!({"wing": raw_wing}),
+                ))
+                .await;
+            decode_tool_payload(&response).unwrap_or_else(|| {
+                panic!(
+                    "expected a successful local coordination events read for wing {raw_wing:?}, \
+                     got: {response}"
+                )
+            });
+            let observed = calls.load(std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(
+                observed, 0,
+                "wing {raw_wing:?} normalises to wing_agents and must never be forwarded to a \
+                 remote, even with coordination federation enabled, got {observed} remote \
+                 call(s)"
+            );
+        }
+    }
+
+    /// Positive control for both findings above: with coordination federation properly enabled
+    /// and an ordinary (non-diary) wing, `mempalace_inbox_read` DOES fan out to the configured
+    /// remote. Without this, a broken fix that simply disabled the fan-out unconditionally would
+    /// pass every test above for the wrong reason.
+    #[tokio::test]
+    async fn inbox_read_fans_out_to_remote_when_coordination_federation_is_enabled() {
+        let (router, calls) = router_with_coordination_config(
+            LibMockRemote::default(),
+            RouteMode::Remote,
+            BTreeMap::new(),
+        );
+        let harness = test_harness_with_mock_router(router).await;
+        let response = harness
+            .server
+            .handle_request(tool_call(
+                934,
+                "mempalace_inbox_read",
+                json!({"recipient": "worker", "wing": "myproject"}),
+            ))
+            .await;
+        decode_tool_payload(&response)
+            .unwrap_or_else(|| panic!("expected a successful inbox read, got: {response}"));
+        let observed = calls.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            observed, 1,
+            "an ordinary wing with coordination federation enabled must still fan out to the \
+             configured remote, got {observed} remote call(s)"
+        );
+    }
+
     #[tokio::test]
     async fn coordination_events_and_inbox_read_filter_by_wing() {
         let harness = test_harness().await;
@@ -8518,6 +8714,28 @@ mod tests {
                 remote: "mock".to_owned(),
                 message: "not used".to_owned(),
             })
+        }
+        /// Recording override for the aggregate-fan-out regression tests below: bumps
+        /// `coordination_calls` (like every other `coordination_*` override on this mock) so a
+        /// test can assert the gate in `FederationRouter::coordination_inbox_fanout` actually
+        /// stopped the call from ever reaching a remote, rather than trusting the response shape.
+        async fn coordination_inbox(
+            &self,
+            query: mempalace_federation::InboxQuery,
+        ) -> mempalace_remote::Result<mempalace_federation::InboxPageResponse> {
+            self.coordination_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = query;
+            Ok(mempalace_federation::InboxPageResponse { messages: vec![], next_cursor: None })
+        }
+        /// See [`Self::coordination_inbox`] — same recording purpose, for
+        /// `coordination_events_fanout`.
+        async fn coordination_events(
+            &self,
+            query: mempalace_federation::CoordinationEventsQuery,
+        ) -> mempalace_remote::Result<mempalace_federation::CoordinationEventsResponse> {
+            self.coordination_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = query;
+            Ok(mempalace_federation::CoordinationEventsResponse { events: vec![], next_cursor: None })
         }
     }
 

@@ -887,12 +887,35 @@ to any remote — a configured remote alone is not enough. A read that finds the
 `origin: "remote:<name>"`; a write that lands on a remote reports `applied_to: "remote:<name>"`.
 `mempalace_inbox_read` and `mempalace_coordination_events` are the exception to the exception:
 being aggregate, cursor-paginated feeds (like `mempalace_get_changes_since`), they always read
-local *and* fan out to every configured remote concurrently with a per-remote cursor, reported
+local and fan out to every configured remote concurrently with a per-remote cursor, reported
 under `remote_messages`/`remote_events` — never routed by a single wing's rule, and never
 merged into the local page, matching `changes_fanout`'s `{unreachable, error}` isolation
 contract (one down remote never blocks a healthy one). `mempalace_coordination_event_get` — a
 single audit event by exact ID — has no remote counterpart at all: Stage 3 never exposed
 `GET /v1/coordination/events/{id}`, only the paginated feed, so it stays local-only.
+
+Being aggregate reads, these two never go through `resolve_coordination_route`, so they carry
+their own two guards rather than inheriting its — placed inside
+`FederationRouter::coordination_inbox_fanout`/`coordination_events_fanout` themselves so no
+future call site can add a fan-out read without them:
+
+- **The same coordination opt-in gate as the ID-discovery fallbacks.** `has_remotes()` alone
+  (true whenever *any* remote is configured for *anything* — drawers, KG, anything) is not
+  enough to fan out a coordination read; the fan-out also requires
+  `coordination_federation_enabled()` — an explicit `federation.coordination` entry, or
+  `default_mode` itself non-`local`. A palace that federates drawers only, with an empty
+  `federation.coordination` table and `default_mode: local`, never sends a recipient name or
+  wing filter to any remote on `mempalace_inbox_read` or `mempalace_coordination_events` — a
+  configured remote alone is not enough, exactly as for the ID-keyed fallbacks above.
+- **`wing_agents` never reaches a remote through either feed.** When the requested `wing`
+  normalises (via `WingId::normalized`, so `"agents"`/`"Wing_Agents"`/`" wing_agents "` all
+  count) to `wing_agents`, both methods skip the remote fan-out entirely and return an empty
+  result map — the local page still returns normally, just with no `remote_messages`/
+  `remote_events` entries, the same shape a healthy config with zero configured remotes
+  produces. A wing argument that fails to normalise at all fails CLOSED the same way
+  (suppressed, not fanned out) rather than falling through un-filtered. A request with no
+  `wing` argument at all is unaffected — there is no wing to protect against in an unfiltered
+  aggregate read.
 
 **Revision conflicts cross the wire intact.** A `409 revision_conflict` from a remote — from a
 `claim`/`renew`/`transition` discovered via the ID-fallback above — decodes into

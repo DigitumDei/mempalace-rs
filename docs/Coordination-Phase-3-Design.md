@@ -343,6 +343,36 @@ gains coordination categories and — unlike today, where it is dead code called
    and `crates/mempalace-server/src/lib.rs` (`route_coordination_events`,
    `route_coordination_inbox`).
 
+8. **Post-implementation fix: `FederationRouter::coordination_inbox_fanout`/
+   `coordination_events_fanout` had neither the coordination opt-in gate nor the diary
+   hard-override.** Deviations 2 and 6 above closed the same two invariants — "coordination
+   never federates unless `federation.coordination`/`default_mode` says so" and "`wing_agents`
+   coordination never federates, unconditionally" — but only on the paths that call
+   `resolve_coordination_route` or the ID-discovery fallback (`coordination_read_fallback`/
+   `coordination_write_fallback`/`coordination_task_revisioned_fallback`). The two aggregate
+   fan-out methods behind `mempalace_inbox_read` and `mempalace_coordination_events` are neither:
+   they are unconditional concurrent broadcasts to every configured remote, gated at their call
+   sites in `crates/mempalace-mcp/src/lib.rs` only by `FederationRouter::has_remotes()` — true
+   whenever *any* remote is configured for *anything* (drawers, KG, anything), not specifically
+   coordination. A palace federating drawers only, with an empty `federation.coordination` table
+   and `default_mode: local`, still sent the recipient name and any wing filter to every
+   configured remote on every `mempalace_inbox_read`/`mempalace_coordination_events` call — and a
+   caller requesting `wing: "wing_agents"` (or a non-canonical spelling of it) got that filter
+   forwarded to every remote with no diary check at all, since neither fan-out method ever calls
+   `resolve_coordination_route` or checks `SHARED_AGENT_DIARY_WING`.
+
+   Fixed by adding both guards directly inside `coordination_inbox_fanout` and
+   `coordination_events_fanout` themselves, rather than at their two call sites, so a future
+   aggregate-read call site cannot add a fan-out without inheriting the checks: each method now
+   returns an empty `BTreeMap` (the local page still returns normally, just with no
+   `remote_messages`/`remote_events` entries — indistinguishable from a healthy config with zero
+   configured remotes) when `coordination_federation_enabled()` is false, or when the requested
+   `wing` normalises (via `WingId::normalized`, so short/mixed-case/whitespace spellings all
+   count, and a wing that fails to normalise at all fails CLOSED the same way) to
+   `SHARED_AGENT_DIARY_WING`. A request with no `wing` filter is unaffected. See
+   `wing_blocks_coordination_fanout` and `coordination_events_fanout`/`coordination_inbox_fanout`
+   in `crates/mempalace-mcp/src/federation.rs`.
+
 ## Stage 5 — A2A adapter
 
 A new crate, `mempalace-a2a`, depending on `mempalace-storage` and `mempalace-federation` and

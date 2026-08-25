@@ -3374,6 +3374,16 @@ async fn coordination_claim_revision_conflict_via_remote_fallback() {
 /// remote is reported as unreachable, while a healthy one alongside it still returns its
 /// events, matching the `{unreachable, error}` isolation contract `changes_fanout` already
 /// guarantees for the generic change feed.
+///
+/// Coordination federation must be explicitly configured for the fan-out to run at all (see
+/// `FederationRouter::coordination_federation_enabled` and the aggregate-fan-out gate inside
+/// `coordination_events_fanout`/`coordination_inbox_fanout` themselves) — this test used to pass
+/// `RouteMode::Local` with an empty `coordination_rules` table here, which is precisely the
+/// "coordination federates with zero coordination configuration" shape that gate now closes, so
+/// it stopped exercising the isolation contract this test exists to check (both `hub` and `down`
+/// started reporting nothing at all). Pinning `wing_fanout` to `remote` in `coordination_rules`
+/// opts coordination in explicitly, the way a real operator would, while leaving the isolation
+/// behaviour under test unchanged.
 #[tokio::test]
 async fn coordination_events_fanout_with_one_remote_down_still_returns_the_healthy_one() {
     let local_dir = TempDir::new().unwrap();
@@ -3409,11 +3419,16 @@ async fn coordination_events_fanout_with_one_remote_down_still_returns_the_healt
         .await
         .unwrap();
 
+    let mut coordination_rules = BTreeMap::new();
+    coordination_rules.insert(
+        "wing_fanout".to_owned(),
+        ResolvedRouteRule { mode: RouteMode::Remote, remote: Some("hub".to_owned()), write: WriteTarget::Remote },
+    );
     let server = mcp_server_with_hub_multi(
         &local_dir,
         &[("hub", &hub_url), ("down", &down_url)],
         BTreeMap::new(),
-        BTreeMap::new(),
+        coordination_rules,
         RouteMode::Local,
     )
     .await;

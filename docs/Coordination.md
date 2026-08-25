@@ -18,9 +18,11 @@ MemPalace stores durable coordination state in the palace's local `storage.sqlit
 
 Delivery is at least once with idempotent writes. MemPalace does not promise exactly-once task execution.
 
-Task states are `pending`, `running`, `input_required`, `completed`, `cancelled`, `failed`, and `expired`. Terminal states cannot transition again. Only a current owner may transition owned work, except that another actor may request cancellation. Only the addressed recipient may acknowledge a message.
+Task states are `pending`, `running`, `input_required`, `completed`, `cancelled`, `failed`, and `expired`. Terminal states cannot transition again. Only a current owner may transition owned work, except that another actor may request cancellation. An acknowledgement must name the message's addressed recipient.
 
 Actor IDs are asserted by the local host runtime. MemPalace enforces ownership and recipient checks against those IDs; transport-level authentication and worker execution remain host-runtime responsibilities.
+
+**Acknowledgement is scoped to the wing, not to the acknowledging agent.** A recipient is a free-form string the sender chooses; it is not an authenticated identity and nothing verifies that the agent acknowledging a message is the agent it was addressed to. The check is that the acknowledgement names the recipient the message was stored with — so any caller who can reach the message can satisfy it. Locally that is any agent on the palace; over federation it is any token holding `coordination_write` on that message's wing. The wing is the authorization boundary here, and it is the same boundary `mempalace_inbox_read` already uses, which accepts any `recipient` argument rather than binding to the caller. Do not treat an acknowledgement as proof that a particular agent saw a message.
 
 Task titles, descriptions, JSON payloads and budgets, and artifact content are limited to 1 MiB. Idempotency keys are limited to 256 bytes. Inbox and event cursors are `null` when a page contains the final available records; a non-null cursor indicates that another page is available.
 

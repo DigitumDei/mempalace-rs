@@ -561,6 +561,88 @@ gains coordination categories and — unlike today, where it is dead code called
     (`delegation.rs`, `skills.rs`) belong to unrelated subsystems `is_local_record_missing` never
     sees.
 
+16. **Post-implementation fix: `mempalace_inbox_read`/`mempalace_coordination_events`'s tool
+    `description` strings never got the `capability_missing` fan-out entry shape deviation 14
+    added.** Deviation 14 gave a `CapabilityMissing` candidate a distinguishable
+    `{"capability_missing": true, "capability": ..., "error": ...}` entry in
+    `remote_messages`/`remote_events`, alongside the pre-existing `{ messages/events, next_cursor
+    }` and `{ unreachable: true, error }` shapes — but only updated `docs/Federation.md`, not the
+    tools' own `description` strings, which is where a schema-driven MCP client actually learns
+    the response shape. Fixed by adding the third shape to both descriptions in
+    `ToolName::definition` (`InboxRead`/`CoordinationEvents`) in `crates/mempalace-mcp/src/lib.rs`.
+
+17. **Post-implementation fix: the wing-visibility-to-`CoordinationVisibility` conversion was
+    hand-copied, byte-identical, at both coordination read routes.** `route_coordination_inbox`'s
+    cross-wing branch and `route_coordination_events` each independently converted
+    `auth.0.visible_wings(Operation::CoordinationRead)` into a `CoordinationVisibility`. This is
+    the same seam that produced deviations 7, 8 and one of the `bd7cd21`/`e3fa83b` fixes: a
+    security-relevant scoping rule living as two hand-synchronised copies in
+    `crates/mempalace-server/src/lib.rs`. Fixed by extracting `CoordinationReadScope`: it owns the
+    resolved `Option<Vec<String>>` wing restriction and exposes a borrowing `.visibility()`
+    accessor, rather than returning `(Option<Vec<String>>, CoordinationVisibility<'_>)` as a pair —
+    the latter would tie the borrow's lifetime to a tuple destructured at the call site, which is
+    harder to use correctly than a single struct the call site just keeps alive. Both routes now
+    call `CoordinationReadScope::resolve(&auth.0)` once and read `.visibility()` where needed. Pure
+    refactor, no behavioural change; covered by the existing wing-visibility test suite
+    (`coordination_events_cursor_does_not_leak_invisible_wing_volume`,
+    `coordination_inbox_cursor_does_not_leak_invisible_wing_recipient_volume`, and neighbours),
+    which passed unchanged before and after.
+
+18. **New regression coverage: the six ID-discovery fallback wrappers with no field-plumbing
+    test.** `mempalace_message_send`, `mempalace_message_acknowledge`, `mempalace_artifact_put`,
+    `mempalace_artifact_get`, `mempalace_result_put` and `mempalace_result_get` each have a thin
+    per-method fallback wrapper in `crates/mempalace-mcp/src/federation.rs`
+    (`coordination_message_send_fallback` and siblings), but until now no test drove any of them
+    through an actual remote fallback and inspected the fields that crossed — the unit tests in
+    that file cover only the shared generic fallback-loop logic (error classification, candidate
+    narrowing), which is blind to a wrapper silently dropping or swapping one of its own request
+    fields. Added six e2e tests in `crates/mempalace-mcp/tests/federation_e2e.rs`
+    (`coordination_message_send_fallback_forwards_recipient_and_sender_fields`,
+    `coordination_message_ack_fallback_forwards_actor_field`,
+    `coordination_artifact_put_fallback_forwards_request_body`,
+    `coordination_artifact_get_fallback_returns_correct_fields`,
+    `coordination_result_put_fallback_forwards_payload`,
+    `coordination_result_get_fallback_returns_correct_payload`), each asserting on the actual
+    field values the hub received and returned (not merely that the call succeeded) and, for the
+    write paths, reading the record back from the hub directly to confirm the fallback's response
+    was not a locally-fabricated echo. All six pass against the existing implementation — this is
+    new coverage of correct behaviour, not a bug fix.
+
+19. **Post-implementation fix: `RemoteApi`'s coordination trait defaults returned a synthetic-501
+    `RemoteRejected`, which the fallback loops in `crates/mempalace-mcp/src/federation.rs` treat
+    as terminal rather than skippable.** Those loops route only a `404`-shaped rejection and
+    (deviation 10) `CapabilityMissing` to "skip this candidate, try the next" for writes — a `501`
+    matches neither. `RemoteClient` overrides every coordination method for real, so this was
+    latent, not live, but any other `RemoteApi` implementor (a test double, or a future
+    implementation) that relied on even one trait default for a coordination method would abort
+    the entire candidate search with a hard error on that method instead of being skipped past.
+    Fixed by having `coordination_unsupported` (`crates/mempalace-remote/src/lib.rs`) construct
+    `RemoteError::CapabilityMissing { capability: "coordination", .. }` instead — which is what it
+    semantically is: "this implementation does not do coordination" is the same fact
+    `RemoteClient::ensure_coordination_capability` reports when a real remote's `/v1/info` omits
+    the capability, just decided locally instead of read off the wire. The `capability` string
+    deliberately matches the literal `RemoteClient` uses, so a caller cannot distinguish "hit an
+    in-process implementor's missing override" from "hit a live remote's capability gap" from the
+    error alone. See `coordination_write_fallback_skips_a_trait_default_implementor_instead_of_failing_hard`
+    in `crates/mempalace-mcp/src/federation.rs`, which fails against the pre-fix `RemoteRejected`
+    shape and passes against `CapabilityMissing`.
+
+20. **Rejected: making `coordination_read_fallback`'s candidate probing concurrent, to match the
+    aggregate fan-outs.** The fan-outs (`coordination_events_fanout`/`coordination_inbox_fanout`)
+    are concurrent because every candidate's answer is wanted and reported; nothing is lost by
+    asking them all at once. `coordination_read_fallback` is a discovery lookup for a single
+    record: it stops at the first success, so candidates after the winner are never asked at all
+    under sequential iteration. Making it concurrent would not change what is returned, only what
+    is sent — every configured coordination candidate would receive the id being looked up on
+    every local miss, unconditionally, including remotes that never had the record. Per this
+    document's own local-first invariant (`CLAUDE.md`: "memory never leaves the user's control by
+    default"), that is a real data-minimisation regression traded only for latency on a path that
+    already runs after a local miss — exactly the case local-first, one-remote-at-a-time ordering
+    exists to keep off the network. The rationale is now recorded directly in
+    `coordination_read_fallback`'s doc comment (`crates/mempalace-mcp/src/federation.rs`) and in
+    `docs/Federation.md`, so it reads as a deliberate trade-off rather than an oversight the next
+    review re-raises as a performance bug.
+
 ## Stage 5 — A2A adapter
 
 A new crate, `mempalace-a2a`, depending on `mempalace-storage` and `mempalace-federation` and

@@ -68,16 +68,30 @@ pub enum RemoteRevisionedWrite<T> {
 }
 
 /// Builds the [`RemoteError`] every coordination method's default trait body returns — see the
-/// `RemoteApi` trait-level comment on why those methods have defaults at all. Shaped like
-/// [`RemoteError::RemoteRejected`] with a synthetic HTTP 501: "this operation is not available"
-/// is conceptually the same rejection a peer that has never heard of `/v1/coordination/*` would
-/// give, just detected locally instead of over the wire.
+/// `RemoteApi` trait-level comment on why those methods have defaults at all.
+///
+/// This is [`RemoteError::CapabilityMissing`], not a synthetic HTTP status, because that is what
+/// it semantically is: "this `RemoteApi` implementation does not do coordination" is exactly the
+/// same fact `RemoteClient::ensure_coordination_capability` reports when a real remote's
+/// `/v1/info` omits the `"coordination"` capability — the trait default is just deciding it
+/// locally instead of reading it off the wire. This match matters beyond taxonomy:
+/// `FederationRouter`'s coordination fallback loops in `mempalace-mcp::federation` route only
+/// `404` and `CapabilityMissing` (plus `Unreachable` for reads) to "skip this candidate, try the
+/// next"; every other error, including the `RemoteRejected` this used to be shaped as (a
+/// synthetic 501, which matches none of those), is terminal and aborts the whole search. Before
+/// this fix, an implementor that inherited even one coordination method from the trait default
+/// made the entire candidate search fail hard on that method rather than being skipped — not
+/// reachable through `RemoteClient` today, since it overrides every coordination method, but
+/// live for any other `RemoteApi` implementor (e.g. a test double) that does not.
+/// `capability` is the literal `"coordination"`, matching what `RemoteClient` reports for a real
+/// remote — the two must agree, since a caller cannot tell from the error alone whether it hit a
+/// live remote's `/v1/info` gap or an in-process implementor's missing override.
+/// `CapabilityMissing` has no field for which method was called, so `operation` is logged here
+/// rather than folded into `capability`, which would make this default disagree with the real
+/// remote's error for no benefit.
 fn coordination_unsupported(operation: &str) -> RemoteError {
-    RemoteError::RemoteRejected {
-        remote: "<unbound>".to_owned(),
-        status: 501,
-        body: format!("{operation} is not implemented by this RemoteApi implementation"),
-    }
+    tracing::debug!(operation, "RemoteApi coordination default invoked: not implemented");
+    RemoteError::CapabilityMissing { remote: "<unbound>".to_owned(), capability: "coordination".to_owned() }
 }
 
 /// Connection parameters for one remote palace.
@@ -169,13 +183,25 @@ pub trait RemoteApi: Send + Sync {
     // ─── Coordination (issue #102 Stage 4) ─────────────────────────────────────
     //
     // Every method below has a default body returning `coordination_unsupported` (an
-    // `Err(RemoteError::RemoteRejected)` with a synthetic 501). The trait otherwise has no
-    // defaults, so adding these 14 methods without them would break every existing implementor —
-    // `RemoteClient` plus the test-double mocks in `mempalace-mcp::federation` and
-    // `mempalace-mcp::lib`. Defaults also let a Stage-4-aware client talk cleanly to a
-    // pre-Stage-3 server, or to a test double with no reason to implement coordination.
-    // `RemoteClient` overrides every one of them for real, gated on the `"coordination"`
-    // capability from the cached `/v1/info` handshake — see its `ensure_coordination_capability`.
+    // `Err(RemoteError::CapabilityMissing { capability: "coordination", .. })`). The trait
+    // otherwise has no defaults, so adding these 14 methods without them would break every
+    // existing implementor — `RemoteClient` plus the test-double mocks in
+    // `mempalace-mcp::federation` and `mempalace-mcp::lib`. Defaults also let a Stage-4-aware
+    // client talk cleanly to a pre-Stage-3 server, or to a test double with no reason to
+    // implement coordination. `RemoteClient` overrides every one of them for real, gated on the
+    // `"coordination"` capability from the cached `/v1/info` handshake — see its
+    // `ensure_coordination_capability`.
+    //
+    // `CapabilityMissing`, not `RemoteRejected`, is deliberate: `FederationRouter`'s coordination
+    // fallback loops (`mempalace-mcp::federation`) treat only a `404` and `CapabilityMissing`
+    // (plus `Unreachable` for reads) as "skip this candidate, try the next" — every other error
+    // is terminal. An implementor relying on these defaults for even one coordination method
+    // must be *skipped*, not treated as a hard failure that aborts the whole candidate search;
+    // that was the bug when this returned a synthetic-501 `RemoteRejected`, which matches neither
+    // skip condition. Not reachable through `RemoteClient` today (it overrides every coordination
+    // method), but live for any other implementor — see
+    // `coordination_read_fallback_skips_a_trait_default_implementor_instead_of_failing_hard` in
+    // `crates/mempalace-mcp/src/federation.rs`.
 
     /// Create a task (`POST /v1/coordination/tasks`).
     async fn coordination_task_create(&self, req: NewTaskRequest) -> Result<CoordinationTaskDto> {

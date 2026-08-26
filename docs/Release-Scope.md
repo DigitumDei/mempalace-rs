@@ -113,12 +113,16 @@ palace-default lineage into an identity packet; model-facing calls cannot select
 See [Self-Continuity Across Models](Self-Continuity.md).
 
 The eight skill-registry tools and the seven delegation-telemetry tools are local-only and
-are not federated. The fifteen coordination tools are still local-only MCP tools, but as of
-issue #102 Stage 3 the records they operate on (tasks, messages, artifacts, results, audit
-events) are also reachable over the federation REST API, server-side and opt-in per wing —
-`mempalace-server` exposes `/v1/coordination/*` under the same scoped-token authorization as
-every other route. The MCP tools themselves do not route through federation yet; that is a
-later stage (`RemoteApi`, `FederationRouter`, MCP dispatch). See
+are not federated. The fifteen coordination tools, by contrast, are federation-aware as of
+issue #102 Stage 4, opt-in per wing via `federation.coordination`: `mempalace_task_create` routes
+by the task's wing; every other ID-keyed tool (get/claim/renew/transition, message send/get/ack,
+artifact/result put/get) tries local storage first and falls back to each configured remote in
+name order on a local miss; and the two aggregate feeds (`mempalace_inbox_read`,
+`mempalace_coordination_events`) always read local and, when coordination federation is
+configured at all, fan out concurrently to the remotes a `federation.coordination` rule names
+(plus the default remote when `default_mode` is not `local`), each with its own cursor. A read
+filtered to `wing_agents` never fans out, on either feed. `mempalace-server` exposes the same records over `/v1/coordination/*` under
+the same scoped-token authorization as every other route. See
 [Native Coordination](Coordination.md), [Federation](Federation.md#part-7--federated-coordination),
 [Skill Registry](Skill-Registry.md), and [Delegation Telemetry](Delegation-Telemetry.md).
 
@@ -141,7 +145,8 @@ Added after the initial v1 freeze; now part of the shipped surface.
   local-first dual-write with best-effort remote replication in `both` mode;
   federated mining and `mine --branch` branch-delta mining.
 - MCP read fan-out: combined search/taxonomy/status, plus `remote_changes` in
-  `mempalace_wake_up` and remote merge in `mempalace_get_changes_since`.
+  `mempalace_wake_up`, remote merge in `mempalace_get_changes_since`, and (issue #102 Stage 4)
+  `remote_messages`/`remote_events` in `mempalace_inbox_read`/`mempalace_coordination_events`.
 
 See [Federation](Federation.md) for the full guide.
 

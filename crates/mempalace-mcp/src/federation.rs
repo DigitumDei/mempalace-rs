@@ -1424,6 +1424,21 @@ impl FederationRouter {
     /// immediately: silently treating it as a miss would let a caller believe a record does not
     /// exist when the truth is "your token is wrong" or "this remote is on an incompatible
     /// version". `Ok(None)` means every candidate was tried and genuinely does not have it.
+    ///
+    /// **Iteration is sequential, not concurrent like the fan-outs
+    /// (`coordination_events_fanout`/`coordination_inbox_fanout`), and this is deliberate, not an
+    /// oversight.** The fan-outs are aggregate reads: every candidate's answer is wanted and
+    /// reported, so there is no "first hit wins" to lose by asking them all at once. This method
+    /// is a discovery lookup for a single record: probing stops at the first success, so the
+    /// candidates after the winner are never even asked. Making that concurrent would not change
+    /// what is returned, only what is sent — every candidate would receive the id being looked up
+    /// on every local miss, unconditionally, whether or not it turns out to hold the record.
+    /// Per `CLAUDE.md`'s "memory never leaves the user's control by default", broadcasting a
+    /// caller's query to remotes that do not have the answer is a real data-minimisation
+    /// regression, traded only for latency on a path that already runs after a local miss —
+    /// exactly where the local-first, one-remote-at-a-time contract is supposed to keep the
+    /// common case from touching the network at all. Sequential order is therefore load-bearing,
+    /// not incidental; do not "optimise" it to concurrent without re-litigating this trade-off.
     async fn coordination_read_fallback<F, Fut, T>(&self, op: F) -> ToolResult<Option<Value>>
     where
         F: Fn(Arc<dyn RemoteApi>) -> Fut,
@@ -3233,6 +3248,173 @@ mod tests {
             "zeta must actually have been called"
         );
         assert_eq!(value["task"]["task_id"], "task-1");
+    }
+
+    /// A `RemoteApi` implementor that inherits every coordination method's trait default (i.e.
+    /// implements none of them itself) — the exact shape the `RemoteApi` trait-level comment in
+    /// `mempalace-remote` describes as "not reachable through `RemoteClient` today, but live for
+    /// any other implementor." Every non-coordination method is implemented since the trait has
+    /// no defaults for those; every coordination method is deliberately left to the default body.
+    struct DefaultsOnlyRemote;
+
+    #[async_trait::async_trait]
+    impl RemoteApi for DefaultsOnlyRemote {
+        async fn info(&self) -> mempalace_remote::Result<InfoResponse> {
+            Ok(serde_json::from_value(json!({
+                "server_version": "1.0.0-test",
+                "federation_api_version": 1,
+                "embedding_profile": "balanced",
+                "capabilities": ["drawers"]
+            }))
+            .unwrap())
+        }
+        async fn search_drawers(
+            &self,
+            _req: DrawerSearchRequest,
+        ) -> mempalace_remote::Result<DrawerSearchResponse> {
+            unimplemented!("not exercised by the coordination-defaults test")
+        }
+        async fn check_duplicate(
+            &self,
+            _req: CheckDuplicateRequest,
+        ) -> mempalace_remote::Result<CheckDuplicateResponse> {
+            unimplemented!("not exercised by the coordination-defaults test")
+        }
+        async fn add_drawer(
+            &self,
+            _req: AddDrawerRequest,
+        ) -> mempalace_remote::Result<AddDrawerResponse> {
+            unimplemented!("not exercised by the coordination-defaults test")
+        }
+        async fn list_drawers(
+            &self,
+            _query: ListDrawersQuery,
+        ) -> mempalace_remote::Result<ListDrawersResponse> {
+            unimplemented!("not exercised by the coordination-defaults test")
+        }
+        async fn get_drawer(&self, _drawer_id: &str) -> mempalace_remote::Result<Value> {
+            unimplemented!("not exercised by the coordination-defaults test")
+        }
+        async fn delete_drawer(&self, _drawer_id: &str) -> mempalace_remote::Result<()> {
+            unimplemented!("not exercised by the coordination-defaults test")
+        }
+        async fn kg_query(&self, _req: KgQueryRequest) -> mempalace_remote::Result<Value> {
+            unimplemented!("not exercised by the coordination-defaults test")
+        }
+        async fn kg_add_fact(&self, _req: KgAddFactRequest) -> mempalace_remote::Result<Value> {
+            unimplemented!("not exercised by the coordination-defaults test")
+        }
+        async fn kg_invalidate(
+            &self,
+            _req: KgInvalidateRequest,
+        ) -> mempalace_remote::Result<Value> {
+            unimplemented!("not exercised by the coordination-defaults test")
+        }
+        async fn kg_timeline(&self, _entity: Option<&str>) -> mempalace_remote::Result<Value> {
+            unimplemented!("not exercised by the coordination-defaults test")
+        }
+        async fn kg_stats(&self) -> mempalace_remote::Result<Value> {
+            unimplemented!("not exercised by the coordination-defaults test")
+        }
+        async fn taxonomy(&self) -> mempalace_remote::Result<Value> {
+            unimplemented!("not exercised by the coordination-defaults test")
+        }
+        async fn wings(&self) -> mempalace_remote::Result<Value> {
+            unimplemented!("not exercised by the coordination-defaults test")
+        }
+        async fn rooms(&self, _wing: Option<&str>) -> mempalace_remote::Result<Value> {
+            unimplemented!("not exercised by the coordination-defaults test")
+        }
+        async fn changes(&self, _query: ChangesQuery) -> mempalace_remote::Result<ChangesResponse> {
+            unimplemented!("not exercised by the coordination-defaults test")
+        }
+        async fn ingest_batch(
+            &self,
+            _req: mempalace_federation::IngestBatchRequest,
+        ) -> mempalace_remote::Result<mempalace_federation::IngestBatchResponse> {
+            unimplemented!("not exercised by the coordination-defaults test")
+        }
+    }
+
+    /// Regression test for the `RemoteApi` trait-default fix: a candidate remote that has not
+    /// overridden any coordination method (and therefore hits the shared
+    /// `coordination_unsupported` default body) must be *skipped* by the write fallback in
+    /// favour of the next candidate, not treated as a terminal error that aborts the whole
+    /// search. Before the fix, the default returned a synthetic-501 `RemoteRejected`, which
+    /// matches neither write fallback skip condition (`404` or `CapabilityMissing`) and so was
+    /// terminal — this test fails against that old behaviour and passes once the default returns
+    /// `CapabilityMissing` instead.
+    #[tokio::test]
+    async fn coordination_write_fallback_skips_a_trait_default_implementor_instead_of_failing_hard()
+    {
+        let defaults_only: Arc<dyn RemoteApi> = Arc::new(DefaultsOnlyRemote);
+        let mut real = MockRemote::default();
+        let expected_task = make_task_dto("task-1");
+        real.coordination_task_write_outcome =
+            MockCoordOutcome::Applied(Box::new(expected_task.clone()));
+        let real_calls = std::sync::Arc::clone(&real.coordination_calls);
+
+        let mut remotes: BTreeMap<String, Arc<dyn RemoteApi>> = BTreeMap::new();
+        remotes.insert("alpha-defaults".to_owned(), defaults_only);
+        remotes.insert("zeta-real".to_owned(), Arc::new(real) as Arc<dyn RemoteApi>);
+        assert_eq!(
+            remotes.keys().collect::<Vec<_>>(),
+            vec!["alpha-defaults", "zeta-real"],
+            "test setup must put the defaults-only remote first in iteration order"
+        );
+
+        let mut rules_remotes = BTreeMap::new();
+        rules_remotes.insert("alpha-defaults".to_owned(), make_resolved_remote("alpha-defaults"));
+        rules_remotes.insert("zeta-real".to_owned(), make_resolved_remote("zeta-real"));
+        let mut coordination = BTreeMap::new();
+        coordination.insert(
+            "wing_team".to_owned(),
+            ResolvedRouteRule {
+                mode: RouteMode::Remote,
+                remote: Some("alpha-defaults".to_owned()),
+                write: WriteTarget::Remote,
+            },
+        );
+        coordination.insert(
+            "wing_other".to_owned(),
+            ResolvedRouteRule {
+                mode: RouteMode::Remote,
+                remote: Some("zeta-real".to_owned()),
+                write: WriteTarget::Remote,
+            },
+        );
+        let rules = FederationRuntimeConfig {
+            remotes: rules_remotes,
+            default_mode: RouteMode::Local,
+            default_remote: None,
+            wings: BTreeMap::new(),
+            kg: None,
+            coordination,
+        };
+        let router = FederationRouter::with_remotes(rules, remotes);
+
+        let value = router
+            .coordination_task_claim_fallback(
+                "task-1",
+                TaskLeaseRequest {
+                    expected_revision: 0,
+                    lease_seconds: 60,
+                    worker: Some("worker-1".to_owned()),
+                },
+            )
+            .await
+            .expect("the defaults-only remote must be skipped, not terminate the search")
+            .expect("claim must reach zeta-real and succeed");
+
+        assert_eq!(
+            value["applied_to"], "remote:zeta-real",
+            "the claim must land on the real remote past the defaults-only one: {value}"
+        );
+        assert_eq!(
+            real_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "zeta-real must actually have been called"
+        );
     }
 
     /// A revision conflict from the sole candidate remote must still surface via the shared

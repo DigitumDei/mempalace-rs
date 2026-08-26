@@ -930,6 +930,21 @@ with `origin: "remote:<name>"`; a write that lands on a remote reports `applied_
 nests the task under `"task"`, exactly like the local shape documented below — `{"success":
 true, "task": {...}, "applied_to": "remote:<name>"}` — so a caller never has to special-case
 which palace served the write.
+
+**The ID-discovery read fallback probes candidates sequentially, one at a time, stopping at the
+first success — this is deliberate, not an oversight left over from before the fan-outs went
+concurrent.** `mempalace_inbox_read`/`mempalace_coordination_events` fan out concurrently because
+they are aggregate reads: every candidate's answer is wanted, so nothing is lost by asking them
+all at once. `coordination_read_fallback` is a discovery lookup for one record: the moment a
+candidate answers, the search stops, so a candidate after the winner is never contacted in the
+first place. Making it concurrent would not change what is returned — only what is sent: every
+configured coordination candidate would receive the id being looked up on every local miss,
+unconditionally, including the remotes that never had the record. Per this document's governing
+invariant that memory never leaves the user's control by default, broadcasting a caller's query
+id to remotes with no answer to it is a real data-minimisation regression, bought only with
+latency on a path that already runs after a local miss — exactly the case local-first ordering
+exists to keep off the network. Sequential order is load-bearing here, not incidental.
+
 `mempalace_inbox_read` and `mempalace_coordination_events` are the exception to the exception:
 being aggregate, cursor-paginated feeds (like `mempalace_get_changes_since`), they always read
 local and fan out concurrently, with a per-remote cursor, to every remote in

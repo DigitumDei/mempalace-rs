@@ -3709,3 +3709,446 @@ async fn coordination_inbox_remote_cursors_round_trip_paginates_without_repeats(
         "no messages remain after page 2: {page2_remote}"
     );
 }
+
+// ─── Six ID-discovery fallback wrappers: field-plumbing coverage (PR #120 review) ─────
+//
+// `coordination_task_create`/`_get`/`_claim`, `coordination_events`/`_inbox` fanouts each have
+// e2e coverage above, but `mempalace_message_send`, `mempalace_message_acknowledge`,
+// `mempalace_artifact_put`, `mempalace_artifact_get`, `mempalace_result_put` and
+// `mempalace_result_get` do not — the unit tests in `federation.rs` exercise the *shared*
+// fallback-loop logic (error classification, candidate narrowing) generically, but nothing pins
+// these six thin wrappers' own field plumbing, e.g. that `coordination_message_ack_fallback`
+// forwards `actor` into `AckMessageRequest` correctly, or that `artifact_put`/`result_put`
+// forward their request bodies unchanged. Each test below asserts on the *values* the hub
+// actually stored and returned, not merely that the call succeeded — a wiring bug that dropped
+// or swapped a field would still produce `"success"`/`"found": true` in every case, so a
+// call-happened assertion would not catch it.
+
+/// `mempalace_message_send` falls back to the hub when the referenced task exists only there,
+/// and must forward `recipient` (stored verbatim) and `sender` (identity-resolved) unchanged —
+/// a dropped `sender` would silently resolve to the bare token identity instead of
+/// `{identity}:{claim}`, which this test would catch.
+#[tokio::test]
+async fn coordination_message_send_fallback_forwards_recipient_and_sender_fields() {
+    let local_dir = TempDir::new().unwrap();
+    let hub_dir = TempDir::new().unwrap();
+    let hub_addr = spawn_server(&hub_dir).await;
+    let hub_url = format!("http://{hub_addr}");
+
+    let hub_client = RemoteClient::new(RemoteEndpoint {
+        name: "hub".to_owned(),
+        base_url: hub_url.clone(),
+        token: Some(TEST_TOKEN.to_owned()),
+        timeout: Duration::from_secs(5),
+    })
+    .unwrap();
+    let hub_task = hub_client
+        .coordination_task_create(mempalace_federation::NewTaskRequest {
+            title: "message send fallback".to_owned(),
+            description: "d".to_owned(),
+            wing: "wing_msgsend".to_owned(),
+            idempotency_key: "e2e-msgsend-task".to_owned(),
+            created_by: None,
+            parent_id: None,
+            dependencies: Vec::new(),
+            budget: None,
+            expires_at: None,
+        })
+        .await
+        .unwrap();
+
+    let server = mcp_server_with_hub_coordination(
+        &local_dir,
+        &hub_url,
+        BTreeMap::new(),
+        BTreeMap::new(),
+        RouteMode::Combined,
+    )
+    .await;
+
+    let response = call_tool(
+        &server,
+        1,
+        "mempalace_message_send",
+        json!({
+            "task_id": hub_task.task_id,
+            "sender": "alice",
+            "recipient": "worker-9",
+            "kind": "status",
+            "payload": {"note": "hello from fallback"},
+            "idempotency_key": "e2e-msgsend-1",
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        response["recipient"], "worker-9",
+        "recipient must be forwarded verbatim through the fallback: {response}"
+    );
+    assert_eq!(
+        response["sender"], "e2e-fed-user:alice",
+        "sender must be identity-resolved from the claimed `alice`, not dropped or defaulted \
+         to the bare token identity: {response}"
+    );
+    assert_eq!(response["payload"]["note"], "hello from fallback");
+    assert_eq!(response["kind"], "status");
+
+    // Read it back from the hub directly to confirm the fallback actually persisted what it
+    // claims to have returned, not just echoed a locally-fabricated value.
+    let stored = hub_client
+        .coordination_message_get(response["message_id"].as_str().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(stored.recipient, "worker-9");
+    assert_eq!(stored.sender, "e2e-fed-user:alice");
+}
+
+/// `mempalace_message_acknowledge` falls back to the hub for a message that exists only there,
+/// and must forward `actor` through `resolve_ack_actor` correctly: an actor claim equal to the
+/// message's own `recipient` must be stored bare, not identity-prefixed — proving
+/// `coordination_message_ack_fallback` actually carries the caller's `actor` argument into
+/// `AckMessageRequest`, rather than e.g. leaving it `None` (which would resolve to the bare
+/// token identity, not `worker-9`, and this test would catch that divergence).
+#[tokio::test]
+async fn coordination_message_ack_fallback_forwards_actor_field() {
+    let local_dir = TempDir::new().unwrap();
+    let hub_dir = TempDir::new().unwrap();
+    let hub_addr = spawn_server(&hub_dir).await;
+    let hub_url = format!("http://{hub_addr}");
+
+    let hub_client = RemoteClient::new(RemoteEndpoint {
+        name: "hub".to_owned(),
+        base_url: hub_url.clone(),
+        token: Some(TEST_TOKEN.to_owned()),
+        timeout: Duration::from_secs(5),
+    })
+    .unwrap();
+    let hub_task = hub_client
+        .coordination_task_create(mempalace_federation::NewTaskRequest {
+            title: "message ack fallback".to_owned(),
+            description: "d".to_owned(),
+            wing: "wing_msgack".to_owned(),
+            idempotency_key: "e2e-msgack-task".to_owned(),
+            created_by: None,
+            parent_id: None,
+            dependencies: Vec::new(),
+            budget: None,
+            expires_at: None,
+        })
+        .await
+        .unwrap();
+    let hub_message = hub_client
+        .coordination_message_send(mempalace_federation::NewMessageRequest {
+            task_id: hub_task.task_id.clone(),
+            recipient: "worker-9".to_owned(),
+            kind: "status".to_owned(),
+            payload: json!({}),
+            idempotency_key: "e2e-msgack-msg".to_owned(),
+            sender: None,
+            envelope_version: 1,
+        })
+        .await
+        .unwrap();
+
+    let server = mcp_server_with_hub_coordination(
+        &local_dir,
+        &hub_url,
+        BTreeMap::new(),
+        BTreeMap::new(),
+        RouteMode::Combined,
+    )
+    .await;
+
+    let response = call_tool(
+        &server,
+        1,
+        "mempalace_message_acknowledge",
+        json!({"message_id": hub_message.message_id, "actor": "worker-9"}),
+    )
+    .await;
+
+    assert_eq!(
+        response["acknowledged_by"], "worker-9",
+        "the acknowledging actor must be forwarded and stored bare (it equals the message's \
+         own recipient), not dropped or identity-prefixed: {response}"
+    );
+    assert!(
+        response["acknowledged_at"].is_string(),
+        "acknowledgement must record a timestamp: {response}"
+    );
+
+    let stored = hub_client.coordination_message_get(&hub_message.message_id).await.unwrap();
+    assert_eq!(stored.acknowledged_by.as_deref(), Some("worker-9"));
+}
+
+/// `mempalace_artifact_put` falls back to the hub when the referenced task exists only there,
+/// and must forward `role`, `media_type` and `content` unchanged.
+#[tokio::test]
+async fn coordination_artifact_put_fallback_forwards_request_body() {
+    let local_dir = TempDir::new().unwrap();
+    let hub_dir = TempDir::new().unwrap();
+    let hub_addr = spawn_server(&hub_dir).await;
+    let hub_url = format!("http://{hub_addr}");
+
+    let hub_client = RemoteClient::new(RemoteEndpoint {
+        name: "hub".to_owned(),
+        base_url: hub_url.clone(),
+        token: Some(TEST_TOKEN.to_owned()),
+        timeout: Duration::from_secs(5),
+    })
+    .unwrap();
+    let hub_task = hub_client
+        .coordination_task_create(mempalace_federation::NewTaskRequest {
+            title: "artifact put fallback".to_owned(),
+            description: "d".to_owned(),
+            wing: "wing_artput".to_owned(),
+            idempotency_key: "e2e-artput-task".to_owned(),
+            created_by: None,
+            parent_id: None,
+            dependencies: Vec::new(),
+            budget: None,
+            expires_at: None,
+        })
+        .await
+        .unwrap();
+
+    let server = mcp_server_with_hub_coordination(
+        &local_dir,
+        &hub_url,
+        BTreeMap::new(),
+        BTreeMap::new(),
+        RouteMode::Combined,
+    )
+    .await;
+
+    let response = call_tool(
+        &server,
+        1,
+        "mempalace_artifact_put",
+        json!({
+            "task_id": hub_task.task_id,
+            "created_by": "alice",
+            "role": "output",
+            "media_type": "text/plain",
+            "content": "the artifact body",
+            "idempotency_key": "e2e-artput-1",
+        }),
+    )
+    .await;
+
+    assert_eq!(response["role"], "output", "role must be forwarded unchanged: {response}");
+    assert_eq!(
+        response["media_type"], "text/plain",
+        "media_type must be forwarded unchanged: {response}"
+    );
+    assert_eq!(
+        response["content"], "the artifact body",
+        "content must be forwarded unchanged: {response}"
+    );
+    assert_eq!(response["created_by"], "e2e-fed-user:alice");
+
+    let stored = hub_client
+        .coordination_artifact_get(response["artifact_id"].as_str().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(stored.content, "the artifact body");
+    assert_eq!(stored.role, "output");
+    assert_eq!(stored.media_type, "text/plain");
+}
+
+/// `mempalace_artifact_get` falls back to the hub for an artifact that exists only there, and
+/// must return its actual field values (not just `found: true`).
+#[tokio::test]
+async fn coordination_artifact_get_fallback_returns_correct_fields() {
+    let local_dir = TempDir::new().unwrap();
+    let hub_dir = TempDir::new().unwrap();
+    let hub_addr = spawn_server(&hub_dir).await;
+    let hub_url = format!("http://{hub_addr}");
+
+    let hub_client = RemoteClient::new(RemoteEndpoint {
+        name: "hub".to_owned(),
+        base_url: hub_url.clone(),
+        token: Some(TEST_TOKEN.to_owned()),
+        timeout: Duration::from_secs(5),
+    })
+    .unwrap();
+    let hub_task = hub_client
+        .coordination_task_create(mempalace_federation::NewTaskRequest {
+            title: "artifact get fallback".to_owned(),
+            description: "d".to_owned(),
+            wing: "wing_artget".to_owned(),
+            idempotency_key: "e2e-artget-task".to_owned(),
+            created_by: None,
+            parent_id: None,
+            dependencies: Vec::new(),
+            budget: None,
+            expires_at: None,
+        })
+        .await
+        .unwrap();
+    let hub_artifact = hub_client
+        .coordination_artifact_put(mempalace_federation::NewArtifactRequest {
+            task_id: hub_task.task_id.clone(),
+            role: "log".to_owned(),
+            media_type: "application/json".to_owned(),
+            content: r#"{"k":"v"}"#.to_owned(),
+            idempotency_key: "e2e-artget-artifact".to_owned(),
+            created_by: None,
+        })
+        .await
+        .unwrap();
+
+    let server = mcp_server_with_hub_coordination(
+        &local_dir,
+        &hub_url,
+        BTreeMap::new(),
+        BTreeMap::new(),
+        RouteMode::Combined,
+    )
+    .await;
+
+    let response = call_tool(
+        &server,
+        1,
+        "mempalace_artifact_get",
+        json!({"artifact_id": hub_artifact.artifact_id}),
+    )
+    .await;
+
+    assert_eq!(response["found"], true, "must find the artifact via remote fallback: {response}");
+    assert_eq!(response["value"]["role"], "log");
+    assert_eq!(response["value"]["media_type"], "application/json");
+    assert_eq!(response["value"]["content"], r#"{"k":"v"}"#);
+    assert_eq!(response["value"]["origin"], "remote:hub");
+}
+
+/// `mempalace_result_put` falls back to the hub when the referenced task exists only there, and
+/// must forward the (nested) `payload` body unchanged.
+#[tokio::test]
+async fn coordination_result_put_fallback_forwards_payload() {
+    let local_dir = TempDir::new().unwrap();
+    let hub_dir = TempDir::new().unwrap();
+    let hub_addr = spawn_server(&hub_dir).await;
+    let hub_url = format!("http://{hub_addr}");
+
+    let hub_client = RemoteClient::new(RemoteEndpoint {
+        name: "hub".to_owned(),
+        base_url: hub_url.clone(),
+        token: Some(TEST_TOKEN.to_owned()),
+        timeout: Duration::from_secs(5),
+    })
+    .unwrap();
+    let hub_task = hub_client
+        .coordination_task_create(mempalace_federation::NewTaskRequest {
+            title: "result put fallback".to_owned(),
+            description: "d".to_owned(),
+            wing: "wing_resput".to_owned(),
+            idempotency_key: "e2e-resput-task".to_owned(),
+            created_by: None,
+            parent_id: None,
+            dependencies: Vec::new(),
+            budget: None,
+            expires_at: None,
+        })
+        .await
+        .unwrap();
+
+    let server = mcp_server_with_hub_coordination(
+        &local_dir,
+        &hub_url,
+        BTreeMap::new(),
+        BTreeMap::new(),
+        RouteMode::Combined,
+    )
+    .await;
+
+    let response = call_tool(
+        &server,
+        1,
+        "mempalace_result_put",
+        json!({
+            "task_id": hub_task.task_id,
+            "created_by": "alice",
+            "payload": {"status": "ok", "nested": {"count": 3}},
+            "idempotency_key": "e2e-resput-1",
+        }),
+    )
+    .await;
+
+    assert_eq!(response["payload"]["status"], "ok", "payload must be forwarded unchanged: {response}");
+    assert_eq!(
+        response["payload"]["nested"]["count"], 3,
+        "nested payload fields must survive the fallback unchanged: {response}"
+    );
+    assert_eq!(response["created_by"], "e2e-fed-user:alice");
+
+    let stored = hub_client
+        .coordination_result_get(response["result_id"].as_str().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(stored.payload["status"], "ok");
+    assert_eq!(stored.payload["nested"]["count"], 3);
+}
+
+/// `mempalace_result_get` falls back to the hub for a result that exists only there, and must
+/// return its actual payload (not just `found: true`).
+#[tokio::test]
+async fn coordination_result_get_fallback_returns_correct_payload() {
+    let local_dir = TempDir::new().unwrap();
+    let hub_dir = TempDir::new().unwrap();
+    let hub_addr = spawn_server(&hub_dir).await;
+    let hub_url = format!("http://{hub_addr}");
+
+    let hub_client = RemoteClient::new(RemoteEndpoint {
+        name: "hub".to_owned(),
+        base_url: hub_url.clone(),
+        token: Some(TEST_TOKEN.to_owned()),
+        timeout: Duration::from_secs(5),
+    })
+    .unwrap();
+    let hub_task = hub_client
+        .coordination_task_create(mempalace_federation::NewTaskRequest {
+            title: "result get fallback".to_owned(),
+            description: "d".to_owned(),
+            wing: "wing_resget".to_owned(),
+            idempotency_key: "e2e-resget-task".to_owned(),
+            created_by: None,
+            parent_id: None,
+            dependencies: Vec::new(),
+            budget: None,
+            expires_at: None,
+        })
+        .await
+        .unwrap();
+    let hub_result = hub_client
+        .coordination_result_put(mempalace_federation::NewTaskResultRequest {
+            task_id: hub_task.task_id.clone(),
+            payload: json!({"status": "done", "value": 42}),
+            idempotency_key: "e2e-resget-result".to_owned(),
+            created_by: None,
+        })
+        .await
+        .unwrap();
+
+    let server = mcp_server_with_hub_coordination(
+        &local_dir,
+        &hub_url,
+        BTreeMap::new(),
+        BTreeMap::new(),
+        RouteMode::Combined,
+    )
+    .await;
+
+    let response = call_tool(
+        &server,
+        1,
+        "mempalace_result_get",
+        json!({"result_id": hub_result.result_id}),
+    )
+    .await;
+
+    assert_eq!(response["found"], true, "must find the result via remote fallback: {response}");
+    assert_eq!(response["value"]["payload"]["status"], "done");
+    assert_eq!(response["value"]["payload"]["value"], 42);
+    assert_eq!(response["value"]["origin"], "remote:hub");
+}

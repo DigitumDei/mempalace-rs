@@ -432,6 +432,38 @@ impl WingVisibility {
     }
 }
 
+/// A caller's wing restriction for `coordination_read`, resolved once from its
+/// [`AuthIdentity`] and owned here so the borrowed [`CoordinationVisibility`] it produces
+/// (via [`Self::visibility`]) never needs to outlive a separate `Option<Vec<String>>` the
+/// call site would otherwise have to keep alive alongside it.
+///
+/// `route_coordination_inbox`'s cross-wing branch and `route_coordination_events` both need
+/// exactly this conversion; it used to be hand-copied at both sites, which is the same trap
+/// that has already produced three previous coordination fixes landing on one of these two
+/// routes and not the other (see the module-level "Wing authorization" note).
+struct CoordinationReadScope {
+    restrict_wings: Option<Vec<String>>,
+}
+
+impl CoordinationReadScope {
+    fn resolve(auth: &AuthIdentity) -> Self {
+        let restrict_wings = match auth.visible_wings(Operation::CoordinationRead) {
+            WingVisibility::All => None,
+            WingVisibility::Only(wings) => Some(wings.into_iter().collect()),
+        };
+        Self { restrict_wings }
+    }
+
+    /// The `CoordinationVisibility` this scope implies. Borrows `self`, so the
+    /// `CoordinationReadScope` must stay alive as long as the returned value is used.
+    fn visibility(&self) -> CoordinationVisibility<'_> {
+        match &self.restrict_wings {
+            None => CoordinationVisibility::Federated(None),
+            Some(wings) => CoordinationVisibility::Federated(Some(wings.as_slice())),
+        }
+    }
+}
+
 /// A single entry in the bearer-token file as stored on disk.
 ///
 /// `deny_unknown_fields` is deliberate: an absent `scopes` field means
@@ -3265,18 +3297,17 @@ where
     // is no longer needed: storage's own `has_more`/cursor boundary is
     // already computed over the filtered set, so "examined everything" and
     // "storage's page boundary" always agree now.
-    let restrict_wings: Option<Vec<String>> = match auth.0.visible_wings(Operation::CoordinationRead)
-    {
-        WingVisibility::All => None,
-        WingVisibility::Only(wings) => Some(wings.into_iter().collect()),
-    };
-    let visibility = match &restrict_wings {
-        None => CoordinationVisibility::Federated(None),
-        Some(wings) => CoordinationVisibility::Federated(Some(wings.as_slice())),
-    };
+    let scope = CoordinationReadScope::resolve(&auth.0);
     let page = state
         .coordination
-        .inbox(&params.recipient, cursor, None, limit, params.unacknowledged_only, visibility)
+        .inbox(
+            &params.recipient,
+            cursor,
+            None,
+            limit,
+            params.unacknowledged_only,
+            scope.visibility(),
+        )
         .map_err(coordination_storage_error)?;
     let messages = page.messages.into_iter().map(message_to_dto).collect::<Result<Vec<_>, _>>()?;
     let next_cursor = page.next_cursor.map(encode_coordination_cursor);
@@ -3423,22 +3454,14 @@ where
     // explicit `?wing=` naming an invisible or diary wing still yields an
     // empty page here, not a 403 or an error: it intersects with an empty (or
     // excluded) set and the query simply returns nothing.
-    let restrict_wings: Option<Vec<String>> = match auth.0.visible_wings(Operation::CoordinationRead)
-    {
-        WingVisibility::All => None,
-        WingVisibility::Only(wings) => Some(wings.into_iter().collect()),
-    };
-    let visibility = match &restrict_wings {
-        None => CoordinationVisibility::Federated(None),
-        Some(wings) => CoordinationVisibility::Federated(Some(wings.as_slice())),
-    };
+    let scope = CoordinationReadScope::resolve(&auth.0);
 
     let page = state.coordination.events(
         cursor,
         params.task_id.as_deref(),
         wing.as_ref().map(WingId::as_str),
         limit,
-        visibility,
+        scope.visibility(),
     )?;
     let next_cursor = page.next_cursor.map(encode_coordination_cursor);
     let events = page.events.into_iter().map(event_to_dto).collect::<Result<Vec<_>, _>>()?;

@@ -921,30 +921,36 @@ entry). A palace that federates drawers only, with an empty `federation.coordina
 `default_mode: local`, never sends a coordination ID lookup to any remote — a configured remote
 alone is not enough.
 
-**Reads and writes part ways on which per-candidate errors mean "not this palace" versus a hard
-failure.** For a **read** (`mempalace_task_get`, `mempalace_message_get`,
-`mempalace_artifact_get`, `mempalace_result_get`), only a `404`-shaped rejection and a
-genuinely-degradable `Unreachable` remote are skipped in favour of the next candidate — the
+**Reads and writes agree that a `404` and a missing `coordination` capability both mean "not
+this palace, try the next candidate"; they part ways on everything else.** Both a `404`-shaped
+rejection and `RemoteError::CapabilityMissing` are a *definitive* answer of absence — "no such
+record" and "I don't implement coordination at all", respectively, the latter read live from
+the candidate's own `/v1/info`, independent of how `federation.coordination` describes it, so a
+candidate remote can still turn out not to run coordination at all. Neither is a sign the
+configured remote is broken, so both fallbacks skip past them to the next candidate. For a
+**read** (`mempalace_task_get`, `mempalace_message_get`, `mempalace_artifact_get`,
+`mempalace_result_get`), a genuinely-degradable `Unreachable` remote is *also* skipped — the
 federation-wide "reads degrade" rule, so one down remote never blocks discovery through the
-others. Every other error from a candidate — wrong credentials, an incompatible API version, a
-missing `coordination` capability, or an undecodable response — means that *configured* remote
-is broken, not merely silent about this one record, and is raised as a tool error instead of
-being folded into `{"found": false}`; a caller must be able to tell "this record genuinely does
-not exist anywhere" apart from "your token is wrong" or "this remote can't do coordination at
-all". For a **write** (`mempalace_task_claim`/`_renew`/`_transition`, `mempalace_message_send`,
-`mempalace_message_acknowledge`, `mempalace_artifact_put`, `mempalace_result_put`), a `404` and a
-missing `coordination` capability both mean "not this palace, try the next candidate" — the
-capability list is read live from the candidate's own `/v1/info`, independent of how
-`federation.coordination` describes it, so a candidate remote can still turn out not to run
-coordination at all. Every other error, including an unreachable remote, is terminal for a
-write: unlike a read, a write cannot afford to guess past a candidate it could not get a
-definitive answer from, since guessing wrong could create a second, divergent record for the
-same task on the wrong palace. A read that finds the record on a remote annotates the response
-with `origin: "remote:<name>"`; a write that lands on a remote reports `applied_to:
-"remote:<name>"`. `mempalace_task_claim`/`_renew`/`_transition`'s successful remote response
-nests the task under `"task"`, exactly like the local shape documented below — `{"success":
-true, "task": {...}, "applied_to": "remote:<name>"}` — so a caller never has to special-case
-which palace served the write.
+others — but every remaining error from a candidate — wrong credentials or an incompatible API
+version — means that *configured* remote is broken in a way that cannot be read as "absent",
+and is raised as a tool error instead of being folded into `{"found": false}`; a caller must be
+able to tell "this record genuinely does not exist anywhere" apart from "your token is wrong"
+or "this remote is on an incompatible protocol version" — cases where the record might still
+exist and reporting absence would be a lie. For a **write**
+(`mempalace_task_claim`/`_renew`/`_transition`, `mempalace_message_send`,
+`mempalace_message_acknowledge`, `mempalace_artifact_put`, `mempalace_result_put`), every error
+other than `404`/`CapabilityMissing`, including an unreachable remote, is terminal: unlike a
+read, a write cannot afford to guess past a candidate it could not get a definitive answer from,
+since guessing wrong could create a second, divergent record for the same task on the wrong
+palace. (An earlier revision of this fallback pair put `CapabilityMissing` in the read side's
+terminal set instead of its skippable one, contradicting the write side and hard-erroring every
+coordination read against a remote that simply predates coordination support; see deviation 21
+in [Coordination-Phase-3-Design.md](Coordination-Phase-3-Design.md).) A read that finds the
+record on a remote annotates the response with `origin: "remote:<name>"`; a write that lands on
+a remote reports `applied_to: "remote:<name>"`. `mempalace_task_claim`/`_renew`/`_transition`'s
+successful remote response nests the task under `"task"`, exactly like the local shape
+documented below — `{"success": true, "task": {...}, "applied_to": "remote:<name>"}` — so a
+caller never has to special-case which palace served the write.
 
 **The ID-discovery read fallback probes candidates sequentially, one at a time, stopping at the
 first success — this is deliberate, not an oversight left over from before the fan-outs went

@@ -1,6 +1,6 @@
 # Native local coordination
 
-MemPalace stores durable coordination state in the palace's local `storage.sqlite3`. It provides persistence and concurrency control; the host agent runtime still owns worker spawning, scheduling, tool execution, and live budget enforcement. Coordination is local-only and is not federated.
+MemPalace stores durable coordination state in the palace's local `storage.sqlite3`. It provides persistence and concurrency control; the host agent runtime still owns worker spawning, scheduling, tool execution, and live budget enforcement. Federation is opt-in and, as of issue #102 Stage 3, server-side only: `mempalace-server` exposes tasks, messages, artifacts, results, and audit events over `/v1/coordination/*` to a caller holding the right scoped token, under the same wing-scoped authorization as the rest of the federation REST surface. The MCP tools documented on this page, and the CLI, still read and write the local palace exclusively — nothing here routes a call to a remote palace yet. That routing (`RemoteApi`, `FederationRouter`, MCP dispatch) is a later stage. See [Federation → Part 7, Federated coordination](Federation.md#part-7--federated-coordination) for the wire behaviour that exists today.
 
 ## Data and guarantees
 
@@ -14,6 +14,7 @@ MemPalace stores durable coordination state in the palace's local `storage.sqlit
 - Every task belongs to a wing, normalised the same way project wings are normalised everywhere else in the palace, so `myproject` and `wing_myproject` resolve to the same wing. Messages, artifacts, and results carry no wing column of their own and reach it through their mandatory task reference; audit events do carry their own `wing` column, always the owning task's wing materialised inside the same transaction as the mutation, never a value supplied by a caller.
 - `wing_unscoped` is a reserved wing name meaning "created before wings existed." The operational schema upgrades itself in place the first time a palace opens under this code — existing tasks, messages, artifacts, results, and events are untouched and read back with that wing, with no separate migration step or data export/import. Task creation rejects `wing_unscoped` (and its unprefixed spelling `unscoped`, which normalises to it) — the reserved name identifies migrated rows, and a new task cannot be created there.
 - `mempalace_coordination_events` and `mempalace_inbox_read` accept an optional wing filter, normalised the same way as task creation, so a filter of `myproject` matches records stored under `wing_myproject`. Omitting the filter is unscoped and spans every wing, matching how visibility already worked before wings existed.
+- `wing_agents` — the shared agent diary wing — never federates, regardless of token scope. A remote `POST /v1/coordination/tasks` targeting it fails with 422; every other coordination route, and the inbox and event feeds, treat `wing_agents` state as though it does not exist. This is the same diary hard-override applied everywhere else in the palace; see [Federation → Part 7, Federated coordination](Federation.md#part-7--federated-coordination).
 
 Delivery is at least once with idempotent writes. MemPalace does not promise exactly-once task execution.
 
@@ -34,6 +35,8 @@ The native local tool surface is:
 - `mempalace_coordination_event_get`, `mempalace_coordination_events` (takes an optional `wing` filter)
 
 Treat returned cursors as opaque and persist them with worker state. After restart, retrieve known task, message, result, and artifact IDs directly, then continue the inbox or event stream from the stored cursor.
+
+This tool surface always operates on the local palace. For the server-side REST equivalent — used by a remote federation peer, not by these MCP tools — see [Federation → Part 7, Federated coordination](Federation.md#part-7--federated-coordination).
 
 ## Recovery and maintenance
 

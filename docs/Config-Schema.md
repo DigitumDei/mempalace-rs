@@ -342,7 +342,13 @@ token entries, not a field of `config.json`. Its shape (`token`/`name`/
 - Each element of the array is a token entry:
   - `token` — string, the bearer secret a client must present.
   - `name` — string, the identity recorded as `added_by` / `ChangeEvent.actor`
-    on writes from that token.
+    on writes from that token. Must not contain `:`; a colon is reserved for
+    the `{identity}:{claimed}` encoding coordination and drawer routes build
+    when a request claims an actor name that disagrees with the token's own
+    identity (see [Federation → 1.5 Authorization
+    scopes](Federation.md#15-authorization-scopes)) — a name containing `:`
+    would let two distinct tokens collide on the same encoded principal, so
+    the token file fails to load if one does.
   - `enabled` — boolean; `false` treats the entry as if it did not exist
     (instant revoke). The file is hot-reloaded on mtime change.
   - `scopes` — optional array of `{ "wings": [...], "operations": [...] }`
@@ -378,9 +384,14 @@ token entries, not a field of `config.json`. Its shape (`token`/`name`/
         See [Federation → 1.5 Authorization scopes](Federation.md#15-authorization-scopes)
         for the full precedence rule and worked examples.
     - `operations` is a closed enum: `read`, `write`, `delete`, `ingest`,
-      `coordination_read`, `coordination_write`, `coordination_claim`. The
-      three `coordination_*` operations have no routes yet — they exist so
-      this file format does not change again when Stage 3 adds them.
+      `coordination_read`, `coordination_write`, `coordination_claim`. As of
+      issue #102 Stage 3 the three `coordination_*` operations gate the
+      `/v1/coordination/*` routes — see
+      [Federation → Part 7, Federated coordination](Federation.md#part-7--federated-coordination).
+      `coordination_claim` is separate from `coordination_write` on purpose:
+      claiming, renewing, and transitioning a task takes a lease and can
+      starve other workers, while creating a task or filing an artifact
+      cannot, so a token can hold one without the other.
     - Validation: an `operations` string outside that enum, or a malformed
       `wings` entry, fails the token file load — same fail-closed behaviour
       as any other malformed reload (see `TokenRegistry` in
@@ -511,8 +522,8 @@ Config load fails with a precise error message for:
   non-loopback host
 - `remote` field missing or ambiguous when `mode` is `remote` or `combined` and multiple remotes are configured
 - (`server.token_file`, not a `federation.*` field, but the same fail-closed loading behaviour)
-  an `operations` entry in a token's `scopes` outside the closed enum — see
-  [Server Config → `server.token_file`](#servertoken_file)
+  an `operations` entry in a token's `scopes` outside the closed enum, or a token `name`
+  containing `:` — see [Server Config → `server.token_file`](#servertoken_file)
 
 Config load succeeds with a warning (does not fail) for:
 - `token_env` set but the named environment variable is absent at startup

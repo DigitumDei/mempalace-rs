@@ -42,20 +42,28 @@ use mempalace_core::{
 };
 use mempalace_embeddings::{EmbeddingProvider, EmbeddingRequest};
 use mempalace_federation::{
-    AddDrawerRequest, AddDrawerResponse, ChangeEventDto, ChangesQuery, ChangesResponse,
-    CheckDuplicateRequest, CheckDuplicateResponse, DrawerSearchRequest, DrawerSearchResponse,
-    ErrorBody, FEDERATION_API_VERSION, InfoResponse, IngestBatchRequest, IngestBatchResponse,
-    IngestFileResult, KgAddFactRequest, KgInvalidateRequest, KgQueryRequest, ListDrawersQuery,
-    ListDrawersResponse, MaintenanceAbortReason as FedMaintenanceAbortReason,
+    AckMessageRequest, AddDrawerRequest, AddDrawerResponse, ChangeEventDto, ChangesQuery,
+    ChangesResponse, CheckDuplicateRequest, CheckDuplicateResponse, CoordinationArtifactDto,
+    CoordinationEventDto, CoordinationEventsQuery, CoordinationEventsResponse,
+    CoordinationMessageDto, CoordinationTaskDto, CoordinationTaskResultDto, CoordinationTaskState,
+    DrawerSearchRequest, DrawerSearchResponse, ErrorBody, FEDERATION_API_VERSION, InboxPageResponse,
+    InboxQuery, InfoResponse, IngestBatchRequest, IngestBatchResponse, IngestFileResult,
+    KgAddFactRequest, KgInvalidateRequest, KgQueryRequest, ListDrawersQuery, ListDrawersResponse,
+    MaintenanceAbortReason as FedMaintenanceAbortReason,
     MaintenanceRunStatus as FedMaintenanceRunStatus,
-    MaintenanceSkipReason as FedMaintenanceSkipReason, MaintenanceStatus, RemoteDrawerResult,
+    MaintenanceSkipReason as FedMaintenanceSkipReason, MaintenanceStatus, NewArtifactRequest,
+    NewMessageRequest, NewTaskRequest, NewTaskResultRequest, RemoteDrawerResult, TaskLeaseRequest,
+    TransitionTaskRequest,
 };
 use mempalace_graph::{AddFactRequest, EntityKind, KnowledgeGraphRuntime, QueryDirection};
 use mempalace_search::{SearchRuntime, SearchRuntimePolicy};
 use mempalace_storage::{
-    ChangeCursor, ChangeEvent, ChangeLogStore, DrawerFilter, DrawerStore, DuplicateStrategy,
-    IngestCommitRequest, IngestManifestStore, MaintenanceAbortReason, MaintenanceOutcome,
-    MaintenanceRunSummary, MaintenanceSettings, MaintenanceSkipReason, StorageEngine,
+    Artifact as CoordinationArtifact, ChangeCursor, ChangeEvent, ChangeLogStore,
+    CoordinationCursor, CoordinationEvent, CoordinationStore, DrawerFilter, DrawerStore,
+    DuplicateStrategy, IngestCommitRequest, IngestManifestStore, MaintenanceAbortReason,
+    MaintenanceOutcome, MaintenanceRunSummary, MaintenanceSettings, MaintenanceSkipReason,
+    Message as CoordinationMessage, NewArtifact, NewMessage, NewTask, NewTaskResult, StorageEngine,
+    Task as CoordinationTask, TaskResult as CoordinationTaskResult, TaskState,
 };
 use serde_json::{Value, json};
 use subtle::ConstantTimeEq;
@@ -88,6 +96,12 @@ const MAX_KG_FIELD_BYTES: usize = 4096;
 const DEFAULT_KG_TIMELINE_LIMIT: usize = 100;
 /// Maximum timeline rows clients may request.
 const MAX_KG_TIMELINE_LIMIT: usize = 200;
+/// Maximum `lease_seconds` accepted by a coordination claim/renew request — a generous 100
+/// years. `mempalace-storage`'s `claim_task`/`renew_lease` reject a TTL that would overflow
+/// `OffsetDateTime` arithmetic (see `LEASE_DURATION_OUT_OF_RANGE`) regardless of this bound, but
+/// this route-level check turns an obviously-nonsensical value into a clean 400 before a request
+/// ever reaches storage, rather than relying on that lower-level guard alone.
+const MAX_LEASE_SECONDS: i64 = 100 * 365 * 24 * 60 * 60;
 
 // ─── Errors ──────────────────────────────────────────────────────────────────
 
@@ -114,6 +128,33 @@ pub enum ServerError {
     /// Attempted to add a drawer that is a near-duplicate of an existing one.
     #[error("duplicate detected")]
     Duplicate(Value),
+    /// A coordination write was rejected because of the record's current
+    /// revision or state — a concurrent writer moved it, another worker holds
+    /// a live lease, the task is terminal, or the caller does not own the
+    /// task/lease/message it is trying to act on. `code` distinguishes the
+    /// two shapes on the wire: `"revision_conflict"` carries both revisions
+    /// (reload and retry with the current one); `"coordination_conflict"`
+    /// carries neither and means the write is not permitted regardless of
+    /// revision (e.g. another worker's lease has not expired). See
+    /// `coordination_storage_error`, which is the sole place this is
+    /// constructed — `mempalace-storage`'s coordination writes are not yet
+    /// reconciled onto the `RevisionedWrite<T>` shape `skills.rs`/
+    /// `delegation.rs` use (tracked as Phase 3 Stage 4), so this classifies
+    /// by matching the `pub const` message fragments `coordination.rs`
+    /// exports for exactly this purpose, not by inline string literals.
+    #[error("{message}")]
+    CoordinationConflict {
+        /// `"revision_conflict"` or `"coordination_conflict"`.
+        code: &'static str,
+        /// Human-readable detail, taken from the underlying storage error.
+        message: String,
+        /// The revision the caller expected, present only for `code ==
+        /// "revision_conflict"`.
+        expected_revision: Option<i64>,
+        /// The record's actual current revision, present only for `code ==
+        /// "revision_conflict"`.
+        actual_revision: Option<i64>,
+    },
     /// Propagated storage error.
     #[error(transparent)]
     Storage(#[from] mempalace_storage::StorageError),
@@ -189,6 +230,9 @@ impl IntoResponse for ServerError {
                 "near-duplicate content detected; add check_duplicate first if intentional"
                     .to_owned(),
             ),
+            Self::CoordinationConflict { code, message, .. } => {
+                (StatusCode::CONFLICT, *code, message.clone())
+            }
             Self::Storage(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "storage_error",
@@ -234,6 +278,16 @@ impl IntoResponse for ServerError {
                 "code": code,
                 "message": message,
                 "matches": matches,
+            })
+        } else if let Self::CoordinationConflict { expected_revision, actual_revision, .. } = &self
+        {
+            // 409 body includes the revisions (when known) so a client can decide whether to
+            // reload and retry, instead of parsing `message`.
+            json!({
+                "code": code,
+                "message": message,
+                "expected_revision": expected_revision,
+                "actual_revision": actual_revision,
             })
         } else {
             json!(ErrorBody { code: code.to_owned(), message })
@@ -458,6 +512,23 @@ impl TokenRegistry {
                     "token entry name must not be empty".to_owned(),
                 ));
             }
+            // A colon in a token's configured `name` is ambiguous with the
+            // `{identity}:{claimed}` encoding `resolve_coordination_actor`
+            // builds for a claimed actor that disagrees with the
+            // authenticated identity (see `route_drawers_add`'s identical
+            // rule). A token named `ci` claiming actor `worker` would
+            // otherwise produce the same principal string, `ci:worker`, as a
+            // distinct token whose configured name literally is
+            // `ci:worker` — and coordination uses that exact string as a
+            // lease-ownership and transition-authorization identity, not
+            // just provenance. Reject at load time, matching how the
+            // registry already fails closed on other malformed entries.
+            if entry.name.contains(':') {
+                return Err(ServerError::TokenFile(format!(
+                    "token entry name `{}` must not contain `:`",
+                    entry.name
+                )));
+            }
             if entry.enabled && entry.token.trim().is_empty() {
                 return Err(ServerError::TokenFile(format!(
                     "enabled token `{}` must not be empty",
@@ -659,6 +730,12 @@ pub struct ServerState<P> {
     pub config: MempalaceConfig,
     /// Storage engine (drawer store + operational store).
     pub storage: StorageEngine,
+    /// Coordination store (tasks, messages, artifacts, results, audit events).
+    /// Opens the same `storage.sqlite3` file as `storage`'s operational store,
+    /// via its own connection — the same construction `McpRuntime::new` uses
+    /// in `mempalace-mcp`. Coordination routes are server-only as of issue
+    /// #102 Stage 3; see docs/Coordination.md.
+    pub coordination: CoordinationStore,
     /// Search runtime. Wrapped in a `Mutex` because `SearchRuntime::search`
     /// takes `&mut self`.
     pub search: Mutex<SearchRuntime<P>>,
@@ -704,6 +781,8 @@ where
     P: EmbeddingProvider + Send + Sync + 'static,
 {
     let storage = StorageEngine::open(&config.palace_path, config.embedding_profile).await?;
+    let coordination = CoordinationStore::new(config.palace_path.join("storage.sqlite3"));
+    coordination.ensure_schema()?;
     let search = SearchRuntime::with_policy(
         provider,
         SearchRuntimePolicy { rerank_enabled: config.low_cpu.effective_rerank_enabled() },
@@ -728,6 +807,7 @@ where
     let state = Arc::new(ServerState {
         config,
         storage,
+        coordination,
         search: Mutex::new(search),
         tokens: Arc::new(tokens),
         last_maintenance_status: std::sync::Mutex::new(None),
@@ -880,6 +960,76 @@ where
         .route("/v1/wings", get(route_wings::<P>).layer(middleware::from_fn(require_read)))
         .route("/v1/rooms", get(route_rooms::<P>).layer(middleware::from_fn(require_read)))
         .route("/v1/changes", get(route_changes::<P>).layer(middleware::from_fn(require_read)))
+        .route(
+            "/v1/coordination/tasks",
+            post(route_coordination_task_create::<P>)
+                .layer(middleware::from_fn(require_coordination_write)),
+        )
+        .route(
+            "/v1/coordination/tasks/{id}",
+            get(route_coordination_task_get::<P>)
+                .layer(middleware::from_fn(require_coordination_read)),
+        )
+        .route(
+            "/v1/coordination/tasks/{id}/claim",
+            post(route_coordination_task_claim::<P>)
+                .layer(middleware::from_fn(require_coordination_claim)),
+        )
+        .route(
+            "/v1/coordination/tasks/{id}/renew",
+            post(route_coordination_task_renew::<P>)
+                .layer(middleware::from_fn(require_coordination_claim)),
+        )
+        .route(
+            "/v1/coordination/tasks/{id}/transition",
+            post(route_coordination_task_transition::<P>)
+                .layer(middleware::from_fn(require_coordination_claim)),
+        )
+        .route(
+            "/v1/coordination/messages",
+            post(route_coordination_message_send::<P>)
+                .layer(middleware::from_fn(require_coordination_write)),
+        )
+        .route(
+            "/v1/coordination/messages/{id}",
+            get(route_coordination_message_get::<P>)
+                .layer(middleware::from_fn(require_coordination_read)),
+        )
+        .route(
+            "/v1/coordination/messages/{id}/ack",
+            post(route_coordination_message_ack::<P>)
+                .layer(middleware::from_fn(require_coordination_write)),
+        )
+        .route(
+            "/v1/coordination/inbox",
+            get(route_coordination_inbox::<P>)
+                .layer(middleware::from_fn(require_coordination_read)),
+        )
+        .route(
+            "/v1/coordination/artifacts",
+            post(route_coordination_artifact_put::<P>)
+                .layer(middleware::from_fn(require_coordination_write)),
+        )
+        .route(
+            "/v1/coordination/artifacts/{id}",
+            get(route_coordination_artifact_get::<P>)
+                .layer(middleware::from_fn(require_coordination_read)),
+        )
+        .route(
+            "/v1/coordination/results",
+            post(route_coordination_result_put::<P>)
+                .layer(middleware::from_fn(require_coordination_write)),
+        )
+        .route(
+            "/v1/coordination/results/{id}",
+            get(route_coordination_result_get::<P>)
+                .layer(middleware::from_fn(require_coordination_read)),
+        )
+        .route(
+            "/v1/coordination/events",
+            get(route_coordination_events::<P>)
+                .layer(middleware::from_fn(require_coordination_read)),
+        )
         .layer(middleware::from_fn_with_state(Arc::clone(&state), auth_middleware::<P>));
 
     let router = public.merge(protected).merge(ingest_route).with_state(Arc::clone(&state));
@@ -948,6 +1098,18 @@ async fn require_delete(request: Request<Body>, next: Next) -> Response {
 
 async fn require_ingest(request: Request<Body>, next: Next) -> Response {
     operation_gate(Operation::Ingest, request, next).await
+}
+
+async fn require_coordination_read(request: Request<Body>, next: Next) -> Response {
+    operation_gate(Operation::CoordinationRead, request, next).await
+}
+
+async fn require_coordination_write(request: Request<Body>, next: Next) -> Response {
+    operation_gate(Operation::CoordinationWrite, request, next).await
+}
+
+async fn require_coordination_claim(request: Request<Body>, next: Next) -> Response {
+    operation_gate(Operation::CoordinationClaim, request, next).await
 }
 
 /// Shared implementation for the per-route operation gates above. A missing
@@ -1065,6 +1227,7 @@ where
             "changes".to_owned(),
             "taxonomy".to_owned(),
             "ingest".to_owned(),
+            "coordination".to_owned(),
         ],
         maintenance_enabled: state.config.maintenance.enabled,
         maintenance_background_enabled: state.config.maintenance.background_enabled,
@@ -2330,6 +2493,904 @@ where
     Ok(Json(IngestBatchResponse { files: file_results, warnings }))
 }
 
+// ─── Coordination (issue #102 Stage 3) ─────────────────────────────────────────
+//
+// Server-side only: exposes the local `CoordinationStore` (tasks, messages,
+// artifacts, results, audit events) over the existing federation HTTP surface
+// and its scoped-token authorization layer. The client side (`RemoteApi`,
+// `FederationRouter`, MCP routing) is Stage 4 — see
+// docs/Coordination-Phase-3-Design.md.
+//
+// Wing authorization. A task's wing is the authorization key for every
+// coordination route. Task creation gets its wing from the request body
+// (Group A: enforced outright, 403 on mismatch — mirrors `route_drawers_add`).
+// Every other route resolves the wing from the target record before
+// authorizing: a message, artifact, or result reaches its wing through its
+// `task_id`; claim/renew/transition act on the task directly. A caller who
+// lacks access to that wing gets 404, not 403 (Group B — mirrors
+// `route_drawers_get`), so the response can never be used as an existence
+// oracle for a wing the caller cannot see; see `resolve_owning_task`. The
+// event feed is an aggregate (Group C): it filters to visible wings rather
+// than rejecting, exactly like `route_changes`/`route_rooms`, and — because
+// `coordination_events.wing` is a mandatory column, always populated even for
+// pre-Phase-3 rows (`UNSCOPED_WING`) — every event has a determinable wing, so
+// "fail closed" here reduces to the ordinary `WingVisibility::contains` check
+// with no separate wingless-event allowlist needed (contrast
+// `change_event_visible`, which does need one for the generic changes feed).
+// The inbox feed is treated the same way by extension, since it is equally
+// cross-task/cross-wing in shape, even though the design note calls out only
+// the event feed by name.
+//
+// Actor identity. Storage accepts a caller-supplied actor string, which is
+// fine locally where the host runtime asserts it. Over HTTP the authenticated
+// token identity is authoritative: every actor-shaped field on a coordination
+// write DTO (`created_by`, `sender`, `worker`, `actor`) is the caller's
+// *claimed* name, and `resolve_coordination_actor` applies the same
+// `{identity}:{claimed}` prefixing rule `route_drawers_add` uses for
+// `added_by`. `recipient` on a message is not an actor field — it addresses a
+// message to someone and does not itself assert who the caller is — so it is
+// taken verbatim, matching local behaviour.
+//
+// Lease clocks. Expiry is evaluated entirely inside `CoordinationStore` using
+// `OffsetDateTime::now_utc()` — this palace's own clock. No route here
+// accepts or forwards a caller-supplied timestamp for a lease or expiry
+// decision.
+
+/// Resolves the task owning a coordination sub-resource and authorizes `op`
+/// against its wing. On either a missing task or an invisible wing, returns
+/// 404 built from `resource_label` (e.g. `"message {id}"`, not `"task
+/// {task_id}"`), so the response can never distinguish "truly missing" from
+/// "wing not visible" — see the module-level "Wing authorization" note. Used
+/// both when `task_id` names the resource being requested directly (task
+/// routes) and when it names the *owning* task of a message/artifact/result.
+fn resolve_owning_task(
+    coordination: &CoordinationStore,
+    auth: &AuthIdentity,
+    task_id: &str,
+    op: Operation,
+    resource_label: &str,
+) -> Result<CoordinationTask, ServerError> {
+    let mask = || ServerError::NotFound(format!("{resource_label} not found"));
+    let task = coordination.get_task(task_id)?.ok_or_else(mask)?;
+    // The diary hard-override applies unconditionally, exactly as it does for
+    // drawer routes: `wing_agents` coordination stays local no matter what
+    // the token is scoped to. A read is masked as 404 — indistinguishable
+    // from "does not exist", matching every other invisible-wing case this
+    // function handles. A write gets the explicit `DiaryNotFederated` 422
+    // `route_drawers_add` already uses for the same content rule; a write is
+    // not an existence-oracle risk the way a differently-coded read would be,
+    // so there is no reason to mask it instead.
+    if is_diary_wing_or_room(&task.wing, "") {
+        return Err(if op == Operation::CoordinationRead { mask() } else { ServerError::DiaryNotFederated });
+    }
+    if !auth.allows_wing(op, &task.wing) {
+        return Err(mask());
+    }
+    Ok(task)
+}
+
+/// Fixed, generic conflict body for an idempotent coordination write whose
+/// *replayed* record fails re-authorization — see [`authorize_replay_wing`].
+/// Deliberately names neither the wing nor any record content: the message
+/// text is the entire disclosure surface here, so it must stay identical
+/// regardless of what actually went wrong.
+fn coordination_replay_conflict() -> ServerError {
+    ServerError::CoordinationConflict {
+        code: "idempotency_key_conflict",
+        message: "idempotency key is already associated with a record this token cannot access"
+            .to_owned(),
+        expected_revision: None,
+        actual_revision: None,
+    }
+}
+
+/// Re-authorizes the *returned* record of an idempotent coordination write
+/// (task create, message send, artifact put, result put) against its actual
+/// owning `wing`.
+///
+/// Storage's `find_*_by_key` replay lookup is keyed on `(actor,
+/// idempotency_key)` alone — it ignores whatever task/wing the replay
+/// request named. So the record handed back can belong to a wing the caller
+/// cannot access even though the pre-write check on the *requested* task
+/// passed. This call closes that gap by checking the wing storage actually
+/// used, after the fact.
+///
+/// An unauthorized wing here is reported as a 409 conflict via
+/// [`coordination_replay_conflict`], never a 404: the idempotency key is
+/// scoped to the caller's own identity, so acknowledging that the key
+/// already exists discloses nothing about another tenant — but the record's
+/// wing and content must not be disclosed, so the message stays fixed and
+/// generic. This is not a 404 because, unlike a masked read, a create
+/// request that reaches this point genuinely conflicts with prior state; see
+/// the module-level "Wing authorization" note for why reads and writes are
+/// coded differently.
+fn authorize_replay_wing(auth: &AuthIdentity, wing: &str) -> Result<(), ServerError> {
+    if is_diary_wing_or_room(wing, "") || !auth.allows_wing(Operation::CoordinationWrite, wing) {
+        return Err(coordination_replay_conflict());
+    }
+    Ok(())
+}
+
+/// Looks up the wing of the task owning a just-written message, artifact, or
+/// result, for [`authorize_replay_wing`]. Messages, artifacts, and results
+/// carry no `wing` column of their own — see docs/Coordination.md — so this
+/// re-resolves it from their mandatory `task_id`. The owning task is
+/// guaranteed to exist by the foreign key `coordination.rs`'s schema
+/// declares; a missing task here would mean that invariant broke, which
+/// surfaces as an ordinary 500 rather than being silently swallowed.
+fn owning_task_wing(coordination: &CoordinationStore, task_id: &str) -> Result<String, ServerError> {
+    Ok(coordination
+        .get_task(task_id)?
+        .ok_or_else(|| {
+            ServerError::Storage(mempalace_storage::StorageError::Invariant(format!(
+                "task `{task_id}` not found"
+            )))
+        })?
+        .wing)
+}
+
+/// Resolves the actor to record for a coordination write. `claimed` is the
+/// value the caller supplied for `created_by`/`sender`/`worker`/`actor` on the
+/// wire; `identity` is the authenticated token name. See the module-level
+/// "Actor identity" note and `route_drawers_add`'s identical `added_by` rule.
+///
+/// Rejects a `claimed` value containing `:` with 400: the `{identity}:{claim}`
+/// encoding below is unambiguous only when neither half can itself contain
+/// the delimiter. `identity` never needs the same check — `TokenRegistry`
+/// already rejects a `:` in a token's configured `name` at load time, so it
+/// cannot arrive here.
+fn resolve_coordination_actor(
+    identity: &str,
+    claimed: &Option<String>,
+) -> Result<String, ServerError> {
+    match claimed {
+        Some(claim) if claim != identity => {
+            if claim.contains(':') {
+                return Err(ServerError::InvalidParams(
+                    "claimed actor must not contain `:`".to_owned(),
+                ));
+            }
+            Ok(format!("{identity}:{claim}"))
+        }
+        _ => Ok(identity.to_owned()),
+    }
+}
+
+/// Rejects an obviously out-of-range `lease_seconds` with a clean 400 before
+/// the request ever reaches storage. `mempalace-storage`'s `claim_task` and
+/// `renew_lease` already reject a TTL that would overflow `OffsetDateTime`
+/// arithmetic (`LEASE_DURATION_OUT_OF_RANGE`), but that guard alone still
+/// requires storage to compute the failing addition; this route-level bound
+/// rejects the request outright instead of depending on that lower layer.
+fn validate_lease_seconds(seconds: i64) -> Result<(), ServerError> {
+    if seconds <= 0 || seconds > MAX_LEASE_SECONDS {
+        return Err(ServerError::InvalidParams(format!(
+            "lease_seconds must be in 1..={MAX_LEASE_SECONDS}"
+        )));
+    }
+    Ok(())
+}
+
+/// Classifies a `StorageError` from a coordination-store write into the right
+/// HTTP shape. `mempalace-storage`'s coordination writes are not yet
+/// reconciled onto the `RevisionedWrite<T>` shape `skills.rs`/`delegation.rs`
+/// use (tracked as Phase 3 Stage 4 — see
+/// docs/Coordination-Phase-3-Design.md) — every rejection `coordination.rs`
+/// can produce surfaces as a single `StorageError::Invariant(String)`, so this
+/// necessarily classifies by matching on that message text. That coupling is
+/// compile-enforced, not textual: every fragment matched below is a `pub
+/// const` re-exported from `mempalace_storage::coordination`, which builds
+/// its own error text from the same constant (see that module's doc comment
+/// on them, and `error_messages_start_with_their_constants` in its test
+/// module). Renaming or removing one of those constants is a compile error
+/// here; rewording the text it holds moves both sides together, because the
+/// text exists in exactly one place. Every branch below corresponds to one
+/// specific message shape coordination.rs actually emits; an `Invariant`
+/// this function does not recognise, or any non-`Invariant` error, falls
+/// through to the ordinary `ServerError::Storage` 500 mapping.
+fn coordination_storage_error(err: mempalace_storage::StorageError) -> ServerError {
+    use mempalace_storage::{
+        INVALID_TRANSITION_PREFIX, LEASE_HAS_EXPIRED, LEASE_HELD_BY_ANOTHER_WORKER,
+        ONLY_LEASE_OWNER_MAY_RENEW, ONLY_OWNER_MAY_TRANSITION, ONLY_RECIPIENT_MAY_ACKNOWLEDGE,
+        STALE_REVISION_PREFIX, STALE_REVISION_SEPARATOR, TASK_HAS_EXPIRED,
+        TERMINAL_TASK_CANNOT_BE_CLAIMED,
+    };
+
+    let mempalace_storage::StorageError::Invariant(msg) = &err else {
+        return ServerError::Storage(err);
+    };
+    if let Some(rest) = msg.strip_prefix(STALE_REVISION_PREFIX)
+        && let Some((expected_str, actual_str)) = rest.split_once(STALE_REVISION_SEPARATOR)
+        && let (Ok(expected), Ok(actual)) = (expected_str.parse::<i64>(), actual_str.parse::<i64>())
+    {
+        return ServerError::CoordinationConflict {
+            code: "revision_conflict",
+            message: msg.clone(),
+            expected_revision: Some(expected),
+            actual_revision: Some(actual),
+        };
+    }
+    // State/ownership/lease rules `coordination.rs` enforces once the
+    // requested revision itself matched — a real conflict with the record's
+    // current state, distinct from a stale revision, so it carries no
+    // revision pair on the wire.
+    const CONFLICT_PREFIXES: &[&str] = &[
+        LEASE_HELD_BY_ANOTHER_WORKER,
+        TERMINAL_TASK_CANNOT_BE_CLAIMED,
+        TASK_HAS_EXPIRED,
+        INVALID_TRANSITION_PREFIX,
+        ONLY_OWNER_MAY_TRANSITION,
+        ONLY_LEASE_OWNER_MAY_RENEW,
+        LEASE_HAS_EXPIRED,
+        ONLY_RECIPIENT_MAY_ACKNOWLEDGE,
+    ];
+    if CONFLICT_PREFIXES.iter().any(|prefix| msg.starts_with(prefix)) {
+        return ServerError::CoordinationConflict {
+            code: "coordination_conflict",
+            message: msg.clone(),
+            expected_revision: None,
+            actual_revision: None,
+        };
+    }
+    // Defensive: every route resolves its target task (and, for a
+    // message/artifact/result write, the owning task) before calling into
+    // storage, so `require_task`'s "not found" should never actually surface
+    // here — this only guards the residual race where the row disappears
+    // between that check and the write's own transaction.
+    if msg.contains("not found") {
+        return ServerError::NotFound(msg.clone());
+    }
+    // Everything else `coordination.rs` raises as `Invariant` is caller input
+    // validation: empty actor, out-of-range idempotency key, oversized
+    // title/description/payload/artifact content, or a non-positive lease
+    // ttl.
+    ServerError::InvalidParams(msg.clone())
+}
+
+/// Encodes a `CoordinationCursor` as an opaque wire string. Deliberately not
+/// the `"{rfc3339}|{rowid}"` shape `encode_cursor` uses for `/v1/changes` —
+/// the coordination feed has no `since` parameter, so a cursor here depends on
+/// no clock at all (see the coordination-DTO docs in `mempalace-federation`).
+/// Clients must treat this as opaque and pass it back verbatim.
+fn encode_coordination_cursor(cursor: CoordinationCursor) -> String {
+    cursor.0.to_string()
+}
+
+/// Decodes a cursor encoded by [`encode_coordination_cursor`].
+fn decode_coordination_cursor(s: &str) -> Result<CoordinationCursor, ServerError> {
+    s.trim()
+        .parse::<i64>()
+        .map(CoordinationCursor)
+        .map_err(|_| ServerError::InvalidParams(format!("invalid cursor `{s}`")))
+}
+
+/// Parses a full RFC 3339 timestamp (unlike `parse_date`, which only handles
+/// the date part).
+fn parse_rfc3339_datetime(s: &str) -> Result<OffsetDateTime, ServerError> {
+    OffsetDateTime::parse(s, &Rfc3339)
+        .map_err(|_| ServerError::InvalidParams(format!("invalid RFC 3339 timestamp `{s}`")))
+}
+
+fn wire_task_state(state: TaskState) -> CoordinationTaskState {
+    match state {
+        TaskState::Pending => CoordinationTaskState::Pending,
+        TaskState::Running => CoordinationTaskState::Running,
+        TaskState::InputRequired => CoordinationTaskState::InputRequired,
+        TaskState::Completed => CoordinationTaskState::Completed,
+        TaskState::Cancelled => CoordinationTaskState::Cancelled,
+        TaskState::Failed => CoordinationTaskState::Failed,
+        TaskState::Expired => CoordinationTaskState::Expired,
+    }
+}
+
+fn storage_task_state(state: CoordinationTaskState) -> TaskState {
+    match state {
+        CoordinationTaskState::Pending => TaskState::Pending,
+        CoordinationTaskState::Running => TaskState::Running,
+        CoordinationTaskState::InputRequired => TaskState::InputRequired,
+        CoordinationTaskState::Completed => TaskState::Completed,
+        CoordinationTaskState::Cancelled => TaskState::Cancelled,
+        CoordinationTaskState::Failed => TaskState::Failed,
+        CoordinationTaskState::Expired => TaskState::Expired,
+    }
+}
+
+fn task_to_dto(task: CoordinationTask) -> Result<CoordinationTaskDto, ServerError> {
+    Ok(CoordinationTaskDto {
+        task_id: task.task_id,
+        title: task.title,
+        description: task.description,
+        state: wire_task_state(task.state),
+        revision: task.revision,
+        created_by: task.created_by,
+        wing: task.wing,
+        owner: task.owner,
+        parent_id: task.parent_id,
+        dependencies: task.dependencies,
+        budget: task.budget,
+        lease_expires_at: task.lease_expires_at.map(format_rfc3339).transpose()?,
+        expires_at: task.expires_at.map(format_rfc3339).transpose()?,
+        created_at: format_rfc3339(task.created_at)?,
+        updated_at: format_rfc3339(task.updated_at)?,
+    })
+}
+
+fn message_to_dto(message: CoordinationMessage) -> Result<CoordinationMessageDto, ServerError> {
+    Ok(CoordinationMessageDto {
+        message_id: message.message_id,
+        sequence: message.sequence,
+        task_id: message.task_id,
+        sender: message.sender,
+        recipient: message.recipient,
+        kind: message.kind,
+        payload: message.payload,
+        envelope_version: message.envelope_version,
+        acknowledged_at: message.acknowledged_at.map(format_rfc3339).transpose()?,
+        acknowledged_by: message.acknowledged_by,
+        created_at: format_rfc3339(message.created_at)?,
+    })
+}
+
+fn artifact_to_dto(
+    artifact: CoordinationArtifact,
+) -> Result<CoordinationArtifactDto, ServerError> {
+    Ok(CoordinationArtifactDto {
+        artifact_id: artifact.artifact_id,
+        task_id: artifact.task_id,
+        created_by: artifact.created_by,
+        role: artifact.role,
+        media_type: artifact.media_type,
+        content: artifact.content,
+        content_hash: artifact.content_hash,
+        created_at: format_rfc3339(artifact.created_at)?,
+    })
+}
+
+fn result_to_dto(result: CoordinationTaskResult) -> Result<CoordinationTaskResultDto, ServerError> {
+    Ok(CoordinationTaskResultDto {
+        result_id: result.result_id,
+        task_id: result.task_id,
+        created_by: result.created_by,
+        payload: result.payload,
+        created_at: format_rfc3339(result.created_at)?,
+    })
+}
+
+fn event_to_dto(event: CoordinationEvent) -> Result<CoordinationEventDto, ServerError> {
+    Ok(CoordinationEventDto {
+        sequence: event.sequence,
+        event_id: event.event_id,
+        entity_type: event.entity_type,
+        entity_id: event.entity_id,
+        task_id: event.task_id,
+        wing: event.wing,
+        event_type: event.event_type,
+        actor: event.actor,
+        from_state: event.from_state.map(wire_task_state),
+        to_state: event.to_state.map(wire_task_state),
+        revision: event.revision,
+        details: event.details,
+        occurred_at: format_rfc3339(event.occurred_at)?,
+    })
+}
+
+// ─── Coordination: tasks ────────────────────────────────────────────────────
+
+async fn route_coordination_task_create<P>(
+    State(state): State<Arc<ServerState<P>>>,
+    auth: axum::extract::Extension<AuthIdentity>,
+    Json(body): Json<NewTaskRequest>,
+) -> Result<impl IntoResponse, ServerError>
+where
+    P: EmbeddingProvider + Send + Sync + 'static,
+{
+    // Group A: wing is required and body-derived, exactly like
+    // `route_drawers_add` — but normalised via `WingId::normalized` (not the
+    // strict `WingId::new` drawers use), because coordination wings support
+    // short forms by design (Stage 1: `myproject` and `wing_myproject` are
+    // the same wing) and `CoordinationStore::create_task` normalises the same
+    // way internally. Authorizing against the normalised form is what keeps
+    // this check and the actually-stored wing in agreement.
+    let wing = WingId::normalized(&body.wing)?;
+    // Reject diary-shaped writes before anything else, exactly like
+    // `route_drawers_add`'s content rule: `wing_agents` coordination stays
+    // local unconditionally, regardless of what the token is scoped to.
+    if is_diary_wing_or_room(wing.as_str(), "") {
+        return Err(ServerError::DiaryNotFederated);
+    }
+    if !auth.0.allows_wing(Operation::CoordinationWrite, wing.as_str()) {
+        return Err(ServerError::Forbidden);
+    }
+    // Authorize every referenced task *before* creation. Storage's own
+    // `require_task` on each dependency/parent would otherwise let a token
+    // that may only write `wing` probe for hidden ids in another wing: a
+    // real id succeeds, a nonexistent one 404s, and that difference is an
+    // existence oracle for wings this token cannot read. Masking an
+    // unauthorized reference exactly as a missing one closes it.
+    for dependency in &body.dependencies {
+        resolve_owning_task(
+            &state.coordination,
+            &auth.0,
+            dependency,
+            Operation::CoordinationRead,
+            &format!("task {dependency}"),
+        )?;
+    }
+    if let Some(parent) = &body.parent_id {
+        resolve_owning_task(
+            &state.coordination,
+            &auth.0,
+            parent,
+            Operation::CoordinationRead,
+            &format!("task {parent}"),
+        )?;
+    }
+    let created_by = resolve_coordination_actor(&auth.0.0, &body.created_by)?;
+    let expires_at = body.expires_at.as_deref().map(parse_rfc3339_datetime).transpose()?;
+    let input = NewTask {
+        title: body.title,
+        description: body.description,
+        created_by,
+        wing: wing.as_str().to_owned(),
+        idempotency_key: body.idempotency_key,
+        parent_id: body.parent_id,
+        dependencies: body.dependencies,
+        budget: body.budget,
+        expires_at,
+    };
+    let task = state.coordination.create_task(&input).map_err(coordination_storage_error)?;
+    // An idempotency-key replay returns whatever task storage originally
+    // created for `(created_by, idempotency_key)`, regardless of the wing
+    // this request named — re-authorize the wing storage actually used.
+    authorize_replay_wing(&auth.0, &task.wing)?;
+    Ok(Json(task_to_dto(task)?))
+}
+
+async fn route_coordination_task_get<P>(
+    State(state): State<Arc<ServerState<P>>>,
+    auth: axum::extract::Extension<AuthIdentity>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, ServerError>
+where
+    P: EmbeddingProvider + Send + Sync + 'static,
+{
+    let task = resolve_owning_task(
+        &state.coordination,
+        &auth.0,
+        &id,
+        Operation::CoordinationRead,
+        &format!("task {id}"),
+    )?;
+    Ok(Json(task_to_dto(task)?))
+}
+
+async fn route_coordination_task_claim<P>(
+    State(state): State<Arc<ServerState<P>>>,
+    auth: axum::extract::Extension<AuthIdentity>,
+    Path(id): Path<String>,
+    Json(body): Json<TaskLeaseRequest>,
+) -> Result<impl IntoResponse, ServerError>
+where
+    P: EmbeddingProvider + Send + Sync + 'static,
+{
+    resolve_owning_task(
+        &state.coordination,
+        &auth.0,
+        &id,
+        Operation::CoordinationClaim,
+        &format!("task {id}"),
+    )?;
+    validate_lease_seconds(body.lease_seconds)?;
+    let worker = resolve_coordination_actor(&auth.0.0, &body.worker)?;
+    let task = state
+        .coordination
+        .claim_task(
+            &id,
+            &worker,
+            body.expected_revision,
+            time::Duration::seconds(body.lease_seconds),
+        )
+        .map_err(coordination_storage_error)?;
+    Ok(Json(task_to_dto(task)?))
+}
+
+async fn route_coordination_task_renew<P>(
+    State(state): State<Arc<ServerState<P>>>,
+    auth: axum::extract::Extension<AuthIdentity>,
+    Path(id): Path<String>,
+    Json(body): Json<TaskLeaseRequest>,
+) -> Result<impl IntoResponse, ServerError>
+where
+    P: EmbeddingProvider + Send + Sync + 'static,
+{
+    resolve_owning_task(
+        &state.coordination,
+        &auth.0,
+        &id,
+        Operation::CoordinationClaim,
+        &format!("task {id}"),
+    )?;
+    validate_lease_seconds(body.lease_seconds)?;
+    let worker = resolve_coordination_actor(&auth.0.0, &body.worker)?;
+    let task = state
+        .coordination
+        .renew_lease(
+            &id,
+            &worker,
+            body.expected_revision,
+            time::Duration::seconds(body.lease_seconds),
+        )
+        .map_err(coordination_storage_error)?;
+    Ok(Json(task_to_dto(task)?))
+}
+
+async fn route_coordination_task_transition<P>(
+    State(state): State<Arc<ServerState<P>>>,
+    auth: axum::extract::Extension<AuthIdentity>,
+    Path(id): Path<String>,
+    Json(body): Json<TransitionTaskRequest>,
+) -> Result<impl IntoResponse, ServerError>
+where
+    P: EmbeddingProvider + Send + Sync + 'static,
+{
+    resolve_owning_task(
+        &state.coordination,
+        &auth.0,
+        &id,
+        Operation::CoordinationClaim,
+        &format!("task {id}"),
+    )?;
+    let actor = resolve_coordination_actor(&auth.0.0, &body.actor)?;
+    let task = state
+        .coordination
+        .transition_task(
+            &id,
+            &actor,
+            body.expected_revision,
+            storage_task_state(body.state),
+            body.details,
+        )
+        .map_err(coordination_storage_error)?;
+    Ok(Json(task_to_dto(task)?))
+}
+
+// ─── Coordination: messages ─────────────────────────────────────────────────
+
+async fn route_coordination_message_send<P>(
+    State(state): State<Arc<ServerState<P>>>,
+    auth: axum::extract::Extension<AuthIdentity>,
+    Json(body): Json<NewMessageRequest>,
+) -> Result<impl IntoResponse, ServerError>
+where
+    P: EmbeddingProvider + Send + Sync + 'static,
+{
+    resolve_owning_task(
+        &state.coordination,
+        &auth.0,
+        &body.task_id,
+        Operation::CoordinationWrite,
+        &format!("task {}", body.task_id),
+    )?;
+    let sender = resolve_coordination_actor(&auth.0.0, &body.sender)?;
+    let input = NewMessage {
+        task_id: body.task_id,
+        sender,
+        recipient: body.recipient,
+        kind: body.kind,
+        payload: body.payload,
+        idempotency_key: body.idempotency_key,
+        envelope_version: body.envelope_version,
+    };
+    let message = state.coordination.send_message(&input).map_err(coordination_storage_error)?;
+    // An idempotency-key replay returns whatever message storage originally
+    // created for `(sender, idempotency_key)`, on whatever task that was —
+    // possibly not `body.task_id`. Re-authorize the wing storage actually
+    // used.
+    authorize_replay_wing(&auth.0, &owning_task_wing(&state.coordination, &message.task_id)?)?;
+    Ok(Json(message_to_dto(message)?))
+}
+
+async fn route_coordination_message_get<P>(
+    State(state): State<Arc<ServerState<P>>>,
+    auth: axum::extract::Extension<AuthIdentity>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, ServerError>
+where
+    P: EmbeddingProvider + Send + Sync + 'static,
+{
+    let message = state
+        .coordination
+        .get_message(&id)?
+        .ok_or_else(|| ServerError::NotFound(format!("message {id} not found")))?;
+    resolve_owning_task(
+        &state.coordination,
+        &auth.0,
+        &message.task_id,
+        Operation::CoordinationRead,
+        &format!("message {id}"),
+    )?;
+    Ok(Json(message_to_dto(message)?))
+}
+
+async fn route_coordination_message_ack<P>(
+    State(state): State<Arc<ServerState<P>>>,
+    auth: axum::extract::Extension<AuthIdentity>,
+    Path(id): Path<String>,
+    Json(body): Json<AckMessageRequest>,
+) -> Result<impl IntoResponse, ServerError>
+where
+    P: EmbeddingProvider + Send + Sync + 'static,
+{
+    let message = state
+        .coordination
+        .get_message(&id)?
+        .ok_or_else(|| ServerError::NotFound(format!("message {id} not found")))?;
+    resolve_owning_task(
+        &state.coordination,
+        &auth.0,
+        &message.task_id,
+        Operation::CoordinationWrite,
+        &format!("message {id}"),
+    )?;
+    let actor = resolve_coordination_actor(&auth.0.0, &body.actor)?;
+    let acknowledged =
+        state.coordination.acknowledge_message(&id, &actor).map_err(coordination_storage_error)?;
+    Ok(Json(message_to_dto(acknowledged)?))
+}
+
+async fn route_coordination_inbox<P>(
+    State(state): State<Arc<ServerState<P>>>,
+    auth: axum::extract::Extension<AuthIdentity>,
+    Query(params): Query<InboxQuery>,
+) -> Result<impl IntoResponse, ServerError>
+where
+    P: EmbeddingProvider + Send + Sync + 'static,
+{
+    let limit = params.limit.unwrap_or(DEFAULT_PAGE_LIMIT).max(1).min(MAX_PAGE_LIMIT);
+    let cursor = params.cursor.as_deref().map(decode_coordination_cursor).transpose()?;
+
+    if let Some(wing_raw) = &params.wing {
+        let wing = WingId::normalized(wing_raw)?;
+        // Group C, not Group A: the inbox is an aggregate feed spanning many
+        // tasks/wings even with an explicit wing filter — mirrors
+        // `route_rooms`'s handling of its optional `?wing=`, not
+        // `route_drawers_list`/`route_drawers_search`'s. A mismatched wing
+        // filters to an empty page rather than 403. All rows returned by a
+        // wing-filtered storage query share that one wing, so a single
+        // visibility check covers the whole page. The diary hard-override
+        // (`wing_agents` never federates) is folded into the same check:
+        // an explicit filter of `wing_agents` is indistinguishable from one
+        // the token simply cannot see.
+        if is_diary_wing_or_room(wing.as_str(), "")
+            || !auth.0.allows_wing(Operation::CoordinationRead, wing.as_str())
+        {
+            return Ok(Json(InboxPageResponse { messages: Vec::new(), next_cursor: None }));
+        }
+        let page = state
+            .coordination
+            .inbox(&params.recipient, cursor, Some(wing.as_str()), limit, params.unacknowledged_only)
+            .map_err(coordination_storage_error)?;
+        let messages =
+            page.messages.into_iter().map(message_to_dto).collect::<Result<Vec<_>, _>>()?;
+        return Ok(Json(InboxPageResponse {
+            messages,
+            next_cursor: page.next_cursor.map(encode_coordination_cursor),
+        }));
+    }
+
+    // No wing filter: cross-wing, so filter to visible wings after the fact
+    // (Group C) rather than reject, and exclude `wing_agents` unconditionally
+    // (the diary hard-override). Over-fetch like `route_drawers_list` — same
+    // 2x heuristic, same limitation if filtered density is high.
+    //
+    // `next_cursor` cannot simply be storage's own page boundary over the
+    // *unfiltered* over-fetched batch: when the loop below stops early —
+    // either because it already collected `limit` visible messages, or
+    // because it broke out with unexamined messages still left in the
+    // batch — storage's boundary describes a point *past* messages this
+    // response never looked at, let alone returned. A client that resumes
+    // from that boundary would silently skip every message between where
+    // the loop actually stopped and where storage's page ended: e.g. two
+    // visible messages with `limit=1` and no third message in the
+    // underlying feed makes storage report `next_cursor: None` (its page
+    // truly is the last one), while the loop below stops after the first
+    // visible message — with `None` returned there would be nothing to
+    // resume from, and the second message is unreachable forever. So the
+    // cursor instead tracks the last message this loop actually examined;
+    // storage's own boundary is used only when the loop consumed the whole
+    // over-fetched batch without reaching `limit`, which is the one case
+    // where "examined everything" and "storage's page boundary" agree.
+    let visibility = auth.0.visible_wings(Operation::CoordinationRead);
+    let storage_limit = limit.saturating_mul(2);
+    let page = state
+        .coordination
+        .inbox(&params.recipient, cursor, None, storage_limit, params.unacknowledged_only)
+        .map_err(coordination_storage_error)?;
+    let mut wing_cache: std::collections::HashMap<String, Option<String>> =
+        std::collections::HashMap::new();
+    let mut messages = Vec::new();
+    let mut last_examined_sequence: Option<i64> = None;
+    let mut consumed_whole_batch = true;
+    for message in page.messages {
+        if messages.len() >= limit {
+            consumed_whole_batch = false;
+            break;
+        }
+        last_examined_sequence = Some(message.sequence);
+        let task_wing = if let Some(cached) = wing_cache.get(&message.task_id) {
+            cached.clone()
+        } else {
+            let resolved = state.coordination.get_task(&message.task_id)?.map(|t| t.wing);
+            wing_cache.insert(message.task_id.clone(), resolved.clone());
+            resolved
+        };
+        if task_wing
+            .as_deref()
+            .is_some_and(|w| !is_diary_wing_or_room(w, "") && visibility.contains(w))
+        {
+            messages.push(message_to_dto(message)?);
+        }
+    }
+    let next_cursor = if consumed_whole_batch {
+        page.next_cursor.map(encode_coordination_cursor)
+    } else {
+        last_examined_sequence.map(|seq| encode_coordination_cursor(CoordinationCursor(seq)))
+    };
+    Ok(Json(InboxPageResponse { messages, next_cursor }))
+}
+
+// ─── Coordination: artifacts ────────────────────────────────────────────────
+
+async fn route_coordination_artifact_put<P>(
+    State(state): State<Arc<ServerState<P>>>,
+    auth: axum::extract::Extension<AuthIdentity>,
+    Json(body): Json<NewArtifactRequest>,
+) -> Result<impl IntoResponse, ServerError>
+where
+    P: EmbeddingProvider + Send + Sync + 'static,
+{
+    resolve_owning_task(
+        &state.coordination,
+        &auth.0,
+        &body.task_id,
+        Operation::CoordinationWrite,
+        &format!("task {}", body.task_id),
+    )?;
+    let created_by = resolve_coordination_actor(&auth.0.0, &body.created_by)?;
+    let input = NewArtifact {
+        task_id: body.task_id,
+        created_by,
+        role: body.role,
+        media_type: body.media_type,
+        content: body.content,
+        idempotency_key: body.idempotency_key,
+    };
+    let artifact = state.coordination.put_artifact(&input).map_err(coordination_storage_error)?;
+    // See the identical note in `route_coordination_message_send`: a replay
+    // can return an artifact belonging to a different, unauthorized wing.
+    authorize_replay_wing(&auth.0, &owning_task_wing(&state.coordination, &artifact.task_id)?)?;
+    Ok(Json(artifact_to_dto(artifact)?))
+}
+
+async fn route_coordination_artifact_get<P>(
+    State(state): State<Arc<ServerState<P>>>,
+    auth: axum::extract::Extension<AuthIdentity>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, ServerError>
+where
+    P: EmbeddingProvider + Send + Sync + 'static,
+{
+    let artifact = state
+        .coordination
+        .get_artifact(&id)?
+        .ok_or_else(|| ServerError::NotFound(format!("artifact {id} not found")))?;
+    resolve_owning_task(
+        &state.coordination,
+        &auth.0,
+        &artifact.task_id,
+        Operation::CoordinationRead,
+        &format!("artifact {id}"),
+    )?;
+    Ok(Json(artifact_to_dto(artifact)?))
+}
+
+// ─── Coordination: results ──────────────────────────────────────────────────
+
+async fn route_coordination_result_put<P>(
+    State(state): State<Arc<ServerState<P>>>,
+    auth: axum::extract::Extension<AuthIdentity>,
+    Json(body): Json<NewTaskResultRequest>,
+) -> Result<impl IntoResponse, ServerError>
+where
+    P: EmbeddingProvider + Send + Sync + 'static,
+{
+    resolve_owning_task(
+        &state.coordination,
+        &auth.0,
+        &body.task_id,
+        Operation::CoordinationWrite,
+        &format!("task {}", body.task_id),
+    )?;
+    let created_by = resolve_coordination_actor(&auth.0.0, &body.created_by)?;
+    let input = NewTaskResult {
+        task_id: body.task_id,
+        created_by,
+        payload: body.payload,
+        idempotency_key: body.idempotency_key,
+    };
+    let result = state.coordination.put_result(&input).map_err(coordination_storage_error)?;
+    // See the identical note in `route_coordination_message_send`: a replay
+    // can return a result belonging to a different, unauthorized wing.
+    authorize_replay_wing(&auth.0, &owning_task_wing(&state.coordination, &result.task_id)?)?;
+    Ok(Json(result_to_dto(result)?))
+}
+
+async fn route_coordination_result_get<P>(
+    State(state): State<Arc<ServerState<P>>>,
+    auth: axum::extract::Extension<AuthIdentity>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, ServerError>
+where
+    P: EmbeddingProvider + Send + Sync + 'static,
+{
+    let result = state
+        .coordination
+        .get_result(&id)?
+        .ok_or_else(|| ServerError::NotFound(format!("result {id} not found")))?;
+    resolve_owning_task(
+        &state.coordination,
+        &auth.0,
+        &result.task_id,
+        Operation::CoordinationRead,
+        &format!("result {id}"),
+    )?;
+    Ok(Json(result_to_dto(result)?))
+}
+
+// ─── Coordination: events ───────────────────────────────────────────────────
+
+async fn route_coordination_events<P>(
+    State(state): State<Arc<ServerState<P>>>,
+    auth: axum::extract::Extension<AuthIdentity>,
+    Query(params): Query<CoordinationEventsQuery>,
+) -> Result<impl IntoResponse, ServerError>
+where
+    P: EmbeddingProvider + Send + Sync + 'static,
+{
+    let limit = params.limit.unwrap_or(DEFAULT_PAGE_LIMIT).max(1).min(MAX_PAGE_LIMIT);
+    let cursor = params.cursor.as_deref().map(decode_coordination_cursor).transpose()?;
+    let wing = params.wing.as_deref().map(WingId::normalized).transpose()?;
+
+    // Group C, matching `route_changes`/`route_rooms`: require read (enforced
+    // by the per-route gate before this handler runs), then filter to the
+    // wings the token can see rather than reject — including when an
+    // explicit `wing` filter is given but not visible, which yields an empty
+    // page, not 403. See the module-level "Wing authorization" note for why
+    // this never needs a wingless-event allowlist the way `/v1/changes` does.
+    let visibility = auth.0.visible_wings(Operation::CoordinationRead);
+
+    let page = state.coordination.events(
+        cursor,
+        params.task_id.as_deref(),
+        wing.as_ref().map(WingId::as_str),
+        limit,
+    )?;
+    let next_cursor = page.next_cursor.map(encode_coordination_cursor);
+    let events = page
+        .events
+        .into_iter()
+        // The diary hard-override applies here too: `wing_agents` events
+        // never federate, regardless of the token's scope or an explicit
+        // `?wing=wing_agents` filter (which, since `event.wing` would then
+        // always equal it, yields an empty page — the same "filters to
+        // empty rather than reject" behaviour every other invisible-wing
+        // filter on this route already has).
+        .filter(|event| !is_diary_wing_or_room(&event.wing, "") && visibility.contains(&event.wing))
+        .map(event_to_dto)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Json(CoordinationEventsResponse { events, next_cursor }))
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 /// Returns `true` when the wing or room identifies diary content that must not
@@ -2764,6 +3825,21 @@ mod tests {
     /// `normalize_scope_wing` keeps an unprefixed-but-valid entry as a
     /// matchable alias instead of only its `wing_`-prefixed normalized form.
     const UNPREFIXED_WING_TOKEN: &str = "unprefixed-wing-secret-token";
+    // Coordination-token fixtures (issue #102 Stage 3).
+    /// Scoped to `wing_alpha` only, with all three coordination operations —
+    /// the full-access worker token used by the lifecycle tests and as the
+    /// "cannot see wing_beta" side of the 404-masking tests.
+    const COORD_ALPHA_TOKEN: &str = "coord-alpha-secret-token";
+    /// Scoped to `wing_alpha` only, `coordination_write` alone (no
+    /// `coordination_claim`) — proves a writer can create a task but not
+    /// claim it.
+    const COORD_WRITE_ONLY_TOKEN: &str = "coord-write-only-secret-token";
+    /// Scoped to `"*"` (every wing) with all three coordination operations —
+    /// used only by the idempotency-replay-narrowing test, which rewrites
+    /// this token's scope on disk mid-test (mirroring
+    /// `hot_reload_picks_up_scope_change`) to narrow it to `wing_alpha`
+    /// after it has already created a task elsewhere.
+    const COORD_WIDE_TOKEN: &str = "coord-wide-secret-token";
 
     fn restrict_token_file(path: &std::path::Path) {
         #[cfg(unix)]
@@ -2868,6 +3944,24 @@ mod tests {
             {
                 "token": UNPREFIXED_WING_TOKEN, "name": "unprefixed_wing", "enabled": true,
                 "scopes": [{"wings": ["project_gamma"], "operations": ["read", "write"]}],
+            },
+            {
+                "token": COORD_ALPHA_TOKEN, "name": "coord_alpha", "enabled": true,
+                "scopes": [{
+                    "wings": ["wing_alpha"],
+                    "operations": ["coordination_read", "coordination_write", "coordination_claim"],
+                }],
+            },
+            {
+                "token": COORD_WRITE_ONLY_TOKEN, "name": "coord_write_only", "enabled": true,
+                "scopes": [{"wings": ["wing_alpha"], "operations": ["coordination_write"]}],
+            },
+            {
+                "token": COORD_WIDE_TOKEN, "name": "coord_wide", "enabled": true,
+                "scopes": [{
+                    "wings": ["*"],
+                    "operations": ["coordination_read", "coordination_write", "coordination_claim"],
+                }],
             },
         ])
     }
@@ -5731,5 +6825,1170 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         panic!("build_router should spawn a scheduler that runs the startup check");
+    }
+
+    // ─── Coordination over the wire (issue #102 Stage 3) ─────────────────────
+
+    #[tokio::test]
+    async fn info_advertises_coordination_capability() {
+        let harness = make_harness().await;
+        let resp = harness.router.clone().oneshot(authed_get("/v1/info", ALICE_TOKEN)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let capabilities = body["capabilities"].as_array().unwrap();
+        assert!(capabilities.iter().any(|c| c == "coordination"));
+    }
+
+    /// Creates a coordination task in `wing` via `token` and returns its id.
+    async fn create_task(harness: &Harness, token: &str, wing: &str, key: &str) -> String {
+        let resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/coordination/tasks",
+                token,
+                json!({
+                    "title": "t",
+                    "description": "d",
+                    "wing": wing,
+                    "idempotency_key": key,
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "task creation should succeed");
+        body_json(resp).await["task_id"].as_str().unwrap().to_owned()
+    }
+
+    /// Seeds a task in `wing_beta`, plus a message/artifact/result attached to
+    /// it, via the unrestricted `alice` token — for the Group B 404-masking
+    /// tests below, where `coord_alpha` (scoped to `wing_alpha` only) must
+    /// never learn these exist. Returns `(task_id, message_id, artifact_id,
+    /// result_id)`.
+    async fn seed_coordination_wing_beta_fixtures(
+        harness: &Harness,
+    ) -> (String, String, String, String) {
+        let task_id = create_task(harness, ALICE_TOKEN, "wing_beta", "beta-masking-task").await;
+
+        let message_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/coordination/messages",
+                ALICE_TOKEN,
+                json!({
+                    "task_id": task_id, "recipient": "someone", "kind": "status",
+                    "payload": {}, "idempotency_key": "beta-message-1",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(message_resp.status(), StatusCode::OK);
+        let message_id = body_json(message_resp).await["message_id"].as_str().unwrap().to_owned();
+
+        let artifact_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/coordination/artifacts",
+                ALICE_TOKEN,
+                json!({
+                    "task_id": task_id, "role": "output", "media_type": "text/plain",
+                    "content": "beta artifact", "idempotency_key": "beta-artifact-1",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(artifact_resp.status(), StatusCode::OK);
+        let artifact_id =
+            body_json(artifact_resp).await["artifact_id"].as_str().unwrap().to_owned();
+
+        let result_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/coordination/results",
+                ALICE_TOKEN,
+                json!({"task_id": task_id, "payload": {}, "idempotency_key": "beta-result-1"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(result_resp.status(), StatusCode::OK);
+        let result_id = body_json(result_resp).await["result_id"].as_str().unwrap().to_owned();
+
+        (task_id, message_id, artifact_id, result_id)
+    }
+
+    #[tokio::test]
+    async fn coordination_task_lifecycle_create_claim_renew_transition() {
+        let harness = make_harness().await;
+
+        let create_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/coordination/tasks",
+                COORD_ALPHA_TOKEN,
+                json!({
+                    "title": "Ship the thing",
+                    "description": "do it well",
+                    "wing": "wing_alpha",
+                    "idempotency_key": "lifecycle-create-1",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(create_resp.status(), StatusCode::OK);
+        let task = body_json(create_resp).await;
+        assert_eq!(task["state"], "pending");
+        assert_eq!(task["revision"], 0);
+        assert_eq!(task["wing"], "wing_alpha");
+        assert_eq!(task["created_by"], "coord_alpha");
+        let task_id = task["task_id"].as_str().unwrap().to_owned();
+
+        let get_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_get(&format!("/v1/coordination/tasks/{task_id}"), COORD_ALPHA_TOKEN))
+            .await
+            .unwrap();
+        assert_eq!(get_resp.status(), StatusCode::OK);
+        assert_eq!(body_json(get_resp).await["task_id"], task_id);
+
+        let claim_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                &format!("/v1/coordination/tasks/{task_id}/claim"),
+                COORD_ALPHA_TOKEN,
+                json!({"expected_revision": 0, "lease_seconds": 300}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(claim_resp.status(), StatusCode::OK);
+        let claimed = body_json(claim_resp).await;
+        assert_eq!(claimed["state"], "running");
+        assert_eq!(claimed["revision"], 1);
+        assert_eq!(claimed["owner"], "coord_alpha");
+
+        let renew_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                &format!("/v1/coordination/tasks/{task_id}/renew"),
+                COORD_ALPHA_TOKEN,
+                json!({"expected_revision": 1, "lease_seconds": 600}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(renew_resp.status(), StatusCode::OK);
+        let renewed = body_json(renew_resp).await;
+        assert_eq!(renewed["revision"], 2);
+        assert_eq!(renewed["state"], "running");
+
+        let transition_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                &format!("/v1/coordination/tasks/{task_id}/transition"),
+                COORD_ALPHA_TOKEN,
+                json!({"expected_revision": 2, "state": "completed"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(transition_resp.status(), StatusCode::OK);
+        let completed = body_json(transition_resp).await;
+        assert_eq!(completed["state"], "completed");
+        assert_eq!(completed["revision"], 3);
+        assert!(completed["owner"].is_null());
+    }
+
+    #[tokio::test]
+    async fn coordination_message_send_get_ack_and_inbox() {
+        let harness = make_harness().await;
+        let task_id =
+            create_task(&harness, COORD_ALPHA_TOKEN, "wing_alpha", "message-lifecycle-task").await;
+
+        let send_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/coordination/messages",
+                COORD_ALPHA_TOKEN,
+                json!({
+                    "task_id": task_id,
+                    "recipient": "coord_alpha",
+                    "kind": "status",
+                    "payload": {"progress": "started"},
+                    "idempotency_key": "message-1",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(send_resp.status(), StatusCode::OK);
+        let message = body_json(send_resp).await;
+        assert_eq!(message["sender"], "coord_alpha");
+        assert_eq!(message["recipient"], "coord_alpha");
+        assert!(message["acknowledged_at"].is_null());
+        let message_id = message["message_id"].as_str().unwrap().to_owned();
+
+        let get_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_get(
+                &format!("/v1/coordination/messages/{message_id}"),
+                COORD_ALPHA_TOKEN,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(get_resp.status(), StatusCode::OK);
+        assert_eq!(body_json(get_resp).await["message_id"], message_id);
+
+        let ack_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                &format!("/v1/coordination/messages/{message_id}/ack"),
+                COORD_ALPHA_TOKEN,
+                json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(ack_resp.status(), StatusCode::OK);
+        let acked = body_json(ack_resp).await;
+        assert_eq!(acked["acknowledged_by"], "coord_alpha");
+        assert!(acked["acknowledged_at"].is_string());
+
+        let inbox_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_get("/v1/coordination/inbox?recipient=coord_alpha", COORD_ALPHA_TOKEN))
+            .await
+            .unwrap();
+        assert_eq!(inbox_resp.status(), StatusCode::OK);
+        let inbox = body_json(inbox_resp).await;
+        let messages = inbox["messages"].as_array().unwrap();
+        assert!(messages.iter().any(|m| m["message_id"] == message_id
+            && m["acknowledged_by"] == "coord_alpha"));
+    }
+
+    #[tokio::test]
+    async fn coordination_artifact_put_and_get() {
+        let harness = make_harness().await;
+        let task_id = create_task(&harness, COORD_ALPHA_TOKEN, "wing_alpha", "artifact-task").await;
+
+        let put_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/coordination/artifacts",
+                COORD_ALPHA_TOKEN,
+                json!({
+                    "task_id": task_id,
+                    "role": "output",
+                    "media_type": "text/plain",
+                    "content": "artifact body",
+                    "idempotency_key": "artifact-1",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(put_resp.status(), StatusCode::OK);
+        let artifact = body_json(put_resp).await;
+        assert_eq!(artifact["created_by"], "coord_alpha");
+        assert_eq!(artifact["content"], "artifact body");
+        let artifact_id = artifact["artifact_id"].as_str().unwrap().to_owned();
+
+        let get_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_get(
+                &format!("/v1/coordination/artifacts/{artifact_id}"),
+                COORD_ALPHA_TOKEN,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(get_resp.status(), StatusCode::OK);
+        let fetched = body_json(get_resp).await;
+        assert_eq!(fetched["artifact_id"], artifact_id);
+        assert_eq!(fetched["content_hash"], artifact["content_hash"]);
+    }
+
+    #[tokio::test]
+    async fn coordination_result_put_and_get() {
+        let harness = make_harness().await;
+        let task_id = create_task(&harness, COORD_ALPHA_TOKEN, "wing_alpha", "result-task").await;
+
+        let put_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/coordination/results",
+                COORD_ALPHA_TOKEN,
+                json!({
+                    "task_id": task_id,
+                    "payload": {"score": 42},
+                    "idempotency_key": "result-1",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(put_resp.status(), StatusCode::OK);
+        let result = body_json(put_resp).await;
+        assert_eq!(result["created_by"], "coord_alpha");
+        assert_eq!(result["payload"]["score"], 42);
+        let result_id = result["result_id"].as_str().unwrap().to_owned();
+
+        let get_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_get(&format!("/v1/coordination/results/{result_id}"), COORD_ALPHA_TOKEN))
+            .await
+            .unwrap();
+        assert_eq!(get_resp.status(), StatusCode::OK);
+        assert_eq!(body_json(get_resp).await["result_id"], result_id);
+    }
+
+    #[tokio::test]
+    async fn coordination_events_feed_pages_with_cursor() {
+        let harness = make_harness().await;
+        let task_id = create_task(&harness, COORD_ALPHA_TOKEN, "wing_alpha", "events-task").await;
+        let claim_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                &format!("/v1/coordination/tasks/{task_id}/claim"),
+                COORD_ALPHA_TOKEN,
+                json!({"expected_revision": 0, "lease_seconds": 300}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(claim_resp.status(), StatusCode::OK);
+
+        // Page through with limit=1, following next_cursor, collecting every
+        // event for this task; the cursor is opaque, so it is only ever
+        // round-tripped verbatim, never parsed.
+        let mut seen = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let uri = match &cursor {
+                Some(c) => format!(
+                    "/v1/coordination/events?task_id={task_id}&limit=1&cursor={}",
+                    urlencoded(c)
+                ),
+                None => format!("/v1/coordination/events?task_id={task_id}&limit=1"),
+            };
+            let resp =
+                harness.router.clone().oneshot(authed_get(&uri, COORD_ALPHA_TOKEN)).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let page = body_json(resp).await;
+            let events = page["events"].as_array().unwrap().clone();
+            assert!(events.len() <= 1);
+            seen.extend(events);
+            let next = page["next_cursor"].as_str().map(str::to_owned);
+            assert!(seen.len() <= 10, "paging should terminate well before this");
+            match next {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        assert_eq!(seen.len(), 2, "expected task_created + task_claimed");
+        assert_eq!(seen[0]["event_type"], "task_created");
+        assert_eq!(seen[1]["event_type"], "task_claimed");
+    }
+
+    #[tokio::test]
+    async fn coordination_task_get_masks_invisible_wing_as_404() {
+        let harness = make_harness().await;
+        let (task_id, ..) = seed_coordination_wing_beta_fixtures(&harness).await;
+
+        let resp = harness
+            .router
+            .clone()
+            .oneshot(authed_get(&format!("/v1/coordination/tasks/{task_id}"), COORD_ALPHA_TOKEN))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(body_json(resp).await["code"], "not_found");
+
+        // A genuinely missing task gets the identical 404 shape — the caller
+        // can never distinguish "does not exist" from "exists, wrong wing".
+        let missing_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_get("/v1/coordination/tasks/task_missing", COORD_ALPHA_TOKEN))
+            .await
+            .unwrap();
+        assert_eq!(missing_resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn coordination_message_get_masks_invisible_wing_as_404() {
+        let harness = make_harness().await;
+        let (_, message_id, ..) = seed_coordination_wing_beta_fixtures(&harness).await;
+
+        let resp = harness
+            .router
+            .clone()
+            .oneshot(authed_get(
+                &format!("/v1/coordination/messages/{message_id}"),
+                COORD_ALPHA_TOKEN,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn coordination_artifact_get_masks_invisible_wing_as_404() {
+        let harness = make_harness().await;
+        let (_, _, artifact_id, _) = seed_coordination_wing_beta_fixtures(&harness).await;
+
+        let resp = harness
+            .router
+            .clone()
+            .oneshot(authed_get(
+                &format!("/v1/coordination/artifacts/{artifact_id}"),
+                COORD_ALPHA_TOKEN,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn coordination_result_get_masks_invisible_wing_as_404() {
+        let harness = make_harness().await;
+        let (.., result_id) = seed_coordination_wing_beta_fixtures(&harness).await;
+
+        let resp = harness
+            .router
+            .clone()
+            .oneshot(authed_get(&format!("/v1/coordination/results/{result_id}"), COORD_ALPHA_TOKEN))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn coordination_actor_impersonation_is_prefixed_not_trusted() {
+        let harness = make_harness().await;
+
+        let resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/coordination/tasks",
+                COORD_ALPHA_TOKEN,
+                json!({
+                    "title": "t", "description": "d", "wing": "wing_alpha",
+                    "idempotency_key": "impersonation-1",
+                    "created_by": "someone-else",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // The authenticated identity wins: a claimed name that disagrees with
+        // it is folded in as `{identity}:{claimed}`, never trusted verbatim —
+        // a remote caller cannot impersonate a local actor.
+        assert_eq!(body_json(resp).await["created_by"], "coord_alpha:someone-else");
+
+        let resp2 = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/coordination/tasks",
+                COORD_ALPHA_TOKEN,
+                json!({
+                    "title": "t", "description": "d", "wing": "wing_alpha",
+                    "idempotency_key": "impersonation-2",
+                    "created_by": "coord_alpha",
+                }),
+            ))
+            .await
+            .unwrap();
+        // A claimed name equal to the identity is stored bare, not doubled up.
+        assert_eq!(body_json(resp2).await["created_by"], "coord_alpha");
+    }
+
+    #[tokio::test]
+    async fn coordination_stale_revision_conflict_reports_actual_revision() {
+        let harness = make_harness().await;
+        let task_id =
+            create_task(&harness, COORD_ALPHA_TOKEN, "wing_alpha", "stale-revision-task").await;
+
+        let first = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                &format!("/v1/coordination/tasks/{task_id}/claim"),
+                COORD_ALPHA_TOKEN,
+                json!({"expected_revision": 0, "lease_seconds": 300}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(body_json(first).await["revision"], 1);
+
+        // Renewing at the now-stale revision 0 is a revision conflict, not a
+        // silent overwrite, and the body carries the real current revision
+        // rather than requiring the client to re-fetch to find out.
+        let stale = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                &format!("/v1/coordination/tasks/{task_id}/renew"),
+                COORD_ALPHA_TOKEN,
+                json!({"expected_revision": 0, "lease_seconds": 300}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(stale.status(), StatusCode::CONFLICT);
+        let body = body_json(stale).await;
+        assert_eq!(body["code"], "revision_conflict");
+        assert_eq!(body["expected_revision"], 0);
+        assert_eq!(body["actual_revision"], 1);
+    }
+
+    #[tokio::test]
+    async fn coordination_claim_of_task_leased_by_another_worker_is_conflict() {
+        let harness = make_harness().await;
+        let task_id = create_task(&harness, COORD_ALPHA_TOKEN, "wing_alpha", "leased-task").await;
+
+        let claim_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                &format!("/v1/coordination/tasks/{task_id}/claim"),
+                COORD_ALPHA_TOKEN,
+                json!({"expected_revision": 0, "lease_seconds": 300, "worker": "worker-a"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(claim_resp.status(), StatusCode::OK);
+        assert_eq!(body_json(claim_resp).await["revision"], 1);
+
+        // A second worker claims at the now-*correct* revision — this is not
+        // a stale-revision conflict, it is a live-lease conflict: worker-a's
+        // 300s lease has not expired, so the wire shape carries no revision
+        // pair (retrying with a fresher revision would not help).
+        let second = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                &format!("/v1/coordination/tasks/{task_id}/claim"),
+                COORD_ALPHA_TOKEN,
+                json!({"expected_revision": 1, "lease_seconds": 300, "worker": "worker-b"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::CONFLICT);
+        let body = body_json(second).await;
+        assert_eq!(body["code"], "coordination_conflict");
+        assert!(body["expected_revision"].is_null());
+        assert!(body["actual_revision"].is_null());
+    }
+
+    #[tokio::test]
+    async fn coordination_events_feed_filters_by_wing_and_fails_closed() {
+        let harness = make_harness().await;
+        let alpha_task =
+            create_task(&harness, COORD_ALPHA_TOKEN, "wing_alpha", "wing-filter-alpha").await;
+        let _beta_task = create_task(&harness, ALICE_TOKEN, "wing_beta", "wing-filter-beta").await;
+
+        let resp = harness
+            .router
+            .clone()
+            .oneshot(authed_get("/v1/coordination/events?limit=100", COORD_ALPHA_TOKEN))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let page = body_json(resp).await;
+        let events = page["events"].as_array().unwrap();
+        assert!(!events.is_empty());
+        // A token scoped to wing_alpha sees only wing_alpha's events, even
+        // though wing_beta's task_created event exists in the same
+        // underlying feed: the same fail-closed-by-default rule
+        // `change_event_visible` uses for `/v1/changes`, applied here to a
+        // column that (unlike the generic changes feed) is always populated,
+        // so nothing is ever admitted for lack of a determinable wing.
+        assert!(events.iter().all(|event| event["wing"] == "wing_alpha"));
+        assert!(events.iter().any(|event| event["entity_id"] == alpha_task));
+
+        let all_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_get("/v1/coordination/events?limit=100", ALICE_TOKEN))
+            .await
+            .unwrap();
+        assert_eq!(all_resp.status(), StatusCode::OK);
+        let all_events = body_json(all_resp).await["events"].as_array().unwrap().clone();
+        assert!(all_events.iter().any(|event| event["wing"] == "wing_alpha"));
+        assert!(all_events.iter().any(|event| event["wing"] == "wing_beta"));
+    }
+
+    #[tokio::test]
+    async fn coordination_write_scope_without_claim_can_create_but_not_claim() {
+        let harness = make_harness().await;
+
+        let create_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/coordination/tasks",
+                COORD_WRITE_ONLY_TOKEN,
+                json!({
+                    "title": "t", "description": "d", "wing": "wing_alpha",
+                    "idempotency_key": "write-only-1",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(create_resp.status(), StatusCode::OK);
+        let task_id = body_json(create_resp).await["task_id"].as_str().unwrap().to_owned();
+
+        // The operation gate rejects before the handler (and its wing check)
+        // ever run — `coord_write_only` holds no `coordination_claim` grant
+        // for any wing, so this is 403 (operation not permitted at all), not
+        // the 404 wing-masking the get/message/artifact/result tests exercise.
+        let claim_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                &format!("/v1/coordination/tasks/{task_id}/claim"),
+                COORD_WRITE_ONLY_TOKEN,
+                json!({"expected_revision": 0, "lease_seconds": 300}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(claim_resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    // ─── Coordination review-finding regressions (2026-08-20) ───────────────
+
+    #[tokio::test]
+    async fn coordination_task_create_in_wing_agents_is_rejected_with_422() {
+        let harness = make_harness().await;
+        let resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/coordination/tasks",
+                ALICE_TOKEN,
+                json!({
+                    "title": "t", "description": "d", "wing": "wing_agents",
+                    "idempotency_key": "diary-create-1",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body_json(resp).await["code"], "diary_not_federated");
+    }
+
+    /// Seeds a task directly in `wing_agents` via the coordination store
+    /// (bypassing the HTTP create route, which now refuses to create one at
+    /// all — see `coordination_task_create_in_wing_agents_is_rejected_with_422`),
+    /// plus a message on it. Proves every read and feed route still masks
+    /// pre-existing `wing_agents` coordination state, and that a write
+    /// against it is rejected outright, regardless of the caller's token
+    /// scope.
+    #[tokio::test]
+    async fn coordination_wing_agents_task_is_masked_from_every_route() {
+        let harness = make_harness().await;
+        let task = harness
+            .state
+            .coordination
+            .create_task(&NewTask {
+                title: "diary-shaped".into(),
+                description: "d".into(),
+                created_by: "alice".into(),
+                wing: "wing_agents".into(),
+                idempotency_key: "diary-seed-1".into(),
+                parent_id: None,
+                dependencies: vec![],
+                budget: None,
+                expires_at: None,
+            })
+            .expect("seed wing_agents task directly through storage");
+        let message = harness
+            .state
+            .coordination
+            .send_message(&NewMessage {
+                task_id: task.task_id.clone(),
+                sender: "alice".into(),
+                recipient: "someone".into(),
+                kind: "status".into(),
+                payload: serde_json::json!({}),
+                idempotency_key: "diary-seed-message-1".into(),
+                envelope_version: 1,
+            })
+            .expect("seed message on the wing_agents task");
+
+        // GET is masked as 404, unrestricted ALICE_TOKEN included — the
+        // diary override applies regardless of scope, not just to a
+        // narrowly-scoped caller.
+        let get_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_get(&format!("/v1/coordination/tasks/{}", task.task_id), ALICE_TOKEN))
+            .await
+            .unwrap();
+        assert_eq!(get_resp.status(), StatusCode::NOT_FOUND);
+
+        let message_get_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_get(
+                &format!("/v1/coordination/messages/{}", message.message_id),
+                ALICE_TOKEN,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(message_get_resp.status(), StatusCode::NOT_FOUND);
+
+        // A write against the task (claim) is rejected with the explicit
+        // diary error, not masked as 404 — a write is not an
+        // existence-oracle risk the way a read is.
+        let claim_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                &format!("/v1/coordination/tasks/{}/claim", task.task_id),
+                ALICE_TOKEN,
+                json!({"expected_revision": 0, "lease_seconds": 300}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(claim_resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body_json(claim_resp).await["code"], "diary_not_federated");
+
+        // The inbox never surfaces the seeded message, whether unfiltered or
+        // explicitly filtered to wing_agents.
+        let inbox_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_get("/v1/coordination/inbox?recipient=someone", ALICE_TOKEN))
+            .await
+            .unwrap();
+        assert_eq!(inbox_resp.status(), StatusCode::OK);
+        let inbox = body_json(inbox_resp).await;
+        assert!(inbox["messages"].as_array().unwrap().is_empty());
+
+        let inbox_wing_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_get(
+                "/v1/coordination/inbox?recipient=someone&wing=wing_agents",
+                ALICE_TOKEN,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(inbox_wing_resp.status(), StatusCode::OK);
+        assert!(body_json(inbox_wing_resp).await["messages"].as_array().unwrap().is_empty());
+
+        // The event feed never surfaces wing_agents events either, whether
+        // unfiltered or explicitly filtered.
+        let events_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_get("/v1/coordination/events?limit=200", ALICE_TOKEN))
+            .await
+            .unwrap();
+        assert_eq!(events_resp.status(), StatusCode::OK);
+        let events = body_json(events_resp).await;
+        assert!(
+            events["events"].as_array().unwrap().iter().all(|e| e["wing"] != "wing_agents"),
+            "no wing_agents event should ever be federated"
+        );
+
+        let events_wing_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_get("/v1/coordination/events?wing=wing_agents&limit=200", ALICE_TOKEN))
+            .await
+            .unwrap();
+        assert_eq!(events_wing_resp.status(), StatusCode::OK);
+        assert!(body_json(events_wing_resp).await["events"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn coordination_idempotency_replay_across_narrowed_scope_is_conflict() {
+        let harness = make_harness().await;
+
+        // coord_wide is initially scoped to every wing; create a task in
+        // wing_beta under a key it will replay below.
+        let original = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/coordination/tasks",
+                COORD_WIDE_TOKEN,
+                json!({
+                    "title": "t", "description": "d", "wing": "wing_beta",
+                    "idempotency_key": "narrowed-replay-1",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(original.status(), StatusCode::OK);
+        assert_eq!(body_json(original).await["wing"], "wing_beta");
+
+        // Narrow coord_wide's scope to wing_alpha only, then wait past the
+        // registry's mtime-based reload granularity (matches
+        // `hot_reload_picks_up_scope_change`).
+        let token_file = harness._tempdir.path().join("tokens.json");
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let mut tokens = default_tokens_json();
+        for entry in tokens.as_array_mut().unwrap() {
+            if entry["name"] == "coord_wide" {
+                entry["scopes"] = json!([{
+                    "wings": ["wing_alpha"],
+                    "operations": ["coordination_read", "coordination_write", "coordination_claim"],
+                }]);
+            }
+        }
+        std::fs::write(&token_file, serde_json::to_string(&tokens).unwrap()).unwrap();
+        restrict_token_file(&token_file);
+
+        // Replaying the same key, now naming an authorized wing_alpha wing,
+        // must not hand back the wing_beta task: the wing the caller can now
+        // see was never authorized for the record storage actually has.
+        let replay = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/coordination/tasks",
+                COORD_WIDE_TOKEN,
+                json!({
+                    "title": "t", "description": "d", "wing": "wing_alpha",
+                    "idempotency_key": "narrowed-replay-1",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::CONFLICT);
+        let body = body_json(replay).await;
+        assert_eq!(body["code"], "idempotency_key_conflict");
+        // The message must not disclose the wing or any task content.
+        let message = body["message"].as_str().unwrap();
+        assert!(!message.contains("wing_beta"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn coordination_message_replay_across_unauthorized_task_is_conflict() {
+        let harness = make_harness().await;
+
+        // coord_wide creates a task in wing_beta, then sends a message on it
+        // under a key it will replay below.
+        let beta_task = create_task(&harness, COORD_WIDE_TOKEN, "wing_beta", "msg-replay-beta").await;
+        let original = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/coordination/messages",
+                COORD_WIDE_TOKEN,
+                json!({
+                    "task_id": beta_task, "recipient": "someone", "kind": "status",
+                    "payload": {}, "idempotency_key": "msg-replay-key-1",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(original.status(), StatusCode::OK);
+
+        // Narrow scope to wing_alpha only.
+        let token_file = harness._tempdir.path().join("tokens.json");
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let mut tokens = default_tokens_json();
+        for entry in tokens.as_array_mut().unwrap() {
+            if entry["name"] == "coord_wide" {
+                entry["scopes"] = json!([{
+                    "wings": ["wing_alpha"],
+                    "operations": ["coordination_read", "coordination_write", "coordination_claim"],
+                }]);
+            }
+        }
+        std::fs::write(&token_file, serde_json::to_string(&tokens).unwrap()).unwrap();
+        restrict_token_file(&token_file);
+
+        // Create a decoy task in the now-authorized wing_alpha, then replay
+        // the message key against it. The replay must not return the
+        // original wing_beta message.
+        let alpha_task = create_task(&harness, COORD_WIDE_TOKEN, "wing_alpha", "msg-replay-alpha").await;
+        let replay = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/coordination/messages",
+                COORD_WIDE_TOKEN,
+                json!({
+                    "task_id": alpha_task, "recipient": "someone", "kind": "status",
+                    "payload": {}, "idempotency_key": "msg-replay-key-1",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::CONFLICT);
+        assert_eq!(body_json(replay).await["code"], "idempotency_key_conflict");
+    }
+
+    #[tokio::test]
+    async fn coordination_inbox_cursor_does_not_skip_the_second_visible_message() {
+        let harness = make_harness().await;
+        let task_id =
+            create_task(&harness, COORD_ALPHA_TOKEN, "wing_alpha", "inbox-cursor-task").await;
+
+        for key in ["inbox-cursor-1", "inbox-cursor-2"] {
+            let resp = harness
+                .router
+                .clone()
+                .oneshot(authed_json_request(
+                    Method::POST,
+                    "/v1/coordination/messages",
+                    COORD_ALPHA_TOKEN,
+                    json!({
+                        "task_id": task_id, "recipient": "coord_alpha", "kind": "status",
+                        "payload": {}, "idempotency_key": key,
+                    }),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+
+        // Page through with limit=1, following next_cursor, exactly as
+        // `coordination_events_feed_pages_with_cursor` does for events.
+        // Before the fix, storage found no third message and reported
+        // `next_cursor: None` on the very first (over-fetched) page even
+        // though a second visible message was still unread, making it
+        // permanently unreachable.
+        let mut seen = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let uri = match &cursor {
+                Some(c) => format!(
+                    "/v1/coordination/inbox?recipient=coord_alpha&limit=1&cursor={}",
+                    urlencoded(c)
+                ),
+                None => "/v1/coordination/inbox?recipient=coord_alpha&limit=1".to_owned(),
+            };
+            let resp =
+                harness.router.clone().oneshot(authed_get(&uri, COORD_ALPHA_TOKEN)).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let page = body_json(resp).await;
+            let messages = page["messages"].as_array().unwrap().clone();
+            assert!(messages.len() <= 1);
+            seen.extend(messages);
+            let next = page["next_cursor"].as_str().map(str::to_owned);
+            assert!(seen.len() <= 10, "paging should terminate well before this");
+            match next {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        assert_eq!(seen.len(), 2, "both visible messages must eventually be reachable");
+    }
+
+    #[test]
+    fn token_registry_rejects_colon_in_token_name() {
+        let tempdir = TempDir::new().unwrap();
+        let token_file = tempdir.path().join("tokens.json");
+        std::fs::write(
+            &token_file,
+            serde_json::to_string(&serde_json::json!([
+                {"token": ALICE_TOKEN, "name": "ci:worker", "enabled": true},
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        restrict_token_file(&token_file);
+
+        let err = TokenRegistry::load(token_file).unwrap_err();
+        assert!(err.to_string().contains("must not contain"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn coordination_claimed_actor_containing_colon_is_rejected() {
+        let harness = make_harness().await;
+        let resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/coordination/tasks",
+                COORD_ALPHA_TOKEN,
+                json!({
+                    "title": "t", "description": "d", "wing": "wing_alpha",
+                    "idempotency_key": "colon-claim-1",
+                    "created_by": "ci:worker",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn coordination_claim_with_oversized_lease_seconds_returns_400_not_a_panic() {
+        let harness = make_harness().await;
+        let task_id =
+            create_task(&harness, COORD_ALPHA_TOKEN, "wing_alpha", "oversized-lease-route-task").await;
+
+        let claim_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                &format!("/v1/coordination/tasks/{task_id}/claim"),
+                COORD_ALPHA_TOKEN,
+                json!({"expected_revision": 0, "lease_seconds": i64::MAX}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(claim_resp.status(), StatusCode::BAD_REQUEST);
+
+        // A sane claim, then an oversized renewal, exercises the same bound
+        // on the renew route.
+        let ok_claim = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                &format!("/v1/coordination/tasks/{task_id}/claim"),
+                COORD_ALPHA_TOKEN,
+                json!({"expected_revision": 0, "lease_seconds": 300}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(ok_claim.status(), StatusCode::OK);
+
+        let renew_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                &format!("/v1/coordination/tasks/{task_id}/renew"),
+                COORD_ALPHA_TOKEN,
+                json!({"expected_revision": 1, "lease_seconds": i64::MAX}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(renew_resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn coordination_task_create_masks_unauthorized_dependency_as_missing() {
+        let harness = make_harness().await;
+        // A real task, hidden in wing_beta, that coord_alpha (scoped to
+        // wing_alpha only) cannot see.
+        let hidden_dependency =
+            create_task(&harness, ALICE_TOKEN, "wing_beta", "oracle-hidden-dependency").await;
+
+        let hidden_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/coordination/tasks",
+                COORD_ALPHA_TOKEN,
+                json!({
+                    "title": "t", "description": "d", "wing": "wing_alpha",
+                    "idempotency_key": "oracle-hidden-1",
+                    "dependencies": [hidden_dependency],
+                }),
+            ))
+            .await
+            .unwrap();
+
+        let missing_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/coordination/tasks",
+                COORD_ALPHA_TOKEN,
+                json!({
+                    "title": "t", "description": "d", "wing": "wing_alpha",
+                    "idempotency_key": "oracle-missing-1",
+                    "dependencies": ["task_does_not_exist_at_all"],
+                }),
+            ))
+            .await
+            .unwrap();
+
+        // A hidden, real cross-wing id and a genuinely nonexistent id must be
+        // indistinguishable: same status, same error shape — otherwise the
+        // route is an existence oracle for wings this token cannot read.
+        assert_eq!(hidden_resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(missing_resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(body_json(hidden_resp).await["code"], "not_found");
+        assert_eq!(body_json(missing_resp).await["code"], "not_found");
+
+        // Same rule for `parent_id`.
+        let hidden_parent_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/coordination/tasks",
+                COORD_ALPHA_TOKEN,
+                json!({
+                    "title": "t", "description": "d", "wing": "wing_alpha",
+                    "idempotency_key": "oracle-hidden-parent-1",
+                    "parent_id": hidden_dependency,
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(hidden_parent_resp.status(), StatusCode::NOT_FOUND);
+
+        // A visible dependency still works normally.
+        let visible_dependency =
+            create_task(&harness, COORD_ALPHA_TOKEN, "wing_alpha", "oracle-visible-dependency").await;
+        let visible_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/coordination/tasks",
+                COORD_ALPHA_TOKEN,
+                json!({
+                    "title": "t", "description": "d", "wing": "wing_alpha",
+                    "idempotency_key": "oracle-visible-1",
+                    "dependencies": [visible_dependency],
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(visible_resp.status(), StatusCode::OK);
     }
 }

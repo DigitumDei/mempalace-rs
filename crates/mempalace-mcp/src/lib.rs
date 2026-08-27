@@ -661,19 +661,19 @@ impl ToolName {
             ),
             Self::TaskClaim => coordination_definition(
                 self,
-                "Atomically claim or reclaim a task lease using an expected revision.",
+                "Atomically claim or reclaim a task lease using an expected revision. Returns {\"success\": true, \"task\": {...}} on success, or {\"success\": false, \"conflict\": {expected_revision, actual_revision, message}} when the expected revision no longer matches — a conflict is data, not an error. Changed in v0.1.26: this previously returned a bare task object and raised a JSON-RPC error on conflict.",
                 json!({"task_id":{"type":"string"},"worker":{"type":"string"},"expected_revision":{"type":"integer"},"lease_seconds":{"type":"integer"}}),
                 &["task_id", "worker", "expected_revision", "lease_seconds"],
             ),
             Self::TaskRenew => coordination_definition(
                 self,
-                "Renew a task lease using an expected revision.",
+                "Renew a task lease using an expected revision. Returns {\"success\": true, \"task\": {...}} on success, or {\"success\": false, \"conflict\": {expected_revision, actual_revision, message}} when the expected revision no longer matches — a conflict is data, not an error. Changed in v0.1.26: this previously returned a bare task object and raised a JSON-RPC error on conflict.",
                 json!({"task_id":{"type":"string"},"worker":{"type":"string"},"expected_revision":{"type":"integer"},"lease_seconds":{"type":"integer"}}),
                 &["task_id", "worker", "expected_revision", "lease_seconds"],
             ),
             Self::TaskTransition => coordination_definition(
                 self,
-                "Durably transition a task lifecycle state using compare-and-swap revision semantics.",
+                "Durably transition a task lifecycle state using compare-and-swap revision semantics. Returns {\"success\": true, \"task\": {...}} on success, or {\"success\": false, \"conflict\": {expected_revision, actual_revision, message}} when the expected revision no longer matches — a conflict is data, not an error. Changed in v0.1.26: this previously returned a bare task object and raised a JSON-RPC error on conflict.",
                 json!({"task_id":{"type":"string"},"actor":{"type":"string"},"expected_revision":{"type":"integer"},"state":{"type":"string","enum":["pending","running","input_required","completed","cancelled","failed","expired"]},"details":{}}),
                 &["task_id", "actor", "expected_revision", "state"],
             ),

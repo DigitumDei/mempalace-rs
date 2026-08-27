@@ -137,6 +137,79 @@ async fn mcp_server_with_hub(
         default_remote,
         wings: wing_rules,
         kg: kg_rule,
+        coordination: BTreeMap::new(),
+    };
+
+    let config = MempalaceConfig {
+        schema_version: 1,
+        collection_name: "mempalace_drawers".to_owned(),
+        palace_path: local_dir.path().join("palace"),
+        embedding_profile: EmbeddingProfile::Balanced,
+        low_cpu: LowCpuRuntimeConfig::defaults_for_profile(EmbeddingProfile::Balanced),
+        server: ServerRuntimeConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            token_file: local_dir.path().join("server_tokens.json"),
+            checkouts: std::collections::BTreeMap::new(),
+        },
+        maintenance: MaintenanceRuntimeConfig::defaults(),
+        federation,
+    };
+
+    McpServer::from_parts(config, DeterministicStubProvider::new(EmbeddingProfile::Balanced))
+        .await
+        .unwrap()
+}
+
+/// Like [`mcp_server_with_hub`], but also sets `federation.coordination` — used by the
+/// coordination-specific tests below (issue #102 Stage 4), which need a route on that separate
+/// table rather than `federation.wings`.
+#[allow(clippy::too_many_arguments)]
+async fn mcp_server_with_hub_coordination(
+    local_dir: &TempDir,
+    hub_url: &str,
+    wing_rules: BTreeMap<String, ResolvedRouteRule>,
+    coordination_rules: BTreeMap<String, ResolvedRouteRule>,
+    default_mode: RouteMode,
+) -> McpServer<DeterministicStubProvider> {
+    mcp_server_with_hub_multi(local_dir, &[("hub", hub_url)], wing_rules, coordination_rules, default_mode)
+        .await
+}
+
+/// Build an `McpServer` with a federation config registering one or more named remotes, plus
+/// `wings` and `coordination` routing tables — the general form
+/// [`mcp_server_with_hub`]/[`mcp_server_with_hub_coordination`] specialize. Used directly by
+/// tests that need more than one remote (e.g. the events fan-out isolation test).
+async fn mcp_server_with_hub_multi(
+    local_dir: &TempDir,
+    remotes: &[(&str, &str)],
+    wing_rules: BTreeMap<String, ResolvedRouteRule>,
+    coordination_rules: BTreeMap<String, ResolvedRouteRule>,
+    default_mode: RouteMode,
+) -> McpServer<DeterministicStubProvider> {
+    let mut resolved_remotes = BTreeMap::new();
+    for (name, url) in remotes {
+        resolved_remotes.insert(
+            (*name).to_owned(),
+            ResolvedRemote {
+                name: (*name).to_owned(),
+                url: (*url).to_owned(),
+                token: Some(TEST_TOKEN.to_owned()),
+                timeout: Duration::from_secs(5),
+            },
+        );
+    }
+    let default_remote = match default_mode {
+        RouteMode::Local => None,
+        _ => remotes.first().map(|(name, _)| (*name).to_owned()),
+    };
+
+    let federation = FederationRuntimeConfig {
+        remotes: resolved_remotes,
+        default_mode,
+        default_remote,
+        wings: wing_rules,
+        kg: None,
+        coordination: coordination_rules,
     };
 
     let config = MempalaceConfig {
@@ -540,6 +613,7 @@ async fn different_embedding_profiles_per_side() {
         default_remote: None,
         wings: wing_rules,
         kg: None,
+        coordination: BTreeMap::new(),
     };
 
     let local_config = MempalaceConfig {
@@ -682,6 +756,7 @@ async fn remote_down_degrades_reads() {
         default_remote: None,
         wings: wing_rules,
         kg: kg_rule,
+        coordination: BTreeMap::new(),
     };
 
     let config = MempalaceConfig {
@@ -1106,6 +1181,7 @@ async fn wake_up_with_down_remote_marks_unreachable_and_succeeds() {
         default_remote: None,
         wings: BTreeMap::new(),
         kg: None,
+        coordination: BTreeMap::new(),
     };
 
     let config = MempalaceConfig {
@@ -1662,6 +1738,7 @@ async fn add_drawer_both_replication_fails_with_remote_rejection() {
         default_remote: None,
         wings: wing_rules,
         kg: None,
+        coordination: BTreeMap::new(),
     };
 
     let config = MempalaceConfig {
@@ -1846,6 +1923,7 @@ async fn add_drawer_both_near_duplicate_same_wing_room_rejected() {
         default_remote: None,
         wings: wing_rules,
         kg: None,
+        coordination: BTreeMap::new(),
     };
 
     let config = MempalaceConfig {
@@ -1973,6 +2051,7 @@ async fn add_drawer_both_retry_reuses_local_drawer_and_replicates() {
         default_remote: None,
         wings: wing_rules_a,
         kg: None,
+        coordination: BTreeMap::new(),
     };
     let config_a = MempalaceConfig {
         schema_version: 1,
@@ -2052,6 +2131,7 @@ async fn add_drawer_both_retry_reuses_local_drawer_and_replicates() {
         default_remote: None,
         wings: wing_rules_b,
         kg: None,
+        coordination: BTreeMap::new(),
     };
     let config_b = MempalaceConfig {
         schema_version: 1,
@@ -2195,6 +2275,7 @@ async fn add_drawer_both_replication_fails_with_down_remote() {
         default_remote: None,
         wings: wing_rules,
         kg: None,
+        coordination: BTreeMap::new(),
     };
 
     let config = MempalaceConfig {
@@ -2367,6 +2448,7 @@ async fn kg_add_both_replication_fails_with_down_remote() {
         default_remote: None,
         wings: BTreeMap::new(),
         kg: Some(combined_kg_rule_both_write()),
+        coordination: BTreeMap::new(),
     };
 
     let config = MempalaceConfig {
@@ -2592,6 +2674,7 @@ async fn kg_invalidate_both_replication_fails_with_down_remote() {
         default_remote: None,
         wings: BTreeMap::new(),
         kg: Some(combined_kg_rule_both_write()),
+        coordination: BTreeMap::new(),
     };
 
     let config = MempalaceConfig {
@@ -2877,6 +2960,7 @@ async fn kg_add_both_replication_fails_with_remote_rejection() {
         default_remote: None,
         wings: BTreeMap::new(),
         kg: Some(combined_kg_rule_both_write()),
+        coordination: BTreeMap::new(),
     };
 
     let config = MempalaceConfig {
@@ -3000,6 +3084,7 @@ async fn kg_invalidate_both_replication_fails_with_remote_rejection() {
         default_remote: None,
         wings: BTreeMap::new(),
         kg: Some(combined_kg_rule_both_write()),
+        coordination: BTreeMap::new(),
     };
 
     let config = MempalaceConfig {
@@ -3084,4 +3169,986 @@ fn combined_kg_rule_remote_write_for_test() -> ResolvedRouteRule {
         remote: Some("hub".to_owned()),
         write: WriteTarget::Remote,
     }
+}
+
+// ─── Coordination federation tests (issue #102 Stage 4) ───────────────────────
+
+/// `mempalace_task_create` for a wing whose `federation.coordination` rule is `Remote` must
+/// land on the hub, not locally — the one coordination write routed by wing rather than by
+/// ID-discovery fallback.
+#[tokio::test]
+async fn coordination_task_create_routes_to_remote_when_wing_configured_remote() {
+    let local_dir = TempDir::new().unwrap();
+    let hub_dir = TempDir::new().unwrap();
+    let hub_addr = spawn_server(&hub_dir).await;
+    let hub_url = format!("http://{hub_addr}");
+
+    let mut coordination_rules = BTreeMap::new();
+    coordination_rules.insert("wing_coordremote".to_owned(), remote_wing_rule());
+
+    let server = mcp_server_with_hub_coordination(
+        &local_dir,
+        &hub_url,
+        BTreeMap::new(),
+        coordination_rules,
+        RouteMode::Local,
+    )
+    .await;
+
+    let response = call_tool(
+        &server,
+        1,
+        "mempalace_task_create",
+        json!({
+            "title": "index the repo",
+            "description": "d",
+            "wing": "wing_coordremote",
+            "idempotency_key": "e2e-remote-task-1",
+            "created_by": "alice",
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        response["applied_to"], "remote:hub",
+        "task_create for a Remote-routed coordination wing must land on the hub: {response}"
+    );
+    assert!(response["task_id"].as_str().is_some(), "response must carry a task_id: {response}");
+
+    // The local palace must not have created a copy.
+    let local_get =
+        call_tool(&server, 2, "mempalace_task_get", json!({"task_id": response["task_id"]})).await;
+    assert_eq!(local_get["found"], true, "the task must still be discoverable via ID fallback");
+    assert_eq!(
+        local_get["value"]["origin"], "remote:hub",
+        "and must be reported as coming from the hub, not local: {local_get}"
+    );
+}
+
+/// A combined-mode exact-ID read: a task created directly on the hub (bypassing the local MCP
+/// server entirely) is invisible locally, but `mempalace_task_get` still finds it by falling
+/// back to the configured remote — and annotates `origin` so the caller can tell.
+#[tokio::test]
+async fn coordination_task_get_falls_back_to_remote_after_local_miss() {
+    let local_dir = TempDir::new().unwrap();
+    let hub_dir = TempDir::new().unwrap();
+    let hub_addr = spawn_server(&hub_dir).await;
+    let hub_url = format!("http://{hub_addr}");
+
+    let hub_client = RemoteClient::new(RemoteEndpoint {
+        name: "hub".to_owned(),
+        base_url: hub_url.clone(),
+        token: Some(TEST_TOKEN.to_owned()),
+        timeout: Duration::from_secs(5),
+    })
+    .unwrap();
+    let hub_task = hub_client
+        .coordination_task_create(mempalace_federation::NewTaskRequest {
+            title: "hub-only task".to_owned(),
+            description: "d".to_owned(),
+            wing: "wing_hubonly".to_owned(),
+            idempotency_key: "e2e-hubonly-1".to_owned(),
+            created_by: Some("alice".to_owned()),
+            parent_id: None,
+            dependencies: Vec::new(),
+            budget: None,
+            expires_at: None,
+        })
+        .await
+        .unwrap();
+
+    // No coordination rule at all for `wing_hubonly` — the fallback is purely ID-discovery,
+    // triggered by coordination federation being configured at all (here, via a non-Local
+    // `default_mode`), not by any specific wing routing. `default_mode: Local` with an empty
+    // `coordination` table means coordination federation was never configured, and the
+    // fallback must not run in that case — see
+    // `coordination_fallback_records_zero_remote_calls_without_coordination_federation_config`
+    // in `crates/mempalace-mcp/src/federation.rs`.
+    let server = mcp_server_with_hub_coordination(
+        &local_dir,
+        &hub_url,
+        BTreeMap::new(),
+        BTreeMap::new(),
+        RouteMode::Combined,
+    )
+    .await;
+
+    let response =
+        call_tool(&server, 1, "mempalace_task_get", json!({"task_id": hub_task.task_id})).await;
+    assert_eq!(response["found"], true, "must find the task via remote fallback: {response}");
+    assert_eq!(response["value"]["task_id"], json!(hub_task.task_id));
+    assert_eq!(response["value"]["origin"], "remote:hub");
+
+    // A task_id that exists nowhere still comes back as a clean "not found", not an error.
+    let missing =
+        call_tool(&server, 2, "mempalace_task_get", json!({"task_id": "task_does_not_exist"}))
+            .await;
+    assert_eq!(missing["found"], false, "a genuinely missing task must report found=false");
+}
+
+/// A revision conflict on a remotely-owned task, discovered through the local-first fallback,
+/// surfaces through the MCP tool exactly like a local conflict does — `success: false` with the
+/// remote's actual current revision, not a JSON-RPC error the caller would have to unwrap.
+#[tokio::test]
+async fn coordination_claim_revision_conflict_via_remote_fallback() {
+    let local_dir = TempDir::new().unwrap();
+    let hub_dir = TempDir::new().unwrap();
+    let hub_addr = spawn_server(&hub_dir).await;
+    let hub_url = format!("http://{hub_addr}");
+
+    let hub_client = RemoteClient::new(RemoteEndpoint {
+        name: "hub".to_owned(),
+        base_url: hub_url.clone(),
+        token: Some(TEST_TOKEN.to_owned()),
+        timeout: Duration::from_secs(5),
+    })
+    .unwrap();
+    let hub_task = hub_client
+        .coordination_task_create(mempalace_federation::NewTaskRequest {
+            title: "claim conflict test".to_owned(),
+            description: "d".to_owned(),
+            wing: "wing_conflict".to_owned(),
+            idempotency_key: "e2e-conflict-1".to_owned(),
+            created_by: None,
+            parent_id: None,
+            dependencies: Vec::new(),
+            budget: None,
+            expires_at: None,
+        })
+        .await
+        .unwrap();
+
+    // `default_mode: Combined` — coordination federation must be configured for the ID
+    // fallback to run at all (see
+    // `coordination_fallback_records_zero_remote_calls_without_coordination_federation_config`
+    // in `crates/mempalace-mcp/src/federation.rs`).
+    let server = mcp_server_with_hub_coordination(
+        &local_dir,
+        &hub_url,
+        BTreeMap::new(),
+        BTreeMap::new(),
+        RouteMode::Combined,
+    )
+    .await;
+
+    // First claim, at the correct revision 0, is discovered on the hub and succeeds.
+    let claimed = call_tool(
+        &server,
+        1,
+        "mempalace_task_claim",
+        json!({
+            "task_id": hub_task.task_id,
+            "worker": "worker-1",
+            "expected_revision": 0,
+            "lease_seconds": 300,
+        }),
+    )
+    .await;
+    assert_eq!(
+        claimed["success"], true,
+        "first claim at the right revision must succeed: {claimed}"
+    );
+    assert_eq!(claimed["applied_to"], "remote:hub");
+
+    // Renewing at the now-stale revision 0 must come back as a typed conflict, not an error.
+    let conflict = call_tool(
+        &server,
+        2,
+        "mempalace_task_renew",
+        json!({
+            "task_id": hub_task.task_id,
+            "worker": "worker-1",
+            "expected_revision": 0,
+            "lease_seconds": 300,
+        }),
+    )
+    .await;
+    assert_eq!(conflict["success"], false, "stale revision must report success=false: {conflict}");
+    assert_eq!(
+        conflict["conflict"]["actual_revision"], 1,
+        "conflict must carry the hub's real current revision: {conflict}"
+    );
+}
+
+/// The coordination-events feed fans out to every coordination *candidate* remote
+/// independently — a down candidate is reported as unreachable, while a healthy one alongside it
+/// still returns its events, matching the `{unreachable, error}` isolation contract
+/// `changes_fanout` already guarantees for the generic change feed.
+///
+/// Coordination federation must be explicitly configured for the fan-out to run at all (see
+/// `FederationRouter::coordination_federation_enabled` and the aggregate-fan-out gate inside
+/// `coordination_events_fanout`/`coordination_inbox_fanout` themselves) — this test used to pass
+/// `RouteMode::Local` with an empty `coordination_rules` table here, which is precisely the
+/// "coordination federates with zero coordination configuration" shape that gate now closes, so
+/// it stopped exercising the isolation contract this test exists to check (both `hub` and `down`
+/// started reporting nothing at all). Pinning `wing_fanout` to `remote` in `coordination_rules`
+/// opts coordination in explicitly, the way a real operator would, while leaving the isolation
+/// behaviour under test unchanged.
+///
+/// PR #120 review, finding 1(a): the fan-outs were later narrowed to query only
+/// `coordination_candidate_remotes()`, not every configured remote — a remote never named by any
+/// `federation.coordination` rule (e.g. one wired up only for drawer/KG federation) is now
+/// skipped entirely rather than probed. `down` must therefore be named by a coordination rule of
+/// its own (`wing_fanout_down`, unrelated to the wing actually queried below — the candidate set
+/// is the union across every wing's rule, not just the requested one) for this test to still
+/// exercise "a down *candidate* is isolated, not the whole call" rather than accidentally
+/// degenerating into "a non-candidate is never contacted", which is
+/// `inbox_read_and_coordination_events_fanout_only_contact_the_coordination_candidate`'s job in
+/// `crates/mempalace-mcp/src/lib.rs`, not this test's.
+#[tokio::test]
+async fn coordination_events_fanout_with_one_remote_down_still_returns_the_healthy_one() {
+    let local_dir = TempDir::new().unwrap();
+    let hub_dir = TempDir::new().unwrap();
+    let hub_addr = spawn_server(&hub_dir).await;
+    let hub_url = format!("http://{hub_addr}");
+
+    // A dead address for the second remote — nothing is listening.
+    let dead_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let dead_addr = dead_listener.local_addr().unwrap();
+    drop(dead_listener);
+    let down_url = format!("http://{dead_addr}");
+
+    let hub_client = RemoteClient::new(RemoteEndpoint {
+        name: "hub".to_owned(),
+        base_url: hub_url.clone(),
+        token: Some(TEST_TOKEN.to_owned()),
+        timeout: Duration::from_secs(5),
+    })
+    .unwrap();
+    hub_client
+        .coordination_task_create(mempalace_federation::NewTaskRequest {
+            title: "fanout test".to_owned(),
+            description: "d".to_owned(),
+            wing: "wing_fanout".to_owned(),
+            idempotency_key: "e2e-fanout-1".to_owned(),
+            created_by: None,
+            parent_id: None,
+            dependencies: Vec::new(),
+            budget: None,
+            expires_at: None,
+        })
+        .await
+        .unwrap();
+
+    let mut coordination_rules = BTreeMap::new();
+    coordination_rules.insert(
+        "wing_fanout".to_owned(),
+        ResolvedRouteRule { mode: RouteMode::Remote, remote: Some("hub".to_owned()), write: WriteTarget::Remote },
+    );
+    // `down` must also be a coordination candidate (named by some wing's rule — any wing,
+    // since the candidate set is the union across all of them) or the aggregate fan-outs'
+    // candidate-narrowing fix (PR #120 review, finding 1a) skips it entirely, and this test
+    // would stop exercising "a down candidate is isolated" at all.
+    coordination_rules.insert(
+        "wing_fanout_down".to_owned(),
+        ResolvedRouteRule { mode: RouteMode::Remote, remote: Some("down".to_owned()), write: WriteTarget::Remote },
+    );
+    let server = mcp_server_with_hub_multi(
+        &local_dir,
+        &[("hub", &hub_url), ("down", &down_url)],
+        BTreeMap::new(),
+        coordination_rules,
+        RouteMode::Local,
+    )
+    .await;
+
+    let response =
+        call_tool(&server, 1, "mempalace_coordination_events", json!({"wing": "wing_fanout"}))
+            .await;
+
+    let remote_events = response.get("remote_events").expect("remote_events must be present");
+    assert_eq!(
+        remote_events["down"]["unreachable"], true,
+        "the down remote must be reported unreachable, not fail the whole call: {remote_events}"
+    );
+    let hub_events = remote_events["hub"]["events"].as_array().expect("hub must return events");
+    assert!(
+        !hub_events.is_empty(),
+        "the healthy remote must still return its events despite the other being down: {remote_events}"
+    );
+    assert!(
+        hub_events.iter().all(|e| e["origin"] == "remote:hub"),
+        "hub events must be annotated with origin: {hub_events:?}"
+    );
+}
+
+/// Regression for Codex finding 3832912235: `mempalace_coordination_events` reads a per-remote
+/// `remote_cursors` argument (`parse_cursors_arg`) to continue a federated fan-out page, but
+/// until now its `input_schema` never declared the field — a schema-driven client had no way to
+/// send it back, so every call restarted the hub's paging from the beginning. This proves the
+/// round trip actually works end to end, not just that the schema mentions the field: a real
+/// `next_cursor` taken out of page 1 is fed back as `remote_cursors.hub` and must yield a
+/// disjoint page 2, not a repeat of page 1.
+#[tokio::test]
+async fn coordination_events_remote_cursors_round_trip_paginates_without_repeats() {
+    let local_dir = TempDir::new().unwrap();
+    let hub_dir = TempDir::new().unwrap();
+    let hub_addr = spawn_server(&hub_dir).await;
+    let hub_url = format!("http://{hub_addr}");
+
+    let hub_client = RemoteClient::new(RemoteEndpoint {
+        name: "hub".to_owned(),
+        base_url: hub_url.clone(),
+        token: Some(TEST_TOKEN.to_owned()),
+        timeout: Duration::from_secs(5),
+    })
+    .unwrap();
+    let hub_task = hub_client
+        .coordination_task_create(mempalace_federation::NewTaskRequest {
+            title: "events cursor pagination".to_owned(),
+            description: "d".to_owned(),
+            wing: "wing_events_pages".to_owned(),
+            idempotency_key: "e2e-events-pages-task".to_owned(),
+            created_by: None,
+            parent_id: None,
+            dependencies: Vec::new(),
+            budget: None,
+            expires_at: None,
+        })
+        .await
+        .unwrap();
+    // Task creation already emitted one event; two more messages bring the total to 3, so a
+    // limit=2 first page leaves exactly one event for the second page.
+    for i in 0..2 {
+        hub_client
+            .coordination_message_send(mempalace_federation::NewMessageRequest {
+                task_id: hub_task.task_id.clone(),
+                recipient: "worker-1".to_owned(),
+                kind: "status".to_owned(),
+                payload: json!({"i": i}),
+                idempotency_key: format!("e2e-events-pages-message-{i}"),
+                sender: None,
+                envelope_version: 1,
+            })
+            .await
+            .unwrap();
+    }
+
+    let mut coordination_rules = BTreeMap::new();
+    coordination_rules.insert(
+        "wing_events_pages".to_owned(),
+        ResolvedRouteRule { mode: RouteMode::Remote, remote: Some("hub".to_owned()), write: WriteTarget::Remote },
+    );
+    let server = mcp_server_with_hub_coordination(
+        &local_dir,
+        &hub_url,
+        BTreeMap::new(),
+        coordination_rules,
+        RouteMode::Local,
+    )
+    .await;
+
+    let page1 = call_tool(
+        &server,
+        1,
+        "mempalace_coordination_events",
+        json!({"wing": "wing_events_pages", "limit": 2}),
+    )
+    .await;
+    let page1_remote = page1.get("remote_events").expect("remote_events must be present on page 1");
+    let page1_events =
+        page1_remote["hub"]["events"].as_array().expect("hub must return events on page 1");
+    assert_eq!(page1_events.len(), 2, "first page must return exactly 2 events: {page1_events:?}");
+    let page1_ids: Vec<&str> =
+        page1_events.iter().filter_map(|e| e["event_id"].as_str()).collect();
+    let hub_cursor1 = page1_remote["hub"]["next_cursor"]
+        .as_str()
+        .expect("remote_events.hub.next_cursor must be a string when more events remain")
+        .to_owned();
+
+    let page2 = call_tool(
+        &server,
+        2,
+        "mempalace_coordination_events",
+        json!({
+            "wing": "wing_events_pages",
+            "limit": 2,
+            "remote_cursors": {"hub": hub_cursor1},
+        }),
+    )
+    .await;
+    let page2_remote = page2.get("remote_events").expect("remote_events must be present on page 2");
+    let page2_events =
+        page2_remote["hub"]["events"].as_array().expect("hub must return events on page 2");
+    assert_eq!(
+        page2_events.len(),
+        1,
+        "second page must return the one remaining event: {page2_events:?}"
+    );
+    let page2_ids: Vec<&str> =
+        page2_events.iter().filter_map(|e| e["event_id"].as_str()).collect();
+    assert_ne!(
+        page1_ids, page2_ids,
+        "feeding remote_cursors back must not repeat the first page's events"
+    );
+    for id in &page2_ids {
+        assert!(
+            !page1_ids.contains(id),
+            "event {id} appeared on both pages — remote_cursors round trip did not advance"
+        );
+    }
+    assert!(
+        page2_remote["hub"]["next_cursor"].is_null(),
+        "no events remain after page 2: {page2_remote}"
+    );
+}
+
+/// Companion to the events round trip above, for `mempalace_inbox_read`'s equally undeclared
+/// `remote_cursors` field. Two messages addressed to the same recipient on the hub; a limit=1
+/// first page followed by the real `next_cursor` fed back must reach the second, different
+/// message rather than repeating the first.
+#[tokio::test]
+async fn coordination_inbox_remote_cursors_round_trip_paginates_without_repeats() {
+    let local_dir = TempDir::new().unwrap();
+    let hub_dir = TempDir::new().unwrap();
+    let hub_addr = spawn_server(&hub_dir).await;
+    let hub_url = format!("http://{hub_addr}");
+
+    let hub_client = RemoteClient::new(RemoteEndpoint {
+        name: "hub".to_owned(),
+        base_url: hub_url.clone(),
+        token: Some(TEST_TOKEN.to_owned()),
+        timeout: Duration::from_secs(5),
+    })
+    .unwrap();
+    let hub_task = hub_client
+        .coordination_task_create(mempalace_federation::NewTaskRequest {
+            title: "inbox cursor pagination".to_owned(),
+            description: "d".to_owned(),
+            wing: "wing_inbox_pages".to_owned(),
+            idempotency_key: "e2e-inbox-pages-task".to_owned(),
+            created_by: None,
+            parent_id: None,
+            dependencies: Vec::new(),
+            budget: None,
+            expires_at: None,
+        })
+        .await
+        .unwrap();
+    for i in 0..2 {
+        hub_client
+            .coordination_message_send(mempalace_federation::NewMessageRequest {
+                task_id: hub_task.task_id.clone(),
+                recipient: "worker-1".to_owned(),
+                kind: "status".to_owned(),
+                payload: json!({"i": i}),
+                idempotency_key: format!("e2e-inbox-pages-message-{i}"),
+                sender: None,
+                envelope_version: 1,
+            })
+            .await
+            .unwrap();
+    }
+
+    let mut coordination_rules = BTreeMap::new();
+    coordination_rules.insert(
+        "wing_inbox_pages".to_owned(),
+        ResolvedRouteRule { mode: RouteMode::Remote, remote: Some("hub".to_owned()), write: WriteTarget::Remote },
+    );
+    let server = mcp_server_with_hub_coordination(
+        &local_dir,
+        &hub_url,
+        BTreeMap::new(),
+        coordination_rules,
+        RouteMode::Local,
+    )
+    .await;
+
+    let page1 = call_tool(
+        &server,
+        1,
+        "mempalace_inbox_read",
+        json!({"recipient": "worker-1", "wing": "wing_inbox_pages", "limit": 1}),
+    )
+    .await;
+    let page1_remote =
+        page1.get("remote_messages").expect("remote_messages must be present on page 1");
+    let page1_messages =
+        page1_remote["hub"]["messages"].as_array().expect("hub must return messages on page 1");
+    assert_eq!(
+        page1_messages.len(),
+        1,
+        "first page must return exactly 1 message: {page1_messages:?}"
+    );
+    let page1_ids: Vec<&str> =
+        page1_messages.iter().filter_map(|m| m["message_id"].as_str()).collect();
+    let hub_cursor1 = page1_remote["hub"]["next_cursor"]
+        .as_str()
+        .expect("remote_messages.hub.next_cursor must be a string when more messages remain")
+        .to_owned();
+
+    let page2 = call_tool(
+        &server,
+        2,
+        "mempalace_inbox_read",
+        json!({
+            "recipient": "worker-1",
+            "wing": "wing_inbox_pages",
+            "limit": 1,
+            "remote_cursors": {"hub": hub_cursor1},
+        }),
+    )
+    .await;
+    let page2_remote =
+        page2.get("remote_messages").expect("remote_messages must be present on page 2");
+    let page2_messages =
+        page2_remote["hub"]["messages"].as_array().expect("hub must return messages on page 2");
+    assert_eq!(
+        page2_messages.len(),
+        1,
+        "second page must return the one remaining message: {page2_messages:?}"
+    );
+    let page2_ids: Vec<&str> =
+        page2_messages.iter().filter_map(|m| m["message_id"].as_str()).collect();
+    assert_ne!(
+        page1_ids, page2_ids,
+        "feeding remote_cursors back must not repeat the first page's message"
+    );
+    assert!(
+        page2_remote["hub"]["next_cursor"].is_null(),
+        "no messages remain after page 2: {page2_remote}"
+    );
+}
+
+// ─── Six ID-discovery fallback wrappers: field-plumbing coverage (PR #120 review) ─────
+//
+// `coordination_task_create`/`_get`/`_claim`, `coordination_events`/`_inbox` fanouts each have
+// e2e coverage above, but `mempalace_message_send`, `mempalace_message_acknowledge`,
+// `mempalace_artifact_put`, `mempalace_artifact_get`, `mempalace_result_put` and
+// `mempalace_result_get` do not — the unit tests in `federation.rs` exercise the *shared*
+// fallback-loop logic (error classification, candidate narrowing) generically, but nothing pins
+// these six thin wrappers' own field plumbing, e.g. that `coordination_message_ack_fallback`
+// forwards `actor` into `AckMessageRequest` correctly, or that `artifact_put`/`result_put`
+// forward their request bodies unchanged. Each test below asserts on the *values* the hub
+// actually stored and returned, not merely that the call succeeded — a wiring bug that dropped
+// or swapped a field would still produce `"success"`/`"found": true` in every case, so a
+// call-happened assertion would not catch it.
+
+/// `mempalace_message_send` falls back to the hub when the referenced task exists only there,
+/// and must forward `recipient` (stored verbatim) and `sender` (identity-resolved) unchanged —
+/// a dropped `sender` would silently resolve to the bare token identity instead of
+/// `{identity}:{claim}`, which this test would catch.
+#[tokio::test]
+async fn coordination_message_send_fallback_forwards_recipient_and_sender_fields() {
+    let local_dir = TempDir::new().unwrap();
+    let hub_dir = TempDir::new().unwrap();
+    let hub_addr = spawn_server(&hub_dir).await;
+    let hub_url = format!("http://{hub_addr}");
+
+    let hub_client = RemoteClient::new(RemoteEndpoint {
+        name: "hub".to_owned(),
+        base_url: hub_url.clone(),
+        token: Some(TEST_TOKEN.to_owned()),
+        timeout: Duration::from_secs(5),
+    })
+    .unwrap();
+    let hub_task = hub_client
+        .coordination_task_create(mempalace_federation::NewTaskRequest {
+            title: "message send fallback".to_owned(),
+            description: "d".to_owned(),
+            wing: "wing_msgsend".to_owned(),
+            idempotency_key: "e2e-msgsend-task".to_owned(),
+            created_by: None,
+            parent_id: None,
+            dependencies: Vec::new(),
+            budget: None,
+            expires_at: None,
+        })
+        .await
+        .unwrap();
+
+    let server = mcp_server_with_hub_coordination(
+        &local_dir,
+        &hub_url,
+        BTreeMap::new(),
+        BTreeMap::new(),
+        RouteMode::Combined,
+    )
+    .await;
+
+    let response = call_tool(
+        &server,
+        1,
+        "mempalace_message_send",
+        json!({
+            "task_id": hub_task.task_id,
+            "sender": "alice",
+            "recipient": "worker-9",
+            "kind": "status",
+            "payload": {"note": "hello from fallback"},
+            "idempotency_key": "e2e-msgsend-1",
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        response["recipient"], "worker-9",
+        "recipient must be forwarded verbatim through the fallback: {response}"
+    );
+    assert_eq!(
+        response["sender"], "e2e-fed-user:alice",
+        "sender must be identity-resolved from the claimed `alice`, not dropped or defaulted \
+         to the bare token identity: {response}"
+    );
+    assert_eq!(response["payload"]["note"], "hello from fallback");
+    assert_eq!(response["kind"], "status");
+
+    // Read it back from the hub directly to confirm the fallback actually persisted what it
+    // claims to have returned, not just echoed a locally-fabricated value.
+    let stored = hub_client
+        .coordination_message_get(response["message_id"].as_str().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(stored.recipient, "worker-9");
+    assert_eq!(stored.sender, "e2e-fed-user:alice");
+}
+
+/// `mempalace_message_acknowledge` falls back to the hub for a message that exists only there,
+/// and must forward `actor` through `resolve_ack_actor` correctly: an actor claim equal to the
+/// message's own `recipient` must be stored bare, not identity-prefixed — proving
+/// `coordination_message_ack_fallback` actually carries the caller's `actor` argument into
+/// `AckMessageRequest`, rather than e.g. leaving it `None` (which would resolve to the bare
+/// token identity, not `worker-9`, and this test would catch that divergence).
+#[tokio::test]
+async fn coordination_message_ack_fallback_forwards_actor_field() {
+    let local_dir = TempDir::new().unwrap();
+    let hub_dir = TempDir::new().unwrap();
+    let hub_addr = spawn_server(&hub_dir).await;
+    let hub_url = format!("http://{hub_addr}");
+
+    let hub_client = RemoteClient::new(RemoteEndpoint {
+        name: "hub".to_owned(),
+        base_url: hub_url.clone(),
+        token: Some(TEST_TOKEN.to_owned()),
+        timeout: Duration::from_secs(5),
+    })
+    .unwrap();
+    let hub_task = hub_client
+        .coordination_task_create(mempalace_federation::NewTaskRequest {
+            title: "message ack fallback".to_owned(),
+            description: "d".to_owned(),
+            wing: "wing_msgack".to_owned(),
+            idempotency_key: "e2e-msgack-task".to_owned(),
+            created_by: None,
+            parent_id: None,
+            dependencies: Vec::new(),
+            budget: None,
+            expires_at: None,
+        })
+        .await
+        .unwrap();
+    let hub_message = hub_client
+        .coordination_message_send(mempalace_federation::NewMessageRequest {
+            task_id: hub_task.task_id.clone(),
+            recipient: "worker-9".to_owned(),
+            kind: "status".to_owned(),
+            payload: json!({}),
+            idempotency_key: "e2e-msgack-msg".to_owned(),
+            sender: None,
+            envelope_version: 1,
+        })
+        .await
+        .unwrap();
+
+    let server = mcp_server_with_hub_coordination(
+        &local_dir,
+        &hub_url,
+        BTreeMap::new(),
+        BTreeMap::new(),
+        RouteMode::Combined,
+    )
+    .await;
+
+    let response = call_tool(
+        &server,
+        1,
+        "mempalace_message_acknowledge",
+        json!({"message_id": hub_message.message_id, "actor": "worker-9"}),
+    )
+    .await;
+
+    assert_eq!(
+        response["acknowledged_by"], "worker-9",
+        "the acknowledging actor must be forwarded and stored bare (it equals the message's \
+         own recipient), not dropped or identity-prefixed: {response}"
+    );
+    assert!(
+        response["acknowledged_at"].is_string(),
+        "acknowledgement must record a timestamp: {response}"
+    );
+
+    let stored = hub_client.coordination_message_get(&hub_message.message_id).await.unwrap();
+    assert_eq!(stored.acknowledged_by.as_deref(), Some("worker-9"));
+}
+
+/// `mempalace_artifact_put` falls back to the hub when the referenced task exists only there,
+/// and must forward `role`, `media_type` and `content` unchanged.
+#[tokio::test]
+async fn coordination_artifact_put_fallback_forwards_request_body() {
+    let local_dir = TempDir::new().unwrap();
+    let hub_dir = TempDir::new().unwrap();
+    let hub_addr = spawn_server(&hub_dir).await;
+    let hub_url = format!("http://{hub_addr}");
+
+    let hub_client = RemoteClient::new(RemoteEndpoint {
+        name: "hub".to_owned(),
+        base_url: hub_url.clone(),
+        token: Some(TEST_TOKEN.to_owned()),
+        timeout: Duration::from_secs(5),
+    })
+    .unwrap();
+    let hub_task = hub_client
+        .coordination_task_create(mempalace_federation::NewTaskRequest {
+            title: "artifact put fallback".to_owned(),
+            description: "d".to_owned(),
+            wing: "wing_artput".to_owned(),
+            idempotency_key: "e2e-artput-task".to_owned(),
+            created_by: None,
+            parent_id: None,
+            dependencies: Vec::new(),
+            budget: None,
+            expires_at: None,
+        })
+        .await
+        .unwrap();
+
+    let server = mcp_server_with_hub_coordination(
+        &local_dir,
+        &hub_url,
+        BTreeMap::new(),
+        BTreeMap::new(),
+        RouteMode::Combined,
+    )
+    .await;
+
+    let response = call_tool(
+        &server,
+        1,
+        "mempalace_artifact_put",
+        json!({
+            "task_id": hub_task.task_id,
+            "created_by": "alice",
+            "role": "output",
+            "media_type": "text/plain",
+            "content": "the artifact body",
+            "idempotency_key": "e2e-artput-1",
+        }),
+    )
+    .await;
+
+    assert_eq!(response["role"], "output", "role must be forwarded unchanged: {response}");
+    assert_eq!(
+        response["media_type"], "text/plain",
+        "media_type must be forwarded unchanged: {response}"
+    );
+    assert_eq!(
+        response["content"], "the artifact body",
+        "content must be forwarded unchanged: {response}"
+    );
+    assert_eq!(response["created_by"], "e2e-fed-user:alice");
+
+    let stored = hub_client
+        .coordination_artifact_get(response["artifact_id"].as_str().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(stored.content, "the artifact body");
+    assert_eq!(stored.role, "output");
+    assert_eq!(stored.media_type, "text/plain");
+}
+
+/// `mempalace_artifact_get` falls back to the hub for an artifact that exists only there, and
+/// must return its actual field values (not just `found: true`).
+#[tokio::test]
+async fn coordination_artifact_get_fallback_returns_correct_fields() {
+    let local_dir = TempDir::new().unwrap();
+    let hub_dir = TempDir::new().unwrap();
+    let hub_addr = spawn_server(&hub_dir).await;
+    let hub_url = format!("http://{hub_addr}");
+
+    let hub_client = RemoteClient::new(RemoteEndpoint {
+        name: "hub".to_owned(),
+        base_url: hub_url.clone(),
+        token: Some(TEST_TOKEN.to_owned()),
+        timeout: Duration::from_secs(5),
+    })
+    .unwrap();
+    let hub_task = hub_client
+        .coordination_task_create(mempalace_federation::NewTaskRequest {
+            title: "artifact get fallback".to_owned(),
+            description: "d".to_owned(),
+            wing: "wing_artget".to_owned(),
+            idempotency_key: "e2e-artget-task".to_owned(),
+            created_by: None,
+            parent_id: None,
+            dependencies: Vec::new(),
+            budget: None,
+            expires_at: None,
+        })
+        .await
+        .unwrap();
+    let hub_artifact = hub_client
+        .coordination_artifact_put(mempalace_federation::NewArtifactRequest {
+            task_id: hub_task.task_id.clone(),
+            role: "log".to_owned(),
+            media_type: "application/json".to_owned(),
+            content: r#"{"k":"v"}"#.to_owned(),
+            idempotency_key: "e2e-artget-artifact".to_owned(),
+            created_by: None,
+        })
+        .await
+        .unwrap();
+
+    let server = mcp_server_with_hub_coordination(
+        &local_dir,
+        &hub_url,
+        BTreeMap::new(),
+        BTreeMap::new(),
+        RouteMode::Combined,
+    )
+    .await;
+
+    let response = call_tool(
+        &server,
+        1,
+        "mempalace_artifact_get",
+        json!({"artifact_id": hub_artifact.artifact_id}),
+    )
+    .await;
+
+    assert_eq!(response["found"], true, "must find the artifact via remote fallback: {response}");
+    assert_eq!(response["value"]["role"], "log");
+    assert_eq!(response["value"]["media_type"], "application/json");
+    assert_eq!(response["value"]["content"], r#"{"k":"v"}"#);
+    assert_eq!(response["value"]["origin"], "remote:hub");
+}
+
+/// `mempalace_result_put` falls back to the hub when the referenced task exists only there, and
+/// must forward the (nested) `payload` body unchanged.
+#[tokio::test]
+async fn coordination_result_put_fallback_forwards_payload() {
+    let local_dir = TempDir::new().unwrap();
+    let hub_dir = TempDir::new().unwrap();
+    let hub_addr = spawn_server(&hub_dir).await;
+    let hub_url = format!("http://{hub_addr}");
+
+    let hub_client = RemoteClient::new(RemoteEndpoint {
+        name: "hub".to_owned(),
+        base_url: hub_url.clone(),
+        token: Some(TEST_TOKEN.to_owned()),
+        timeout: Duration::from_secs(5),
+    })
+    .unwrap();
+    let hub_task = hub_client
+        .coordination_task_create(mempalace_federation::NewTaskRequest {
+            title: "result put fallback".to_owned(),
+            description: "d".to_owned(),
+            wing: "wing_resput".to_owned(),
+            idempotency_key: "e2e-resput-task".to_owned(),
+            created_by: None,
+            parent_id: None,
+            dependencies: Vec::new(),
+            budget: None,
+            expires_at: None,
+        })
+        .await
+        .unwrap();
+
+    let server = mcp_server_with_hub_coordination(
+        &local_dir,
+        &hub_url,
+        BTreeMap::new(),
+        BTreeMap::new(),
+        RouteMode::Combined,
+    )
+    .await;
+
+    let response = call_tool(
+        &server,
+        1,
+        "mempalace_result_put",
+        json!({
+            "task_id": hub_task.task_id,
+            "created_by": "alice",
+            "payload": {"status": "ok", "nested": {"count": 3}},
+            "idempotency_key": "e2e-resput-1",
+        }),
+    )
+    .await;
+
+    assert_eq!(response["payload"]["status"], "ok", "payload must be forwarded unchanged: {response}");
+    assert_eq!(
+        response["payload"]["nested"]["count"], 3,
+        "nested payload fields must survive the fallback unchanged: {response}"
+    );
+    assert_eq!(response["created_by"], "e2e-fed-user:alice");
+
+    let stored = hub_client
+        .coordination_result_get(response["result_id"].as_str().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(stored.payload["status"], "ok");
+    assert_eq!(stored.payload["nested"]["count"], 3);
+}
+
+/// `mempalace_result_get` falls back to the hub for a result that exists only there, and must
+/// return its actual payload (not just `found: true`).
+#[tokio::test]
+async fn coordination_result_get_fallback_returns_correct_payload() {
+    let local_dir = TempDir::new().unwrap();
+    let hub_dir = TempDir::new().unwrap();
+    let hub_addr = spawn_server(&hub_dir).await;
+    let hub_url = format!("http://{hub_addr}");
+
+    let hub_client = RemoteClient::new(RemoteEndpoint {
+        name: "hub".to_owned(),
+        base_url: hub_url.clone(),
+        token: Some(TEST_TOKEN.to_owned()),
+        timeout: Duration::from_secs(5),
+    })
+    .unwrap();
+    let hub_task = hub_client
+        .coordination_task_create(mempalace_federation::NewTaskRequest {
+            title: "result get fallback".to_owned(),
+            description: "d".to_owned(),
+            wing: "wing_resget".to_owned(),
+            idempotency_key: "e2e-resget-task".to_owned(),
+            created_by: None,
+            parent_id: None,
+            dependencies: Vec::new(),
+            budget: None,
+            expires_at: None,
+        })
+        .await
+        .unwrap();
+    let hub_result = hub_client
+        .coordination_result_put(mempalace_federation::NewTaskResultRequest {
+            task_id: hub_task.task_id.clone(),
+            payload: json!({"status": "done", "value": 42}),
+            idempotency_key: "e2e-resget-result".to_owned(),
+            created_by: None,
+        })
+        .await
+        .unwrap();
+
+    let server = mcp_server_with_hub_coordination(
+        &local_dir,
+        &hub_url,
+        BTreeMap::new(),
+        BTreeMap::new(),
+        RouteMode::Combined,
+    )
+    .await;
+
+    let response = call_tool(
+        &server,
+        1,
+        "mempalace_result_get",
+        json!({"result_id": hub_result.result_id}),
+    )
+    .await;
+
+    assert_eq!(response["found"], true, "must find the result via remote fallback: {response}");
+    assert_eq!(response["value"]["payload"]["status"], "done");
+    assert_eq!(response["value"]["payload"]["value"], 42);
+    assert_eq!(response["value"]["origin"], "remote:hub");
 }

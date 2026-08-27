@@ -1,16 +1,24 @@
 //! [`RemoteClient`] — concrete reqwest-backed implementation of [`RemoteApi`].
 
 use mempalace_federation::{
-    AddDrawerRequest, AddDrawerResponse, ChangesQuery, ChangesResponse, CheckDuplicateRequest,
-    CheckDuplicateResponse, DrawerSearchRequest, DrawerSearchResponse, ErrorBody,
-    FEDERATION_API_VERSION, InfoResponse, IngestBatchRequest, IngestBatchResponse,
-    KgAddFactRequest, KgInvalidateRequest, KgQueryRequest, ListDrawersQuery, ListDrawersResponse,
+    AckMessageRequest, AddDrawerRequest, AddDrawerResponse, ChangesQuery, ChangesResponse,
+    CheckDuplicateRequest, CheckDuplicateResponse, CoordinationArtifactDto,
+    CoordinationEventsQuery, CoordinationEventsResponse, CoordinationMessageDto,
+    CoordinationTaskDto, CoordinationTaskResultDto, DrawerSearchRequest, DrawerSearchResponse,
+    ErrorBody, FEDERATION_API_VERSION, InboxPageResponse, InboxQuery, InfoResponse,
+    IngestBatchRequest, IngestBatchResponse, KgAddFactRequest, KgInvalidateRequest, KgQueryRequest,
+    ListDrawersQuery, ListDrawersResponse, NewArtifactRequest, NewMessageRequest, NewTaskRequest,
+    NewTaskResultRequest, TaskLeaseRequest, TransitionTaskRequest,
 };
 
 use crate::{
-    RemoteApi, RemoteEndpoint,
+    RemoteApi, RemoteEndpoint, RemoteRevisionedWrite,
     error::{RemoteError, Result},
 };
+
+/// Capability string a remote must advertise on `GET /v1/info` before this client will attempt
+/// any `/v1/coordination/*` route (issue #102 Stage 3/4).
+const COORDINATION_CAPABILITY: &str = "coordination";
 
 /// Maximum body length (in bytes) included verbatim in [`RemoteError::RemoteRejected`].
 ///
@@ -127,18 +135,15 @@ impl RemoteClient {
         Ok(info)
     }
 
-    /// Send a prepared [`reqwest::RequestBuilder`], inject auth, and decode the
-    /// response body as `T`.
-    ///
-    /// Error classification:
-    /// - Network/timeout failures → [`RemoteError::Unreachable`]
-    /// - HTTP 401 → [`RemoteError::Unauthorized`]
-    /// - Other non-2xx → [`RemoteError::RemoteRejected`] (body included)
-    /// - 2xx with bad JSON → [`RemoteError::InvalidResponse`]
-    async fn execute<T: serde::de::DeserializeOwned>(
+    /// Send a prepared [`reqwest::RequestBuilder`] with auth injected, and read the full
+    /// response body with a size cap (tighter for error responses than for success, since the
+    /// server controls the success schema but an error body from a misbehaving proxy could be
+    /// arbitrarily large). Shared by [`Self::execute`] and [`Self::execute_revisioned`] so the
+    /// two only diverge in how they classify a non-2xx status, not in how bytes are read.
+    async fn send_and_read(
         &self,
         rb: reqwest::RequestBuilder,
-    ) -> Result<T> {
+    ) -> Result<(reqwest::StatusCode, Vec<u8>)> {
         let rb = match &self.token {
             Some(tok) => rb.bearer_auth(tok),
             None => rb,
@@ -151,8 +156,6 @@ impl RemoteClient {
 
         let status = response.status();
 
-        // Read the full body with a size cap to prevent peer OOM (both success
-        // and error paths re-use these bytes).
         let mut bytes = Vec::new();
         let mut response = response;
         while let Some(chunk) = response.chunk().await.map_err(|e| RemoteError::Unreachable {
@@ -160,42 +163,118 @@ impl RemoteClient {
             message: e.to_string(),
         })? {
             bytes.extend_from_slice(&chunk);
-            // For error responses use a tighter limit; for success the full
-            // cap is safe because the server controls the schema.
             let cap = if status.is_success() { MAX_RESPONSE_BYTES } else { MAX_ERROR_BODY };
             if bytes.len() >= cap {
                 break;
             }
         }
+        Ok((status, bytes))
+    }
+
+    /// Classifies a non-2xx, non-401 response into [`RemoteError::RemoteRejected`], decoding an
+    /// [`ErrorBody`] when present so the message is `"{code}: {message}"` rather than raw JSON.
+    fn remote_rejected(&self, status: reqwest::StatusCode, bytes: &[u8]) -> RemoteError {
+        let raw = String::from_utf8_lossy(bytes).into_owned();
+        let body = if let Ok(err_body) = serde_json::from_str::<ErrorBody>(&raw) {
+            format!("{}: {}", err_body.code, err_body.message)
+        } else if raw.len() > MAX_ERROR_BODY {
+            let mut cut = MAX_ERROR_BODY;
+            while !raw.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            format!("{}… (truncated)", &raw[..cut])
+        } else {
+            raw
+        };
+        RemoteError::RemoteRejected { remote: self.name.clone(), status: status.as_u16(), body }
+    }
+
+    /// Send a prepared [`reqwest::RequestBuilder`], inject auth, and decode the
+    /// response body as `T`.
+    ///
+    /// Error classification:
+    /// - Network/timeout failures → [`RemoteError::Unreachable`]
+    /// - HTTP 401 → [`RemoteError::Unauthorized`]
+    /// - Other non-2xx → [`RemoteError::RemoteRejected`] (body included)
+    /// - 2xx with bad JSON → [`RemoteError::InvalidResponse`]
+    async fn execute<T: serde::de::DeserializeOwned>(
+        &self,
+        rb: reqwest::RequestBuilder,
+    ) -> Result<T> {
+        let (status, bytes) = self.send_and_read(rb).await?;
 
         if status == reqwest::StatusCode::UNAUTHORIZED {
             return Err(RemoteError::Unauthorized { remote: self.name.clone() });
         }
 
         if !status.is_success() {
-            let raw = String::from_utf8_lossy(&bytes).into_owned();
-            let body = if let Ok(err_body) = serde_json::from_str::<ErrorBody>(&raw) {
-                format!("{}: {}", err_body.code, err_body.message)
-            } else if raw.len() > MAX_ERROR_BODY {
-                let mut cut = MAX_ERROR_BODY;
-                while !raw.is_char_boundary(cut) {
-                    cut -= 1;
-                }
-                format!("{}… (truncated)", &raw[..cut])
-            } else {
-                raw
-            };
-            return Err(RemoteError::RemoteRejected {
-                remote: self.name.clone(),
-                status: status.as_u16(),
-                body,
-            });
+            return Err(self.remote_rejected(status, &bytes));
         }
 
         serde_json::from_slice(&bytes).map_err(|e| RemoteError::InvalidResponse {
             remote: self.name.clone(),
             message: e.to_string(),
         })
+    }
+
+    /// Like [`Self::execute`], but a `409` body whose `code` is `"revision_conflict"` decodes
+    /// into `Ok(RemoteRevisionedWrite::Conflict)` carrying the remote's `actual_revision`,
+    /// instead of an `Err` — the wire counterpart of how
+    /// `mempalace_storage::CoordinationStore::claim_task`/`renew_lease`/`transition_task` report
+    /// the same conflict locally (Phase 3 Stage 4). A `409 coordination_conflict` (no revision
+    /// pair — a live lease held by someone else, a terminal task, an invalid transition) has
+    /// nothing this shape can carry and falls through to the ordinary `RemoteRejected`
+    /// classification, same as any other non-2xx status.
+    async fn execute_revisioned<T: serde::de::DeserializeOwned>(
+        &self,
+        rb: reqwest::RequestBuilder,
+    ) -> Result<RemoteRevisionedWrite<T>> {
+        let (status, bytes) = self.send_and_read(rb).await?;
+
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(RemoteError::Unauthorized { remote: self.name.clone() });
+        }
+
+        if status == reqwest::StatusCode::CONFLICT {
+            #[derive(serde::Deserialize)]
+            struct ConflictBody {
+                code: String,
+                #[serde(default)]
+                actual_revision: Option<i64>,
+            }
+            if let Ok(conflict) = serde_json::from_slice::<ConflictBody>(&bytes)
+                && conflict.code == "revision_conflict"
+            {
+                return Ok(RemoteRevisionedWrite::Conflict {
+                    actual_revision: conflict.actual_revision,
+                });
+            }
+        }
+
+        if !status.is_success() {
+            return Err(self.remote_rejected(status, &bytes));
+        }
+
+        serde_json::from_slice(&bytes).map(RemoteRevisionedWrite::Applied).map_err(|e| {
+            RemoteError::InvalidResponse { remote: self.name.clone(), message: e.to_string() }
+        })
+    }
+
+    /// Ensures the cached `/v1/info` handshake has run and the remote advertises
+    /// `"coordination"` (issue #102 Stage 3). Every coordination method calls this before
+    /// sending its request — cheap, since [`Self::ensure_handshake`] caches the result in a
+    /// `OnceCell` that every other method already populates on first use, so this costs nothing
+    /// beyond the handshake every call already pays for.
+    async fn ensure_coordination_capability(&self) -> Result<()> {
+        let info = self.ensure_handshake().await?;
+        if info.capabilities.iter().any(|c| c == COORDINATION_CAPABILITY) {
+            Ok(())
+        } else {
+            Err(RemoteError::CapabilityMissing {
+                remote: self.name.clone(),
+                capability: COORDINATION_CAPABILITY.to_owned(),
+            })
+        }
     }
 }
 
@@ -353,6 +432,157 @@ impl RemoteApi for RemoteClient {
         let rb = self.http.post(url).json(&req);
         self.execute(rb).await
     }
+
+    /// Create a task (`POST /v1/coordination/tasks`).
+    async fn coordination_task_create(&self, req: NewTaskRequest) -> Result<CoordinationTaskDto> {
+        self.ensure_coordination_capability().await?;
+        let url = self.url("v1/coordination/tasks")?;
+        let rb = self.http.post(url).json(&req);
+        self.execute(rb).await
+    }
+
+    /// Get one task by exact ID (`GET /v1/coordination/tasks/{id}`).
+    async fn coordination_task_get(&self, task_id: &str) -> Result<CoordinationTaskDto> {
+        self.ensure_coordination_capability().await?;
+        let path = format!("v1/coordination/tasks/{task_id}");
+        let url = self.url(&path)?;
+        let rb = self.http.get(url);
+        self.execute(rb).await
+    }
+
+    /// Claim a task, or reclaim an expired lease (`POST /v1/coordination/tasks/{id}/claim`).
+    async fn coordination_task_claim(
+        &self,
+        task_id: &str,
+        req: TaskLeaseRequest,
+    ) -> Result<RemoteRevisionedWrite<CoordinationTaskDto>> {
+        self.ensure_coordination_capability().await?;
+        let path = format!("v1/coordination/tasks/{task_id}/claim");
+        let url = self.url(&path)?;
+        let rb = self.http.post(url).json(&req);
+        self.execute_revisioned(rb).await
+    }
+
+    /// Renew a live lease (`POST /v1/coordination/tasks/{id}/renew`).
+    async fn coordination_task_renew(
+        &self,
+        task_id: &str,
+        req: TaskLeaseRequest,
+    ) -> Result<RemoteRevisionedWrite<CoordinationTaskDto>> {
+        self.ensure_coordination_capability().await?;
+        let path = format!("v1/coordination/tasks/{task_id}/renew");
+        let url = self.url(&path)?;
+        let rb = self.http.post(url).json(&req);
+        self.execute_revisioned(rb).await
+    }
+
+    /// Transition a task's lifecycle state (`POST /v1/coordination/tasks/{id}/transition`).
+    async fn coordination_task_transition(
+        &self,
+        task_id: &str,
+        req: TransitionTaskRequest,
+    ) -> Result<RemoteRevisionedWrite<CoordinationTaskDto>> {
+        self.ensure_coordination_capability().await?;
+        let path = format!("v1/coordination/tasks/{task_id}/transition");
+        let url = self.url(&path)?;
+        let rb = self.http.post(url).json(&req);
+        self.execute_revisioned(rb).await
+    }
+
+    /// Send an addressed message (`POST /v1/coordination/messages`).
+    async fn coordination_message_send(
+        &self,
+        req: NewMessageRequest,
+    ) -> Result<CoordinationMessageDto> {
+        self.ensure_coordination_capability().await?;
+        let url = self.url("v1/coordination/messages")?;
+        let rb = self.http.post(url).json(&req);
+        self.execute(rb).await
+    }
+
+    /// Get one message by exact ID (`GET /v1/coordination/messages/{id}`).
+    async fn coordination_message_get(&self, message_id: &str) -> Result<CoordinationMessageDto> {
+        self.ensure_coordination_capability().await?;
+        let path = format!("v1/coordination/messages/{message_id}");
+        let url = self.url(&path)?;
+        let rb = self.http.get(url);
+        self.execute(rb).await
+    }
+
+    /// Acknowledge a message (`POST /v1/coordination/messages/{id}/ack`).
+    async fn coordination_message_ack(
+        &self,
+        message_id: &str,
+        req: AckMessageRequest,
+    ) -> Result<CoordinationMessageDto> {
+        self.ensure_coordination_capability().await?;
+        let path = format!("v1/coordination/messages/{message_id}/ack");
+        let url = self.url(&path)?;
+        let rb = self.http.post(url).json(&req);
+        self.execute(rb).await
+    }
+
+    /// Read an addressed inbox, cursor-paginated (`GET /v1/coordination/inbox`).
+    async fn coordination_inbox(&self, query: InboxQuery) -> Result<InboxPageResponse> {
+        self.ensure_coordination_capability().await?;
+        let url = self.url("v1/coordination/inbox")?;
+        let rb = self.http.get(url).query(&query);
+        self.execute(rb).await
+    }
+
+    /// Store an immutable artifact (`POST /v1/coordination/artifacts`).
+    async fn coordination_artifact_put(
+        &self,
+        req: NewArtifactRequest,
+    ) -> Result<CoordinationArtifactDto> {
+        self.ensure_coordination_capability().await?;
+        let url = self.url("v1/coordination/artifacts")?;
+        let rb = self.http.post(url).json(&req);
+        self.execute(rb).await
+    }
+
+    /// Get one artifact by exact ID (`GET /v1/coordination/artifacts/{id}`).
+    async fn coordination_artifact_get(
+        &self,
+        artifact_id: &str,
+    ) -> Result<CoordinationArtifactDto> {
+        self.ensure_coordination_capability().await?;
+        let path = format!("v1/coordination/artifacts/{artifact_id}");
+        let url = self.url(&path)?;
+        let rb = self.http.get(url);
+        self.execute(rb).await
+    }
+
+    /// Store an immutable task result (`POST /v1/coordination/results`).
+    async fn coordination_result_put(
+        &self,
+        req: NewTaskResultRequest,
+    ) -> Result<CoordinationTaskResultDto> {
+        self.ensure_coordination_capability().await?;
+        let url = self.url("v1/coordination/results")?;
+        let rb = self.http.post(url).json(&req);
+        self.execute(rb).await
+    }
+
+    /// Get one task result by exact ID (`GET /v1/coordination/results/{id}`).
+    async fn coordination_result_get(&self, result_id: &str) -> Result<CoordinationTaskResultDto> {
+        self.ensure_coordination_capability().await?;
+        let path = format!("v1/coordination/results/{result_id}");
+        let url = self.url(&path)?;
+        let rb = self.http.get(url);
+        self.execute(rb).await
+    }
+
+    /// Read the coordination audit-event feed, cursor-paginated (`GET /v1/coordination/events`).
+    async fn coordination_events(
+        &self,
+        query: CoordinationEventsQuery,
+    ) -> Result<CoordinationEventsResponse> {
+        self.ensure_coordination_capability().await?;
+        let url = self.url("v1/coordination/events")?;
+        let rb = self.http.get(url).query(&query);
+        self.execute(rb).await
+    }
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -432,6 +662,10 @@ mod tests {
         );
         assert!(
             !RemoteError::InvalidConfig { remote: mk_name(), message: "x".to_owned() }
+                .is_degradable()
+        );
+        assert!(
+            !RemoteError::CapabilityMissing { remote: mk_name(), capability: "x".to_owned() }
                 .is_degradable()
         );
     }

@@ -57,6 +57,18 @@ pub enum RemoteError {
         /// Description of the configuration problem.
         message: String,
     },
+    /// The remote does not advertise a capability this call requires (e.g. `"coordination"`,
+    /// from `GET /v1/info`'s `capabilities` list). Distinct from `RemoteRejected` so a caller
+    /// can tell "the peer doesn't support this feature at all" apart from "the peer rejected
+    /// this specific request" — and distinct from a raw HTTP 404, which would otherwise look
+    /// identical to "the requested record does not exist."
+    #[error("remote `{remote}` does not support the `{capability}` capability")]
+    CapabilityMissing {
+        /// Name of the remote palace.
+        remote: String,
+        /// The capability string this call required.
+        capability: String,
+    },
 }
 
 impl RemoteError {

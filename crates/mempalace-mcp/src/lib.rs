@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use blake3::Hasher;
-use mempalace_config::{ConfigLoader, MempalaceConfig, ReplicationStatus, RouteMode};
+use mempalace_config::{ConfigLoader, MempalaceConfig, ReplicationStatus, RouteMode, WriteTarget};
 use mempalace_core::{
     DIARY_HALL, DIARY_ROOM, DIARY_SUMMARY_MAX_CHARS, DIARY_TOPIC_PREFIX, DrawerId, DrawerRecord,
     EmbeddingProfile, RoomId, SHARED_AGENT_DIARY_WING, SearchQuery, WingId,
@@ -17,6 +17,12 @@ use mempalace_embeddings::{
     EmbeddingError, EmbeddingProvider, EmbeddingRequest, FastembedProvider,
     FastembedProviderConfig, env_flag,
 };
+use mempalace_federation::{
+    AckMessageRequest, CoordinationTaskState as WireTaskState,
+    NewArtifactRequest as WireNewArtifactRequest, NewMessageRequest as WireNewMessageRequest,
+    NewTaskRequest as WireNewTaskRequest, NewTaskResultRequest as WireNewTaskResultRequest,
+    TaskLeaseRequest, TransitionTaskRequest,
+};
 use mempalace_graph::{
     AddFactRequest, EntityKind, KnowledgeGraphRuntime, PalaceGraphSnapshot, QueryDirection,
     derive_palace_graph_from_store, find_tunnels, traverse_graph,
@@ -24,7 +30,8 @@ use mempalace_graph::{
 use mempalace_search::{SearchRuntime, SearchRuntimePolicy};
 use mempalace_storage::{
     AgentLineageRecord, ChangeEvent, ChangeLogStore, CoordinationCursor, CoordinationStore,
-    DiaryStore, DrawerFilter, DrawerStore, DuplicateStrategy, IngestCommitRequest,
+    CoordinationVisibility, DiaryStore, DrawerFilter, DrawerStore, DuplicateStrategy,
+    IngestCommitRequest,
     DelegationStore, LineageMigrationRecord, NewArtifact, NewCheckpoint, NewMessage, NewSkill,
     NewSkillOutcome, NewSpan, NewTask, NewTaskResult, RevisionedWrite, SelfModelStore,
     SelfObservationRecord, SelfObservationScope, SelfObservationStatus, SkillScope, SkillStatus,
@@ -63,11 +70,33 @@ pub use mempalace_core as core;
 // **Routable — uses `resolve_kg_route()` (knowledge-graph-specific routing):**
 //   KgQuery, KgAdd, KgInvalidate, KgTimeline, KgStats
 //
+// **Routable — coordination (issue #102 Stage 4):**
+//   TaskCreate, TaskGet, TaskClaim, TaskRenew, TaskTransition, MessageSend,
+//   MessageGet, MessageAcknowledge, InboxRead, ArtifactPut, ArtifactGet,
+//   ResultPut, ResultGet, CoordinationEvents. `TaskCreate` is the one exception
+//   routed by wing (`resolve_coordination_route` + `resolve_write_target`,
+//   mirroring `KgAdd`/`KgInvalidate` — `write` can only ever resolve to `Local`
+//   or `Remote`, never `Both`: a coordination route can never carry
+//   `WriteTarget::Both`, rejected at config load). Every other coordination tool
+//   above is keyed by an existing record ID with no wing in the request at all,
+//   so it is local-first with an ID-discovery fallback across all configured
+//   remotes in name order — the same reasoning `DeleteDrawer` already uses, and
+//   documented in full in the `FederationRouter` "Coordination" section comment
+//   in `federation.rs`. `InboxRead`/`CoordinationEvents` are aggregate,
+//   cursor-paginated feeds like `GetChangesSince`: always local plus a fan-out
+//   to every remote (never routed by a single record's owner), reported under
+//   `remote_messages`/`remote_events`. `CoordinationEventGet` — a single event
+//   by exact ID — is **not** in this category: Stage 3 never exposed a
+//   `GET /v1/coordination/events/{id}` route, only the paginated feed, so it
+//   stays `LocalOnly` below.
+//
 // **Always local — never federated:**
 //   DiaryWrite, DiaryRead, WakeUp, GetChangesSince, Traverse, FindTunnels,
 //   GraphStats, IdentityRead, IdentityUpdate, LineageSet,
 //   SelfObservationPropose, SelfObservationReview, IdentityPacket,
-//   MigrationRecord, GetAaaKSpec
+//   MigrationRecord, GetAaaKSpec, CoordinationEventGet. Skill and delegation
+//   tools (SkillPropose..SkillReviews, DelegationSpanStart..DelegationTrace)
+//   are local-only too — they are not federated in this phase.
 //
 // **`kg_add`/`kg_invalidate` policy:** Both follow `resolve_kg_route()` and write
 //   to the write-target side ONLY (local or the configured remote). The response
@@ -171,6 +200,15 @@ pub enum ToolRoutingCategory {
     RoutableDrawer,
     /// Tool routes via KG-specific rules (`resolve_kg_route`).
     RoutableKg,
+    /// Tool participates in coordination federation (issue #102 Stage 4). Most of these route
+    /// by an existing record's ID rather than a wing (see the `FederationRouter` "Coordination"
+    /// section comment in `federation.rs`) — `mempalace_task_create` is the one exception,
+    /// which uses `resolve_coordination_route`. `mempalace_coordination_event_get` is
+    /// deliberately **not** in this category, even though its sibling
+    /// `mempalace_coordination_events` is: Stage 3 never exposed a
+    /// `GET /v1/coordination/events/{id}` route, only the paginated feed, so a single event has
+    /// no remote counterpart to route to.
+    RoutableCoordination,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -659,8 +697,8 @@ impl ToolName {
             ),
             Self::InboxRead => coordination_definition(
                 self,
-                "Read messages addressed to a recipient using an opaque local cursor. Optionally scope to one wing (matched via the sending task, normalised the same way as task creation).",
-                json!({"recipient":{"type":"string"},"cursor":{"type":"integer"},"wing":{"type":"string","description":"Optional wing filter, e.g. wing_myproject. Normalised the same way as task creation."},"limit":{"type":"integer"},"unacknowledged_only":{"type":"boolean"}}),
+                "Read messages addressed to a recipient using an opaque local cursor. Optionally scope to one wing (matched via the sending task, normalised the same way as task creation). When coordination federation is configured for this wing (and it is not the shared diary wing), the local page is read and, concurrently, each configured remote is also queried; remote pages are reported under a top-level `remote_messages` object keyed by remote name, each entry one of `{ messages, next_cursor }`, `{ unreachable: true, error }`, or `{ capability_missing: true, capability, error }` when that remote does not advertise coordination support, mirroring `mempalace_get_changes_since`'s `remotes` field. `remote_messages` is an empty object whenever coordination federation is not configured for this wing (including the diary wing, or when no remotes are configured at all) — its absence of entries does not imply no remotes exist. Persist each remote's `next_cursor` and pass them back via `remote_cursors` to continue paging that remote without re-fetching already-seen messages; the local `cursor` argument is unrelated and only advances the local page.",
+                json!({"recipient":{"type":"string"},"cursor":{"type":"integer"},"wing":{"type":"string","description":"Optional wing filter, e.g. wing_myproject. Normalised the same way as task creation."},"limit":{"type":"integer"},"unacknowledged_only":{"type":"boolean"},"remote_cursors":{"type":"object","description":"Per-remote opaque cursor strings from a previous response's `remote_messages.<name>.next_cursor`. Pass back to continue pagination for specific remotes without re-fetching already-seen messages.","additionalProperties":{"type":"string"}}}),
                 &["recipient"],
             ),
             Self::ArtifactPut => coordination_definition(
@@ -695,8 +733,8 @@ impl ToolName {
             ),
             Self::CoordinationEvents => coordination_definition(
                 self,
-                "Read append-only coordination audit events using an opaque local cursor. Optionally scope to one task and/or one wing (normalised the same way as task creation).",
-                json!({"cursor":{"type":"integer"},"task_id":{"type":"string"},"wing":{"type":"string","description":"Optional wing filter, e.g. wing_myproject. Normalised the same way as task creation."},"limit":{"type":"integer"}}),
+                "Read append-only coordination audit events using an opaque local cursor. Optionally scope to one task and/or one wing (normalised the same way as task creation). When coordination federation is configured for this wing (and it is not the shared diary wing), the local page is read and, concurrently, each configured remote is also queried; remote pages are reported under a top-level `remote_events` object keyed by remote name, each entry one of `{ events, next_cursor }`, `{ unreachable: true, error }`, or `{ capability_missing: true, capability, error }` when that remote does not advertise coordination support, mirroring `mempalace_get_changes_since`'s `remotes` field. `remote_events` is an empty object whenever coordination federation is not configured for this wing (including the diary wing, or when no remotes are configured at all) — its absence of entries does not imply no remotes exist. Persist each remote's `next_cursor` and pass them back via `remote_cursors` to continue paging that remote without re-fetching already-seen events; the local `cursor` argument is unrelated and only advances the local page.",
+                json!({"cursor":{"type":"integer"},"task_id":{"type":"string"},"wing":{"type":"string","description":"Optional wing filter, e.g. wing_myproject. Normalised the same way as task creation."},"limit":{"type":"integer"},"remote_cursors":{"type":"object","description":"Per-remote opaque cursor strings from a previous response's `remote_events.<name>.next_cursor`. Pass back to continue pagination for specific remotes without re-fetching already-seen events.","additionalProperties":{"type":"string"}}}),
                 &[],
             ),
             Self::SkillPropose => coordination_definition(
@@ -895,22 +933,8 @@ impl ToolName {
             | Self::SelfObservationReview
             | Self::IdentityPacket
             | Self::MigrationRecord
-            | Self::GetAaaKSpec => ToolRoutingCategory::LocalOnly,
-            Self::TaskCreate
-            | Self::TaskGet
-            | Self::TaskClaim
-            | Self::TaskRenew
-            | Self::TaskTransition
-            | Self::MessageSend
-            | Self::MessageGet
-            | Self::MessageAcknowledge
-            | Self::InboxRead
-            | Self::ArtifactPut
-            | Self::ArtifactGet
-            | Self::ResultPut
-            | Self::ResultGet
-            | Self::CoordinationEventGet
-            | Self::CoordinationEvents
+            | Self::GetAaaKSpec
+            // Not federated in this phase — see the module-level federation-semantics comment.
             | Self::SkillPropose
             | Self::SkillGet
             | Self::SkillVersions
@@ -925,7 +949,23 @@ impl ToolName {
             | Self::DelegationSpansForTask
             | Self::DelegationCheckpointAppend
             | Self::DelegationCheckpointGet
-            | Self::DelegationTrace => ToolRoutingCategory::LocalOnly,
+            | Self::DelegationTrace
+            // No wire counterpart to route to — see `ToolRoutingCategory::RoutableCoordination`.
+            | Self::CoordinationEventGet => ToolRoutingCategory::LocalOnly,
+            Self::TaskCreate
+            | Self::TaskGet
+            | Self::TaskClaim
+            | Self::TaskRenew
+            | Self::TaskTransition
+            | Self::MessageSend
+            | Self::MessageGet
+            | Self::MessageAcknowledge
+            | Self::InboxRead
+            | Self::ArtifactPut
+            | Self::ArtifactGet
+            | Self::ResultPut
+            | Self::ResultGet
+            | Self::CoordinationEvents => ToolRoutingCategory::RoutableCoordination,
             Self::Search
             | Self::ListWings
             | Self::ListRooms
@@ -1140,75 +1180,124 @@ where
 
         let mut runtime = self.runtime.lock().await;
 
-        let result = match tool {
-            ToolName::WakeUp => runtime.tool_wake_up(&call.arguments).await,
-            ToolName::Status => runtime.tool_status().await,
-            ToolName::ListWings => runtime.tool_list_wings().await,
-            ToolName::ListRooms => runtime.tool_list_rooms(&call.arguments).await,
-            ToolName::GetTaxonomy => runtime.tool_get_taxonomy().await,
-            ToolName::GetAaaKSpec => runtime.tool_get_aaak_spec().await,
-            ToolName::KgQuery => runtime.tool_kg_query(&call.arguments).await,
-            ToolName::KgAdd => runtime.tool_kg_add(&call.arguments).await,
-            ToolName::KgInvalidate => runtime.tool_kg_invalidate(&call.arguments).await,
-            ToolName::KgTimeline => runtime.tool_kg_timeline(&call.arguments).await,
-            ToolName::KgStats => runtime.tool_kg_stats().await,
-            ToolName::Traverse => runtime.tool_traverse(&call.arguments).await,
-            ToolName::FindTunnels => runtime.tool_find_tunnels(&call.arguments).await,
-            ToolName::GraphStats => runtime.tool_graph_stats().await,
-            ToolName::Search => runtime.tool_search(&call.arguments).await,
-            ToolName::CheckDuplicate => runtime.tool_check_duplicate(&call.arguments).await,
-            ToolName::AddDrawer => runtime.tool_add_drawer(&call.arguments).await,
-            ToolName::DeleteDrawer => runtime.tool_delete_drawer(&call.arguments).await,
-            ToolName::DiaryWrite => runtime.tool_diary_write(&call.arguments).await,
-            ToolName::DiaryRead => runtime.tool_diary_read(&call.arguments).await,
-            ToolName::GetChangesSince => runtime.tool_get_changes_since(&call.arguments).await,
-            ToolName::IdentityRead => runtime.tool_identity_read().await,
-            ToolName::IdentityUpdate => runtime.tool_identity_update(&call.arguments).await,
-            ToolName::TaskCreate => runtime.tool_task_create(&call.arguments),
-            ToolName::TaskGet => runtime.tool_task_get(&call.arguments),
-            ToolName::TaskClaim => runtime.tool_task_claim(&call.arguments),
-            ToolName::TaskRenew => runtime.tool_task_renew(&call.arguments),
-            ToolName::TaskTransition => runtime.tool_task_transition(&call.arguments),
-            ToolName::MessageSend => runtime.tool_message_send(&call.arguments),
-            ToolName::MessageGet => runtime.tool_message_get(&call.arguments),
-            ToolName::MessageAcknowledge => runtime.tool_message_acknowledge(&call.arguments),
-            ToolName::InboxRead => runtime.tool_inbox_read(&call.arguments),
-            ToolName::ArtifactPut => runtime.tool_artifact_put(&call.arguments),
-            ToolName::ArtifactGet => runtime.tool_artifact_get(&call.arguments),
-            ToolName::ResultPut => runtime.tool_result_put(&call.arguments),
-            ToolName::ResultGet => runtime.tool_result_get(&call.arguments),
-            ToolName::CoordinationEventGet => runtime.tool_coordination_event_get(&call.arguments),
-            ToolName::CoordinationEvents => runtime.tool_coordination_events(&call.arguments),
-            ToolName::SkillPropose => runtime.tool_skill_propose(&call.arguments),
-            ToolName::SkillGet => runtime.tool_skill_get(&call.arguments),
-            ToolName::SkillVersions => runtime.tool_skill_versions(&call.arguments),
-            ToolName::SkillList => runtime.tool_skill_list(&call.arguments),
-            ToolName::SkillRecordOutcome => runtime.tool_skill_record_outcome(&call.arguments),
-            ToolName::SkillPromote => runtime.tool_skill_promote(&call.arguments),
-            ToolName::SkillRetire => runtime.tool_skill_retire(&call.arguments),
-            ToolName::SkillReviews => runtime.tool_skill_reviews(&call.arguments),
-            ToolName::DelegationSpanStart => runtime.tool_delegation_span_start(&call.arguments),
-            ToolName::DelegationSpanGet => runtime.tool_delegation_span_get(&call.arguments),
-            ToolName::DelegationSpanClose => runtime.tool_delegation_span_close(&call.arguments),
-            ToolName::DelegationSpansForTask => {
-                runtime.tool_delegation_spans_for_task(&call.arguments)
-            }
-            ToolName::DelegationCheckpointAppend => {
-                runtime.tool_delegation_checkpoint_append(&call.arguments)
-            }
-            ToolName::DelegationCheckpointGet => {
-                runtime.tool_delegation_checkpoint_get(&call.arguments)
-            }
-            ToolName::DelegationTrace => runtime.tool_delegation_trace(&call.arguments),
-            ToolName::LineageSet => runtime.tool_lineage_set(&call.arguments).await,
-            ToolName::SelfObservationPropose => {
-                runtime.tool_self_observation_propose(&call.arguments).await
-            }
-            ToolName::SelfObservationReview => {
-                runtime.tool_self_observation_review(&call.arguments).await
-            }
-            ToolName::IdentityPacket => runtime.tool_identity_packet(&call.arguments).await,
-            ToolName::MigrationRecord => runtime.tool_migration_record(&call.arguments).await,
+        // `tool.routing()` is not just documentation here: which of the four inner `match`
+        // blocks below runs is decided by it, and each inner match only covers the `ToolName`
+        // variants that category is supposed to contain. A tool miscategorized by `routing()`
+        // (e.g. a coordination tool accidentally left `LocalOnly`) reaches the wrong inner
+        // match, which has no arm for it, and panics via the catch-all below instead of
+        // silently behaving as if it were still correctly routed — the same guarantee
+        // `routing_categories_are_consistent_with_semantics_doc` checks statically, backstopped
+        // here at dispatch time.
+        let result = match tool.routing() {
+            ToolRoutingCategory::LocalOnly => match tool {
+                ToolName::WakeUp => runtime.tool_wake_up(&call.arguments).await,
+                ToolName::GetAaaKSpec => runtime.tool_get_aaak_spec().await,
+                ToolName::DiaryWrite => runtime.tool_diary_write(&call.arguments).await,
+                ToolName::DiaryRead => runtime.tool_diary_read(&call.arguments).await,
+                ToolName::GetChangesSince => runtime.tool_get_changes_since(&call.arguments).await,
+                ToolName::Traverse => runtime.tool_traverse(&call.arguments).await,
+                ToolName::FindTunnels => runtime.tool_find_tunnels(&call.arguments).await,
+                ToolName::GraphStats => runtime.tool_graph_stats().await,
+                ToolName::IdentityRead => runtime.tool_identity_read().await,
+                ToolName::IdentityUpdate => runtime.tool_identity_update(&call.arguments).await,
+                ToolName::LineageSet => runtime.tool_lineage_set(&call.arguments).await,
+                ToolName::SelfObservationPropose => {
+                    runtime.tool_self_observation_propose(&call.arguments).await
+                }
+                ToolName::SelfObservationReview => {
+                    runtime.tool_self_observation_review(&call.arguments).await
+                }
+                ToolName::IdentityPacket => runtime.tool_identity_packet(&call.arguments).await,
+                ToolName::MigrationRecord => runtime.tool_migration_record(&call.arguments).await,
+                // Not federated in this phase (skills/delegation), or has no wire counterpart
+                // at all (a single coordination event has no `GET .../events/{id}` route — only
+                // the paginated feed does; see `tool_coordination_event_get`'s doc comment).
+                ToolName::CoordinationEventGet => {
+                    runtime.tool_coordination_event_get(&call.arguments).await
+                }
+                ToolName::SkillPropose => runtime.tool_skill_propose(&call.arguments).await,
+                ToolName::SkillGet => runtime.tool_skill_get(&call.arguments).await,
+                ToolName::SkillVersions => runtime.tool_skill_versions(&call.arguments).await,
+                ToolName::SkillList => runtime.tool_skill_list(&call.arguments).await,
+                ToolName::SkillRecordOutcome => {
+                    runtime.tool_skill_record_outcome(&call.arguments).await
+                }
+                ToolName::SkillPromote => runtime.tool_skill_promote(&call.arguments).await,
+                ToolName::SkillRetire => runtime.tool_skill_retire(&call.arguments).await,
+                ToolName::SkillReviews => runtime.tool_skill_reviews(&call.arguments).await,
+                ToolName::DelegationSpanStart => {
+                    runtime.tool_delegation_span_start(&call.arguments).await
+                }
+                ToolName::DelegationSpanGet => {
+                    runtime.tool_delegation_span_get(&call.arguments).await
+                }
+                ToolName::DelegationSpanClose => {
+                    runtime.tool_delegation_span_close(&call.arguments).await
+                }
+                ToolName::DelegationSpansForTask => {
+                    runtime.tool_delegation_spans_for_task(&call.arguments).await
+                }
+                ToolName::DelegationCheckpointAppend => {
+                    runtime.tool_delegation_checkpoint_append(&call.arguments).await
+                }
+                ToolName::DelegationCheckpointGet => {
+                    runtime.tool_delegation_checkpoint_get(&call.arguments).await
+                }
+                ToolName::DelegationTrace => runtime.tool_delegation_trace(&call.arguments).await,
+                other => unreachable!(
+                    "ToolName::routing() classified {other:?} as LocalOnly, \
+                     but dispatch_tool's LocalOnly arm does not handle it"
+                ),
+            },
+            ToolRoutingCategory::RoutableDrawer => match tool {
+                ToolName::Search => runtime.tool_search(&call.arguments).await,
+                ToolName::ListWings => runtime.tool_list_wings().await,
+                ToolName::ListRooms => runtime.tool_list_rooms(&call.arguments).await,
+                ToolName::GetTaxonomy => runtime.tool_get_taxonomy().await,
+                ToolName::Status => runtime.tool_status().await,
+                ToolName::CheckDuplicate => runtime.tool_check_duplicate(&call.arguments).await,
+                ToolName::AddDrawer => runtime.tool_add_drawer(&call.arguments).await,
+                ToolName::DeleteDrawer => runtime.tool_delete_drawer(&call.arguments).await,
+                other => unreachable!(
+                    "ToolName::routing() classified {other:?} as RoutableDrawer, \
+                     but dispatch_tool's RoutableDrawer arm does not handle it"
+                ),
+            },
+            ToolRoutingCategory::RoutableKg => match tool {
+                ToolName::KgQuery => runtime.tool_kg_query(&call.arguments).await,
+                ToolName::KgAdd => runtime.tool_kg_add(&call.arguments).await,
+                ToolName::KgInvalidate => runtime.tool_kg_invalidate(&call.arguments).await,
+                ToolName::KgTimeline => runtime.tool_kg_timeline(&call.arguments).await,
+                ToolName::KgStats => runtime.tool_kg_stats().await,
+                other => unreachable!(
+                    "ToolName::routing() classified {other:?} as RoutableKg, \
+                     but dispatch_tool's RoutableKg arm does not handle it"
+                ),
+            },
+            ToolRoutingCategory::RoutableCoordination => match tool {
+                ToolName::TaskCreate => runtime.tool_task_create(&call.arguments).await,
+                ToolName::TaskGet => runtime.tool_task_get(&call.arguments).await,
+                ToolName::TaskClaim => runtime.tool_task_claim(&call.arguments).await,
+                ToolName::TaskRenew => runtime.tool_task_renew(&call.arguments).await,
+                ToolName::TaskTransition => runtime.tool_task_transition(&call.arguments).await,
+                ToolName::MessageSend => runtime.tool_message_send(&call.arguments).await,
+                ToolName::MessageGet => runtime.tool_message_get(&call.arguments).await,
+                ToolName::MessageAcknowledge => {
+                    runtime.tool_message_acknowledge(&call.arguments).await
+                }
+                ToolName::InboxRead => runtime.tool_inbox_read(&call.arguments).await,
+                ToolName::ArtifactPut => runtime.tool_artifact_put(&call.arguments).await,
+                ToolName::ArtifactGet => runtime.tool_artifact_get(&call.arguments).await,
+                ToolName::ResultPut => runtime.tool_result_put(&call.arguments).await,
+                ToolName::ResultGet => runtime.tool_result_get(&call.arguments).await,
+                ToolName::CoordinationEvents => {
+                    runtime.tool_coordination_events(&call.arguments).await
+                }
+                other => unreachable!(
+                    "ToolName::routing() classified {other:?} as RoutableCoordination, \
+                     but dispatch_tool's RoutableCoordination arm does not handle it"
+                ),
+            },
         };
 
         match result {
@@ -3279,136 +3368,361 @@ where
         }
     }
 
-    fn tool_task_create(&self, arguments: &Value) -> ToolResult<Value> {
-        let input: NewTask = parse_coordination_input(arguments)?;
+    /// Create a task. The only coordination write with an explicit `wing` at request time, so
+    /// it is the only one routed via `resolve_coordination_route`/`resolve_write_target`
+    /// (mirroring `kg_add_remote`) rather than the local-first ID-discovery fallback every
+    /// other coordination tool below uses — see the `FederationRouter` "Coordination" section
+    /// comment in `federation.rs` for why. `write` can only ever resolve to `Local` or
+    /// `Remote` here, never `Both` (rejected at config load).
+    async fn tool_task_create(&mut self, arguments: &Value) -> ToolResult<Value> {
+        let mut input: NewTask = parse_coordination_input(arguments)?;
+        // Normalise the wing once, up front, and use that canonical value for BOTH the routing
+        // decision and the outgoing request (local or remote). `resolve_coordination_route` is
+        // keyed on the raw string it is given; routing on the un-normalised caller input would
+        // let a short form like `"agents"` slip past the `wing_agents` diary hard-override and
+        // past an operator's explicit `federation.coordination["wing_x"]` pin (see the security
+        // fix notes in `docs/Federation.md`). Layer 2 (`resolve_coordination_route` itself) also
+        // normalises defensively, but this is the fix that matters: it is also what stops the
+        // raw wing from ever reaching the wire.
+        let wing = parse_wing_id(&input.wing)?;
+        input.wing = wing.as_str().to_owned();
+        if let Some(router) = &self.federation {
+            let route = router.resolve_coordination_route(input.wing.as_str());
+            if router.resolve_write_target(&route) == WriteTarget::Remote {
+                let remote_name = route.remote.clone().unwrap_or_else(|| "remote".to_owned());
+                let mut req: WireNewTaskRequest = serde_json::from_value(arguments.clone())
+                    .map_err(|e| ToolError::InvalidParams(e.to_string()))?;
+                req.wing = input.wing.clone();
+                return router.coordination_task_create_remote(&remote_name, req).await;
+            }
+        }
         Ok(json!(self.coordination.create_task(&input).map_tool_internal()?))
     }
-    fn tool_task_get(&self, arguments: &Value) -> ToolResult<Value> {
+    /// Get a task by exact ID. Local first; on a local miss, falls back to each configured
+    /// remote in name order (no wing is known for an ID-keyed lookup — see the federation
+    /// module comment).
+    async fn tool_task_get(&mut self, arguments: &Value) -> ToolResult<Value> {
         let id = required_string(arguments, "task_id")?;
-        exact_result(self.coordination.get_task(&id).map_tool_internal()?)
+        if let Some(task) = self.coordination.get_task(&id).map_tool_internal()? {
+            return Ok(json!({"found": true, "value": task}));
+        }
+        if let Some(router) = &self.federation {
+            if let Some(value) = router.coordination_task_get_fallback(&id).await? {
+                return Ok(json!({"found": true, "value": value}));
+            }
+        }
+        Ok(json!({"found": false}))
     }
-    fn tool_task_claim(&self, arguments: &Value) -> ToolResult<Value> {
-        let task = self
-            .coordination
-            .claim_task(
-                &required_string(arguments, "task_id")?,
-                &required_string(arguments, "worker")?,
-                required_i64(arguments, "expected_revision")?,
-                Duration::seconds(required_positive_i64(arguments, "lease_seconds")?),
-            )
-            .map_tool_internal()?;
-        Ok(json!(task))
+    /// Claim a task, or reclaim an expired lease. Local first; a local "task not found" falls
+    /// back to each configured remote in name order, sending the claim to whichever one
+    /// actually owns the task. A revision conflict — local or remote — surfaces via
+    /// `revision_conflict_payload` either way; MemPalace never retries on the caller's behalf.
+    async fn tool_task_claim(&mut self, arguments: &Value) -> ToolResult<Value> {
+        let expected_revision = required_i64(arguments, "expected_revision")?;
+        let task_id = required_string(arguments, "task_id")?;
+        let worker = required_string(arguments, "worker")?;
+        let lease_seconds = required_positive_i64(arguments, "lease_seconds")?;
+        match self.coordination.claim_task(
+            &task_id,
+            &worker,
+            expected_revision,
+            Duration::seconds(lease_seconds),
+        ) {
+            Ok(RevisionedWrite::Applied(task)) => Ok(json!({"success": true, "task": task})),
+            Ok(RevisionedWrite::Conflict { actual_revision }) => {
+                Ok(revision_conflict_payload(expected_revision, actual_revision))
+            }
+            Err(err) if is_local_record_missing(&err) => {
+                if let Some(router) = &self.federation {
+                    let req = TaskLeaseRequest {
+                        expected_revision,
+                        lease_seconds,
+                        worker: Some(worker),
+                    };
+                    if let Some(value) =
+                        router.coordination_task_claim_fallback(&task_id, req).await?
+                    {
+                        return Ok(value);
+                    }
+                }
+                Err(err).map_tool_internal()
+            }
+            Err(err) => Err(err).map_tool_internal(),
+        }
     }
-    fn tool_task_renew(&self, arguments: &Value) -> ToolResult<Value> {
-        let task = self
-            .coordination
-            .renew_lease(
-                &required_string(arguments, "task_id")?,
-                &required_string(arguments, "worker")?,
-                required_i64(arguments, "expected_revision")?,
-                Duration::seconds(required_positive_i64(arguments, "lease_seconds")?),
-            )
-            .map_tool_internal()?;
-        Ok(json!(task))
+    /// Renew a live lease. See [`Self::tool_task_claim`] for the local-first/fallback and
+    /// conflict-shape notes — identical here.
+    async fn tool_task_renew(&mut self, arguments: &Value) -> ToolResult<Value> {
+        let expected_revision = required_i64(arguments, "expected_revision")?;
+        let task_id = required_string(arguments, "task_id")?;
+        let worker = required_string(arguments, "worker")?;
+        let lease_seconds = required_positive_i64(arguments, "lease_seconds")?;
+        match self.coordination.renew_lease(
+            &task_id,
+            &worker,
+            expected_revision,
+            Duration::seconds(lease_seconds),
+        ) {
+            Ok(RevisionedWrite::Applied(task)) => Ok(json!({"success": true, "task": task})),
+            Ok(RevisionedWrite::Conflict { actual_revision }) => {
+                Ok(revision_conflict_payload(expected_revision, actual_revision))
+            }
+            Err(err) if is_local_record_missing(&err) => {
+                if let Some(router) = &self.federation {
+                    let req = TaskLeaseRequest {
+                        expected_revision,
+                        lease_seconds,
+                        worker: Some(worker),
+                    };
+                    if let Some(value) =
+                        router.coordination_task_renew_fallback(&task_id, req).await?
+                    {
+                        return Ok(value);
+                    }
+                }
+                Err(err).map_tool_internal()
+            }
+            Err(err) => Err(err).map_tool_internal(),
+        }
     }
-    fn tool_task_transition(&self, arguments: &Value) -> ToolResult<Value> {
+    /// Transition a task's lifecycle state. See [`Self::tool_task_claim`] for the
+    /// local-first/fallback and conflict-shape notes — identical here.
+    async fn tool_task_transition(&mut self, arguments: &Value) -> ToolResult<Value> {
         let state: TaskState = serde_json::from_value(json!(required_string(arguments, "state")?))
             .map_err(|e| ToolError::InvalidParams(e.to_string()))?;
-        let task = self
-            .coordination
-            .transition_task(
-                &required_string(arguments, "task_id")?,
-                &required_string(arguments, "actor")?,
-                required_i64(arguments, "expected_revision")?,
-                state,
-                arguments.get("details").cloned(),
-            )
-            .map_tool_internal()?;
-        Ok(json!(task))
+        let expected_revision = required_i64(arguments, "expected_revision")?;
+        let task_id = required_string(arguments, "task_id")?;
+        let actor = required_string(arguments, "actor")?;
+        let details = arguments.get("details").cloned();
+        match self.coordination.transition_task(
+            &task_id,
+            &actor,
+            expected_revision,
+            state,
+            details.clone(),
+        ) {
+            Ok(RevisionedWrite::Applied(task)) => Ok(json!({"success": true, "task": task})),
+            Ok(RevisionedWrite::Conflict { actual_revision }) => {
+                Ok(revision_conflict_payload(expected_revision, actual_revision))
+            }
+            Err(err) if is_local_record_missing(&err) => {
+                if let Some(router) = &self.federation {
+                    let req = TransitionTaskRequest {
+                        expected_revision,
+                        state: wire_task_state(state),
+                        actor: Some(actor),
+                        details,
+                    };
+                    if let Some(value) =
+                        router.coordination_task_transition_fallback(&task_id, req).await?
+                    {
+                        return Ok(value);
+                    }
+                }
+                Err(err).map_tool_internal()
+            }
+            Err(err) => Err(err).map_tool_internal(),
+        }
     }
-    fn tool_message_send(&self, arguments: &Value) -> ToolResult<Value> {
+    /// Send an addressed message. Local first; a local "task not found" falls back to each
+    /// configured remote in name order, sending to whichever one owns the referenced task.
+    async fn tool_message_send(&mut self, arguments: &Value) -> ToolResult<Value> {
         let input: NewMessage = parse_coordination_input(arguments)?;
-        Ok(json!(self.coordination.send_message(&input).map_tool_internal()?))
+        match self.coordination.send_message(&input) {
+            Ok(message) => Ok(json!(message)),
+            Err(err) if is_local_record_missing(&err) => {
+                if let Some(router) = &self.federation {
+                    let req: WireNewMessageRequest = serde_json::from_value(arguments.clone())
+                        .map_err(|e| ToolError::InvalidParams(e.to_string()))?;
+                    if let Some(value) = router.coordination_message_send_fallback(req).await? {
+                        return Ok(value);
+                    }
+                }
+                Err(err).map_tool_internal()
+            }
+            Err(err) => Err(err).map_tool_internal(),
+        }
     }
-    fn tool_message_get(&self, arguments: &Value) -> ToolResult<Value> {
-        exact_result(
-            self.coordination
-                .get_message(&required_string(arguments, "message_id")?)
-                .map_tool_internal()?,
-        )
+    /// Get a message by exact ID. Local first, then falls back across remotes in name order.
+    async fn tool_message_get(&mut self, arguments: &Value) -> ToolResult<Value> {
+        let id = required_string(arguments, "message_id")?;
+        if let Some(message) = self.coordination.get_message(&id).map_tool_internal()? {
+            return Ok(json!({"found": true, "value": message}));
+        }
+        if let Some(router) = &self.federation {
+            if let Some(value) = router.coordination_message_get_fallback(&id).await? {
+                return Ok(json!({"found": true, "value": value}));
+            }
+        }
+        Ok(json!({"found": false}))
     }
-    fn tool_message_acknowledge(&self, arguments: &Value) -> ToolResult<Value> {
-        Ok(json!(
-            self.coordination
-                .acknowledge_message(
-                    &required_string(arguments, "message_id")?,
-                    &required_string(arguments, "actor")?
-                )
-                .map_tool_internal()?
-        ))
+    /// Acknowledge a message. Local first; a local "message not found" falls back to each
+    /// configured remote in name order.
+    async fn tool_message_acknowledge(&mut self, arguments: &Value) -> ToolResult<Value> {
+        let message_id = required_string(arguments, "message_id")?;
+        let actor = required_string(arguments, "actor")?;
+        match self.coordination.acknowledge_message(&message_id, &actor) {
+            Ok(message) => Ok(json!(message)),
+            Err(err) if is_local_record_missing(&err) => {
+                if let Some(router) = &self.federation {
+                    let req = AckMessageRequest { actor: Some(actor) };
+                    if let Some(value) =
+                        router.coordination_message_ack_fallback(&message_id, req).await?
+                    {
+                        return Ok(value);
+                    }
+                }
+                Err(err).map_tool_internal()
+            }
+            Err(err) => Err(err).map_tool_internal(),
+        }
     }
-    fn tool_inbox_read(&self, arguments: &Value) -> ToolResult<Value> {
+    /// Read an addressed inbox. This is an aggregate, cursor-paginated feed, not an exact-ID
+    /// lookup — like `mempalace_get_changes_since`, it always reads local *and* (when
+    /// federation has remotes configured) fans out to every remote concurrently with a
+    /// per-remote cursor, rather than routing by a single wing's resolved rule. The local page
+    /// is returned as-is; remote pages are reported under `remote_messages`, keyed by remote
+    /// name, in the same `{unreachable, error}` isolation shape `changes_fanout` uses.
+    async fn tool_inbox_read(&mut self, arguments: &Value) -> ToolResult<Value> {
         let wing = optional_non_blank_string(arguments, "wing")?;
+        let recipient = required_string(arguments, "recipient")?;
+        let limit = optional_usize(arguments, "limit")?.unwrap_or(50);
+        let unacknowledged_only = optional_bool(arguments, "unacknowledged_only")?.unwrap_or(false);
         let page = self
             .coordination
             .inbox(
-                &required_string(arguments, "recipient")?,
+                &recipient,
                 optional_i64(arguments, "cursor")?.map(CoordinationCursor),
                 wing.as_deref(),
-                optional_usize(arguments, "limit")?.unwrap_or(50),
-                optional_bool(arguments, "unacknowledged_only")?.unwrap_or(false),
+                limit,
+                unacknowledged_only,
+                // The MCP surface has no HTTP caller identity to scope against — it is the
+                // local agent talking to its own palace — so it is always fully trusted,
+                // diary included. See `CoordinationVisibility::Trusted`'s doc comment: this
+                // variant must never be used for an HTTP-authenticated caller.
+                CoordinationVisibility::Trusted,
             )
             .map_tool_internal()?;
-        Ok(json!(page))
+        let mut payload = json!(page);
+        if let Some(router) = self.federation.as_ref().filter(|r| r.has_remotes()) {
+            let cursors = parse_cursors_arg(arguments, "remote_cursors")?;
+            let remote_messages = router
+                .coordination_inbox_fanout(recipient, wing, Some(limit), unacknowledged_only, &cursors)
+                .await;
+            payload["remote_messages"] = json!(remote_messages);
+        }
+        Ok(payload)
     }
-    fn tool_artifact_put(&self, arguments: &Value) -> ToolResult<Value> {
+    /// Store an immutable artifact. Local first; a local "task not found" falls back to each
+    /// configured remote in name order.
+    async fn tool_artifact_put(&mut self, arguments: &Value) -> ToolResult<Value> {
         let input: NewArtifact = parse_coordination_input(arguments)?;
-        Ok(json!(self.coordination.put_artifact(&input).map_tool_internal()?))
+        match self.coordination.put_artifact(&input) {
+            Ok(artifact) => Ok(json!(artifact)),
+            Err(err) if is_local_record_missing(&err) => {
+                if let Some(router) = &self.federation {
+                    let req: WireNewArtifactRequest = serde_json::from_value(arguments.clone())
+                        .map_err(|e| ToolError::InvalidParams(e.to_string()))?;
+                    if let Some(value) = router.coordination_artifact_put_fallback(req).await? {
+                        return Ok(value);
+                    }
+                }
+                Err(err).map_tool_internal()
+            }
+            Err(err) => Err(err).map_tool_internal(),
+        }
     }
-    fn tool_artifact_get(&self, arguments: &Value) -> ToolResult<Value> {
-        exact_result(
-            self.coordination
-                .get_artifact(&required_string(arguments, "artifact_id")?)
-                .map_tool_internal()?,
-        )
+    /// Get an artifact by exact ID. Local first, then falls back across remotes in name order.
+    async fn tool_artifact_get(&mut self, arguments: &Value) -> ToolResult<Value> {
+        let id = required_string(arguments, "artifact_id")?;
+        if let Some(artifact) = self.coordination.get_artifact(&id).map_tool_internal()? {
+            return Ok(json!({"found": true, "value": artifact}));
+        }
+        if let Some(router) = &self.federation {
+            if let Some(value) = router.coordination_artifact_get_fallback(&id).await? {
+                return Ok(json!({"found": true, "value": value}));
+            }
+        }
+        Ok(json!({"found": false}))
     }
-    fn tool_result_put(&self, arguments: &Value) -> ToolResult<Value> {
+    /// Store an immutable task result. Local first; a local "task not found" falls back to
+    /// each configured remote in name order.
+    async fn tool_result_put(&mut self, arguments: &Value) -> ToolResult<Value> {
         let input: NewTaskResult = parse_coordination_input(arguments)?;
-        Ok(json!(self.coordination.put_result(&input).map_tool_internal()?))
+        match self.coordination.put_result(&input) {
+            Ok(result) => Ok(json!(result)),
+            Err(err) if is_local_record_missing(&err) => {
+                if let Some(router) = &self.federation {
+                    let req: WireNewTaskResultRequest = serde_json::from_value(arguments.clone())
+                        .map_err(|e| ToolError::InvalidParams(e.to_string()))?;
+                    if let Some(value) = router.coordination_result_put_fallback(req).await? {
+                        return Ok(value);
+                    }
+                }
+                Err(err).map_tool_internal()
+            }
+            Err(err) => Err(err).map_tool_internal(),
+        }
     }
-    fn tool_result_get(&self, arguments: &Value) -> ToolResult<Value> {
-        exact_result(
-            self.coordination
-                .get_result(&required_string(arguments, "result_id")?)
-                .map_tool_internal()?,
-        )
+    /// Get a task result by exact ID. Local first, then falls back across remotes in name
+    /// order.
+    async fn tool_result_get(&mut self, arguments: &Value) -> ToolResult<Value> {
+        let id = required_string(arguments, "result_id")?;
+        if let Some(result) = self.coordination.get_result(&id).map_tool_internal()? {
+            return Ok(json!({"found": true, "value": result}));
+        }
+        if let Some(router) = &self.federation {
+            if let Some(value) = router.coordination_result_get_fallback(&id).await? {
+                return Ok(json!({"found": true, "value": value}));
+            }
+        }
+        Ok(json!({"found": false}))
     }
-    fn tool_coordination_event_get(&self, arguments: &Value) -> ToolResult<Value> {
+    /// Get a single audit event by exact ID. Stays local-only: unlike every other coordination
+    /// route, Stage 3 never exposed `GET /v1/coordination/events/{id}` on the wire — only the
+    /// paginated `GET /v1/coordination/events` feed — so there is no remote counterpart to fall
+    /// back to. See `ToolName::routing()`, which categorizes this tool `LocalOnly` even though
+    /// its sibling `mempalace_coordination_events` is `RoutableCoordination`.
+    async fn tool_coordination_event_get(&self, arguments: &Value) -> ToolResult<Value> {
         exact_result(
             self.coordination
                 .get_event(&required_string(arguments, "event_id")?)
                 .map_tool_internal()?,
         )
     }
-    fn tool_coordination_events(&self, arguments: &Value) -> ToolResult<Value> {
+    /// Read the coordination audit-event feed. Aggregate and cursor-paginated, like
+    /// `mempalace_inbox_read` — always reads local and fans out to every configured remote
+    /// concurrently with a per-remote cursor, reported under `remote_events`.
+    async fn tool_coordination_events(&mut self, arguments: &Value) -> ToolResult<Value> {
         let wing = optional_non_blank_string(arguments, "wing")?;
-        Ok(json!(
-            self.coordination
-                .events(
-                    optional_i64(arguments, "cursor")?.map(CoordinationCursor),
-                    optional_string(arguments, "task_id")?.as_deref(),
-                    wing.as_deref(),
-                    optional_usize(arguments, "limit")?.unwrap_or(50),
-                )
-                .map_tool_internal()?
-        ))
+        let task_id = optional_string(arguments, "task_id")?;
+        let limit = optional_usize(arguments, "limit")?.unwrap_or(50);
+        let page = self
+            .coordination
+            .events(
+                optional_i64(arguments, "cursor")?.map(CoordinationCursor),
+                task_id.as_deref(),
+                wing.as_deref(),
+                limit,
+                // Fully trusted local caller — see the identical note in `tool_inbox_read`.
+                CoordinationVisibility::Trusted,
+            )
+            .map_tool_internal()?;
+        let mut payload = json!(page);
+        if let Some(router) = self.federation.as_ref().filter(|r| r.has_remotes()) {
+            let cursors = parse_cursors_arg(arguments, "remote_cursors")?;
+            let remote_events =
+                router.coordination_events_fanout(task_id, wing, Some(limit), &cursors).await;
+            payload["remote_events"] = json!(remote_events);
+        }
+        Ok(payload)
     }
 
-    fn tool_skill_propose(&self, arguments: &Value) -> ToolResult<Value> {
+    async fn tool_skill_propose(&self, arguments: &Value) -> ToolResult<Value> {
         let input: NewSkill = parse_coordination_input(arguments)?;
         Ok(json!(self.skills.propose_skill(&input).map_tool_internal()?))
     }
-    fn tool_skill_get(&self, arguments: &Value) -> ToolResult<Value> {
+    async fn tool_skill_get(&self, arguments: &Value) -> ToolResult<Value> {
         exact_result(
             self.skills
                 .get_skill(
@@ -3418,14 +3732,14 @@ where
                 .map_tool_internal()?,
         )
     }
-    fn tool_skill_versions(&self, arguments: &Value) -> ToolResult<Value> {
+    async fn tool_skill_versions(&self, arguments: &Value) -> ToolResult<Value> {
         Ok(json!(
             self.skills
                 .list_skill_versions(&required_string(arguments, "skill_id")?)
                 .map_tool_internal()?
         ))
     }
-    fn tool_skill_list(&self, arguments: &Value) -> ToolResult<Value> {
+    async fn tool_skill_list(&self, arguments: &Value) -> ToolResult<Value> {
         let scope = optional_string(arguments, "scope")?
             .map(|value| serde_json::from_value::<SkillScope>(json!(value)))
             .transpose()
@@ -3448,11 +3762,11 @@ where
                 .map_tool_internal()?
         ))
     }
-    fn tool_skill_record_outcome(&self, arguments: &Value) -> ToolResult<Value> {
+    async fn tool_skill_record_outcome(&self, arguments: &Value) -> ToolResult<Value> {
         let input: NewSkillOutcome = parse_coordination_input(arguments)?;
         Ok(json!(self.skills.record_outcome(&input).map_tool_internal()?))
     }
-    fn tool_skill_promote(&self, arguments: &Value) -> ToolResult<Value> {
+    async fn tool_skill_promote(&self, arguments: &Value) -> ToolResult<Value> {
         let expected_revision = required_i64(arguments, "expected_revision")?;
         let result = self
             .skills
@@ -3471,7 +3785,7 @@ where
             }
         })
     }
-    fn tool_skill_retire(&self, arguments: &Value) -> ToolResult<Value> {
+    async fn tool_skill_retire(&self, arguments: &Value) -> ToolResult<Value> {
         let expected_revision = required_i64(arguments, "expected_revision")?;
         let result = self
             .skills
@@ -3490,7 +3804,7 @@ where
             }
         })
     }
-    fn tool_skill_reviews(&self, arguments: &Value) -> ToolResult<Value> {
+    async fn tool_skill_reviews(&self, arguments: &Value) -> ToolResult<Value> {
         Ok(json!(
             self.skills
                 .list_skill_reviews(
@@ -3501,18 +3815,18 @@ where
         ))
     }
 
-    fn tool_delegation_span_start(&self, arguments: &Value) -> ToolResult<Value> {
+    async fn tool_delegation_span_start(&self, arguments: &Value) -> ToolResult<Value> {
         let input: NewSpan = parse_coordination_input(arguments)?;
         Ok(json!(self.delegation.start_span(&input).map_tool_internal()?))
     }
-    fn tool_delegation_span_get(&self, arguments: &Value) -> ToolResult<Value> {
+    async fn tool_delegation_span_get(&self, arguments: &Value) -> ToolResult<Value> {
         exact_result(
             self.delegation
                 .get_span(&required_string(arguments, "span_id")?)
                 .map_tool_internal()?,
         )
     }
-    fn tool_delegation_span_close(&self, arguments: &Value) -> ToolResult<Value> {
+    async fn tool_delegation_span_close(&self, arguments: &Value) -> ToolResult<Value> {
         let status: SpanStatus =
             serde_json::from_value(json!(required_string(arguments, "status")?))
                 .map_err(|error| ToolError::InvalidParams(error.to_string()))?;
@@ -3537,25 +3851,25 @@ where
             }
         })
     }
-    fn tool_delegation_spans_for_task(&self, arguments: &Value) -> ToolResult<Value> {
+    async fn tool_delegation_spans_for_task(&self, arguments: &Value) -> ToolResult<Value> {
         Ok(json!(
             self.delegation
                 .list_spans_for_task(&required_string(arguments, "task_id")?)
                 .map_tool_internal()?
         ))
     }
-    fn tool_delegation_checkpoint_append(&self, arguments: &Value) -> ToolResult<Value> {
+    async fn tool_delegation_checkpoint_append(&self, arguments: &Value) -> ToolResult<Value> {
         let input: NewCheckpoint = parse_coordination_input(arguments)?;
         Ok(json!(self.delegation.append_checkpoint(&input).map_tool_internal()?))
     }
-    fn tool_delegation_checkpoint_get(&self, arguments: &Value) -> ToolResult<Value> {
+    async fn tool_delegation_checkpoint_get(&self, arguments: &Value) -> ToolResult<Value> {
         exact_result(
             self.delegation
                 .get_checkpoint(&required_string(arguments, "checkpoint_id")?)
                 .map_tool_internal()?,
         )
     }
-    fn tool_delegation_trace(&self, arguments: &Value) -> ToolResult<Value> {
+    async fn tool_delegation_trace(&self, arguments: &Value) -> ToolResult<Value> {
         exact_result(
             self.delegation
                 .trace(&required_string(arguments, "root_span_id")?)
@@ -3994,6 +4308,69 @@ fn observation_applies_to_runtime(
         .as_deref()
         .is_none_or(|expected| harness == Some(expected));
     model_matches && harness_matches
+}
+
+/// Converts a local `mempalace_storage::TaskState` to the wire `CoordinationTaskState` used by
+/// `TransitionTaskRequest`, mirroring `wire_task_state` in `crates/mempalace-server/src/lib.rs`
+/// (that copy converts the same two enums the other direction across the HTTP boundary; this
+/// one is needed on the client side when a local task-not-found falls back to a federated
+/// transition request).
+fn wire_task_state(state: TaskState) -> WireTaskState {
+    match state {
+        TaskState::Pending => WireTaskState::Pending,
+        TaskState::Running => WireTaskState::Running,
+        TaskState::InputRequired => WireTaskState::InputRequired,
+        TaskState::Completed => WireTaskState::Completed,
+        TaskState::Cancelled => WireTaskState::Cancelled,
+        TaskState::Failed => WireTaskState::Failed,
+        TaskState::Expired => WireTaskState::Expired,
+    }
+}
+
+/// True when a coordination write's local failure is specifically "the referenced task or
+/// message does not exist locally" (`require_task`/`get_message` in
+/// `mempalace_storage::coordination`) — the signal a federated coordination tool uses to decide
+/// whether to fall back to a remote rather than surface the error immediately. Every other
+/// `StorageError` (a lease/state conflict, bad input) is not a "wrong palace" signal and must
+/// propagate as-is.
+///
+/// Matches against [`mempalace_storage::NOT_FOUND_SUFFIX`] rather than a bare `"not found"`
+/// literal, so a future rewording of the underlying message is a compile error at its
+/// construction site instead of silently disabling federation fallback for that path.
+fn is_local_record_missing(err: &mempalace_storage::StorageError) -> bool {
+    matches!(
+        err,
+        mempalace_storage::StorageError::Invariant(msg)
+            if msg.contains(mempalace_storage::NOT_FOUND_SUFFIX)
+    )
+}
+
+/// Parses an optional `{remote_name: cursor}` object argument into a per-remote cursor map, the
+/// same shape `mempalace_get_changes_since`'s inline `cursors` parsing already uses — factored
+/// out here so `tool_coordination_events`/`tool_inbox_read` do not duplicate it a second time.
+fn parse_cursors_arg(arguments: &Value, field: &'static str) -> ToolResult<BTreeMap<String, String>> {
+    match arguments.get(field) {
+        None | Some(Value::Null) => Ok(BTreeMap::new()),
+        Some(Value::Object(map)) => {
+            let mut out = BTreeMap::new();
+            for (k, v) in map {
+                match v.as_str() {
+                    Some(s) => {
+                        out.insert(k.clone(), s.to_owned());
+                    }
+                    None => {
+                        return Err(ToolError::InvalidParams(format!(
+                            "field `{field}` must be an object of string values"
+                        )));
+                    }
+                }
+            }
+            Ok(out)
+        }
+        Some(_) => Err(ToolError::InvalidParams(format!(
+            "field `{field}` must be an object of string values"
+        ))),
+    }
 }
 
 fn revision_conflict_payload(expected_revision: i64, actual_revision: Option<i64>) -> Value {
@@ -4592,6 +4969,35 @@ mod tests {
         }
     }
 
+    /// Regression for Codex finding 3832912235: `tool_inbox_read`/`tool_coordination_events`
+    /// read `remote_cursors` off the arguments (`parse_cursors_arg`), but until now neither
+    /// tool's `input_schema` declared it, so a schema-driven MCP client had no way to know the
+    /// field exists — every subsequent federated page restarted each remote's paging. Both
+    /// `mempalace_inbox_read` and `mempalace_coordination_events` must declare a `remote_cursors`
+    /// object property whose values are strings, matching the `{remote_name: cursor}` shape
+    /// `parse_cursors_arg` actually parses.
+    #[test]
+    fn inbox_read_and_coordination_events_declare_remote_cursors_schema() {
+        for tool_name in ["mempalace_inbox_read", "mempalace_coordination_events"] {
+            let tool = tool_definitions()
+                .into_iter()
+                .find(|tool| tool.name == tool_name)
+                .unwrap_or_else(|| panic!("{tool_name} must be a defined tool"));
+            let remote_cursors = tool.input_schema["properties"]
+                .get("remote_cursors")
+                .unwrap_or_else(|| panic!("{tool_name} must declare `remote_cursors`"));
+            assert_eq!(
+                remote_cursors["type"], "object",
+                "{tool_name}.remote_cursors must be an object: {remote_cursors}"
+            );
+            assert_eq!(
+                remote_cursors["additionalProperties"]["type"], "string",
+                "{tool_name}.remote_cursors values must be declared as strings, matching \
+                 parse_cursors_arg: {remote_cursors}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn initialize_matches_phase0_contract_shape() {
         let fixture = phase0_contract_fixture().unwrap();
@@ -4748,6 +5154,547 @@ mod tests {
             .await;
         let task = decode_tool_payload(&created).expect("task payload");
         assert_eq!(task["wing"], "wing_myproject");
+    }
+
+    /// Regression test for the coordination wing-normalisation security fix (Impact A): a
+    /// caller-supplied short/mixed-case spelling of `wing_agents` must still hit the diary
+    /// hard-override and resolve local, even when `default_mode` is `remote`. Before the fix,
+    /// `tool_task_create` routed on the raw, un-normalised wing string, so `"agents"` did not
+    /// `==` `wing_agents`, missed the override, and fell through to `default_mode: remote` —
+    /// shipping the task body to the configured remote before the peer's own normalisation
+    /// could reject it.
+    ///
+    /// Asserts on the mock's call counter, not on the tool's result: a bare "task was created"
+    /// check can pass even when the write went remote (the remote could still accept it, or a
+    /// local fallback could mask it), so the only thing that actually proves the remote was
+    /// never touched is the recording mock's `coordination_calls` counter staying at zero — the
+    /// same pattern `coordination_fallback_records_zero_remote_calls_without_coordination_federation_config`
+    /// in `federation.rs` uses for the sibling ID-discovery fallback.
+    #[tokio::test]
+    async fn task_create_wing_agents_short_form_stays_local_and_never_calls_remote() {
+        for raw_wing in ["agents", "Wing_Agents", " wing_agents "] {
+            let remote = LibMockRemote::default();
+            let calls = std::sync::Arc::clone(&remote.coordination_calls);
+            let mut remotes: BTreeMap<String, Arc<dyn mempalace_remote::RemoteApi>> =
+                BTreeMap::new();
+            remotes.insert("hub".to_owned(), Arc::new(remote));
+            let mut rules_remotes = BTreeMap::new();
+            for name in remotes.keys() {
+                rules_remotes.insert(
+                    name.clone(),
+                    ResolvedRemote {
+                        name: name.clone(),
+                        url: "https://test.example".to_owned(),
+                        token: None,
+                        timeout: std::time::Duration::from_secs(5),
+                    },
+                );
+            }
+            let rules = FederationRuntimeConfig {
+                remotes: rules_remotes,
+                default_mode: RouteMode::Remote,
+                default_remote: Some("hub".to_owned()),
+                wings: BTreeMap::new(),
+                kg: None,
+                coordination: BTreeMap::new(),
+            };
+            let router = FederationRouter::with_remotes(rules, remotes);
+            let harness = test_harness_with_mock_router(router).await;
+
+            let created = harness
+                .server
+                .handle_request(tool_call(
+                    920,
+                    "mempalace_task_create",
+                    json!({
+                        "title":"Research", "description":"Produce a result", "created_by":"manager",
+                        "wing": raw_wing,
+                        "idempotency_key": format!("agents-bypass-{raw_wing}")
+                    }),
+                ))
+                .await;
+            decode_tool_payload(&created).unwrap_or_else(|| {
+                panic!("expected a successful local task for wing {raw_wing:?}, got: {created}")
+            });
+            let observed = calls.load(std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(
+                observed, 0,
+                "wing {raw_wing:?} must resolve local via the wing_agents diary hard-override \
+                 and must never reach the remote, got {observed} remote call(s)"
+            );
+        }
+    }
+
+    /// Regression test for the coordination wing-normalisation security fix (Impact B): an
+    /// operator's explicit `federation.coordination["wing_secret"]: { mode: local }` pin must
+    /// still apply when the caller passes the short form `"secret"`, even though
+    /// `default_mode` is `remote`. Before the fix, routing was keyed on the raw string, so the
+    /// map lookup for `"secret"` missed the canonical `"wing_secret"` key entirely and fell
+    /// through to `default_mode: remote`, silently ignoring the pin and persisting the task on
+    /// the remote with no local record at all.
+    ///
+    /// As above, this asserts on the recording mock's call count, not on the result.
+    #[tokio::test]
+    async fn task_create_respects_an_explicit_local_pin_under_a_short_wing_form() {
+        let remote = LibMockRemote::default();
+        let calls = std::sync::Arc::clone(&remote.coordination_calls);
+        let mut remotes: BTreeMap<String, Arc<dyn mempalace_remote::RemoteApi>> = BTreeMap::new();
+        remotes.insert("hub".to_owned(), Arc::new(remote));
+        let mut rules_remotes = BTreeMap::new();
+        for name in remotes.keys() {
+            rules_remotes.insert(
+                name.clone(),
+                ResolvedRemote {
+                    name: name.clone(),
+                    url: "https://test.example".to_owned(),
+                    token: None,
+                    timeout: std::time::Duration::from_secs(5),
+                },
+            );
+        }
+        let mut coordination = BTreeMap::new();
+        coordination.insert(
+            "wing_secret".to_owned(),
+            ResolvedRouteRule { mode: RouteMode::Local, remote: None, write: WriteTarget::Local },
+        );
+        let rules = FederationRuntimeConfig {
+            remotes: rules_remotes,
+            default_mode: RouteMode::Remote,
+            default_remote: Some("hub".to_owned()),
+            wings: BTreeMap::new(),
+            kg: None,
+            coordination,
+        };
+        let router = FederationRouter::with_remotes(rules, remotes);
+        let harness = test_harness_with_mock_router(router).await;
+
+        let created = harness
+            .server
+            .handle_request(tool_call(
+                921,
+                "mempalace_task_create",
+                json!({
+                    "title":"Research", "description":"Produce a result", "created_by":"manager",
+                    "wing":"secret", "idempotency_key":"secret-local-pin-1"
+                }),
+            ))
+            .await;
+        decode_tool_payload(&created)
+            .unwrap_or_else(|| panic!("expected a successful local task for wing \"secret\", got: {created}"));
+        let observed = calls.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            observed, 0,
+            "an explicit federation.coordination[\"wing_secret\"] local pin must not be bypassed \
+             by the short-form wing spelling \"secret\", got {observed} remote call(s)"
+        );
+    }
+
+    /// Build a `FederationRouter` wired to a single recording mock remote, for the aggregate
+    /// fan-out gate regression tests below (`mempalace_inbox_read`/`mempalace_coordination_events`
+    /// bypassing `resolve_coordination_route` entirely — see the Codex findings this fixes).
+    /// `default_mode`/`coordination` are the two knobs that decide whether
+    /// `FederationRouter::coordination_federation_enabled()` is true.
+    fn router_with_coordination_config(
+        remote: LibMockRemote,
+        default_mode: RouteMode,
+        coordination: BTreeMap<String, ResolvedRouteRule>,
+    ) -> (FederationRouter, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let calls = std::sync::Arc::clone(&remote.coordination_calls);
+        let mut remotes: BTreeMap<String, Arc<dyn mempalace_remote::RemoteApi>> = BTreeMap::new();
+        remotes.insert("hub".to_owned(), Arc::new(remote));
+        let mut rules_remotes = BTreeMap::new();
+        for name in remotes.keys() {
+            rules_remotes.insert(
+                name.clone(),
+                ResolvedRemote {
+                    name: name.clone(),
+                    url: "https://test.example".to_owned(),
+                    token: None,
+                    timeout: std::time::Duration::from_secs(5),
+                },
+            );
+        }
+        let rules = FederationRuntimeConfig {
+            remotes: rules_remotes,
+            default_mode,
+            default_remote: Some("hub".to_owned()),
+            wings: BTreeMap::new(),
+            kg: None,
+            coordination,
+        };
+        (FederationRouter::with_remotes(rules, remotes), calls)
+    }
+
+    /// Codex P1 finding (comment 3832912220), Part 1: `mempalace_inbox_read`'s aggregate
+    /// fan-out must not contact any remote when coordination federation was never configured,
+    /// even though a remote IS configured (`has_remotes()` is true — the router below has one).
+    /// Before the fix, `tool_inbox_read` gated its fan-out on `has_remotes()` alone, so a palace
+    /// that federates drawers only, with an empty `federation.coordination` table and
+    /// `default_mode: local`, still sent the recipient and wing filter to the remote on every
+    /// inbox read.
+    #[tokio::test]
+    async fn inbox_read_stays_local_without_coordination_federation_configured() {
+        let (router, calls) = router_with_coordination_config(
+            LibMockRemote::default(),
+            RouteMode::Local,
+            BTreeMap::new(),
+        );
+        let harness = test_harness_with_mock_router(router).await;
+        let response = harness
+            .server
+            .handle_request(tool_call(930, "mempalace_inbox_read", json!({"recipient": "worker"})))
+            .await;
+        decode_tool_payload(&response)
+            .unwrap_or_else(|| panic!("expected a successful local inbox read, got: {response}"));
+        let observed = calls.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            observed, 0,
+            "mempalace_inbox_read must not contact a remote configured for drawers only, with \
+             an empty federation.coordination table and default_mode: local, got {observed} \
+             remote call(s)"
+        );
+    }
+
+    /// Codex P1 finding (comment 3832912220), Part 2: `mempalace_coordination_events`
+    /// counterpart of the test above.
+    #[tokio::test]
+    async fn coordination_events_stays_local_without_coordination_federation_configured() {
+        let (router, calls) = router_with_coordination_config(
+            LibMockRemote::default(),
+            RouteMode::Local,
+            BTreeMap::new(),
+        );
+        let harness = test_harness_with_mock_router(router).await;
+        let response = harness
+            .server
+            .handle_request(tool_call(931, "mempalace_coordination_events", json!({})))
+            .await;
+        decode_tool_payload(&response).unwrap_or_else(|| {
+            panic!("expected a successful local coordination events read, got: {response}")
+        });
+        let observed = calls.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            observed, 0,
+            "mempalace_coordination_events must not contact a remote configured for drawers \
+             only, with an empty federation.coordination table and default_mode: local, got \
+             {observed} remote call(s)"
+        );
+    }
+
+    /// Codex P1 finding (comment 3832912230): even with coordination federation properly
+    /// enabled (`default_mode: remote`), `mempalace_inbox_read` must never forward a
+    /// `wing_agents`-shaped filter to any remote — canonical spelling and several non-canonical
+    /// ones (locking in normalise-before-compare, the same bypass class `c1166d7` closed on
+    /// `tool_task_create`). This is a separate test from the gate-only tests above because the
+    /// two guards (coordination opt-in, diary suppression) are independent: a single test
+    /// exercising only one could pass even if the other guard were entirely missing.
+    #[tokio::test]
+    async fn inbox_read_wing_agents_never_fans_out_even_with_coordination_enabled() {
+        for raw_wing in [SHARED_AGENT_DIARY_WING, "agents", "Wing_Agents", " wing_agents "] {
+            let (router, calls) = router_with_coordination_config(
+                LibMockRemote::default(),
+                RouteMode::Remote,
+                BTreeMap::new(),
+            );
+            let harness = test_harness_with_mock_router(router).await;
+            let response = harness
+                .server
+                .handle_request(tool_call(
+                    932,
+                    "mempalace_inbox_read",
+                    json!({"recipient": "worker", "wing": raw_wing}),
+                ))
+                .await;
+            decode_tool_payload(&response).unwrap_or_else(|| {
+                panic!(
+                    "expected a successful local inbox read for wing {raw_wing:?}, got: {response}"
+                )
+            });
+            let observed = calls.load(std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(
+                observed, 0,
+                "wing {raw_wing:?} normalises to wing_agents and must never be forwarded to a \
+                 remote, even with coordination federation enabled, got {observed} remote \
+                 call(s)"
+            );
+        }
+    }
+
+    /// Codex P1 finding (comment 3832912230), `mempalace_coordination_events` counterpart —
+    /// same canonical-plus-non-canonical coverage.
+    #[tokio::test]
+    async fn coordination_events_wing_agents_never_fans_out_even_with_coordination_enabled() {
+        for raw_wing in [SHARED_AGENT_DIARY_WING, "agents", "Wing_Agents", " wing_agents "] {
+            let (router, calls) = router_with_coordination_config(
+                LibMockRemote::default(),
+                RouteMode::Remote,
+                BTreeMap::new(),
+            );
+            let harness = test_harness_with_mock_router(router).await;
+            let response = harness
+                .server
+                .handle_request(tool_call(
+                    933,
+                    "mempalace_coordination_events",
+                    json!({"wing": raw_wing}),
+                ))
+                .await;
+            decode_tool_payload(&response).unwrap_or_else(|| {
+                panic!(
+                    "expected a successful local coordination events read for wing {raw_wing:?}, \
+                     got: {response}"
+                )
+            });
+            let observed = calls.load(std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(
+                observed, 0,
+                "wing {raw_wing:?} normalises to wing_agents and must never be forwarded to a \
+                 remote, even with coordination federation enabled, got {observed} remote \
+                 call(s)"
+            );
+        }
+    }
+
+    /// Positive control for both findings above: with coordination federation properly enabled
+    /// and an ordinary (non-diary) wing, `mempalace_inbox_read` DOES fan out to the configured
+    /// remote. Without this, a broken fix that simply disabled the fan-out unconditionally would
+    /// pass every test above for the wrong reason.
+    #[tokio::test]
+    async fn inbox_read_fans_out_to_remote_when_coordination_federation_is_enabled() {
+        let (router, calls) = router_with_coordination_config(
+            LibMockRemote::default(),
+            RouteMode::Remote,
+            BTreeMap::new(),
+        );
+        let harness = test_harness_with_mock_router(router).await;
+        let response = harness
+            .server
+            .handle_request(tool_call(
+                934,
+                "mempalace_inbox_read",
+                json!({"recipient": "worker", "wing": "myproject"}),
+            ))
+            .await;
+        decode_tool_payload(&response)
+            .unwrap_or_else(|| panic!("expected a successful inbox read, got: {response}"));
+        let observed = calls.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            observed, 1,
+            "an ordinary wing with coordination federation enabled must still fan out to the \
+             configured remote, got {observed} remote call(s)"
+        );
+    }
+
+    /// Build a `FederationRouter` wired to two recording mock remotes, only one of which
+    /// ("hub") is named by a `federation.coordination["wing_team"]` rule; the other ("other")
+    /// is configured (present in `self.remotes`) but never referenced by any coordination rule
+    /// — e.g. a remote wired up only for drawer/KG federation. `default_mode: Local` and no
+    /// `default_remote` keep "other" out of the candidate set the same way an operator's config
+    /// would. Returns the router plus each remote's independent `coordination_calls` counter, so
+    /// a test can assert exactly which remote(s) were actually contacted.
+    fn router_with_two_remotes_one_coordination_candidate(
+        hub: LibMockRemote,
+        other: LibMockRemote,
+    ) -> (
+        FederationRouter,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let hub_calls = std::sync::Arc::clone(&hub.coordination_calls);
+        let other_calls = std::sync::Arc::clone(&other.coordination_calls);
+        let mut remotes: BTreeMap<String, Arc<dyn mempalace_remote::RemoteApi>> = BTreeMap::new();
+        remotes.insert("hub".to_owned(), Arc::new(hub));
+        remotes.insert("other".to_owned(), Arc::new(other));
+        let mut rules_remotes = BTreeMap::new();
+        for name in remotes.keys() {
+            rules_remotes.insert(
+                name.clone(),
+                ResolvedRemote {
+                    name: name.clone(),
+                    url: "https://test.example".to_owned(),
+                    token: None,
+                    timeout: std::time::Duration::from_secs(5),
+                },
+            );
+        }
+        let mut coordination = BTreeMap::new();
+        coordination.insert(
+            "wing_team".to_owned(),
+            ResolvedRouteRule {
+                mode: RouteMode::Remote,
+                remote: Some("hub".to_owned()),
+                write: WriteTarget::Remote,
+            },
+        );
+        let rules = FederationRuntimeConfig {
+            remotes: rules_remotes,
+            default_mode: RouteMode::Local,
+            default_remote: None,
+            wings: BTreeMap::new(),
+            kg: None,
+            coordination,
+        };
+        (FederationRouter::with_remotes(rules, remotes), hub_calls, other_calls)
+    }
+
+    /// PR #120 review, finding 1(a): `mempalace_inbox_read` and `mempalace_coordination_events`
+    /// must contact only the remote(s) actually named by a `federation.coordination` rule, not
+    /// every configured remote. Before the fix, both aggregate fan-outs looped over
+    /// `&self.remotes` unfiltered — unlike the ID-discovery fallbacks, which already narrowed to
+    /// `coordination_candidate_remotes()` — so a remote wired up only for drawer/KG federation,
+    /// never named by any coordination rule, still received the recipient/wing/task_id filter.
+    /// Asserts on each mock's independent `coordination_calls` counter, not on the response map,
+    /// so this cannot pass because the shape of an (empty) response happened to look right.
+    #[tokio::test]
+    async fn inbox_read_and_coordination_events_fanout_only_contact_the_coordination_candidate() {
+        let (router, hub_calls, other_calls) = router_with_two_remotes_one_coordination_candidate(
+            LibMockRemote::default(),
+            LibMockRemote::default(),
+        );
+        let harness = test_harness_with_mock_router(router).await;
+
+        let inbox = harness
+            .server
+            .handle_request(tool_call(940, "mempalace_inbox_read", json!({"recipient": "worker"})))
+            .await;
+        decode_tool_payload(&inbox)
+            .unwrap_or_else(|| panic!("expected a successful inbox read, got: {inbox}"));
+        assert_eq!(
+            hub_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "hub is named by federation.coordination and must be contacted exactly once"
+        );
+        assert_eq!(
+            other_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "other is never named by any federation.coordination rule and must not be contacted \
+             by mempalace_inbox_read"
+        );
+
+        let events = harness
+            .server
+            .handle_request(tool_call(941, "mempalace_coordination_events", json!({})))
+            .await;
+        decode_tool_payload(&events)
+            .unwrap_or_else(|| panic!("expected a successful events read, got: {events}"));
+        assert_eq!(
+            hub_calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "hub must be contacted again for mempalace_coordination_events"
+        );
+        assert_eq!(
+            other_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "other must still never be contacted, by either aggregate fan-out"
+        );
+    }
+
+    /// PR #120 review, finding 1(b): a coordination candidate that answers `CapabilityMissing`
+    /// (discovered live from its own `/v1/info` — it was never actually wired up to run
+    /// coordination at all) must be reported distinguishably from a remote that is genuinely
+    /// unreachable. Before the fix, both fan-outs stringified every `Err` the same way and
+    /// always inserted `{"unreachable": true, "error": ...}`, so a candidate that correctly
+    /// declined coordination support looked identical to a remote that was actually down.
+    #[tokio::test]
+    async fn coordination_fanout_distinguishes_capability_missing_from_unreachable() {
+        let mut capability_missing_remote = LibMockRemote::default();
+        capability_missing_remote.coordination_fanout_outcome =
+            LibMockFanoutOutcome::CapabilityMissing;
+        let (router, _calls) = router_with_coordination_config(
+            capability_missing_remote,
+            RouteMode::Remote,
+            BTreeMap::new(),
+        );
+        let harness = test_harness_with_mock_router(router).await;
+        let response = harness
+            .server
+            .handle_request(tool_call(942, "mempalace_inbox_read", json!({"recipient": "worker"})))
+            .await;
+        let payload = decode_tool_payload(&response).expect("inbox payload");
+        let remote_result = payload["remote_messages"]["hub"].clone();
+        assert_eq!(
+            remote_result["capability_missing"], true,
+            "a CapabilityMissing remote must be reported as capability_missing, got: {remote_result}"
+        );
+        assert!(
+            remote_result.get("unreachable").is_none(),
+            "a CapabilityMissing remote must not also be reported as unreachable, got: \
+             {remote_result}"
+        );
+
+        let mut unreachable_remote = LibMockRemote::default();
+        unreachable_remote.coordination_fanout_outcome = LibMockFanoutOutcome::Unreachable;
+        let (router, _calls) =
+            router_with_coordination_config(unreachable_remote, RouteMode::Remote, BTreeMap::new());
+        let harness = test_harness_with_mock_router(router).await;
+        let response = harness
+            .server
+            .handle_request(tool_call(943, "mempalace_inbox_read", json!({"recipient": "worker"})))
+            .await;
+        let payload = decode_tool_payload(&response).expect("inbox payload");
+        let remote_result = payload["remote_messages"]["hub"].clone();
+        assert_eq!(
+            remote_result["unreachable"], true,
+            "a genuinely unreachable remote must still be reported as unreachable, got: \
+             {remote_result}"
+        );
+        assert!(
+            remote_result.get("capability_missing").is_none(),
+            "a genuinely unreachable remote must not be reported as capability_missing, got: \
+             {remote_result}"
+        );
+    }
+
+    /// PR #120 review, finding 2: `is_local_record_missing` must match the real `Invariant`
+    /// error `mempalace_storage::coordination::CoordinationStore` actually produces for a
+    /// genuinely missing task or message — driven through the real storage calls, not a
+    /// hand-built string — and that message must actually be built from
+    /// `mempalace_storage::NOT_FOUND_SUFFIX`, the pinned constant both this predicate and
+    /// `mempalace-server`'s `coordination_storage_error` match against. Before the fix, the
+    /// predicate matched a bare `"not found"` literal with no compile-time link to the
+    /// constructing call sites, so a future rewording of either message would have silently
+    /// disabled federation fallback for that path with no signal here.
+    #[test]
+    fn is_local_record_missing_matches_real_missing_task_and_message_errors() {
+        let tempdir = TempDir::new().unwrap();
+        let store = mempalace_storage::CoordinationStore::new(tempdir.path().join("storage.sqlite3"));
+        store.ensure_schema().unwrap();
+
+        let err = store
+            .claim_task("does-not-exist", "worker-a", 1, Duration::minutes(1))
+            .expect_err("claiming a nonexistent task must fail");
+        assert!(
+            is_local_record_missing(&err),
+            "a genuinely missing task's real storage error must be treated as federatable, got: \
+             {err}"
+        );
+        match &err {
+            mempalace_storage::StorageError::Invariant(msg) => {
+                assert!(
+                    msg.ends_with(mempalace_storage::NOT_FOUND_SUFFIX),
+                    "the real message must be built from NOT_FOUND_SUFFIX, got: {msg}"
+                );
+            }
+            other => panic!("expected StorageError::Invariant, got {other:?}"),
+        }
+
+        let err = store
+            .acknowledge_message("does-not-exist", "worker-a")
+            .expect_err("acknowledging a nonexistent message must fail");
+        assert!(
+            is_local_record_missing(&err),
+            "a genuinely missing message's real storage error must be treated as federatable, \
+             got: {err}"
+        );
+        match &err {
+            mempalace_storage::StorageError::Invariant(msg) => {
+                assert!(
+                    msg.ends_with(mempalace_storage::NOT_FOUND_SUFFIX),
+                    "the real message must be built from NOT_FOUND_SUFFIX, got: {msg}"
+                );
+            }
+            other => panic!("expected StorageError::Invariant, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -7645,6 +8592,54 @@ mod tests {
         assert_eq!(ToolName::KgInvalidate.routing(), ToolRoutingCategory::RoutableKg);
         assert_eq!(ToolName::KgTimeline.routing(), ToolRoutingCategory::RoutableKg);
         assert_eq!(ToolName::KgStats.routing(), ToolRoutingCategory::RoutableKg);
+
+        // RoutableCoordination tools (issue #102 Stage 4) — before this stage every
+        // coordination tool below was (wrongly) declared LocalOnly with nothing checking it;
+        // flipping one to routable would have compiled and passed silently.
+        assert_eq!(ToolName::TaskCreate.routing(), ToolRoutingCategory::RoutableCoordination);
+        assert_eq!(ToolName::TaskGet.routing(), ToolRoutingCategory::RoutableCoordination);
+        assert_eq!(ToolName::TaskClaim.routing(), ToolRoutingCategory::RoutableCoordination);
+        assert_eq!(ToolName::TaskRenew.routing(), ToolRoutingCategory::RoutableCoordination);
+        assert_eq!(ToolName::TaskTransition.routing(), ToolRoutingCategory::RoutableCoordination);
+        assert_eq!(ToolName::MessageSend.routing(), ToolRoutingCategory::RoutableCoordination);
+        assert_eq!(ToolName::MessageGet.routing(), ToolRoutingCategory::RoutableCoordination);
+        assert_eq!(
+            ToolName::MessageAcknowledge.routing(),
+            ToolRoutingCategory::RoutableCoordination
+        );
+        assert_eq!(ToolName::InboxRead.routing(), ToolRoutingCategory::RoutableCoordination);
+        assert_eq!(ToolName::ArtifactPut.routing(), ToolRoutingCategory::RoutableCoordination);
+        assert_eq!(ToolName::ArtifactGet.routing(), ToolRoutingCategory::RoutableCoordination);
+        assert_eq!(ToolName::ResultPut.routing(), ToolRoutingCategory::RoutableCoordination);
+        assert_eq!(ToolName::ResultGet.routing(), ToolRoutingCategory::RoutableCoordination);
+        assert_eq!(
+            ToolName::CoordinationEvents.routing(),
+            ToolRoutingCategory::RoutableCoordination
+        );
+
+        // CoordinationEventGet is deliberately LocalOnly, not RoutableCoordination — Stage 3
+        // never exposed a single-event GET route on the wire, only the paginated feed.
+        assert_eq!(ToolName::CoordinationEventGet.routing(), ToolRoutingCategory::LocalOnly);
+
+        // Skill and delegation tools stay LocalOnly in this phase — not federated yet.
+        assert_eq!(ToolName::SkillPropose.routing(), ToolRoutingCategory::LocalOnly);
+        assert_eq!(ToolName::SkillGet.routing(), ToolRoutingCategory::LocalOnly);
+        assert_eq!(ToolName::SkillVersions.routing(), ToolRoutingCategory::LocalOnly);
+        assert_eq!(ToolName::SkillList.routing(), ToolRoutingCategory::LocalOnly);
+        assert_eq!(ToolName::SkillRecordOutcome.routing(), ToolRoutingCategory::LocalOnly);
+        assert_eq!(ToolName::SkillPromote.routing(), ToolRoutingCategory::LocalOnly);
+        assert_eq!(ToolName::SkillRetire.routing(), ToolRoutingCategory::LocalOnly);
+        assert_eq!(ToolName::SkillReviews.routing(), ToolRoutingCategory::LocalOnly);
+        assert_eq!(ToolName::DelegationSpanStart.routing(), ToolRoutingCategory::LocalOnly);
+        assert_eq!(ToolName::DelegationSpanGet.routing(), ToolRoutingCategory::LocalOnly);
+        assert_eq!(ToolName::DelegationSpanClose.routing(), ToolRoutingCategory::LocalOnly);
+        assert_eq!(ToolName::DelegationSpansForTask.routing(), ToolRoutingCategory::LocalOnly);
+        assert_eq!(
+            ToolName::DelegationCheckpointAppend.routing(),
+            ToolRoutingCategory::LocalOnly
+        );
+        assert_eq!(ToolName::DelegationCheckpointGet.routing(), ToolRoutingCategory::LocalOnly);
+        assert_eq!(ToolName::DelegationTrace.routing(), ToolRoutingCategory::LocalOnly);
     }
 
     #[tokio::test]
@@ -7836,6 +8831,30 @@ mod tests {
         changes_next_cursor: Option<String>,
         search_results: Vec<mempalace_federation::RemoteDrawerResult>,
         fail: bool,
+        /// Bumped by every `coordination_*` method this mock implements. Lets a test assert a
+        /// coordination write never reached the remote at all — see
+        /// `MockRemote::coordination_calls` in `federation.rs` for why a bare result check is
+        /// not sufficient on its own.
+        coordination_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        /// Outcome for `coordination_events`/`coordination_inbox` on this mock — lets a test
+        /// drive the aggregate fan-outs' `CapabilityMissing` vs. genuinely-unreachable
+        /// distinction (finding 1b) without hand-building a non-`Clone` `RemoteError`.
+        coordination_fanout_outcome: LibMockFanoutOutcome,
+    }
+
+    /// Canned outcomes for `LibMockRemote::coordination_events`/`coordination_inbox`.
+    #[derive(Clone, Copy, Default)]
+    enum LibMockFanoutOutcome {
+        /// Returns an empty, successful page.
+        #[default]
+        Success,
+        /// The remote does not advertise the `coordination` capability at all — the "declined,
+        /// not down" case the aggregate fan-outs must report as `capability_missing`, not
+        /// `unreachable`.
+        CapabilityMissing,
+        /// The remote could not be reached — the genuinely-degradable case that must still be
+        /// reported as `unreachable`.
+        Unreachable,
     }
 
     impl Default for LibMockRemote {
@@ -7845,6 +8864,8 @@ mod tests {
                 changes_next_cursor: None,
                 search_results: vec![],
                 fail: false,
+                coordination_calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                coordination_fanout_outcome: LibMockFanoutOutcome::default(),
             }
         }
     }
@@ -7952,6 +8973,70 @@ mod tests {
                 message: "not used".to_owned(),
             })
         }
+        async fn coordination_task_create(
+            &self,
+            req: mempalace_federation::NewTaskRequest,
+        ) -> mempalace_remote::Result<mempalace_federation::CoordinationTaskDto> {
+            self.coordination_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = req;
+            Err(mempalace_remote::RemoteError::Unreachable {
+                remote: "mock".to_owned(),
+                message: "not used".to_owned(),
+            })
+        }
+        /// Recording override for the aggregate-fan-out regression tests below: bumps
+        /// `coordination_calls` (like every other `coordination_*` override on this mock) so a
+        /// test can assert the gate in `FederationRouter::coordination_inbox_fanout` actually
+        /// stopped the call from ever reaching a remote, rather than trusting the response shape.
+        /// Honors `coordination_fanout_outcome` so a test can also drive the `CapabilityMissing`
+        /// vs. genuinely-unreachable distinction (finding 1b).
+        async fn coordination_inbox(
+            &self,
+            query: mempalace_federation::InboxQuery,
+        ) -> mempalace_remote::Result<mempalace_federation::InboxPageResponse> {
+            self.coordination_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = query;
+            match self.coordination_fanout_outcome {
+                LibMockFanoutOutcome::Success => {
+                    Ok(mempalace_federation::InboxPageResponse { messages: vec![], next_cursor: None })
+                }
+                LibMockFanoutOutcome::CapabilityMissing => {
+                    Err(mempalace_remote::RemoteError::CapabilityMissing {
+                        remote: "mock".to_owned(),
+                        capability: "coordination".to_owned(),
+                    })
+                }
+                LibMockFanoutOutcome::Unreachable => Err(mempalace_remote::RemoteError::Unreachable {
+                    remote: "mock".to_owned(),
+                    message: "mock remote is down".to_owned(),
+                }),
+            }
+        }
+        /// See [`Self::coordination_inbox`] — same recording purpose, for
+        /// `coordination_events_fanout`.
+        async fn coordination_events(
+            &self,
+            query: mempalace_federation::CoordinationEventsQuery,
+        ) -> mempalace_remote::Result<mempalace_federation::CoordinationEventsResponse> {
+            self.coordination_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = query;
+            match self.coordination_fanout_outcome {
+                LibMockFanoutOutcome::Success => Ok(mempalace_federation::CoordinationEventsResponse {
+                    events: vec![],
+                    next_cursor: None,
+                }),
+                LibMockFanoutOutcome::CapabilityMissing => {
+                    Err(mempalace_remote::RemoteError::CapabilityMissing {
+                        remote: "mock".to_owned(),
+                        capability: "coordination".to_owned(),
+                    })
+                }
+                LibMockFanoutOutcome::Unreachable => Err(mempalace_remote::RemoteError::Unreachable {
+                    remote: "mock".to_owned(),
+                    message: "mock remote is down".to_owned(),
+                }),
+            }
+        }
     }
 
     fn make_lib_router(
@@ -7979,6 +9064,7 @@ mod tests {
                 remote: remotes.keys().next().cloned(),
                 write: WriteTarget::Remote,
             }),
+            coordination: BTreeMap::new(),
         };
         FederationRouter::with_remotes(rules, remotes)
     }
@@ -8470,6 +9556,7 @@ mod tests {
             )]
             .into(),
             kg: None,
+            coordination: BTreeMap::new(),
         }
     }
 

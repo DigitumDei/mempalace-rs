@@ -12,7 +12,8 @@ mod types;
 
 pub use coordination::{
     Artifact, CoordinationCursor, CoordinationEvent, CoordinationEventPage, CoordinationStore,
-    InboxPage, Message, NewArtifact, NewMessage, NewTask, NewTaskResult, Task, TaskResult, TaskState,
+    InboxPage, Message, NewArtifact, NewMessage, NewTask, NewTaskResult, Task, TaskResult,
+    TaskState, UNSCOPED_WING,
 };
 pub use delegation::{
     Checkpoint, CheckpointType, DelegationStore, NewCheckpoint, NewSpan, Span, SpanStatus,

@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
+use mempalace_core::WingId;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -12,6 +13,10 @@ use crate::{Result, StorageError};
 
 const MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
 const MAX_TASK_TEXT_BYTES: usize = 1024 * 1024;
+
+/// Reserved wing name for coordination rows that existed before wings were introduced. Every
+/// task and event created before this stage upgraded its schema reads back with this wing.
+pub const UNSCOPED_WING: &str = "wing_unscoped";
 
 /// Durable task lifecycle state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,6 +66,10 @@ pub struct NewTask {
     pub title: String,
     pub description: String,
     pub created_by: String,
+    /// Owning wing, e.g. `myproject` or `wing_myproject`. Normalised on the way in with
+    /// [`WingId::normalized`], so both spellings resolve to the same wing. Required: there is
+    /// no default, unlike the reserved `wing_unscoped` used for pre-upgrade rows.
+    pub wing: String,
     pub idempotency_key: String,
     #[serde(default)]
     pub parent_id: Option<String>,
@@ -81,6 +90,9 @@ pub struct Task {
     pub state: TaskState,
     pub revision: i64,
     pub created_by: String,
+    /// Normalised owning wing. Always present; pre-upgrade rows read back as
+    /// [`UNSCOPED_WING`].
+    pub wing: String,
     pub owner: Option<String>,
     pub parent_id: Option<String>,
     pub dependencies: Vec<String>,
@@ -185,6 +197,9 @@ pub struct CoordinationEvent {
     pub entity_type: String,
     pub entity_id: String,
     pub task_id: Option<String>,
+    /// The owning task's normalised wing, materialised at write time inside the same
+    /// transaction as the mutation. Never supplied by a caller.
+    pub wing: String,
     pub event_type: String,
     pub actor: String,
     pub from_state: Option<TaskState>,
@@ -220,14 +235,28 @@ impl CoordinationStore {
     }
 
     /// Install coordination tables and indexes.
+    ///
+    /// Upgrade-aware: a palace created before wings existed has `coordination_tasks` and
+    /// `coordination_events` tables without a `wing` column. `CREATE TABLE IF NOT EXISTS` is a
+    /// no-op against those existing tables, so after it runs this checks
+    /// `PRAGMA table_info` and adds the column with `ALTER TABLE ... ADD COLUMN` when it is
+    /// missing. Both the fresh and the upgraded path leave `wing` as the last physical column,
+    /// so the two schemas end up identical. Safe to call on every startup: adding an already-
+    /// present column is skipped, not repeated.
+    ///
+    /// The wing index on `coordination_events` is created *after* the column backfill, not in
+    /// the same batch as the rest of the schema: on an upgrade path the column does not exist
+    /// yet when that batch runs, and `CREATE INDEX ... (wing, ...)` against a still-missing
+    /// column would fail outright.
     pub fn ensure_schema(&self) -> Result<()> {
-        let conn = self.connection()?;
+        let mut conn = self.connection()?;
         conn.execute_batch(r#"
 CREATE TABLE IF NOT EXISTS coordination_tasks (
  task_id TEXT PRIMARY KEY, title TEXT NOT NULL, description TEXT NOT NULL, state TEXT NOT NULL,
  revision INTEGER NOT NULL, created_by TEXT NOT NULL, owner TEXT, parent_id TEXT,
  dependencies_json TEXT NOT NULL, budget_json TEXT, lease_expires_at TEXT, expires_at TEXT,
  idempotency_key TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+ wing TEXT NOT NULL DEFAULT 'wing_unscoped',
  UNIQUE(created_by, idempotency_key), FOREIGN KEY(parent_id) REFERENCES coordination_tasks(task_id));
 CREATE TABLE IF NOT EXISTS coordination_messages (
  sequence INTEGER PRIMARY KEY AUTOINCREMENT, message_id TEXT UNIQUE NOT NULL, task_id TEXT NOT NULL,
@@ -248,9 +277,31 @@ CREATE TABLE IF NOT EXISTS coordination_results (
 CREATE TABLE IF NOT EXISTS coordination_events (
  sequence INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT UNIQUE NOT NULL, entity_type TEXT NOT NULL,
  entity_id TEXT NOT NULL, task_id TEXT, event_type TEXT NOT NULL, actor TEXT NOT NULL,
- from_state TEXT, to_state TEXT, revision INTEGER, details_json TEXT, occurred_at TEXT NOT NULL);
+ from_state TEXT, to_state TEXT, revision INTEGER, details_json TEXT, occurred_at TEXT NOT NULL,
+ wing TEXT NOT NULL DEFAULT 'wing_unscoped');
 CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(task_id, sequence);
 "#)?;
+        // The check-then-act column backfill below must not run concurrently with itself across
+        // processes: two MCP servers opening the same pre-Phase-3 palace at once could both
+        // observe the column absent via `PRAGMA table_info` and both attempt
+        // `ALTER TABLE ... ADD COLUMN`, and the loser would fail `ensure_schema` outright — a
+        // startup failure at the exact moment a palace is upgraded. `BEGIN IMMEDIATE` acquires
+        // the write lock up front, so a second racing connection blocks (up to
+        // `PRAGMA busy_timeout`) until the first commits, then re-checks `PRAGMA table_info`
+        // inside its own transaction and finds the column already present. The duplicate-column
+        // error is also tolerated as a second line of defence (e.g. an external tool holding the
+        // lock differently), since `add_column_if_missing` is meant to be idempotent by
+        // contract, not just serialized by this transaction.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        add_column_if_missing(&tx, "coordination_tasks", "wing", "TEXT NOT NULL DEFAULT 'wing_unscoped'")?;
+        add_column_if_missing(&tx, "coordination_events", "wing", "TEXT NOT NULL DEFAULT 'wing_unscoped'")?;
+        // Wing-filtered `events()` calls are a continuously polled feed, so a full scan is a
+        // real cost, not a theoretical one. The column is guaranteed to exist by this point on
+        // both the fresh and the upgraded path.
+        tx.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_coordination_events_wing ON coordination_events(wing, sequence);",
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -262,6 +313,12 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
         bounded_text(&input.description, "task description")?;
         if let Some(budget) = &input.budget {
             bounded_json(budget)?;
+        }
+        let wing = WingId::normalized(&input.wing)?.to_string();
+        if wing == UNSCOPED_WING {
+            return Err(StorageError::Invariant(format!(
+                "`{UNSCOPED_WING}` is reserved for tasks migrated from before wings existed; new tasks must specify a real wing"
+            )));
         }
         let mut conn = self.connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -277,12 +334,13 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
         }
         let now = OffsetDateTime::now_utc();
         let id = format!("task_{}", Uuid::new_v4().simple());
-        tx.execute("INSERT INTO coordination_tasks VALUES (?1,?2,?3,'pending',0,?4,NULL,?5,?6,?7,NULL,?8,?9,?10,?10)", params![id,input.title,input.description,input.created_by,input.parent_id,serde_json::to_string(&input.dependencies)?,input.budget.as_ref().map(serde_json::to_string).transpose()?,format_time_opt(input.expires_at)?,input.idempotency_key,format_time(now)?])?;
+        tx.execute("INSERT INTO coordination_tasks(task_id,title,description,state,revision,created_by,owner,parent_id,dependencies_json,budget_json,lease_expires_at,expires_at,idempotency_key,created_at,updated_at,wing) VALUES (?1,?2,?3,'pending',0,?4,NULL,?5,?6,?7,NULL,?8,?9,?10,?10,?11)", params![id,input.title,input.description,input.created_by,input.parent_id,serde_json::to_string(&input.dependencies)?,input.budget.as_ref().map(serde_json::to_string).transpose()?,format_time_opt(input.expires_at)?,input.idempotency_key,format_time(now)?,wing])?;
         append_event(
             &tx,
             "task",
             &id,
             Some(&id),
+            &wing,
             "task_created",
             &input.created_by,
             None,
@@ -335,6 +393,7 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
                 "task",
                 id,
                 Some(id),
+                &task.wing,
                 "task_expired",
                 worker,
                 Some(task.state),
@@ -362,6 +421,7 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
             "task",
             id,
             Some(id),
+            &task.wing,
             if task.owner.is_some() { "task_reclaimed" } else { "task_claimed" },
             worker,
             Some(task.state),
@@ -407,6 +467,7 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
             "task",
             id,
             Some(id),
+            &task.wing,
             "lease_renewed",
             worker,
             None,
@@ -458,6 +519,7 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
             "task",
             id,
             Some(id),
+            &task.wing,
             "task_transitioned",
             actor,
             Some(task.state),
@@ -483,7 +545,7 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
             tx.commit()?;
             return Ok(v);
         }
-        require_task(&tx, &input.task_id)?;
+        let task = require_task(&tx, &input.task_id)?;
         let now = OffsetDateTime::now_utc();
         let id = format!("message_{}", Uuid::new_v4().simple());
         tx.execute("INSERT INTO coordination_messages(message_id,task_id,sender,recipient,kind,payload_json,envelope_version,idempotency_key,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",params![id,input.task_id,input.sender,input.recipient,input.kind,serde_json::to_string(&input.payload)?,input.envelope_version,input.idempotency_key,format_time(now)?])?;
@@ -492,6 +554,7 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
             "message",
             &id,
             Some(&input.task_id),
+            &task.wing,
             "message_sent",
             &input.sender,
             None,
@@ -509,27 +572,43 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
     pub fn get_message(&self, id: &str) -> Result<Option<Message>> {
         get_message_conn(&self.connection()?, id)
     }
-    /// Read an addressed inbox after an opaque sequence cursor.
+    /// Read an addressed inbox after an opaque sequence cursor, optionally scoped to one wing.
+    ///
+    /// Messages carry no `wing` column of their own — filtering joins to the owning task's
+    /// `wing` instead. `wing` is normalised the same way as task creation, so a filter of
+    /// `myproject` matches messages on tasks stored as `wing_myproject`.
     pub fn inbox(
         &self,
         recipient: &str,
         cursor: Option<CoordinationCursor>,
+        wing: Option<&str>,
         limit: usize,
         unacknowledged_only: bool,
     ) -> Result<InboxPage> {
         let conn = self.connection()?;
-        let mut sql="SELECT message_id,sequence,task_id,sender,recipient,kind,payload_json,envelope_version,acknowledged_at,acknowledged_by,created_at FROM coordination_messages WHERE recipient=?1 AND sequence>?2".to_owned();
-        if unacknowledged_only {
-            sql.push_str(" AND acknowledged_at IS NULL");
-        }
-        sql.push_str(" ORDER BY sequence LIMIT ?3");
         let requested = limit.clamp(1, 500);
+        let mut sql = "SELECT m.message_id,m.sequence,m.task_id,m.sender,m.recipient,m.kind,m.payload_json,m.envelope_version,m.acknowledged_at,m.acknowledged_by,m.created_at FROM coordination_messages m".to_owned();
+        let mut predicates = vec!["m.recipient=?1".to_owned(), "m.sequence>?2".to_owned()];
+        let mut bindings: Vec<Box<dyn rusqlite::ToSql>> =
+            vec![Box::new(recipient.to_owned()), Box::new(cursor.map_or(0, |c| c.0))];
+        if let Some(wing) = wing {
+            let normalized = WingId::normalized(wing)?.to_string();
+            sql.push_str(" JOIN coordination_tasks t ON t.task_id=m.task_id");
+            bindings.push(Box::new(normalized));
+            predicates.push(format!("t.wing=?{}", bindings.len()));
+        }
+        if unacknowledged_only {
+            predicates.push("m.acknowledged_at IS NULL".to_owned());
+        }
+        bindings.push(Box::new((requested + 1) as i64));
+        sql.push_str(&format!(
+            " WHERE {} ORDER BY m.sequence LIMIT ?{}",
+            predicates.join(" AND "),
+            bindings.len(),
+        ));
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt
-            .query_map(
-                params![recipient, cursor.map_or(0, |c| c.0), (requested + 1) as i64],
-                message_row,
-            )?;
+        let parameters = bindings.iter().map(AsRef::as_ref).collect::<Vec<&dyn rusqlite::ToSql>>();
+        let rows = stmt.query_map(parameters.as_slice(), message_row)?;
         let mut values = rows.collect::<std::result::Result<Vec<_>, _>>()?;
         let has_more = values.len() > requested;
         values.truncate(requested);
@@ -554,12 +633,14 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
             return Ok(msg);
         }
         let now = OffsetDateTime::now_utc();
+        let wing = task_wing(&tx, &msg.task_id)?;
         tx.execute("UPDATE coordination_messages SET acknowledged_at=?2,acknowledged_by=?3 WHERE message_id=?1",params![id,format_time(now)?,actor])?;
         append_event(
             &tx,
             "message",
             id,
             Some(&msg.task_id),
+            &wing,
             "message_acknowledged",
             actor,
             None,
@@ -586,12 +667,12 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
             tx.commit()?;
             return Ok(v);
         }
-        require_task(&tx, &input.task_id)?;
+        let task = require_task(&tx, &input.task_id)?;
         let now = OffsetDateTime::now_utc();
         let id = format!("artifact_{}", Uuid::new_v4().simple());
         let hash = blake3::hash(input.content.as_bytes()).to_hex().to_string();
         tx.execute(
-            "INSERT INTO coordination_artifacts VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            "INSERT INTO coordination_artifacts(artifact_id,task_id,created_by,role,media_type,content,content_hash,idempotency_key,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             params![
                 id,
                 input.task_id,
@@ -609,6 +690,7 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
             "artifact",
             &id,
             Some(&input.task_id),
+            &task.wing,
             "artifact_created",
             &input.created_by,
             None,
@@ -637,14 +719,14 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
             tx.commit()?;
             return Ok(value);
         }
-        require_task(&tx, &input.task_id)?;
+        let task = require_task(&tx, &input.task_id)?;
         let now = OffsetDateTime::now_utc();
         let id = format!("result_{}", Uuid::new_v4().simple());
         tx.execute(
             "INSERT INTO coordination_results(result_id,task_id,created_by,payload_json,idempotency_key,created_at) VALUES(?1,?2,?3,?4,?5,?6)",
             params![id, input.task_id, input.created_by, serde_json::to_string(&input.payload)?, input.idempotency_key, format_time(now)?],
         )?;
-        append_event(&tx, "result", &id, Some(&input.task_id), "result_created", &input.created_by, None, None, None, None, now)?;
+        append_event(&tx, "result", &id, Some(&input.task_id), &task.wing, "result_created", &input.created_by, None, None, None, None, now)?;
         let value = get_result_tx(&tx, &id)?
             .ok_or_else(|| StorageError::Invariant("created result disappeared".into()))?;
         tx.commit()?;
@@ -654,38 +736,38 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
     pub fn get_result(&self, id: &str) -> Result<Option<TaskResult>> {
         get_result_conn(&self.connection()?, id)
     }
-    /// Read ordered audit events after an opaque cursor.
+    /// Read ordered audit events after an opaque cursor, optionally scoped to one task and/or
+    /// one wing. `wing` is normalised the same way as task creation, so a filter of `myproject`
+    /// matches events stored as `wing_myproject`.
     pub fn events(
         &self,
         cursor: Option<CoordinationCursor>,
         task_id: Option<&str>,
+        wing: Option<&str>,
         limit: usize,
     ) -> Result<CoordinationEventPage> {
         let conn = self.connection()?;
         let requested = limit.clamp(1, 500);
-        let (sql, task) = if let Some(id) = task_id {
-            (
-                "SELECT sequence,event_id,entity_type,entity_id,task_id,event_type,actor,from_state,to_state,revision,details_json,occurred_at FROM coordination_events WHERE sequence>?1 AND task_id=?2 ORDER BY sequence LIMIT ?3",
-                Some(id),
-            )
-        } else {
-            (
-                "SELECT sequence,event_id,entity_type,entity_id,task_id,event_type,actor,from_state,to_state,revision,details_json,occurred_at FROM coordination_events WHERE sequence>?1 ORDER BY sequence LIMIT ?2",
-                None,
-            )
-        };
-        let mut stmt = conn.prepare(sql)?;
-        let rows = if let Some(id) = task {
-            stmt.query_map(
-                params![cursor.map_or(0, |c| c.0), id, (requested + 1) as i64],
-                event_row,
-            )?
-        } else {
-            stmt.query_map(
-                params![cursor.map_or(0, |c| c.0), (requested + 1) as i64],
-                event_row,
-            )?
-        };
+        let mut predicates = vec!["sequence>?1".to_owned()];
+        let mut bindings: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(cursor.map_or(0, |c| c.0))];
+        if let Some(id) = task_id {
+            bindings.push(Box::new(id.to_owned()));
+            predicates.push(format!("task_id=?{}", bindings.len()));
+        }
+        if let Some(wing) = wing {
+            let normalized = WingId::normalized(wing)?.to_string();
+            bindings.push(Box::new(normalized));
+            predicates.push(format!("wing=?{}", bindings.len()));
+        }
+        bindings.push(Box::new((requested + 1) as i64));
+        let sql = format!(
+            "SELECT sequence,event_id,entity_type,entity_id,task_id,event_type,actor,from_state,to_state,revision,details_json,occurred_at,wing FROM coordination_events WHERE {} ORDER BY sequence LIMIT ?{}",
+            predicates.join(" AND "),
+            bindings.len(),
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let parameters = bindings.iter().map(AsRef::as_ref).collect::<Vec<&dyn rusqlite::ToSql>>();
+        let rows = stmt.query_map(parameters.as_slice(), event_row)?;
         let mut values = rows.collect::<std::result::Result<Vec<_>, _>>()?;
         let has_more = values.len() > requested;
         values.truncate(requested);
@@ -700,18 +782,67 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
     pub fn get_event(&self, id: &str) -> Result<Option<CoordinationEvent>> {
         let conn = self.connection()?;
         let mut statement = conn.prepare(
-            "SELECT sequence,event_id,entity_type,entity_id,task_id,event_type,actor,from_state,to_state,revision,details_json,occurred_at FROM coordination_events WHERE event_id=?1",
+            "SELECT sequence,event_id,entity_type,entity_id,task_id,event_type,actor,from_state,to_state,revision,details_json,occurred_at,wing FROM coordination_events WHERE event_id=?1",
         )?;
         statement.query_row([id], event_row).optional().map_err(Into::into)
     }
 
     fn connection(&self) -> Result<Connection> {
-        let conn = Connection::open(&self.path)?;
-        conn.execute_batch(
-            "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;",
-        )?;
-        Ok(conn)
+        open_palace_connection(&self.path)
     }
+}
+
+/// Add `column` to `table` with the given DDL fragment (type, nullability, default) unless it
+/// already exists. `table` and `column` are always internal literals, never caller input, so
+/// interpolating them into DDL text carries no injection risk; SQLite has no
+/// `ADD COLUMN IF NOT EXISTS`, so the existence check is done by hand via `PRAGMA table_info`.
+///
+/// Callers are expected to hold a write lock (e.g. a `BEGIN IMMEDIATE` transaction) across the
+/// check-and-act so two processes never race here in the first place. The duplicate-column error
+/// from `ALTER TABLE` is tolerated anyway as a second line of defence: SQLite has no distinct
+/// error code for it (it comes back as a generic `SQLITE_ERROR` with a message), so this matches
+/// on the message text, which is a stable, documented SQLite error string for this exact
+/// condition, not a moving target we control.
+fn add_column_if_missing(conn: &Connection, table: &str, column: &str, ddl: &str) -> Result<()> {
+    let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let exists = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .iter()
+        .any(|name| name == column);
+    if !exists {
+        if let Err(err) = conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {ddl};")) {
+            let message = err.to_string();
+            if !message.contains("duplicate column name") {
+                return Err(err.into());
+            }
+        }
+    }
+    Ok(())
+}
+/// Open a connection to the palace database with the pragmas every coordination-family
+/// store depends on.
+///
+/// `journal_mode=WAL` briefly needs an exclusive lock, and SQLite does **not** retry a
+/// journal-mode change through the busy handler when another connection has the database
+/// open - it returns `SQLITE_BUSY` immediately no matter how long the timeout is. Two
+/// processes opening the same palace at once (two MCP runtimes starting together) would
+/// therefore fail outright. WAL is a persistent property of the database file, so a busy
+/// here means another connection is setting it or already has: tolerate that specific
+/// condition and carry on. Matched on the structured error code, never on message text.
+pub(crate) fn open_palace_connection(path: &Path) -> Result<Connection> {
+    let conn = Connection::open(path)?;
+    // Installed through rusqlite's API rather than as a pragma in the batch below, so the
+    // handler exists before the first statement that could contend runs.
+    conn.busy_timeout(std::time::Duration::from_millis(5_000))?;
+    conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+    match conn.execute_batch("PRAGMA journal_mode=WAL;") {
+        Ok(()) => {}
+        Err(rusqlite::Error::SqliteFailure(err, _))
+            if err.code == rusqlite::ErrorCode::DatabaseBusy => {}
+        Err(err) => return Err(err.into()),
+    }
+    Ok(conn)
 }
 
 fn validate_actor(v: &str) -> Result<()> {
@@ -785,8 +916,15 @@ fn parse_time_opt(v: Option<String>) -> Result<Option<OffsetDateTime>> {
 fn require_task(tx: &Transaction<'_>, id: &str) -> Result<Task> {
     get_task_tx(tx, id)?.ok_or_else(|| StorageError::Invariant(format!("task `{id}` not found")))
 }
+/// Look up just the owning task's wing, for events whose entity isn't a `Task` itself (e.g. a
+/// message acknowledgement, which only has the `Message` on hand).
+fn task_wing(tx: &Transaction<'_>, task_id: &str) -> Result<String> {
+    tx.query_row("SELECT wing FROM coordination_tasks WHERE task_id=?1", [task_id], |r| r.get(0))
+        .optional()?
+        .ok_or_else(|| StorageError::Invariant(format!("task `{task_id}` not found")))
+}
 fn get_task_conn(conn: &Connection, id: &str) -> Result<Option<Task>> {
-    let mut s=conn.prepare("SELECT task_id,title,description,state,revision,created_by,owner,parent_id,dependencies_json,budget_json,lease_expires_at,expires_at,created_at,updated_at FROM coordination_tasks WHERE task_id=?1")?;
+    let mut s=conn.prepare("SELECT task_id,title,description,state,revision,created_by,owner,parent_id,dependencies_json,budget_json,lease_expires_at,expires_at,created_at,updated_at,wing FROM coordination_tasks WHERE task_id=?1")?;
     s.query_row([id], task_row).optional().map_err(Into::into)
 }
 fn get_task_tx(tx: &Transaction<'_>, id: &str) -> Result<Option<Task>> {
@@ -810,6 +948,7 @@ fn task_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
     let expiry: Option<String> = r.get(11)?;
     let created: String = r.get(12)?;
     let updated: String = r.get(13)?;
+    let wing: String = r.get(14)?;
     Ok(Task {
         task_id: r.get(0)?,
         title: r.get(1)?,
@@ -817,6 +956,7 @@ fn task_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         state: TaskState::parse(&state).map_err(sql_conv)?,
         revision: r.get(4)?,
         created_by: r.get(5)?,
+        wing,
         owner: r.get(6)?,
         parent_id: r.get(7)?,
         dependencies: serde_json::from_str(&deps).map_err(sql_conv)?,
@@ -932,11 +1072,16 @@ fn find_result_by_key(
     })
     .transpose()
 }
+/// Append an audit event. `wing` must be the owning task's wing, read inside the same
+/// transaction as the mutation being recorded — it is never accepted from an external caller,
+/// so an event can never carry a wing that disagrees with its task.
+#[allow(clippy::too_many_arguments)]
 fn append_event(
     tx: &Transaction<'_>,
     entity_type: &str,
     entity_id: &str,
     task_id: Option<&str>,
+    wing: &str,
     event_type: &str,
     actor: &str,
     from: Option<TaskState>,
@@ -945,7 +1090,7 @@ fn append_event(
     details: Option<&Value>,
     at: OffsetDateTime,
 ) -> Result<()> {
-    tx.execute("INSERT INTO coordination_events(event_id,entity_type,entity_id,task_id,event_type,actor,from_state,to_state,revision,details_json,occurred_at)VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",params![format!("event_{}",Uuid::new_v4().simple()),entity_type,entity_id,task_id,event_type,actor,from.map(TaskState::as_str),to.map(TaskState::as_str),revision,details.map(serde_json::to_string).transpose()?,format_time(at)?])?;
+    tx.execute("INSERT INTO coordination_events(event_id,entity_type,entity_id,task_id,event_type,actor,from_state,to_state,revision,details_json,occurred_at,wing)VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",params![format!("event_{}",Uuid::new_v4().simple()),entity_type,entity_id,task_id,event_type,actor,from.map(TaskState::as_str),to.map(TaskState::as_str),revision,details.map(serde_json::to_string).transpose()?,format_time(at)?,wing])?;
     Ok(())
 }
 fn event_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<CoordinationEvent> {
@@ -953,12 +1098,14 @@ fn event_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<CoordinationEvent> {
     let to: Option<String> = r.get(8)?;
     let details: Option<String> = r.get(10)?;
     let at: String = r.get(11)?;
+    let wing: String = r.get(12)?;
     Ok(CoordinationEvent {
         sequence: r.get(0)?,
         event_id: r.get(1)?,
         entity_type: r.get(2)?,
         entity_id: r.get(3)?,
         task_id: r.get(4)?,
+        wing,
         event_type: r.get(5)?,
         actor: r.get(6)?,
         from_state: from.map(|v| TaskState::parse(&v)).transpose().map_err(sql_conv)?,
@@ -987,6 +1134,7 @@ mod tests {
             title: "work".into(),
             description: "do it".into(),
             created_by: "manager".into(),
+            wing: "wing_test".into(),
             idempotency_key: "create-1".into(),
             parent_id: None,
             dependencies: vec![],
@@ -994,6 +1142,87 @@ mod tests {
             expires_at: None,
         })
         .expect("task")
+    }
+    fn task_with_wing(s: &CoordinationStore, wing: &str, key: &str) -> Task {
+        s.create_task(&NewTask {
+            title: "work".into(),
+            description: "do it".into(),
+            created_by: "manager".into(),
+            wing: wing.into(),
+            idempotency_key: key.into(),
+            parent_id: None,
+            dependencies: vec![],
+            budget: None,
+            expires_at: None,
+        })
+        .expect("task")
+    }
+    /// Build the pre-Phase-3 schema by hand (no `wing` column), to simulate a palace created
+    /// before this stage shipped. Kept in sync with `CoordinationStore::ensure_schema`'s output
+    /// minus the `wing` columns — the upgrade tests below prove the two converge.
+    const LEGACY_SCHEMA_SQL: &str = r#"
+CREATE TABLE coordination_tasks (
+ task_id TEXT PRIMARY KEY, title TEXT NOT NULL, description TEXT NOT NULL, state TEXT NOT NULL,
+ revision INTEGER NOT NULL, created_by TEXT NOT NULL, owner TEXT, parent_id TEXT,
+ dependencies_json TEXT NOT NULL, budget_json TEXT, lease_expires_at TEXT, expires_at TEXT,
+ idempotency_key TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+ UNIQUE(created_by, idempotency_key), FOREIGN KEY(parent_id) REFERENCES coordination_tasks(task_id));
+CREATE TABLE coordination_messages (
+ sequence INTEGER PRIMARY KEY AUTOINCREMENT, message_id TEXT UNIQUE NOT NULL, task_id TEXT NOT NULL,
+ sender TEXT NOT NULL, recipient TEXT NOT NULL, kind TEXT NOT NULL, payload_json TEXT NOT NULL,
+ envelope_version INTEGER NOT NULL, idempotency_key TEXT NOT NULL, acknowledged_at TEXT,
+ acknowledged_by TEXT, created_at TEXT NOT NULL, UNIQUE(sender, idempotency_key),
+ FOREIGN KEY(task_id) REFERENCES coordination_tasks(task_id));
+CREATE INDEX IF NOT EXISTS idx_coordination_inbox ON coordination_messages(recipient, sequence);
+CREATE TABLE coordination_artifacts (
+ artifact_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, created_by TEXT NOT NULL, role TEXT NOT NULL,
+ media_type TEXT NOT NULL, content TEXT NOT NULL, content_hash TEXT NOT NULL, idempotency_key TEXT NOT NULL,
+ created_at TEXT NOT NULL, UNIQUE(created_by, idempotency_key),
+ FOREIGN KEY(task_id) REFERENCES coordination_tasks(task_id));
+CREATE TABLE coordination_results (
+ result_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, created_by TEXT NOT NULL,
+ payload_json TEXT NOT NULL, idempotency_key TEXT NOT NULL, created_at TEXT NOT NULL,
+ UNIQUE(created_by, idempotency_key), FOREIGN KEY(task_id) REFERENCES coordination_tasks(task_id));
+CREATE TABLE coordination_events (
+ sequence INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT UNIQUE NOT NULL, entity_type TEXT NOT NULL,
+ entity_id TEXT NOT NULL, task_id TEXT, event_type TEXT NOT NULL, actor TEXT NOT NULL,
+ from_state TEXT, to_state TEXT, revision INTEGER, details_json TEXT, occurred_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(task_id, sequence);
+"#;
+    /// `(name, type, notnull, dflt_value, pk)` for every column of `table`, in physical column
+    /// order — enough to prove two schemas are structurally identical.
+    fn table_info(path: &Path, table: &str) -> Vec<(String, String, i64, Option<String>, i64)> {
+        let conn = Connection::open(path).expect("open for pragma");
+        let mut statement =
+            conn.prepare(&format!("PRAGMA table_info({table})")).expect("prepare pragma");
+        statement
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, i64>(5)?,
+                ))
+            })
+            .expect("query pragma")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect pragma rows")
+    }
+    /// `(name, unique)` for every index on `table`, sorted — enough to catch an index that
+    /// exists on only one of a fresh and an upgraded schema. `table_info` alone would miss
+    /// that: columns can match while an index is silently absent on one side.
+    fn index_list(path: &Path, table: &str) -> Vec<(String, i64)> {
+        let conn = Connection::open(path).expect("open for pragma");
+        let mut statement =
+            conn.prepare(&format!("PRAGMA index_list({table})")).expect("prepare pragma");
+        let mut rows = statement
+            .query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, i64>(2)?)))
+            .expect("query pragma")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect pragma rows");
+        rows.sort();
+        rows
     }
     #[test]
     fn exact_ids_and_idempotency_are_authoritative() {
@@ -1014,7 +1243,7 @@ mod tests {
         let reclaimed =
             s.claim_task(&t.task_id, "b", claimed.revision, Duration::minutes(1)).expect("reclaim");
         assert_eq!(reclaimed.owner.as_deref(), Some("b"));
-        let events = s.events(None, Some(&t.task_id), 20).expect("events");
+        let events = s.events(None, Some(&t.task_id), None, 20).expect("events");
         assert_eq!(events.events.len(), 3);
         let event = events.events.first().expect("event").clone();
         assert_eq!(s.get_event(&event.event_id).expect("exact event"), Some(event));
@@ -1050,6 +1279,7 @@ mod tests {
                 title: "child".into(),
                 description: "dependent work".into(),
                 created_by: "manager".into(),
+                wing: "wing_test".into(),
                 idempotency_key: "child-1".into(),
                 parent_id: Some(parent.task_id.clone()),
                 dependencies: vec![parent.task_id.clone()],
@@ -1165,6 +1395,7 @@ mod tests {
                 title: oversized,
                 description: "description".into(),
                 created_by: "manager".into(),
+                wing: "wing_test".into(),
                 idempotency_key: "oversized-title".into(),
                 parent_id: None,
                 dependencies: vec![],
@@ -1186,20 +1417,291 @@ mod tests {
             })
             .expect("message");
         }
-        let first = s.inbox("receiver", None, 1, false).expect("first inbox page");
+        let first = s.inbox("receiver", None, None, 1, false).expect("first inbox page");
         assert_eq!(first.messages.len(), 1);
         assert!(first.next_cursor.is_some());
-        let last = s.inbox("receiver", first.next_cursor, 1, false).expect("last inbox page");
+        let last =
+            s.inbox("receiver", first.next_cursor, None, 1, false).expect("last inbox page");
         assert_eq!(last.messages.len(), 1);
         assert_eq!(last.next_cursor, None);
 
-        let first_events = s.events(None, Some(&t.task_id), 1).expect("first event page");
+        let first_events = s.events(None, Some(&t.task_id), None, 1).expect("first event page");
         assert_eq!(first_events.events.len(), 1);
         assert!(first_events.next_cursor.is_some());
         let mut cursor = first_events.next_cursor;
         while cursor.is_some() {
-            let page = s.events(cursor, Some(&t.task_id), 500).expect("event page");
+            let page = s.events(cursor, Some(&t.task_id), None, 500).expect("event page");
             cursor = page.next_cursor;
         }
+    }
+
+    #[test]
+    fn ensure_schema_upgrades_a_pre_phase3_palace_and_preserves_existing_tasks() {
+        let dir = TempDir::new().expect("temp");
+        let path = dir.path().join("palace.sqlite3");
+        {
+            let conn = Connection::open(&path).expect("open");
+            conn.execute_batch(LEGACY_SCHEMA_SQL).expect("legacy schema");
+            conn.execute(
+                "INSERT INTO coordination_tasks VALUES ('task_legacy','old title','old description','pending',0,'manager',NULL,NULL,'[]',NULL,NULL,NULL,'legacy-key','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+                [],
+            )
+            .expect("legacy task row");
+        }
+
+        let store = CoordinationStore::new(&path);
+        store.ensure_schema().expect("upgrade schema");
+
+        let task = store.get_task("task_legacy").expect("get").expect("legacy task survives");
+        assert_eq!(task.title, "old title");
+        assert_eq!(task.created_by, "manager");
+        assert_eq!(task.wing, UNSCOPED_WING, "pre-existing tasks get the reserved unscoped wing");
+
+        // The upgraded store must still be fully usable: new tasks and events on this same
+        // palace get a real wing, not the reserved one.
+        let fresh = task_with_wing(&store, "alpha", "post-upgrade-1");
+        assert_eq!(fresh.wing, "wing_alpha");
+        let events = store.events(None, Some(&fresh.task_id), None, 10).expect("events");
+        assert_eq!(events.events.first().expect("event").wing, "wing_alpha");
+    }
+
+    #[test]
+    fn fresh_and_upgraded_schema_end_up_identical() {
+        let fresh_dir = TempDir::new().expect("temp");
+        let fresh_path = fresh_dir.path().join("palace.sqlite3");
+        CoordinationStore::new(&fresh_path).ensure_schema().expect("fresh schema");
+
+        let upgraded_dir = TempDir::new().expect("temp");
+        let upgraded_path = upgraded_dir.path().join("palace.sqlite3");
+        {
+            let conn = Connection::open(&upgraded_path).expect("open");
+            conn.execute_batch(LEGACY_SCHEMA_SQL).expect("legacy schema");
+        }
+        CoordinationStore::new(&upgraded_path).ensure_schema().expect("upgrade schema");
+
+        assert_eq!(
+            table_info(&fresh_path, "coordination_tasks"),
+            table_info(&upgraded_path, "coordination_tasks"),
+            "a fresh palace and an upgraded palace must agree on coordination_tasks"
+        );
+        assert_eq!(
+            table_info(&fresh_path, "coordination_events"),
+            table_info(&upgraded_path, "coordination_events"),
+            "a fresh palace and an upgraded palace must agree on coordination_events"
+        );
+        // Columns matching is not enough — an index present on only one path is invisible to
+        // `table_info` but still a real divergence (e.g. a full scan on one side, an index seek
+        // on the other).
+        assert_eq!(
+            index_list(&fresh_path, "coordination_tasks"),
+            index_list(&upgraded_path, "coordination_tasks"),
+            "a fresh palace and an upgraded palace must agree on coordination_tasks indexes"
+        );
+        assert_eq!(
+            index_list(&fresh_path, "coordination_events"),
+            index_list(&upgraded_path, "coordination_events"),
+            "a fresh palace and an upgraded palace must agree on coordination_events indexes"
+        );
+        let event_indexes = index_list(&fresh_path, "coordination_events");
+        assert!(
+            event_indexes.iter().any(|(name, _)| name == "idx_coordination_events_wing"),
+            "the wing index must actually be present, not merely agreed-upon: {event_indexes:?}"
+        );
+    }
+
+    #[test]
+    fn concurrent_ensure_schema_on_a_pre_phase3_palace_does_not_fail_the_backfill() {
+        // Simulates two MCP processes opening the same pre-Phase-3 palace at the same instant:
+        // both would see `wing` absent from `PRAGMA table_info` and race to `ALTER TABLE ... ADD
+        // COLUMN`. Before the fix, the loser's `ensure_schema` (and therefore `McpRuntime::new`)
+        // failed outright.
+        let dir = TempDir::new().expect("temp");
+        let path = dir.path().join("palace.sqlite3");
+        {
+            let conn = Connection::open(&path).expect("open");
+            conn.execute_batch(LEGACY_SCHEMA_SQL).expect("legacy schema");
+        }
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut joins = Vec::new();
+        for _ in 0..2 {
+            let path = path.clone();
+            let gate = barrier.clone();
+            joins.push(std::thread::spawn(move || {
+                let store = CoordinationStore::new(path);
+                gate.wait();
+                store.ensure_schema()
+            }));
+        }
+        for join in joins {
+            join.join().expect("racing thread").expect("ensure_schema must not fail under a race");
+        }
+
+        let wing_columns = table_info(&path, "coordination_tasks")
+            .into_iter()
+            .filter(|(name, ..)| name == "wing")
+            .count();
+        assert_eq!(wing_columns, 1, "racing backfills must not duplicate the column");
+
+        let store = CoordinationStore::new(&path);
+        let t = task_with_wing(&store, "race", "concurrent-ensure-schema-1");
+        assert_eq!(t.wing, "wing_race");
+    }
+
+    #[test]
+    fn ensure_schema_is_idempotent() {
+        let dir = TempDir::new().expect("temp");
+        let path = dir.path().join("palace.sqlite3");
+        let store = CoordinationStore::new(&path);
+        store.ensure_schema().expect("first call");
+        store.ensure_schema().expect("second call");
+        store.ensure_schema().expect("third call");
+
+        let wing_columns = table_info(&path, "coordination_tasks")
+            .into_iter()
+            .filter(|(name, ..)| name == "wing")
+            .count();
+        assert_eq!(wing_columns, 1, "repeated ensure_schema calls must not duplicate the column");
+
+        // The store must still work after repeated calls: McpRuntime::new calls this on every
+        // startup, so this is the realistic shape of the guarantee.
+        let t = task_with_wing(&store, "repeat", "idempotence-1");
+        assert_eq!(store.get_task(&t.task_id).expect("get").expect("found").wing, "wing_repeat");
+    }
+
+    #[test]
+    fn task_wing_is_normalised_on_create() {
+        let (_d, s) = store();
+        let t = task_with_wing(&s, "myproject", "wing-normalise-1");
+        assert_eq!(t.wing, "wing_myproject");
+        let fetched = s.get_task(&t.task_id).expect("get").expect("found");
+        assert_eq!(fetched.wing, "wing_myproject");
+    }
+
+    #[test]
+    fn create_task_rejects_the_reserved_unscoped_wing_in_either_spelling() {
+        let (_d, s) = store();
+        s.create_task(&NewTask {
+            title: "work".into(),
+            description: "do it".into(),
+            created_by: "manager".into(),
+            wing: UNSCOPED_WING.into(),
+            idempotency_key: "reject-prefixed".into(),
+            parent_id: None,
+            dependencies: vec![],
+            budget: None,
+            expires_at: None,
+        })
+        .expect_err("prefixed wing_unscoped must be rejected");
+        s.create_task(&NewTask {
+            title: "work".into(),
+            description: "do it".into(),
+            created_by: "manager".into(),
+            wing: "unscoped".into(),
+            idempotency_key: "reject-unprefixed".into(),
+            parent_id: None,
+            dependencies: vec![],
+            budget: None,
+            expires_at: None,
+        })
+        .expect_err("unprefixed unscoped must be rejected after normalisation");
+    }
+
+    #[test]
+    fn events_inherit_the_owning_tasks_wing_and_callers_cannot_override_it() {
+        let (_d, s) = store();
+        let t = task_with_wing(&s, "alpha", "wing-events-1");
+        s.send_message(&NewMessage {
+            task_id: t.task_id.clone(),
+            sender: "manager".into(),
+            recipient: "worker".into(),
+            kind: "handoff".into(),
+            payload: serde_json::json!({}),
+            idempotency_key: "wing-events-msg".into(),
+            envelope_version: 1,
+        })
+        .expect("message");
+        let claimed = s.claim_task(&t.task_id, "worker", t.revision, Duration::minutes(1)).expect("claim");
+        s.put_artifact(&NewArtifact {
+            task_id: t.task_id.clone(),
+            created_by: "worker".into(),
+            role: "note".into(),
+            media_type: "text/plain".into(),
+            content: "hi".into(),
+            idempotency_key: "wing-events-artifact".into(),
+        })
+        .expect("artifact");
+        s.put_result(&NewTaskResult {
+            task_id: t.task_id.clone(),
+            created_by: "worker".into(),
+            payload: serde_json::json!({"ok": true}),
+            idempotency_key: "wing-events-result".into(),
+        })
+        .expect("result");
+        s.transition_task(&t.task_id, "worker", claimed.revision, TaskState::Completed, None)
+            .expect("transition");
+
+        // Note that none of NewMessage, NewArtifact, or NewTaskResult has a `wing` field at
+        // all — there is no code path through which a caller could supply one.
+        let page = s.events(None, Some(&t.task_id), None, 50).expect("events");
+        assert_eq!(
+            page.events.len(),
+            6,
+            "task_created, message_sent, task_claimed, artifact_created, result_created, task_transitioned"
+        );
+        assert!(
+            page.events.iter().all(|event| event.wing == "wing_alpha"),
+            "every event must inherit the owning task's normalised wing"
+        );
+    }
+
+    #[test]
+    fn wing_filter_scopes_events_and_inbox_with_normalisation() {
+        let (_d, s) = store();
+        let alpha = task_with_wing(&s, "alpha", "wf-alpha");
+        let beta = task_with_wing(&s, "beta", "wf-beta");
+
+        s.send_message(&NewMessage {
+            task_id: alpha.task_id.clone(),
+            sender: "manager".into(),
+            recipient: "worker".into(),
+            kind: "handoff".into(),
+            payload: serde_json::json!({}),
+            idempotency_key: "wf-msg-alpha".into(),
+            envelope_version: 1,
+        })
+        .expect("alpha message");
+        s.send_message(&NewMessage {
+            task_id: beta.task_id.clone(),
+            sender: "manager".into(),
+            recipient: "worker".into(),
+            kind: "handoff".into(),
+            payload: serde_json::json!({}),
+            idempotency_key: "wf-msg-beta".into(),
+            envelope_version: 1,
+        })
+        .expect("beta message");
+
+        // The filter uses the unprefixed spelling; it must still match the normalised,
+        // `wing_`-prefixed value that was actually stored.
+        let alpha_events = s.events(None, None, Some("alpha"), 100).expect("alpha events");
+        assert!(!alpha_events.events.is_empty());
+        assert!(
+            alpha_events.events.iter().all(|e| e.task_id.as_deref() == Some(alpha.task_id.as_str())),
+            "an alpha wing filter must not leak beta's events"
+        );
+
+        let alpha_inbox = s.inbox("worker", None, Some("alpha"), 100, false).expect("alpha inbox");
+        assert_eq!(alpha_inbox.messages.len(), 1);
+        assert_eq!(alpha_inbox.messages[0].task_id, alpha.task_id);
+
+        // The already-prefixed spelling must match too, on both sides of the earlier asymmetry.
+        let beta_inbox =
+            s.inbox("worker", None, Some("wing_beta"), 100, false).expect("beta inbox");
+        assert_eq!(beta_inbox.messages.len(), 1);
+        assert_eq!(beta_inbox.messages[0].task_id, beta.task_id);
+
+        // No filter at all still returns both.
+        let unfiltered = s.inbox("worker", None, None, 100, false).expect("unfiltered inbox");
+        assert_eq!(unfiltered.messages.len(), 2);
     }
 }

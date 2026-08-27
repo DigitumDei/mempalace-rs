@@ -611,9 +611,9 @@ impl ToolName {
             },
             Self::TaskCreate => coordination_definition(
                 self,
-                "Create a durable task idempotently. Replaying the same created_by and idempotency_key returns the committed task.",
-                json!({"title":{"type":"string"},"description":{"type":"string"},"created_by":{"type":"string"},"idempotency_key":{"type":"string"},"parent_id":{"type":"string"},"dependencies":{"type":"array","items":{"type":"string"}},"budget":{},"expires_at":{"type":"string"}}),
-                &["title", "description", "created_by", "idempotency_key"],
+                "Create a durable task idempotently in the given wing. Replaying the same created_by and idempotency_key returns the committed task. wing is normalised on write (myproject and wing_myproject are the same wing) and is inherited by every message, artifact, result, and audit event this task produces.",
+                json!({"title":{"type":"string"},"description":{"type":"string"},"created_by":{"type":"string"},"wing":{"type":"string","description":"Owning wing, e.g. wing_myproject. Normalised on write."},"idempotency_key":{"type":"string"},"parent_id":{"type":"string"},"dependencies":{"type":"array","items":{"type":"string"}},"budget":{},"expires_at":{"type":"string"}}),
+                &["title", "description", "created_by", "wing", "idempotency_key"],
             ),
             Self::TaskGet => coordination_definition(
                 self,
@@ -659,8 +659,8 @@ impl ToolName {
             ),
             Self::InboxRead => coordination_definition(
                 self,
-                "Read messages addressed to a recipient using an opaque local cursor.",
-                json!({"recipient":{"type":"string"},"cursor":{"type":"integer"},"limit":{"type":"integer"},"unacknowledged_only":{"type":"boolean"}}),
+                "Read messages addressed to a recipient using an opaque local cursor. Optionally scope to one wing (matched via the sending task, normalised the same way as task creation).",
+                json!({"recipient":{"type":"string"},"cursor":{"type":"integer"},"wing":{"type":"string","description":"Optional wing filter, e.g. wing_myproject. Normalised the same way as task creation."},"limit":{"type":"integer"},"unacknowledged_only":{"type":"boolean"}}),
                 &["recipient"],
             ),
             Self::ArtifactPut => coordination_definition(
@@ -695,8 +695,8 @@ impl ToolName {
             ),
             Self::CoordinationEvents => coordination_definition(
                 self,
-                "Read append-only coordination audit events using an opaque local cursor.",
-                json!({"cursor":{"type":"integer"},"task_id":{"type":"string"},"limit":{"type":"integer"}}),
+                "Read append-only coordination audit events using an opaque local cursor. Optionally scope to one task and/or one wing (normalised the same way as task creation).",
+                json!({"cursor":{"type":"integer"},"task_id":{"type":"string"},"wing":{"type":"string","description":"Optional wing filter, e.g. wing_myproject. Normalised the same way as task creation."},"limit":{"type":"integer"}}),
                 &[],
             ),
             Self::SkillPropose => coordination_definition(
@@ -3327,11 +3327,13 @@ where
         ))
     }
     fn tool_inbox_read(&self, arguments: &Value) -> ToolResult<Value> {
+        let wing = optional_non_blank_string(arguments, "wing")?;
         let page = self
             .coordination
             .inbox(
                 &required_string(arguments, "recipient")?,
                 optional_i64(arguments, "cursor")?.map(CoordinationCursor),
+                wing.as_deref(),
                 optional_usize(arguments, "limit")?.unwrap_or(50),
                 optional_bool(arguments, "unacknowledged_only")?.unwrap_or(false),
             )
@@ -3368,11 +3370,13 @@ where
         )
     }
     fn tool_coordination_events(&self, arguments: &Value) -> ToolResult<Value> {
+        let wing = optional_non_blank_string(arguments, "wing")?;
         Ok(json!(
             self.coordination
                 .events(
                     optional_i64(arguments, "cursor")?.map(CoordinationCursor),
                     optional_string(arguments, "task_id")?.as_deref(),
+                    wing.as_deref(),
                     optional_usize(arguments, "limit")?.unwrap_or(50),
                 )
                 .map_tool_internal()?
@@ -4593,7 +4597,7 @@ mod tests {
                 "mempalace_task_create",
                 json!({
                     "title":"Research", "description":"Produce a result", "created_by":"manager",
-                    "idempotency_key":"task-request-1", "budget":{"tokens":500}
+                    "wing":"wing_test", "idempotency_key":"task-request-1", "budget":{"tokens":500}
                 }),
             ))
             .await;
@@ -4607,7 +4611,7 @@ mod tests {
                 "mempalace_task_create",
                 json!({
                     "title":"Research", "description":"Produce a result", "created_by":"manager",
-                    "idempotency_key":"task-request-1", "budget":{"tokens":500}
+                    "wing":"wing_test", "idempotency_key":"task-request-1", "budget":{"tokens":500}
                 }),
             ))
             .await;
@@ -4679,6 +4683,136 @@ mod tests {
         assert_eq!(
             decode_tool_payload(&exact_result_response).expect("exact result")["found"],
             true
+        );
+    }
+
+    #[tokio::test]
+    async fn task_create_requires_a_wing() {
+        let harness = test_harness().await;
+        let response = harness
+            .server
+            .handle_request(tool_call(
+                909,
+                "mempalace_task_create",
+                json!({
+                    "title":"Research", "description":"Produce a result", "created_by":"manager",
+                    "idempotency_key":"missing-wing-1"
+                }),
+            ))
+            .await;
+        // A bare `error.is_some()` would also pass for an unrelated failure, so check the
+        // message actually names the missing field rather than just that *something* failed.
+        let message = response["error"]["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("expected a tool error naming `wing`, got: {response}"));
+        assert!(
+            message.contains("wing"),
+            "error message must name the missing `wing` field, got: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_create_normalises_the_wing() {
+        let harness = test_harness().await;
+        let created = harness
+            .server
+            .handle_request(tool_call(
+                910,
+                "mempalace_task_create",
+                json!({
+                    "title":"Research", "description":"Produce a result", "created_by":"manager",
+                    "wing":"myproject", "idempotency_key":"wing-normalise-1"
+                }),
+            ))
+            .await;
+        let task = decode_tool_payload(&created).expect("task payload");
+        assert_eq!(task["wing"], "wing_myproject");
+    }
+
+    #[tokio::test]
+    async fn coordination_events_and_inbox_read_filter_by_wing() {
+        let harness = test_harness().await;
+        let alpha = harness
+            .server
+            .handle_request(tool_call(
+                911,
+                "mempalace_task_create",
+                json!({
+                    "title":"Alpha work", "description":"d", "created_by":"manager",
+                    "wing":"alpha", "idempotency_key":"wf-alpha"
+                }),
+            ))
+            .await;
+        let alpha_id =
+            decode_tool_payload(&alpha).expect("alpha task")["task_id"].as_str().unwrap().to_owned();
+
+        let beta = harness
+            .server
+            .handle_request(tool_call(
+                912,
+                "mempalace_task_create",
+                json!({
+                    "title":"Beta work", "description":"d", "created_by":"manager",
+                    "wing":"beta", "idempotency_key":"wf-beta"
+                }),
+            ))
+            .await;
+        let beta_id =
+            decode_tool_payload(&beta).expect("beta task")["task_id"].as_str().unwrap().to_owned();
+
+        harness
+            .server
+            .handle_request(tool_call(
+                913,
+                "mempalace_message_send",
+                json!({
+                    "task_id":alpha_id, "sender":"manager", "recipient":"worker", "kind":"handoff",
+                    "payload":{}, "idempotency_key":"wf-msg-alpha"
+                }),
+            ))
+            .await;
+        harness
+            .server
+            .handle_request(tool_call(
+                914,
+                "mempalace_message_send",
+                json!({
+                    "task_id":beta_id, "sender":"manager", "recipient":"worker", "kind":"handoff",
+                    "payload":{}, "idempotency_key":"wf-msg-beta"
+                }),
+            ))
+            .await;
+
+        // The filter is unprefixed; it must still match the normalised, `wing_`-prefixed value
+        // that was actually stored for the alpha task.
+        let inbox = harness
+            .server
+            .handle_request(tool_call(
+                915,
+                "mempalace_inbox_read",
+                json!({"recipient":"worker", "wing":"alpha"}),
+            ))
+            .await;
+        let inbox = decode_tool_payload(&inbox).expect("inbox payload");
+        let messages = inbox["messages"].as_array().expect("messages array");
+        assert_eq!(messages.len(), 1, "the wing filter must exclude beta's message");
+        assert_eq!(messages[0]["task_id"], alpha_id);
+
+        // The already-prefixed spelling must work on the events side too.
+        let events = harness
+            .server
+            .handle_request(tool_call(
+                916,
+                "mempalace_coordination_events",
+                json!({"wing":"wing_beta"}),
+            ))
+            .await;
+        let events = decode_tool_payload(&events).expect("events payload");
+        let events = events["events"].as_array().expect("events array");
+        assert!(!events.is_empty());
+        assert!(
+            events.iter().all(|event| event["task_id"] == beta_id),
+            "the wing filter must exclude alpha's events"
         );
     }
 
@@ -4815,6 +4949,47 @@ mod tests {
         assert_eq!(reviews[0]["reviewer"], "reviewer-b");
     }
 
+    /// Regression for the propose/list wing asymmetry described in
+    /// docs/Coordination-Phase-3-Design.md: before the fix, `mempalace_skill_propose` stored a
+    /// raw wing while `mempalace_skill_list` normalised its filter, so proposing and listing
+    /// with the *same* unprefixed wing spelling could still miss each other.
+    #[tokio::test]
+    async fn skill_propose_and_list_agree_on_an_unprefixed_wing() {
+        let harness = test_harness().await;
+        harness
+            .server
+            .handle_request(tool_call(
+                930,
+                "mempalace_skill_propose",
+                json!({
+                    "skill_id":"unprefixed-wing-skill", "scope":"project", "wing":"myproject",
+                    "applicability":"a", "instructions_ref":"r", "author":"author-a",
+                    "confidence":0.5, "idempotency_key":"unprefixed-wing-1"
+                }),
+            ))
+            .await;
+
+        let list = harness
+            .server
+            .handle_request(tool_call(
+                931,
+                "mempalace_skill_list",
+                json!({"wing":"myproject"}),
+            ))
+            .await;
+        let list = decode_tool_payload(&list).expect("list payload");
+        let ids = list
+            .as_array()
+            .expect("array")
+            .iter()
+            .map(|skill| skill["skill_id"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert!(
+            ids.contains(&"unprefixed-wing-skill"),
+            "proposing and listing with the same unprefixed wing must agree"
+        );
+    }
+
     #[tokio::test]
     async fn delegation_trace_reconstructs_a_run_and_keeps_budget_stops_visible() {
         let harness = test_harness().await;
@@ -4825,7 +5000,7 @@ mod tests {
                 "mempalace_task_create",
                 json!({
                     "title":"Investigate", "description":"delegated work", "created_by":"manager",
-                    "idempotency_key":"delegation-task-1"
+                    "wing":"wing_test", "idempotency_key":"delegation-task-1"
                 }),
             ))
             .await;

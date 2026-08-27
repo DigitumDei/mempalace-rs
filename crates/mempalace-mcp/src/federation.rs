@@ -1346,14 +1346,17 @@ impl FederationRouter {
     // Reads and writes deliberately part ways on which errors count as "not this palace, try the
     // next candidate" versus a hard failure — see `coordination_read_fallback` and
     // `coordination_write_fallback`'s doc comments for the exact split and the reasoning behind
-    // it. In short: a **write** cannot afford to guess past a remote it could not actually get an
-    // answer from (guessing wrong could create a second, divergent record for the same task on
-    // the wrong palace), so only `404`/`CapabilityMissing` are skippable there and everything
-    // else — including an unreachable remote — is terminal. A plain **read** has no such
-    // downside, so it also skips a genuinely degradable `Unreachable` remote (the
-    // federation-wide "reads degrade" rule — see `docs/Federation.md`), but still surfaces
-    // `Unauthorized`/`VersionSkew`/`CapabilityMissing`/malformed-response errors as hard
-    // failures: those mean the configured remote itself is broken, and silently treating that as
+    // it. Both agree that `404` and `CapabilityMissing` are skippable: both are the remote
+    // giving a definitive, structural "no" (no such record / no coordination support at all),
+    // not an ambiguous answer. Where they part ways is everything else: a **write** cannot
+    // afford to guess past a remote it could not actually get an answer from (guessing wrong
+    // could create a second, divergent record for the same task on the wrong palace), so
+    // anything beyond `404`/`CapabilityMissing` — including an unreachable remote — is terminal.
+    // A plain **read** has no such downside, so it also skips a genuinely degradable
+    // `Unreachable` remote (the federation-wide "reads degrade" rule — see
+    // `docs/Federation.md`), but still surfaces `Unauthorized`/`VersionSkew`/malformed-response
+    // errors as hard failures: those cannot be read as a definitive answer (the token might be
+    // wrong, or the remote's protocol version cannot be trusted), so silently treating them as
     // "record not found" would hide a real misconfiguration from the caller.
 
     /// Remote names that can actually participate in coordination discovery: every remote
@@ -1413,17 +1416,27 @@ impl FederationRouter {
     /// coordination conflict/response payloads already read more like the changes feed's
     /// `origin` shape than a search hit).
     ///
-    /// Error policy (deliberately asymmetric with `coordination_write_fallback` — see that
-    /// method's doc comment): a `404` means "not this palace, try the next candidate"; an
-    /// `Unreachable` remote is the one genuinely degradable transport failure and is skipped
-    /// the same way, because a down remote must not block discovery through the others (the
-    /// federation-wide "reads degrade" rule — see `docs/Federation.md`). Every other error —
-    /// `Unauthorized`, `VersionSkew`, `CapabilityMissing`, `InvalidResponse`, `InvalidConfig`,
-    /// or a non-404 `RemoteRejected` — means the *configured* remote itself is broken or
-    /// misconfigured, not merely "not this palace", and is surfaced as a hard `ToolError`
-    /// immediately: silently treating it as a miss would let a caller believe a record does not
-    /// exist when the truth is "your token is wrong" or "this remote is on an incompatible
-    /// version". `Ok(None)` means every candidate was tried and genuinely does not have it.
+    /// Error policy (shares the `CapabilityMissing` handling with `coordination_write_fallback`
+    /// — see that method's doc comment — but is not otherwise symmetric with it): a `404` or a
+    /// `CapabilityMissing` both mean "not this palace, try the next candidate". A `404` is the
+    /// remote definitively saying it does not have this particular record; `CapabilityMissing`
+    /// is the remote definitively saying it does not implement coordination at all — decided
+    /// live from the remote's `/v1/info` capability list, independent of whether
+    /// `federation.coordination` names it as a candidate. Both are a *positive, structural*
+    /// answer of absence, not an ambiguous one, so treating them alike is correct for a read: it
+    /// is the same "not this palace" case whether the remote says "no such task" or "I don't
+    /// speak coordination at all". An `Unreachable` remote is the one genuinely degradable
+    /// transport failure and is skipped the same way, because a down remote must not block
+    /// discovery through the others (the federation-wide "reads degrade" rule — see
+    /// `docs/Federation.md`). Every other error — `Unauthorized`, `VersionSkew`,
+    /// `InvalidResponse`, `InvalidConfig`, or a non-404 `RemoteRejected` — is left terminal
+    /// because it cannot be read as a definitive answer: `Unauthorized` means the token is
+    /// wrong, so the record may well exist and reporting absence would be a lie; `VersionSkew`
+    /// means the remote's protocol version cannot be trusted to answer at all. Those are surfaced
+    /// as a hard `ToolError` immediately: silently treating them as a miss would let a caller
+    /// believe a record does not exist when the truth is "your token is wrong" or "this remote
+    /// is on an incompatible version". `Ok(None)` means every candidate was tried and genuinely
+    /// does not have it.
     ///
     /// **Iteration is sequential, not concurrent like the fan-outs
     /// (`coordination_events_fanout`/`coordination_inbox_fanout`), and this is deliberate, not an
@@ -1458,6 +1471,7 @@ impl FederationRouter {
                     return Ok(Some(value));
                 }
                 Err(RemoteError::RemoteRejected { status: 404, .. }) => continue,
+                Err(RemoteError::CapabilityMissing { .. }) => continue,
                 Err(e) if e.is_degradable() => {
                     tracing::warn!(
                         remote = %name,
@@ -1478,8 +1492,9 @@ impl FederationRouter {
     /// Try a coordination *write that references an existing record* against each candidate
     /// remote (see `coordination_candidate_remotes`) in name order.
     ///
-    /// Error policy (deliberately asymmetric with `coordination_read_fallback` — see that
-    /// method's doc comment): a `404` or `CapabilityMissing` both mean "not this palace, try the
+    /// Error policy (shares the `404`/`CapabilityMissing` handling with
+    /// `coordination_read_fallback` but is not otherwise symmetric with it — see that method's
+    /// doc comment): a `404` or `CapabilityMissing` both mean "not this palace, try the
     /// next candidate" — `CapabilityMissing` is decided live from the remote's `/v1/info`
     /// capability list, independent of whether `federation.coordination` names it as a
     /// candidate, so a candidate remote can still turn out to be running a pre-Stage-4 server
@@ -3097,19 +3112,26 @@ mod tests {
         assert!(msg.contains("alpha"), "error must name the offending remote: {msg}");
     }
 
-    /// Same as above for `CapabilityMissing` — for a *read*, this means the configured remote
-    /// itself is broken (advertises no coordination support), not "not this palace"; see
-    /// `coordination_write_fallback`'s test below for the deliberately opposite write policy.
+    /// `CapabilityMissing` from the only candidate remote means it definitively does not
+    /// implement coordination at all — the same "not this palace" case a `404` is, not a
+    /// misconfiguration — so a read must skip it and come back as a plain miss, matching
+    /// `coordination_write_fallback`'s (correct) handling of the same error. This inverts what
+    /// was `coordination_read_fallback_surfaces_capability_missing_as_hard_error`: that test
+    /// encoded the live regression where `e3fa83b` reconciled `CapabilityMissing` in opposite
+    /// directions on the read and write sides, hard-erroring every coordination read (task_get,
+    /// message_get, artifact_get, result_get) against a `combined`-mode remote that simply
+    /// predates coordination support, instead of returning `found: false`.
     #[tokio::test]
-    async fn coordination_read_fallback_surfaces_capability_missing_as_hard_error() {
+    async fn coordination_read_fallback_skips_capability_missing_as_definitive_miss() {
         let mut mock = MockRemote::default();
         mock.coordination_task_get_outcome = MockCoordOutcome::CapabilityMissing;
         let router = make_single_remote_coordination_router("alpha", mock);
 
-        router
+        let result = router
             .coordination_task_get_fallback("task_missing")
             .await
-            .expect_err("CapabilityMissing must be a hard error for a read");
+            .expect("CapabilityMissing must be skipped, not a hard error, for a read");
+        assert_eq!(result, None, "a remote with no coordination support must read as a miss");
     }
 
     /// Same as above for `VersionSkew`.

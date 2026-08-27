@@ -5645,6 +5645,59 @@ mod tests {
         );
     }
 
+    /// Reproduces the live regression end to end, through the tool layer (`mempalace_task_get`),
+    /// exactly matching a real operator's configuration: `federation.default_mode: combined`
+    /// with an EMPTY `federation.coordination` table (`make_lib_router` builds precisely this —
+    /// `default_mode: Combined`, `coordination: BTreeMap::new()`, and the one remote as
+    /// `default_remote`), federated with a single remote that does not implement coordination at
+    /// all. `coordination_federation_enabled()` is true purely because `default_mode !=
+    /// RouteMode::Local` (see that method's doc comment and deviation 9 in
+    /// `docs/Coordination-Phase-3-Design.md`), so the remote is a coordination candidate even
+    /// though no `federation.coordination` rule names it — and it answers every coordination
+    /// call with `RemoteError::CapabilityMissing` because `LibMockRemote` does not override
+    /// `coordination_task_get`, falling through to `RemoteApi`'s default body
+    /// (`coordination_unsupported`, deviation 19), the same shape a real pre-Stage-3 server
+    /// produces from a `/v1/info` response missing the `coordination` capability.
+    ///
+    /// Before this fix, `mempalace_task_get` on an unknown task id hard-errored with
+    /// `federation error: remote ... coordination read failed: remote ... does not support the
+    /// \`coordination\` capability` instead of returning `{"found": false}` — because
+    /// `coordination_read_fallback` treated `CapabilityMissing` as terminal for reads (see the
+    /// now-corrected doc comment on that method, and deviation 21 in
+    /// `docs/Coordination-Phase-3-Design.md`). Every other coordination read
+    /// (`mempalace_message_get`, `mempalace_artifact_get`, `mempalace_result_get`) went through
+    /// the exact same `coordination_read_fallback` helper and was equally broken; this test only
+    /// drives `mempalace_task_get` because all four share one fallback implementation.
+    #[tokio::test]
+    async fn task_get_returns_found_false_when_only_candidate_lacks_coordination_capability() {
+        let remote = LibMockRemote::default();
+        let mut remotes: BTreeMap<String, Arc<dyn mempalace_remote::RemoteApi>> = BTreeMap::new();
+        remotes.insert("actuarius".to_owned(), Arc::new(remote));
+        let router = make_lib_router(remotes);
+        assert_eq!(router.resolve_coordination_route("wing_test").mode, RouteMode::Combined);
+
+        let harness = test_harness_with_mock_router(router).await;
+        let response = harness
+            .server
+            .handle_request(tool_call(
+                944,
+                "mempalace_task_get",
+                json!({"task_id": "task_00000000000000000000000000000000"}),
+            ))
+            .await;
+        let payload = decode_tool_payload(&response).unwrap_or_else(|| {
+            panic!(
+                "a CapabilityMissing-only remote must not hard-error a coordination read, got: \
+                 {response}"
+            )
+        });
+        assert_eq!(
+            payload["found"], false,
+            "an unknown task id against a remote with no coordination support must read as a \
+             plain miss, got: {payload}"
+        );
+    }
+
     /// PR #120 review, finding 2: `is_local_record_missing` must match the real `Invariant`
     /// error `mempalace_storage::coordination::CoordinationStore` actually produces for a
     /// genuinely missing task or message — driven through the real storage calls, not a

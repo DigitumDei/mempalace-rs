@@ -387,7 +387,9 @@ gains coordination categories and — unlike today, where it is dead code called
    every other error — `Unauthorized`, `VersionSkew`, `CapabilityMissing`, `InvalidResponse`, or
    any other `RemoteRejected` status — now surfaces as a hard `ToolError`, matching the error
    construction every other federation read path in `crates/mempalace-mcp/src/federation.rs`
-   already uses. `coordination_task_get_fallback`/`coordination_message_get_fallback`/
+   already uses. **Correction (deviation 21 below): putting `CapabilityMissing` in this terminal
+   set was itself wrong and was reverted — it is now skippable for reads too, the same as a
+   `404`.** `coordination_task_get_fallback`/`coordination_message_get_fallback`/
    `coordination_artifact_get_fallback`/`coordination_result_get_fallback` changed signature from
    `Option<Value>` to `ToolResult<Option<Value>>` to carry the new error path; their callers in
    `crates/mempalace-mcp/src/lib.rs` now propagate it with `?`. See `coordination_read_fallback`
@@ -414,11 +416,14 @@ gains coordination categories and — unlike today, where it is dead code called
     `CapabilityMissing` from a remote still inside the candidate set is treated the same as a
     `404` for a *write* — "not this palace" — because the capability list comes live from the
     remote's own `/v1/info`, independent of what `federation.coordination` says about it, so a
-    candidate can genuinely turn out not to run coordination at all. This is the opposite of
-    deviation 9's read policy on the very same error, deliberately: a write cannot afford to
-    guess past a remote it could not get an answer from (wrong guess risks a second, divergent
-    record for the same task on the wrong palace), so every other error, including an unreachable
-    remote, stays terminal for writes. See `coordination_write_fallback`'s doc comment and the
+    candidate can genuinely turn out not to run coordination at all. (Deviation 9's read policy
+    on this same error was, for a time, the opposite — treating `CapabilityMissing` as terminal
+    for reads. That was a mistake, corrected in deviation 21: reads and writes agree that
+    `CapabilityMissing` is skippable.) What still differs between reads and writes is everything
+    *else*: a write cannot afford to guess past a remote it could not get an answer from (wrong
+    guess risks a second, divergent record for the same task on the wrong palace), so every other
+    error, including an unreachable remote, stays terminal for writes, while a read also skips a
+    genuinely degradable `Unreachable` remote. See `coordination_write_fallback`'s doc comment and the
     `coordination_write_fallback_reaches_later_remote_past_earlier_capability_missing` test
     (two remotes, the non-coordination one sorting first) in
     `crates/mempalace-mcp/src/federation.rs`.
@@ -642,6 +647,43 @@ gains coordination categories and — unlike today, where it is dead code called
     `coordination_read_fallback`'s doc comment (`crates/mempalace-mcp/src/federation.rs`) and in
     `docs/Federation.md`, so it reads as a deliberate trade-off rather than an oversight the next
     review re-raises as a performance bug.
+
+21. **Post-implementation fix: `e3fa83b` reconciled two review findings about `CapabilityMissing`
+    in opposite directions on the read and write sides, and the read side landed wrong.**
+    Deviation 9 above put `CapabilityMissing` in `coordination_read_fallback`'s terminal set,
+    alongside `Unauthorized`/`VersionSkew`/`InvalidResponse`; deviation 10 put it in
+    `coordination_write_fallback`'s skippable set, alongside `404`. Only the write side's
+    placement was correct. `CapabilityMissing` means the remote definitively does not implement
+    coordination at all, decided live from its own `/v1/info` — the same "not this palace"
+    answer a `404` gives for a specific record, just at the whole-feature level instead of the
+    single-record level. That is categorically unlike `Unauthorized` (the token is wrong, so the
+    record may well exist — reporting absence would be a lie) or `VersionSkew` (the remote's
+    protocol version cannot be trusted to answer at all, so "not found" cannot be inferred
+    either way). Those two are the ones deviation 9 was actually protecting against ("do not let
+    a misconfigured remote masquerade as absent data"), and a remote correctly and definitively
+    reporting that it has no coordination support is not misconfigured.
+
+    Live impact: an operator with `federation.default_mode: combined`, an empty
+    `federation.coordination` table (which still makes `coordination_federation_enabled()` true —
+    see deviation 9's note that `default_remote` is a candidate whenever `default_mode !=
+    Local`), and a pre-Stage-3 remote (advertising `drawers, kg, changes, taxonomy, ingest` but
+    not `coordination`) got a hard `ToolError` from every coordination read — `task_get`,
+    `message_get`, `artifact_get`, `result_get` — on every local miss, instead of `{"found":
+    false}`.
+
+    Fixed by moving the `Err(RemoteError::CapabilityMissing { .. }) => continue` arm from
+    `coordination_write_fallback` (deviation 10, unchanged) into `coordination_read_fallback` as
+    well, so both fallbacks now agree: `404` and `CapabilityMissing` are skippable for both reads
+    and writes; `Unauthorized`, `VersionSkew`, `InvalidResponse`, `InvalidConfig`, and any other
+    `RemoteRejected` status remain terminal for reads (writes keep everything except `404`/
+    `CapabilityMissing` terminal, per deviation 10, since a write cannot afford to guess past a
+    remote it could not get an answer from). The read/write asymmetry that remains —
+    `Unreachable` degrades for reads but is terminal for writes — is deviation 9's original,
+    correct distinction and is untouched by this fix. See `coordination_read_fallback`'s and
+    `coordination_write_fallback`'s doc comments and the
+    `coordination_read_fallback_skips_capability_missing_as_definitive_miss` test (inverted from
+    the old, wrong `coordination_read_fallback_surfaces_capability_missing_as_hard_error`) in
+    `crates/mempalace-mcp/src/federation.rs`.
 
 ## Stage 5 — A2A adapter
 

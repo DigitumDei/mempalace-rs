@@ -20,7 +20,7 @@ use time::{Date, OffsetDateTime};
 
 use crate::error::{Result, StorageError};
 use crate::types::{DrawerFilter, DrawerMatch, DrawerStore, DuplicateStrategy, SearchRequest};
-use mempalace_core::{DrawerId, DrawerRecord, EmbeddingProfile};
+use mempalace_core::{DrawerId, DrawerRecord, EmbeddingProfile, WingId};
 
 /// Statistics about vector-index coverage for the embedding column.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -796,6 +796,9 @@ fn compile_filter(filter: &DrawerFilter) -> String {
     if let Some(wing) = &filter.wing {
         parts.push(format!("wing = '{}'", escape_sql(wing.as_str())));
     }
+    if !filter.wings.is_empty() {
+        parts.push(format!("wing IN ({})", quote_wings(&filter.wings)));
+    }
     if let Some(room) = &filter.room {
         parts.push(format!("room = '{}'", escape_sql(room.as_str())));
     }
@@ -837,6 +840,10 @@ fn compile_filter(filter: &DrawerFilter) -> String {
 
 fn quote_ids(ids: &[DrawerId]) -> String {
     ids.iter().map(|id| format!("'{}'", escape_sql(id.as_str()))).collect::<Vec<_>>().join(", ")
+}
+
+fn quote_wings(wings: &[WingId]) -> String {
+    wings.iter().map(|w| format!("'{}'", escape_sql(w.as_str()))).collect::<Vec<_>>().join(", ")
 }
 
 fn quote_strings(values: &[String]) -> String {

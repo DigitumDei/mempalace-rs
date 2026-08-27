@@ -81,7 +81,11 @@ define_id!(WingId, "wing");
 define_id!(RoomId, "room");
 define_id!(DrawerId, "drawer");
 
-const WING_PREFIX: &str = "wing_";
+/// Prefix every fully-qualified wing id carries. Exposed so callers that need
+/// to recognise an already-prefixed id (rather than construct one) — e.g.
+/// `mempalace-server`'s `normalize_scope_wing` — check against the real
+/// constant instead of hardcoding `"wing_"`.
+pub const WING_PREFIX: &str = "wing_";
 
 impl WingId {
     /// Build a `WingId` from arbitrary input by canonicalizing it.

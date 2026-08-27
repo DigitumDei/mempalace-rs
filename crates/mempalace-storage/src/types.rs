@@ -27,6 +27,21 @@ impl StorageLayout {
 pub struct DrawerFilter {
     pub ids: Vec<DrawerId>,
     pub wing: Option<WingId>,
+    /// Restrict results to any of these wings (an "IN" match), independent of
+    /// `wing`'s single-value equality match. Empty means unconstrained by
+    /// this field. Used to push a caller's visible-wing set into the storage
+    /// query itself — e.g. a scoped federation token listing drawers with no
+    /// `wing` filter — so authorization is enforced by the query rather than
+    /// by filtering rows the query already returned. That distinction
+    /// matters because storage-side filtering composes correctly with
+    /// `limit`; filtering visibility out of an already-limited result page
+    /// can silently strand authorized rows below the page with no cursor to
+    /// reach them (see `route_drawers_list` in `mempalace-server`). An empty
+    /// set from a caller whose visible-wing set is genuinely empty must be
+    /// handled by the caller *not* querying at all — passing an empty `wings`
+    /// here is indistinguishable from "unconstrained" and would return
+    /// everything.
+    pub wings: Vec<WingId>,
     pub room: Option<RoomId>,
     pub hall: Option<String>,
     pub source_file: Option<String>,

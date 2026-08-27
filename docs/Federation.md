@@ -69,17 +69,22 @@ Authentication is bearer-token based. The token file is a JSON array of entries:
 ```json
 [
   { "token": "alice-secret-token", "name": "alice", "enabled": true },
-  { "token": "bob-secret-token",   "name": "bob",   "enabled": false }
+  { "token": "bob-secret-token",   "name": "bob",   "enabled": false },
+  { "token": "ci-secret-token",    "name": "ci",     "enabled": true,
+    "scopes": [ { "wings": ["wing_myproject"], "operations": ["read", "coordination_read"] } ] }
 ]
 ```
 
 - `token` — the bearer secret a client must present.
 - `name` — the identity recorded as `added_by` on writes from that token.
 - `enabled` — `false` treats the entry as if it did not exist (instant revoke).
+- `scopes` — optional; restricts what the token may do. Absent (like `alice` and `bob` above)
+  means unrestricted access, exactly as before this field existed. See
+  [1.5 Authorization scopes](#15-authorization-scopes) for the full shape and rules.
 
 Tokens are hashed in memory; the raw secret is not retained after load. The file
-is hot-reloaded — editing it (e.g. flipping `enabled`) takes effect on the next
-request without restarting the server. The default path is
+is hot-reloaded — editing it (e.g. flipping `enabled`, or narrowing `scopes`) takes
+effect on the next request without restarting the server. The default path is
 `~/.mempalace/server_tokens.json`.
 
 ### 1.2 Configure the server section (optional but recommended)
@@ -157,6 +162,120 @@ requires `Authorization: Bearer <token>`.
 `GET /v1/info` advertises a `capabilities` list; the `"ingest"` capability is what
 a client checks before attempting federated mining. The wire DTOs live in the
 `mempalace-federation` crate and are shared verbatim by server and client.
+
+### 1.5 Authorization scopes
+
+A token with no `scopes` field (§1.1) may do anything any route allows. A scoped
+token is restricted to an `(operation, wing)` combination granted by at least one
+of its scope entries. `operations` is closed: `read`, `write`, `delete`, `ingest`,
+`coordination_read`, `coordination_write`, `coordination_claim`. The three
+`coordination_*` operations have no routes yet — they exist so the token file
+format is stable ahead of the coordination REST routes.
+
+Every route requires an operation; most also involve a wing. Routes fall into
+four groups, and each group is authorized differently:
+
+- **Wing is in the request — enforce `(operation, wing)` directly.**
+  `POST /v1/drawers/search`, `GET /v1/drawers` (wing optional in both — when
+  given it is enforced outright; when absent, see the next bullet), and
+  `POST /v1/drawers` and `POST /v1/ingest/batch` (wing required). A mismatched
+  wing is a plain **403**.
+- **The wing needs a lookup first.** `GET /v1/drawers/{id}` and
+  `DELETE /v1/drawers/{id}` resolve the drawer, then authorize. A caller without
+  access gets a **404**, not a 403 — the same masking the diary guard already
+  applies to `GET /v1/drawers/{id}` (see `route_drawers_get` in
+  `crates/mempalace-server/src/lib.rs`), so the response never becomes an
+  existence oracle for wings the caller cannot see.
+- **Aggregate routes filter instead of rejecting.** `GET /v1/taxonomy`,
+  `GET /v1/wings`, `GET /v1/rooms`, `GET /v1/changes`, and
+  `POST /v1/drawers/check_duplicate` require `read`, then filter their response
+  down to the wings the token can see — a token scoped to one wing gets that
+  wing's slice, not a 403. A wing-absent `POST /v1/drawers/search` does the
+  same, filtering ranked candidates after an over-fetch (it has no
+  continuation promise, so a short page is an acceptable trade-off there — see
+  `route_drawers_search` in `crates/mempalace-server/src/lib.rs`). A
+  wing-absent `GET /v1/drawers` cannot use that approach: its `limit`/
+  `next_cursor` shape implies a caller can page through everything it can see,
+  and the store has no cursor-based pagination, so filtering visibility out of
+  an already-`limit`-bounded page could permanently strand authorized rows
+  below the page with no way to reach them. `route_drawers_list` instead
+  pushes the visible-wing set into the storage query itself
+  (`DrawerFilter::wings`, an `IN` match) so storage never returns an
+  invisible-wing row in the first place — visibility is enforced by the query,
+  not by filtering its output.
+  `check_duplicate` belongs here despite having no wing in its own request:
+  its response carries `wing`/`room` per match and an `is_duplicate` boolean,
+  either of which would otherwise let a token learn about content in a wing it
+  cannot read; `is_duplicate` is computed *after* filtering, not before, so
+  the boolean itself cannot leak that either. `POST /v1/drawers` applies the
+  identical filter to its own near-duplicate check, before deciding whether
+  to return **409 duplicate**: candidate matches outside the caller's visible
+  wings (and diary matches) are discarded first, because the 409 status and
+  its `matches` body would otherwise let a scoped writer learn about content
+  in a wing it cannot read even though it can only write to a wing it *is*
+  scoped to. This has a real, deliberate cost: a scoped writer can now create
+  a drawer that duplicates content already present in a wing it cannot see,
+  because that duplicate is invisible to the check. The alternative —
+  reporting it — would disclose that wing's content to a caller not
+  authorized to read it, which is worse. For an unrestricted token every wing
+  is visible, so this changes nothing. `GET /v1/changes` matters most —
+  it is the federated change feed. Not every event carries a determinable
+  wing (KG facts, identity updates, lineage records and self-observations
+  never do; some `drawer_deleted` events written before this scoping model
+  existed, or via a remote-fallback delete with no local record of the
+  drawer, don't either). The feed fails **closed** on those: an event whose
+  wing can't be determined is hidden from a scoped token unless its type is
+  one of the seven with no wing concept at all (matching the Group D list
+  below); an unrestricted token still sees everything.
+- **No wing concept — operation only.** `POST /v1/kg/query`, `GET /v1/kg/timeline`,
+  `GET /v1/kg/stats`, `POST /v1/kg/facts`, and `POST /v1/kg/facts/invalidate`
+  check only the operation. KG facts are entity-scoped, not wing-scoped — this is
+  the same rule `resolve_kg_route` in `mempalace-config` already applies by
+  skipping the wing lookup for KG routing. `GET /v1/info` requires any
+  authenticated token and no specific operation; `GET /v1/health` stays
+  unauthenticated.
+
+The diary guard is unaffected by any of this: it is a content rule (wing
+`wing_agents`, room `diary`, or a `diary:`-prefixed source), not an identity
+rule, and it applies to every token regardless of scope.
+
+`wings` in a scope entry accepts the literal `"*"` for every wing. Other
+entries expand at load time along two independent dimensions, and only one
+of them is aliased: **the prefix is aliased, case is significant.**
+
+- **Prefix.** REST and MCP request paths disagree on whether a wing carries
+  the `wing_` prefix: REST handlers build the wing they authorize against
+  with `WingId::new`, which validates but does not transform, while MCP
+  paths use `WingId::normalized`, which adds the prefix when absent. So
+  `myproject` and `wing_myproject` genuinely name the same wing by
+  convention, and an entry that is a valid `WingId` (passes `WingId::new`)
+  but lacks the prefix expands to **two** aliases: the entry as written, and
+  the entry with `wing_` prepended — case untouched in both.
+- **Case.** `wing_MyProject` and `wing_myproject` are **not** the same wing.
+  `WingId::new`'s validation accepts uppercase ASCII and does not transform
+  it, so a palace can legitimately hold both as two distinct wings storing
+  different data. Folding case into a single alias set — as an earlier
+  version of this fix did — would let a scope written for one silently
+  authorize the other: a privilege escalation inferred from a spelling
+  convention, not a convenience. So an entry that is already a valid
+  `WingId`, prefixed or not, keeps its case exactly as written in every
+  alias it produces. There is no case-insensitive alias, ever.
+- Only when the raw entry is **not** a valid `WingId` at all (e.g. embedded
+  whitespace) does it fall back to `WingId::normalized`, which sanitizes and
+  lowercases, as its single alias — acceptable there because sanitizing
+  malformed input is the whole point of that path and there is no verbatim
+  form worth preserving.
+
+Worked examples:
+
+| Raw entry           | Aliases                                    | Why |
+|----------------------|---------------------------------------------|-----|
+| `wing_MyProject`     | `wing_MyProject`                             | Already prefixed; case is not aliased, so no lowercased sibling. |
+| `MyProject`          | `MyProject`, `wing_MyProject`                | Prefix dimension aliases; case preserved in both. |
+| `project_alpha`      | `project_alpha`, `wing_project_alpha`        | Same as above, already-lowercase case is just not visible. |
+| `My Project` (invalid `WingId`) | `wing_my_project` (via `WingId::normalized`) | No verbatim form exists to preserve, so sanitization applies. |
+
+A request is authorized if it matches any alias a raw entry produces.
 
 ## Part 2 — Configuring a client
 
@@ -534,6 +653,15 @@ unauthenticated (fine against a server with an unauthenticated entry, otherwise
 ### A remote-routed write returns 422
 The target is diary-shaped (`wing_agents` / `diary` room / `diary:` source). Diary
 is local-only by design; no config can federate it.
+
+### A request returns 403 with code `forbidden`
+The token authenticated fine but its `scopes` do not grant the operation or wing
+the request needs — distinct from a 401, which means the token itself was
+missing, unrecognised, or disabled. Check the token's `scopes` entry in the
+server's token file: either the `operations` list is missing the one the route
+needs, or none of its `wings` cover the target wing (`"*"` covers every wing).
+See [1.5 Authorization scopes](#15-authorization-scopes). `GET /v1/drawers/{id}`
+and `DELETE /v1/drawers/{id}` mask this as 404 instead — see the same section.
 
 ### `version != 1` on the server
 The server only accepts config schema version `1`. See

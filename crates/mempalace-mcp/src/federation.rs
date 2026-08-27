@@ -132,6 +132,53 @@ impl FederationRouter {
         Value::Object(avail)
     }
 
+    /// Compute coordination availability annotations for the local wing set, keyed by wing
+    /// name. Sibling to [`Self::wing_availability`] — same output shape
+    /// (`wing_name → "local" | "remote:<name>" | "combined"`) but resolves through
+    /// [`Self::resolve_coordination_route`] instead of [`resolve_route`], because drawer routing
+    /// and coordination routing are deliberately separate tables (see
+    /// [`mempalace_config::FederationConfigV1::coordination`] for why) and the same wing can
+    /// legitimately answer differently in each.
+    ///
+    /// This is intentionally *not* a re-derivation of `resolve_coordination_route`'s precedence
+    /// — it calls that function directly — so the diary hard-override (`wing_agents` always
+    /// `"local"`), the wing normalisation, and the fail-closed behaviour on an unnormalisable
+    /// wing all come from the single source of truth used by real coordination routing.
+    ///
+    /// The key set is `local_wings ∪ rules.wings ∪ rules.coordination`: `rules.wings` is
+    /// included (not just `rules.coordination`) so this map has the same keys as
+    /// `wing_availability` and the two can be read side by side — a wing configured only for
+    /// drawers still gets a coordination answer (it falls through to `default_mode`), and
+    /// surfacing that is the point. `rules.coordination` is included so a wing configured only
+    /// for coordination (no drawers, no `federation.wings` entry) is visible at all — the
+    /// concrete defect this method exists to fix.
+    pub fn coordination_availability(&self, local_wings: &BTreeMap<String, usize>) -> Value {
+        let mut avail = serde_json::Map::new();
+        let all_wing_names: std::collections::BTreeSet<&str> = local_wings
+            .keys()
+            .map(|s| s.as_str())
+            .chain(self.rules.wings.keys().map(|s| s.as_str()))
+            .chain(self.rules.coordination.keys().map(|s| s.as_str()))
+            .collect();
+
+        for wing_name in all_wing_names {
+            let rule = self.resolve_coordination_route(wing_name);
+            let status = match rule.mode {
+                RouteMode::Local => "local".to_owned(),
+                RouteMode::Remote => {
+                    if let Some(name) = &rule.remote {
+                        format_remote_origin(name)
+                    } else {
+                        "remote".to_owned()
+                    }
+                }
+                RouteMode::Combined => "combined".to_owned(),
+            };
+            avail.insert(wing_name.to_owned(), json!(status));
+        }
+        Value::Object(avail)
+    }
+
     /// Resolve the route for a drawer operation. Accepts room and source_file so
     /// the diary hard-override can fire correctly (see resolve_route precedence).
     pub fn resolve_drawer_route(
@@ -2553,6 +2600,146 @@ mod tests {
         wings.insert("wing_code".to_owned(), 5);
         let avail = router_obj.wing_availability(&wings);
         assert_eq!(avail["wing_code"], "combined");
+    }
+
+    // ─── coordination_availability (issue #125) ──────────────────────────────
+
+    #[test]
+    fn coordination_availability_includes_coordination_only_wing() {
+        // A wing named only in federation.coordination — no drawers, no
+        // federation.wings entry — must still appear. This is the core defect:
+        // wing_availability's key set never sees such a wing at all.
+        let mut coordination = BTreeMap::new();
+        coordination.insert(
+            "wing_tasks".to_owned(),
+            ResolvedRouteRule {
+                mode: RouteMode::Remote,
+                remote: Some("alpha".to_owned()),
+                write: WriteTarget::Remote,
+            },
+        );
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), make_resolved_remote("alpha"));
+        let rules = FederationRuntimeConfig {
+            remotes,
+            default_mode: RouteMode::Local,
+            default_remote: None,
+            wings: BTreeMap::new(),
+            kg: None,
+            coordination,
+        };
+        let router = FederationRouter::new(rules);
+
+        // No drawers locally, and no federation.wings entry either.
+        let local_wings: BTreeMap<String, usize> = BTreeMap::new();
+
+        // The drawer map (unchanged behaviour) never sees this wing.
+        let drawer_avail = router.wing_availability(&local_wings);
+        assert!(
+            drawer_avail.get("wing_tasks").is_none(),
+            "wing_availability must not be changed by this fix"
+        );
+
+        // The new coordination map does.
+        let coord_avail = router.coordination_availability(&local_wings);
+        assert_eq!(coord_avail["wing_tasks"], "remote:alpha");
+    }
+
+    #[test]
+    fn coordination_availability_diverges_from_drawer_availability() {
+        // A wing whose drawer routing and coordination routing differ must
+        // report both correctly and independently — the conflation defect.
+        let mut wings = BTreeMap::new();
+        wings.insert(
+            "wing_x".to_owned(),
+            ResolvedRouteRule {
+                mode: RouteMode::Combined,
+                remote: Some("alpha".to_owned()),
+                write: WriteTarget::Both,
+            },
+        );
+        let mut coordination = BTreeMap::new();
+        coordination.insert(
+            "wing_x".to_owned(),
+            ResolvedRouteRule {
+                mode: RouteMode::Remote,
+                remote: Some("alpha".to_owned()),
+                write: WriteTarget::Remote,
+            },
+        );
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), make_resolved_remote("alpha"));
+        let rules = FederationRuntimeConfig {
+            remotes,
+            default_mode: RouteMode::Local,
+            default_remote: None,
+            wings,
+            kg: None,
+            coordination,
+        };
+        let router = FederationRouter::new(rules);
+        let local_wings: BTreeMap<String, usize> = BTreeMap::new();
+
+        let drawer_avail = router.wing_availability(&local_wings);
+        let coord_avail = router.coordination_availability(&local_wings);
+        assert_eq!(drawer_avail["wing_x"], "combined");
+        assert_eq!(coord_avail["wing_x"], "remote:alpha");
+    }
+
+    #[test]
+    fn coordination_availability_wing_agents_always_local() {
+        // wing_agents must report "local" unconditionally — even when
+        // default_mode is Remote and even when a federation.coordination
+        // rule tries to route it elsewhere. This must fall out of
+        // resolve_coordination_route's hard override, not a special case here.
+        let mut coordination = BTreeMap::new();
+        coordination.insert(
+            "wing_agents".to_owned(),
+            ResolvedRouteRule {
+                mode: RouteMode::Remote,
+                remote: Some("alpha".to_owned()),
+                write: WriteTarget::Remote,
+            },
+        );
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), make_resolved_remote("alpha"));
+        let rules = FederationRuntimeConfig {
+            remotes,
+            default_mode: RouteMode::Remote,
+            default_remote: Some("alpha".to_owned()),
+            wings: BTreeMap::new(),
+            kg: None,
+            coordination,
+        };
+        let router = FederationRouter::new(rules);
+        let mut local_wings = BTreeMap::new();
+        local_wings.insert("wing_agents".to_owned(), 3);
+
+        let coord_avail = router.coordination_availability(&local_wings);
+        assert_eq!(coord_avail["wing_agents"], "local");
+    }
+
+    #[test]
+    fn coordination_availability_falls_through_to_default_mode() {
+        // A wing with no rule anywhere (not in local drawers... it IS a local
+        // wing here, but has no federation.wings or federation.coordination
+        // entry) falls through to default_mode.
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), make_resolved_remote("alpha"));
+        let rules = FederationRuntimeConfig {
+            remotes,
+            default_mode: RouteMode::Combined,
+            default_remote: Some("alpha".to_owned()),
+            wings: BTreeMap::new(),
+            kg: None,
+            coordination: BTreeMap::new(),
+        };
+        let router = FederationRouter::new(rules);
+        let mut local_wings = BTreeMap::new();
+        local_wings.insert("wing_unlisted".to_owned(), 2);
+
+        let coord_avail = router.coordination_availability(&local_wings);
+        assert_eq!(coord_avail["wing_unlisted"], "combined");
     }
 
     // ─── E2E federation tests with mock remote ──────────────────────────────

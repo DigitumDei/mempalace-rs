@@ -1032,6 +1032,47 @@ someone else, a terminal task, an invalid transition) has no revision pair to re
 a hard error — MemPalace never retries a conflicting write on the caller's behalf, locally or
 federated.
 
+### Discovering coordination routing
+
+Every routing decision documented above except one can be inspected without side effects:
+drawer routing shows up in `wing_availability`, configured remotes show up in
+`mempalace_status`, and `/v1/info` lists capabilities. Coordination routing was the exception —
+the only way to learn where `mempalace_task_create` would put a task in a given wing was to
+create one, and coordination has no delete. Issue #125 closes that gap with a
+`coordination_availability` map, a sibling to `wing_availability` rather than a change to it,
+returned by the same four discovery tools whenever federation has remotes configured:
+
+```jsonc
+{
+  "wing_availability":         { "wing_code": "combined", "wing_myproject": "local" },
+  "coordination_availability": { "wing_code": "remote:work", "wing_myproject": "local", "wing_tasks": "remote:work" }
+}
+```
+
+- `mempalace_status`, `mempalace_list_wings`, `mempalace_list_rooms`, and `mempalace_get_taxonomy`
+  all emit it, exactly like `wing_availability`.
+- Each entry is resolved by calling `resolve_coordination_route` directly — the same function
+  `mempalace_task_create` uses — never a second implementation of its precedence. That
+  precedence has already produced three separate bugs in this file when re-derived on a parallel
+  code path (the coordination opt-in gate, the diary override, and the candidate-set narrowing
+  each landed on one of two paths and missed the other — see the deviations in
+  [Coordination-Phase-3-Design.md](Coordination-Phase-3-Design.md)), so the availability map
+  reuses the wrapper instead of re-deriving the chain.
+- The key set is the union of the local wing names, `federation.wings`, and
+  `federation.coordination`. Drawer and coordination routing are deliberately separate tables
+  (see [`FederationConfigV1::coordination`](../crates/mempalace-config/src/federation.rs) for
+  why), so the same wing can legitimately answer differently in each map — `wing_code` above is
+  `combined` for drawers but `remote:work` for coordination. Including `federation.wings` in the
+  key set (not just `federation.coordination`) means a wing configured only for drawers still
+  gets a coordination answer (it falls through to `default_mode`), and `wing_tasks` above — named
+  only in `federation.coordination`, holding no drawers — is visible at all, which
+  `wing_availability`'s key set never allowed.
+- `wing_agents` always reports `"local"` in `coordination_availability`, unconditionally — the
+  same hard override `resolve_coordination_route` applies everywhere else, not a special case in
+  the availability map itself.
+- Choosing a destination explicitly at `task_create` time, rather than discovering it here, is
+  a related but separate capability and is not part of this change.
+
 ## Troubleshooting
 
 ### `remote '<name>' is unreachable ... writes do not fall back to local`

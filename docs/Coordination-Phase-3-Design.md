@@ -685,6 +685,40 @@ gains coordination categories and — unlike today, where it is dead code called
     the old, wrong `coordination_read_fallback_surfaces_capability_missing_as_hard_error`) in
     `crates/mempalace-mcp/src/federation.rs`.
 
+22. **Post-implementation addition (issue #125): coordination routing discovery, as a sibling
+    field, not a change to `wing_availability`.** Every routing decision in the palace could be
+    inspected without mutating state except coordination: drawer routing showed up in
+    `wing_availability`, remotes in `mempalace_status`, capabilities in `/v1/info`, but the only
+    way to learn where `mempalace_task_create` would put a task in a given wing was to create
+    one, and coordination has no delete. Two concrete defects followed from
+    `FederationRouter::wing_availability`'s key set (`local_wings ∪ rules.wings`) and its use of
+    `resolve_route` rather than `resolve_coordination_route`: a wing named only in
+    `federation.coordination` (no drawers, no `federation.wings` entry — the natural shape of a
+    dedicated task wing) never appeared anywhere, and a wing configured differently for drawers
+    and coordination (legitimate — see deviation 1 above) only ever reported one of the two
+    answers, silently.
+
+    Fixed with a new `FederationRouter::coordination_availability` method — deliberately not a
+    change to `wing_availability`'s existing shape or values, so nothing consuming that map today
+    is affected — with the same `wing_name → "local" | "remote:<name>" | "combined"` output shape,
+    resolved through `resolve_coordination_route` (never a re-derivation of its precedence: three
+    of the deviations above — 9, 6, and the read/write split in 21 — are exactly what happens when
+    the same precedence gets re-implemented on a second code path and the two drift), and keyed by
+    `local_wings ∪ rules.wings ∪ rules.coordination` — `rules.wings` is included, not just
+    `rules.coordination`, so the two maps share a key set and can be read side by side; a wing
+    configured only for drawers still gets a coordination answer (it falls through to
+    `default_mode`), and surfacing that is the point. `wing_agents` reporting `"local"`
+    unconditionally falls out of `resolve_coordination_route`'s existing hard override with no
+    special case needed in the new method. Emitted by all four tools that already emit
+    `wing_availability` (`mempalace_status`, `mempalace_list_wings`, `mempalace_list_rooms`,
+    `mempalace_get_taxonomy`), gated the same way (`router.has_remotes()`). See
+    `coordination_availability_*` tests in `crates/mempalace-mcp/src/federation.rs` and
+    `coordination_availability_emitted_consistently_across_wing_tools` in
+    `crates/mempalace-mcp/src/lib.rs`, and [Federation.md → Discovering coordination
+    routing](Federation.md#discovering-coordination-routing). Choosing a destination explicitly at
+    `task_create` time, rather than discovering it via this map, remains a separate, out-of-scope
+    capability.
+
 ## Stage 5 — A2A adapter
 
 A new crate, `mempalace-a2a`, depending on `mempalace-storage` and `mempalace-federation` and

@@ -150,6 +150,40 @@ Added after the initial v1 freeze; now part of the shipped surface.
 
 See [Federation](Federation.md) for the full guide.
 
+## Breaking Changes
+
+Changes that alter an already-shipped surface, newest first. A consumer written against the
+previous shape must be updated; nothing here is additive.
+
+### v0.1.26 — coordination task-write responses (issue #102 Stage 4)
+
+`mempalace_task_claim`, `mempalace_task_renew` and `mempalace_task_transition` changed shape
+twice in one release, in the same direction: a revision conflict is now **data**, not an error,
+and the task is **nested** rather than spread across the top level.
+
+| | Before | After |
+|---|---|---|
+| Success | bare task object — `{"task_id": ..., "revision": ...}` | `{"success": true, "task": {...}}` |
+| Conflict | JSON-RPC error | `{"success": false, "conflict": {"expected_revision": N, "actual_revision": N \| null, "message": "..."}}` |
+
+Two reasons this was worth breaking. A stale revision is an ordinary, expected outcome of
+compare-and-swap under contention — modelling it as a transport error forced every caller to
+parse an error string to distinguish "retry with the current revision" from "this genuinely
+failed". And the federated path had drifted: a remote claim returned the task flattened with
+`success` beside its fields, so a client written against the local shape lost the task entirely
+whenever the same call fell back to a remote. Both paths now emit one envelope, pinned by a
+test that drives the same assertion over each.
+
+This matches `mempalace_skill_promote` and `mempalace_delegation_span_close`, which have used
+the `{"success", ...}` envelope since Phase 2.
+
+**Migrating:** read `response.task` instead of the response body, and branch on
+`response.success` instead of catching a JSON-RPC error. `actual_revision` is `null` when the
+record does not exist at any revision, as opposed to existing at a different one.
+
+Note that the two Phase 2 tools above still do not describe their own response envelope in their
+tool `description`, which is a pre-existing documentation gap rather than a change here.
+
 ## Explicitly Deferred Or Out Of Scope
 
 - CLI `split` is deferred. It remains visible in help and fails with an explicit deferral

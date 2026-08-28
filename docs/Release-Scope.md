@@ -149,12 +149,14 @@ Added after the initial v1 freeze; now part of the shipped surface.
   `remote_messages`/`remote_events` in `mempalace_inbox_read`/`mempalace_coordination_events`.
 - Routing discovery (issue #125): when federation has remotes configured, `mempalace_status`,
   `mempalace_list_wings`, `mempalace_list_rooms`, and `mempalace_get_taxonomy` each include a
-  `wing_availability` map (drawer routing, `federation.wings`) and a sibling
-  `coordination_availability` map (task routing, `federation.coordination`), both keyed by wing
-  name with `"local"` / `"remote:<name>"` / `"combined"` values. The two maps can disagree for
-  the same wing — drawer and coordination routing are independent tables — and
-  `coordination_availability`'s key set includes wings named only in `federation.coordination`
-  (no drawers, no `federation.wings` entry), which `wing_availability` never surfaces. See
+  `wing_availability` map (drawer routing *mode*, `federation.wings`, values `"local"` /
+  `"remote:<name>"` / `"combined"`) and a sibling `coordination_availability` map (the effective
+  task *write target*, `federation.coordination`, values `"local"` / `"remote:<name>"` only —
+  `"combined"` cannot occur here because a coordination route can never resolve to `write:
+  both`), both keyed by wing name. The two maps can disagree for the same wing — drawer and
+  coordination routing are independent tables — and `coordination_availability`'s key set
+  includes wings named only in `federation.coordination` (no drawers, no `federation.wings`
+  entry), which `wing_availability` never surfaces. See
   [Federation → Discovering coordination routing](Federation.md#discovering-coordination-routing).
 
 See [Federation](Federation.md) for the full guide.

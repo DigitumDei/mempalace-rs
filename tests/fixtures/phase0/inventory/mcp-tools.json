@@ -186,7 +186,7 @@
     }
   },
   "mempalace_get_taxonomy": {
-    "description": "Full taxonomy: wing → room → drawer count. When federation is active, includes `wing_availability` (drawer routing) and `coordination_availability` (task routing) per wing.",
+    "description": "Full taxonomy: wing → room → drawer count. When federation is active, includes `wing_availability` (drawer routing) and `coordination_availability` (task placement: local or remote) per wing.",
     "input_schema": {
       "properties": {},
       "type": "object"
@@ -407,7 +407,7 @@
     }
   },
   "mempalace_list_rooms": {
-    "description": "List rooms within a wing (or all rooms if no wing given). When federation is active, includes `wing_availability` (drawer routing) and `coordination_availability` (task routing) per wing.",
+    "description": "List rooms within a wing (or all rooms if no wing given). When federation is active, includes `wing_availability` (drawer routing) and `coordination_availability` (task placement: local or remote) per wing.",
     "input_schema": {
       "properties": {
         "wing": {
@@ -419,7 +419,7 @@
     }
   },
   "mempalace_list_wings": {
-    "description": "List all wings with drawer counts. When federation is active, includes `wing_availability` (drawer routing) and `coordination_availability` (task routing) per wing.",
+    "description": "List all wings with drawer counts. When federation is active, includes `wing_availability` (drawer routing) and `coordination_availability` (task placement: local or remote) per wing.",
     "input_schema": {
       "properties": {},
       "type": "object"
@@ -639,7 +639,7 @@
     }
   },
   "mempalace_status": {
-    "description": "Palace overview — total drawers, wing and room counts. When federation is active, includes `wing_availability` (drawer routing) and `coordination_availability` (task routing) per wing.",
+    "description": "Palace overview — total drawers, wing and room counts. When federation is active, includes `wing_availability` (drawer routing) and `coordination_availability` (task placement: local or remote) per wing.",
     "input_schema": {
       "properties": {},
       "type": "object"

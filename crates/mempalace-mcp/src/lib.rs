@@ -426,17 +426,17 @@ impl ToolName {
             },
             Self::Status => ToolDefinition {
                 name: self.as_str(),
-                description: "Palace overview — total drawers, wing and room counts. When federation is active, includes `wing_availability` (drawer routing) and `coordination_availability` (task routing) per wing.",
+                description: "Palace overview — total drawers, wing and room counts. When federation is active, includes `wing_availability` (drawer routing) and `coordination_availability` (task placement: local or remote) per wing.",
                 input_schema: json!({"type":"object","properties":{}}),
             },
             Self::ListWings => ToolDefinition {
                 name: self.as_str(),
-                description: "List all wings with drawer counts. When federation is active, includes `wing_availability` (drawer routing) and `coordination_availability` (task routing) per wing.",
+                description: "List all wings with drawer counts. When federation is active, includes `wing_availability` (drawer routing) and `coordination_availability` (task placement: local or remote) per wing.",
                 input_schema: json!({"type":"object","properties":{}}),
             },
             Self::ListRooms => ToolDefinition {
                 name: self.as_str(),
-                description: "List rooms within a wing (or all rooms if no wing given). When federation is active, includes `wing_availability` (drawer routing) and `coordination_availability` (task routing) per wing.",
+                description: "List rooms within a wing (or all rooms if no wing given). When federation is active, includes `wing_availability` (drawer routing) and `coordination_availability` (task placement: local or remote) per wing.",
                 input_schema: json!({
                     "type":"object",
                     "properties":{"wing":{"type":"string","description":"Wing to list rooms for (optional)"}}
@@ -444,7 +444,7 @@ impl ToolName {
             },
             Self::GetTaxonomy => ToolDefinition {
                 name: self.as_str(),
-                description: "Full taxonomy: wing → room → drawer count. When federation is active, includes `wing_availability` (drawer routing) and `coordination_availability` (task routing) per wing.",
+                description: "Full taxonomy: wing → room → drawer count. When federation is active, includes `wing_availability` (drawer routing) and `coordination_availability` (task placement: local or remote) per wing.",
                 input_schema: json!({"type":"object","properties":{}}),
             },
             Self::GetAaaKSpec => ToolDefinition {

@@ -700,10 +700,12 @@ gains coordination categories and — unlike today, where it is dead code called
 
     Fixed with a new `FederationRouter::coordination_availability` method — deliberately not a
     change to `wing_availability`'s existing shape or values, so nothing consuming that map today
-    is affected — with the same `wing_name → "local" | "remote:<name>" | "combined"` output shape,
-    resolved through `resolve_coordination_route` (never a re-derivation of its precedence: three
-    of the deviations above — 9, 6, and the read/write split in 21 — are exactly what happens when
-    the same precedence gets re-implemented on a second code path and the two drift), and keyed by
+    is affected — with the same `wing_name → "local" | "remote:<name>"` output shape (see
+    deviation 23 below for why this reports the effective *write target* rather than
+    `wing_availability`'s *mode*, and why `"combined"` is not a possible value here), resolved
+    through `resolve_coordination_route` (never a re-derivation of its precedence: three of the
+    deviations above — 9, 6, and the read/write split in 21 — are exactly what happens when the
+    same precedence gets re-implemented on a second code path and the two drift), and keyed by
     `local_wings ∪ rules.wings ∪ rules.coordination` — `rules.wings` is included, not just
     `rules.coordination`, so the two maps share a key set and can be read side by side; a wing
     configured only for drawers still gets a coordination answer (it falls through to
@@ -718,6 +720,42 @@ gains coordination categories and — unlike today, where it is dead code called
     routing](Federation.md#discovering-coordination-routing). Choosing a destination explicitly at
     `task_create` time, rather than discovering it via this map, remains a separate, out-of-scope
     capability.
+
+23. **Post-review correction (PR #126, Codex P2): `coordination_availability` reports the write
+    target, not the mode.** Deviation 22's first cut resolved each entry through
+    `resolve_coordination_route` and reported `rule.mode` directly — the same match arms
+    `wing_availability` uses, including a literal `RouteMode::Combined => "combined"` arm. That
+    is wrong for coordination specifically: a task is authoritative in exactly one palace, so
+    `federation.coordination` rejects any rule that would resolve to `write: both` at config
+    load, and `rule_from_default_mode` maps an inherited `RouteMode::Combined` to `write:
+    local`. A wing that falls through `default_mode: combined` with no explicit
+    `federation.coordination` entry therefore has `mode == Combined` but places every task
+    locally — the mode-based map reported `"combined"` for such a wing, which does not identify
+    where a task lands and is wrong for every wing shaped that way. On the palace that motivated
+    issue #125, 19 of 20 wings fell through `default_mode: combined` this way and all 19 reported
+    `"combined"` while placing tasks locally; only the one explicitly-`remote` wing was correct,
+    because `RouteMode::Remote` happens to map onto `WriteTarget::Remote` directly.
+
+    Fixed by resolving each entry through `resolve_coordination_route` followed by
+    `FederationRouter::resolve_write_target` — the same helper `mempalace_task_create` already
+    uses to turn a resolved route into an actual write destination — and matching on the
+    resulting `WriteTarget` instead of `RouteMode`. `WriteTarget::Local` reports `"local"`,
+    `WriteTarget::Remote` reports `"remote:<name>"` (or bare `"remote"` if the rule names no
+    remote, mirroring `wing_availability`'s existing fallback), and `WriteTarget::Both` is
+    structurally unreachable for a coordination route (see above) and is asserted as such via
+    `unreachable!()` rather than silently folded into `"local"` or `"remote"` — either fallback
+    would misreport where a task lands, and a diagnostic that exists to be trustworthy must not
+    lie quietly if the load-time invariant it depends on is ever broken. `wing_availability` is
+    unchanged: `write: both` is a real, supported drawer configuration (dual-write plus
+    dual-read), so reporting `"combined"` for it is a correct, complete answer there and the two
+    maps are correctly asymmetric, not two implementations of the same idea that drifted. See
+    `coordination_availability_falls_through_to_default_mode` (updated to assert `"local"`,
+    the headline regression case) and the new
+    `coordination_availability_explicit_combined_write_remote_reports_remote`,
+    `coordination_availability_explicit_combined_write_local_reports_local`,
+    `coordination_availability_explicit_remote_mode_unchanged`, and
+    `coordination_availability_and_wing_availability_diverge_on_combined_default` tests in
+    `crates/mempalace-mcp/src/federation.rs`.
 
 ## Stage 5 — A2A adapter
 

@@ -426,17 +426,17 @@ impl ToolName {
             },
             Self::Status => ToolDefinition {
                 name: self.as_str(),
-                description: "Palace overview — total drawers, wing and room counts",
+                description: "Palace overview — total drawers, wing and room counts. When federation is active, includes `wing_availability` (drawer routing) and `coordination_availability` (task placement: local or remote) per wing.",
                 input_schema: json!({"type":"object","properties":{}}),
             },
             Self::ListWings => ToolDefinition {
                 name: self.as_str(),
-                description: "List all wings with drawer counts",
+                description: "List all wings with drawer counts. When federation is active, includes `wing_availability` (drawer routing) and `coordination_availability` (task placement: local or remote) per wing.",
                 input_schema: json!({"type":"object","properties":{}}),
             },
             Self::ListRooms => ToolDefinition {
                 name: self.as_str(),
-                description: "List rooms within a wing (or all rooms if no wing given)",
+                description: "List rooms within a wing (or all rooms if no wing given). When federation is active, includes `wing_availability` (drawer routing) and `coordination_availability` (task placement: local or remote) per wing.",
                 input_schema: json!({
                     "type":"object",
                     "properties":{"wing":{"type":"string","description":"Wing to list rooms for (optional)"}}
@@ -444,7 +444,7 @@ impl ToolName {
             },
             Self::GetTaxonomy => ToolDefinition {
                 name: self.as_str(),
-                description: "Full taxonomy: wing → room → drawer count",
+                description: "Full taxonomy: wing → room → drawer count. When federation is active, includes `wing_availability` (drawer routing) and `coordination_availability` (task placement: local or remote) per wing.",
                 input_schema: json!({"type":"object","properties":{}}),
             },
             Self::GetAaaKSpec => ToolDefinition {
@@ -1457,6 +1457,8 @@ where
                 .unwrap_or_default();
             if router.has_remotes() {
                 payload["wing_availability"] = router.wing_availability(&local_wings);
+                payload["coordination_availability"] =
+                    router.coordination_availability(&local_wings);
             }
         }
         Ok(payload)
@@ -2047,6 +2049,8 @@ where
                 .unwrap_or_default();
             if router.has_remotes() {
                 payload["wing_availability"] = router.wing_availability(&local_wings);
+                payload["coordination_availability"] =
+                    router.coordination_availability(&local_wings);
             }
         }
         Ok(payload)
@@ -2073,6 +2077,8 @@ where
             payload = router.rooms_merge(payload, wing.as_deref()).await?;
             if router.has_remotes() {
                 payload["wing_availability"] = router.wing_availability(&room_wings);
+                payload["coordination_availability"] =
+                    router.coordination_availability(&room_wings);
             }
         }
         Ok(payload)
@@ -2095,6 +2101,7 @@ where
             payload = router.taxonomy_merge(payload).await?;
             if router.has_remotes() {
                 payload["wing_availability"] = router.wing_availability(&wings);
+                payload["coordination_availability"] = router.coordination_availability(&wings);
             }
         }
         Ok(payload)
@@ -8720,6 +8727,79 @@ mod tests {
             .await;
         let payload = decode_tool_payload(&response).unwrap();
         assert_eq!(payload["wing"], "wing_code");
+    }
+
+    /// Issue #125: `coordination_availability` must be emitted alongside `wing_availability`
+    /// (unchanged) by all four discovery tools, and the two maps must disagree exactly where
+    /// the underlying config disagrees.
+    ///
+    /// `wing_code` is deliberately configured with divergent drawer/coordination routes
+    /// (drawers `combined`, coordination `remote:hub`) — the conflation defect. `wing_tasks` is
+    /// configured only in `federation.coordination` (no drawers, no `federation.wings` entry) —
+    /// the invisible-wing defect. Both must show up correctly in every tool's response, and
+    /// `wing_tasks` must never appear in `wing_availability` (that map's shape is unchanged).
+    #[tokio::test]
+    async fn coordination_availability_emitted_consistently_across_wing_tools() {
+        let remote = LibMockRemote::default();
+        let mut remotes: BTreeMap<String, Arc<dyn mempalace_remote::RemoteApi>> = BTreeMap::new();
+        remotes.insert("hub".to_owned(), Arc::new(remote));
+        let mut router = make_lib_router(remotes);
+        router.rules.wings.insert(
+            "wing_code".to_owned(),
+            ResolvedRouteRule {
+                mode: RouteMode::Combined,
+                remote: Some("hub".to_owned()),
+                write: WriteTarget::Both,
+            },
+        );
+        router.rules.coordination.insert(
+            "wing_code".to_owned(),
+            ResolvedRouteRule {
+                mode: RouteMode::Remote,
+                remote: Some("hub".to_owned()),
+                write: WriteTarget::Remote,
+            },
+        );
+        router.rules.coordination.insert(
+            "wing_tasks".to_owned(),
+            ResolvedRouteRule {
+                mode: RouteMode::Remote,
+                remote: Some("hub".to_owned()),
+                write: WriteTarget::Remote,
+            },
+        );
+        let harness = test_harness_with_mock_router(router).await;
+
+        let checks: [(&str, Value); 4] = [
+            ("mempalace_status", json!({})),
+            ("mempalace_list_wings", json!({})),
+            ("mempalace_list_rooms", json!({"wing": "wing_code"})),
+            ("mempalace_get_taxonomy", json!({})),
+        ];
+
+        for (tool, args) in checks {
+            let response = harness.server.handle_request(tool_call(1100, tool, args)).await;
+            let payload = decode_tool_payload(&response)
+                .unwrap_or_else(|| panic!("tool `{tool}` returned no payload"));
+
+            assert_eq!(
+                payload["wing_availability"]["wing_code"], "combined",
+                "tool `{tool}`: wing_availability must be unchanged (drawer routing)"
+            );
+            assert_eq!(
+                payload["coordination_availability"]["wing_code"], "remote:hub",
+                "tool `{tool}`: coordination_availability must reflect the coordination table, \
+                 not the drawer table"
+            );
+            assert_eq!(
+                payload["coordination_availability"]["wing_tasks"], "remote:hub",
+                "tool `{tool}`: a coordination-only wing must be visible"
+            );
+            assert!(
+                payload["wing_availability"].get("wing_tasks").is_none(),
+                "tool `{tool}`: wing_availability must not gain a key for a coordination-only wing"
+            );
+        }
     }
 
     #[tokio::test]

@@ -1032,6 +1032,68 @@ someone else, a terminal task, an invalid transition) has no revision pair to re
 a hard error — MemPalace never retries a conflicting write on the caller's behalf, locally or
 federated.
 
+### Discovering coordination routing
+
+Every routing decision documented above except one can be inspected without side effects:
+drawer routing shows up in `wing_availability`, configured remotes show up in
+`mempalace_status`, and `/v1/info` lists capabilities. Coordination routing was the exception —
+the only way to learn where `mempalace_task_create` would put a task in a given wing was to
+create one, and coordination has no delete. Issue #125 closes that gap with a
+`coordination_availability` map, a sibling to `wing_availability` rather than a change to it,
+returned by the same four discovery tools whenever federation has remotes configured:
+
+```jsonc
+{
+  "wing_availability":         { "wing_code": "combined", "wing_myproject": "local" },
+  "coordination_availability": { "wing_code": "remote:work", "wing_myproject": "local", "wing_tasks": "local" }
+}
+```
+
+- `mempalace_status`, `mempalace_list_wings`, `mempalace_list_rooms`, and `mempalace_get_taxonomy`
+  all emit it, exactly like `wing_availability`.
+- **`coordination_availability` reports the effective *write target* — `"local"` or
+  `"remote:<name>"` — not the routing *mode*.** This is the one place it deliberately diverges
+  from `wing_availability`, which reports the mode (`"local"` / `"remote:<name>"` /
+  `"combined"`) verbatim. For drawers, `"combined"` is a complete, meaningful answer: `write:
+  both` is a real, supported drawer configuration (dual-write plus dual-read). For coordination
+  it would not be: a task is authoritative in exactly one palace, so `federation.coordination`
+  rejects any rule that would resolve to `write: both` at config load, and a wing that falls
+  through `default_mode: combined` with no explicit coordination rule places every task
+  *locally* even though its resolved *mode* is `Combined`. Reporting the mode there would print
+  `"combined"` for a wing whose tasks always land locally — answering the one question this map
+  exists to answer (where will my task go?) incorrectly for exactly that case. `wing_tasks`
+  above illustrates it: with no explicit `federation.coordination` entry, it falls through to
+  `default_mode: combined` and is reported as `"local"`, matching where `mempalace_task_create`
+  actually places its tasks.
+- Each entry is resolved by calling `resolve_coordination_route` followed by the same
+  `resolve_write_target` helper `mempalace_task_create` uses to turn a resolved route into an
+  actual write destination — never a second implementation of either. That precedence has
+  already produced three separate bugs in this file when re-derived on a parallel code path
+  (the coordination opt-in gate, the diary override, and the candidate-set narrowing each landed
+  on one of two paths and missed the other — see the deviations in
+  [Coordination-Phase-3-Design.md](Coordination-Phase-3-Design.md)), so the availability map
+  reuses both wrappers instead of re-deriving the chain.
+- The key set is the union of the local wing names, `federation.wings`, and
+  `federation.coordination`. Drawer and coordination routing are deliberately separate tables
+  (see [`FederationConfigV1::coordination`](../crates/mempalace-config/src/federation.rs) for
+  why), so the same wing can legitimately answer differently in each map — `wing_code` above is
+  `combined` for drawers but `remote:work` for coordination. Including `federation.wings` in the
+  key set (not just `federation.coordination`) means a wing configured only for drawers still
+  gets a coordination answer (it falls through to `default_mode`, as `wing_tasks` does above);
+  the reverse — a wing named only in `federation.coordination`, holding no drawers — is visible
+  too, which `wing_availability`'s key set never allowed.
+- `wing_agents` always reports `"local"` in `coordination_availability`, unconditionally — the
+  same hard override `resolve_coordination_route` applies everywhere else, not a special case in
+  the availability map itself.
+- Per-wing coordination *reads* (task/message/artifact/result lookups after a local miss) do
+  not vary by mode the way writes do — `coordination_candidate_remotes` is a union across every
+  `federation.coordination` rule plus the default remote, tried in name order regardless of
+  which wing the record turns out to belong to. Placement is therefore the only per-wing
+  coordination semantic there is, and `coordination_availability` reporting the write target
+  loses no information a per-wing read behaviour would need.
+- Choosing a destination explicitly at `task_create` time, rather than discovering it here, is
+  a related but separate capability and is not part of this change.
+
 ## Troubleshooting
 
 ### `remote '<name>' is unreachable ... writes do not fall back to local`

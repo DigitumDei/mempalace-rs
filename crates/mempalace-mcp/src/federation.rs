@@ -132,6 +132,94 @@ impl FederationRouter {
         Value::Object(avail)
     }
 
+    /// Compute coordination availability annotations for the local wing set, keyed by wing
+    /// name. Sibling to [`Self::wing_availability`] but reports a **different thing**: the
+    /// output shape here is `wing_name → "local" | "remote:<name>"`, the *effective write
+    /// target* (where a `mempalace_task_create` for that wing would actually place the task),
+    /// not the routing *mode*.
+    ///
+    /// This is deliberately not symmetric with `wing_availability`, which reports `"combined"`
+    /// verbatim for `RouteMode::Combined`. For drawers that is a meaningful, complete answer —
+    /// `write: both` is a real, supported drawer configuration (dual-write plus dual-read), so
+    /// `"combined"` genuinely describes what happens. For coordination it is not: a task is
+    /// authoritative in exactly one palace, `federation.coordination` rejects any rule that
+    /// would resolve to `write: both` at config load (see
+    /// [`mempalace_config::resolve_coordination_route`]'s doc comment), and
+    /// `rule_from_default_mode` maps an inherited `RouteMode::Combined` to `write: local` — so a
+    /// wing falling through `default_mode: combined` with no explicit coordination rule places
+    /// every task locally while still carrying `mode == Combined`. Reporting the mode there
+    /// would print `"combined"` for a wing that never puts a task anywhere but the local
+    /// palace — answering the one question this field exists to answer (where will my task
+    /// land?) incorrectly for every such wing. Reporting the resolved write target instead is
+    /// correct precisely because coordination's `write` is always fully determined
+    /// (`Local`/`Remote`, never `Both`) — there is no ambiguity here to lose by collapsing to a
+    /// single value the way there would be for a hypothetical dual-write coordination wing.
+    ///
+    /// Uses [`Self::resolve_write_target`] rather than re-deriving the mode→target mapping here
+    /// — that is the one implementation `add_drawer_remote`/`kg_add_remote`/`task_create` all
+    /// already share, and re-deriving it in a diagnostic method would just recreate the seam
+    /// that a future change to the precedence rule could drift out of sync on.
+    ///
+    /// This is intentionally *not* a re-derivation of `resolve_coordination_route`'s precedence
+    /// either — it calls that function directly — so the diary hard-override (`wing_agents`
+    /// always `"local"`), the wing normalisation, and the fail-closed behaviour on an
+    /// unnormalisable wing all come from the single source of truth used by real coordination
+    /// routing.
+    ///
+    /// The key set is `local_wings ∪ rules.wings ∪ rules.coordination`: `rules.wings` is
+    /// included (not just `rules.coordination`) so this map has the same keys as
+    /// `wing_availability` and the two can be read side by side — a wing configured only for
+    /// drawers still gets a coordination answer (it falls through to `default_mode`), and
+    /// surfacing that is the point. `rules.coordination` is included so a wing configured only
+    /// for coordination (no drawers, no `federation.wings` entry) is visible at all — the
+    /// concrete defect this method exists to fix.
+    ///
+    /// Per-wing coordination *reads* do not vary by mode the way writes do:
+    /// `coordination_candidate_remotes()` is a union across every `federation.coordination`
+    /// rule plus the default remote, tried in name order regardless of which wing a record
+    /// belongs to (a coordination read has no wing to resolve against until the record is
+    /// found — see the "Coordination (issue #102 Stage 4)" section comment above). Placement
+    /// (this field) is therefore the only per-wing coordination semantic there is to report;
+    /// reporting the write target loses no information a per-wing read behaviour would need.
+    pub fn coordination_availability(&self, local_wings: &BTreeMap<String, usize>) -> Value {
+        let mut avail = serde_json::Map::new();
+        let all_wing_names: std::collections::BTreeSet<&str> = local_wings
+            .keys()
+            .map(|s| s.as_str())
+            .chain(self.rules.wings.keys().map(|s| s.as_str()))
+            .chain(self.rules.coordination.keys().map(|s| s.as_str()))
+            .collect();
+
+        for wing_name in all_wing_names {
+            let rule = self.resolve_coordination_route(wing_name);
+            let write_target = self.resolve_write_target(&rule);
+            let status = match write_target {
+                WriteTarget::Local => "local".to_owned(),
+                WriteTarget::Remote => {
+                    if let Some(name) = &rule.remote {
+                        format_remote_origin(name)
+                    } else {
+                        "remote".to_owned()
+                    }
+                }
+                // Structurally unreachable: `resolve_coordination_route` never returns
+                // `write: both` — `resolve_federation_config` rejects any
+                // `federation.coordination` entry that would resolve to it, at config load
+                // (see `resolve_coordination_route`'s doc comment). Panicking here rather than
+                // silently folding this into `"local"` or `"remote"` is deliberate: either
+                // fallback would misreport where a task actually lands, and a value this
+                // diagnostic exists to make trustworthy must not lie quietly if the load-time
+                // invariant is ever broken.
+                WriteTarget::Both => unreachable!(
+                    "coordination route resolved to WriteTarget::Both for wing `{wing_name}`; \
+                     resolve_federation_config should reject this at config load"
+                ),
+            };
+            avail.insert(wing_name.to_owned(), json!(status));
+        }
+        Value::Object(avail)
+    }
+
     /// Resolve the route for a drawer operation. Accepts room and source_file so
     /// the diary hard-override can fire correctly (see resolve_route precedence).
     pub fn resolve_drawer_route(
@@ -2553,6 +2641,277 @@ mod tests {
         wings.insert("wing_code".to_owned(), 5);
         let avail = router_obj.wing_availability(&wings);
         assert_eq!(avail["wing_code"], "combined");
+    }
+
+    // ─── coordination_availability (issue #125) ──────────────────────────────
+
+    #[test]
+    fn coordination_availability_includes_coordination_only_wing() {
+        // A wing named only in federation.coordination — no drawers, no
+        // federation.wings entry — must still appear. This is the core defect:
+        // wing_availability's key set never sees such a wing at all.
+        let mut coordination = BTreeMap::new();
+        coordination.insert(
+            "wing_tasks".to_owned(),
+            ResolvedRouteRule {
+                mode: RouteMode::Remote,
+                remote: Some("alpha".to_owned()),
+                write: WriteTarget::Remote,
+            },
+        );
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), make_resolved_remote("alpha"));
+        let rules = FederationRuntimeConfig {
+            remotes,
+            default_mode: RouteMode::Local,
+            default_remote: None,
+            wings: BTreeMap::new(),
+            kg: None,
+            coordination,
+        };
+        let router = FederationRouter::new(rules);
+
+        // No drawers locally, and no federation.wings entry either.
+        let local_wings: BTreeMap<String, usize> = BTreeMap::new();
+
+        // The drawer map (unchanged behaviour) never sees this wing.
+        let drawer_avail = router.wing_availability(&local_wings);
+        assert!(
+            drawer_avail.get("wing_tasks").is_none(),
+            "wing_availability must not be changed by this fix"
+        );
+
+        // The new coordination map does.
+        let coord_avail = router.coordination_availability(&local_wings);
+        assert_eq!(coord_avail["wing_tasks"], "remote:alpha");
+    }
+
+    #[test]
+    fn coordination_availability_diverges_from_drawer_availability() {
+        // A wing whose drawer routing and coordination routing differ must
+        // report both correctly and independently — the conflation defect.
+        let mut wings = BTreeMap::new();
+        wings.insert(
+            "wing_x".to_owned(),
+            ResolvedRouteRule {
+                mode: RouteMode::Combined,
+                remote: Some("alpha".to_owned()),
+                write: WriteTarget::Both,
+            },
+        );
+        let mut coordination = BTreeMap::new();
+        coordination.insert(
+            "wing_x".to_owned(),
+            ResolvedRouteRule {
+                mode: RouteMode::Remote,
+                remote: Some("alpha".to_owned()),
+                write: WriteTarget::Remote,
+            },
+        );
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), make_resolved_remote("alpha"));
+        let rules = FederationRuntimeConfig {
+            remotes,
+            default_mode: RouteMode::Local,
+            default_remote: None,
+            wings,
+            kg: None,
+            coordination,
+        };
+        let router = FederationRouter::new(rules);
+        let local_wings: BTreeMap<String, usize> = BTreeMap::new();
+
+        let drawer_avail = router.wing_availability(&local_wings);
+        let coord_avail = router.coordination_availability(&local_wings);
+        assert_eq!(drawer_avail["wing_x"], "combined");
+        assert_eq!(coord_avail["wing_x"], "remote:alpha");
+    }
+
+    #[test]
+    fn coordination_availability_wing_agents_always_local() {
+        // wing_agents must report "local" unconditionally — even when
+        // default_mode is Remote and even when a federation.coordination
+        // rule tries to route it elsewhere. This must fall out of
+        // resolve_coordination_route's hard override, not a special case here.
+        let mut coordination = BTreeMap::new();
+        coordination.insert(
+            "wing_agents".to_owned(),
+            ResolvedRouteRule {
+                mode: RouteMode::Remote,
+                remote: Some("alpha".to_owned()),
+                write: WriteTarget::Remote,
+            },
+        );
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), make_resolved_remote("alpha"));
+        let rules = FederationRuntimeConfig {
+            remotes,
+            default_mode: RouteMode::Remote,
+            default_remote: Some("alpha".to_owned()),
+            wings: BTreeMap::new(),
+            kg: None,
+            coordination,
+        };
+        let router = FederationRouter::new(rules);
+        let mut local_wings = BTreeMap::new();
+        local_wings.insert("wing_agents".to_owned(), 3);
+
+        let coord_avail = router.coordination_availability(&local_wings);
+        assert_eq!(coord_avail["wing_agents"], "local");
+    }
+
+    #[test]
+    fn coordination_availability_falls_through_to_default_mode() {
+        // A wing with no rule anywhere (not in local drawers... it IS a local
+        // wing here, but has no federation.wings or federation.coordination
+        // entry) falls through to default_mode.
+        //
+        // This is the headline regression test (Codex P2, PR #126, comment 3873465832): the
+        // real-world config that motivated this fix is exactly this shape — `default_mode:
+        // combined`, no explicit `federation.coordination` entry for the wing.
+        // `rule_from_default_mode` maps that to `mode: Combined, write: Local`, so the task is
+        // always placed locally. Reporting the mode (the pre-fix behaviour) would print
+        // `"combined"` here, which is wrong: it does not identify where a task lands, and on the
+        // real palace that motivated this fix, 19 of 20 wings fell through this exact path and
+        // every one of them placed tasks locally while reporting `"combined"`. This test
+        // previously asserted `"combined"` — that assertion was pinning the defect, not
+        // documented behaviour; it is corrected here to assert the effective write target,
+        // `"local"`.
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), make_resolved_remote("alpha"));
+        let rules = FederationRuntimeConfig {
+            remotes,
+            default_mode: RouteMode::Combined,
+            default_remote: Some("alpha".to_owned()),
+            wings: BTreeMap::new(),
+            kg: None,
+            coordination: BTreeMap::new(),
+        };
+        let router = FederationRouter::new(rules);
+        let mut local_wings = BTreeMap::new();
+        local_wings.insert("wing_unlisted".to_owned(), 2);
+
+        let coord_avail = router.coordination_availability(&local_wings);
+        assert_eq!(coord_avail["wing_unlisted"], "local");
+    }
+
+    #[test]
+    fn coordination_availability_explicit_combined_write_remote_reports_remote() {
+        // An explicit `mode: combined` coordination rule with `write: remote` must report
+        // "remote:<name>" — the effective write target, not the "combined" mode.
+        let mut coordination = BTreeMap::new();
+        coordination.insert(
+            "wing_combined_remote".to_owned(),
+            ResolvedRouteRule {
+                mode: RouteMode::Combined,
+                remote: Some("alpha".to_owned()),
+                write: WriteTarget::Remote,
+            },
+        );
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), make_resolved_remote("alpha"));
+        let rules = FederationRuntimeConfig {
+            remotes,
+            default_mode: RouteMode::Local,
+            default_remote: None,
+            wings: BTreeMap::new(),
+            kg: None,
+            coordination,
+        };
+        let router = FederationRouter::new(rules);
+        let local_wings: BTreeMap<String, usize> = BTreeMap::new();
+
+        let coord_avail = router.coordination_availability(&local_wings);
+        assert_eq!(coord_avail["wing_combined_remote"], "remote:alpha");
+    }
+
+    #[test]
+    fn coordination_availability_explicit_combined_write_local_reports_local() {
+        // An explicit `mode: combined` coordination rule with `write: local` must report
+        // "local" — the effective write target, not the "combined" mode.
+        let mut coordination = BTreeMap::new();
+        coordination.insert(
+            "wing_combined_local".to_owned(),
+            ResolvedRouteRule {
+                mode: RouteMode::Combined,
+                remote: Some("alpha".to_owned()),
+                write: WriteTarget::Local,
+            },
+        );
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), make_resolved_remote("alpha"));
+        let rules = FederationRuntimeConfig {
+            remotes,
+            default_mode: RouteMode::Local,
+            default_remote: None,
+            wings: BTreeMap::new(),
+            kg: None,
+            coordination,
+        };
+        let router = FederationRouter::new(rules);
+        let local_wings: BTreeMap<String, usize> = BTreeMap::new();
+
+        let coord_avail = router.coordination_availability(&local_wings);
+        assert_eq!(coord_avail["wing_combined_local"], "local");
+    }
+
+    #[test]
+    fn coordination_availability_explicit_remote_mode_unchanged() {
+        // `mode: remote` must still report "remote:<name>" (unchanged by this fix — Remote
+        // mode maps directly to WriteTarget::Remote either way).
+        let mut coordination = BTreeMap::new();
+        coordination.insert(
+            "wing_remote".to_owned(),
+            ResolvedRouteRule {
+                mode: RouteMode::Remote,
+                remote: Some("alpha".to_owned()),
+                write: WriteTarget::Remote,
+            },
+        );
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), make_resolved_remote("alpha"));
+        let rules = FederationRuntimeConfig {
+            remotes,
+            default_mode: RouteMode::Local,
+            default_remote: None,
+            wings: BTreeMap::new(),
+            kg: None,
+            coordination,
+        };
+        let router = FederationRouter::new(rules);
+        let local_wings: BTreeMap<String, usize> = BTreeMap::new();
+
+        let coord_avail = router.coordination_availability(&local_wings);
+        assert_eq!(coord_avail["wing_remote"], "remote:alpha");
+    }
+
+    #[test]
+    fn coordination_availability_and_wing_availability_diverge_on_combined_default() {
+        // Pin the deliberate divergence: for the same fixture (a wing falling through
+        // `default_mode: combined`), wing_availability (drawer routing) must still report the
+        // *mode* ("combined" — a real, supported drawer configuration), while
+        // coordination_availability must report the effective *write target* ("local" — a task
+        // for this wing is always created locally because `federation.coordination` cannot
+        // resolve to `write: both`). wing_availability's behaviour must be completely unchanged
+        // by this fix.
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), make_resolved_remote("alpha"));
+        let rules = FederationRuntimeConfig {
+            remotes,
+            default_mode: RouteMode::Combined,
+            default_remote: Some("alpha".to_owned()),
+            wings: BTreeMap::new(),
+            kg: None,
+            coordination: BTreeMap::new(),
+        };
+        let router = FederationRouter::new(rules);
+        let mut local_wings = BTreeMap::new();
+        local_wings.insert("wing_unlisted".to_owned(), 2);
+
+        let drawer_avail = router.wing_availability(&local_wings);
+        let coord_avail = router.coordination_availability(&local_wings);
+        assert_eq!(drawer_avail["wing_unlisted"], "combined");
+        assert_eq!(coord_avail["wing_unlisted"], "local");
     }
 
     // ─── E2E federation tests with mock remote ──────────────────────────────

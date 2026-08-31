@@ -102,6 +102,7 @@ jobs:
           - mempalace-dialect
           - mempalace-federation
           - mempalace-import
+          - mempalace-mcp-tasks
           - mempalace-remote
           - mempalace-search
           - mempalace-server

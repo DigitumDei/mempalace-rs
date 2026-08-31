@@ -913,6 +913,36 @@ gains coordination categories and — unlike today, where it is dead code called
     `InputRequired`/`Completed`/`Failed`), and `NewTaskConversion::target_state`'s doc comment
     points there instead of claiming a single call always suffices.
 
+31. **Stage 6 planning: this design doc's original MCP Tasks section had the wrong JSON-RPC error
+    code and described `Task` as a flat struct when it is a discriminated union.** Corrected
+    against the authoritative sources — the extension lives in its own repo, not the core MCP
+    schema — `schema/2026-07-28/schema.ts` (raw:
+    `https://raw.githubusercontent.com/modelcontextprotocol/ext-tasks/main/schema/2026-07-28/schema.ts`)
+    and `specification/2026-07-28/tasks.md` (raw:
+    `https://raw.githubusercontent.com/modelcontextprotocol/ext-tasks/main/specification/2026-07-28/tasks.md`).
+    Two corrections, the same shape as deviation 24's A2A wire-string fix:
+    - **Error code.** The section named `-32003` for a missing client capability. The real code is
+      `-32021` ("Missing Required Client Capability"); `-32003` appears nowhere in the extension.
+      The spec also names `-32602` ("Invalid params", mandatory for `tasks/get` on an invalid or
+      nonexistent `taskId`) and `-32603` ("Internal error") — both standard JSON-RPC 2.0 codes,
+      reused rather than newly allocated by this extension.
+    - **`Task` shape.** The section described one struct carrying `result`, `error`, and
+      `inputRequests` together, with all three implicitly optional. The real schema has a base
+      `Task` (`taskId`, `status`, `statusMessage`, `createdAt`, `lastUpdatedAt`, `ttlMs`,
+      `pollIntervalMs`) and five variants discriminated on `status`
+      (`WorkingTask`/`InputRequiredTask`/`CompletedTask`/`FailedTask`/`CancelledTask`), united as
+      `DetailedTask`; `CreateTaskResult = Result & Task & { resultType: "task" }` was omitted
+      entirely. The five status values, the three methods, and `ttlMs`/`pollIntervalMs` semantics
+      in the original section were all independently verified correct against the same two
+      sources and needed no change.
+
+    Fixed in `crates/mempalace-mcp-tasks`: `src/detailed_task.rs` models `DetailedTask` as a Rust
+    enum with one variant per status (see that module's docs for why a flat struct was rejected —
+    the same "illegal states must be unrepresentable" reasoning as `mempalace-a2a`'s `Part`
+    `oneof` fix, deviation 29) instead of carrying the bug forward into the implementation, and
+    `src/json_rpc.rs` defines `MISSING_CLIENT_CAPABILITY = -32021` (not `-32003`) alongside the two
+    standard JSON-RPC codes the spec also names.
+
 ## Stage 5 — A2A adapter
 
 A new crate, `mempalace-a2a`, depending on `mempalace-storage` and `mempalace-federation` and
@@ -962,13 +992,42 @@ not leak into the core storage schema" being violated.
 
 The MCP Tasks extension left experimental core and became the official
 `io.modelcontextprotocol/tasks` extension in the 2026-07-28 specification. That satisfies issue
-#102's "once its wire model is stable" condition. Implement against the published extension
-specification — read it, do not infer it from the core protocol.
+#102's "once its wire model is stable" condition. Implemented against the published extension
+specification (`modelcontextprotocol/ext-tasks`, not the core MCP schema repo) —
+`schema/2026-07-28/schema.ts` and `specification/2026-07-28/tasks.md` — rather than inferred from
+the core protocol or copied forward from an earlier, uncorrected draft of this section. See
+deviation entry 31 (in "Deviations from this design" under Stage 4, above) for the two
+corrections that were needed relative to that earlier draft.
 
 It defines three methods — `tasks/get`, `tasks/update`, `tasks/cancel` — and a task carrying
-`taskId`, `status`, `statusMessage`, `createdAt`, `lastUpdatedAt`, `ttlMs`, `pollIntervalMs`,
-`result`, `error`, and an `inputRequests` map. A missing client capability is signalled with
-JSON-RPC error `-32003`.
+`taskId`, `status`, `statusMessage`, `createdAt`, `lastUpdatedAt`, `ttlMs`, and `pollIntervalMs`.
+**`Task` is a discriminated union, not a flat struct carrying `result`/`error`/`inputRequests`
+together**: the base fields above are common to all five statuses, and each status adds exactly
+one status-specific field, forming `DetailedTask`:
+
+| Status | Extra field | Rust representation |
+|---|---|---|
+| `working` | — | `WorkingTask`, no extra field |
+| `input_required` | `inputRequests` | `InputRequiredTask` |
+| `completed` | `result` | `CompletedTask` |
+| `failed` | `error` (`JSONRPCErrorObject`) | `FailedTask` |
+| `cancelled` | — | `CancelledTask`, no extra field |
+
+There is also `CreateTaskResult = Result & Task & { resultType: "task" }` — the base (non-
+discriminated) `Task` shape plus a `resultType: "task"` literal, returned when a server processes
+a request asynchronously as a task. `crates/mempalace-mcp-tasks/src/detailed_task.rs` models
+`DetailedTask` as a Rust enum (one variant per status) rather than a flat struct with optional
+fields, for the same "make the illegal state unrepresentable" reason `mempalace-a2a`'s `Part`
+`oneof` and non-empty-`Artifact.parts` invariants (deviations 29 and the empty-`parts` fix above)
+had to be retrofitted as explicit `validate()` calls: a flat struct would let a `completed` task
+carry `inputRequests`, or a `working` task carry `error`, and nothing but caller discipline would
+stop it.
+
+A missing client capability is signalled with JSON-RPC error **`-32021`** ("Missing Required
+Client Capability"), not `-32003` — see deviation entry 31. The spec also names `-32602`
+("Invalid params") as mandatory for `tasks/get` on an invalid/nonexistent `taskId` (recommended
+for `tasks/update`/`tasks/cancel`), and `-32603` ("Internal error") for unrelated server-side
+failures; both are standard JSON-RPC 2.0 codes, not extension-specific allocations.
 
 Its status set is smaller than either of the other two — five values, only one of them
 non-terminal:
@@ -988,7 +1047,10 @@ Inbound is total, so no coercion is needed in that direction. Outbound coerces `
 
 `ttlMs` maps onto the task's existing `expires_at`, and `pollIntervalMs` is adapter policy, not
 stored state — neither becomes a column. Same isolation rule and same envelope-as-artifact
-mechanism as Stage 5.
+mechanism as Stage 5, implemented in `crates/mempalace-mcp-tasks` (depending only on
+`mempalace-storage` plus `serde`/`serde_json`/`thiserror`/`time`/`blake3` — not on
+`mempalace-a2a`, so the two adapters stay independent translation libraries with no shared
+runtime dependency, each defining its own `Mapped`/`Coercion` types).
 
 ## Documentation
 

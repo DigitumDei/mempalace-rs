@@ -54,12 +54,18 @@ pub struct A2aArtifact {
 /// `task_id` is the owning MemPalace task; `created_by`/`idempotency_key` are resolved by the
 /// caller the same way every other coordination write resolves them (see
 /// `mempalace_storage::coordination::NewArtifact`).
+///
+/// Fails with [`A2aError::InvalidPart`] if any of `a2a.parts` violates the `Part.content`
+/// `oneof` invariant (see [`A2aPart::validate`]).
 pub fn a2a_artifact_to_new_artifact(
     a2a: &A2aArtifact,
     task_id: &str,
     created_by: &str,
     idempotency_key: String,
 ) -> Result<NewArtifact, A2aError> {
+    for part in &a2a.parts {
+        part.validate()?;
+    }
     let content = serde_json::to_string(a2a)?;
     Ok(NewArtifact {
         task_id: task_id.to_owned(),
@@ -74,9 +80,10 @@ pub fn a2a_artifact_to_new_artifact(
 /// Decode a stored [`Artifact`] back into an [`A2aArtifact`].
 ///
 /// Fails with [`A2aError::InvalidStoredShape`] if `artifact.role` is not [`A2A_ARTIFACT_ROLE`],
-/// or `content` does not decode as an `A2aArtifact` — e.g. an artifact written by a non-A2A
+/// `content` does not decode as an `A2aArtifact` — e.g. an artifact written by a non-A2A
 /// caller (including a [`crate::envelope::PROTOCOL_ENVELOPE_ROLE`] envelope artifact, which has
-/// a different shape entirely).
+/// a different shape entirely) — or any decoded part violates the `Part.content` `oneof`
+/// invariant (see [`A2aPart::validate`]).
 pub fn artifact_to_a2a_artifact(artifact: &Artifact) -> Result<A2aArtifact, A2aError> {
     if artifact.role != A2A_ARTIFACT_ROLE {
         return Err(A2aError::InvalidStoredShape {
@@ -84,10 +91,18 @@ pub fn artifact_to_a2a_artifact(artifact: &Artifact) -> Result<A2aArtifact, A2aE
             detail: format!("role `{}` is not `{A2A_ARTIFACT_ROLE}`", artifact.role),
         });
     }
-    serde_json::from_str(&artifact.content).map_err(|err| A2aError::InvalidStoredShape {
-        shape: "Artifact",
-        detail: err.to_string(),
-    })
+    let decoded: A2aArtifact =
+        serde_json::from_str(&artifact.content).map_err(|err| A2aError::InvalidStoredShape {
+            shape: "Artifact",
+            detail: err.to_string(),
+        })?;
+    for part in &decoded.parts {
+        part.validate().map_err(|err| A2aError::InvalidStoredShape {
+            shape: "Artifact",
+            detail: err.to_string(),
+        })?;
+    }
+    Ok(decoded)
 }
 
 #[cfg(test)]
@@ -142,6 +157,36 @@ mod tests {
             created_at: time::OffsetDateTime::now_utc(),
         };
         let err = artifact_to_a2a_artifact(&stored).expect_err("wrong role must be rejected");
+        assert!(matches!(err, A2aError::InvalidStoredShape { shape: "Artifact", .. }));
+    }
+
+    #[test]
+    fn rejects_building_a_new_artifact_whose_part_violates_the_oneof_invariant() {
+        let mut invalid = sample();
+        invalid.parts = vec![A2aPart::default()];
+        let err = a2a_artifact_to_new_artifact(&invalid, "task_1", "a", "key_1".to_owned())
+            .expect_err("a part with no content field set must be rejected");
+        assert!(matches!(err, A2aError::InvalidPart { set_count: 0 }));
+    }
+
+    #[test]
+    fn rejects_decoding_a_stored_artifact_whose_part_violates_the_oneof_invariant() {
+        let stored = Artifact {
+            artifact_id: "artifact_stored_1".to_owned(),
+            task_id: "task_1".to_owned(),
+            created_by: "a".to_owned(),
+            role: A2A_ARTIFACT_ROLE.to_owned(),
+            media_type: A2A_ARTIFACT_MEDIA_TYPE.to_owned(),
+            content: serde_json::json!({
+                "artifactId": "artifact_1",
+                "parts": [{"text": "a", "url": "https://example.com/f"}],
+            })
+            .to_string(),
+            content_hash: "irrelevant-for-this-test".to_owned(),
+            created_at: time::OffsetDateTime::now_utc(),
+        };
+        let err = artifact_to_a2a_artifact(&stored)
+            .expect_err("a stored part with two content fields set must be rejected");
         assert!(matches!(err, A2aError::InvalidStoredShape { shape: "Artifact", .. }));
     }
 }

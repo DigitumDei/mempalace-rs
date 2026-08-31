@@ -58,6 +58,10 @@ pub struct A2aMessage {
 /// by the caller the same way every other coordination write resolves them (see
 /// `mempalace_storage::coordination::NewMessage`). `envelope_version` defaults to `1`, matching
 /// `NewMessage`'s own default.
+///
+/// Fails with [`A2aError::InvalidPart`] if any of `a2a.parts` violates the `Part.content`
+/// `oneof` invariant (see [`A2aPart::validate`]) — a message carrying such a part must not be
+/// persisted, since it could never be legally re-emitted to a conforming A2A implementation.
 pub fn a2a_message_to_new_message(
     a2a: &A2aMessage,
     task_id: &str,
@@ -65,6 +69,9 @@ pub fn a2a_message_to_new_message(
     recipient: &str,
     idempotency_key: String,
 ) -> Result<NewMessage, A2aError> {
+    for part in &a2a.parts {
+        part.validate()?;
+    }
     let payload = serde_json::to_value(a2a)?;
     Ok(NewMessage {
         task_id: task_id.to_owned(),
@@ -79,8 +86,9 @@ pub fn a2a_message_to_new_message(
 
 /// Decode a stored [`Message`] back into an [`A2aMessage`].
 ///
-/// Fails with [`A2aError::InvalidStoredShape`] if `message.kind` is not [`A2A_MESSAGE_KIND`], or
-/// the payload does not decode as an `A2aMessage` — e.g. a message written by a non-A2A caller.
+/// Fails with [`A2aError::InvalidStoredShape`] if `message.kind` is not [`A2A_MESSAGE_KIND`], the
+/// payload does not decode as an `A2aMessage` — e.g. a message written by a non-A2A caller — or
+/// any decoded part violates the `Part.content` `oneof` invariant (see [`A2aPart::validate`]).
 pub fn message_to_a2a_message(message: &Message) -> Result<A2aMessage, A2aError> {
     if message.kind != A2A_MESSAGE_KIND {
         return Err(A2aError::InvalidStoredShape {
@@ -88,10 +96,17 @@ pub fn message_to_a2a_message(message: &Message) -> Result<A2aMessage, A2aError>
             detail: format!("kind `{}` is not `{A2A_MESSAGE_KIND}`", message.kind),
         });
     }
-    serde_json::from_value(message.payload.clone()).map_err(|err| A2aError::InvalidStoredShape {
-        shape: "Message",
-        detail: err.to_string(),
-    })
+    let decoded: A2aMessage =
+        serde_json::from_value(message.payload.clone()).map_err(|err| {
+            A2aError::InvalidStoredShape { shape: "Message", detail: err.to_string() }
+        })?;
+    for part in &decoded.parts {
+        part.validate().map_err(|err| A2aError::InvalidStoredShape {
+            shape: "Message",
+            detail: err.to_string(),
+        })?;
+    }
+    Ok(decoded)
 }
 
 #[cfg(test)]
@@ -160,6 +175,40 @@ mod tests {
             created_at: time::OffsetDateTime::now_utc(),
         };
         let err = message_to_a2a_message(&stored).expect_err("wrong kind must be rejected");
+        assert!(matches!(err, A2aError::InvalidStoredShape { shape: "Message", .. }));
+    }
+
+    #[test]
+    fn rejects_building_a_new_message_whose_part_violates_the_oneof_invariant() {
+        let mut invalid = sample();
+        // Zero fields set - violates the "exactly one" oneof invariant.
+        invalid.parts = vec![A2aPart::default()];
+        let err = a2a_message_to_new_message(&invalid, "task_1", "a", "b", "key_1".to_owned())
+            .expect_err("a part with no content field set must be rejected");
+        assert!(matches!(err, A2aError::InvalidPart { set_count: 0 }));
+    }
+
+    #[test]
+    fn rejects_decoding_a_stored_message_whose_part_violates_the_oneof_invariant() {
+        let stored = Message {
+            message_id: "message_stored_1".to_owned(),
+            sequence: 1,
+            task_id: "task_1".to_owned(),
+            sender: "a".to_owned(),
+            recipient: "b".to_owned(),
+            kind: A2A_MESSAGE_KIND.to_owned(),
+            payload: serde_json::json!({
+                "messageId": "msg_1",
+                "role": "ROLE_AGENT",
+                "parts": [{"text": "a", "raw": "YQ=="}],
+            }),
+            envelope_version: 1,
+            acknowledged_at: None,
+            acknowledged_by: None,
+            created_at: time::OffsetDateTime::now_utc(),
+        };
+        let err = message_to_a2a_message(&stored)
+            .expect_err("a stored part with two content fields set must be rejected");
         assert!(matches!(err, A2aError::InvalidStoredShape { shape: "Message", .. }));
     }
 }

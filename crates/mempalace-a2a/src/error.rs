@@ -22,4 +22,15 @@ pub enum A2aError {
         /// Human-readable detail of what was wrong.
         detail: String,
     },
+    /// An [`crate::part::A2aPart`] violated the A2A `Part.content` `oneof` invariant: the proto
+    /// requires exactly one of `text`/`raw`/`url`/`data` to be set, but `set_count` of them were
+    /// (0 meaning none were set, 2+ meaning more than one was).
+    #[error(
+        "A2A Part must set exactly one of text/raw/url/data, but {set_count} were set"
+    )]
+    InvalidPart {
+        /// How many of `text`/`raw`/`url`/`data` were set (anything other than exactly `1` is
+        /// invalid).
+        set_count: usize,
+    },
 }

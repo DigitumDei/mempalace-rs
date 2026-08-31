@@ -813,6 +813,81 @@ gains coordination categories and — unlike today, where it is dead code called
     schema" acceptance criterion the envelope mechanism exists for, without duplicating it where
     the storage schema already provides an opaque container.
 
+27. **Post-review fix (P1): the `Task` ↔ `coordination_tasks` mapping this stage's description
+    promised did not exist, and cannot be a plain bidirectional function once built.** A review
+    found `crates/mempalace-a2a` implemented the Agent Card, `Message`, and `Artifact` mappings
+    plus the task-state table, but had no `A2aTask` type and no conversion to/from
+    `mempalace_storage::coordination::Task`/`NewTask` at all — a caller holding a real A2A `Task`
+    had no way to translate it, despite this stage's own bullet list above naming "A2A Task ↔
+    `coordination_tasks`" as one of the four mappings. Added `crates/mempalace-a2a/src/task.rs`
+    with `A2aTask`/`A2aTaskStatus` (mirroring the proto's `Task`/`TaskStatus` messages) and
+    `a2a_task_to_new_task`/`task_to_a2a_task`. Two things this doc did not anticipate fell out of
+    actually building it:
+    - `NewTask` requires `title`, `description`, `wing`, `created_by`, and `idempotency_key`,
+      none of which the A2A `Task` message carries (A2A has no title, no description distinct
+      from its message history, no wing/multi-tenancy concept, and no creator identity separate
+      from `Message.role`'s bare `ROLE_USER`/`ROLE_AGENT`). Rather than inventing values, per
+      this stage's "a smaller correct [thing] beats a larger invented one" instruction (already
+      applied to `AgentCard` in deviation 25), `a2a_task_to_new_task` takes them as an explicit
+      `NewTaskInputs` parameter, the same caller-supplied-input pattern `AgentCardInputs` already
+      established. `NewTask`'s other fields (`parent_id`, `dependencies`, `budget`,
+      `expires_at`) genuinely have no A2A analogue either, but are optional in MemPalace, so
+      those are set to their absent/empty value rather than treated as a caller input.
+    - `NewTask` has no `state` field at all: `CoordinationStore::create_task` always creates a
+      task as `Pending`, with no way to create directly into any other state. So an inbound A2A
+      `Task` whose `status.state` legally maps to something other than `Pending` (e.g.
+      `TASK_STATE_WORKING`) cannot be reflected at creation time — the caller must create the
+      task, then issue a separate `task_transition` call. `a2a_task_to_new_task` still computes
+      the mapped state via the existing `map_inbound_task_state` and returns it (as
+      `NewTaskConversion::target_state: Mapped<TaskState>`, coercion included) alongside the
+      `NewTask`, so the caller can apply that follow-up transition and the coercion record is
+      never silently dropped — consistent with the crate-wide no-silent-coercion rule this doc
+      already establishes for state mapping. `task_to_a2a_task` (outbound) takes the caller's
+      already-fetched `artifacts`/`history`/`status_message` as parameters for the same reason
+      `AgentCard`'s `interfaces` is caller-supplied: `Task` itself stores none of them, and A2A's
+      `context_id`/`metadata` have no MemPalace source either, so those are always emitted as
+      `None`.
+    See `crates/mempalace-a2a/src/task.rs` module docs for the full reasoning and
+    `a2a_task_to_new_task_reports_a_coerced_target_state_without_discarding_it` for the coercion-
+    survives-the-trip test.
+
+28. **Post-review fix (P2): the envelope artifact was not actually verbatim.**
+    `envelope_artifact` took an already-parsed `&serde_json::Value` and re-serialized it with
+    `serde_json::to_string`, which is not a byte-identical copy of what arrived on the wire — it
+    normalises whitespace, can reorder object keys, collapses duplicate keys the parser already
+    discarded, and respells numbers (`1.0` becomes `1`, `1e3` becomes `1000`). That silently
+    contradicted this doc's own claim, a few paragraphs below (the "documented, deterministic,
+    lossless in audit" rule), that "the inbound envelope is already stored verbatim... so the
+    original state is always recoverable" — the entire argument for permitting state coercion
+    depends on that claim being literally true. It also reintroduced the exact BLAKE3-migration
+    defect the idempotency key was designed to avoid: two byte-different envelopes that happen to
+    parse to an equal `Value` hashed identically, so the second would be silently deduplicated
+    away and its audit record lost. `envelope_artifact` now takes `envelope_json: &str` — the
+    original JSON text as received — and hashes and stores exactly that; a caller that also needs
+    a parsed form for translation parses a separate copy rather than feeding this function an
+    already-parsed-then-re-serialized value. Since hashing raw text can no longer fail, the
+    function's signature also dropped its now-pointless `Result` wrapper. See
+    `two_envelopes_differing_only_in_key_order_and_whitespace_get_different_idempotency_keys_and_are_both_preserved`
+    in `crates/mempalace-a2a/src/envelope.rs` for the regression test.
+
+29. **Post-review fix (P2): the `Part` `oneof` invariant was unenforced.** The proto defines
+    `Part.content` as `oneof { text; raw; url; data; }` — exactly one of the four may be set. The
+    flat `A2aPart` representation (four independent `Option` fields, matching how protojson
+    actually flattens a `oneof`) is correct and is not being changed; what was missing is
+    enforcing "exactly one" at all. A part with zero fields set, or with two or more set,
+    deserialised and was accepted and persisted without complaint, even though a struct with two
+    fields set serialises to JSON a conforming A2A implementation must reject. Added
+    `A2aPart::validate` (an explicit check, not a custom `Deserialize` impl, since the flat shape
+    itself is unchanged) and a new `A2aError::InvalidPart { set_count }` variant, and wired it
+    into all four conversion functions in both directions:
+    `a2a_message_to_new_message`/`message_to_a2a_message` and
+    `a2a_artifact_to_new_artifact`/`artifact_to_a2a_artifact` each now validate every part before
+    persisting and after decoding. See `part::tests::validate_rejects_zero_fields_set`/
+    `validate_rejects_more_than_one_field_set` for the invariant itself, and
+    `rejects_building_a_new_message_whose_part_violates_the_oneof_invariant`/
+    `rejects_decoding_a_stored_message_whose_part_violates_the_oneof_invariant` (and the matching
+    pair in `artifact.rs`) for both directions of both mappings.
+
 ## Stage 5 — A2A adapter
 
 A new crate, `mempalace-a2a`, depending on `mempalace-storage` and `mempalace-federation` and

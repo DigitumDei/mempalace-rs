@@ -3,18 +3,6 @@
 /// Errors raised while translating between MCP Tasks wire shapes and MemPalace storage types.
 #[derive(Debug, thiserror::Error)]
 pub enum McpTasksError {
-    /// Serializing or deserializing an MCP Tasks JSON payload failed.
-    #[error("MCP Tasks payload (de)serialization failed: {0}")]
-    Serde(#[from] serde_json::Error),
-    /// A stored payload/content was not valid JSON for the MCP Tasks shape being decoded, or was
-    /// missing a field required by that shape.
-    #[error("stored record is not a valid MCP Tasks {shape}: {detail}")]
-    InvalidStoredShape {
-        /// The MCP Tasks shape that failed to decode (e.g. `"DetailedTask"`).
-        shape: &'static str,
-        /// Human-readable detail of what was wrong.
-        detail: String,
-    },
     /// A [`crate::detailed_task::DetailedTask`] wire object was missing a field its `status`
     /// requires — e.g. `status: "completed"` with no `result`, or `status: "failed"` with no
     /// `error`.

@@ -615,6 +615,23 @@ mod tests {
         assert!(err.to_string().contains("must not carry `result`"));
     }
 
+    /// `ttlMs` is a *required key with a nullable value* in the extension schema (`number |
+    /// null`), so this crate always serializes it — including as explicit `null` — but must still
+    /// tolerate a payload that omits the key entirely, since serde's derive treats a missing
+    /// `Option<T>` field as `None` without needing `#[serde(default)]`. This is the regression
+    /// test for that tolerance on the [`DetailedTask`] side.
+    #[test]
+    fn absent_ttl_ms_decodes_as_none() {
+        let raw = serde_json::json!({
+            "taskId": "task_1",
+            "status": "working",
+            "createdAt": "2026-01-01T00:00:00Z",
+            "lastUpdatedAt": "2026-01-01T00:00:00Z",
+        });
+        let decoded: DetailedTask = serde_json::from_value(raw).unwrap();
+        assert_eq!(decoded.common().ttl_ms, None);
+    }
+
     #[test]
     fn create_task_result_type_rejects_wrong_literal() {
         let raw = serde_json::json!({
@@ -646,6 +663,22 @@ mod tests {
         assert!(json.contains("\"resultType\":\"task\""));
         let decoded: CreateTaskResult = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, result);
+    }
+
+    /// Same tolerance as [`absent_ttl_ms_decodes_as_none`] above, but for [`CreateTaskResult`],
+    /// which the PR reviewer flagged as tested less thoroughly than [`DetailedTask`] for this
+    /// exact contract. `resultType` must still be present — only `ttlMs` is omitted here.
+    #[test]
+    fn create_task_result_absent_ttl_ms_decodes_as_none() {
+        let raw = serde_json::json!({
+            "taskId": "task_1",
+            "status": "working",
+            "createdAt": "2026-01-01T00:00:00Z",
+            "lastUpdatedAt": "2026-01-01T00:00:00Z",
+            "resultType": "task",
+        });
+        let decoded: CreateTaskResult = serde_json::from_value(raw).unwrap();
+        assert_eq!(decoded.ttl_ms, None);
     }
 
     fn sample_inputs() -> NewTaskInputs<'static> {

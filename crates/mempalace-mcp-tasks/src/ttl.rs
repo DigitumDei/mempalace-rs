@@ -72,6 +72,8 @@ pub fn expires_at_to_ttl_ms(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use time::PrimitiveDateTime;
+
     use super::*;
 
     #[test]
@@ -105,6 +107,30 @@ mod tests {
         let created_at = OffsetDateTime::now_utc();
         let expires_at = created_at - Duration::minutes(1);
         assert_eq!(expires_at_to_ttl_ms(created_at, Some(expires_at)), Some(0));
+    }
+
+    /// [`ttl_ms_to_expires_at`] has two fallible operations, either of which can produce
+    /// [`McpTasksError::TtlOutOfRange`]: converting `ttl_ms: u64` to `i64` (this test), and
+    /// `created_at.checked_add(...)` (the next test). This one drives the first: a `ttl_ms` too
+    /// large to fit in `i64` fails the `u64 -> i64` conversion regardless of `created_at`.
+    #[test]
+    fn ttl_ms_exceeding_i64_range_is_out_of_range() {
+        let created_at = OffsetDateTime::now_utc();
+        let ttl_ms = u64::try_from(i64::MAX).unwrap() + 1;
+        let err = ttl_ms_to_expires_at(created_at, Some(ttl_ms))
+            .expect_err("ttl_ms beyond i64::MAX must be rejected, not silently truncated");
+        assert!(matches!(err, McpTasksError::TtlOutOfRange));
+    }
+
+    /// The second fallible operation in [`ttl_ms_to_expires_at`]: `ttl_ms` fits comfortably in
+    /// `i64`, but `created_at` is already at [`OffsetDateTime`]'s representable maximum (without
+    /// the `large-dates` feature, year 9999), so adding any positive duration overflows.
+    #[test]
+    fn created_at_plus_ttl_ms_past_offset_date_time_max_is_out_of_range() {
+        let created_at = PrimitiveDateTime::MAX.assume_utc();
+        let err = ttl_ms_to_expires_at(created_at, Some(1))
+            .expect_err("created_at + ttl_ms past OffsetDateTime::MAX must be rejected");
+        assert!(matches!(err, McpTasksError::TtlOutOfRange));
     }
 
     #[test]

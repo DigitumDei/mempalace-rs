@@ -28,6 +28,6 @@ pub enum McpTasksError {
     /// outside the range [`time::OffsetDateTime`] can represent. Mirrors
     /// `mempalace_storage::coordination::LEASE_DURATION_OUT_OF_RANGE`'s handling of the same
     /// class of overflow for lease durations.
-    #[error("computed expiry from ttlMs overflows the representable timestamp range")]
+    #[error("computed retention deadline from ttlMs overflows the representable timestamp range")]
     TtlOutOfRange,
 }

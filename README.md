@@ -72,6 +72,7 @@ MemPalace provides a palace-style memory store with:
 | `mempalace-federation` | Shared wire DTOs for the federation REST API |
 | `mempalace-server` | Axum federation REST server (`mempalace serve`) |
 | `mempalace-remote` | Federation HTTP client (RemoteApi trait + RemoteClient) |
+| `mempalace-a2a` | A2A protocol adapter: translation library between A2A and coordination storage |
 
 ## Requirements
 

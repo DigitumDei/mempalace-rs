@@ -757,6 +757,62 @@ gains coordination categories and — unlike today, where it is dead code called
     `coordination_availability_and_wing_availability_diverge_on_combined_default` tests in
     `crates/mempalace-mcp/src/federation.rs`.
 
+24. **Stage 5 implementation: this design doc's original A2A wire-string table used the wrong
+    spelling; it has been corrected to match the real A2A v1.0.1 wire format.** The state table
+    above originally specified bare wire strings — `SUBMITTED`, `WORKING`, `INPUT_REQUIRED`,
+    `AUTH_REQUIRED`, etc. — and `crates/mempalace-a2a/src/state.rs` was first implemented to
+    match that bare spelling literally. A review checked both against the authoritative source:
+    the A2A v1.0.1 proto
+    (`specification/a2a.proto` in `a2aproject/A2A` at tag `v1.0.1`, raw:
+    `https://raw.githubusercontent.com/a2aproject/A2A/v1.0.1/specification/a2a.proto`), whose
+    `enum TaskState` values are `TASK_STATE_UNSPECIFIED`, `TASK_STATE_SUBMITTED`,
+    `TASK_STATE_WORKING`, `TASK_STATE_COMPLETED`, `TASK_STATE_FAILED`, `TASK_STATE_CANCELED`,
+    `TASK_STATE_INPUT_REQUIRED`, `TASK_STATE_REJECTED`, `TASK_STATE_AUTH_REQUIRED`; and the
+    worked JSON examples in that release's `docs/specification.md` (raw:
+    `https://raw.githubusercontent.com/a2aproject/A2A/v1.0.1/docs/specification.md`), which
+    contains 11 literal JSON examples, every one of the form `"state": "TASK_STATE_COMPLETED"`.
+    Proto3 JSON encoding (protojson) serializes enums by their full value name, not a stripped
+    suffix, so the prefixed form is what actually appears on the wire — the bare-suffix spelling
+    in the original table and the original implementation was simply wrong, not a deliberate
+    simplification. This is no longer recorded as a deviation: the table above and
+    `crates/mempalace-a2a/src/state.rs`'s `A2aTaskState` (and its module docs) now both use the
+    `TASK_STATE_` prefix, with explicit per-variant `#[serde(rename = "...")]` attributes rather
+    than a `rename_all` derive, so the mapping is visible and greppable. The same check was
+    repeated for `Role` in `crates/mempalace-a2a/src/part.rs`, which had the identical bare-suffix
+    mistake (`USER`/`AGENT` instead of the proto's `ROLE_USER`/`ROLE_AGENT`) and has been
+    corrected the same way.
+
+25. **Stage 5 implementation: `AgentCard` omits fields with no source in this crate's
+    dependencies, and cannot populate `supportedInterfaces` at all.** The real `AgentCard`
+    (same proto, `AgentCard`/`AgentProvider`/`AgentCapabilities`/`AgentExtension`/`AgentSkill`/
+    `AgentInterface` messages) also defines `securitySchemes`, `securityRequirements`,
+    `signatures`, `documentationUrl`, and `iconUrl`. None of those have an obvious source in
+    `mempalace_storage` or `mempalace_federation::InfoResponse` — no auth-scheme description, no
+    signing key, no docs/icon URL configured anywhere this crate can see — so
+    `crates/mempalace-a2a/src/agent_card.rs` leaves them out entirely rather than invent
+    placeholder values, per this stage's "a smaller correct card beats a larger invented one"
+    instruction. Separately, the real `AgentCard::supportedInterfaces` is a required, normally
+    non-empty array (each entry needs a live, resolvable URL) — but this crate builds no HTTP
+    surface (open question 3 above is still unresolved), so it has no endpoint address to put
+    there. `build_agent_card` takes `interfaces` as a caller-supplied, possibly-empty
+    `Vec<AgentInterface>` rather than compute one; a card built with an empty list is not
+    actually spec-compliant for a live A2A transport until whichever stage resolves open
+    question 3 supplies real interface entries.
+
+26. **Stage 5 implementation: `Message`/`Artifact` isolation reuses existing opaque columns
+    instead of a second envelope-artifact mechanism.** The design's isolation rule ("no A2A
+    field may become a column") is satisfied for the task-level envelope by storing it verbatim
+    as a `role = "protocol_envelope"` artifact (as specified). For the per-record `Message`/
+    `Artifact` mappings, `mempalace_storage::coordination::Message.payload` is already an opaque
+    `serde_json::Value` and `..::Artifact.content` is already an opaque `String` with no
+    per-field columns of their own — so `crates/mempalace-a2a/src/message.rs` and
+    `crates/mempalace-a2a/src/artifact.rs` serialize the whole `A2aMessage`/`A2aArtifact`
+    verbatim into that existing column (tagged with a fixed `kind`/`role` so a reader can
+    recognise the shape before decoding), rather than writing a second, separate envelope
+    artifact per message/artifact. This satisfies the same "no A2A field leaks into the core
+    schema" acceptance criterion the envelope mechanism exists for, without duplicating it where
+    the storage schema already provides an opaque container.
+
 ## Stage 5 — A2A adapter
 
 A new crate, `mempalace-a2a`, depending on `mempalace-storage` and `mempalace-federation` and
@@ -772,16 +828,16 @@ MemPalace's seven, so the mapping is not bijective in either direction:
 
 | A2A | MemPalace | Note |
 |---|---|---|
-| `SUBMITTED` | `Pending` | |
-| `WORKING` | `Running` | |
-| `INPUT_REQUIRED` | `InputRequired` | |
-| `COMPLETED` | `Completed` | |
-| `FAILED` | `Failed` | |
-| `CANCELED` | `Cancelled` | note the spelling difference — A2A uses one `l` |
-| `AUTH_REQUIRED` | `InputRequired` | coerced; both mean "interrupted, awaiting external input" |
-| `REJECTED` | `Failed` | coerced; terminal and unsuccessful |
-| `UNSPECIFIED` | — | rejected as malformed; never coerced |
-| — | `Expired` | outbound only, emitted as `FAILED` |
+| `TASK_STATE_SUBMITTED` | `Pending` | |
+| `TASK_STATE_WORKING` | `Running` | |
+| `TASK_STATE_INPUT_REQUIRED` | `InputRequired` | |
+| `TASK_STATE_COMPLETED` | `Completed` | |
+| `TASK_STATE_FAILED` | `Failed` | |
+| `TASK_STATE_CANCELED` | `Cancelled` | note the spelling difference — A2A uses one `l` |
+| `TASK_STATE_AUTH_REQUIRED` | `InputRequired` | coerced; both mean "interrupted, awaiting external input" |
+| `TASK_STATE_REJECTED` | `Failed` | coerced; terminal and unsuccessful |
+| `TASK_STATE_UNSPECIFIED` | — | rejected as malformed; never coerced |
+| — | `Expired` | outbound only, emitted as `TASK_STATE_FAILED` |
 
 **This revises the original rule.** Requiring a mapping that is total in both directions is not
 achievable without either adding `AuthRequired`, `Rejected` and an `Expired` analogue to the

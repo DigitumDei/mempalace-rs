@@ -1,6 +1,6 @@
 # mempalace-rs — instructions for Claude
 
-A Rust workspace of 14 crates implementing MemPalace, a local-first memory store for LLM
+A Rust workspace of 15 crates implementing MemPalace, a local-first memory store for LLM
 agents.
 
 **The invariant to protect:** memory never leaves the user's control by default. Embeddings,
@@ -32,9 +32,9 @@ at a time:
 cargo test -p mempalace-storage --locked
 ```
 
-Packages: `mempalace-cli`, `mempalace-config`, `mempalace-core`, `mempalace-dialect`,
-`mempalace-embeddings`, `mempalace-federation`, `mempalace-graph`, `mempalace-import`,
-`mempalace-ingest`, `mempalace-mcp`, `mempalace-remote`, `mempalace-search`,
+Packages: `mempalace-a2a`, `mempalace-cli`, `mempalace-config`, `mempalace-core`,
+`mempalace-dialect`, `mempalace-embeddings`, `mempalace-federation`, `mempalace-graph`,
+`mempalace-import`, `mempalace-ingest`, `mempalace-mcp`, `mempalace-remote`, `mempalace-search`,
 `mempalace-server`, `mempalace-storage`.
 
 ## Embeddings are offline by default

@@ -995,3 +995,10 @@ config-load failure.
 2. Should `coordination_claim` imply `coordination_write`, or must a worker token carry both?
 3. Does the A2A adapter need its own HTTP surface, or is it a translation layer over the
    existing `/v1/coordination/*` routes?
+
+   A proposed answer is written up in [A2A-Broker-Design.html](A2A-Broker-Design.html):
+   MemPalace is a broker rather than an A2A peer, so the palace is the single addressable
+   endpoint and each registered agent is an `AgentInterface.tenant` behind it. That resolves
+   deviation 25 without an endpoint per agent, and splits "the A2A adapter" into an inbound
+   broker surface and an outbound HTTP client that need separate work. **Proposal only —
+   agreed in conversation, not implemented, and not yet ratified into this design.**

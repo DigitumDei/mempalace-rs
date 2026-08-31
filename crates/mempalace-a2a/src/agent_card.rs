@@ -90,6 +90,12 @@ pub struct AgentExtension {
 }
 
 /// A distinct capability or function an agent can perform, per A2A's `AgentSkill`.
+///
+/// `security_requirements` (proto field 8) is deliberately omitted: like the security-related
+/// `AgentCard` fields this module already leaves out (see the module docs), it has no source in
+/// this crate's dependencies, so a smaller correct type beats a larger invented one. This is not
+/// an oversight — see deviation entry 25 in `docs/Coordination-Phase-3-Design.md`, which this
+/// entry extends to the per-skill field.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentSkill {
@@ -101,6 +107,17 @@ pub struct AgentSkill {
     pub description: String,
     /// Keywords describing the skill's capabilities.
     pub tags: Vec<String>,
+    /// Example prompts or scenarios that this skill can handle.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub examples: Vec<String>,
+    /// Supported input media types for this skill, overriding
+    /// [`AgentCard::default_input_modes`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input_modes: Vec<String>,
+    /// Supported output media types for this skill, overriding
+    /// [`AgentCard::default_output_modes`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub output_modes: Vec<String>,
 }
 
 /// A target URL, transport, and protocol version for interacting with the agent, per A2A's
@@ -153,6 +170,9 @@ pub fn build_agent_card(inputs: &AgentCardInputs<'_>) -> AgentCard {
                 "Coordinate tasks in the `{wing}` wing via MemPalace's coordination surface."
             ),
             tags: inputs.info.capabilities.clone(),
+            examples: Vec::new(),
+            input_modes: Vec::new(),
+            output_modes: Vec::new(),
         })
         .collect();
     AgentCard {

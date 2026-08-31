@@ -9,11 +9,19 @@
 //! `mempalace_storage::coordination::Artifact` stores its body as an opaque `content: String`
 //! column with generic `role`/`media_type` metadata columns — it has no per-A2A-field columns
 //! of its own. Mapping an A2A `Artifact` into that shape serializes the entire `A2aArtifact`
-//! verbatim into `content` (as it does for [`crate::message`]), so no A2A field is dropped,
+//! into `content` (as it does for [`crate::message`]), so no *modeled* field is dropped,
 //! reinterpreted, or promoted to a column. `role` is fixed to [`A2A_ARTIFACT_ROLE`] and
 //! `media_type` to [`A2A_ARTIFACT_MEDIA_TYPE`] so a reader can recognise the content shape
 //! before deserializing it — distinct from [`crate::envelope::PROTOCOL_ENVELOPE_ROLE`], which
 //! is reserved for the whole inbound *task* envelope, not an individual `Artifact` object.
+//!
+//! This is weaker than "no A2A field is dropped": [`a2a_artifact_to_new_artifact`] takes an
+//! already-parsed `&A2aArtifact`, so any wire field this struct does not model is gone before
+//! this function ever runs — re-serializing the parsed struct cannot recover what parsing
+//! already discarded on the way in. Verbatim preservation of the full original exchange,
+//! unmodeled fields included, is what [`crate::envelope::envelope_artifact`] is for: it stores
+//! the original wire bytes, not a re-serialization of a parsed value. This module's "no field is
+//! dropped" claim covers only the fields [`A2aArtifact`] models.
 
 use mempalace_storage::{Artifact, NewArtifact};
 use serde::{Deserialize, Serialize};
@@ -55,14 +63,18 @@ pub struct A2aArtifact {
 /// caller the same way every other coordination write resolves them (see
 /// `mempalace_storage::coordination::NewArtifact`).
 ///
-/// Fails with [`A2aError::InvalidPart`] if any of `a2a.parts` violates the `Part.content`
-/// `oneof` invariant (see [`A2aPart::validate`]).
+/// Fails with [`A2aError::EmptyArtifactParts`] if `a2a.parts` is empty — the A2A spec requires
+/// an artifact to carry at least one part — or [`A2aError::InvalidPart`] if any of `a2a.parts`
+/// violates the `Part.content` `oneof` invariant (see [`A2aPart::validate`]).
 pub fn a2a_artifact_to_new_artifact(
     a2a: &A2aArtifact,
     task_id: &str,
     created_by: &str,
     idempotency_key: String,
 ) -> Result<NewArtifact, A2aError> {
+    if a2a.parts.is_empty() {
+        return Err(A2aError::EmptyArtifactParts);
+    }
     for part in &a2a.parts {
         part.validate()?;
     }
@@ -83,7 +95,8 @@ pub fn a2a_artifact_to_new_artifact(
 /// `content` does not decode as an `A2aArtifact` — e.g. an artifact written by a non-A2A
 /// caller (including a [`crate::envelope::PROTOCOL_ENVELOPE_ROLE`] envelope artifact, which has
 /// a different shape entirely) — or any decoded part violates the `Part.content` `oneof`
-/// invariant (see [`A2aPart::validate`]).
+/// invariant (see [`A2aPart::validate`]). Fails with [`A2aError::EmptyArtifactParts`] if the
+/// decoded `parts` is empty.
 pub fn artifact_to_a2a_artifact(artifact: &Artifact) -> Result<A2aArtifact, A2aError> {
     if artifact.role != A2A_ARTIFACT_ROLE {
         return Err(A2aError::InvalidStoredShape {
@@ -96,6 +109,9 @@ pub fn artifact_to_a2a_artifact(artifact: &Artifact) -> Result<A2aArtifact, A2aE
             shape: "Artifact",
             detail: err.to_string(),
         })?;
+    if decoded.parts.is_empty() {
+        return Err(A2aError::EmptyArtifactParts);
+    }
     for part in &decoded.parts {
         part.validate().map_err(|err| A2aError::InvalidStoredShape {
             shape: "Artifact",
@@ -158,6 +174,36 @@ mod tests {
         };
         let err = artifact_to_a2a_artifact(&stored).expect_err("wrong role must be rejected");
         assert!(matches!(err, A2aError::InvalidStoredShape { shape: "Artifact", .. }));
+    }
+
+    #[test]
+    fn rejects_building_a_new_artifact_with_no_parts() {
+        let mut invalid = sample();
+        invalid.parts = Vec::new();
+        let err = a2a_artifact_to_new_artifact(&invalid, "task_1", "a", "key_1".to_owned())
+            .expect_err("an artifact with an empty parts list must be rejected");
+        assert!(matches!(err, A2aError::EmptyArtifactParts));
+    }
+
+    #[test]
+    fn rejects_decoding_a_stored_artifact_with_no_parts() {
+        let stored = Artifact {
+            artifact_id: "artifact_stored_1".to_owned(),
+            task_id: "task_1".to_owned(),
+            created_by: "a".to_owned(),
+            role: A2A_ARTIFACT_ROLE.to_owned(),
+            media_type: A2A_ARTIFACT_MEDIA_TYPE.to_owned(),
+            content: serde_json::json!({
+                "artifactId": "artifact_1",
+                "parts": [],
+            })
+            .to_string(),
+            content_hash: "irrelevant-for-this-test".to_owned(),
+            created_at: time::OffsetDateTime::now_utc(),
+        };
+        let err = artifact_to_a2a_artifact(&stored)
+            .expect_err("a stored artifact with an empty parts list must be rejected");
+        assert!(matches!(err, A2aError::EmptyArtifactParts));
     }
 
     #[test]

@@ -10,9 +10,18 @@
 //! [`serde_json::Value`] payload with no per-field columns of its own — `sender`, `recipient`,
 //! `kind`, `payload` are the only columns, and `payload` is caller-defined JSON. Mapping an A2A
 //! `Message` into that shape therefore needs no artifact-isolation trick the way task-state
-//! coercion does: the entire `A2aMessage` is serialized verbatim into `payload`, so no A2A
-//! field is dropped, reinterpreted, or promoted to a column. `kind` is fixed to
-//! [`A2A_MESSAGE_KIND`] so a reader can recognise the payload shape before deserializing it.
+//! coercion does: the entire `A2aMessage` is serialized into `payload`, so no *modeled* field is
+//! dropped, reinterpreted, or promoted to a column. `kind` is fixed to [`A2A_MESSAGE_KIND`] so a
+//! reader can recognise the payload shape before deserializing it.
+//!
+//! This is weaker than "no A2A field is dropped": [`a2a_message_to_new_message`] takes an
+//! already-parsed `&A2aMessage`, so any wire field this struct does not model is gone before
+//! this function ever runs — re-serializing the parsed struct cannot recover what
+//! `serde_json::from_str`/`from_value` already discarded on the way in. Verbatim preservation of
+//! the full original exchange, unmodeled fields included, is what
+//! [`crate::envelope::envelope_artifact`] is for: it stores the original wire bytes, not a
+//! re-serialization of a parsed value. This module's "no field is dropped" claim covers only the
+//! fields [`A2aMessage`] models.
 
 use mempalace_storage::{Message, NewMessage};
 use serde::{Deserialize, Serialize};

@@ -33,4 +33,9 @@ pub enum A2aError {
         /// invalid).
         set_count: usize,
     },
+    /// An [`crate::artifact::A2aArtifact`] had an empty `parts` list. The A2A v1.0.1 proto
+    /// documents `Artifact.parts` as "must contain at least one part" — an artifact with none
+    /// carries no content and must not be built or accepted.
+    #[error("A2A Artifact `parts` must contain at least one part, but it was empty")]
+    EmptyArtifactParts,
 }

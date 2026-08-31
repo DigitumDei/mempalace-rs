@@ -888,6 +888,31 @@ gains coordination categories and — unlike today, where it is dead code called
     `rejects_decoding_a_stored_message_whose_part_violates_the_oneof_invariant` (and the matching
     pair in `artifact.rs`) for both directions of both mappings.
 
+30. **Post-review fix (P1): `task.rs` documented a recovery path that mostly returns an error.**
+    `NewTaskConversion::target_state` exists because `NewTask` has no `state` field, so the
+    module docs told the caller to "apply it via a follow-up `task_transition` call once the
+    task exists." That is only true for two of the six reachable target states.
+    `CoordinationStore::create_task` always creates a task in `Pending`, and
+    `CoordinationStore::allowed_transition` only permits `Pending -> Cancelled | Expired`,
+    `Running -> InputRequired | Completed | Cancelled | Failed | Expired`, and
+    `InputRequired -> Pending | Running | Cancelled | Failed | Expired` — `Pending -> Running` is
+    not in the table at all. So an inbound `TASK_STATE_WORKING` (`target_state = Running`) sent
+    straight to `transition_task` returns `Err(StorageError::Invariant("invalid transition
+    pending -> running"))`, and `InputRequired`/`Completed`/`Failed` all need a `claim_task` hop
+    through `Running` first. Only `Cancelled` and `Expired` are reachable by the single call the
+    docs described. This gap traces back to this design doc's Stage 5 section (below): it
+    describes the state table and the isolation rule but never anticipated that inbound A2A
+    states are largely unreachable at creation time, so it gave the crate's docs no warning to
+    carry forward. Considered and rejected: a helper that runs the `claim_task`/`transition_task`
+    sequence for the caller — this crate is a pure translation library (see the crate-level
+    docs) and must not take a dependency on a live `CoordinationStore`, and `claim_task` needs a
+    worker identity and lease TTL this crate has no source for, so a helper would have to invent
+    them or silently fail on most inputs. Fixed the documentation instead: `task.rs`'s module
+    docs now give the real per-state path (nothing for `Pending`; one `transition_task` call for
+    `Cancelled`/`Expired`; `claim_task` for `Running`; `claim_task` then `transition_task` for
+    `InputRequired`/`Completed`/`Failed`), and `NewTaskConversion::target_state`'s doc comment
+    points there instead of claiming a single call always suffices.
+
 ## Stage 5 — A2A adapter
 
 A new crate, `mempalace-a2a`, depending on `mempalace-storage` and `mempalace-federation` and

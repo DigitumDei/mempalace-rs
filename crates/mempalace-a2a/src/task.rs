@@ -33,10 +33,42 @@
 //! reflected at creation time. [`a2a_task_to_new_task`] still runs the A2A status through
 //! [`crate::state::map_inbound_task_state`] and returns the result alongside the `NewTask`, so
 //! the caller can see what the *target* state should be — and whether reaching it required a
-//! coercion — and apply it via a follow-up `task_transition` call once the task exists. This
-//! mirrors the crate-wide rule that a state mapping's [`crate::state::Coercion`] is never
-//! silently dropped, even when the value it travels with (here, a whole [`NewTask`]) has no slot
-//! to carry the *state* itself.
+//! coercion. This mirrors the crate-wide rule that a state mapping's [`crate::state::Coercion`]
+//! is never silently dropped, even when the value it travels with (here, a whole [`NewTask`])
+//! has no slot to carry the *state* itself.
+//!
+//! # Reaching `target_state` is not always one call
+//!
+//! A freshly created task is always [`TaskState::Pending`]. `CoordinationStore::transition_task`
+//! only permits the transitions in `allowed_transition`
+//! (`crates/mempalace-storage/src/coordination.rs`):
+//! `Pending -> Cancelled | Expired`, `Running -> InputRequired | Completed | Cancelled | Failed |
+//! Expired`, and `InputRequired -> Pending | Running | Cancelled | Failed | Expired`.
+//! `Pending -> Running` is not in that table at all — the only way to move a task out of
+//! `Pending` into `Running` is `CoordinationStore::claim_task`, which additionally requires a
+//! `worker` identity and a lease `ttl: Duration` and returns a `RevisionedWrite<Task>` rather
+//! than the plain `Task` `transition_task` returns. So what the caller must do after creation
+//! depends on `target_state.value`:
+//!
+//! - [`TaskState::Pending`] — nothing; this is the state `create_task` already produced.
+//! - [`TaskState::Cancelled`]/[`TaskState::Expired`] — a single `transition_task` call, as
+//!   `Pending -> Cancelled`/`Pending -> Expired` are both directly allowed.
+//! - [`TaskState::Running`] — `claim_task`, not `transition_task`. The caller must supply a
+//!   worker and lease TTL that the inbound A2A `Task` carries no equivalent of, and must decide
+//!   what lease TTL to use for a task the A2A side may believe is already `TASK_STATE_WORKING`.
+//! - [`TaskState::InputRequired`]/[`TaskState::Completed`]/[`TaskState::Failed`] — `claim_task`
+//!   first (to reach `Running`), then `transition_task` from `Running` to the target. Two calls,
+//!   two round trips, and the same worker/lease-TTL requirement as the `Running` case in
+//!   between, purely as an artifact of the storage state machine, not anything A2A asked for.
+//!
+//! This crate does not provide a helper that performs the multi-step sequence: doing so
+//! correctly needs a live `CoordinationStore` (to make the `claim_task` and `transition_task`
+//! calls) plus a worker identity and lease TTL policy this crate has no way to supply, and this
+//! crate is a pure translation library that must not depend on a live `CoordinationStore` (see
+//! the crate-level docs). A helper that papered over the sequence without those inputs would
+//! either invent a worker identity/TTL or silently fail on every non-`Pending` inbound state —
+//! either is worse than the caller doing the two calls itself with real values. See deviation
+//! entry 30 in `docs/Coordination-Phase-3-Design.md`.
 //!
 //! # Fields with no home in `NewTask`
 //!
@@ -131,12 +163,17 @@ pub struct NewTaskConversion {
     /// here.
     pub new_task: NewTask,
     /// Where the task's state should end up, per [`crate::state::map_inbound_task_state`] on the
-    /// A2A task's `status.state`. If this is not [`TaskState::Pending`], the caller must apply
-    /// it with a follow-up `task_transition` call after creation — `create_task` has no way to
-    /// create directly into any other state. `target_state.coercion` reports whether reaching
-    /// it required coercing an A2A state MemPalace has no direct counterpart for (e.g.
-    /// `TASK_STATE_AUTH_REQUIRED`); this is never discarded, per the crate-wide no-silent-
-    /// coercion rule.
+    /// A2A task's `status.state`. `create_task` has no way to create directly into any state
+    /// other than [`TaskState::Pending`], so if this is not `Pending` the caller must apply it
+    /// afterward — but *how* depends on the value: `Cancelled`/`Expired` are a single
+    /// `transition_task` call, while `Running`/`InputRequired`/`Completed`/`Failed` all require
+    /// `claim_task` (which needs a worker identity and lease TTL this type does not carry)
+    /// before `transition_task` can run, if at all. See the module docs' "Reaching
+    /// `target_state` is not always one call" section for the full per-state breakdown — do not
+    /// assume a single `task_transition` call always suffices. `target_state.coercion` reports
+    /// whether reaching it required coercing an A2A state MemPalace has no direct counterpart
+    /// for (e.g. `TASK_STATE_AUTH_REQUIRED`); this is never discarded, per the crate-wide
+    /// no-silent-coercion rule.
     pub target_state: Mapped<TaskState>,
 }
 

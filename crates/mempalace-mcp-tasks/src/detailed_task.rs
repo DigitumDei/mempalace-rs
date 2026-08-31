@@ -11,6 +11,11 @@
 //! - `WorkingTask` — `status: "working"`, no extra fields.
 //! - `InputRequiredTask` — `status: "input_required"`, adds `inputRequests`.
 //! - `CompletedTask` — `status: "completed"`, adds `result`.
+//!   `result: { [key: string]: unknown }` is a JSON *object*, so [`DetailedTask::Completed`]
+//!   types it as `serde_json::Map<String, Value>` rather than `Value` — `null`, a scalar, or an
+//!   array is a shape a conforming client must reject, so it must not be representable here
+//!   either. Same reasoning as the discriminated-union point below, applied to one field instead
+//!   of the whole enum.
 //! - `FailedTask` — `status: "failed"`, adds `error` (a [`crate::json_rpc::JsonRpcErrorObject`]).
 //! - `CancelledTask` — `status: "cancelled"`, no extra fields.
 //!
@@ -43,6 +48,8 @@
 //! own design doc previously omitted this type entirely; [`CreateTaskResult`] fills that gap.
 //! [`TaskResultType`] makes the `"task"` discriminator itself unrepresentable as anything else,
 //! the same way the `status`-keyed variants above make an illegal `DetailedTask` unrepresentable.
+//! [`CreateTaskResult`] also carries `Result::_meta` (see [`CreateTaskResult`]'s own doc comment)
+//! — the base `Result` field this type had been dropping.
 //!
 //! # The hard part: `NewTask` needs fields MCP Tasks does not carry
 //!
@@ -88,24 +95,59 @@
 //!
 //! # `ttlMs`, and fields with no home in `NewTask`
 //!
-//! `ttlMs` maps onto `NewTask::expires_at` via [`crate::ttl::ttl_ms_to_expires_at`] — see that
-//! module for the null/absent-means-unlimited handling. `pollIntervalMs` is adapter policy, not
-//! stored state, and is dropped on the way into [`NewTask`] (there is no column for it and none
-//! should be added). `NewTask::parent_id`, `dependencies`, and `budget` are set to their absent
-//! value: MCP Tasks carries no analogue for any of them.
+//! `ttlMs` does **not** map onto `NewTask::expires_at`. They mean different things — MCP `ttlMs`
+//! is a retention hint ("the server may discard the task"), MemPalace `expires_at` is a lifecycle
+//! deadline that `claim_task` enforces and this crate's own outbound mapping reports as `failed`
+//! — see [`crate::ttl`]'s module docs for the full argument and the bug this used to cause. The
+//! absolute deadline `ttlMs` implies is still computed (via [`crate::ttl::ttl_ms_to_deadline`])
+//! but returned to the caller as [`ImportedTaskProvenance::retention_deadline`], never written
+//! into [`NewTask::expires_at`] (which this crate always leaves `None` on the inbound path).
+//!
+//! `pollIntervalMs` is adapter policy, not stored state, and is dropped on the way into
+//! [`NewTask`] (there is no column for it and none should be added). `NewTask::parent_id`,
+//! `dependencies`, and `budget` are set to their absent value: MCP Tasks carries no analogue for
+//! any of them.
+//!
+//! # `NewTask` cannot hold the inbound `taskId`, `createdAt`, or `lastUpdatedAt` — this is a real
+//! # limitation, not silently handled
+//!
+//! `NewTask` has no `task_id` field: `CoordinationStore::create_task` generates its own local id.
+//! It has no timestamp fields either: storage stamps import time for both `created_at` and
+//! `updated_at`. So an inbound object's wire identity and its source timestamps have no MemPalace
+//! column to land in, and this crate — a pure translation library with no storage handle and no
+//! side channel of its own — cannot make them durable on its own. The envelope artifact
+//! ([`crate::envelope`]) does not help here either: artifacts are queried by the *local* task id,
+//! so it gives no wire-id → local-id path for a caller that only has the wire id (e.g. a later
+//! `tasks/get`/`tasks/update`/`tasks/cancel` after a restart, or after the in-memory mapping the
+//! caller may have kept is gone).
+//!
+//! **This crate cannot fix that from inside `mempalace-storage` — the caller must.**
+//! [`detailed_task_to_new_task`]/[`create_task_result_to_new_task`] surface the source `taskId`,
+//! `createdAt`, and `lastUpdatedAt` (plus the retention deadline from the previous section) on
+//! [`NewTaskConversion::provenance`] as an [`ImportedTaskProvenance`], instead of dropping them or
+//! pretending storage can round-trip them. If the caller does not itself persist the
+//! `source_task_id` -> local `task_id` association (for example as a knowledge-graph fact, or a
+//! side table) before discarding the [`NewTaskConversion`], **the imported task becomes
+//! unreachable by its wire id after a restart** — the caller will have only the local id
+//! `create_task` returned. Likewise, if the caller does not persist `source_created_at`/
+//! `source_last_updated_at` somewhere it can retrieve them from later, [`task_to_detailed_task`]
+//! will report storage's import-time timestamps instead of the original ones, and even an
+//! otherwise-unchanged task will not round-trip its `createdAt`/`lastUpdatedAt` byte-for-byte.
+//! An honest, prominent limitation here is deliberately preferred over a workaround that looks
+//! complete but silently loses the mapping.
 
 use std::collections::HashMap;
 
 use mempalace_storage::{NewTask, Task, TaskState};
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use time::OffsetDateTime;
 
 use crate::error::McpTasksError;
 use crate::json_rpc::JsonRpcErrorObject;
 use crate::status::{Mapped, McpTaskStatus, map_inbound_task_status, map_outbound_task_state};
-use crate::ttl::{expires_at_to_ttl_ms, ttl_ms_to_expires_at};
+use crate::ttl::{deadline_to_ttl_ms, ttl_ms_to_deadline};
 
 /// Fields every `DetailedTask` variant carries, regardless of `status`.
 #[derive(Debug, Clone, PartialEq)]
@@ -147,8 +189,11 @@ pub enum DetailedTask {
     Completed {
         /// Fields common to every variant.
         common: DetailedTaskCommon,
-        /// The completed result payload.
-        result: Value,
+        /// The completed result payload. Typed as a JSON object
+        /// (`serde_json::Map<String, Value>`), matching the schema's `result: { [key: string]:
+        /// unknown }` — see the module docs' "`CompletedTask.result` must be a JSON object"
+        /// section for why this is a `Map` rather than a post-hoc-validated `Value`.
+        result: Map<String, Value>,
     },
     /// `status: "failed"` — finished with a JSON-RPC error.
     Failed {
@@ -206,8 +251,11 @@ struct RawDetailedTask {
     poll_interval_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     input_requests: Option<HashMap<String, Value>>,
+    /// Typed as `Map<String, Value>`, not `Value` — a bare JSON object is the only shape the
+    /// schema's `result: { [key: string]: unknown }` permits, so serde rejects `null`, a scalar,
+    /// or an array here automatically, rather than needing a post-hoc `validate()` call.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    result: Option<Value>,
+    result: Option<Map<String, Value>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     error: Option<JsonRpcErrorObject>,
 }
@@ -336,6 +384,18 @@ impl<'de> Deserialize<'de> for TaskResultType {
 /// immediately when it decides to process a request as an async task. Unlike [`DetailedTask`],
 /// `status` here is the bare [`McpTaskStatus`]: a `CreateTaskResult` is not discriminated into
 /// `inputRequests`/`result`/`error` variants, because at creation time none of those exist yet.
+///
+/// # `Result`'s base fields
+///
+/// The core MCP schema's `Result` interface (`schema/2026-07-28/schema.ts` in
+/// `modelcontextprotocol/modelcontextprotocol`) is `{ _meta?: ResultMetaObject; resultType:
+/// ResultType; [key: string]: unknown }`. `resultType` is already modeled above as
+/// [`TaskResultType`]; `_meta` is carried here as `meta` (opaque — this crate has no reason to
+/// interpret `io.modelcontextprotocol/serverInfo` or any other key a server puts there) so it
+/// round-trips instead of being silently dropped on decode and unrepresentable on encode. The
+/// `[key: string]: unknown` index signature is TypeScript's way of saying "extra keys are legal
+/// JSON-RPC result fields", not a field this type needs to model — nothing else in `Result` (nor
+/// in `Task`, which this type also flattens) was found to need a home here.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateTaskResult {
@@ -358,6 +418,11 @@ pub struct CreateTaskResult {
     /// Recommended client polling interval in milliseconds, if the server supplied one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub poll_interval_ms: Option<u64>,
+    /// `Result::_meta`, carried opaquely. This crate does not interpret its contents (e.g.
+    /// `io.modelcontextprotocol/serverInfo`) — it only needs to survive a decode→encode round
+    /// trip so correlation/extension metadata a client or server attached is not silently lost.
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
     /// Always `"task"` on the wire; see [`TaskResultType`].
     pub result_type: TaskResultType,
 }
@@ -384,6 +449,10 @@ pub struct NewTaskInputs<'a> {
 #[derive(Debug, Clone)]
 pub struct NewTaskConversion {
     /// The task to create. Always creates in [`TaskState::Pending`] — see the module docs.
+    /// `expires_at` is always `None` here: this crate never derives it from `ttlMs` — see the
+    /// module docs' "`ttlMs`, and fields with no home in `NewTask`" section and
+    /// [`crate::ttl`]. A caller that wants MCP retention to also drive MemPalace lifecycle expiry
+    /// may set `new_task.expires_at` from `provenance.retention_deadline` itself.
     pub new_task: NewTask,
     /// Where the task's state should end up, per [`crate::status::map_inbound_task_status`].
     /// `create_task` cannot create directly into any state but `Pending`, so the caller must
@@ -393,22 +462,64 @@ pub struct NewTaskConversion {
     /// for symmetry with the outbound direction and so a caller inspecting it never has to guess
     /// whether the field was omitted on purpose.
     pub target_state: Mapped<TaskState>,
+    /// Source-of-truth fields `NewTask` has no column for. **The caller must persist these
+    /// itself** if it needs to resolve the wire identity or round-trip the original timestamps
+    /// later — see the module docs' "`NewTask` cannot hold the inbound `taskId`, `createdAt`, or
+    /// `lastUpdatedAt`" section. This crate has no storage handle and cannot do it for the caller.
+    pub provenance: ImportedTaskProvenance,
+}
+
+/// Source-of-truth fields from an inbound MCP Tasks object that `NewTask` has no column for, and
+/// that this crate cannot make durable on the caller's behalf.
+///
+/// See [`NewTaskConversion::provenance`] and the module docs' "`NewTask` cannot hold the inbound
+/// `taskId`, `createdAt`, or `lastUpdatedAt`" section for why each field exists and what breaks
+/// if the caller drops it on the floor instead of persisting it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImportedTaskProvenance {
+    /// The wire `taskId` from the inbound object. `CoordinationStore::create_task` assigns its
+    /// own local task id, unrelated to this one. **Without the caller persisting a
+    /// `source_task_id` -> local-id association, the imported task is unreachable by this id
+    /// after a restart** — a later `tasks/get`/`tasks/update`/`tasks/cancel` carrying it cannot be
+    /// resolved to the local record.
+    pub source_task_id: String,
+    /// The wire `createdAt` from the inbound object. Storage stamps its own import-time
+    /// `created_at`; without the caller persisting this value separately,
+    /// [`task_to_detailed_task`]/[`task_to_create_task_result`] will later report the import time
+    /// instead of the true creation time.
+    pub source_created_at: OffsetDateTime,
+    /// The wire `lastUpdatedAt` from the inbound object. Same caveat as `source_created_at`:
+    /// storage stamps its own import-time `updated_at`, and this value is lost unless the caller
+    /// persists it.
+    pub source_last_updated_at: OffsetDateTime,
+    /// The absolute deadline `ttlMs` implies, relative to `source_created_at` — see
+    /// [`crate::ttl`] for why this is retention, not lifecycle, and therefore is not written to
+    /// `new_task.expires_at`. `None` means the inbound object had no TTL (wire `null` or an
+    /// absent field).
+    pub retention_deadline: Option<OffsetDateTime>,
 }
 
 /// Translate an inbound [`DetailedTask`] into a [`NewTask`], plus the state it should be
-/// transitioned to after creation.
+/// transitioned to after creation and the [`ImportedTaskProvenance`] the caller must persist
+/// itself — see the module docs' "`NewTask` cannot hold the inbound `taskId`, `createdAt`, or
+/// `lastUpdatedAt`" section.
+///
+/// `new_task.expires_at` is always `None`: `ttlMs` is retention, not lifecycle, and is never
+/// written there — see [`crate::ttl`] and the module docs' "`ttlMs`, and fields with no home in
+/// `NewTask`" section. The absolute deadline it implies is returned as
+/// `provenance.retention_deadline` instead.
 ///
 /// # Errors
 ///
 /// Returns [`McpTasksError::TtlOutOfRange`] if `common.created_at + common.ttl_ms` (see
-/// [`crate::ttl::ttl_ms_to_expires_at`]) overflows the representable timestamp range.
+/// [`crate::ttl::ttl_ms_to_deadline`]) overflows the representable timestamp range.
 pub fn detailed_task_to_new_task(
     detailed: &DetailedTask,
     inputs: NewTaskInputs<'_>,
 ) -> Result<NewTaskConversion, McpTasksError> {
     let common = detailed.common();
     let target_state = map_inbound_task_status(detailed.status());
-    let expires_at = ttl_ms_to_expires_at(common.created_at, common.ttl_ms)?;
+    let retention_deadline = ttl_ms_to_deadline(common.created_at, common.ttl_ms)?;
     let new_task = NewTask {
         title: inputs.title.to_owned(),
         description: inputs.description.to_owned(),
@@ -418,14 +529,22 @@ pub fn detailed_task_to_new_task(
         parent_id: None,
         dependencies: Vec::new(),
         budget: None,
-        expires_at,
+        expires_at: None,
     };
-    Ok(NewTaskConversion { new_task, target_state })
+    let provenance = ImportedTaskProvenance {
+        source_task_id: common.task_id.clone(),
+        source_created_at: common.created_at,
+        source_last_updated_at: common.last_updated_at,
+        retention_deadline,
+    };
+    Ok(NewTaskConversion { new_task, target_state, provenance })
 }
 
 /// Translate an inbound [`CreateTaskResult`] into a [`NewTask`], plus the state it should be
-/// transitioned to after creation. See [`detailed_task_to_new_task`] for the equivalent
-/// [`DetailedTask`] conversion and the shared module docs for why both need [`NewTaskInputs`].
+/// transitioned to after creation and the [`ImportedTaskProvenance`] the caller must persist
+/// itself. See [`detailed_task_to_new_task`] for the equivalent [`DetailedTask`] conversion, the
+/// shared module docs for why both need [`NewTaskInputs`], and why `new_task.expires_at` is
+/// always `None` here too.
 ///
 /// # Errors
 ///
@@ -436,7 +555,7 @@ pub fn create_task_result_to_new_task(
     inputs: NewTaskInputs<'_>,
 ) -> Result<NewTaskConversion, McpTasksError> {
     let target_state = map_inbound_task_status(result.status);
-    let expires_at = ttl_ms_to_expires_at(result.created_at, result.ttl_ms)?;
+    let retention_deadline = ttl_ms_to_deadline(result.created_at, result.ttl_ms)?;
     let new_task = NewTask {
         title: inputs.title.to_owned(),
         description: inputs.description.to_owned(),
@@ -446,9 +565,15 @@ pub fn create_task_result_to_new_task(
         parent_id: None,
         dependencies: Vec::new(),
         budget: None,
-        expires_at,
+        expires_at: None,
     };
-    Ok(NewTaskConversion { new_task, target_state })
+    let provenance = ImportedTaskProvenance {
+        source_task_id: result.task_id.clone(),
+        source_created_at: result.created_at,
+        source_last_updated_at: result.last_updated_at,
+        retention_deadline,
+    };
+    Ok(NewTaskConversion { new_task, target_state, provenance })
 }
 
 /// Translate an outbound MemPalace [`Task`] into a [`DetailedTask`], for a `tasks/get` response.
@@ -469,16 +594,22 @@ pub fn create_task_result_to_new_task(
 /// Returns [`McpTasksError::MissingField`]/[`McpTasksError::UnexpectedField`] if
 /// `input_requests`/`result`/`error` do not match exactly what the mapped status requires (see
 /// the module docs' "`Task` is a discriminated union" section).
+///
+/// The outbound `ttlMs` is computed from `task.expires_at` — MemPalace's lifecycle deadline, not
+/// a round-tripped retention hint (this crate never wrote one there — see [`crate::ttl`]). A
+/// caller that separately persisted an inbound `retention_deadline`
+/// ([`ImportedTaskProvenance::retention_deadline`]) and wants to report *that* as `ttlMs` instead
+/// should compute it with [`deadline_to_ttl_ms`] directly.
 pub fn task_to_detailed_task(
     task: &Task,
     status_message: Option<String>,
     poll_interval_ms: Option<u64>,
     input_requests: Option<HashMap<String, Value>>,
-    result: Option<Value>,
+    result: Option<Map<String, Value>>,
     error: Option<JsonRpcErrorObject>,
 ) -> Result<Mapped<DetailedTask>, McpTasksError> {
     let mapped_status = map_outbound_task_state(task.state);
-    let ttl_ms = expires_at_to_ttl_ms(task.created_at, task.expires_at);
+    let ttl_ms = deadline_to_ttl_ms(task.created_at, task.expires_at);
     let raw = RawDetailedTask {
         task_id: task.task_id.clone(),
         status: mapped_status.value,
@@ -498,17 +629,27 @@ pub fn task_to_detailed_task(
 /// Translate an outbound MemPalace [`Task`] into a [`CreateTaskResult`] — the handle a server
 /// returns immediately after deciding to process a request as an async task.
 ///
-/// `status_message` and `poll_interval_ms` are caller-supplied for the same reason as in
-/// [`task_to_detailed_task`]. The returned [`Mapped::coercion`] reports the same
-/// `Pending`/`Expired` coercion.
+/// `status_message`, `poll_interval_ms`, and `meta` are caller-supplied for the same reason as
+/// `status_message`/`poll_interval_ms` in [`task_to_detailed_task`]: [`Task`] has no dedicated
+/// column for any of them, and `meta` (`Result::_meta`) in particular is per-response
+/// correlation/extension data this crate has no source for. The returned [`Mapped::coercion`]
+/// reports the same `Pending`/`Expired` coercion.
+///
+/// `ttl_ms` here is computed from `task.expires_at`, which is MemPalace's *lifecycle* deadline —
+/// not a retention hint round-tripped from an inbound `ttlMs` (this crate never wrote one there
+/// to begin with; see [`crate::ttl`]). A caller that separately tracked an inbound
+/// `retention_deadline` and wants to report *that* as outbound `ttlMs` instead should compute it
+/// with [`deadline_to_ttl_ms`] directly rather than relying on this function's use of
+/// `task.expires_at`.
 #[must_use]
 pub fn task_to_create_task_result(
     task: &Task,
     status_message: Option<String>,
     poll_interval_ms: Option<u64>,
+    meta: Option<Value>,
 ) -> Mapped<CreateTaskResult> {
     let mapped_status = map_outbound_task_state(task.state);
-    let ttl_ms = expires_at_to_ttl_ms(task.created_at, task.expires_at);
+    let ttl_ms = deadline_to_ttl_ms(task.created_at, task.expires_at);
     let value = CreateTaskResult {
         task_id: task.task_id.clone(),
         status: mapped_status.value,
@@ -517,6 +658,7 @@ pub fn task_to_create_task_result(
         last_updated_at: task.updated_at,
         ttl_ms,
         poll_interval_ms,
+        meta,
         result_type: TaskResultType,
     };
     Mapped { value, coercion: mapped_status.coercion }
@@ -551,7 +693,10 @@ mod tests {
                     serde_json::json!({"kind": "elicit"}),
                 )]),
             },
-            DetailedTask::Completed { common: common(), result: serde_json::json!({"ok": true}) },
+            DetailedTask::Completed {
+                common: common(),
+                result: serde_json::Map::from_iter([("ok".to_owned(), serde_json::json!(true))]),
+            },
             DetailedTask::Failed {
                 common: common(),
                 error: JsonRpcErrorObject {
@@ -657,12 +802,60 @@ mod tests {
             last_updated_at: OffsetDateTime::now_utc(),
             ttl_ms: None,
             poll_interval_ms: Some(1_000),
+            meta: None,
             result_type: TaskResultType,
         };
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("\"resultType\":\"task\""));
+        assert!(!json.contains("_meta"), "absent meta must not be serialized, got {json}");
         let decoded: CreateTaskResult = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, result);
+    }
+
+    /// Finding B: the core MCP `Result` interface's `_meta` field must survive a decode -> encode
+    /// round trip verbatim rather than being silently dropped. `meta` is kept opaque (`Value`) —
+    /// this crate has no reason to interpret `io.modelcontextprotocol/serverInfo` or any other
+    /// key a server attaches.
+    #[test]
+    fn create_task_result_meta_round_trips_through_json() {
+        let meta = serde_json::json!({
+            "io.modelcontextprotocol/serverInfo": {"name": "mempalace", "version": "0.1.0"},
+            "custom.example/traceId": "abc123",
+        });
+        let raw = serde_json::json!({
+            "taskId": "task_1",
+            "status": "working",
+            "createdAt": "2026-01-01T00:00:00Z",
+            "lastUpdatedAt": "2026-01-01T00:00:00Z",
+            "ttlMs": null,
+            "resultType": "task",
+            "_meta": meta,
+        });
+        let decoded: CreateTaskResult = serde_json::from_value(raw).unwrap();
+        assert_eq!(decoded.meta, Some(meta.clone()));
+
+        let encoded = serde_json::to_value(&decoded).unwrap();
+        assert_eq!(encoded["_meta"], meta, "encoded payload: {encoded}");
+
+        // A second decode -> encode cycle must reproduce the identical `_meta` value.
+        let round_tripped: CreateTaskResult = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(round_tripped.meta, decoded.meta);
+    }
+
+    #[test]
+    fn create_task_result_absent_meta_is_omitted_on_encode_and_none_on_decode() {
+        let raw = serde_json::json!({
+            "taskId": "task_1",
+            "status": "working",
+            "createdAt": "2026-01-01T00:00:00Z",
+            "lastUpdatedAt": "2026-01-01T00:00:00Z",
+            "ttlMs": null,
+            "resultType": "task",
+        });
+        let decoded: CreateTaskResult = serde_json::from_value(raw).unwrap();
+        assert_eq!(decoded.meta, None);
+        let encoded = serde_json::to_value(&decoded).unwrap();
+        assert!(encoded.get("_meta").is_none(), "encoded payload: {encoded}");
     }
 
     /// Same tolerance as [`absent_ttl_ms_decodes_as_none`] above, but for [`CreateTaskResult`],
@@ -692,16 +885,49 @@ mod tests {
     }
 
     #[test]
-    fn detailed_task_to_new_task_carries_caller_supplied_fields_and_ttl_through() {
+    fn detailed_task_to_new_task_carries_caller_supplied_fields_through() {
         let detailed = DetailedTask::Working(common());
         let conversion = detailed_task_to_new_task(&detailed, sample_inputs()).unwrap();
         assert_eq!(conversion.new_task.title, "Summarize the quarterly report");
         assert_eq!(conversion.new_task.wing, "wing_myproject");
         assert_eq!(conversion.target_state.value, TaskState::Running);
         assert!(conversion.target_state.coercion.is_none());
-        let expected_expires_at =
-            ttl_ms_to_expires_at(detailed.common().created_at, detailed.common().ttl_ms).unwrap();
-        assert_eq!(conversion.new_task.expires_at, expected_expires_at);
+        // Finding A regression: `ttlMs` must never land in `expires_at` (it is retention, not
+        // MemPalace lifecycle) -- `create_task` is always given `expires_at: None`.
+        assert_eq!(conversion.new_task.expires_at, None);
+    }
+
+    /// Finding A regression: a `completed` MCP task with a TTL that has since elapsed must not
+    /// come back to life as a fabricated MemPalace `expires_at`/`Expired` state. The retention
+    /// deadline `ttlMs` implies is surfaced on `provenance.retention_deadline` instead of being
+    /// written to `new_task.expires_at`, which stays `None` regardless of the TTL value.
+    #[test]
+    fn detailed_task_to_new_task_never_writes_ttl_ms_into_expires_at() {
+        let mut source = common();
+        source.ttl_ms = Some(3_600_000); // one hour
+        let detailed = DetailedTask::Completed {
+            common: source.clone(),
+            result: Map::from_iter([("ok".to_owned(), serde_json::json!(true))]),
+        };
+        let conversion = detailed_task_to_new_task(&detailed, sample_inputs()).unwrap();
+        assert_eq!(
+            conversion.new_task.expires_at, None,
+            "ttlMs (retention) must never populate expires_at (lifecycle)"
+        );
+        let expected_deadline = ttl_ms_to_deadline(source.created_at, source.ttl_ms).unwrap();
+        assert_eq!(conversion.provenance.retention_deadline, expected_deadline);
+    }
+
+    /// Finding D/E regression: the caller must be able to recover the inbound wire identity and
+    /// source timestamps from `NewTaskConversion`, since `NewTask` has no columns for them.
+    #[test]
+    fn detailed_task_to_new_task_surfaces_provenance_for_the_caller_to_persist() {
+        let source = common();
+        let detailed = DetailedTask::Working(source.clone());
+        let conversion = detailed_task_to_new_task(&detailed, sample_inputs()).unwrap();
+        assert_eq!(conversion.provenance.source_task_id, source.task_id);
+        assert_eq!(conversion.provenance.source_created_at, source.created_at);
+        assert_eq!(conversion.provenance.source_last_updated_at, source.last_updated_at);
     }
 
     #[test]
@@ -714,11 +940,14 @@ mod tests {
             last_updated_at: OffsetDateTime::now_utc(),
             ttl_ms: None,
             poll_interval_ms: None,
+            meta: None,
             result_type: TaskResultType,
         };
         let conversion = create_task_result_to_new_task(&result, sample_inputs()).unwrap();
         assert_eq!(conversion.target_state.value, TaskState::Running);
         assert_eq!(conversion.new_task.expires_at, None);
+        assert_eq!(conversion.provenance.source_task_id, "task_1");
+        assert_eq!(conversion.provenance.retention_deadline, None);
     }
 
     fn sample_task(state: TaskState) -> Task {
@@ -749,7 +978,7 @@ mod tests {
             None,
             None,
             None,
-            Some(serde_json::json!({"ok": true})),
+            Some(Map::from_iter([("ok".to_owned(), serde_json::json!(true))])),
             None,
         )
         .unwrap();
@@ -762,6 +991,49 @@ mod tests {
             err,
             McpTasksError::MissingField { status: "completed", field: "result" }
         ));
+    }
+
+    /// Finding C regression: `CompletedTask.result` is typed as a JSON object
+    /// (`serde_json::Map<String, Value>`), so a non-object payload (`null`, a scalar, or an
+    /// array) must be rejected on decode rather than silently accepted.
+    #[test]
+    fn decoding_completed_result_as_a_non_object_is_rejected() {
+        for non_object in [
+            serde_json::json!(null),
+            serde_json::json!("a string"),
+            serde_json::json!(42),
+            serde_json::json!([1, 2, 3]),
+        ] {
+            let raw = serde_json::json!({
+                "taskId": "task_1",
+                "status": "completed",
+                "createdAt": "2026-01-01T00:00:00Z",
+                "lastUpdatedAt": "2026-01-01T00:00:00Z",
+                "ttlMs": null,
+                "result": non_object,
+            });
+            serde_json::from_value::<DetailedTask>(raw)
+                .expect_err("a non-object `result` must be rejected on decode");
+        }
+    }
+
+    /// Finding C regression, positive case: a genuine JSON object round-trips through
+    /// `DetailedTask::Completed` unchanged.
+    #[test]
+    fn completed_result_object_round_trips_through_json() {
+        let result = Map::from_iter([
+            ("summary".to_owned(), serde_json::json!("done")),
+            ("count".to_owned(), serde_json::json!(3)),
+        ]);
+        let detailed = DetailedTask::Completed { common: common(), result: result.clone() };
+        let json = serde_json::to_string(&detailed).unwrap();
+        let decoded: DetailedTask = serde_json::from_str(&json).unwrap();
+        match decoded {
+            DetailedTask::Completed { result: decoded_result, .. } => {
+                assert_eq!(decoded_result, result);
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
     }
 
     #[test]
@@ -777,10 +1049,21 @@ mod tests {
     #[test]
     fn task_to_create_task_result_reports_the_expired_coercion() {
         let task = sample_task(TaskState::Expired);
-        let mapped = task_to_create_task_result(&task, None, None);
+        let mapped = task_to_create_task_result(&task, None, None, None);
         assert_eq!(mapped.value.status, McpTaskStatus::Failed);
         let coercion = mapped.coercion.expect("Expired must be reported as a coercion");
         assert_eq!(coercion.from, "expired");
         assert_eq!(coercion.to, "failed");
+    }
+
+    /// [`task_to_create_task_result`] threads `meta` straight through to
+    /// `CreateTaskResult::meta` -- it is caller-supplied opaque data, not something this crate
+    /// computes.
+    #[test]
+    fn task_to_create_task_result_threads_meta_through() {
+        let task = sample_task(TaskState::Running);
+        let meta = serde_json::json!({"custom.example/traceId": "abc123"});
+        let mapped = task_to_create_task_result(&task, None, None, Some(meta.clone()));
+        assert_eq!(mapped.value.meta, Some(meta));
     }
 }

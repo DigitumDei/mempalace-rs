@@ -943,6 +943,55 @@ gains coordination categories and — unlike today, where it is dead code called
     `src/json_rpc.rs` defines `MISSING_CLIENT_CAPABILITY = -32021` (not `-32003`) alongside the two
     standard JSON-RPC codes the spec also names.
 
+32. **Post-review fix (P1): `ttlMs` was mapped onto `expires_at`, conflating retention with
+    lifecycle.** This section's line below — "`ttlMs` maps onto the task's existing
+    `expires_at`" — was wrong, and the implementation it was copied into inherited the bug.
+    `ttlMs` (`schema/2026-07-28/schema.ts`, `modelcontextprotocol/ext-tasks`) is a **retention**
+    hint: the spec says the server *"may discard the task"* after it elapses, and a
+    `completed`/`failed`/`cancelled` task past its TTL is still exactly that status — the server
+    is merely permitted to stop remembering it. MemPalace's `expires_at`
+    (`mempalace_storage::coordination::Task`/`NewTask`) is a **lifecycle** deadline:
+    `CoordinationStore::claim_task` checks it in-transaction and, if it has passed, transitions
+    the record to `TaskState::Expired` and returns `TASK_HAS_EXPIRED`, and this crate's own
+    outbound mapping reports `Expired` as MCP `failed`. Feeding `ttlMs` into `expires_at`
+    therefore fabricated failures out of a retention hint: a successfully `completed` MCP task
+    with a one-hour TTL, queried an hour later, came back as `failed`, and a legitimate target
+    state transition could become unreachable because `claim_task` expired the task first.
+
+    Fixed in `crates/mempalace-mcp-tasks`: `detailed_task_to_new_task`/
+    `create_task_result_to_new_task` now always set `new_task.expires_at: None` and instead
+    return the absolute deadline `ttlMs` implies as `NewTaskConversion::provenance
+    .retention_deadline` (part of the new `ImportedTaskProvenance` struct — see deviation 33
+    below), under a name that cannot be mistaken for a lifecycle field. `src/ttl.rs`'s conversion
+    helpers (renamed `ttl_ms_to_deadline`/`deadline_to_ttl_ms`, since they no longer produce or
+    consume `expires_at` specifically) are unchanged in behaviour — computing an absolute
+    deadline from `created_at + ttlMs` is still the right calculation, it just no longer lands in
+    a lifecycle column. A caller that genuinely wants MCP retention to also drive MemPalace
+    expiry may set `new_task.expires_at` from `retention_deadline` itself; the adapter must not
+    decide that silently. This section's "`ttlMs` maps onto the task's existing `expires_at`"
+    line below has been corrected to describe the fix.
+
+33. **Post-review fix (P1/P2, same review as deviation 32): the inbound `taskId`, `createdAt`,
+    and `lastUpdatedAt` had no path out of the adapter.** `NewTask` has no `task_id` field —
+    `CoordinationStore::create_task` always generates its own local id — and no timestamp fields;
+    storage stamps import time for both `created_at` and `updated_at`. So an inbound object's
+    wire identity and true creation/update times had nowhere to go: a later
+    `tasks/get`/`tasks/update`/`tasks/cancel` carrying the wire `taskId` had no way to resolve the
+    local record after a restart (the envelope artifact does not help — artifacts are queried by
+    the *local* task id), and an outbound `task_to_detailed_task` call would report storage's
+    invented import-time timestamps instead of the real ones, breaking round-tripping even for an
+    unchanged task. Neither is fixable inside `mempalace-storage` under this stage's no-new-
+    columns constraint.
+
+    Fixed by surfacing rather than hiding the gap: `NewTaskConversion` gained a `provenance:
+    ImportedTaskProvenance` field (`source_task_id`, `source_created_at`,
+    `source_last_updated_at`, `retention_deadline` — the last one from deviation 32) that the
+    caller must persist itself (e.g. as a knowledge-graph fact or a side table) if it needs the
+    wire-id lookup or timestamp round-trip to survive a restart. This crate has no storage handle
+    and cannot make that association durable on its own; the module docs for
+    `crates/mempalace-mcp-tasks/src/detailed_task.rs` state the limitation prominently rather
+    than leaving it implicit in what fields happen to be missing.
+
 ## Stage 5 — A2A adapter
 
 A new crate, `mempalace-a2a`, depending on `mempalace-storage` and `mempalace-federation` and
@@ -1045,12 +1094,21 @@ non-terminal:
 Inbound is total, so no coercion is needed in that direction. Outbound coerces `Pending` and
 `Expired`, under the same documented-deterministic-auditable rule as Stage 5.
 
-`ttlMs` maps onto the task's existing `expires_at`, and `pollIntervalMs` is adapter policy, not
-stored state — neither becomes a column. Same isolation rule and same envelope-as-artifact
-mechanism as Stage 5, implemented in `crates/mempalace-mcp-tasks` (depending only on
-`mempalace-storage` plus `serde`/`serde_json`/`thiserror`/`time`/`blake3` — not on
-`mempalace-a2a`, so the two adapters stay independent translation libraries with no shared
-runtime dependency, each defining its own `Mapped`/`Coercion` types).
+`ttlMs` is a retention hint, not a lifecycle deadline, and per deviation 32 it is **not** mapped
+onto `expires_at`: doing so would let a completed task's own retention TTL fabricate a `failed`
+outcome once it elapsed. The absolute deadline it implies is instead returned to the caller as
+`retention_deadline` on `NewTaskConversion::provenance`, and `pollIntervalMs` is adapter policy,
+not stored state — neither becomes a column. Per deviation 33, the inbound `taskId`/`createdAt`/
+`lastUpdatedAt` are likewise returned via `provenance` rather than dropped, since `NewTask` has no
+columns for them and the caller — not this crate — must persist the association if it needs it to
+survive a restart. `CreateTaskResult` also carries `Result::_meta` (opaque, round-tripped
+verbatim), and `CompletedTask.result` is typed `Map<String, Value>` rather than a bare `Value`,
+matching the schema's `result: { [key: string]: unknown }` and rejecting non-object payloads on
+decode. Same isolation rule and same envelope-as-artifact mechanism as Stage 5, implemented in
+`crates/mempalace-mcp-tasks` (depending only on `mempalace-storage` plus
+`serde`/`serde_json`/`thiserror`/`time`/`blake3` — not on `mempalace-a2a`, so the two adapters stay
+independent translation libraries with no shared runtime dependency, each defining its own
+`Mapped`/`Coercion` types).
 
 ## Documentation
 

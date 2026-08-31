@@ -24,7 +24,7 @@ pub enum McpTasksError {
         /// The field that is not legal for `status` but was present anyway (e.g. `"result"`).
         field: &'static str,
     },
-    /// [`crate::ttl::ttl_ms_to_expires_at`] computed `created_at + ttlMs`, but the result falls
+    /// [`crate::ttl::ttl_ms_to_deadline`] computed `created_at + ttlMs`, but the result falls
     /// outside the range [`time::OffsetDateTime`] can represent. Mirrors
     /// `mempalace_storage::coordination::LEASE_DURATION_OUT_OF_RANGE`'s handling of the same
     /// class of overflow for lease durations.

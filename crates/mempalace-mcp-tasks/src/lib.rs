@@ -41,7 +41,8 @@
 //!
 //! - [`status`] — [`McpTaskStatus`] and the inbound/outbound status mappings.
 //! - [`json_rpc`] — [`JsonRpcErrorObject`] and the extension's named JSON-RPC error codes.
-//! - [`ttl`] — `ttlMs` ↔ `expires_at` conversion.
+//! - [`ttl`] — `ttlMs` ↔ absolute-deadline conversion. **Not** `expires_at` — see [`ttl`]'s module
+//!   docs for why MCP retention and MemPalace lifecycle must not be conflated.
 //! - [`detailed_task`] — [`DetailedTask`]/[`CreateTaskResult`] ↔ `coordination_tasks`.
 //! - [`envelope`] — the envelope-as-artifact isolation mechanism for the whole inbound task.
 
@@ -54,12 +55,12 @@ pub mod ttl;
 mod error;
 
 pub use detailed_task::{
-    CreateTaskResult, DetailedTask, DetailedTaskCommon, NewTaskConversion, NewTaskInputs,
-    TaskResultType, create_task_result_to_new_task, detailed_task_to_new_task,
+    CreateTaskResult, DetailedTask, DetailedTaskCommon, ImportedTaskProvenance, NewTaskConversion,
+    NewTaskInputs, TaskResultType, create_task_result_to_new_task, detailed_task_to_new_task,
     task_to_create_task_result, task_to_detailed_task,
 };
 pub use envelope::{PROTOCOL_ENVELOPE_MEDIA_TYPE, PROTOCOL_ENVELOPE_ROLE, envelope_artifact};
 pub use error::McpTasksError;
 pub use json_rpc::{INTERNAL_ERROR, INVALID_TASK_ID, JsonRpcErrorObject, MISSING_CLIENT_CAPABILITY};
 pub use status::{Coercion, Mapped, McpTaskStatus, map_inbound_task_status, map_outbound_task_state};
-pub use ttl::{expires_at_to_ttl_ms, ttl_ms_to_expires_at};
+pub use ttl::{deadline_to_ttl_ms, ttl_ms_to_deadline};

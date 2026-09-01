@@ -1,6 +1,8 @@
 #![allow(missing_docs)]
 
 mod federation;
+mod metrics;
+mod replication;
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
@@ -18,10 +20,10 @@ use mempalace_embeddings::{
     FastembedProviderConfig, env_flag,
 };
 use mempalace_federation::{
-    AckMessageRequest, CoordinationTaskState as WireTaskState,
-    NewArtifactRequest as WireNewArtifactRequest, NewMessageRequest as WireNewMessageRequest,
-    NewTaskRequest as WireNewTaskRequest, NewTaskResultRequest as WireNewTaskResultRequest,
-    TaskLeaseRequest, TransitionTaskRequest,
+    AckMessageRequest, AddDrawerRequest, CoordinationTaskState as WireTaskState, KgAddFactRequest,
+    KgInvalidateRequest, NewArtifactRequest as WireNewArtifactRequest,
+    NewMessageRequest as WireNewMessageRequest, NewTaskRequest as WireNewTaskRequest,
+    NewTaskResultRequest as WireNewTaskResultRequest, TaskLeaseRequest, TransitionTaskRequest,
 };
 use mempalace_graph::{
     AddFactRequest, EntityKind, KnowledgeGraphRuntime, PalaceGraphSnapshot, QueryDirection,
@@ -30,10 +32,10 @@ use mempalace_graph::{
 use mempalace_search::{SearchRuntime, SearchRuntimePolicy};
 use mempalace_storage::{
     AgentLineageRecord, ChangeEvent, ChangeLogStore, CoordinationCursor, CoordinationStore,
-    CoordinationVisibility, DiaryStore, DrawerFilter, DrawerStore, DuplicateStrategy,
-    IngestCommitRequest,
-    DelegationStore, LineageMigrationRecord, NewArtifact, NewCheckpoint, NewMessage, NewSkill,
-    NewSkillOutcome, NewSpan, NewTask, NewTaskResult, RevisionedWrite, SelfModelStore,
+    CoordinationVisibility, DelegationStore, DiaryStore, DrawerFilter, DrawerStore,
+    DuplicateStrategy, IngestCommitRequest, LineageMigrationRecord, NewArtifact, NewCheckpoint,
+    NewMessage, NewOutboxOperation, NewSkill, NewSkillOutcome, NewSpan, NewTask, NewTaskResult,
+    OutboxOperation, OutboxState, OutboxStore, RevisionedWrite, SelfModelStore,
     SelfObservationRecord, SelfObservationScope, SelfObservationStatus, SkillScope, SkillStatus,
     SkillStore, SpanStatus, StopReason, StorageEngine, TaskState,
 };
@@ -46,6 +48,10 @@ use tokio::sync::{Mutex, Semaphore, TryAcquireError};
 
 use federation::FederationRouter;
 pub use mempalace_core as core;
+use metrics::PhaseMeter;
+use replication::{
+    OUTBOX_ACTOR, OUTBOX_MAX_ATTEMPTS, ReplicationMutation, expect_applied, run_replication_worker,
+};
 
 // ─── Federation routing semantics ─────────────────────────────────────────────
 //
@@ -170,6 +176,8 @@ pub enum McpError {
     TimeFormat(String),
     #[error("federation error: {0}")]
     Federation(String),
+    #[error("replication state error: {0}")]
+    Replication(String),
     #[error("invalid {LINEAGE_ID_ENV}: {0}")]
     InvalidLineageBinding(String),
     #[error("io error at {path}: {source}")]
@@ -475,7 +483,8 @@ impl ToolName {
                         "predicate":{"type":"string","description":"The relationship type (e.g. 'loves', 'works_on', 'daughter_of')"},
                         "object":{"type":"string","description":"The entity being connected to"},
                         "valid_from":{"type":"string","description":"When this became true (YYYY-MM-DD, optional)"},
-                        "source_closet":{"type":"string","description":"Closet ID where this fact appears (optional)"}
+                        "source_closet":{"type":"string","description":"Closet ID where this fact appears (optional)"},
+                        "operation_id":{"type":"string","description":"Stable idempotency key for a remote or durable dual-write retry (optional)"}
                     },
                     "required":["subject","predicate","object"]
                 }),
@@ -489,7 +498,8 @@ impl ToolName {
                         "subject":{"type":"string","description":"Entity"},
                         "predicate":{"type":"string","description":"Relationship"},
                         "object":{"type":"string","description":"Connected entity"},
-                        "ended":{"type":"string","description":"When it stopped being true (YYYY-MM-DD, default: today)"}
+                        "ended":{"type":"string","description":"When it stopped being true (YYYY-MM-DD, default: today)"},
+                        "operation_id":{"type":"string","description":"Stable idempotency key for a remote or durable dual-write retry (optional)"}
                     },
                     "required":["subject","predicate","object"]
                 }),
@@ -572,17 +582,21 @@ impl ToolName {
                         "room":{"type":"string","description":"Room (aspect: backend, decisions, meetings...)"},
                         "content":{"type":"string","description":"Verbatim content to store — exact words, never summarized"},
                         "source_file":{"type":"string","description":"Where this came from (optional)"},
-                        "added_by":{"type":"string","description":"Who is filing this (default: mcp)"}
+                        "added_by":{"type":"string","description":"Who is filing this (default: mcp)"},
+                        "operation_id":{"type":"string","description":"Stable idempotency key for a remote or durable dual-write retry (optional)"}
                     },
                     "required":["wing","room","content"]
                 }),
             },
             Self::DeleteDrawer => ToolDefinition {
                 name: self.as_str(),
-                description: "Delete a drawer by ID. Irreversible. Local deletion first by ID; if not found locally, falls back to remotes in name order. Does not use write routing.",
+                description: "Delete a drawer by ID. Irreversible. Known local drawers follow write routing; write:both commits locally and queues durable replication. Unknown IDs fall back across remotes.",
                 input_schema: json!({
                     "type":"object",
-                    "properties":{"drawer_id":{"type":"string","description":"ID of the drawer to delete"}},
+                    "properties":{
+                        "drawer_id":{"type":"string","description":"ID of the drawer to delete"},
+                        "operation_id":{"type":"string","description":"Stable idempotency key for a remote or durable dual-write retry (optional)"}
+                    },
                     "required":["drawer_id"]
                 }),
             },
@@ -741,7 +755,15 @@ impl ToolName {
                 self,
                 "Propose a reusable procedure as a candidate skill version. The version is derived automatically as one past the highest existing version for skill_id; it is never caller-supplied. `scope: project` requires a `wing` naming the owning project, and the other scopes must omit it; a skill stays bound to that wing for its whole life. Replaying the same author and idempotency_key returns the committed version. Candidates are not authoritative until promoted.",
                 json!({"skill_id":{"type":"string"},"scope":{"type":"string","enum":["agent","project","organization"]},"wing":{"type":"string","description":"Owning project wing, e.g. wing_myproject. Required for project scope, rejected otherwise."},"applicability":{"type":"string"},"instructions_ref":{"type":"string"},"required_capabilities":{"type":"array","items":{"type":"string"}},"required_tools":{"type":"array","items":{"type":"string"}},"required_permissions":{"type":"array","items":{"type":"string"}},"author":{"type":"string"},"provenance":{},"confidence":{"type":"number","minimum":0,"maximum":1},"idempotency_key":{"type":"string"}}),
-                &["skill_id", "scope", "applicability", "instructions_ref", "author", "confidence", "idempotency_key"],
+                &[
+                    "skill_id",
+                    "scope",
+                    "applicability",
+                    "instructions_ref",
+                    "author",
+                    "confidence",
+                    "idempotency_key",
+                ],
             ),
             Self::SkillGet => coordination_definition(
                 self,
@@ -1045,13 +1067,13 @@ impl McpServer<FastembedProvider> {
 
 pub fn configured_lineage_id_from_env() -> Result<Option<String>> {
     match std::env::var(LINEAGE_ID_ENV) {
-        Ok(value) => validate_record_id_value(&value)
-            .map(Some)
-            .map_err(McpError::InvalidLineageBinding),
+        Ok(value) => {
+            validate_record_id_value(&value).map(Some).map_err(McpError::InvalidLineageBinding)
+        }
         Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(std::env::VarError::NotUnicode(_)) => Err(McpError::InvalidLineageBinding(
-            "must be valid Unicode".to_owned(),
-        )),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(McpError::InvalidLineageBinding("must be valid Unicode".to_owned()))
+        }
     }
 }
 
@@ -1087,6 +1109,16 @@ where
             .map_err(McpError::InvalidLineageBinding)?;
         let queue_limit = config.low_cpu.effective_queue_limit().min(Semaphore::MAX_PERMITS);
         let runtime = McpRuntime::new(config, provider, lineage_id).await?;
+        if let Some(router) = &runtime.federation {
+            let remotes = router.remotes.clone();
+            if !remotes.is_empty() {
+                tokio::spawn(run_replication_worker(
+                    runtime.outbox.clone(),
+                    remotes,
+                    runtime.metrics.clone(),
+                ));
+            }
+        }
         Ok(Self {
             runtime: Arc::new(Mutex::new(runtime)),
             queue_limit: Arc::new(Semaphore::new(queue_limit)),
@@ -1324,8 +1356,10 @@ struct McpRuntime<P> {
     coordination: CoordinationStore,
     skills: SkillStore,
     delegation: DelegationStore,
+    outbox: OutboxStore,
     search: SearchRuntime<P>,
     federation: Option<FederationRouter>,
+    metrics: PhaseMeter,
 }
 
 impl<P> McpRuntime<P>
@@ -1344,9 +1378,11 @@ where
         skills.ensure_schema()?;
         let delegation = DelegationStore::new(config.palace_path.join("storage.sqlite3"));
         delegation.ensure_schema()?;
+        let outbox = OutboxStore::new(config.palace_path.join("storage.sqlite3"));
+        outbox.ensure_schema()?;
         let router = FederationRouter::new(config.federation.clone());
         let federation = if router.has_remotes() { Some(router) } else { None };
-        Ok(Self {
+        let mut runtime = Self {
             search: SearchRuntime::with_policy(
                 provider,
                 SearchRuntimePolicy { rerank_enabled: config.low_cpu.effective_rerank_enabled() },
@@ -1357,8 +1393,181 @@ where
             coordination,
             skills,
             delegation,
+            outbox,
             federation,
-        })
+            metrics: PhaseMeter::default(),
+        };
+        runtime.reconcile_staged_replication().await?;
+        Ok(runtime)
+    }
+
+    /// Settle every pre-crash staged intent before a dispatcher can claim work. The local
+    /// logical state is authoritative: a committed mutation is activated, while an intent whose
+    /// local mutation never landed is cancelled.
+    async fn reconcile_staged_replication(&mut self) -> Result<()> {
+        loop {
+            let staged = self.outbox.list_staged(10_000)?;
+            if staged.is_empty() {
+                return Ok(());
+            }
+            for operation in staged {
+                let committed = self.replication_intent_committed(&operation).await?;
+                let transition = if committed {
+                    self.outbox.activate(&operation.operation_id, operation.revision)?
+                } else {
+                    self.outbox.cancel(&operation.operation_id, operation.revision)?
+                };
+                expect_applied(transition, if committed { "activation" } else { "cancellation" })
+                    .map_err(McpError::Replication)?;
+                tracing::info!(
+                    operation_id = %operation.operation_id,
+                    committed,
+                    "reconciled staged durable replication intent"
+                );
+            }
+        }
+    }
+
+    async fn replication_intent_committed(&self, operation: &OutboxOperation) -> Result<bool> {
+        let mutation = serde_json::from_value::<ReplicationMutation>(operation.payload.clone())
+            .map_err(|error| {
+                McpError::Replication(format!(
+                    "invalid staged replication payload {}: {error}",
+                    operation.operation_id
+                ))
+            })?;
+        match mutation {
+            ReplicationMutation::DrawerAdd { request } => {
+                let drawer_id = request.drawer_id.ok_or_else(|| {
+                    McpError::Replication(format!(
+                        "staged drawer add {} has no stable drawer id",
+                        operation.operation_id
+                    ))
+                })?;
+                let drawer_id = parse_drawer_id(&drawer_id).map_err(|error| match error {
+                    ToolError::InvalidParams(message) => McpError::Replication(message),
+                    ToolError::Internal(error) => error,
+                })?;
+                Ok(self.storage.drawer_store().get_drawer(&drawer_id).await?.is_some())
+            }
+            ReplicationMutation::DrawerDelete { drawer_id } => {
+                let drawer_id = parse_drawer_id(&drawer_id).map_err(|error| match error {
+                    ToolError::InvalidParams(message) => McpError::Replication(message),
+                    ToolError::Internal(error) => error,
+                })?;
+                Ok(self.storage.drawer_store().get_drawer(&drawer_id).await?.is_none())
+            }
+            ReplicationMutation::KgAdd { request } => {
+                Ok(self.local_fact_state(&request.subject, &request.predicate, &request.object)?
+                    == Some(true))
+            }
+            ReplicationMutation::KgInvalidate { request } => {
+                Ok(self.local_fact_state(&request.subject, &request.predicate, &request.object)?
+                    != Some(true))
+            }
+        }
+    }
+
+    fn local_fact_state(
+        &self,
+        subject: &str,
+        predicate: &str,
+        object: &str,
+    ) -> Result<Option<bool>> {
+        let runtime = KnowledgeGraphRuntime::new(self.storage.operational_store());
+        match runtime.query_entity(subject, None, QueryDirection::Outgoing) {
+            Ok(rows) => Ok(rows
+                .into_iter()
+                .find(|row| {
+                    row.subject.eq_ignore_ascii_case(subject)
+                        && row.predicate.eq_ignore_ascii_case(predicate)
+                        && row.object.eq_ignore_ascii_case(object)
+                })
+                .map(|row| row.current)),
+            Err(mempalace_graph::GraphError::UnknownEntity { .. }) => Ok(None),
+            Err(error) => Err(McpError::Graph(error)),
+        }
+    }
+
+    fn stage_replication(
+        &self,
+        idempotency_key: String,
+        mutation_kind: &str,
+        entity_id: String,
+        destination_remote: String,
+        ordering_key: String,
+        mutation: ReplicationMutation,
+    ) -> Result<OutboxOperation> {
+        Ok(self.outbox.enqueue(&NewOutboxOperation {
+            created_by: OUTBOX_ACTOR.to_owned(),
+            idempotency_key,
+            mutation_kind: mutation_kind.to_owned(),
+            entity_id,
+            destination_remote,
+            ordering_key,
+            payload: mutation.into_value()?,
+            max_attempts: OUTBOX_MAX_ATTEMPTS,
+        })?)
+    }
+
+    fn activate_replication(&self, operation: &OutboxOperation) -> Result<OutboxOperation> {
+        let transition = self.outbox.activate(&operation.operation_id, operation.revision)?;
+        expect_applied(transition, "activation").map_err(McpError::Replication)
+    }
+
+    fn cancel_staged_replication(&self, operation: &OutboxOperation) {
+        if let Err(error) = self.outbox.cancel(&operation.operation_id, operation.revision) {
+            tracing::warn!(
+                operation_id = %operation.operation_id,
+                %error,
+                "failed to cancel uncommitted replication intent; startup reconciliation will retry"
+            );
+        }
+    }
+
+    /// Recover a keyed `write:both` delete's durable outbox intent from the caller's
+    /// stable operation id alone, before any local drawer metadata is consulted.
+    ///
+    /// The outbox row is authoritative: it names the destination remote and the current
+    /// queued/terminal state, neither of which can be re-derived after the local drawer is
+    /// gone. Retrying the same `operation_id` after a successful local deletion (or a crash
+    /// after delete, once startup reconciliation has activated the intent) must therefore
+    /// return that original state rather than falling into the synchronous all-remote
+    /// fallback / false-not-found path.
+    ///
+    /// Returns `Ok(None)` when there is no live terminal/queued intent for this drawer under
+    /// this key (a genuinely fresh delete, a no-key delete, or a still-staged intent whose
+    /// local delete never committed — the normal path handles those).
+    fn recover_keyed_delete_replication(
+        &self,
+        requested_operation_id: &str,
+        drawer_id: &str,
+    ) -> Result<Option<Value>> {
+        let Some(operation) = self.outbox.find_by_key(OUTBOX_ACTOR, requested_operation_id)? else {
+            return Ok(None);
+        };
+        if operation.mutation_kind != "drawer_deleted" {
+            return Ok(None);
+        }
+        let matches_drawer =
+            serde_json::from_value::<ReplicationMutation>(operation.payload.clone())
+                .ok()
+                .is_some_and(|mutation| {
+                    matches!(
+                        mutation,
+                        ReplicationMutation::DrawerDelete { drawer_id: id } if id == drawer_id
+                    )
+                });
+        if !matches_drawer {
+            return Ok(None);
+        }
+        match operation.state {
+            // A staged intent means the local delete never committed; the retry must
+            // perform the delete and activate this same operation (idempotent enqueue
+            // replay), so the normal path handles it.
+            OutboxState::Staged | OutboxState::Cancelled => Ok(None),
+            _ => Ok(Some(delete_replication_replay_payload(&operation, drawer_id))),
+        }
     }
 
     async fn tool_wake_up(&mut self, arguments: &Value) -> ToolResult<Value> {
@@ -1492,6 +1701,44 @@ where
         if let Some(rooms) = rooms {
             payload["rooms"] = json!(rooms);
         }
+        let backlog = self.outbox.backlog(None).map_tool()?;
+        let failures = self
+            .outbox
+            .list_failed(10)
+            .map_tool()?
+            .into_iter()
+            .map(|operation| {
+                json!({
+                    "operation_id": operation.operation_id,
+                    "remote": operation.destination_remote,
+                    "mutation_kind": operation.mutation_kind,
+                    "entity_id": operation.entity_id,
+                    "attempt_count": operation.attempt_count,
+                    "last_error": operation.last_error,
+                    "failed_at": operation.updated_at,
+                })
+            })
+            .collect::<Vec<_>>();
+        let metrics = self.metrics.snapshot();
+        let phase_metrics = metrics
+            .into_iter()
+            .map(|(phase, stats)| {
+                let phase = phase.to_owned();
+                let value = json!({
+                    "count": stats.count,
+                    "last_ms": stats.last_ms,
+                    "total_ms": stats.total_ms,
+                    "max_ms": stats.max_ms,
+                    "avg_ms": stats.avg_ms(),
+                });
+                (phase, value)
+            })
+            .collect::<BTreeMap<_, _>>();
+        payload["replication"] = json!({
+            "backlog": backlog,
+            "recent_terminal_failures": failures,
+            "phase_metrics": phase_metrics,
+        });
         Ok(payload)
     }
 
@@ -1616,20 +1863,12 @@ where
         Ok(json!({"success": true, "lineage": lineage}))
     }
 
-    async fn tool_self_observation_propose(
-        &mut self,
-        arguments: &Value,
-    ) -> ToolResult<Value> {
+    async fn tool_self_observation_propose(&mut self, arguments: &Value) -> ToolResult<Value> {
         let lineage_id = required_record_id(arguments, "lineage_id")?;
-        let Some(_) = self
-            .storage
-            .operational_store()
-            .get_lineage(&lineage_id)
-            .map_tool_internal()?
+        let Some(_) =
+            self.storage.operational_store().get_lineage(&lineage_id).map_tool_internal()?
         else {
-            return Err(ToolError::InvalidParams(format!(
-                "lineage `{lineage_id}` does not exist"
-            )));
+            return Err(ToolError::InvalidParams(format!("lineage `{lineage_id}` does not exist")));
         };
         let statement = required_non_blank_string(arguments, "statement")?;
         let behavioral_consequence =
@@ -1717,10 +1956,7 @@ where
         Ok(json!({"success": true, "observation": observation}))
     }
 
-    async fn tool_self_observation_review(
-        &mut self,
-        arguments: &Value,
-    ) -> ToolResult<Value> {
+    async fn tool_self_observation_review(&mut self, arguments: &Value) -> ToolResult<Value> {
         let observation_id = required_record_id(arguments, "observation_id")?;
         let decision = required_non_blank_string(arguments, "decision")?;
         let expected_revision = required_positive_i64(arguments, "expected_revision")?;
@@ -1796,15 +2032,10 @@ where
 
     async fn tool_migration_record(&mut self, arguments: &Value) -> ToolResult<Value> {
         let lineage_id = required_record_id(arguments, "lineage_id")?;
-        let Some(_) = self
-            .storage
-            .operational_store()
-            .get_lineage(&lineage_id)
-            .map_tool_internal()?
+        let Some(_) =
+            self.storage.operational_store().get_lineage(&lineage_id).map_tool_internal()?
         else {
-            return Err(ToolError::InvalidParams(format!(
-                "lineage `{lineage_id}` does not exist"
-            )));
+            return Err(ToolError::InvalidParams(format!("lineage `{lineage_id}` does not exist")));
         };
         let from_model = optional_non_blank_string(arguments, "from_model")?;
         let from_harness = optional_non_blank_string(arguments, "from_harness")?;
@@ -1869,7 +2100,8 @@ where
         let model = optional_non_blank_string(arguments, "model")?;
         let harness = optional_non_blank_string(arguments, "harness")?;
         let include_candidates = optional_bool(arguments, "include_candidates")?.unwrap_or(false);
-        let observation_limit = optional_usize(arguments, "observation_limit")?.unwrap_or(20).min(50);
+        let observation_limit =
+            optional_usize(arguments, "observation_limit")?.unwrap_or(20).min(50);
         let migration_limit = optional_usize(arguments, "migration_limit")?.unwrap_or(5).min(25);
         let operational_store = self.storage.operational_store();
         let (lineage, lineage_selection) = match self.bound_lineage_id.as_deref() {
@@ -1885,7 +2117,8 @@ where
                         }),
                     ),
                     None => {
-                        let fallback = operational_store.get_default_lineage().map_tool_internal()?;
+                        let fallback =
+                            operational_store.get_default_lineage().map_tool_internal()?;
                         let fallback_id = fallback.as_ref().map(|record| record.lineage_id.clone());
                         let message = if fallback_id.is_some() {
                             format!(
@@ -2153,6 +2386,7 @@ where
                             .into_iter()
                             .map(|result| {
                                 let mut obj = json!({
+                                    "drawer_id": result.drawer_id,
                                     "wing": result.wing,
                                     "room": result.room,
                                     "similarity": round_similarity(result.score),
@@ -2324,6 +2558,7 @@ where
         let content = required_string(arguments, "content")?;
         let source_file = optional_string(arguments, "source_file")?.unwrap_or_default();
         let added_by = optional_string(arguments, "added_by")?.unwrap_or_else(|| "mcp".to_owned());
+        let requested_operation_id = optional_string(arguments, "operation_id")?;
         let content_hash = hash_text(&content);
 
         // ── Resolve federation route once, reuse for dual-write decisions ──
@@ -2344,7 +2579,7 @@ where
             if let Some(router) = &self.federation {
                 if let Some(route) = &route {
                     if let Some(remote_resp) = router
-                        .add_drawer_remote(
+                        .add_drawer_remote_with_operation(
                             wing.as_str(),
                             room.as_str(),
                             &content,
@@ -2352,6 +2587,7 @@ where
                             &added_by,
                             route,
                             DEFAULT_DUPLICATE_THRESHOLD,
+                            requested_operation_id.as_deref(),
                         )
                         .await?
                     {
@@ -2361,7 +2597,9 @@ where
             }
         }
 
+        let duplicates_started = std::time::Instant::now();
         let duplicates = self.find_duplicates(&content, DEFAULT_DUPLICATE_THRESHOLD).await?;
+        self.metrics.record("duplicate_search", duplicates_started.elapsed());
         if !duplicates.is_empty() {
             // ── Both-mode: same wing+room → retry, reuse local, retry remote ──
             if is_both {
@@ -2372,6 +2610,43 @@ where
                             == Some(content_hash.as_str())
                 }) {
                     let existing_drawer_id = existing["id"].as_str().unwrap_or("");
+                    let remote =
+                        route.as_ref().and_then(|value| value.remote.clone()).ok_or_else(|| {
+                            ToolError::Internal(McpError::Federation(
+                                "write:both route has no remote configured".to_owned(),
+                            ))
+                        })?;
+                    let operation = self
+                        .stage_replication(
+                            replication_idempotency_key(
+                                requested_operation_id.as_deref(),
+                                "drawer-add",
+                                existing_drawer_id,
+                                &remote,
+                            ),
+                            "drawer_added",
+                            existing_drawer_id.to_owned(),
+                            remote.clone(),
+                            existing_drawer_id.to_owned(),
+                            ReplicationMutation::DrawerAdd {
+                                request: AddDrawerRequest {
+                                    wing: wing.as_str().to_owned(),
+                                    room: room.as_str().to_owned(),
+                                    content: content.clone(),
+                                    source_file: (!source_file.is_empty())
+                                        .then(|| source_file.clone()),
+                                    added_by: Some(added_by.clone()),
+                                    drawer_id: Some(existing_drawer_id.to_owned()),
+                                    operation_id: None,
+                                },
+                            },
+                        )
+                        .map_tool()?;
+                    let operation = if operation.state == OutboxState::Staged {
+                        self.activate_replication(&operation).map_tool()?
+                    } else {
+                        operation
+                    };
                     let mut result = json!({
                         "success": true,
                         "drawer_id": existing_drawer_id,
@@ -2383,29 +2658,14 @@ where
                             obj.insert("applied_to".to_owned(), json!("local"));
                         }
                     }
-                    if let Some(router) = &self.federation {
-                        if let Some(route) = &route {
-                            let replication = router
-                                .add_drawer_replicate(
-                                    wing.as_str(),
-                                    room.as_str(),
-                                    &content,
-                                    &source_file,
-                                    &added_by,
-                                    route,
-                                    DEFAULT_DUPLICATE_THRESHOLD,
-                                )
-                                .await;
-                            if let Some(obj) = result.as_object_mut() {
-                                obj.insert("replication".to_owned(), json!(replication));
-                                if matches!(replication, ReplicationStatus::Failed { .. }) {
-                                    obj.insert(
-                                        "warnings".to_owned(),
-                                        json!(["local content already existed; remote replication failed"]),
-                                    );
-                                }
-                            }
-                        }
+                    if let Some(obj) = result.as_object_mut() {
+                        obj.insert(
+                            "replication".to_owned(),
+                            json!(ReplicationStatus::Queued {
+                                remote,
+                                operation_id: operation.operation_id,
+                            }),
+                        );
                     }
                     return Ok(result);
                 }
@@ -2419,8 +2679,43 @@ where
 
         let now = OffsetDateTime::now_utc();
         let drawer_id = generated_drawer_id("drawer", wing.as_str(), room.as_str(), &content, now)?;
-        let content_clone = content.clone();
-        let record = self
+        let staged = if is_both {
+            let remote =
+                route.as_ref().and_then(|value| value.remote.clone()).ok_or_else(|| {
+                    ToolError::Internal(McpError::Federation(
+                        "write:both route has no remote configured".to_owned(),
+                    ))
+                })?;
+            Some(
+                self.stage_replication(
+                    replication_idempotency_key(
+                        requested_operation_id.as_deref(),
+                        "drawer-add",
+                        drawer_id.as_str(),
+                        &remote,
+                    ),
+                    "drawer_added",
+                    drawer_id.as_str().to_owned(),
+                    remote,
+                    drawer_id.as_str().to_owned(),
+                    ReplicationMutation::DrawerAdd {
+                        request: AddDrawerRequest {
+                            wing: wing.as_str().to_owned(),
+                            room: room.as_str().to_owned(),
+                            content: content.clone(),
+                            source_file: (!source_file.is_empty()).then(|| source_file.clone()),
+                            added_by: Some(added_by.clone()),
+                            drawer_id: Some(drawer_id.as_str().to_owned()),
+                            operation_id: None,
+                        },
+                    },
+                )
+                .map_tool()?,
+            )
+        } else {
+            None
+        };
+        let record = match self
             .build_drawer_record(
                 drawer_id.clone(),
                 wing.clone(),
@@ -2433,9 +2728,20 @@ where
                 content,
                 now,
             )
-            .await?;
+            .await
+        {
+            Ok(record) => record,
+            Err(error) => {
+                if let Some(operation) = &staged {
+                    self.cancel_staged_replication(operation);
+                }
+                return Err(error);
+            }
+        };
 
-        self.storage
+        let commit_started = std::time::Instant::now();
+        if let Err(error) = self
+            .storage
             .commit_ingest(IngestCommitRequest {
                 ingest_kind: "mcp_write".to_owned(),
                 source_key: format!("mcp:{}", drawer_id.as_str()),
@@ -2445,7 +2751,13 @@ where
                 duplicate_strategy: DuplicateStrategy::Error,
             })
             .await
-            .map_tool()?;
+        {
+            if let Some(operation) = &staged {
+                self.cancel_staged_replication(operation);
+            }
+            return Err(ToolError::Internal(error.into()));
+        }
+        self.metrics.record("commit", commit_started.elapsed());
 
         self.log_change(ChangeEvent {
             event_type: "drawer_added".to_owned(),
@@ -2467,31 +2779,16 @@ where
             }
         }
 
-        // ── Both-mode: best-effort remote replication after local write ──
-        if is_both {
-            if let Some(router) = &self.federation {
-                if let Some(route) = &route {
-                    let replication = router
-                        .add_drawer_replicate(
-                            wing.as_str(),
-                            room.as_str(),
-                            &content_clone,
-                            &source_file,
-                            &added_by,
-                            route,
-                            DEFAULT_DUPLICATE_THRESHOLD,
-                        )
-                        .await;
-                    if let Some(obj) = result.as_object_mut() {
-                        obj.insert("replication".to_owned(), json!(replication));
-                        if matches!(replication, ReplicationStatus::Failed { .. }) {
-                            obj.insert(
-                                "warnings".to_owned(),
-                                json!(["local write succeeded but remote replication failed"]),
-                            );
-                        }
-                    }
-                }
+        if let Some(staged) = staged {
+            let operation = self.activate_replication(&staged).map_tool()?;
+            if let Some(obj) = result.as_object_mut() {
+                obj.insert(
+                    "replication".to_owned(),
+                    json!(ReplicationStatus::Queued {
+                        remote: operation.destination_remote.clone(),
+                        operation_id: operation.operation_id,
+                    }),
+                );
             }
         }
 
@@ -2500,6 +2797,23 @@ where
 
     async fn tool_delete_drawer(&mut self, arguments: &Value) -> ToolResult<Value> {
         let drawer_id = parse_drawer_id(&required_string(arguments, "drawer_id")?)?;
+        let requested_operation_id = optional_string(arguments, "operation_id")?;
+
+        // ── Keyed replay recovery ─────────────────────────────────────────────
+        // A write:both delete stages a durable outbox intent (keyed by the caller's
+        // operation_id) before committing locally. Retrying the same operation_id after
+        // the local drawer is gone must recover that original intent from the outbox —
+        // which names the destination remote and the current queued/terminal state that
+        // local drawer metadata can no longer provide — rather than falling into the
+        // synchronous all-remote fallback / false-not-found path.
+        if let Some(operation_id) = requested_operation_id.as_deref() {
+            if let Some(replay) = self
+                .recover_keyed_delete_replication(operation_id, drawer_id.as_str())
+                .map_tool()?
+            {
+                return Ok(replay);
+            }
+        }
         // Look the drawer up before deleting so its wing/room can be recorded
         // on the `drawer_deleted` change event below. There is no way to
         // recover them afterward, and a `drawer_deleted` event with no wing
@@ -2509,16 +2823,102 @@ where
         // docs/Federation.md §1.5), so leaving it out here would make every
         // local deletion silently invisible to scoped remote readers.
         let existing = self.storage.drawer_store().get_drawer(&drawer_id).await.map_tool()?;
-        let deleted = self
+        let route = existing.as_ref().and_then(|drawer| {
+            self.federation.as_ref().map(|router| {
+                router.resolve_drawer_route(
+                    Some(drawer.wing.as_str()),
+                    Some(drawer.room.as_str()),
+                    (!drawer.source_file.is_empty()).then_some(drawer.source_file.as_str()),
+                )
+            })
+        });
+        if let (Some(router), Some(route)) = (&self.federation, &route) {
+            if router.resolve_write_target(route) == WriteTarget::Remote {
+                if let Some(response) = router
+                    .delete_drawer_routed_remote(
+                        drawer_id.as_str(),
+                        route,
+                        requested_operation_id.as_deref(),
+                    )
+                    .await?
+                {
+                    return Ok(response);
+                }
+            }
+        }
+        let is_both = match (&self.federation, &route) {
+            (Some(router), Some(route)) => router.is_dual_write(route),
+            _ => false,
+        };
+        let staged = if is_both {
+            let remote =
+                route.as_ref().and_then(|value| value.remote.clone()).ok_or_else(|| {
+                    ToolError::Internal(McpError::Federation(
+                        "write:both delete route has no remote configured".to_owned(),
+                    ))
+                })?;
+            let unique_entity = format!(
+                "{}:{}",
+                drawer_id.as_str(),
+                OffsetDateTime::now_utc().unix_timestamp_nanos()
+            );
+            Some(
+                self.stage_replication(
+                    replication_idempotency_key(
+                        requested_operation_id.as_deref(),
+                        "drawer-delete",
+                        &unique_entity,
+                        &remote,
+                    ),
+                    "drawer_deleted",
+                    drawer_id.as_str().to_owned(),
+                    remote,
+                    drawer_id.as_str().to_owned(),
+                    ReplicationMutation::DrawerDelete { drawer_id: drawer_id.as_str().to_owned() },
+                )
+                .map_tool()?,
+            )
+        } else {
+            None
+        };
+        let commit_started = std::time::Instant::now();
+        let deleted = match self
             .storage
             .drawer_store()
             .delete_drawers(std::slice::from_ref(&drawer_id))
             .await
-            .map_tool()?;
+        {
+            Ok(deleted) => deleted,
+            Err(error) => {
+                if let Some(operation) = &staged {
+                    self.cancel_staged_replication(operation);
+                }
+                return Err(ToolError::Internal(error.into()));
+            }
+        };
+        self.metrics.record("commit", commit_started.elapsed());
         if deleted == 0 {
+            if let Some(staged) = &staged {
+                let operation = self.activate_replication(staged).map_tool()?;
+                return Ok(json!({
+                    "success": true,
+                    "drawer_id": drawer_id,
+                    "applied_to": "local",
+                    "replication": ReplicationStatus::Queued {
+                        remote: operation.destination_remote,
+                        operation_id: operation.operation_id,
+                    },
+                }));
+            }
             // ── Federation fallback ──
             if let Some(router) = &self.federation {
-                if let Some(remote_resp) = router.delete_drawer_remote(drawer_id.as_str()).await? {
+                if let Some(remote_resp) = router
+                    .delete_drawer_remote_with_operation(
+                        drawer_id.as_str(),
+                        requested_operation_id.as_deref(),
+                    )
+                    .await?
+                {
                     // `existing` is almost always `None` here in practice —
                     // `deleted == 0` means this palace never had the row, so
                     // there was nothing to look up — but populate wing/room
@@ -2567,6 +2967,18 @@ where
         if self.federation.is_some() {
             if let Some(obj) = result.as_object_mut() {
                 obj.insert("applied_to".to_owned(), json!("local"));
+            }
+        }
+        if let Some(staged) = staged {
+            let operation = self.activate_replication(&staged).map_tool()?;
+            if let Some(obj) = result.as_object_mut() {
+                obj.insert(
+                    "replication".to_owned(),
+                    json!(ReplicationStatus::Queued {
+                        remote: operation.destination_remote.clone(),
+                        operation_id: operation.operation_id,
+                    }),
+                );
             }
         }
         Ok(result)
@@ -2900,6 +3312,7 @@ where
         let predicate = required_string(arguments, "predicate")?;
         let object = required_string(arguments, "object")?;
         let valid_from_text = optional_string(arguments, "valid_from")?;
+        let requested_operation_id = optional_string(arguments, "operation_id")?;
 
         // ── Resolve federation route once, reuse for dual-write decisions ──
         let route = self.federation.as_ref().map(|router| router.resolve_kg_route());
@@ -2913,12 +3326,13 @@ where
             if let Some(router) = &self.federation {
                 if let Some(route) = &route {
                     if let Some(remote_resp) = router
-                        .kg_add_remote(
+                        .kg_add_remote_with_operation(
                             &subject,
                             &predicate,
                             &object,
                             valid_from_text.as_deref(),
                             route,
+                            requested_operation_id.as_deref(),
                         )
                         .await?
                     {
@@ -2934,23 +3348,67 @@ where
             source_closet.as_deref().and_then(|value| parse_drawer_id(value).ok());
         let runtime = KnowledgeGraphRuntime::new(self.storage.operational_store());
         let now = OffsetDateTime::now_utc();
-        let triple_id = runtime
-            .add_fact(
-                AddFactRequest {
-                    subject: subject.clone(),
-                    subject_type: infer_entity_kind(&subject),
-                    predicate: predicate.clone(),
-                    object_type: infer_entity_kind(&object),
-                    object: object.clone(),
-                    valid_from,
-                    valid_to: None,
-                    confidence: 1.0,
-                    source_drawer_id,
-                    source_file: source_closet,
-                },
-                now,
+        let ordering_key = kg_ordering_key(&subject, &predicate, &object);
+        let staged = if is_both {
+            let remote =
+                route.as_ref().and_then(|value| value.remote.clone()).ok_or_else(|| {
+                    ToolError::Internal(McpError::Federation(
+                        "write:both KG route has no remote configured".to_owned(),
+                    ))
+                })?;
+            let idempotency_entity = format!("{ordering_key}:{}", now.unix_timestamp_nanos());
+            Some(
+                self.stage_replication(
+                    replication_idempotency_key(
+                        requested_operation_id.as_deref(),
+                        "kg-add",
+                        &idempotency_entity,
+                        &remote,
+                    ),
+                    "kg_fact_added",
+                    ordering_key.clone(),
+                    remote,
+                    ordering_key.clone(),
+                    ReplicationMutation::KgAdd {
+                        request: KgAddFactRequest {
+                            subject: subject.clone(),
+                            predicate: predicate.clone(),
+                            object: object.clone(),
+                            valid_from: valid_from_text.clone(),
+                            operation_id: None,
+                        },
+                    },
+                )
+                .map_tool()?,
             )
-            .map_tool_internal()?;
+        } else {
+            None
+        };
+        let commit_started = std::time::Instant::now();
+        let triple_id = match runtime.add_fact(
+            AddFactRequest {
+                subject: subject.clone(),
+                subject_type: infer_entity_kind(&subject),
+                predicate: predicate.clone(),
+                object_type: infer_entity_kind(&object),
+                object: object.clone(),
+                valid_from,
+                valid_to: None,
+                confidence: 1.0,
+                source_drawer_id,
+                source_file: source_closet,
+            },
+            now,
+        ) {
+            Ok(triple_id) => triple_id,
+            Err(error) => {
+                if let Some(operation) = &staged {
+                    self.cancel_staged_replication(operation);
+                }
+                return Err(ToolError::Internal(error.into()));
+            }
+        };
+        self.metrics.record("commit", commit_started.elapsed());
 
         let sub = subject.clone();
         let pred = predicate.clone();
@@ -2976,23 +3434,16 @@ where
             }
         }
 
-        // ── Both-mode: best-effort remote replication after local KG add ──
-        if is_both {
-            if let Some(router) = &self.federation {
-                if let Some(route) = &route {
-                    let replication = router
-                        .kg_add_replicate(&sub, &pred, &obj, valid_from_text.as_deref(), route)
-                        .await;
-                    if let Some(p) = payload.as_object_mut() {
-                        p.insert("replication".to_owned(), json!(replication));
-                        if matches!(replication, ReplicationStatus::Failed { .. }) {
-                            p.insert(
-                                "warnings".to_owned(),
-                                json!(["local write succeeded but remote replication failed"]),
-                            );
-                        }
-                    }
-                }
+        if let Some(staged) = staged {
+            let operation = self.activate_replication(&staged).map_tool()?;
+            if let Some(obj) = payload.as_object_mut() {
+                obj.insert(
+                    "replication".to_owned(),
+                    json!(ReplicationStatus::Queued {
+                        remote: operation.destination_remote.clone(),
+                        operation_id: operation.operation_id,
+                    }),
+                );
             }
         }
 
@@ -3010,6 +3461,7 @@ where
         let predicate = required_string(arguments, "predicate")?;
         let object = required_string(arguments, "object")?;
         let ended_text = optional_string(arguments, "ended")?;
+        let requested_operation_id = optional_string(arguments, "operation_id")?;
         let ended = ended_text
             .as_deref()
             .map(parse_date)
@@ -3028,12 +3480,13 @@ where
             if let Some(router) = &self.federation {
                 if let Some(route) = &route {
                     if let Some(remote_resp) = router
-                        .kg_invalidate_remote(
+                        .kg_invalidate_remote_with_operation(
                             &subject,
                             &predicate,
                             &object,
                             ended_text.as_deref(),
                             route,
+                            requested_operation_id.as_deref(),
                         )
                         .await?
                     {
@@ -3044,9 +3497,54 @@ where
         }
 
         let now = OffsetDateTime::now_utc();
+        let ordering_key = kg_ordering_key(&subject, &predicate, &object);
+        let staged = if is_both {
+            let remote =
+                route.as_ref().and_then(|value| value.remote.clone()).ok_or_else(|| {
+                    ToolError::Internal(McpError::Federation(
+                        "write:both KG route has no remote configured".to_owned(),
+                    ))
+                })?;
+            let idempotency_entity = format!("{ordering_key}:{}", now.unix_timestamp_nanos());
+            Some(
+                self.stage_replication(
+                    replication_idempotency_key(
+                        requested_operation_id.as_deref(),
+                        "kg-invalidate",
+                        &idempotency_entity,
+                        &remote,
+                    ),
+                    "kg_fact_invalidated",
+                    ordering_key.clone(),
+                    remote,
+                    ordering_key,
+                    ReplicationMutation::KgInvalidate {
+                        request: KgInvalidateRequest {
+                            subject: subject.clone(),
+                            predicate: predicate.clone(),
+                            object: object.clone(),
+                            ended: ended_text.clone(),
+                            operation_id: None,
+                        },
+                    },
+                )
+                .map_tool()?,
+            )
+        } else {
+            None
+        };
         let runtime = KnowledgeGraphRuntime::new(self.storage.operational_store());
-        let invalidated =
-            runtime.invalidate(&subject, &predicate, &object, ended, now).map_tool_internal()?;
+        let commit_started = std::time::Instant::now();
+        let invalidated = match runtime.invalidate(&subject, &predicate, &object, ended, now) {
+            Ok(invalidated) => invalidated,
+            Err(error) => {
+                if let Some(operation) = &staged {
+                    self.cancel_staged_replication(operation);
+                }
+                return Err(ToolError::Internal(error.into()));
+            }
+        };
+        self.metrics.record("commit", commit_started.elapsed());
 
         let sub = subject.clone();
         let pred = predicate.clone();
@@ -3078,23 +3576,16 @@ where
             }
         }
 
-        // ── Both-mode: best-effort remote replication after local KG invalidation ──
-        if is_both {
-            if let Some(router) = &self.federation {
-                if let Some(route) = &route {
-                    let replication = router
-                        .kg_invalidate_replicate(&sub, &pred, &obj, ended_text.as_deref(), route)
-                        .await;
-                    if let Some(p) = payload.as_object_mut() {
-                        p.insert("replication".to_owned(), json!(replication));
-                        if matches!(replication, ReplicationStatus::Failed { .. }) {
-                            p.insert(
-                                "warnings".to_owned(),
-                                json!(["local write succeeded but remote replication failed"]),
-                            );
-                        }
-                    }
-                }
+        if let Some(staged) = staged {
+            let operation = self.activate_replication(&staged).map_tool()?;
+            if let Some(obj) = payload.as_object_mut() {
+                obj.insert(
+                    "replication".to_owned(),
+                    json!(ReplicationStatus::Queued {
+                        remote: operation.destination_remote.clone(),
+                        operation_id: operation.operation_id,
+                    }),
+                );
             }
         }
 
@@ -3203,8 +3694,10 @@ where
         content: String,
         filed_at: OffsetDateTime,
     ) -> ToolResult<DrawerRecord> {
+        let embed_started = std::time::Instant::now();
         let request = EmbeddingRequest::new(vec![content.clone()]).map_tool_internal()?;
         let response = self.search.provider_mut().embed(&request).map_tool_internal()?;
+        self.metrics.record("embedding", embed_started.elapsed());
         let embedding = response.vectors().first().cloned().ok_or_else(|| {
             ToolError::Internal(McpError::Embeddings(EmbeddingError::ProviderContract(
                 "provider returned no vector for single-drawer ingest".to_owned(),
@@ -3441,11 +3934,8 @@ where
             }
             Err(err) if is_local_record_missing(&err) => {
                 if let Some(router) = &self.federation {
-                    let req = TaskLeaseRequest {
-                        expected_revision,
-                        lease_seconds,
-                        worker: Some(worker),
-                    };
+                    let req =
+                        TaskLeaseRequest { expected_revision, lease_seconds, worker: Some(worker) };
                     if let Some(value) =
                         router.coordination_task_claim_fallback(&task_id, req).await?
                     {
@@ -3476,11 +3966,8 @@ where
             }
             Err(err) if is_local_record_missing(&err) => {
                 if let Some(router) = &self.federation {
-                    let req = TaskLeaseRequest {
-                        expected_revision,
-                        lease_seconds,
-                        worker: Some(worker),
-                    };
+                    let req =
+                        TaskLeaseRequest { expected_revision, lease_seconds, worker: Some(worker) };
                     if let Some(value) =
                         router.coordination_task_renew_fallback(&task_id, req).await?
                     {
@@ -3614,7 +4101,13 @@ where
         if let Some(router) = self.federation.as_ref().filter(|r| r.has_remotes()) {
             let cursors = parse_cursors_arg(arguments, "remote_cursors")?;
             let remote_messages = router
-                .coordination_inbox_fanout(recipient, wing, Some(limit), unacknowledged_only, &cursors)
+                .coordination_inbox_fanout(
+                    recipient,
+                    wing,
+                    Some(limit),
+                    unacknowledged_only,
+                    &cursors,
+                )
                 .await;
             payload["remote_messages"] = json!(remote_messages);
         }
@@ -3660,8 +4153,9 @@ where
             Ok(result) => Ok(json!(result)),
             Err(err) if is_local_record_missing(&err) => {
                 if let Some(router) = &self.federation {
-                    let req: WireNewTaskResultRequest = serde_json::from_value(arguments.clone())
-                        .map_err(|e| ToolError::InvalidParams(e.to_string()))?;
+                    let req: WireNewTaskResultRequest =
+                        serde_json::from_value(arguments.clone())
+                            .map_err(|e| ToolError::InvalidParams(e.to_string()))?;
                     if let Some(value) = router.coordination_result_put_fallback(req).await? {
                         return Ok(value);
                     }
@@ -4165,9 +4659,7 @@ fn required_string_array(
         };
         let value = value.trim();
         if value.is_empty() {
-            return Err(ToolError::InvalidParams(format!(
-                "items in `{field}` cannot be blank"
-            )));
+            return Err(ToolError::InvalidParams(format!("items in `{field}` cannot be blank")));
         }
         parsed.push(value.to_owned());
     }
@@ -4206,7 +4698,7 @@ fn validate_record_id_value(value: &str) -> std::result::Result<String, String> 
         .all(|character| character.is_ascii_alphanumeric() || "-_.:/".contains(character))
     {
         return Err(
-            "may contain only ASCII letters, digits, '-', '_', '.', ':', and '/'".to_owned(),
+            "may contain only ASCII letters, digits, '-', '_', '.', ':', and '/'".to_owned()
         );
     }
     Ok(value.to_owned())
@@ -4310,10 +4802,8 @@ fn observation_applies_to_runtime(
         return true;
     }
     let model_matches = observation.model.as_deref().is_none_or(|expected| model == Some(expected));
-    let harness_matches = observation
-        .harness
-        .as_deref()
-        .is_none_or(|expected| harness == Some(expected));
+    let harness_matches =
+        observation.harness.as_deref().is_none_or(|expected| harness == Some(expected));
     model_matches && harness_matches
 }
 
@@ -4355,7 +4845,10 @@ fn is_local_record_missing(err: &mempalace_storage::StorageError) -> bool {
 /// Parses an optional `{remote_name: cursor}` object argument into a per-remote cursor map, the
 /// same shape `mempalace_get_changes_since`'s inline `cursors` parsing already uses — factored
 /// out here so `tool_coordination_events`/`tool_inbox_read` do not duplicate it a second time.
-fn parse_cursors_arg(arguments: &Value, field: &'static str) -> ToolResult<BTreeMap<String, String>> {
+fn parse_cursors_arg(
+    arguments: &Value,
+    field: &'static str,
+) -> ToolResult<BTreeMap<String, String>> {
     match arguments.get(field) {
         None | Some(Value::Null) => Ok(BTreeMap::new()),
         Some(Value::Object(map)) => {
@@ -4525,6 +5018,56 @@ fn generated_drawer_id(
     let suffix = hasher.finalize().to_hex().chars().take(16).collect::<String>();
     DrawerId::new(format!("{prefix}_{wing}_{room}_{suffix}"))
         .map_err(|error| ToolError::InvalidParams(error.to_string()))
+}
+
+fn replication_idempotency_key(
+    requested: Option<&str>,
+    kind: &str,
+    entity_id: &str,
+    remote: &str,
+) -> String {
+    requested.map(ToOwned::to_owned).unwrap_or_else(|| {
+        let digest = blake3::hash(format!("{kind}\0{entity_id}\0{remote}").as_bytes());
+        format!("{kind}:{}", digest.to_hex())
+    })
+}
+
+/// Render a recovered outbox operation's state as the delete tool's response shape, so a
+/// keyed retry after the local delete returns the original queued/terminal replication state
+/// consistently instead of re-executing or falling back.
+fn delete_replication_replay_payload(operation: &OutboxOperation, drawer_id: &str) -> Value {
+    let replication = match operation.state {
+        OutboxState::Replicated => {
+            json!(ReplicationStatus::Replicated { remote: operation.destination_remote.clone() })
+        }
+        OutboxState::Failed => json!(ReplicationStatus::Failed {
+            remote: operation.destination_remote.clone(),
+            reason: operation
+                .last_error
+                .clone()
+                .unwrap_or_else(|| "replication failed terminally".to_owned()),
+        }),
+        _ => json!(ReplicationStatus::Queued {
+            remote: operation.destination_remote.clone(),
+            operation_id: operation.operation_id.clone(),
+        }),
+    };
+    json!({
+        "success": true,
+        "drawer_id": drawer_id,
+        "applied_to": "local",
+        "replication": replication,
+    })
+}
+
+fn kg_ordering_key(subject: &str, predicate: &str, object: &str) -> String {
+    let canonical = format!(
+        "{}\0{}\0{}",
+        subject.trim().to_lowercase(),
+        predicate.trim().to_lowercase(),
+        object.trim().to_lowercase()
+    );
+    format!("kg:{}", blake3::hash(canonical.as_bytes()).to_hex())
 }
 
 fn generated_record_id(
@@ -4965,10 +5508,7 @@ mod tests {
     #[test]
     fn identity_tools_do_not_expose_model_selectable_lineage_ids() {
         for tool_name in ["mempalace_wake_up", "mempalace_identity_packet"] {
-            let tool = tool_definitions()
-                .into_iter()
-                .find(|tool| tool.name == tool_name)
-                .unwrap();
+            let tool = tool_definitions().into_iter().find(|tool| tool.name == tool_name).unwrap();
             assert!(
                 tool.input_schema["properties"].get("lineage_id").is_none(),
                 "{tool_name} must not let the model select its lineage"
@@ -5108,11 +5648,7 @@ mod tests {
             .to_owned();
         let exact_result_response = harness
             .server
-            .handle_request(tool_call(
-                908,
-                "mempalace_result_get",
-                json!({"result_id":result_id}),
-            ))
+            .handle_request(tool_call(908, "mempalace_result_get", json!({"result_id":result_id})))
             .await;
         assert_eq!(
             decode_tool_payload(&exact_result_response).expect("exact result")["found"],
@@ -5286,8 +5822,9 @@ mod tests {
                 }),
             ))
             .await;
-        decode_tool_payload(&created)
-            .unwrap_or_else(|| panic!("expected a successful local task for wing \"secret\", got: {created}"));
+        decode_tool_payload(&created).unwrap_or_else(|| {
+            panic!("expected a successful local task for wing \"secret\", got: {created}")
+        });
         let observed = calls.load(std::sync::atomic::Ordering::SeqCst);
         assert_eq!(
             observed, 0,
@@ -5717,7 +6254,8 @@ mod tests {
     #[test]
     fn is_local_record_missing_matches_real_missing_task_and_message_errors() {
         let tempdir = TempDir::new().unwrap();
-        let store = mempalace_storage::CoordinationStore::new(tempdir.path().join("storage.sqlite3"));
+        let store =
+            mempalace_storage::CoordinationStore::new(tempdir.path().join("storage.sqlite3"));
         store.ensure_schema().unwrap();
 
         let err = store
@@ -5771,8 +6309,10 @@ mod tests {
                 }),
             ))
             .await;
-        let alpha_id =
-            decode_tool_payload(&alpha).expect("alpha task")["task_id"].as_str().unwrap().to_owned();
+        let alpha_id = decode_tool_payload(&alpha).expect("alpha task")["task_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
 
         let beta = harness
             .server
@@ -5999,11 +6539,7 @@ mod tests {
 
         let list = harness
             .server
-            .handle_request(tool_call(
-                931,
-                "mempalace_skill_list",
-                json!({"wing":"myproject"}),
-            ))
+            .handle_request(tool_call(931, "mempalace_skill_list", json!({"wing":"myproject"})))
             .await;
         let list = decode_tool_payload(&list).expect("list payload");
         let ids = list
@@ -6508,10 +7044,7 @@ mod tests {
         assert_eq!(payload["identity_packet"]["constitution"]["identity_ref"], "$.identity");
         assert!(payload["identity_packet"]["constitution"].get("identity").is_none());
         assert!(
-            payload["identity_packet"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("No default lineage")
+            payload["identity_packet"]["message"].as_str().unwrap().contains("No default lineage")
         );
         assert_eq!(payload["status"]["total_drawers"], 5);
         assert_eq!(payload["status"]["protocol"], PALACE_PROTOCOL);
@@ -6779,10 +7312,7 @@ mod tests {
         assert!(message.contains("expected_revision 0"));
 
         let wake = decode_tool_payload(
-            &harness
-                .server
-                .handle_request(tool_call(6076, "mempalace_wake_up", json!({})))
-                .await,
+            &harness.server.handle_request(tool_call(6076, "mempalace_wake_up", json!({}))).await,
         )
         .unwrap();
         assert_eq!(
@@ -6882,15 +7412,14 @@ mod tests {
                 scope: SelfObservationScope::Lineage,
                 statement: "A newer lineage-scoped observation must not hide shared context."
                     .to_owned(),
-                behavioral_consequence: "Filter applicability before applying the limit.".to_owned(),
+                behavioral_consequence: "Filter applicability before applying the limit."
+                    .to_owned(),
                 evidence: vec!["test:newer-lineage-observation".to_owned()],
                 created_at: now + Duration::minutes(4),
                 updated_at: now + Duration::minutes(4),
                 ..shared
             };
-            store
-                .propose_self_observation(&newer_lineage_observation)
-                .unwrap();
+            store.propose_self_observation(&newer_lineage_observation).unwrap();
             store
                 .review_self_observation(
                     &newer_lineage_observation.observation_id,
@@ -7128,11 +7657,7 @@ mod tests {
         let changes = decode_tool_payload(
             &harness
                 .server
-                .handle_request(tool_call(
-                    617,
-                    "mempalace_get_changes_since",
-                    json!({"limit":100}),
-                ))
+                .handle_request(tool_call(617, "mempalace_get_changes_since", json!({"limit":100})))
                 .await,
         )
         .unwrap();
@@ -8694,10 +9219,7 @@ mod tests {
         assert_eq!(ToolName::DelegationSpanGet.routing(), ToolRoutingCategory::LocalOnly);
         assert_eq!(ToolName::DelegationSpanClose.routing(), ToolRoutingCategory::LocalOnly);
         assert_eq!(ToolName::DelegationSpansForTask.routing(), ToolRoutingCategory::LocalOnly);
-        assert_eq!(
-            ToolName::DelegationCheckpointAppend.routing(),
-            ToolRoutingCategory::LocalOnly
-        );
+        assert_eq!(ToolName::DelegationCheckpointAppend.routing(), ToolRoutingCategory::LocalOnly);
         assert_eq!(ToolName::DelegationCheckpointGet.routing(), ToolRoutingCategory::LocalOnly);
         assert_eq!(ToolName::DelegationTrace.routing(), ToolRoutingCategory::LocalOnly);
     }
@@ -8973,6 +9495,10 @@ mod tests {
         /// drive the aggregate fan-outs' `CapabilityMissing` vs. genuinely-unreachable
         /// distinction (finding 1b) without hand-building a non-`Clone` `RemoteError`.
         coordination_fanout_outcome: LibMockFanoutOutcome,
+        /// When set, `add_drawer`/`kg_add_fact`/`kg_invalidate` return
+        /// [`RemoteError::UnknownOutcome`] so the MCP tool surface's structured unknown-outcome
+        /// result can be asserted end to end.
+        mutation_unknown_outcome: bool,
     }
 
     /// Canned outcomes for `LibMockRemote::coordination_events`/`coordination_inbox`.
@@ -8999,6 +9525,23 @@ mod tests {
                 fail: false,
                 coordination_calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 coordination_fanout_outcome: LibMockFanoutOutcome::default(),
+                mutation_unknown_outcome: false,
+            }
+        }
+    }
+
+    impl LibMockRemote {
+        fn mutation_result<T>(&self) -> mempalace_remote::Result<T> {
+            if self.mutation_unknown_outcome {
+                Err(mempalace_remote::RemoteError::UnknownOutcome {
+                    remote: "mock".to_owned(),
+                    message: "committed but response lost".to_owned(),
+                })
+            } else {
+                Err(mempalace_remote::RemoteError::Unreachable {
+                    remote: "mock".to_owned(),
+                    message: "not used".to_owned(),
+                })
             }
         }
     }
@@ -9030,10 +9573,7 @@ mod tests {
             &self,
             _req: mempalace_federation::AddDrawerRequest,
         ) -> mempalace_remote::Result<mempalace_federation::AddDrawerResponse> {
-            Err(mempalace_remote::RemoteError::Unreachable {
-                remote: "mock".to_owned(),
-                message: "not used".to_owned(),
-            })
+            self.mutation_result()
         }
         async fn list_drawers(
             &self,
@@ -9057,13 +9597,13 @@ mod tests {
             &self,
             _req: mempalace_federation::KgAddFactRequest,
         ) -> mempalace_remote::Result<Value> {
-            Ok(json!({"success":true}))
+            self.mutation_result()
         }
         async fn kg_invalidate(
             &self,
             _req: mempalace_federation::KgInvalidateRequest,
         ) -> mempalace_remote::Result<Value> {
-            Ok(json!({"success":true}))
+            self.mutation_result()
         }
         async fn kg_timeline(&self, _entity: Option<&str>) -> mempalace_remote::Result<Value> {
             Ok(json!({"entity":"all","timeline":[],"count":0}))
@@ -9130,19 +9670,22 @@ mod tests {
             self.coordination_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let _ = query;
             match self.coordination_fanout_outcome {
-                LibMockFanoutOutcome::Success => {
-                    Ok(mempalace_federation::InboxPageResponse { messages: vec![], next_cursor: None })
-                }
+                LibMockFanoutOutcome::Success => Ok(mempalace_federation::InboxPageResponse {
+                    messages: vec![],
+                    next_cursor: None,
+                }),
                 LibMockFanoutOutcome::CapabilityMissing => {
                     Err(mempalace_remote::RemoteError::CapabilityMissing {
                         remote: "mock".to_owned(),
                         capability: "coordination".to_owned(),
                     })
                 }
-                LibMockFanoutOutcome::Unreachable => Err(mempalace_remote::RemoteError::Unreachable {
-                    remote: "mock".to_owned(),
-                    message: "mock remote is down".to_owned(),
-                }),
+                LibMockFanoutOutcome::Unreachable => {
+                    Err(mempalace_remote::RemoteError::Unreachable {
+                        remote: "mock".to_owned(),
+                        message: "mock remote is down".to_owned(),
+                    })
+                }
             }
         }
         /// See [`Self::coordination_inbox`] — same recording purpose, for
@@ -9154,20 +9697,24 @@ mod tests {
             self.coordination_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let _ = query;
             match self.coordination_fanout_outcome {
-                LibMockFanoutOutcome::Success => Ok(mempalace_federation::CoordinationEventsResponse {
-                    events: vec![],
-                    next_cursor: None,
-                }),
+                LibMockFanoutOutcome::Success => {
+                    Ok(mempalace_federation::CoordinationEventsResponse {
+                        events: vec![],
+                        next_cursor: None,
+                    })
+                }
                 LibMockFanoutOutcome::CapabilityMissing => {
                     Err(mempalace_remote::RemoteError::CapabilityMissing {
                         remote: "mock".to_owned(),
                         capability: "coordination".to_owned(),
                     })
                 }
-                LibMockFanoutOutcome::Unreachable => Err(mempalace_remote::RemoteError::Unreachable {
-                    remote: "mock".to_owned(),
-                    message: "mock remote is down".to_owned(),
-                }),
+                LibMockFanoutOutcome::Unreachable => {
+                    Err(mempalace_remote::RemoteError::Unreachable {
+                        remote: "mock".to_owned(),
+                        message: "mock remote is down".to_owned(),
+                    })
+                }
             }
         }
     }
@@ -9554,6 +10101,9 @@ mod tests {
     struct DeleteDrawerMock {
         delete_succeeds: bool,
         delete_call_count: AtomicU64,
+        /// When set, `delete_drawer` returns [`RemoteError::UnknownOutcome`] — the
+        /// committed-but-lost-response case the MCP surface must surface honestly.
+        delete_unknown_outcome: bool,
     }
 
     impl DeleteDrawerMock {
@@ -9599,6 +10149,12 @@ mod tests {
         }
         async fn delete_drawer(&self, _drawer_id: &str) -> mempalace_remote::Result<()> {
             self.delete_call_count.fetch_add(1, Ordering::SeqCst);
+            if self.delete_unknown_outcome {
+                return Err(mempalace_remote::RemoteError::UnknownOutcome {
+                    remote: "mock".to_owned(),
+                    message: "committed but response lost".to_owned(),
+                });
+            }
             if self.delete_succeeds {
                 Ok(())
             } else {
@@ -9725,17 +10281,19 @@ mod tests {
     #[tokio::test]
     async fn tool_delete_drawer_with_write_remote_local_hit() {
         // Given a Combined/write:Remote wing route, and a drawer that exists
-        // locally, DeleteDrawer must delete locally — not forward to the remote.
+        // locally, DeleteDrawer follows write routing: the delete targets the
+        // remote, not the local store, and is not synchronously replicated.
         let mock = Arc::new(DeleteDrawerMock {
             delete_succeeds: true,
             delete_call_count: AtomicU64::new(0),
+            delete_unknown_outcome: false,
         });
         let mock_for_assert = mock.clone();
         let remotes =
             BTreeMap::from([("alpha".to_owned(), mock as Arc<dyn mempalace_remote::RemoteApi>)]);
         let mut ctx = make_delete_drawer_ctx(remotes, WriteTarget::Remote).await;
 
-        // Seed a drawer into the local store so it will be found locally.
+        // Seed a drawer into the local store so it can be resolved to a route.
         let local_id = DrawerId::new("local-test-drawer-001").unwrap();
         let now = OffsetDateTime::now_utc();
         ctx.runtime
@@ -9773,25 +10331,206 @@ mod tests {
 
         assert_eq!(result["success"], true);
         assert_eq!(result["drawer_id"], local_id.as_str());
-        assert_eq!(result["applied_to"], "local");
+        assert_eq!(result["applied_to"], "remote:alpha");
+        assert_eq!(result["origin"], "alpha");
         assert!(
             !result.as_object().unwrap().contains_key("replication"),
-            "DeleteDrawer must never produce a replication field; got: {result}"
+            "routed remote delete must not report queued replication; got: {result}"
         );
         assert_eq!(
             mock_for_assert.delete_call_count(),
-            0,
-            "write:Remote local hit must not call the remote"
+            1,
+            "write:Remote local hit must forward the delete to the remote"
+        );
+        // The local row must be left untouched under write:Remote routing.
+        let still_local = ctx.runtime.storage.drawer_store().get_drawer(&local_id).await.unwrap();
+        assert!(still_local.is_some(), "write:Remote must not delete the local row");
+    }
+
+    #[tokio::test]
+    async fn tool_delete_drawer_with_write_remote_unknown_outcome_returns_structured_result() {
+        // An operation-aware remote delete whose outcome cannot be confirmed must surface a
+        // structured unknown_outcome result (remote, operation_id, safe-retry guidance) through
+        // the MCP tool — never a generic internal JSON-RPC error and never an authoritative
+        // "not found".
+        let mock = Arc::new(DeleteDrawerMock {
+            delete_succeeds: true,
+            delete_call_count: AtomicU64::new(0),
+            delete_unknown_outcome: true,
+        });
+        let remotes =
+            BTreeMap::from([("alpha".to_owned(), mock as Arc<dyn mempalace_remote::RemoteApi>)]);
+        let mut ctx = make_delete_drawer_ctx(remotes, WriteTarget::Remote).await;
+
+        let local_id = DrawerId::new("local-unknown-outcome-drawer").unwrap();
+        let now = OffsetDateTime::now_utc();
+        ctx.runtime
+            .storage
+            .drawer_store()
+            .put_drawers(
+                &[DrawerRecord {
+                    id: local_id.clone(),
+                    wing: WingId::new("wing_code").unwrap(),
+                    room: RoomId::new("test-room").unwrap(),
+                    hall: None,
+                    date: Some(now.date()),
+                    source_file: "test.txt".to_owned(),
+                    chunk_index: 0,
+                    ingest_mode: "test".to_owned(),
+                    extract_mode: None,
+                    added_by: "test".to_owned(),
+                    filed_at: now,
+                    importance: None,
+                    emotional_weight: None,
+                    weight: None,
+                    content: "test content".to_owned(),
+                    content_hash: mempalace_core::hash_text("test content"),
+                    embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
+                    locator: None,
+                    view_metadata: None,
+                }],
+                DuplicateStrategy::Error,
+            )
+            .await
+            .unwrap();
+
+        let result = ctx
+            .runtime
+            .tool_delete_drawer(&json!({
+                "drawer_id": local_id.as_str(),
+                "operation_id": "op-del-mcp-unknown",
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result["outcome"], "unknown_outcome");
+        assert_eq!(result["success"], false);
+        assert_eq!(result["remote"], "mock");
+        assert_eq!(result["operation_id"], "op-del-mcp-unknown");
+        assert!(
+            result["retry"].as_str().unwrap().contains("same operation_id"),
+            "structured result must carry safe-retry guidance: {result}"
+        );
+        // The local row stays untouched: the delete was routed remote and its outcome is
+        // unconfirmed.
+        let still_local = ctx.runtime.storage.drawer_store().get_drawer(&local_id).await.unwrap();
+        assert!(still_local.is_some(), "unknown outcome must not delete the local row");
+    }
+
+    /// A `Combined/write:Remote` wing rule router wired to a mock whose mutation endpoints return
+    /// [`RemoteError::UnknownOutcome`], built through the full `McpServer` handle path.
+    async fn unknown_outcome_mutation_harness() -> TestHarness {
+        let mut remote = LibMockRemote::default();
+        remote.mutation_unknown_outcome = true;
+        let mut remotes: BTreeMap<String, Arc<dyn mempalace_remote::RemoteApi>> = BTreeMap::new();
+        remotes.insert("hub".to_owned(), Arc::new(remote));
+        let mut router = make_lib_router(remotes);
+        router.rules.wings.insert(
+            "wing_code".to_owned(),
+            ResolvedRouteRule {
+                mode: RouteMode::Combined,
+                remote: Some("hub".to_owned()),
+                write: WriteTarget::Remote,
+            },
+        );
+        test_harness_with_mock_router(router).await
+    }
+
+    #[tokio::test]
+    async fn tool_add_drawer_write_remote_unknown_outcome_returns_structured_result() {
+        let harness = unknown_outcome_mutation_harness().await;
+        let response = harness
+            .server
+            .handle_request(tool_call(
+                1,
+                "mempalace_add_drawer",
+                json!({
+                    "wing": "wing_code",
+                    "room": "general",
+                    "content": "unknown outcome mcp add test content",
+                    "added_by": "mcp-test",
+                    "operation_id": "op-add-mcp-unknown",
+                }),
+            ))
+            .await;
+        let result = decode_tool_payload(&response).expect("structured result expected");
+
+        assert_eq!(result["outcome"], "unknown_outcome");
+        assert_eq!(result["success"], false);
+        assert_eq!(result["remote"], "mock");
+        assert_eq!(result["operation_id"], "op-add-mcp-unknown");
+        assert!(
+            result["retry"].as_str().unwrap().contains("same operation_id"),
+            "structured result must carry safe-retry guidance: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_kg_add_unknown_outcome_returns_structured_result() {
+        let harness = unknown_outcome_mutation_harness().await;
+        let response = harness
+            .server
+            .handle_request(tool_call(
+                1,
+                "mempalace_kg_add",
+                json!({
+                    "subject": "Alice",
+                    "predicate": "loves",
+                    "object": "Bob",
+                    "operation_id": "op-kgadd-mcp-unknown",
+                }),
+            ))
+            .await;
+        let result = decode_tool_payload(&response).expect("structured result expected");
+
+        assert_eq!(result["outcome"], "unknown_outcome");
+        assert_eq!(result["success"], false);
+        assert_eq!(result["remote"], "mock");
+        assert_eq!(result["operation_id"], "op-kgadd-mcp-unknown");
+        assert!(
+            result["retry"].as_str().unwrap().contains("same operation_id"),
+            "structured result must carry safe-retry guidance: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_kg_invalidate_unknown_outcome_returns_structured_result() {
+        let harness = unknown_outcome_mutation_harness().await;
+        let response = harness
+            .server
+            .handle_request(tool_call(
+                1,
+                "mempalace_kg_invalidate",
+                json!({
+                    "subject": "Alice",
+                    "predicate": "loves",
+                    "object": "Bob",
+                    "operation_id": "op-kginv-mcp-unknown",
+                }),
+            ))
+            .await;
+        let result = decode_tool_payload(&response).expect("structured result expected");
+
+        assert_eq!(result["outcome"], "unknown_outcome");
+        assert_eq!(result["success"], false);
+        assert_eq!(result["remote"], "mock");
+        assert_eq!(result["operation_id"], "op-kginv-mcp-unknown");
+        assert!(
+            result["retry"].as_str().unwrap().contains("same operation_id"),
+            "structured result must carry safe-retry guidance: {result}"
         );
     }
 
     #[tokio::test]
     async fn tool_delete_drawer_with_write_both_local_hit() {
         // Given a Combined/write:Both wing route, and a drawer that exists
-        // locally, DeleteDrawer must delete locally — no replication attempt.
+        // locally, DeleteDrawer commits the local deletion and queues durable
+        // replication with a stable operation id — it must not call the remote
+        // inline.
         let mock = Arc::new(DeleteDrawerMock {
             delete_succeeds: true,
             delete_call_count: AtomicU64::new(0),
+            delete_unknown_outcome: false,
         });
         let mock_for_assert = mock.clone();
         let remotes =
@@ -9836,14 +10575,21 @@ mod tests {
         assert_eq!(result["success"], true);
         assert_eq!(result["drawer_id"], local_id.as_str());
         assert_eq!(result["applied_to"], "local");
+        assert_eq!(
+            result["replication"]["status"], "queued",
+            "write:Both local hit must queue durable replication; got: {result}"
+        );
+        assert_eq!(result["replication"]["remote"], "alpha");
         assert!(
-            !result.as_object().unwrap().contains_key("replication"),
-            "DeleteDrawer must never produce a replication field; got: {result}"
+            result["replication"]["operation_id"]
+                .as_str()
+                .map_or(false, |id| id.starts_with("outbox_")),
+            "queued replication must expose a stable operation id; got: {result}"
         );
         assert_eq!(
             mock_for_assert.delete_call_count(),
             0,
-            "write:Both local hit must not call the remote"
+            "write:Both local hit must not call the remote inline"
         );
     }
 
@@ -9855,6 +10601,7 @@ mod tests {
         let mock = Arc::new(DeleteDrawerMock {
             delete_succeeds: true,
             delete_call_count: AtomicU64::new(0),
+            delete_unknown_outcome: false,
         });
         let mock_for_assert = mock.clone();
         let remotes =
@@ -9934,6 +10681,7 @@ mod tests {
         let mock = Arc::new(DeleteDrawerMock {
             delete_succeeds: true,
             delete_call_count: AtomicU64::new(0),
+            delete_unknown_outcome: false,
         });
         let remotes =
             BTreeMap::from([("alpha".to_owned(), mock as Arc<dyn mempalace_remote::RemoteApi>)]);
@@ -10019,8 +10767,11 @@ mod tests {
             .await
             .unwrap();
 
-        let result =
-            ctx.runtime.tool_delete_drawer(&json!({"drawer_id": drawer_id.as_str()})).await.unwrap();
+        let result = ctx
+            .runtime
+            .tool_delete_drawer(&json!({"drawer_id": drawer_id.as_str()}))
+            .await
+            .unwrap();
         assert_eq!(result["success"], true);
 
         let changes = ctx.runtime.tool_get_changes_since(&json!({})).await.unwrap();

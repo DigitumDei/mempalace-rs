@@ -171,8 +171,14 @@ async fn mcp_server_with_hub_coordination(
     coordination_rules: BTreeMap<String, ResolvedRouteRule>,
     default_mode: RouteMode,
 ) -> McpServer<DeterministicStubProvider> {
-    mcp_server_with_hub_multi(local_dir, &[("hub", hub_url)], wing_rules, coordination_rules, default_mode)
-        .await
+    mcp_server_with_hub_multi(
+        local_dir,
+        &[("hub", hub_url)],
+        wing_rules,
+        coordination_rules,
+        default_mode,
+    )
+    .await
 }
 
 /// Build an `McpServer` with a federation config registering one or more named remotes, plus
@@ -252,6 +258,156 @@ async fn call_tool(
     let response = server.handle_request(tool_call(id, tool, arguments)).await;
     decode_tool_payload(&response)
         .unwrap_or_else(|| panic!("no payload in response for tool {tool}: {response}"))
+}
+
+/// Poll an asynchronous condition with a deadline, sleeping between attempts.
+///
+/// issue #127 replication is durable and background-threaded: a `write: both` tool call returns
+/// `status: "queued"` with a stable `operation_id` immediately, and the in-process worker
+/// delivers asynchronously. Tests must therefore wait on the *observable outcome* rather than
+/// assert on the immediate response. For delivery-success this is the remote's own state (polled
+/// via the hub client); for terminal outcomes it is `mempalace_status` →
+/// `replication.recent_terminal_failures`; for retryable outages it is the outbox backlog.
+async fn poll_until<Fut, F>(what: &str, timeout: Duration, mut check: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if check().await {
+            return;
+        }
+        assert!(std::time::Instant::now() < deadline, "timed out waiting for {what}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+fn hub_client(hub_url: &str) -> std::sync::Arc<dyn RemoteApi> {
+    std::sync::Arc::new(
+        RemoteClient::new(RemoteEndpoint {
+            name: "hub".to_owned(),
+            base_url: hub_url.to_owned(),
+            token: Some(TEST_TOKEN.to_owned()),
+            timeout: Duration::from_secs(5),
+        })
+        .unwrap(),
+    )
+}
+
+/// Poll the hub directly until it holds a drawer whose content text equals `content`
+/// in the given wing/room — proof the background worker delivered the queued mutation.
+async fn wait_for_hub_drawer(hub_url: &str, content: &str, wing: &str, room: &str) {
+    let client = std::sync::Arc::clone(&hub_client(hub_url));
+    poll_until(
+        &format!("drawer `{content}` to appear on the hub"),
+        Duration::from_secs(20),
+        move || {
+            let client = std::sync::Arc::clone(&client);
+            let content = content.to_owned();
+            let wing = wing.to_owned();
+            let room = room.to_owned();
+            async move {
+                let req = DrawerSearchRequest {
+                    query: content.clone(),
+                    wing: Some(wing.clone()),
+                    room: Some(room),
+                    limit: Some(20),
+                    view: None,
+                };
+                match client.search_drawers(req).await {
+                    Ok(resp) => resp.results.iter().any(|r| r.content == content),
+                    Err(_) => false,
+                }
+            }
+        },
+    )
+    .await;
+}
+
+/// Poll the hub's KG until the fact `predicate → object` for `entity` is (or is no longer,
+/// when `present` is false) returned with the given `as_of`.
+async fn wait_for_hub_kg_fact(
+    hub_url: &str,
+    entity: &str,
+    predicate: &str,
+    object: &str,
+    as_of: Option<&str>,
+    present: bool,
+) {
+    let client = std::sync::Arc::clone(&hub_client(hub_url));
+    poll_until(
+        &format!(
+            "KG fact {entity} {predicate} {object} as_of {as_of:?} to be {} on the hub",
+            if present { "present" } else { "absent" }
+        ),
+        Duration::from_secs(20),
+        move || {
+            let client = std::sync::Arc::clone(&client);
+            let entity = entity.to_owned();
+            let predicate = predicate.to_owned();
+            let object = object.to_owned();
+            let as_of = as_of.map(ToOwned::to_owned);
+            async move {
+                match client
+                    .kg_query(KgQueryRequest {
+                        entity: entity.clone(),
+                        as_of: as_of.clone(),
+                        direction: Some("outgoing".to_owned()),
+                    })
+                    .await
+                {
+                    Ok(payload) => {
+                        let found = payload["facts"].as_array().map_or(false, |facts| {
+                            facts.iter().any(|f| {
+                                f["predicate"].as_str() == Some(predicate.as_str())
+                                    && f["object"].as_str() == Some(object.as_str())
+                            })
+                        });
+                        if present { found } else { !found }
+                    }
+                    Err(_) => false,
+                }
+            }
+        },
+    )
+    .await;
+}
+
+/// Return the newest `mempalace_status` payload.
+async fn status_of(server: &McpServer<DeterministicStubProvider>) -> Value {
+    call_tool(server, 900, "mempalace_status", json!({})).await
+}
+
+/// Whether `replication.recent_terminal_failures` lists an entry for `operation_id`.
+fn status_has_terminal_failure(status: &Value, operation_id: &str) -> bool {
+    status["replication"]["recent_terminal_failures"].as_array().map_or(false, |fails| {
+        fails.iter().any(|f| f["operation_id"].as_str() == Some(operation_id))
+    })
+}
+
+/// Whether the status backlog reports any retryable operation.
+fn status_has_retryable(status: &Value) -> bool {
+    status["replication"]["backlog"]["retryable_count"].as_i64().unwrap_or(0) >= 1
+}
+
+/// Poll `mempalace_status` until `predicate` holds; panics after `timeout`.
+async fn wait_for_status<P>(server: &McpServer<DeterministicStubProvider>, what: &str, predicate: P)
+where
+    P: Fn(&Value) -> bool,
+{
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let status = status_of(server).await;
+        if predicate(&status) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {what}; last status: {status}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 // ─── Helper: combined-mode wing rule routing to "hub" with Remote write ───────
@@ -833,6 +989,19 @@ async fn remote_down_degrades_reads() {
         warnings.is_some() && !warnings.unwrap().is_empty(),
         "search with dead remote must include warnings: {search}"
     );
+    // Must ALSO carry structured degradation records (issue #127) alongside the legacy
+    // string warnings — machine-actionable, not bare prose.
+    let degradations = search.get("degradations").and_then(|d| d.as_array());
+    assert!(
+        degradations.is_some() && !degradations.unwrap().is_empty(),
+        "search with dead remote must include structured degradations: {search}"
+    );
+    let first_degradation = &degradations.unwrap()[0];
+    assert_eq!(first_degradation["code"], "remote_read_degraded");
+    assert_eq!(first_degradation["remote"], "hub");
+    assert_eq!(first_degradation["kind"], "search");
+    assert_eq!(first_degradation["classification"], "unreachable");
+    assert!(!first_degradation["error"].as_str().unwrap().is_empty());
 
     // mempalace_status → federation.remotes[].reachable must be false.
     let status = call_tool(&server, 4, "mempalace_status", json!({})).await;
@@ -866,6 +1035,14 @@ async fn remote_down_degrades_reads() {
         kg_warnings.is_some() && !kg_warnings.unwrap().is_empty(),
         "kg_query with dead remote must include warnings: {kg_query}"
     );
+    // Structured degradations accompany the legacy warnings.
+    let kg_degradations = kg_query.get("degradations").and_then(|d| d.as_array());
+    assert!(
+        kg_degradations.is_some() && !kg_degradations.unwrap().is_empty(),
+        "kg_query with dead remote must include structured degradations: {kg_query}"
+    );
+    assert_eq!(kg_degradations.unwrap()[0]["kind"], "kg_query");
+    assert_eq!(kg_degradations.unwrap()[0]["classification"], "unreachable");
 
     // ── Local delete_drawer must report applied_to=local ─────────────────────
     let local_delete = call_tool(
@@ -1615,10 +1792,12 @@ async fn get_changes_since_includes_local_and_remote_origins() {
 
 // ─── Test 12: add_drawer_both_replicates_successfully ───────────────────────
 
-/// Combined/write:Both wing rule → local write first, then best-effort remote
-/// replication. Response must show `applied_to: "local"`, a `replication` object
-/// with `status: "replicated"` and `remote: "hub"`, and no `origin` field
-/// (primary write was local). The drawer must be reachable on the hub.
+/// Combined/write:Both wing rule → local write first, then **durable queued** remote
+/// replication. The immediate response must show `applied_to: "local"` and a `replication`
+/// object with `status: "queued"` plus a stable `operation_id` — the tool never blocks on the
+/// remote (issue #127: returns before delivery, worker delivers in the background). The test
+/// then awaits the worker's async delivery by polling the hub directly until the drawer
+/// appears, and asserts the operation is not recorded as a terminal failure.
 #[tokio::test]
 async fn add_drawer_both_replicates_successfully() {
     let hub_dir = TempDir::new().unwrap();
@@ -1657,15 +1836,21 @@ async fn add_drawer_both_replicates_successfully() {
         add.get("origin").is_none() || add["origin"].is_null(),
         "both add must not have an origin field; got: {add}"
     );
-    // replication must show success.
+    // Replication is durably queued, not synchronously replicated — issue #127 semantics.
     let replication = add.get("replication").expect("both add must include replication field");
     assert_eq!(
-        replication["status"], "replicated",
-        "replication must report status=replicated; got: {replication}"
+        replication["status"], "queued",
+        "replication must report status=queued (async delivery); got: {replication}"
     );
     assert_eq!(
         replication["remote"], "hub",
         "replication must report remote=hub; got: {replication}"
+    );
+    let operation_id =
+        replication["operation_id"].as_str().expect("queued must carry operation_id").to_owned();
+    assert!(
+        operation_id.starts_with("outbox_"),
+        "queued replication must expose a stable outbox operation id; got: {replication}"
     );
     // No warnings on success.
     assert!(
@@ -1674,39 +1859,33 @@ async fn add_drawer_both_replicates_successfully() {
     );
     let _drawer_id = add["drawer_id"].as_str().unwrap().to_owned();
 
-    // ── Verify the drawer landed on the hub directly ───────────────────────
+    // ── Verify the background worker eventually delivers to the hub ──────────
     // Combined search deduplicates the local and replicated copies and prefers
-    // local, so it cannot prove the remote write occurred.
-    let hub_client = RemoteClient::new(RemoteEndpoint {
-        name: "hub".into(),
-        base_url: hub_url,
-        token: Some(TEST_TOKEN.to_owned()),
-        timeout: Duration::from_secs(5),
+    // local, so it cannot prove the remote write occurred — poll the hub directly.
+    wait_for_hub_drawer(
+        &hub_url,
+        "dual-write e2e test drawer successful replication",
+        "wing_both",
+        "both-room",
+    )
+    .await;
+
+    // The delivered operation must NOT be recorded as a terminal failure.
+    wait_for_status(&server, "operation to be acknowledged (not terminally failed)", |status| {
+        !status_has_terminal_failure(status, &operation_id)
     })
-    .unwrap();
-    let hub_search = hub_client
-        .search_drawers(DrawerSearchRequest {
-            query: "dual-write e2e test drawer successful replication".to_owned(),
-            wing: Some("wing_both".to_owned()),
-            room: Some("both-room".to_owned()),
-            limit: Some(5),
-            view: None,
-        })
-        .await
-        .expect("hub search must succeed");
-    let hub_hit = hub_search
-        .results
-        .iter()
-        .any(|result| result.content == "dual-write e2e test drawer successful replication");
-    assert!(hub_hit, "hub search must include the replicated drawer; results: {hub_search:?}");
+    .await;
 }
 
 // ─── Test 22: add_drawer_both_replication_fails_with_remote_rejection ───────
 
-/// Combined/write:Both wing rule with a reachable remote that rejects the
-/// replication attempt (wrong bearer token → HTTP 401). The local write must
-/// still succeed, `applied_to` must be `"local"`, and `replication.status`
-/// must be `"failed"` with a non-empty `reason` and a `warnings` array.
+/// Combined/write:Both wing rule with a reachable remote that rejects the replication attempt
+/// (wrong bearer token → HTTP 401). The local write must still succeed immediately and return
+/// `applied_to: "local"` with `replication.status: "queued"` — the tool never waits on the
+/// remote. The background worker then delivers, observes the authoritative `Unauthorized`
+/// rejection, and records the operation as a **terminal failure** observable via
+/// `mempalace_status`. Both the queued immediate response and the terminal outbox record are
+/// asserted.
 #[tokio::test]
 async fn add_drawer_both_replication_fails_with_remote_rejection() {
     let hub_dir = TempDir::new().unwrap();
@@ -1781,35 +1960,42 @@ async fn add_drawer_both_replication_fails_with_remote_rejection() {
         "both add with wrong token must report applied_to=local: {add}"
     );
 
-    // Replication must be failed.
+    // Replication is queued (not synchronously failed) — the tool returns before delivery.
     let replication = add.get("replication").expect("both add must include replication field");
     assert_eq!(
-        replication["status"], "failed",
-        "replication must report status=failed with wrong token; got: {replication}"
+        replication["status"], "queued",
+        "replication must report status=queued with wrong token; got: {replication}"
     );
     assert_eq!(
         replication["remote"], "hub",
         "replication must report remote=hub; got: {replication}"
     );
-    let reason = replication["reason"].as_str().unwrap_or("");
+    let operation_id =
+        replication["operation_id"].as_str().expect("queued must carry operation_id").to_owned();
+
+    // No inline warnings — rejection surfaces asynchronously through the outbox.
     assert!(
-        !reason.is_empty(),
-        "replication failure must include a non-empty reason; got: {replication}"
+        add.get("warnings").is_none(),
+        "queued replication must not add inline warnings; got: {add}"
     );
 
-    // Warnings must be present.
-    let warnings = add.get("warnings").and_then(|w| w.as_array());
-    assert!(
-        warnings.is_some() && !warnings.unwrap().is_empty(),
-        "both add with failed replication must include warnings array; got: {add}"
-    );
+    // The authoritative permanent rejection is recorded as a terminal failure.
+    wait_for_status(&server, "operation to be recorded as a terminal failure", |status| {
+        status_has_terminal_failure(status, &operation_id)
+    })
+    .await;
 }
 
 // ─── Test 23: add_drawer_both_duplicate_replication ─────────────────────────
 
-/// The content already exists on the hub (seeded via a Remote route).
-/// A subsequent Both write for the same exact content must succeed locally but
-/// report replication as converged (exact content already on remote).
+/// The content already exists on the hub (seeded via a Remote route), with a **different**
+/// drawer_id than the local write will commit. Issue #127 forbids treating a semantic/content
+/// duplicate with a different remote drawer_id as replicated/converged success: logical
+/// identity is the only replay key, and a divergent remote ID is an inspectable terminal
+/// identity conflict, not convergence. The local Both write must still succeed immediately and
+/// report `status: "queued"`; the background worker then delivers, the hub authoritatively
+/// rejects with 409 (duplicate, different id), and the operation is recorded as a **terminal
+/// failure** surfaced via `mempalace_status` — not marked converged.
 #[tokio::test]
 async fn add_drawer_both_duplicate_replication() {
     let hub_dir = TempDir::new().unwrap();
@@ -1842,6 +2028,7 @@ async fn add_drawer_both_duplicate_replication() {
     .await;
     assert_eq!(seed["success"], true, "seed add must succeed: {seed}");
     assert_eq!(seed["origin"], "hub", "seed must go to hub: {seed}");
+    let hub_drawer_id = seed["drawer_id"].as_str().expect("seed must return a drawer_id");
 
     // ── Server B: Both write with the same content ──────────────────────────
     let mut wing_rules_b = BTreeMap::new();
@@ -1867,21 +2054,55 @@ async fn add_drawer_both_duplicate_replication() {
     assert_eq!(dup["success"], true, "both add with duplicate content must succeed locally: {dup}");
     assert_eq!(dup["applied_to"], "local", "both add must report applied_to=local: {dup}");
 
-    // Replication must be converged (exact same content already on hub).
+    // Replication is queued, NOT synchronously converged.
     let replication = dup.get("replication").expect("both add must include replication field");
     assert_eq!(
-        replication["status"], "converged",
-        "replication must report status=converged for exact duplicate content; got: {replication}"
+        replication["status"], "queued",
+        "replication must report status=queued (delivery is async); got: {replication}"
     );
     assert_eq!(
         replication["remote"], "hub",
         "replication must report remote=hub; got: {replication}"
     );
+    let operation_id =
+        replication["operation_id"].as_str().expect("queued must carry operation_id").to_owned();
 
-    // No warnings for converged replication.
+    // No warnings for a queued write (conflict surfaces asynchronously).
     assert!(
         dup.get("warnings").is_none(),
-        "converged replication must not produce warnings; got: {dup}"
+        "queued replication must not produce warnings; got: {dup}"
+    );
+
+    // ── The worker hits the authoritative 409 and records a TERMINAL CONFLICT, not convergence ──
+    wait_for_status(
+        &server_b,
+        "duplicate-with-different-id to be recorded as a terminal failure",
+        |status| status_has_terminal_failure(status, &operation_id),
+    )
+    .await;
+
+    // The divergent drawer must NOT exist on the hub: the seeded id is still the only copy.
+    let client = hub_client(&hub_url);
+    let hub_search = client
+        .search_drawers(DrawerSearchRequest {
+            query: content.to_owned(),
+            wing: None,
+            room: None,
+            limit: Some(20),
+            view: None,
+        })
+        .await
+        .expect("hub search must succeed");
+    let hub_ids: Vec<&str> = hub_search
+        .results
+        .iter()
+        .filter(|r| r.content == content)
+        .map(|r| r.drawer_id.as_str())
+        .collect();
+    assert_eq!(
+        hub_ids,
+        vec![hub_drawer_id],
+        "hub must contain exactly the seeded drawer for this content, not a divergent duplicate; got: {hub_ids:?}"
     );
 }
 
@@ -2004,20 +2225,21 @@ async fn add_drawer_both_near_duplicate_same_wing_room_rejected() {
 
 // ─── Test 26: add_drawer_both_retry_reuses_local_drawer_and_replicates ──────
 
-/// Dual-write retry regression:
+/// Dual-write retry regression under issue #127 durable queued semantics:
 ///
 /// 1. Start a real hub, then take it down.
-/// 2. First write:both add while the hub is unavailable → local success,
-///    replication fails with `status: "failed"`.
+/// 2. First write:both add while the hub is unavailable → local success, response shows
+///    `replication.status: "queued"` (never a synchronous failure), and a stable
+///    `operation_id` is captured. The in-process worker keeps the intent in the retryable
+///    backlog rather than recording a terminal failure for a merely-unreachable remote.
 /// 3. Restore the hub on the same endpoint.
-/// 4. Retry the identical add → existing local drawer is reused (same
-///    `drawer_id`), replication reaches `status: "replicated"` **or**
-///    `"converged"` (409/convergence is valid when the remote already has
-///    the drawer), the remote contains the drawer, and no duplicate local
-///    drawer is created.
+/// 4. Retry the identical add → existing local drawer is reused (same `drawer_id`), and the
+///    replication is staged with the **same stable operation_id** (logical replay identity),
+///    returned again as `status: "queued"`. The worker then delivers to the restored hub and
+///    the drawer appears there. No duplicate local drawer is created.
 ///
-/// Retain coverage that same-wing/room near-duplicates with different content
-/// hashes remain rejected (Test 12b above).
+/// Retain coverage that same-wing/room near-duplicates with different content hashes remain
+/// rejected (Test 12b above).
 #[tokio::test]
 async fn add_drawer_both_retry_reuses_local_drawer_and_replicates() {
     // ── Phase 0: Start hub, then take it down ───────────────────────────────
@@ -2032,7 +2254,7 @@ async fn add_drawer_both_retry_reuses_local_drawer_and_replicates() {
     let room = "retry-room";
     let added_by = "retry-test";
 
-    // ── Phase 1: Hub is down → replication must fail ─────────────────────────
+    // ── Phase 1: Hub is down → the write commits locally and stays QUEUED ────
     let mut remotes_a = BTreeMap::new();
     remotes_a.insert(
         "hub".to_owned(),
@@ -2092,14 +2314,29 @@ async fn add_drawer_both_retry_reuses_local_drawer_and_replicates() {
 
     let replication = first.get("replication").expect("both add must include replication");
     assert_eq!(
-        replication["status"], "failed",
-        "replication must fail with down remote; got: {replication}"
+        replication["status"], "queued",
+        "first add with a down remote must be queued, not terminally failed; got: {replication}"
     );
-    let warnings = first.get("warnings").and_then(|w| w.as_array());
+    let operation_id =
+        replication["operation_id"].as_str().expect("queued must carry operation_id").to_owned();
     assert!(
-        warnings.is_some() && !warnings.unwrap().is_empty(),
-        "failed replication must include warnings; got: {first}"
+        operation_id.starts_with("outbox_"),
+        "stable outbox operation id expected; got: {replication}"
     );
+    assert!(
+        first.get("warnings").is_none(),
+        "queued replication must not add inline warnings; got: {first}"
+    );
+
+    // The unreachable remote keeps the intent retryable — never a terminal failure.
+    wait_for_status(
+        &server_a,
+        "down-remote intent to be retryable, not terminally failed",
+        |status| {
+            status_has_retryable(status) && !status_has_terminal_failure(status, &operation_id)
+        },
+    )
+    .await;
 
     drop(server_a);
 
@@ -2173,11 +2410,16 @@ async fn add_drawer_both_retry_reuses_local_drawer_and_replicates() {
         "retry must reuse the same drawer_id (was {drawer_id}); got: {retry}"
     );
 
+    // Stable op identity: the retry stages the SAME durable operation, never a fresh one.
     let replication2 = retry.get("replication").expect("retry add must include replication");
-    let status = replication2["status"].as_str().unwrap_or("");
-    assert!(
-        status == "replicated" || status == "converged",
-        "retry replication must be 'replicated' or 'converged'; got: {replication2}"
+    assert_eq!(
+        replication2["status"], "queued",
+        "retry must return status=queued for the same operation; got: {replication2}"
+    );
+    assert_eq!(
+        replication2["operation_id"].as_str().unwrap_or(""),
+        operation_id,
+        "retry must reuse the same operation_id ({operation_id}); got: {replication2}"
     );
     assert_eq!(
         replication2["remote"], "hub",
@@ -2188,6 +2430,9 @@ async fn add_drawer_both_retry_reuses_local_drawer_and_replicates() {
         retry.get("warnings").is_none(),
         "retry must not have warnings on success; got: {retry}"
     );
+
+    // ── The worker delivers the queued intent to the restored hub ────────────
+    wait_for_hub_drawer(&hub_url, content, wing, room).await;
 
     // ── Verify local drawer count via a local-only server ──────────────────
     drop(server_b);
@@ -2240,12 +2485,265 @@ async fn add_drawer_both_retry_reuses_local_drawer_and_replicates() {
     );
 }
 
+// ─── Test 12c: delete_both_retry_after_local_delete_replays_same_operation ──
+
+/// A `write:both` delete retried with the same operation_id after the local drawer is already
+/// gone must recover the original durable outbox intent by that key and return its queued/terminal
+/// state — not fall into the synchronous all-remote fallback or a false "not found".
+///
+/// Phases:
+/// 1. write:both add while the hub is down → local success, `replication.status: "queued"`.
+/// 2. Delete with a stable caller operation_id → local commit, queued replication, and a stable
+///    outbox operation_id is captured.
+/// 3. Retry the delete with the SAME operation_id → the outbox row (authoritative: it names the
+///    destination remote and current state that local drawer metadata can no longer provide) is
+///    recovered, returning success with the SAME outbox operation_id and queued state — never a
+///    `success:false` not-found and never a fresh synchronous remote delete.
+#[tokio::test]
+async fn delete_both_retry_after_local_delete_replays_same_operation() {
+    let dead_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let dead_addr = dead_listener.local_addr().unwrap();
+    drop(dead_listener);
+    let dead_url = format!("http://{dead_addr}");
+
+    let local_dir = TempDir::new().unwrap();
+    let wing = "wing_delretry";
+    let room = "del-retry-room";
+    let content = "dual-write delete retry regression content unique qwerty";
+    let del_op = "del-replay-op-1";
+
+    let mut remotes = BTreeMap::new();
+    remotes.insert(
+        "hub".to_owned(),
+        ResolvedRemote {
+            name: "hub".to_owned(),
+            url: dead_url,
+            token: Some(TEST_TOKEN.to_owned()),
+            timeout: Duration::from_millis(500),
+        },
+    );
+    let mut wing_rules = BTreeMap::new();
+    wing_rules.insert(wing.to_owned(), combined_wing_rule_both_write());
+    let federation = FederationRuntimeConfig {
+        remotes,
+        default_mode: RouteMode::Local,
+        default_remote: None,
+        wings: wing_rules,
+        kg: None,
+        coordination: BTreeMap::new(),
+    };
+    let config = MempalaceConfig {
+        schema_version: 1,
+        collection_name: "mempalace_drawers".to_owned(),
+        palace_path: local_dir.path().join("palace"),
+        embedding_profile: EmbeddingProfile::Balanced,
+        low_cpu: LowCpuRuntimeConfig::defaults_for_profile(EmbeddingProfile::Balanced),
+        server: ServerRuntimeConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            token_file: local_dir.path().join("server_tokens.json"),
+            checkouts: std::collections::BTreeMap::new(),
+        },
+        maintenance: MaintenanceRuntimeConfig::defaults(),
+        federation,
+    };
+    let server =
+        McpServer::from_parts(config, DeterministicStubProvider::new(EmbeddingProfile::Balanced))
+            .await
+            .unwrap();
+
+    // ── 1. write:both add while the hub is down → local + queued replication ──
+    let add = call_tool(
+        &server,
+        1,
+        "mempalace_add_drawer",
+        json!({
+            "wing": wing,
+            "room": room,
+            "content": content,
+            "added_by": "del-retry-test",
+        }),
+    )
+    .await;
+    assert_eq!(add["success"], true, "add must succeed locally: {add}");
+    let drawer_id = add["drawer_id"].as_str().expect("add must return drawer_id").to_owned();
+    assert_eq!(
+        add["replication"]["status"], "queued",
+        "add replication must be queued (hub down): {add}"
+    );
+
+    // ── 2. First delete: local commit + queued durable intent ────────────────
+    let del1 = call_tool(
+        &server,
+        2,
+        "mempalace_delete_drawer",
+        json!({"drawer_id": drawer_id, "operation_id": del_op}),
+    )
+    .await;
+    assert_eq!(del1["success"], true, "first delete must succeed locally: {del1}");
+    assert_eq!(del1["applied_to"], "local", "delete must report applied_to=local: {del1}");
+    let repl = del1.get("replication").expect("both delete must include replication: {del1}");
+    assert_eq!(repl["status"], "queued", "delete replication must be queued: {del1}");
+    let operation_id =
+        repl["operation_id"].as_str().expect("queued must carry operation_id").to_owned();
+    assert!(operation_id.starts_with("outbox_"), "stable outbox id expected: {del1}");
+
+    // ── 3. Retry with the SAME operation_id → replay, not fallback ───────────
+    let del2 = call_tool(
+        &server,
+        3,
+        "mempalace_delete_drawer",
+        json!({"drawer_id": drawer_id, "operation_id": del_op}),
+    )
+    .await;
+    assert_eq!(
+        del2["success"], true,
+        "retry must report success (local delete already committed): {del2}"
+    );
+    assert_eq!(del2["drawer_id"], drawer_id, "retry must echo the requested drawer_id: {del2}");
+    let repl2 = del2.get("replication").expect("retry must include replication state: {del2}");
+    assert_eq!(
+        repl2["operation_id"].as_str().unwrap_or(""),
+        operation_id,
+        "retry must reuse the same outbox operation_id ({operation_id}); got: {del2}"
+    );
+    assert_eq!(
+        repl2["status"], "queued",
+        "retry must report the original queued state; got: {del2}"
+    );
+    assert!(del2.get("error").is_none(), "retry must not fall into false not-found; got: {del2}");
+}
+
+// ─── Test 12d: delete_both_retry_after_restart_replays_same_operation ───────
+
+/// A `write:both` delete whose durable outbox intent survives a process restart must be recovered
+/// by the caller's operation_id on retry after restart, returning the original queued/terminal
+/// state. Startup reconciliation on restart settles any staged intent; the activated delete intent
+/// here is already `pending`/retryable and is read back verbatim.
+#[tokio::test]
+async fn delete_both_retry_after_restart_replays_same_operation() {
+    let dead_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let dead_addr = dead_listener.local_addr().unwrap();
+    drop(dead_listener);
+    let dead_url = format!("http://{dead_addr}");
+
+    let local_dir = TempDir::new().unwrap();
+    let wing = "wing_delrestart";
+    let room = "del-restart-room";
+    let content = "dual-write delete restart regression content unique asdfgh";
+    let del_op = "del-replay-op-2";
+
+    let make_federation = || FederationRuntimeConfig {
+        remotes: BTreeMap::from([(
+            "hub".to_owned(),
+            ResolvedRemote {
+                name: "hub".to_owned(),
+                url: dead_url.clone(),
+                token: Some(TEST_TOKEN.to_owned()),
+                timeout: Duration::from_millis(500),
+            },
+        )]),
+        default_mode: RouteMode::Local,
+        default_remote: None,
+        wings: BTreeMap::from([(wing.to_owned(), combined_wing_rule_both_write())]),
+        kg: None,
+        coordination: BTreeMap::new(),
+    };
+    let make_config = || MempalaceConfig {
+        schema_version: 1,
+        collection_name: "mempalace_drawers".to_owned(),
+        palace_path: local_dir.path().join("palace"),
+        embedding_profile: EmbeddingProfile::Balanced,
+        low_cpu: LowCpuRuntimeConfig::defaults_for_profile(EmbeddingProfile::Balanced),
+        server: ServerRuntimeConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            token_file: local_dir.path().join("server_tokens.json"),
+            checkouts: std::collections::BTreeMap::new(),
+        },
+        maintenance: MaintenanceRuntimeConfig::defaults(),
+        federation: make_federation(),
+    };
+
+    let server_a = McpServer::from_parts(
+        make_config(),
+        DeterministicStubProvider::new(EmbeddingProfile::Balanced),
+    )
+    .await
+    .unwrap();
+
+    let add = call_tool(
+        &server_a,
+        1,
+        "mempalace_add_drawer",
+        json!({
+            "wing": wing,
+            "room": room,
+            "content": content,
+            "added_by": "del-restart-test",
+        }),
+    )
+    .await;
+    assert_eq!(add["success"], true, "add must succeed locally: {add}");
+    let drawer_id = add["drawer_id"].as_str().expect("add must return drawer_id").to_owned();
+
+    // The delete commits locally (op activated to pending) before the response returns, so the
+    // intent is durable when we crash.
+    let del1 = call_tool(
+        &server_a,
+        2,
+        "mempalace_delete_drawer",
+        json!({"drawer_id": drawer_id, "operation_id": del_op}),
+    )
+    .await;
+    assert_eq!(del1["success"], true, "delete must succeed locally: {del1}");
+    let operation_id = del1["replication"]["operation_id"]
+        .as_str()
+        .expect("queued must carry operation_id")
+        .to_owned();
+    assert!(operation_id.starts_with("outbox_"));
+
+    // ── Crash (drop the runtime) and restart on the same palace dir ──────────
+    drop(server_a);
+    let server_b = McpServer::from_parts(
+        make_config(),
+        DeterministicStubProvider::new(EmbeddingProfile::Balanced),
+    )
+    .await
+    .unwrap();
+
+    // ── Retry the same operation_id after restart → recover the original intent ──
+    let del2 = call_tool(
+        &server_b,
+        3,
+        "mempalace_delete_drawer",
+        json!({"drawer_id": drawer_id, "operation_id": del_op}),
+    )
+    .await;
+    assert_eq!(
+        del2["success"], true,
+        "retry after restart must report success (local delete already committed): {del2}"
+    );
+    let repl2 = del2.get("replication").expect("retry must include replication state: {del2}");
+    assert_eq!(
+        repl2["operation_id"].as_str().unwrap_or(""),
+        operation_id,
+        "restart retry must reuse the same outbox operation_id ({operation_id}); got: {del2}"
+    );
+    assert_eq!(
+        repl2["status"], "queued",
+        "restart retry must report the original queued state; got: {del2}"
+    );
+    assert!(del2.get("error").is_none(), "restart retry must not be a false not-found: {del2}");
+}
+
 // ─── Test 13: add_drawer_both_replication_fails_with_down_remote ────────────
 
-/// Combined/write:Both wing rule with the remote down (dead address).
-/// The local write must still succeed, `applied_to` must be `"local"`, and
-/// the `replication` field must show `status: "failed"` with a non-empty
-/// `reason` and a `warnings` array.
+/// Combined/write:Both wing rule with the remote down (dead address). The local write must still
+/// succeed immediately and report `applied_to: "local"` with `replication.status: "queued"` —
+/// issue #127 semantics: the tool returns before delivery and never blocks on the remote. The
+/// in-process worker fails to reach the remote (an unreachable-before-send error), which is a
+/// **retryable** outcome: the intent stays in the backlog with exponential backoff rather than
+/// recording a terminal failure. The test asserts the queued response, then that status shows a
+/// retryable backlog entry and NO terminal failure for that operation.
 #[tokio::test]
 async fn add_drawer_both_replication_fails_with_down_remote() {
     let dead_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2318,35 +2816,40 @@ async fn add_drawer_both_replication_fails_with_down_remote() {
         "both add with down remote must report applied_to=local: {add}"
     );
 
-    // Replication must be failed.
+    // Replication is queued (async delivery), never a synchronous failure.
     let replication = add.get("replication").expect("both add must include replication field");
     assert_eq!(
-        replication["status"], "failed",
-        "replication must report status=failed with down remote; got: {replication}"
+        replication["status"], "queued",
+        "replication must report status=queued with down remote; got: {replication}"
     );
     assert_eq!(
         replication["remote"], "hub",
         "replication must report remote=hub; got: {replication}"
     );
-    let reason = replication["reason"].as_str().unwrap_or("");
+    let operation_id =
+        replication["operation_id"].as_str().expect("queued must carry operation_id").to_owned();
+
+    // No inline warnings — the outage is surfaced through the retryable backlog.
     assert!(
-        !reason.is_empty(),
-        "replication failure must include a non-empty reason; got: {replication}"
+        add.get("warnings").is_none(),
+        "queued replication must not add inline warnings; got: {add}"
     );
 
-    // Warnings must be present.
-    let warnings = add.get("warnings").and_then(|w| w.as_array());
-    assert!(
-        warnings.is_some() && !warnings.unwrap().is_empty(),
-        "both add with failed replication must include warnings array; got: {add}"
-    );
+    // The unreachable remote is retryable: the intent stays in the backlog with backoff, and is
+    // NEVER recorded as a terminal failure for a merely-unreachable remote.
+    wait_for_status(&server, "retryable backlog entry without a terminal failure", |status| {
+        status_has_retryable(status) && !status_has_terminal_failure(status, &operation_id)
+    })
+    .await;
 }
 
 // ─── Test 14: kg_add_both_replicates_successfully ───────────────────────────
 
-/// Combined KG rule with write:Both → local KG add succeeds, best-effort
-/// replication succeeds. Response must have `applied_to: "local"`,
-/// `replication.status: "replicated"`, `replication.remote: "hub"`.
+/// Combined KG rule with write:Both → local KG add succeeds, and remote replication is durably
+/// queued: the response reports `applied_to: "local"` with `replication.status: "queued"` and a
+/// stable `operation_id`. The background worker then delivers the fact to the hub; the test
+/// awaits that async delivery by polling the hub's KG directly, and asserts the operation was
+/// not recorded as a terminal failure.
 #[tokio::test]
 async fn kg_add_both_replicates_successfully() {
     let hub_dir = TempDir::new().unwrap();
@@ -2380,48 +2883,33 @@ async fn kg_add_both_replicates_successfully() {
     assert_eq!(kg_add["applied_to"], "local", "kg_add both must report applied_to=local: {kg_add}");
     let replication = kg_add.get("replication").expect("kg_add both must include replication");
     assert_eq!(
-        replication["status"], "replicated",
-        "kg_add replication must be replicated; got: {replication}"
+        replication["status"], "queued",
+        "kg_add replication must be queued (async delivery); got: {replication}"
     );
     assert_eq!(
         replication["remote"], "hub",
         "kg_add replication must target hub; got: {replication}"
     );
+    let operation_id =
+        replication["operation_id"].as_str().expect("queued must carry operation_id").to_owned();
     assert!(kg_add.get("warnings").is_none(), "kg_add must not have warnings on success: {kg_add}");
 
-    // Verify the fact exists on the hub directly. Combined KG queries dedupe
-    // identical facts and prefer local, so no separate hub-origin fact remains.
-    let hub_client = RemoteClient::new(RemoteEndpoint {
-        name: "hub".into(),
-        base_url: hub_url,
-        token: Some(TEST_TOKEN.to_owned()),
-        timeout: Duration::from_secs(5),
+    // Await the background worker's async delivery to the hub.
+    wait_for_hub_kg_fact(&hub_url, "BothTest", "uses_protocol", "dual_write_kg", None, true).await;
+
+    // Delivered, not terminally failed.
+    wait_for_status(&server, "kg_add replication to be acknowledged, not failed", |status| {
+        !status_has_terminal_failure(status, &operation_id)
     })
-    .unwrap();
-    let hub_query = hub_client
-        .kg_query(KgQueryRequest {
-            entity: "BothTest".to_owned(),
-            as_of: None,
-            direction: Some("outgoing".to_owned()),
-        })
-        .await
-        .expect("hub KG query must succeed");
-    let hub_fact = hub_query["facts"].as_array().and_then(|facts| {
-        facts.iter().find(|f| {
-            f["predicate"].as_str() == Some("uses_protocol")
-                && f["object"].as_str() == Some("dual_write_kg")
-        })
-    });
-    assert!(
-        hub_fact.is_some(),
-        "hub KG query must include the replicated fact; response: {hub_query}"
-    );
+    .await;
 }
 
 // ─── Test 15: kg_add_both_replication_fails_with_down_remote ────────────────
 
-/// Combined KG rule with write:Both and a dead remote. Local KG add succeeds,
-/// replication fails with `status: "failed"` and warnings.
+/// Combined KG rule with write:Both and a dead remote. Local KG add succeeds and reports
+/// `status: "queued"` immediately; the worker keeps the intent in the retryable backlog (an
+/// unreachable-before-send error is retryable), and never records a terminal failure for a
+/// merely-unreachable remote.
 #[tokio::test]
 async fn kg_add_both_replication_fails_with_down_remote() {
     let dead_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2487,25 +2975,25 @@ async fn kg_add_both_replication_fails_with_down_remote() {
     assert_eq!(kg_add["applied_to"], "local", "kg_add must report applied_to=local: {kg_add}");
     let replication = kg_add.get("replication").expect("kg_add both must include replication");
     assert_eq!(
-        replication["status"], "failed",
-        "replication must be failed with down remote; got: {replication}"
+        replication["status"], "queued",
+        "kg_add replication must be queued with down remote; got: {replication}"
     );
     assert_eq!(replication["remote"], "hub", "replication must target hub; got: {replication}");
-    let reason = replication["reason"].as_str().unwrap_or("");
-    assert!(!reason.is_empty(), "failure reason must be non-empty; got: {replication}");
+    let operation_id =
+        replication["operation_id"].as_str().expect("queued must carry operation_id").to_owned();
 
-    let warnings = kg_add.get("warnings").and_then(|w| w.as_array());
-    assert!(
-        warnings.is_some() && !warnings.unwrap().is_empty(),
-        "failed replication must include warnings; got: {kg_add}"
-    );
+    wait_for_status(&server, "retryable backlog entry without a terminal failure", |status| {
+        status_has_retryable(status) && !status_has_terminal_failure(status, &operation_id)
+    })
+    .await;
 }
 
 // ─── Test 16: kg_invalidate_both_replicates_successfully ────────────────────
 
-/// Combined KG rule with write:Both → local KG invalidate succeeds, best-effort
-/// replication succeeds. Response must have `applied_to: "local"`,
-/// `replication.status: "replicated"`.
+/// Combined KG rule with write:Both → local KG invalidate succeeds, and the invalidation is
+/// durably queued (`applied_to: "local"`, `replication.status: "queued"`). The background worker
+/// delivers both the add and the invalidate to the hub; the test awaits each async leg by
+/// polling the hub's KG directly with `as_of` dates.
 ///
 /// Verifies invalidation on the hub by using explicit `ended` + `as_of` dates:
 /// the fact has `valid_from: 2026-01-01`, is invalidated with `ended: 2026-06-01`,
@@ -2541,33 +3029,21 @@ async fn kg_invalidate_both_replicates_successfully() {
     )
     .await;
     assert_eq!(add_resp["success"], true, "kg_add must succeed: {add_resp}");
-
-    // Verify the fact exists on the hub before invalidation. Combined KG queries
-    // dedupe replicated facts, so query the hub directly.
-    let hub_client = RemoteClient::new(RemoteEndpoint {
-        name: "hub".into(),
-        base_url: hub_url.clone(),
-        token: Some(TEST_TOKEN.to_owned()),
-        timeout: Duration::from_secs(5),
-    })
-    .unwrap();
-    let hub_before = hub_client
-        .kg_query(KgQueryRequest {
-            entity: "InvalidateBothTest".to_owned(),
-            as_of: Some("2026-03-01".to_owned()),
-            direction: Some("outgoing".to_owned()),
-        })
-        .await
-        .expect("hub KG query before invalidation must succeed");
-    let hub_fact_before = hub_before["facts"].as_array().and_then(|facts| {
-        facts.iter().find(|f| {
-            f["predicate"].as_str() == Some("replication") && f["object"].as_str() == Some("active")
-        })
-    });
-    assert!(
-        hub_fact_before.is_some(),
-        "hub KG query before invalidation must include the fact; response: {hub_before}"
+    assert_eq!(
+        add_resp["replication"]["status"], "queued",
+        "kg_add must be durably queued: {add_resp}"
     );
+
+    // Verify the fact exists on the hub before invalidation, awaiting async delivery.
+    wait_for_hub_kg_fact(
+        &hub_url,
+        "InvalidateBothTest",
+        "replication",
+        "active",
+        Some("2026-03-01"),
+        true,
+    )
+    .await;
 
     // Now invalidate with an explicit past ended date.
     let invalidate = call_tool(
@@ -2591,40 +3067,35 @@ async fn kg_invalidate_both_replicates_successfully() {
     let replication =
         invalidate.get("replication").expect("kg_invalidate must include replication");
     assert_eq!(
-        replication["status"], "replicated",
-        "invalidate replication must be replicated; got: {replication}"
+        replication["status"], "queued",
+        "invalidate replication must be queued; got: {replication}"
     );
     assert_eq!(
         replication["remote"], "hub",
         "invalidate replication must target hub; got: {replication}"
     );
+    let operation_id =
+        replication["operation_id"].as_str().expect("queued must carry operation_id").to_owned();
     assert!(
         invalidate.get("warnings").is_none(),
         "kg_invalidate must not have warnings on success: {invalidate}"
     );
 
     // ── Verify the fact is invalidated on the hub using as_of after ended ───
-    let hub_after = hub_client
-        .kg_query(KgQueryRequest {
-            entity: "InvalidateBothTest".to_owned(),
-            as_of: Some("2026-07-01".to_owned()),
-            direction: Some("outgoing".to_owned()),
-        })
-        .await
-        .expect("hub KG query after invalidation must succeed");
-    let hub_fact = hub_after["facts"].as_array().and_then(|facts| {
-        facts.iter().find(|f| {
-            f["predicate"].as_str() == Some("replication") && f["object"].as_str() == Some("active")
-        })
-    });
-    assert!(
-        hub_fact.is_none(),
-        "hub KG query after invalidation must not include the fact; response: {hub_after}"
-    );
+    wait_for_hub_kg_fact(
+        &hub_url,
+        "InvalidateBothTest",
+        "replication",
+        "active",
+        Some("2026-07-01"),
+        false,
+    )
+    .await;
 
     // Query without as_of returns all facts including historical ones (the fact
     // should still exist as a historical record on the hub).
-    let hub_all = hub_client
+    let client = hub_client(&hub_url);
+    let hub_all = client
         .kg_query(KgQueryRequest {
             entity: "InvalidateBothTest".to_owned(),
             as_of: None,
@@ -2633,8 +3104,6 @@ async fn kg_invalidate_both_replicates_successfully() {
         .await
         .expect("hub KG query without as_of must succeed");
     let facts_all = hub_all["facts"].as_array().expect("hub facts must be array");
-    // The fact should still appear in the unfiltered query but with current: false.
-    // We just verify the hub at least has the fact in the unfiltered view.
     let hub_fact_historical = facts_all.iter().find(|f| {
         f["predicate"].as_str() == Some("replication") && f["object"].as_str() == Some("active")
     });
@@ -2642,12 +3111,18 @@ async fn kg_invalidate_both_replicates_successfully() {
         hub_fact_historical.is_some(),
         "hub KG query without as_of must show the historical fact; facts: {facts_all:?}"
     );
+
+    // Delivered, not terminally failed.
+    wait_for_status(&server, "kg_invalidate to be acknowledged, not failed", |status| {
+        !status_has_terminal_failure(status, &operation_id)
+    })
+    .await;
 }
 
 // ─── Test 17: kg_invalidate_both_replication_fails_with_down_remote ─────────
 
-/// Combined KG rule with write:Both and a dead remote. Local KG invalidate
-/// succeeds, replication fails with `status: "failed"` and warnings.
+/// Combined KG rule with write:Both and a dead remote. Local KG invalidate succeeds and
+/// reports `status: "queued"`; the worker keeps the intent retryable, never termially failed.
 #[tokio::test]
 async fn kg_invalidate_both_replication_fails_with_down_remote() {
     let dead_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2698,8 +3173,7 @@ async fn kg_invalidate_both_replication_fails_with_down_remote() {
             .unwrap();
 
     // First add a fact locally so we can invalidate it.
-    // (With dead remote, the KG add goes both locally and tries replicate;
-    //  we ignore the replication failure for setup purposes.)
+    // (With dead remote, the KG add queues replication; we ignore its eventual backlog state.)
     let _add_resp = call_tool(
         &server,
         1,
@@ -2736,18 +3210,17 @@ async fn kg_invalidate_both_replication_fails_with_down_remote() {
     let replication =
         invalidate.get("replication").expect("kg_invalidate must include replication");
     assert_eq!(
-        replication["status"], "failed",
-        "replication must be failed with down remote; got: {replication}"
+        replication["status"], "queued",
+        "invalidate replication must be queued with down remote; got: {replication}"
     );
     assert_eq!(replication["remote"], "hub", "replication must target hub; got: {replication}");
-    let reason = replication["reason"].as_str().unwrap_or("");
-    assert!(!reason.is_empty(), "failure reason must be non-empty; got: {replication}");
+    let operation_id =
+        replication["operation_id"].as_str().expect("queued must carry operation_id").to_owned();
 
-    let warnings = invalidate.get("warnings").and_then(|w| w.as_array());
-    assert!(
-        warnings.is_some() && !warnings.unwrap().is_empty(),
-        "failed replication must include warnings; got: {invalidate}"
-    );
+    wait_for_status(&server, "retryable backlog entry without a terminal failure", |status| {
+        status_has_retryable(status) && !status_has_terminal_failure(status, &operation_id)
+    })
+    .await;
 }
 
 // ─── Test 18: legacy_local_route_has_no_replication_field ────────────────────
@@ -2878,8 +3351,9 @@ async fn add_drawer_both_diary_guard_skips_replication() {
 
 // ─── Test 21: kg_add_both_with_valid_from_succeeds ──────────────────────────
 
-/// Combined KG rule with write:Both and a `valid_from` date. Local KG add of a
-/// dated fact + remote replication must both succeed.
+/// Combined KG rule with write:Both and a `valid_from` date. Local KG add of a dated fact
+/// succeeds and reports `replication.status: "queued"`; the background worker then delivers the
+/// dated fact to the hub, which the test awaits via direct hub polling.
 #[tokio::test]
 async fn kg_add_both_with_valid_from_succeeds() {
     let hub_dir = TempDir::new().unwrap();
@@ -2917,21 +3391,32 @@ async fn kg_add_both_with_valid_from_succeeds() {
     );
     let replication = kg_add.get("replication").expect("dated kg_add must include replication");
     assert_eq!(
-        replication["status"], "replicated",
-        "dated replication must be replicated; got: {replication}"
+        replication["status"], "queued",
+        "dated replication must be queued; got: {replication}"
     );
     assert_eq!(
         replication["remote"], "hub",
         "dated replication must target hub; got: {replication}"
     );
+    let operation_id =
+        replication["operation_id"].as_str().expect("queued must carry operation_id").to_owned();
+
+    // Await async delivery of the dated fact to the hub.
+    wait_for_hub_kg_fact(&hub_url, "DatedBothTest", "started_on", "project_epsilon", None, true)
+        .await;
+
+    wait_for_status(&server, "dated kg_add to be acknowledged, not failed", |status| {
+        !status_has_terminal_failure(status, &operation_id)
+    })
+    .await;
 }
 
 // ─── Test 24: kg_add_both_replication_fails_with_remote_rejection ───────────
 
-/// Combined KG rule with write:Both and a reachable remote that rejects the
-/// replication attempt (wrong bearer token → HTTP 401). The local KG add must
-/// still succeed, `applied_to` must be `"local"`, and `replication.status`
-/// must be `"failed"` with a non-empty `reason` and a `warnings` array.
+/// Combined KG rule with write:Both and a reachable remote that rejects the replication attempt
+/// (wrong bearer token → HTTP 401). The local KG add succeeds immediately and reports
+/// `replication.status: "queued"`; the worker then observes the authoritative `Unauthorized`
+/// rejection and records the operation as a terminal failure via `mempalace_status`.
 #[tokio::test]
 async fn kg_add_both_replication_fails_with_remote_rejection() {
     let hub_dir = TempDir::new().unwrap();
@@ -2995,42 +3480,39 @@ async fn kg_add_both_replication_fails_with_remote_rejection() {
     )
     .await;
 
-    // Local write must succeed despite replication failure.
+    // Local write must succeed despite the remote rejection.
     assert_eq!(
         kg_add["success"], true,
         "kg_add with wrong token must still succeed locally: {kg_add}"
     );
     assert_eq!(kg_add["applied_to"], "local", "kg_add must report applied_to=local: {kg_add}");
 
-    // Replication must be failed.
+    // Replication is queued (async delivery) — not a synchronous failure.
     let replication = kg_add.get("replication").expect("kg_add both must include replication");
     assert_eq!(
-        replication["status"], "failed",
-        "replication must report status=failed with wrong token; got: {replication}"
+        replication["status"], "queued",
+        "kg_add replication must be queued with wrong token; got: {replication}"
     );
     assert_eq!(
         replication["remote"], "hub",
-        "replication must report remote=hub; got: {replication}"
+        "kg_add replication must target hub; got: {replication}"
     );
-    let reason = replication["reason"].as_str().unwrap_or("");
-    assert!(
-        !reason.is_empty(),
-        "replication failure must include a non-empty reason; got: {replication}"
-    );
+    let operation_id =
+        replication["operation_id"].as_str().expect("queued must carry operation_id").to_owned();
 
-    // Warnings must be present.
-    let warnings = kg_add.get("warnings").and_then(|w| w.as_array());
-    assert!(
-        warnings.is_some() && !warnings.unwrap().is_empty(),
-        "kg_add with failed replication must include warnings array; got: {kg_add}"
-    );
+    // The authoritative permanent rejection terminates the operation.
+    wait_for_status(&server, "kg_add operation to be recorded as a terminal failure", |status| {
+        status_has_terminal_failure(status, &operation_id)
+    })
+    .await;
 }
 
 // ─── Test 25: kg_invalidate_both_replication_fails_with_remote_rejection ────
 
-/// Combined KG rule with write:Both and a reachable remote that rejects the
-/// KG invalidate replication (wrong bearer token → HTTP 401). The local KG
-/// invalidate must still succeed, and `replication.status` must be `"failed"`.
+/// Combined KG rule with write:Both and a reachable remote that rejects the KG invalidate
+/// replication (wrong bearer token → HTTP 401). The local KG invalidate succeeds immediately and
+/// reports `replication.status: "queued"`; the worker then observes the authoritative
+/// `Unauthorized` rejection and records the operation as a terminal failure.
 #[tokio::test]
 async fn kg_invalidate_both_replication_fails_with_remote_rejection() {
     let hub_dir = TempDir::new().unwrap();
@@ -3143,22 +3625,24 @@ async fn kg_invalidate_both_replication_fails_with_remote_rejection() {
         "kg_invalidate must report applied_to=local: {invalidate}"
     );
 
-    // Replication must be failed.
+    // Replication is queued (async delivery) — not a synchronous failure.
     let replication =
         invalidate.get("replication").expect("kg_invalidate must include replication");
     assert_eq!(
-        replication["status"], "failed",
-        "replication must be failed with wrong token; got: {replication}"
+        replication["status"], "queued",
+        "kg_invalidate replication must be queued with wrong token; got: {replication}"
     );
     assert_eq!(replication["remote"], "hub", "replication must target hub; got: {replication}");
-    let reason = replication["reason"].as_str().unwrap_or("");
-    assert!(!reason.is_empty(), "failure reason must be non-empty; got: {replication}");
+    let operation_id =
+        replication["operation_id"].as_str().expect("queued must carry operation_id").to_owned();
 
-    let warnings = invalidate.get("warnings").and_then(|w| w.as_array());
-    assert!(
-        warnings.is_some() && !warnings.unwrap().is_empty(),
-        "failed replication must include warnings; got: {invalidate}"
-    );
+    // The authoritative permanent rejection terminates the operation.
+    wait_for_status(
+        &server,
+        "kg_invalidate operation to be recorded as a terminal failure",
+        |status| status_has_terminal_failure(status, &operation_id),
+    )
+    .await;
 }
 
 /// Helper: combined-mode KG rule routing to "hub" with Remote write
@@ -3433,7 +3917,11 @@ async fn coordination_events_fanout_with_one_remote_down_still_returns_the_healt
     let mut coordination_rules = BTreeMap::new();
     coordination_rules.insert(
         "wing_fanout".to_owned(),
-        ResolvedRouteRule { mode: RouteMode::Remote, remote: Some("hub".to_owned()), write: WriteTarget::Remote },
+        ResolvedRouteRule {
+            mode: RouteMode::Remote,
+            remote: Some("hub".to_owned()),
+            write: WriteTarget::Remote,
+        },
     );
     // `down` must also be a coordination candidate (named by some wing's rule — any wing,
     // since the candidate set is the union across all of them) or the aggregate fan-outs'
@@ -3441,7 +3929,11 @@ async fn coordination_events_fanout_with_one_remote_down_still_returns_the_healt
     // would stop exercising "a down candidate is isolated" at all.
     coordination_rules.insert(
         "wing_fanout_down".to_owned(),
-        ResolvedRouteRule { mode: RouteMode::Remote, remote: Some("down".to_owned()), write: WriteTarget::Remote },
+        ResolvedRouteRule {
+            mode: RouteMode::Remote,
+            remote: Some("down".to_owned()),
+            write: WriteTarget::Remote,
+        },
     );
     let server = mcp_server_with_hub_multi(
         &local_dir,
@@ -3527,7 +4019,11 @@ async fn coordination_events_remote_cursors_round_trip_paginates_without_repeats
     let mut coordination_rules = BTreeMap::new();
     coordination_rules.insert(
         "wing_events_pages".to_owned(),
-        ResolvedRouteRule { mode: RouteMode::Remote, remote: Some("hub".to_owned()), write: WriteTarget::Remote },
+        ResolvedRouteRule {
+            mode: RouteMode::Remote,
+            remote: Some("hub".to_owned()),
+            write: WriteTarget::Remote,
+        },
     );
     let server = mcp_server_with_hub_coordination(
         &local_dir,
@@ -3549,8 +4045,7 @@ async fn coordination_events_remote_cursors_round_trip_paginates_without_repeats
     let page1_events =
         page1_remote["hub"]["events"].as_array().expect("hub must return events on page 1");
     assert_eq!(page1_events.len(), 2, "first page must return exactly 2 events: {page1_events:?}");
-    let page1_ids: Vec<&str> =
-        page1_events.iter().filter_map(|e| e["event_id"].as_str()).collect();
+    let page1_ids: Vec<&str> = page1_events.iter().filter_map(|e| e["event_id"].as_str()).collect();
     let hub_cursor1 = page1_remote["hub"]["next_cursor"]
         .as_str()
         .expect("remote_events.hub.next_cursor must be a string when more events remain")
@@ -3575,8 +4070,7 @@ async fn coordination_events_remote_cursors_round_trip_paginates_without_repeats
         1,
         "second page must return the one remaining event: {page2_events:?}"
     );
-    let page2_ids: Vec<&str> =
-        page2_events.iter().filter_map(|e| e["event_id"].as_str()).collect();
+    let page2_ids: Vec<&str> = page2_events.iter().filter_map(|e| e["event_id"].as_str()).collect();
     assert_ne!(
         page1_ids, page2_ids,
         "feeding remote_cursors back must not repeat the first page's events"
@@ -3643,7 +4137,11 @@ async fn coordination_inbox_remote_cursors_round_trip_paginates_without_repeats(
     let mut coordination_rules = BTreeMap::new();
     coordination_rules.insert(
         "wing_inbox_pages".to_owned(),
-        ResolvedRouteRule { mode: RouteMode::Remote, remote: Some("hub".to_owned()), write: WriteTarget::Remote },
+        ResolvedRouteRule {
+            mode: RouteMode::Remote,
+            remote: Some("hub".to_owned()),
+            write: WriteTarget::Remote,
+        },
     );
     let server = mcp_server_with_hub_coordination(
         &local_dir,
@@ -4075,17 +4573,18 @@ async fn coordination_result_put_fallback_forwards_payload() {
     )
     .await;
 
-    assert_eq!(response["payload"]["status"], "ok", "payload must be forwarded unchanged: {response}");
+    assert_eq!(
+        response["payload"]["status"], "ok",
+        "payload must be forwarded unchanged: {response}"
+    );
     assert_eq!(
         response["payload"]["nested"]["count"], 3,
         "nested payload fields must survive the fallback unchanged: {response}"
     );
     assert_eq!(response["created_by"], "e2e-fed-user:alice");
 
-    let stored = hub_client
-        .coordination_result_get(response["result_id"].as_str().unwrap())
-        .await
-        .unwrap();
+    let stored =
+        hub_client.coordination_result_get(response["result_id"].as_str().unwrap()).await.unwrap();
     assert_eq!(stored.payload["status"], "ok");
     assert_eq!(stored.payload["nested"]["count"], 3);
 }
@@ -4139,13 +4638,9 @@ async fn coordination_result_get_fallback_returns_correct_payload() {
     )
     .await;
 
-    let response = call_tool(
-        &server,
-        1,
-        "mempalace_result_get",
-        json!({"result_id": hub_result.result_id}),
-    )
-    .await;
+    let response =
+        call_tool(&server, 1, "mempalace_result_get", json!({"result_id": hub_result.result_id}))
+            .await;
 
     assert_eq!(response["found"], true, "must find the result via remote fallback: {response}");
     assert_eq!(response["value"]["payload"]["status"], "done");

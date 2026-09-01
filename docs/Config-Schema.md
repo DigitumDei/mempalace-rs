@@ -289,11 +289,13 @@ routing:
 - `mode`: `local`, `remote`, or `combined`
 - `remote`: name of a remote defined in `~/.mempalace/config.json` federation.remotes. May be omitted when exactly one remote is configured.
 - `write`: `local`, `remote`, or `both`. Only meaningful for `combined` mode. Default: `local`.
-  - `both` performs a local-first dual-write: the local write must complete
-    successfully, then best-effort remote replication is attempted. Remote
-    failure does not roll back the local write or change the success result.
-    The outcome of the remote leg is reported as a `replication` field on MCP
-    tool responses — see [`ReplicationStatus`](#replicationstatus).
+  - `both` performs a durable local-first dual-write (issue #127): the local
+    write must complete successfully, then replication is **queued** durably in
+    the local outbox and delivered asynchronously by a background worker with
+    a stable `operation_id`. The tool never waits on the remote; remote
+    failures do not roll back the local write or change the success result.
+    The queued state is reported as a `replication` field on MCP tool responses
+    — see [`ReplicationStatus`](#replicationstatus).
 
 ## Server Config
 
@@ -491,8 +493,9 @@ Validation:
   - `write`: `local` | `remote` | `both`. Only meaningful for `combined` mode. Default: `local`.
     - `local` — writes go to the local palace only.
     - `remote` — writes go to the remote palace only.
-    - `both` — local-first dual-write; the local write must complete first,
-      then best-effort remote replication is attempted. See
+    - `both` — durable local-first dual-write; the local write must complete
+      first, then replication is durably queued and delivered asynchronously by
+      a background worker with a stable `operation_id`. See
       [`ReplicationStatus`](#replicationstatus) for the response shape.
 
 #### `federation.kg`
@@ -587,26 +590,26 @@ Config load succeeds with a warning (does not fail) for:
 ### `ReplicationStatus`
 
 When `write: both` is configured, MCP tool responses carry a `replication` field
-reporting the result of the best-effort remote leg. Non-`both` routes and
-diary-local writes omit the field entirely. The shape is a tagged union:
+reporting the durable, asynchronous remote leg (issue #127). Non-`both` routes
+and diary-local writes omit the field entirely. The shape is a tagged union; the
+only status an MCP tool reports for `write: both` is `queued`, because the
+worker delivers asynchronously in the background:
 
 ```json
-{ "status": "replicated", "remote": "work" }
-```
-
-```json
-{ "status": "failed", "remote": "work", "reason": "transport failure: timeout" }
-```
-
-```json
-{ "status": "converged", "remote": "work" }
+{ "status": "queued", "remote": "work", "operation_id": "outbox_1a2b3c" }
 ```
 
 | Variant | Meaning |
 |---|---|
-| `replicated` | Best-effort remote write to the named remote succeeded. |
-| `converged` | Exact content already exists on the named remote; state is converged. |
-| `failed` | Best-effort remote write failed; `reason` contains a human-readable description. The local write was unaffected. |
+| `queued` | The local mutation committed and durable replication to the named remote is queued in the local outbox. `operation_id` is the stable identity used for retries and remote idempotency. |
+| `skipped` | No replication was attempted: route is not `write: both`, or the target is diary-local. |
+
+The terminal outcomes of the queued operation are not reported inline; they are
+observed via `mempalace_status` under `replication.backlog` (pending/leased/
+retryable) and `replication.recent_terminal_failures` (authoritative permanent
+rejections such as HTTP 401 or a semantic/content duplicate 409 with a
+different remote `drawer_id`). See
+[docs/Federation.md#write-both--durable-local-first-dual-write-semantics](Federation.md#write-both--durable-local-first-dual-write-semantics).
 
 The `replication` field is absent when federation is not configured, the route
 does not use `write: both`, or the write targets a diary-local destination.

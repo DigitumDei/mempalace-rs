@@ -403,6 +403,48 @@ Operational guidance:
 - Back up `storage.sqlite3` and `lancedb/` together.
 - Do not back up only one side of the storage layout and assume point-in-time consistency.
 
+## Durable Replication Recovery
+
+`write: both` federation routes are asynchronous and durable (issue #127): the
+MCP process commits the local mutation immediately and persists a replication
+intent in `replication_outbox` (inside `storage.sqlite3`), then a background
+worker delivers it to the remote with a stable `operation_id`. Because the
+outbox lives in the same SQLite file as the palace schema, operator backup and
+recovery guidance above applies to it unchanged.
+
+Observe the replication pipeline through `mempalace_status` (and the status
+embedded in `mempalace_wake_up`):
+
+- `replication.backlog` — pending/leased/retryable counts, the age of the oldest
+  pending operation, the attempt count and last error of the oldest retryable
+  operation, plus failed/cancelled totals. A non-zero `retryable_count` or
+  `pending_count` means some queued write has not reached the remote yet.
+- `replication.recent_terminal_failures` — the newest operations that hit an
+  authoritative permanent error (e.g. HTTP 401, or a semantic/content duplicate
+  with a different remote `drawer_id`). Each entry carries the `operation_id`,
+  remote, mutation kind, attempt count, and `last_error`.
+- `replication.phase_metrics` — per-phase latency aggregates
+  (`duplicate_search`, `embedding`, `commit`, `outbox_wait`,
+  `delivery_attempt`, `remote_acknowledge`) with count/last/total/max/avg
+  millisecond statistics. These are process-local and reset on restart; they
+  are also emitted as `tracing` events under target `mempalace_metrics`.
+
+Operational rules:
+
+- A remote outage does **not** require re-applying the originating MCP tool
+  call. The queued intent retries indefinitely with bounded exponential backoff
+  and jitter; fix the remote and watch `replication.backlog` drain.
+- A `recent_terminal_failures` entry is the terminal answer: the remote
+  authoritatively rejected that mutation (wrong credentials, or a stable-
+  identity conflict the receiver would repeat on every retry). Resubmitting the
+  tool call unchanged will reproduce the same terminal result. Investigate the
+  `last_error` instead.
+- On restart, startup reconciliation settles intents whose local mutation never
+  committed: committed mutations are activated and delivered, uncommitted
+  intents are cancelled. You do not need to intervene for a clean shutdown, but
+  a hard power loss mid-write leaves exactly this two-step recovery to the next
+  `McpServer` start.
+
 ## Troubleshooting
 
 ### `No palace found at ...`

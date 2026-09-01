@@ -46,10 +46,10 @@ use mempalace_federation::{
     ChangesResponse, CheckDuplicateRequest, CheckDuplicateResponse, CoordinationArtifactDto,
     CoordinationEventDto, CoordinationEventsQuery, CoordinationEventsResponse,
     CoordinationMessageDto, CoordinationTaskDto, CoordinationTaskResultDto, CoordinationTaskState,
-    DrawerSearchRequest, DrawerSearchResponse, ErrorBody, FEDERATION_API_VERSION, InboxPageResponse,
-    InboxQuery, InfoResponse, IngestBatchRequest, IngestBatchResponse, IngestFileResult,
-    KgAddFactRequest, KgInvalidateRequest, KgQueryRequest, ListDrawersQuery, ListDrawersResponse,
-    MaintenanceAbortReason as FedMaintenanceAbortReason,
+    DeleteDrawerQuery, DrawerSearchRequest, DrawerSearchResponse, ErrorBody,
+    FEDERATION_API_VERSION, InboxPageResponse, InboxQuery, InfoResponse, IngestBatchRequest,
+    IngestBatchResponse, IngestFileResult, KgAddFactRequest, KgInvalidateRequest, KgQueryRequest,
+    ListDrawersQuery, ListDrawersResponse, MaintenanceAbortReason as FedMaintenanceAbortReason,
     MaintenanceRunStatus as FedMaintenanceRunStatus,
     MaintenanceSkipReason as FedMaintenanceSkipReason, MaintenanceStatus, NewArtifactRequest,
     NewMessageRequest, NewTaskRequest, NewTaskResultRequest, RemoteDrawerResult, TaskLeaseRequest,
@@ -60,12 +60,13 @@ use mempalace_search::{SearchRuntime, SearchRuntimePolicy};
 use mempalace_storage::{
     Artifact as CoordinationArtifact, ChangeCursor, ChangeEvent, ChangeLogStore,
     CoordinationCursor, CoordinationEvent, CoordinationStore, CoordinationVisibility, DrawerFilter,
-    DrawerStore,
-    DuplicateStrategy, IngestCommitRequest, IngestManifestStore, MaintenanceAbortReason,
-    MaintenanceOutcome, MaintenanceRunSummary, MaintenanceSettings, MaintenanceSkipReason,
-    Message as CoordinationMessage, NewArtifact, NewMessage, NewTask, NewTaskResult,
-    RevisionedWrite, StorageEngine, Task as CoordinationTask,
-    TaskResult as CoordinationTaskResult, TaskState,
+    DrawerStore, DuplicateStrategy, EntityRegistryStore, IngestCommitRequest, IngestManifestStore,
+    KnowledgeGraphStore, MaintenanceAbortReason, MaintenanceOutcome, MaintenanceRunSummary,
+    MaintenanceSettings, MaintenanceSkipReason, Message as CoordinationMessage, NewArtifact,
+    NewMessage, NewReceipt, NewTask, NewTaskResult, RECEIPT_KIND_DRAWER_ADD,
+    RECEIPT_KIND_DRAWER_DELETE, RECEIPT_KIND_KG_ADD, RECEIPT_KIND_KG_INVALIDATE, ReceiptOutcome,
+    RevisionedWrite, StorageEngine, Task as CoordinationTask, TaskResult as CoordinationTaskResult,
+    TaskState,
 };
 use serde_json::{Value, json};
 use subtle::ConstantTimeEq;
@@ -130,6 +131,14 @@ pub enum ServerError {
     /// Attempted to add a drawer that is a near-duplicate of an existing one.
     #[error("duplicate detected")]
     Duplicate(Value),
+    /// A mutation replayed with the same `operation_id` but a different request body.
+    ///
+    /// The `operation_id` is a stable identity for the whole mutation: two different requests
+    /// must not silently share one response. The idempotency layer rejects the second consuming
+    /// request with this error so the caller's durable replication knows the operation id was
+    /// already used.
+    #[error("idempotency conflict: {0}")]
+    IdempotencyConflict(String),
     /// A coordination write was rejected because of the record's current
     /// revision or state — a concurrent writer moved it, another worker holds
     /// a live lease, the task is terminal, or the caller does not own the
@@ -232,6 +241,9 @@ impl IntoResponse for ServerError {
                 "near-duplicate content detected; add check_duplicate first if intentional"
                     .to_owned(),
             ),
+            Self::IdempotencyConflict(error) => {
+                (StatusCode::CONFLICT, "operation_id_conflict", error.clone())
+            }
             Self::CoordinationConflict { code, message, .. } => {
                 (StatusCode::CONFLICT, *code, message.clone())
             }
@@ -406,9 +418,9 @@ fn normalize_scope_wing(raw: &str) -> Result<Vec<String>, ServerError> {
         let prefixed = format!("{WING_PREFIX}{verbatim}");
         return Ok(vec![verbatim, prefixed]);
     }
-    WingId::normalized(trimmed)
-        .map(|wing| vec![wing.as_str().to_owned()])
-        .map_err(|err| ServerError::TokenFile(format!("invalid wing `{raw}` in token scope: {err}")))
+    WingId::normalized(trimmed).map(|wing| vec![wing.as_str().to_owned()]).map_err(|err| {
+        ServerError::TokenFile(format!("invalid wing `{raw}` in token scope: {err}"))
+    })
 }
 
 /// Wings visible to a token for a given operation. Returned by
@@ -967,10 +979,7 @@ where
             "/v1/drawers",
             post(route_drawers_add::<P>).layer(middleware::from_fn(require_write)),
         )
-        .route(
-            "/v1/drawers",
-            get(route_drawers_list::<P>).layer(middleware::from_fn(require_read)),
-        )
+        .route("/v1/drawers", get(route_drawers_list::<P>).layer(middleware::from_fn(require_read)))
         .route(
             "/v1/drawers/{id}",
             get(route_drawers_get::<P>).layer(middleware::from_fn(require_read)),
@@ -1262,6 +1271,7 @@ where
             "taxonomy".to_owned(),
             "ingest".to_owned(),
             "coordination".to_owned(),
+            "idempotent_mutations".to_owned(),
         ],
         maintenance_enabled: state.config.maintenance.enabled,
         maintenance_background_enabled: state.config.maintenance.background_enabled,
@@ -1402,6 +1412,77 @@ where
         return Err(ServerError::Forbidden);
     }
 
+    let operation_id = body.operation_id.clone();
+    // Resolve the drawer identity. A caller-supplied `drawer_id` is preserved
+    // verbatim so replicated adds converge on a stable identity instead of the
+    // receiver minting a fresh one; when absent, the first attempt derives one
+    // and the receipt pins it so crash recovery re-applies to the same id.
+    let resolved_target_id = match &body.drawer_id {
+        Some(supplied) => DrawerId::new(supplied)?,
+        None => generated_drawer_id(
+            "drawer",
+            wing.as_str(),
+            room.as_str(),
+            &body.content,
+            OffsetDateTime::now_utc(),
+        )?,
+    };
+    // The drawer id to actually store. Set once a receipt pins the target on the
+    // first attempt and then consulted (unchanged) on recovery, so a re-applied
+    // mutation lands on the same id instead of a freshly derived one.
+    let mut pinned_drawer_id: Option<String> = None;
+    let receipts = state.storage.receipt_store();
+
+    if let Some(op) = &operation_id {
+        let request_hash = mutation_request_hash(&[
+            ("wing", json!(body.wing)),
+            ("room", json!(body.room)),
+            ("content", json!(&body.content)),
+            ("source_file", json!(&body.source_file)),
+            ("added_by", json!(&body.added_by)),
+            ("drawer_id", json!(&body.drawer_id)),
+        ]);
+        let outcome = receipts.begin_receipt(&NewReceipt {
+            operation_id: op.clone(),
+            operation_kind: RECEIPT_KIND_DRAWER_ADD.to_owned(),
+            request_hash,
+            target_id: resolved_target_id.as_str().to_owned(),
+        })?;
+
+        match outcome {
+            ReceiptOutcome::Conflict { .. } => {
+                return Err(ServerError::IdempotencyConflict(format!(
+                    "operation `{op}` was already used by a different add request"
+                )));
+            }
+            ReceiptOutcome::Replay(receipt) => {
+                // Identical request already completed: replay the durable response,
+                // performing no side effects.
+                let response = receipt.response.unwrap_or_else(|| json!({"success": true}));
+                return Ok(Json(response));
+            }
+            ReceiptOutcome::Recover(receipt) => {
+                pinned_drawer_id = Some(receipt.target_id.clone());
+                // A prior attempt started but never completed (crash). Inspect the stable target
+                // state: if the drawer already exists the add already applied, so converge on the
+                // pinned target id and complete the receipt instead of re-running the mutation.
+                let target = DrawerId::new(&receipt.target_id)?;
+                if state.storage.drawer_store().get_drawer(&target).await?.is_some() {
+                    let response = serde_json::to_value(add_drawer_response(
+                        &receipt.target_id,
+                        wing.as_str(),
+                        room.as_str(),
+                    ))?;
+                    receipts.complete_receipt(op, &response)?;
+                    return Ok(Json(response));
+                }
+            }
+            ReceiptOutcome::Fresh(receipt) => {
+                pinned_drawer_id = Some(receipt.target_id.clone());
+            }
+        }
+    }
+
     // Duplicate check. `find_duplicates` scans every wing, but this handler
     // has only established that the caller may WRITE `wing` — not that it may
     // READ whatever wing a near-duplicate happens to live in. Filtering only
@@ -1440,8 +1521,13 @@ where
     };
 
     let now = OffsetDateTime::now_utc();
-    let drawer_id =
-        generated_drawer_id("drawer", wing.as_str(), room.as_str(), &body.content, now)?;
+    // When an operation_id is present the identity was pinned by the receipt's `target_id` on the
+    // first attempt — either the caller-supplied id (preserved verbatim) or the derived one — so a
+    // recovered re-apply lands on the exact same drawer rather than generating a fresh id.
+    let drawer_id = match pinned_drawer_id {
+        Some(pinned) => DrawerId::new(&pinned)?,
+        None => resolved_target_id,
+    };
     let source_file = body.source_file.unwrap_or_default();
     let record = build_drawer_record(
         &state,
@@ -1476,12 +1562,15 @@ where
         details_json: Some(json!({"wing": wing.as_str(), "room": room.as_str()}).to_string()),
     })?;
 
-    Ok(Json(AddDrawerResponse {
-        success: true,
-        drawer_id: Some(drawer_id.as_str().to_owned()),
-        wing: Some(wing.as_str().to_owned()),
-        room: Some(room.as_str().to_owned()),
-    }))
+    let response = serde_json::to_value(add_drawer_response(
+        drawer_id.as_str(),
+        wing.as_str(),
+        room.as_str(),
+    ))?;
+    if let Some(op) = operation_id {
+        receipts.complete_receipt(&op, &response)?;
+    }
+    Ok(Json(response))
 }
 
 // ─── Drawers: check duplicate ─────────────────────────────────────────────────
@@ -1569,19 +1658,59 @@ async fn route_drawers_delete<P>(
     State(state): State<Arc<ServerState<P>>>,
     auth: axum::extract::Extension<AuthIdentity>,
     Path(id): Path<String>,
+    Query(params): Query<DeleteDrawerQuery>,
 ) -> Result<impl IntoResponse, ServerError>
 where
     P: EmbeddingProvider + Send + Sync + 'static,
 {
     let drawer_id = DrawerId::new(&id)?;
 
-    // Check the drawer exists and is not a diary drawer
-    let drawer = state
-        .storage
-        .drawer_store()
-        .get_drawer(&drawer_id)
-        .await?
-        .ok_or_else(|| ServerError::NotFound(format!("drawer {id} not found")))?;
+    let operation_id = params.operation_id.clone();
+    let receipts = state.storage.receipt_store();
+
+    // Idempotency gate. Without an `operation_id` the behaviour below is exactly the legacy one.
+    if let Some(op) = &operation_id {
+        let request_hash = mutation_request_hash(&[("drawer_id", json!(id))]);
+        let outcome = receipts.begin_receipt(&NewReceipt {
+            operation_id: op.clone(),
+            operation_kind: RECEIPT_KIND_DRAWER_DELETE.to_owned(),
+            request_hash,
+            target_id: id.clone(),
+        })?;
+        match outcome {
+            ReceiptOutcome::Conflict { .. } => {
+                return Err(ServerError::IdempotencyConflict(format!(
+                    "operation `{op}` was already used by a different delete request"
+                )));
+            }
+            ReceiptOutcome::Replay(receipt) => {
+                // Identical request already completed: replay the durable response, performing no
+                // side effects.
+                let response = receipt.response.unwrap_or_else(|| json!({"success": true}));
+                return Ok(Json(response));
+            }
+            ReceiptOutcome::Recover(_) | ReceiptOutcome::Fresh(_) => {}
+        }
+    }
+
+    // Check the drawer exists and is not a diary drawer.
+    let drawer = state.storage.drawer_store().get_drawer(&drawer_id).await?;
+
+    let Some(drawer) = drawer else {
+        // Target absent. With an `operation_id` this is a converged end state — exactly the
+        // "operation-aware delete is idempotent when already absent" requirement: a crash that
+        // applied the delete but never completed the receipt, or a delete racing a concurrent
+        // delete, leaves the same durable state as a fresh delete would. The per-route operation
+        // gate already proved the caller holds the `delete` operation, and an absent target leaks
+        // no wing it cannot read, so the legacy 404 becomes a 200 with the receipt completed.
+        // Legacy requests (no `operation_id`) keep the 404.
+        if let Some(op) = &operation_id {
+            let response = json!({"success": true});
+            receipts.complete_receipt(op, &response)?;
+            return Ok(Json(response));
+        }
+        return Err(ServerError::NotFound(format!("drawer {id} not found")));
+    };
 
     if is_diary_wing_or_room(drawer.wing.as_str(), drawer.room.as_str()) {
         return Err(ServerError::NotFound(format!("drawer {id} not found")));
@@ -1596,24 +1725,32 @@ where
 
     let deleted =
         state.storage.drawer_store().delete_drawers(std::slice::from_ref(&drawer_id)).await?;
+    let response = json!({"success": true});
 
-    if deleted == 0 {
+    // Operation-aware delete is idempotent when the target is already absent: whether the delete
+    // removed a row now or the row was already gone (a racing concurrent delete), the converged
+    // state is identical, so `deleted == 0` is success rather than a 404. Legacy requests (no
+    // `operation_id`) keep the exact historical edge behaviour: a zero-row delete is a 404.
+    if deleted == 0 && operation_id.is_none() {
         return Err(ServerError::NotFound(format!("drawer {id} not found")));
     }
-
-    state.storage.operational_store().append_event(&ChangeEvent {
-        event_type: "drawer_deleted".to_owned(),
-        occurred_at: OffsetDateTime::now_utc(),
-        entity_id: id,
-        actor: Some(identity),
-        // wing/room recorded so `/v1/changes` (Group C) can filter deletion
-        // events by scope the same way it already filters `drawer_added`.
-        details_json: Some(
-            json!({"wing": drawer.wing.as_str(), "room": drawer.room.as_str()}).to_string(),
-        ),
-    })?;
-
-    Ok(Json(json!({"success": true})))
+    if deleted > 0 {
+        state.storage.operational_store().append_event(&ChangeEvent {
+            event_type: "drawer_deleted".to_owned(),
+            occurred_at: OffsetDateTime::now_utc(),
+            entity_id: id,
+            actor: Some(identity),
+            // wing/room recorded so `/v1/changes` (Group C) can filter deletion
+            // events by scope the same way it already filters `drawer_added`.
+            details_json: Some(
+                json!({"wing": drawer.wing.as_str(), "room": drawer.room.as_str()}).to_string(),
+            ),
+        })?;
+    }
+    if let Some(op) = operation_id {
+        receipts.complete_receipt(&op, &response)?;
+    }
+    Ok(Json(response))
 }
 
 // ─── Drawers: list ───────────────────────────────────────────────────────────
@@ -1754,6 +1891,88 @@ where
     let valid_from = body.valid_from.as_deref().map(parse_date).transpose()?;
     let runtime = KnowledgeGraphRuntime::new(state.storage.operational_store());
     let now = OffsetDateTime::now_utc();
+
+    let operation_id = body.operation_id.clone();
+    let receipts = state.storage.receipt_store();
+
+    // Idempotency gate. `add_fact` is itself idempotent over the triple (it returns the existing
+    // active fact id instead of creating a duplicate), so the real risks on a replay are the
+    // duplicate change event and the duplicate work. A completed receipt short-circuits both.
+    if let Some(op) = &operation_id {
+        let request_hash = mutation_request_hash(&[
+            ("subject", json!(&body.subject)),
+            ("predicate", json!(&body.predicate)),
+            ("object", json!(&body.object)),
+            ("valid_from", json!(&body.valid_from)),
+        ]);
+        let outcome = receipts.begin_receipt(&NewReceipt {
+            operation_id: op.clone(),
+            operation_kind: RECEIPT_KIND_KG_ADD.to_owned(),
+            request_hash,
+            target_id: canonical_kg_triple(&body.subject, &body.predicate, &body.object),
+        })?;
+        match outcome {
+            ReceiptOutcome::Conflict { .. } => {
+                return Err(ServerError::IdempotencyConflict(format!(
+                    "operation `{op}` was already used by a different kg add request"
+                )));
+            }
+            ReceiptOutcome::Replay(receipt) => {
+                let response = receipt.response.unwrap_or_else(|| json!({"success": true}));
+                return Ok(Json(response));
+            }
+            ReceiptOutcome::Recover(_receipt) => {
+                // A prior attempt started but never completed (crash). Inspect the stable target
+                // state: if the exact triple is already present the add already took effect, so
+                // converge (the receipt's target id is that triple) and skip the change event.
+                let effect_present = kg_fact_exists(
+                    &runtime,
+                    &body.subject,
+                    &body.predicate,
+                    &body.object,
+                    valid_from,
+                )?;
+                let triple_id = runtime.add_fact(
+                    AddFactRequest {
+                        subject: body.subject.clone(),
+                        subject_type: infer_entity_kind(&body.subject),
+                        predicate: body.predicate.clone(),
+                        object: body.object.clone(),
+                        object_type: infer_entity_kind(&body.object),
+                        valid_from,
+                        valid_to: None,
+                        confidence: 1.0,
+                        source_drawer_id: None,
+                        source_file: None,
+                    },
+                    now,
+                )?;
+                if !effect_present {
+                    state.storage.operational_store().append_event(&ChangeEvent {
+                        event_type: "kg_fact_added".to_owned(),
+                        occurred_at: now,
+                        entity_id: triple_id.clone(),
+                        actor: Some(identity),
+                        details_json: Some(
+                            json!({"subject": body.subject, "predicate": body.predicate,
+                                   "object": body.object})
+                            .to_string(),
+                        ),
+                    })?;
+                }
+                let response = json!({
+                    "success": true,
+                    "triple_id": triple_id,
+                    "fact": format!("{} → {} → {}", body.subject, body.predicate, body.object),
+                });
+                receipts.complete_receipt(op, &response)?;
+                return Ok(Json(response));
+            }
+            ReceiptOutcome::Fresh(_) => {}
+        }
+    }
+
+    // Apply path: fresh intent, or a recovered intent whose effect was not yet present.
     let triple_id = runtime.add_fact(
         AddFactRequest {
             subject: body.subject.clone(),
@@ -1781,11 +2000,15 @@ where
         ),
     })?;
 
-    Ok(Json(json!({
+    let response = json!({
         "success": true,
         "triple_id": triple_id,
         "fact": format!("{} → {} → {}", body.subject, body.predicate, body.object),
-    })))
+    });
+    if let Some(op) = operation_id {
+        receipts.complete_receipt(&op, &response)?;
+    }
+    Ok(Json(response))
 }
 
 // ─── KG: invalidate ──────────────────────────────────────────────────────────
@@ -1810,8 +2033,47 @@ where
         .unwrap_or_else(|| OffsetDateTime::now_utc().date());
     let now = OffsetDateTime::now_utc();
     let runtime = KnowledgeGraphRuntime::new(state.storage.operational_store());
+
+    let operation_id = body.operation_id.clone();
+    let receipts = state.storage.receipt_store();
+
+    // Idempotency gate for the invalidate replay path.
+    if let Some(op) = &operation_id {
+        let request_hash = mutation_request_hash(&[
+            ("subject", json!(&body.subject)),
+            ("predicate", json!(&body.predicate)),
+            ("object", json!(&body.object)),
+            ("ended", json!(&body.ended)),
+        ]);
+        let outcome = receipts.begin_receipt(&NewReceipt {
+            operation_id: op.clone(),
+            operation_kind: RECEIPT_KIND_KG_INVALIDATE.to_owned(),
+            request_hash,
+            target_id: canonical_kg_triple(&body.subject, &body.predicate, &body.object),
+        })?;
+        match outcome {
+            ReceiptOutcome::Conflict { .. } => {
+                return Err(ServerError::IdempotencyConflict(format!(
+                    "operation `{op}` was already used by a different kg invalidate request"
+                )));
+            }
+            ReceiptOutcome::Replay(receipt) => {
+                let response = receipt.response.unwrap_or_else(|| json!({"success": true}));
+                return Ok(Json(response));
+            }
+            ReceiptOutcome::Recover(_) | ReceiptOutcome::Fresh(_) => {}
+        }
+    }
+
+    // Apply path. `invalidate_active_fact` is idempotent over the triple: invalidating an already
+    // invalidated (or absent) fact returns 0, which is a converged end state for an operation-aware
+    // replay. An unknown entity is likewise a converged absence rather than a hard error.
     let invalidated =
-        runtime.invalidate(&body.subject, &body.predicate, &body.object, ended, now)?;
+        match runtime.invalidate(&body.subject, &body.predicate, &body.object, ended, now) {
+            Ok(count) => count,
+            Err(mempalace_graph::GraphError::UnknownEntity { .. }) if operation_id.is_some() => 0,
+            Err(error) => return Err(error.into()),
+        };
 
     if invalidated > 0 {
         state.storage.operational_store().append_event(&ChangeEvent {
@@ -1827,12 +2089,23 @@ where
         })?;
     }
 
-    Ok(Json(json!({
-        "success": invalidated > 0,
+    // Legacy shape: `success` mirrors whether a row was invalidated. Operation-aware requests treat
+    // a converged state (already invalidated, or absent) as success, so replayed invalidates do not
+    // surface an error.
+    let success = match &operation_id {
+        Some(_) => true,
+        None => invalidated > 0,
+    };
+    let response = json!({
+        "success": success,
         "invalidated": invalidated,
         "fact": format!("{} → {} → {}", body.subject, body.predicate, body.object),
         "ended": body.ended.unwrap_or_else(|| "today".to_owned()),
-    })))
+    });
+    if let Some(op) = operation_id {
+        receipts.complete_receipt(&op, &response)?;
+    }
+    Ok(Json(response))
 }
 
 // ─── KG: timeline ─────────────────────────────────────────────────────────────
@@ -2613,7 +2886,11 @@ fn resolve_owning_task(
     // not an existence-oracle risk the way a differently-coded read would be,
     // so there is no reason to mask it instead.
     if is_diary_wing_or_room(&task.wing, "") {
-        return Err(if op == Operation::CoordinationRead { mask() } else { ServerError::DiaryNotFederated });
+        return Err(if op == Operation::CoordinationRead {
+            mask()
+        } else {
+            ServerError::DiaryNotFederated
+        });
     }
     if !auth.allows_wing(op, &task.wing) {
         return Err(mask());
@@ -2670,7 +2947,10 @@ fn authorize_replay_wing(auth: &AuthIdentity, wing: &str) -> Result<(), ServerEr
 /// guaranteed to exist by the foreign key `coordination.rs`'s schema
 /// declares; a missing task here would mean that invariant broke, which
 /// surfaces as an ordinary 500 rather than being silently swallowed.
-fn owning_task_wing(coordination: &CoordinationStore, task_id: &str) -> Result<String, ServerError> {
+fn owning_task_wing(
+    coordination: &CoordinationStore,
+    task_id: &str,
+) -> Result<String, ServerError> {
     Ok(coordination
         .get_task(task_id)?
         .ok_or_else(|| {
@@ -2920,9 +3200,7 @@ fn message_to_dto(message: CoordinationMessage) -> Result<CoordinationMessageDto
     })
 }
 
-fn artifact_to_dto(
-    artifact: CoordinationArtifact,
-) -> Result<CoordinationArtifactDto, ServerError> {
+fn artifact_to_dto(artifact: CoordinationArtifact) -> Result<CoordinationArtifactDto, ServerError> {
     Ok(CoordinationArtifactDto {
         artifact_id: artifact.artifact_id,
         task_id: artifact.task_id,
@@ -3777,9 +4055,94 @@ fn generated_drawer_id(
     DrawerId::new(format!("{prefix}_{wing}_{room}_{suffix}")).map_err(ServerError::Id)
 }
 
+/// Builds the add-drawer success response shared by the live apply path and the idempotent replay
+/// path, so both wire the identical shape.
+fn add_drawer_response(drawer_id: &str, wing: &str, room: &str) -> AddDrawerResponse {
+    AddDrawerResponse {
+        success: true,
+        drawer_id: Some(drawer_id.to_owned()),
+        wing: Some(wing.to_owned()),
+        room: Some(room.to_owned()),
+    }
+}
+
 /// Computes the BLAKE3 hex hash of a text string.
 fn hash_text(content: &str) -> String {
     mempalace_core::hash_text(content)
+}
+
+/// Canonical request hash for an idempotent mutation receipt.
+///
+/// Hashes exactly the fields that determine a mutation's effect, so two requests that would
+/// produce different effects can never collide on the same `operation_id`. `serde_json::Map`
+/// (without the `preserve_order` feature) sorts keys lexicographically, keeping the serialised
+/// form — and therefore the hash — deterministic for identical requests.
+fn mutation_request_hash(fields: &[(&str, serde_json::Value)]) -> String {
+    let mut object = serde_json::Map::new();
+    for (key, value) in fields {
+        object.insert((*key).to_owned(), value.clone());
+    }
+    let canonical = serde_json::to_string(&serde_json::Value::Object(object)).unwrap_or_default();
+    mempalace_core::hash_text(&canonical)
+}
+
+/// Canonical KG label used as the stable target identity for a triple.
+///
+/// Mirrors `mempalace-graph`'s private `canonicalize_label` so effect-inspection can compare
+/// against stored predicates without reaching into graph internals. See the identical mirror in
+/// `infer_entity_kind`.
+fn canonical_kg_label(value: &str) -> String {
+    let mut normalized = String::new();
+    let mut last_was_sep = false;
+    for ch in value.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            normalized.push(ch.to_ascii_lowercase());
+            last_was_sep = false;
+        } else if !last_was_sep {
+            normalized.push('_');
+            last_was_sep = true;
+        }
+    }
+    normalized.trim_matches('_').to_owned()
+}
+
+/// Stable target identity for a KG mutation receipt: the canonicalised triple.
+fn canonical_kg_triple(subject: &str, predicate: &str, object: &str) -> String {
+    format!(
+        "{} → {} → {}",
+        canonical_kg_label(subject),
+        canonical_kg_label(predicate),
+        canonical_kg_label(object)
+    )
+}
+
+/// Inspect the stable target state for a KG fact-add: is the exact triple already present?
+///
+/// This is the "recover safely by inspecting stable target state" check for the KG-add handler. A
+/// pending receipt means the prior attempt may have applied the add before crashing; querying the
+/// entity avoids re-running the mutation (and re-appending the change event) when its effect is
+/// already durable. Unknown subject entities are treated as *not present* — the add cannot have
+/// taken effect because the entity does not exist — rather than as an error.
+fn kg_fact_exists<S>(
+    runtime: &KnowledgeGraphRuntime<'_, S>,
+    subject: &str,
+    predicate: &str,
+    object: &str,
+    valid_from: Option<Date>,
+) -> Result<bool, ServerError>
+where
+    S: EntityRegistryStore + KnowledgeGraphStore,
+{
+    let expected_predicate = canonical_kg_label(predicate);
+    match runtime.query_entity(subject, None, QueryDirection::Outgoing) {
+        Err(mempalace_graph::GraphError::UnknownEntity { .. }) => Ok(false),
+        Err(error) => Err(error.into()),
+        Ok(rows) => Ok(rows.iter().any(|row| {
+            row.predicate == expected_predicate
+                && row.object.eq_ignore_ascii_case(object)
+                && row.valid_from == valid_from.map(format_date)
+        })),
+    }
 }
 
 /// Formats an `OffsetDateTime` as RFC 3339.
@@ -4214,7 +4577,10 @@ mod tests {
         .unwrap();
         restrict_token_file(&token_file);
         let registry = TokenRegistry::load(token_file.clone()).unwrap();
-        assert_eq!(registry.authenticate(ALICE_TOKEN).as_ref().map(AuthIdentity::name), Some("alice"));
+        assert_eq!(
+            registry.authenticate(ALICE_TOKEN).as_ref().map(AuthIdentity::name),
+            Some("alice")
+        );
         assert!(registry.authenticate("").is_none());
 
         std::thread::sleep(std::time::Duration::from_millis(1100));
@@ -4236,7 +4602,10 @@ mod tests {
         .unwrap();
         restrict_token_file(&token_file);
         let registry = TokenRegistry::load(token_file.clone()).unwrap();
-        assert_eq!(registry.authenticate(ALICE_TOKEN).as_ref().map(AuthIdentity::name), Some("alice"));
+        assert_eq!(
+            registry.authenticate(ALICE_TOKEN).as_ref().map(AuthIdentity::name),
+            Some("alice")
+        );
 
         std::thread::sleep(std::time::Duration::from_millis(1100));
         std::fs::remove_file(&token_file).unwrap();
@@ -4259,7 +4628,10 @@ mod tests {
         )
         .unwrap();
         restrict_token_file(&token_file);
-        assert_eq!(registry.authenticate(ALICE_TOKEN).as_ref().map(AuthIdentity::name), Some("alice"));
+        assert_eq!(
+            registry.authenticate(ALICE_TOKEN).as_ref().map(AuthIdentity::name),
+            Some("alice")
+        );
     }
 
     // ─── 3. Add + search + get ────────────────────────────────────────────────
@@ -4614,6 +4986,581 @@ mod tests {
             .unwrap();
         let del2_resp = harness.router.clone().oneshot(del2_req).await.unwrap();
         assert_eq!(del2_resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ─── 8b. Idempotent mutation receipts (issue #127, receiving side) ────────
+
+    #[tokio::test]
+    async fn info_advertises_idempotent_mutations_capability() {
+        let harness = make_harness().await;
+        let response = harness.router.oneshot(authed_get("/v1/info", ALICE_TOKEN)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        let capabilities = body["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|c| c.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            capabilities.contains(&"idempotent_mutations"),
+            "capabilities must advertise idempotent_mutations: {capabilities:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_with_operation_id_replays_success_and_conflicts_on_different_request() {
+        let harness = make_harness().await;
+
+        let op = "op-add-replay-1";
+        let first_payload = json!({
+            "wing": "wing_code",
+            "room": "idem-test",
+            "content": "idempotent add content alpha",
+            "operation_id": op,
+        });
+        let first = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/drawers",
+                ALICE_TOKEN,
+                first_payload.clone(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_body = body_json(first).await;
+        assert_eq!(first_body["success"], true);
+        let drawer_id = first_body["drawer_id"].as_str().unwrap().to_owned();
+
+        // Identical request replays success with the identical drawer id, no second drawer.
+        let replay = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(Method::POST, "/v1/drawers", ALICE_TOKEN, first_payload))
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::OK);
+        let replay_body = body_json(replay).await;
+        assert_eq!(replay_body["drawer_id"], drawer_id);
+
+        // The receipt is durably completed.
+        let receipt =
+            harness.state.storage.receipt_store().get_receipt(op).unwrap().expect("receipt exists");
+        assert_eq!(receipt.status, mempalace_storage::ReceiptState::Completed);
+
+        // Same operation id, different request → conflict.
+        let conflict_payload = json!({
+            "wing": "wing_code",
+            "room": "idem-test",
+            "content": "idempotent add content BETA different",
+            "operation_id": op,
+        });
+        let conflict = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/drawers",
+                ALICE_TOKEN,
+                conflict_payload,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(conflict.status(), StatusCode::CONFLICT, "different request under same op id");
+        let conflict_body = body_json(conflict).await;
+        assert_eq!(conflict_body["code"], "operation_id_conflict");
+
+        // Exactly one drawer exists under that id.
+        let get_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_get(&format!("/v1/drawers/{drawer_id}"), ALICE_TOKEN))
+            .await
+            .unwrap();
+        assert_eq!(get_resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn add_with_supplied_drawer_id_preserves_it() {
+        let harness = make_harness().await;
+
+        let supplied_id = "custom-replicated-drawer-id-0001";
+        let resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/drawers",
+                ALICE_TOKEN,
+                json!({
+                    "wing": "wing_code",
+                    "room": "idem-test",
+                    "content": "replicated add with a stable drawer id",
+                    "drawer_id": supplied_id,
+                    "operation_id": "op-add-supplied-1",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["drawer_id"], supplied_id);
+
+        let get_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_get(&format!("/v1/drawers/{supplied_id}"), ALICE_TOKEN))
+            .await
+            .unwrap();
+        assert_eq!(get_resp.status(), StatusCode::OK);
+        let get_body = body_json(get_resp).await;
+        assert_eq!(get_body["id"], supplied_id);
+    }
+
+    #[tokio::test]
+    async fn delete_with_operation_id_is_idempotent_when_already_absent() {
+        let harness = make_harness().await;
+
+        // Operation-aware delete of a never-existing drawer succeeds and is replayable.
+        let absent_id = "drawer_that_never_existed_42";
+        for _ in 0..2 {
+            let req = Request::builder()
+                .method(Method::DELETE)
+                .uri(format!("/v1/drawers/{absent_id}?operation_id=op-del-absent-1"))
+                .header(header::AUTHORIZATION, format!("Bearer {ALICE_TOKEN}"))
+                .body(Body::empty())
+                .unwrap();
+            let resp = harness.router.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "op-aware delete of absent target");
+            let body = body_json(resp).await;
+            assert_eq!(body["success"], true);
+        }
+
+        // Legacy delete of the same absent drawer still 404s.
+        let legacy_req = Request::builder()
+            .method(Method::DELETE)
+            .uri(format!("/v1/drawers/{absent_id}"))
+            .header(header::AUTHORIZATION, format!("Bearer {ALICE_TOKEN}"))
+            .body(Body::empty())
+            .unwrap();
+        let legacy_resp = harness.router.clone().oneshot(legacy_req).await.unwrap();
+        assert_eq!(legacy_resp.status(), StatusCode::NOT_FOUND);
+
+        // Operation-aware delete of a real drawer: first delete, then replay.
+        let add_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/drawers",
+                ALICE_TOKEN,
+                json!({
+                    "wing": "wing_code",
+                    "room": "idem-test",
+                    "content": "drawer to delete idempotently",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(add_resp.status(), StatusCode::OK);
+        let drawer_id = body_json(add_resp).await["drawer_id"].as_str().unwrap().to_owned();
+
+        let delete_uri = format!("/v1/drawers/{drawer_id}?operation_id=op-del-real-1");
+        for _ in 0..2 {
+            let req = Request::builder()
+                .method(Method::DELETE)
+                .uri(&delete_uri)
+                .header(header::AUTHORIZATION, format!("Bearer {ALICE_TOKEN}"))
+                .body(Body::empty())
+                .unwrap();
+            let resp = harness.router.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "replay of a completed delete");
+        }
+
+        // The drawer is gone.
+        let get_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_get(&format!("/v1/drawers/{drawer_id}"), ALICE_TOKEN))
+            .await
+            .unwrap();
+        assert_eq!(get_resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn kg_add_with_operation_id_replays_without_duplicating_fact() {
+        let harness = make_harness().await;
+
+        let op = "op-kg-add-1";
+        let payload = json!({
+            "subject": "Riley",
+            "predicate": "practices",
+            "object": "Chess",
+            "valid_from": "2026-02-01",
+            "operation_id": op,
+        });
+        let first = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/kg/facts",
+                ALICE_TOKEN,
+                payload.clone(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_body = body_json(first).await;
+        assert_eq!(first_body["success"], true);
+        let triple_id = first_body["triple_id"].as_str().unwrap().to_owned();
+
+        // Identical replay returns the same triple id and does not duplicate the fact.
+        let replay = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(Method::POST, "/v1/kg/facts", ALICE_TOKEN, payload))
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::OK);
+        let replay_body = body_json(replay).await;
+        assert_eq!(replay_body["triple_id"], triple_id);
+
+        // Exactly one fact row for the triple.
+        let query_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/kg/query",
+                ALICE_TOKEN,
+                json!({"entity": "Riley", "direction": "outgoing"}),
+            ))
+            .await
+            .unwrap();
+        let query_body = body_json(query_resp).await;
+        assert_eq!(query_body["count"], 1, "replayed kg add must not duplicate the fact");
+
+        // Same operation id, different request → conflict.
+        let bad = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/kg/facts",
+                ALICE_TOKEN,
+                json!({
+                    "subject": "Riley",
+                    "predicate": "practices",
+                    "object": "Tennis",
+                    "operation_id": op,
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), StatusCode::CONFLICT);
+        assert_eq!(body_json(bad).await["code"], "operation_id_conflict");
+    }
+
+    #[tokio::test]
+    async fn kg_add_recovers_pending_receipt_with_preapplied_effect() {
+        let harness = make_harness().await;
+
+        let op = "op-kg-add-recover-1";
+        let payload = json!({
+            "subject": "Robin",
+            "predicate": "runs",
+            "object": "Marathon",
+            "operation_id": op,
+        });
+        let first = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/kg/facts",
+                ALICE_TOKEN,
+                payload.clone(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let triple_id = body_json(first).await["triple_id"].as_str().unwrap().to_owned();
+
+        // Rewind the completed receipt to pending — the crash signature of "fact applied but the
+        // receipt was never completed". Recovery must detect the effect and converge without
+        // duplicating the fact or re-appending a change event.
+        let sqlite_path = harness.state.storage.layout().sqlite_path.clone();
+        {
+            let conn = rusqlite::Connection::open(&sqlite_path).unwrap();
+            conn.execute(
+                "UPDATE mutation_receipts SET status='pending', response_json=NULL, completed_at=NULL \
+                 WHERE operation_id=?1",
+                [op],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            harness.state.storage.receipt_store().get_receipt(op).unwrap().unwrap().status,
+            mempalace_storage::ReceiptState::Pending
+        );
+
+        let recovered = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(Method::POST, "/v1/kg/facts", ALICE_TOKEN, payload))
+            .await
+            .unwrap();
+        assert_eq!(recovered.status(), StatusCode::OK);
+        let recovered_body = body_json(recovered).await;
+        assert_eq!(recovered_body["triple_id"], triple_id);
+
+        // The fact still exists exactly once.
+        let query_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/kg/query",
+                ALICE_TOKEN,
+                json!({"entity": "Robin", "direction": "outgoing"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(body_json(query_resp).await["count"], 1);
+
+        assert_eq!(
+            harness.state.storage.receipt_store().get_receipt(op).unwrap().unwrap().status,
+            mempalace_storage::ReceiptState::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn kg_invalidate_with_operation_id_is_idempotent() {
+        let harness = make_harness().await;
+
+        let add_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/kg/facts",
+                ALICE_TOKEN,
+                json!({"subject": "Sam", "predicate": "manages", "object": "Team"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(add_resp.status(), StatusCode::OK);
+
+        let op = "op-kg-invalidate-1";
+        let payload = json!({
+            "subject": "Sam",
+            "predicate": "manages",
+            "object": "Team",
+            "ended": "2026-07-01",
+            "operation_id": op,
+        });
+        let first = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/kg/facts/invalidate",
+                ALICE_TOKEN,
+                payload.clone(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_body = body_json(first).await;
+        assert!(first_body["invalidated"].as_u64().unwrap() > 0);
+
+        // Replay returns the stored success response.
+        let replay = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/kg/facts/invalidate",
+                ALICE_TOKEN,
+                payload,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::OK);
+        assert_eq!(body_json(replay).await["success"], true);
+
+        // Invalidate of a never-added triple under an operation id is a converged success.
+        let never_added = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/kg/facts/invalidate",
+                ALICE_TOKEN,
+                json!({
+                    "subject": "Nobody",
+                    "predicate": "owns",
+                    "object": "Nothing",
+                    "operation_id": "op-kg-invalidate-2",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(never_added.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn add_recovers_pending_receipt_after_crash_without_effect() {
+        let harness = make_harness().await;
+
+        // Simulate a crash that happened *after* begin_receipt but *before* the mutation applied:
+        // a pending receipt exists with the exact request hash the handler will compute, and the
+        // target drawer does not exist yet. The retry must re-apply the mutation and complete.
+        let op = "op-add-recover-1";
+        let drawer_id = "recover-target-without-effect-0001";
+        let hash = mutation_request_hash(&[
+            ("wing", json!("wing_code")),
+            ("room", json!("idem-test")),
+            ("content", json!("recover pending receipt content")),
+            ("source_file", json!(Option::<String>::None)),
+            ("added_by", json!(Option::<String>::None)),
+            ("drawer_id", json!(Some(drawer_id.to_owned()))),
+        ]);
+        let receipts = harness.state.storage.receipt_store();
+        let outcome = receipts
+            .begin_receipt(&mempalace_storage::NewReceipt {
+                operation_id: op.to_owned(),
+                operation_kind: mempalace_storage::RECEIPT_KIND_DRAWER_ADD.to_owned(),
+                request_hash: hash,
+                target_id: drawer_id.to_owned(),
+            })
+            .unwrap();
+        assert!(matches!(outcome, mempalace_storage::ReceiptOutcome::Fresh(_)));
+
+        let resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/drawers",
+                ALICE_TOKEN,
+                json!({
+                    "wing": "wing_code",
+                    "room": "idem-test",
+                    "content": "recover pending receipt content",
+                    "drawer_id": Some(drawer_id),
+                    "operation_id": op,
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["success"], true);
+        assert_eq!(body["drawer_id"], drawer_id);
+
+        let receipt = receipts.get_receipt(op).unwrap().unwrap();
+        assert_eq!(receipt.status, mempalace_storage::ReceiptState::Completed);
+        assert_eq!(receipt.target_id, drawer_id);
+
+        // The mutation took effect exactly once.
+        let get_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_get(&format!("/v1/drawers/{drawer_id}"), ALICE_TOKEN))
+            .await
+            .unwrap();
+        assert_eq!(get_resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn add_recovers_pending_receipt_with_preapplied_effect() {
+        let harness = make_harness().await;
+
+        // First apply the mutation fully (drawer exists, receipt completed), then rewind the
+        // receipt to `pending` — the durable signature of a crash between the storage commit and
+        // the `complete_receipt` call. The retry must detect the effect via the target's stable
+        // state and converge without creating a second drawer.
+        let op = "op-add-recover-2";
+        let drawer_id = "recover-target-preapplied-0002";
+        let first_uri_payload = json!({
+            "wing": "wing_code",
+            "room": "idem-test",
+            "content": "recover preapplied effect content",
+            "drawer_id": Some(drawer_id),
+            "operation_id": op,
+        });
+        let first = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/drawers",
+                ALICE_TOKEN,
+                first_uri_payload,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(body_json(first).await["drawer_id"], drawer_id);
+
+        let sqlite_path = harness.state.storage.layout().sqlite_path.clone();
+        {
+            let conn = rusqlite::Connection::open(&sqlite_path).unwrap();
+            conn.execute(
+                "UPDATE mutation_receipts SET status='pending', response_json=NULL, completed_at=NULL \
+                 WHERE operation_id=?1",
+                [op],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            harness.state.storage.receipt_store().get_receipt(op).unwrap().unwrap().status,
+            mempalace_storage::ReceiptState::Pending,
+            "precondition: receipt rewound to pending"
+        );
+
+        let second = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/drawers",
+                ALICE_TOKEN,
+                json!({
+                    "wing": "wing_code",
+                    "room": "idem-test",
+                    "content": "recover preapplied effect content",
+                    "drawer_id": Some(drawer_id),
+                    "operation_id": op,
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        let second_body = body_json(second).await;
+        assert_eq!(second_body["success"], true);
+        assert_eq!(second_body["drawer_id"], drawer_id);
+
+        // The pending receipt completed again, and only one drawer exists under the target id.
+        assert_eq!(
+            harness.state.storage.receipt_store().get_receipt(op).unwrap().unwrap().status,
+            mempalace_storage::ReceiptState::Completed
+        );
+        let all = harness
+            .state
+            .storage
+            .drawer_store()
+            .list_drawers(&DrawerFilter::default())
+            .await
+            .unwrap();
+        let duplicates =
+            all.iter().filter(|drawer| drawer.id.as_str() == drawer_id).collect::<Vec<_>>();
+        assert_eq!(duplicates.len(), 1, "recovery must not duplicate the drawer");
     }
 
     /// URL-encodes the cursor string so it can be embedded in a query string.
@@ -5007,7 +5954,11 @@ mod tests {
             .oneshot(authed_get(&format!("/v1/drawers/{beta_id}"), ALICE_TOKEN))
             .await
             .unwrap();
-        assert_eq!(get_resp.status(), StatusCode::OK, "denied delete must not have removed the drawer");
+        assert_eq!(
+            get_resp.status(),
+            StatusCode::OK,
+            "denied delete must not have removed the drawer"
+        );
     }
 
     // Wrong operation with the right wing -> 403.
@@ -5126,10 +6077,7 @@ mod tests {
         // Pins the split: prefix aliasing still applies to a mixed-case
         // unprefixed entry, but neither alias it produces folds case —
         // `MyProject` must not become `myproject` on either spelling.
-        assert_eq!(
-            normalize_scope_wing("MyProject").unwrap(),
-            vec!["MyProject", "wing_MyProject"]
-        );
+        assert_eq!(normalize_scope_wing("MyProject").unwrap(), vec!["MyProject", "wing_MyProject"]);
     }
 
     #[test]
@@ -5260,13 +6208,20 @@ mod tests {
         let harness = make_harness().await;
         seed_two_wings(&harness).await;
 
-        let scoped =
-            harness.router.clone().oneshot(authed_get("/v1/taxonomy", SCOPED_ALPHA_TOKEN)).await.unwrap();
+        let scoped = harness
+            .router
+            .clone()
+            .oneshot(authed_get("/v1/taxonomy", SCOPED_ALPHA_TOKEN))
+            .await
+            .unwrap();
         assert_eq!(scoped.status(), StatusCode::OK);
         let scoped_body = body_json(scoped).await;
         let taxonomy = scoped_body["taxonomy"].as_object().unwrap();
         assert!(taxonomy.contains_key("wing_alpha"));
-        assert!(!taxonomy.contains_key("wing_beta"), "scoped token must not see wing_beta in taxonomy");
+        assert!(
+            !taxonomy.contains_key("wing_beta"),
+            "scoped token must not see wing_beta in taxonomy"
+        );
 
         let alice =
             harness.router.clone().oneshot(authed_get("/v1/taxonomy", ALICE_TOKEN)).await.unwrap();
@@ -5284,14 +6239,19 @@ mod tests {
         let harness = make_harness().await;
         seed_two_wings(&harness).await;
 
-        let scoped =
-            harness.router.clone().oneshot(authed_get("/v1/wings", SCOPED_ALPHA_TOKEN)).await.unwrap();
+        let scoped = harness
+            .router
+            .clone()
+            .oneshot(authed_get("/v1/wings", SCOPED_ALPHA_TOKEN))
+            .await
+            .unwrap();
         let scoped_body = body_json(scoped).await;
         let wings = scoped_body["wings"].as_object().unwrap();
         assert!(wings.contains_key("wing_alpha"));
         assert!(!wings.contains_key("wing_beta"));
 
-        let alice = harness.router.clone().oneshot(authed_get("/v1/wings", ALICE_TOKEN)).await.unwrap();
+        let alice =
+            harness.router.clone().oneshot(authed_get("/v1/wings", ALICE_TOKEN)).await.unwrap();
         let alice_body = body_json(alice).await;
         let alice_wings = alice_body["wings"].as_object().unwrap();
         assert!(alice_wings.contains_key("wing_alpha"));
@@ -5303,14 +6263,19 @@ mod tests {
         let harness = make_harness().await;
         seed_two_wings(&harness).await;
 
-        let scoped =
-            harness.router.clone().oneshot(authed_get("/v1/rooms", SCOPED_ALPHA_TOKEN)).await.unwrap();
+        let scoped = harness
+            .router
+            .clone()
+            .oneshot(authed_get("/v1/rooms", SCOPED_ALPHA_TOKEN))
+            .await
+            .unwrap();
         let scoped_body = body_json(scoped).await;
         let rooms = scoped_body["rooms"].as_object().unwrap();
         assert!(rooms.contains_key("alpha-room"));
         assert!(!rooms.contains_key("beta-room"), "scoped token must not see wing_beta's rooms");
 
-        let alice = harness.router.clone().oneshot(authed_get("/v1/rooms", ALICE_TOKEN)).await.unwrap();
+        let alice =
+            harness.router.clone().oneshot(authed_get("/v1/rooms", ALICE_TOKEN)).await.unwrap();
         let alice_body = body_json(alice).await;
         let alice_rooms = alice_body["rooms"].as_object().unwrap();
         assert!(alice_rooms.contains_key("alpha-room"));
@@ -5336,8 +6301,12 @@ mod tests {
             "scoped token must not see wing_beta's change events: {scoped_events:?}"
         );
 
-        let alice =
-            harness.router.clone().oneshot(authed_get("/v1/changes?limit=50", ALICE_TOKEN)).await.unwrap();
+        let alice = harness
+            .router
+            .clone()
+            .oneshot(authed_get("/v1/changes?limit=50", ALICE_TOKEN))
+            .await
+            .unwrap();
         let alice_body = body_json(alice).await;
         let alice_events = alice_body["events"].as_array().unwrap();
         assert!(alice_events.iter().any(|e| e["entity_id"] == alpha_id));
@@ -5382,8 +6351,12 @@ mod tests {
             "a wing-less event must fail closed (hidden) for a scoped token: {scoped_events:?}"
         );
 
-        let alice =
-            harness.router.clone().oneshot(authed_get("/v1/changes?limit=50", ALICE_TOKEN)).await.unwrap();
+        let alice = harness
+            .router
+            .clone()
+            .oneshot(authed_get("/v1/changes?limit=50", ALICE_TOKEN))
+            .await
+            .unwrap();
         let alice_body = body_json(alice).await;
         let alice_events = alice_body["events"].as_array().unwrap();
         assert!(
@@ -5439,7 +6412,11 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(scoped_resp.status(), StatusCode::OK, "must filter, not 403 — the caller does hold read");
+        assert_eq!(
+            scoped_resp.status(),
+            StatusCode::OK,
+            "must filter, not 403 — the caller does hold read"
+        );
         let scoped_body = body_json(scoped_resp).await;
         let scoped_matches = scoped_body["matches"].as_array().unwrap();
         assert!(
@@ -5523,7 +6500,11 @@ mod tests {
             .oneshot(authed_get(&format!("/v1/drawers/{drawer_id}"), SCOPED_ALPHA_TOKEN))
             .await
             .unwrap();
-        assert_eq!(get_resp.status(), StatusCode::OK, "the duplicate-content drawer must have committed");
+        assert_eq!(
+            get_resp.status(),
+            StatusCode::OK,
+            "the duplicate-content drawer must have committed"
+        );
     }
 
     // An unknown operation string in the token file is a load error.
@@ -5638,7 +6619,12 @@ mod tests {
         let alice_resp = harness
             .router
             .clone()
-            .oneshot(authed_json_request(Method::POST, "/v1/drawers/search", ALICE_TOKEN, query.clone()))
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/drawers/search",
+                ALICE_TOKEN,
+                query.clone(),
+            ))
             .await
             .unwrap();
         let alice_body = body_json(alice_resp).await;
@@ -5653,7 +6639,12 @@ mod tests {
         let scoped_resp = harness
             .router
             .clone()
-            .oneshot(authed_json_request(Method::POST, "/v1/drawers/search", SCOPED_ALPHA_TOKEN, query))
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/drawers/search",
+                SCOPED_ALPHA_TOKEN,
+                query,
+            ))
             .await
             .unwrap();
         let scoped_body = body_json(scoped_resp).await;
@@ -5713,7 +6704,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_pagination_reaches_full_page_when_visible_rows_are_outnumbered_by_invisible_ones() {
+    async fn list_pagination_reaches_full_page_when_visible_rows_are_outnumbered_by_invisible_ones()
+    {
         // Maintenance disabled so no background compaction can reorder rows
         // mid-test — `list_drawers` has no ranking (a plain storage scan),
         // so this test relies on insertion order: seeding the 3 invisible
@@ -6909,7 +7901,8 @@ mod tests {
     #[tokio::test]
     async fn info_advertises_coordination_capability() {
         let harness = make_harness().await;
-        let resp = harness.router.clone().oneshot(authed_get("/v1/info", ALICE_TOKEN)).await.unwrap();
+        let resp =
+            harness.router.clone().oneshot(authed_get("/v1/info", ALICE_TOKEN)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp).await;
         let capabilities = body["capabilities"].as_array().unwrap();
@@ -7155,8 +8148,11 @@ mod tests {
         assert_eq!(inbox_resp.status(), StatusCode::OK);
         let inbox = body_json(inbox_resp).await;
         let messages = inbox["messages"].as_array().unwrap();
-        assert!(messages.iter().any(|m| m["message_id"] == message_id
-            && m["acknowledged_by"] == "coord_alpha"));
+        assert!(
+            messages
+                .iter()
+                .any(|m| m["message_id"] == message_id && m["acknowledged_by"] == "coord_alpha")
+        );
     }
 
     /// Regression for Codex finding 3832912248: a federated acknowledgement
@@ -7343,7 +8339,10 @@ mod tests {
         let get_resp = harness
             .router
             .clone()
-            .oneshot(authed_get(&format!("/v1/coordination/results/{result_id}"), COORD_ALPHA_TOKEN))
+            .oneshot(authed_get(
+                &format!("/v1/coordination/results/{result_id}"),
+                COORD_ALPHA_TOKEN,
+            ))
             .await
             .unwrap();
         assert_eq!(get_resp.status(), StatusCode::OK);
@@ -7466,7 +8465,10 @@ mod tests {
         let resp = harness
             .router
             .clone()
-            .oneshot(authed_get(&format!("/v1/coordination/results/{result_id}"), COORD_ALPHA_TOKEN))
+            .oneshot(authed_get(
+                &format!("/v1/coordination/results/{result_id}"),
+                COORD_ALPHA_TOKEN,
+            ))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -7865,7 +8867,10 @@ mod tests {
         let without_events = harness
             .router
             .clone()
-            .oneshot(authed_get("/v1/coordination/events?wing=wing_ghost&limit=1", COORD_ALPHA_TOKEN))
+            .oneshot(authed_get(
+                "/v1/coordination/events?wing=wing_ghost&limit=1",
+                COORD_ALPHA_TOKEN,
+            ))
             .await
             .unwrap();
         assert_eq!(without_events.status(), StatusCode::OK);
@@ -8108,7 +9113,8 @@ mod tests {
 
         // coord_wide creates a task in wing_beta, then sends a message on it
         // under a key it will replay below.
-        let beta_task = create_task(&harness, COORD_WIDE_TOKEN, "wing_beta", "msg-replay-beta").await;
+        let beta_task =
+            create_task(&harness, COORD_WIDE_TOKEN, "wing_beta", "msg-replay-beta").await;
         let original = harness
             .router
             .clone()
@@ -8143,7 +9149,8 @@ mod tests {
         // Create a decoy task in the now-authorized wing_alpha, then replay
         // the message key against it. The replay must not return the
         // original wing_beta message.
-        let alpha_task = create_task(&harness, COORD_WIDE_TOKEN, "wing_alpha", "msg-replay-alpha").await;
+        let alpha_task =
+            create_task(&harness, COORD_WIDE_TOKEN, "wing_alpha", "msg-replay-alpha").await;
         let replay = harness
             .router
             .clone()
@@ -8262,7 +9269,8 @@ mod tests {
     async fn coordination_claim_with_oversized_lease_seconds_returns_400_not_a_panic() {
         let harness = make_harness().await;
         let task_id =
-            create_task(&harness, COORD_ALPHA_TOKEN, "wing_alpha", "oversized-lease-route-task").await;
+            create_task(&harness, COORD_ALPHA_TOKEN, "wing_alpha", "oversized-lease-route-task")
+                .await;
 
         let claim_resp = harness
             .router
@@ -8374,7 +9382,8 @@ mod tests {
 
         // A visible dependency still works normally.
         let visible_dependency =
-            create_task(&harness, COORD_ALPHA_TOKEN, "wing_alpha", "oracle-visible-dependency").await;
+            create_task(&harness, COORD_ALPHA_TOKEN, "wing_alpha", "oracle-visible-dependency")
+                .await;
         let visible_resp = harness
             .router
             .clone()

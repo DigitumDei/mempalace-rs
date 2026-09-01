@@ -11,6 +11,10 @@
           "description": "Verbatim content to store — exact words, never summarized",
           "type": "string"
         },
+        "operation_id": {
+          "description": "Stable idempotency key for a remote or durable dual-write retry (optional)",
+          "type": "string"
+        },
         "room": {
           "description": "Room (aspect: backend, decisions, meetings...)",
           "type": "string"
@@ -52,11 +56,15 @@
     }
   },
   "mempalace_delete_drawer": {
-    "description": "Delete a drawer by ID. Irreversible. Local deletion first by ID; if not found locally, falls back to remotes in name order. Does not use write routing.",
+    "description": "Delete a drawer by ID. Irreversible. Known local drawers follow write routing; write:both commits locally and queues durable replication. Unknown IDs fall back across remotes.",
     "input_schema": {
       "properties": {
         "drawer_id": {
           "description": "ID of the drawer to delete",
+          "type": "string"
+        },
+        "operation_id": {
+          "description": "Stable idempotency key for a remote or durable dual-write retry (optional)",
           "type": "string"
         }
       },
@@ -270,6 +278,10 @@
           "description": "The entity being connected to",
           "type": "string"
         },
+        "operation_id": {
+          "description": "Stable idempotency key for a remote or durable dual-write retry (optional)",
+          "type": "string"
+        },
         "predicate": {
           "description": "The relationship type (e.g. 'loves', 'works_on', 'daughter_of')",
           "type": "string"
@@ -305,6 +317,10 @@
         },
         "object": {
           "description": "Connected entity",
+          "type": "string"
+        },
+        "operation_id": {
+          "description": "Stable idempotency key for a remote or durable dual-write retry (optional)",
           "type": "string"
         },
         "predicate": {

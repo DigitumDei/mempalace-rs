@@ -547,8 +547,8 @@ a purely local concept — see [Part 4](#part-4--branch-aware-mining).
 > batch semantics *or* a clearly identified linked follow-up, this gap is intentionally
 > tracked as its own issue rather than silently absorbed into the MCP-only outbox work.
 >
-> **Proposed follow-up (draft, for the #127 coordination thread — issue #127 must not
-> be closed until this is created and linked):**
+> **Tracked follow-up:** [issue #131](https://github.com/DigitumDei/mempalace-rs/issues/131)
+> carries the durable, resumable batch-ingest work split from issue #127:
 >
 > - **Title:** `Durable resumable batch-ingest replication for write: both (issue #127 follow-up)`
 > - **Body:** `mempalace-cli mine` currently replicates `write: both` batches to
@@ -560,7 +560,8 @@ a purely local concept — see [Part 4](#part-4--branch-aware-mining).
 >   files. Acceptance: a crash mid-push is reconciled at next start; a retry never
 >   double-applies an already-replicated file; status exposes the pending/retryable/
 >   failed batch count.`
-> - **Blocks:** issue #127 closure.
+> Creating and linking issue #131 satisfies issue #127's explicit split-follow-up
+> requirement; implementation of the batch-specific guarantees remains scoped to #131.
 
 ## Part 4 — Branch-aware mining
 

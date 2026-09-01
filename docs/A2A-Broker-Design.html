@@ -1,0 +1,526 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Broker, Not Peer — MemPalace A2A design</title>
+<meta name="description" content="Design proposal resolving open question 3 of issue #102: MemPalace as an A2A broker rather than a peer, with wing_registry for agent cards.">
+<!--
+  Self-contained by design: no webfonts, no scripts, no external requests of any
+  kind. Open it straight from the filesystem. See docs/Coordination-Phase-3-Design.md
+  for the surrounding Phase 3 design and the numbered deviation list this refers to.
+-->
+<style>
+  :root {
+    --ground:      #F6F7F9;
+    --surface:     #FFFFFF;
+    --surface-alt: #EDEFF3;
+    --ink:         #1C2027;
+    --ink-soft:    #4A525E;
+    --ink-muted:   #6B7480;
+    --rule:        #DCE0E7;
+    --rule-strong: #C2C8D2;
+    --accent:      #8F6425;
+    --accent-soft: #F0E4D0;
+    --accent-edge: #C9A76F;
+    --caution:     #9C3A31;
+    --measure: 66ch;
+
+    --sans: "Segoe UI", Roboto, -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
+    --serif: Georgia, Cambria, "Times New Roman", Times, serif;
+    --mono: ui-monospace, "Cascadia Mono", "Segoe UI Mono", "SF Mono", Menlo, Consolas, monospace;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground:      #14181F;
+      --surface:     #1A1F27;
+      --surface-alt: #212832;
+      --ink:         #DDE2EA;
+      --ink-soft:    #A9B2BF;
+      --ink-muted:   #7F8896;
+      --rule:        #2A313C;
+      --rule-strong: #3A424F;
+      --accent:      #D9A253;
+      --accent-soft: #33291A;
+      --accent-edge: #6B5228;
+      --caution:     #E08A80;
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --ground:      #14181F;
+    --surface:     #1A1F27;
+    --surface-alt: #212832;
+    --ink:         #DDE2EA;
+    --ink-soft:    #A9B2BF;
+    --ink-muted:   #7F8896;
+    --rule:        #2A313C;
+    --rule-strong: #3A424F;
+    --accent:      #D9A253;
+    --accent-soft: #33291A;
+    --accent-edge: #6B5228;
+    --caution:     #E08A80;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--serif);
+    font-size: 17px;
+    line-height: 1.62;
+    margin: 0;
+    padding: 0 24px 96px;
+    -webkit-text-size-adjust: 100%;
+  }
+
+  .wrap { max-width: 760px; margin: 0 auto; }
+
+  header.masthead {
+    padding: 72px 0 32px;
+    border-bottom: 2px solid var(--rule-strong);
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+  }
+
+  .status {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+    font-family: var(--sans);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+  }
+
+  .chip {
+    padding: 4px 10px;
+    border-radius: 2px;
+    background: var(--accent-soft);
+    color: var(--accent);
+    border: 1px solid var(--accent-edge);
+  }
+
+  .chip.plain {
+    background: transparent;
+    color: var(--ink-muted);
+    border-color: var(--rule-strong);
+  }
+
+  h1 {
+    font-family: var(--sans);
+    font-weight: 700;
+    font-size: clamp(2.4rem, 7vw, 3.5rem);
+    line-height: 1.02;
+    letter-spacing: -0.022em;
+    margin: 0;
+    text-wrap: balance;
+  }
+
+  .standfirst {
+    font-size: 1.19rem;
+    line-height: 1.5;
+    color: var(--ink-soft);
+    margin: 0;
+    max-width: var(--measure);
+    text-wrap: pretty;
+  }
+
+  section { padding: 44px 0 0; }
+
+  h2 {
+    font-family: var(--sans);
+    font-weight: 600;
+    font-size: 1.44rem;
+    letter-spacing: -0.012em;
+    line-height: 1.22;
+    margin: 0 0 6px;
+    text-wrap: balance;
+  }
+
+  .eyebrow {
+    font-family: var(--sans);
+    font-size: 10.5px;
+    font-weight: 600;
+    letter-spacing: 0.13em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin: 0 0 10px;
+  }
+
+  p { max-width: var(--measure); margin: 0 0 15px; text-wrap: pretty; }
+  section > p:last-child { margin-bottom: 0; }
+  strong { font-weight: 700; }
+
+  code {
+    font-family: var(--mono);
+    font-size: 0.845em;
+    background: var(--surface-alt);
+    padding: 1.5px 5px;
+    border-radius: 3px;
+    border: 1px solid var(--rule);
+  }
+
+  blockquote {
+    margin: 22px 0;
+    padding: 16px 20px;
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-left: 3px solid var(--accent);
+    max-width: var(--measure);
+  }
+
+  blockquote p { margin: 0; font-style: italic; color: var(--ink-soft); }
+
+  blockquote cite {
+    display: block;
+    margin-top: 9px;
+    font-style: normal;
+    font-family: var(--sans);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.07em;
+    text-transform: uppercase;
+    color: var(--ink-muted);
+  }
+
+  figure { margin: 26px 0; padding: 0; overflow-x: auto; }
+  figure svg { display: block; min-width: 500px; width: 100%; height: auto; }
+
+  figcaption {
+    font-family: var(--sans);
+    font-size: 12px;
+    line-height: 1.45;
+    color: var(--ink-muted);
+    margin-top: 12px;
+    max-width: var(--measure);
+  }
+
+  .tablewrap { overflow-x: auto; margin: 22px 0; }
+
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    min-width: 460px;
+    font-size: 15px;
+  }
+
+  th, td {
+    text-align: left;
+    padding: 11px 14px;
+    border-bottom: 1px solid var(--rule);
+    vertical-align: top;
+  }
+
+  th {
+    font-family: var(--sans);
+    font-size: 10.5px;
+    font-weight: 600;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--ink-muted);
+    border-bottom: 1.5px solid var(--rule-strong);
+    white-space: nowrap;
+  }
+
+  tbody tr:last-child td { border-bottom: none; }
+
+  td.who {
+    font-family: var(--sans);
+    font-weight: 600;
+    font-size: 14px;
+    white-space: nowrap;
+  }
+
+  td.who .sub { font-weight: 400; color: var(--ink-muted); white-space: normal; }
+
+  .note {
+    margin: 22px 0;
+    padding: 15px 18px;
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-top: 2px solid var(--accent);
+    max-width: var(--measure);
+  }
+
+  .note.warn { border-top-color: var(--caution); }
+
+  .note h3 {
+    font-family: var(--sans);
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin: 0 0 7px;
+  }
+
+  .note.warn h3 { color: var(--caution); }
+  .note p { font-size: 15.5px; margin-bottom: 10px; }
+  .note p:last-child { margin-bottom: 0; }
+
+  ul.todo { list-style: none; padding: 0; margin: 20px 0 0; max-width: var(--measure); }
+
+  ul.todo li {
+    display: grid;
+    grid-template-columns: 22px 1fr;
+    gap: 10px;
+    padding: 11px 0;
+    border-bottom: 1px solid var(--rule);
+    font-size: 15.5px;
+    line-height: 1.5;
+  }
+
+  ul.todo li:last-child { border-bottom: none; }
+
+  ul.todo .box {
+    width: 13px; height: 13px;
+    margin-top: 6px;
+    border: 1.5px solid var(--rule-strong);
+    border-radius: 2px;
+  }
+
+  footer {
+    margin-top: 56px;
+    padding-top: 22px;
+    border-top: 1px solid var(--rule);
+    font-family: var(--sans);
+    font-size: 12.5px;
+    line-height: 1.55;
+    color: var(--ink-muted);
+    max-width: var(--measure);
+  }
+
+  a { color: var(--accent); text-underline-offset: 2px; }
+  a:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+
+  <header class="masthead">
+    <div class="status">
+      <span class="chip">Proposal</span>
+      <span class="chip plain">Resolves open question 3</span>
+      <span class="chip plain">Issue #102 &middot; Phase 3</span>
+    </div>
+    <h1>Broker, Not Peer</h1>
+    <p class="standfirst">A2A assumes every agent is a server with a URL. MemPalace is a mailbox. Reconciling those is not a compromise &mdash; the A2A spec already has first-class vocabulary for it, and using that vocabulary is what lets an agent on a laptop participate without ever opening a port.</p>
+  </header>
+
+  <section>
+    <p class="eyebrow">The question this answers</p>
+    <h2>Why the Agent Card was a shell</h2>
+    <p>Stage 5 shipped the <code>mempalace-a2a</code> mapping crate, but left one thing unbuildable. The A2A <code>AgentCard</code> requires <code>supported_interfaces</code>: a non-empty, ordered list where every entry carries a resolvable absolute HTTPS URL. We had no endpoint, so there was nothing truthful to put in it. The card was recorded as not spec-compliant for a live transport &mdash; deviation 25.</p>
+    <p>The instinct was to treat that as a missing feature: give the adapter an HTTP surface and fill the field in. That instinct is wrong, and the reason is worth stating precisely, because it changes what gets built.</p>
+  </section>
+
+  <section>
+    <p class="eyebrow">The reframing</p>
+    <h2>The disagreement is about who holds the socket</h2>
+    <p>A2A's default topology is peer-to-peer. Each agent is a server, has an address, and gets dialled. Discovery means fetching a card, reading a URL, and posting to it.</p>
+    <p>MemPalace is a broker. There are tasks, an inbox, and opaque cursors, and agents <em>pull</em> the work addressed to them. An agent behind a mailbox needs no inbound port, no TLS certificate, and no public address &mdash; which is exactly what makes an agent running on a laptop a first-class participant rather than a second-class one.</p>
+
+    <figure>
+      <svg viewBox="0 0 640 232" role="img" aria-labelledby="topo-title">
+        <title id="topo-title">Peer-to-peer topology, where four agents each expose an endpoint, contrasted with a broker topology, where one palace endpoint fronts four agents that poll it</title>
+        <defs>
+          <marker id="pull" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <path d="M0 0 L8 4 L0 8 z" fill="var(--ink-soft)"/>
+          </marker>
+        </defs>
+        <g font-family="var(--sans)">
+
+          <text x="0" y="14" font-size="10.5" font-weight="600" letter-spacing="1.3" fill="var(--ink-muted)">A2A DEFAULT &#8212; PEER TO PEER</text>
+
+          <g stroke="var(--rule-strong)" stroke-width="1" fill="none">
+            <path d="M62 74 L212 74" />
+            <path d="M62 158 L212 158" />
+            <path d="M62 74 L62 158" />
+            <path d="M212 74 L212 158" />
+            <path d="M62 74 L212 158" />
+            <path d="M212 74 L62 158" />
+          </g>
+
+          <g>
+            <circle cx="62"  cy="74"  r="21" fill="var(--surface)" stroke="var(--ink-soft)" stroke-width="1.5"/>
+            <circle cx="212" cy="74"  r="21" fill="var(--surface)" stroke="var(--ink-soft)" stroke-width="1.5"/>
+            <circle cx="62"  cy="158" r="21" fill="var(--surface)" stroke="var(--ink-soft)" stroke-width="1.5"/>
+            <circle cx="212" cy="158" r="21" fill="var(--surface)" stroke="var(--ink-soft)" stroke-width="1.5"/>
+          </g>
+
+          <g fill="var(--caution)">
+            <circle cx="79"  cy="59"  r="4.5"/>
+            <circle cx="229" cy="59"  r="4.5"/>
+            <circle cx="79"  cy="143" r="4.5"/>
+            <circle cx="229" cy="143" r="4.5"/>
+          </g>
+
+          <g font-size="11" font-weight="600" fill="var(--ink)" text-anchor="middle">
+            <text x="62"  y="78">A</text>
+            <text x="212" y="78">B</text>
+            <text x="62"  y="162">C</text>
+            <text x="212" y="162">D</text>
+          </g>
+
+          <text x="0" y="205" font-size="11.5" fill="var(--ink-soft)">Four agents, four public endpoints,</text>
+          <text x="0" y="221" font-size="11.5" fill="var(--ink-soft)">four certificates, four things to secure.</text>
+
+          <line x1="310" y1="26" x2="310" y2="214" stroke="var(--rule)" stroke-width="1" stroke-dasharray="3 4"/>
+
+          <text x="352" y="14" font-size="10.5" font-weight="600" letter-spacing="1.3" fill="var(--accent)">MEMPALACE &#8212; BROKER</text>
+
+          <rect x="356" y="92" width="104" height="48" rx="3" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.5"/>
+          <text x="408" y="112" font-size="11.5" font-weight="700" fill="var(--accent)" text-anchor="middle">PALACE</text>
+          <text x="408" y="127" font-size="9.5" font-weight="500" fill="var(--accent)" text-anchor="middle" letter-spacing="0.5">one endpoint</text>
+
+          <circle cx="460" cy="92" r="4.5" fill="var(--caution)"/>
+
+          <g stroke="var(--ink-soft)" stroke-width="1.2" fill="none" marker-end="url(#pull)">
+            <path d="M470 104 L556 62"/>
+            <path d="M470 111 L556 104"/>
+            <path d="M470 122 L556 146"/>
+            <path d="M470 129 L556 188"/>
+          </g>
+
+          <g>
+            <rect x="562" y="48"  width="66" height="26" rx="3" fill="var(--surface)" stroke="var(--rule-strong)" stroke-width="1.2"/>
+            <rect x="562" y="90"  width="66" height="26" rx="3" fill="var(--surface)" stroke="var(--rule-strong)" stroke-width="1.2"/>
+            <rect x="562" y="132" width="66" height="26" rx="3" fill="var(--surface)" stroke="var(--rule-strong)" stroke-width="1.2"/>
+            <rect x="562" y="174" width="66" height="26" rx="3" fill="var(--surface)" stroke="var(--rule-strong)" stroke-width="1.2"/>
+          </g>
+          <g font-size="10" font-weight="600" fill="var(--ink-soft)" text-anchor="middle">
+            <text x="595" y="65">tenant A</text>
+            <text x="595" y="107">tenant B</text>
+            <text x="595" y="149">tenant C</text>
+            <text x="595" y="191">tenant D</text>
+          </g>
+
+          <text x="352" y="205" font-size="11.5" fill="var(--ink-soft)">One endpoint. Agents pull; none of them</text>
+          <text x="352" y="221" font-size="11.5" fill="var(--ink-soft)">is dialled, so none needs an address.</text>
+        </g>
+      </svg>
+      <figcaption>Red dots mark a listening socket &mdash; something that must be reachable, certificated, and defended. Peer-to-peer needs one per agent. The broker needs one, total. Arrows point toward the agents because work flows to them on a connection <em>they</em> opened.</figcaption>
+    </figure>
+  </section>
+
+  <section>
+    <p class="eyebrow">The load-bearing find</p>
+    <h2>A2A already has a word for this</h2>
+    <p>This is not a departure from the protocol. <code>AgentInterface</code> carries an optional <code>tenant</code> field, and the v1.0.1 proto defines it as exactly the broker case:</p>
+
+    <blockquote>
+      <p>An opaque string used for routing requests to a specific agent or tenant when multiple agents are served behind a single A2A endpoint. When set, clients MUST include this value in the <code>tenant</code> field of all request messages sent to this interface.</p>
+      <cite>a2aproject/A2A &middot; specification/a2a.proto &middot; v1.0.1</cite>
+    </blockquote>
+
+    <p>The protocol deliberately leaves the format undefined &mdash; the server interprets it. That is the whole mechanism we need, already specified, already required of conforming clients.</p>
+
+    <div class="tablewrap">
+      <table>
+        <thead>
+          <tr><th>A2A concept</th><th>Maps to</th></tr>
+        </thead>
+        <tbody>
+          <tr><td class="who">supported_interfaces</td><td>One entry: the palace's own URL. There was only ever one endpoint to advertise.</td></tr>
+          <tr><td class="who">tenant</td><td>One registered agent. Many agents, one address.</td></tr>
+          <tr><td class="who">SUBMITTED</td><td><code>Pending</code> &mdash; already means &ldquo;accepted, nobody working it yet&rdquo;. An offline agent is not an error condition.</td></tr>
+          <tr><td class="who">Polling</td><td>Opaque cursors, already the stated compatibility baseline in issue #102.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>Resolving deviation 25 therefore costs nothing new. It is not an endpoint per agent; it is the recognition that the palace was the addressable thing all along.</p>
+  </section>
+
+  <section>
+    <p class="eyebrow">The honest cost</p>
+    <h2>Two capabilities we give up, and say so</h2>
+    <p><code>AgentCapabilities.streaming</code> and <code>push_notifications</code> are declarations <em>about the agent</em>. An agent that pulls from a mailbox cannot stream to a caller. The palace could stream on its behalf &mdash; but then it is asserting a property the registered agent does not have.</p>
+
+    <div class="note warn">
+      <h3>Declare both false and mean it</h3>
+      <p>Synthesising these at the broker is the same silent-coercion failure the crate already refuses everywhere else: a claim that reads as true, with the fact that it was manufactured left nowhere in the record. The crate returns coercion provenance rather than a bare <code>From</code> impl for precisely this reason. The broker should not quietly do at the capability layer what the state mapping is forbidden from doing at the value layer.</p>
+    </div>
+  </section>
+
+  <section>
+    <p class="eyebrow">The distinction to hold</p>
+    <h2>&ldquo;A2A adapter&rdquo; is two things</h2>
+    <p>Conflating these is the trap. They differ in who serves, and therefore in auth model, code path, and failure mode.</p>
+
+    <div class="tablewrap">
+      <table>
+        <thead>
+          <tr><th>Direction</th><th>Who serves</th><th>Shape</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="who">Inbound<br><span class="sub">external client &rarr; palace &rarr; agent</span></td>
+            <td class="who">Palace</td>
+            <td>Broker. Agent pulls. Needs <code>tenant</code> routing and per-agent authorization.</td>
+          </tr>
+          <tr>
+            <td class="who">Outbound<br><span class="sub">palace agent &rarr; external agent</span></td>
+            <td class="who">They do</td>
+            <td>An HTTP client, structurally like <code>mempalace-remote</code>. Here the remote genuinely has a URL and we dial it.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>The mapping crate already serves both directions &mdash; it is pure translation and does not care who holds the socket. The exposure work does not: these are two separate pieces of build, and only inbound depends on answering this question.</p>
+  </section>
+
+  <section>
+    <p class="eyebrow">Where cards live</p>
+    <h2><code>wing_registry</code></h2>
+    <p>Registration cards cannot live in <code>wing_agents</code>. That wing carries the unconditional diary hard-override and never federates under any configuration, which would make every card undiscoverable &mdash; defeating the purpose of registering it.</p>
+    <p>A sibling wing is safe. Every diary-override comparison in the codebase is an exact <code>==</code> against <code>"wing_agents"</code>; there is no prefix or substring matching on the wing anywhere, so a distinct name is genuinely clear of it.</p>
+
+    <div class="note">
+      <h3>The override has a second dimension</h3>
+      <p>It is not only the wing. Several sites read <code>wing == SHARED_AGENT_DIARY_WING || room == DIARY_ROOM</code>. A card filed into a room named <code>diary</code> is blocked from federating regardless of which wing it sits in. &ldquo;Put it in a different wing&rdquo; is only half the rule.</p>
+    </div>
+
+    <div class="note warn">
+      <h3>This wing inverts the default posture</h3>
+      <p>Everywhere else in MemPalace, memory stays local unless deliberately routed out. <code>wing_registry</code> federates <em>by definition</em> &mdash; that is its entire purpose. It therefore needs an explicit, stated rule about what may be filed there.</p>
+      <p>The failure mode is mundane and likely: someone reasons &ldquo;agent things go in the agents wing&rdquo;, picks the wrong one, and has it replicate silently. The name <code>wing_registry</code> was chosen over <code>wing_agent_public</code> for exactly this reason &mdash; two wings with opposite egress semantics should not differ by six characters.</p>
+    </div>
+  </section>
+
+  <section>
+    <p class="eyebrow">Not yet built</p>
+    <h2>What this needs to become real</h2>
+    <p>Nothing here is implemented. This is the design as agreed in conversation, written down so it is reviewable rather than remembered.</p>
+
+    <ul class="todo">
+      <li><span class="box"></span><span><code>wing_registry</code> as a well-known constant alongside <code>SHARED_AGENT_DIARY_WING</code> and <code>UNSCOPED_WING</code> &mdash; a string convention is not enough if discovery depends on it.</span></li>
+      <li><span class="box"></span><span>Load-time validation, and a stated content rule for what may be filed into a wing that federates by definition.</span></li>
+      <li><span class="box"></span><span>Agent Card generation from a registry entry: palace URL, per-agent <code>tenant</code>, <code>streaming</code> and <code>push_notifications</code> both false.</span></li>
+      <li><span class="box"></span><span>Inbound routing: resolve <code>tenant</code> to a registered agent, then to its task queue and authorization scope.</span></li>
+      <li><span class="box"></span><span>Update deviation 25 &mdash; the Agent Card limitation is resolved by this design, not outstanding.</span></li>
+      <li><span class="box"></span><span>Docs per <code>CLAUDE.md</code>: <code>Config-Schema.md</code>, <code>Federation.md</code>, and open question 3 in <code>Coordination-Phase-3-Design.md</code>.</span></li>
+    </ul>
+
+    <div class="note">
+      <h3>Unverified assumption worth checking first</h3>
+      <p>The protocol claims here come from the v1.0.1 proto's field definitions and comments. That is solid on the wire contract and stated intent, but it does not establish how major A2A implementations behave in practice &mdash; in particular, whether clients actually honour <code>tenant</code> routing and interface preference order. Confirm against a real implementation before building inbound; it is the one assumption here that could quietly not hold.</p>
+    </div>
+  </section>
+
+  <footer>
+    Design agreed in conversation, 31 August 2026. Protocol claims verified against <code>a2aproject/A2A</code> at tag <code>v1.0.1</code>; codebase claims verified against <code>main</code> at <code>4b4ab3b</code> plus PR&nbsp;#128. Not yet implemented.
+  </footer>
+
+</div>
+
+</body>
+</html>

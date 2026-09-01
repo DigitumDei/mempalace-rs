@@ -3916,6 +3916,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "mempalace-a2a"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "mempalace-federation",
+ "mempalace-storage",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "time",
+]
+
+[[package]]
 name = "mempalace-cli"
 version = "0.1.0"
 dependencies = [
@@ -4062,6 +4075,18 @@ dependencies = [
  "time",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "mempalace-mcp-tasks"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "mempalace-storage",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "time",
 ]
 
 [[package]]

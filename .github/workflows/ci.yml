@@ -72,8 +72,16 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      # `key` scopes this job's cache. `ort-sys` (via fastembed) downloads a prebuilt
+      # ONNX Runtime in its build script and records an absolute link-search path; when a
+      # restored cache carries that recorded path but not the downloaded library, the crate
+      # fails to link with "could not find native static library `onnxruntime`" and no
+      # rebuild is attempted. Because CACHE_ON_FAILURE is false, a poisoned cache is never
+      # replaced and every retry fails identically. Bump this value to evict it.
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          key: ort-1
 
       - name: Build mempalace-embeddings tests
         run: cargo test -p mempalace-embeddings --locked --no-run
@@ -88,11 +96,13 @@ jobs:
       fail-fast: false
       matrix:
         package:
+          - mempalace-a2a
           - mempalace-config
           - mempalace-core
           - mempalace-dialect
           - mempalace-federation
           - mempalace-import
+          - mempalace-mcp-tasks
           - mempalace-remote
           - mempalace-search
           - mempalace-server

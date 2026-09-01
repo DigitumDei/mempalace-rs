@@ -447,6 +447,10 @@ pub struct ChangeEvent {
 
 pub trait ChangeLogStore {
     fn append_event(&self, event: &ChangeEvent) -> Result<()>;
+    /// Whether the change log already contains at least one event with the given
+    /// `entity_id` and `event_type`. Used to make crash-window recovery idempotent: a handler
+    /// restores a lost side-effect event only when none already exists.
+    fn event_exists(&self, entity_id: &str, event_type: &str) -> Result<bool>;
     fn get_changes_since(&self, since: OffsetDateTime, limit: usize) -> Result<Vec<ChangeEvent>>;
     fn get_recent_changes(&self, limit: usize) -> Result<Vec<ChangeEvent>>;
     /// Cursor-paginated forward scan of the change log.
@@ -1962,6 +1966,18 @@ impl ChangeLogStore for SqliteOperationalStore {
             ],
         )?;
         Ok(())
+    }
+
+    fn event_exists(&self, entity_id: &str, event_type: &str) -> Result<bool> {
+        let connection = self.open_connection()?;
+        let exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM change_log WHERE entity_id=?1 AND event_type=?2)",
+                params![entity_id, event_type],
+                |row| row.get(0),
+            )
+            .map_err(StorageError::from)?;
+        Ok(exists)
     }
 
     fn get_changes_since(&self, since: OffsetDateTime, limit: usize) -> Result<Vec<ChangeEvent>> {

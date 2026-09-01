@@ -48,6 +48,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
+use crate::coordination::add_column_if_missing;
 use crate::{Result, StorageError};
 
 const MAX_IDENTIFIER_BYTES: usize = 256;
@@ -89,6 +90,11 @@ pub struct MutationReceipt {
     pub status: ReceiptState,
     /// The stored successful response, present once `status` is [`ReceiptState::Completed`].
     pub response: Option<Value>,
+    /// Caller-supplied durable metadata about the mutation's effect (e.g. a delete's
+    /// `{"wing", "room"}`), captured **before** the effect runs so a crash between the effect
+    /// and its completion can be converged from. Populated via
+    /// [`MutationReceiptStore::set_receipt_details`].
+    pub details: Option<Value>,
     /// When the receipt was first created.
     pub created_at: OffsetDateTime,
     /// When the mutation confirmed completion, if it has.
@@ -148,7 +154,7 @@ impl MutationReceiptStore {
 
     /// Install the receipt table. Idempotent and safe to call on every startup.
     pub fn ensure_schema(&self) -> Result<()> {
-        let conn = self.connection()?;
+        let mut conn = self.connection()?;
         conn.execute_batch(
             r#"
 CREATE TABLE IF NOT EXISTS mutation_receipts (
@@ -158,6 +164,7 @@ CREATE TABLE IF NOT EXISTS mutation_receipts (
     target_id      TEXT NOT NULL,
     status         TEXT NOT NULL CHECK(status IN ('pending', 'completed')),
     response_json  TEXT,
+    details_json   TEXT,
     created_at     TEXT NOT NULL,
     completed_at   TEXT
 );
@@ -165,6 +172,14 @@ CREATE INDEX IF NOT EXISTS idx_mutation_receipts_status
     ON mutation_receipts(status, created_at);
 "#,
         )?;
+        // Upgrade path: a palace created before finding 6 has `mutation_receipts` without
+        // `details_json`. `CREATE TABLE IF NOT EXISTS` is a no-op against that table, so after
+        // it runs this checks `PRAGMA table_info` and adds the column when missing. `BEGIN
+        // IMMEDIATE` serialises the check-then-act across processes (see the identical pattern
+        // in `CoordinationStore::ensure_schema`).
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        add_column_if_missing(&tx, "mutation_receipts", "details_json", "TEXT")?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -197,8 +212,8 @@ CREATE INDEX IF NOT EXISTS idx_mutation_receipts_status
         let created = format_time(now)?;
         tx.execute(
             "INSERT INTO mutation_receipts(operation_id, operation_kind, request_hash, target_id,\
-             status, response_json, created_at, completed_at)\
-             VALUES(?1, ?2, ?3, ?4, 'pending', NULL, ?5, NULL)",
+             status, response_json, details_json, created_at, completed_at)\
+             VALUES(?1, ?2, ?3, ?4, 'pending', NULL, NULL, ?5, NULL)",
             params![
                 input.operation_id,
                 input.operation_kind,
@@ -255,13 +270,53 @@ CREATE INDEX IF NOT EXISTS idx_mutation_receipts_status
         receipt_by_id(&conn, operation_id)
     }
 
+    /// Durably attach caller-supplied metadata (`details`) to a **pending** receipt.
+    ///
+    /// Used by handlers that must survive the crash window *after* committing the mutation but
+    /// *before* recording its side effect (e.g. a drawer delete commits, then the `drawer_deleted`
+    /// change-event append never lands): the metadata is persisted **before** the mutation runs,
+    /// so a retry that recovers the pending receipt can converge using it instead of re-reading
+    /// state the mutation already destroyed. Commits in its own transaction, so it is durable as
+    /// soon as it returns. Rejecting a completed receipt is an invariant error — details can only
+    /// be attached while the mutation is still in flight.
+    pub fn set_receipt_details(&self, operation_id: &str, details: &Value) -> Result<()> {
+        bounded_identifier(operation_id, "operation_id")?;
+        let details_json = serde_json::to_string(details)?;
+        if details_json.len() > MAX_RESPONSE_BYTES {
+            return Err(StorageError::Invariant(format!(
+                "receipt details exceed {MAX_RESPONSE_BYTES} bytes"
+            )));
+        }
+        let mut conn = self.connection()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(existing) = receipt_by_id(&tx, operation_id)? else {
+            tx.commit()?;
+            return Err(StorageError::Invariant(format!(
+                "cannot annotate unknown receipt `{operation_id}`"
+            )));
+        };
+        if existing.status != ReceiptState::Pending {
+            tx.commit()?;
+            return Err(StorageError::Invariant(format!(
+                "cannot annotate completed receipt `{operation_id}`"
+            )));
+        }
+        tx.execute(
+            "UPDATE mutation_receipts SET details_json=?1 \
+             WHERE operation_id=?2 AND status='pending'",
+            params![details_json, operation_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// List all pending receipts, oldest first — the startup-reconciliation feed.
     pub fn pending_receipts(&self) -> Result<Vec<MutationReceipt>> {
         let conn = self.connection()?;
         collect_receipts(
             &conn,
             "SELECT operation_id, operation_kind, request_hash, target_id, status, response_json, \
-             created_at, completed_at FROM mutation_receipts WHERE status='pending' \
+             created_at, completed_at, details_json FROM mutation_receipts WHERE status='pending' \
              ORDER BY created_at ASC",
         )
     }
@@ -274,7 +329,7 @@ CREATE INDEX IF NOT EXISTS idx_mutation_receipts_status
 fn receipt_by_id(conn: &Connection, operation_id: &str) -> Result<Option<MutationReceipt>> {
     conn.prepare(
         "SELECT operation_id, operation_kind, request_hash, target_id, status, response_json, \
-         created_at, completed_at FROM mutation_receipts WHERE operation_id=?1",
+         created_at, completed_at, details_json FROM mutation_receipts WHERE operation_id=?1",
     )?
     .query_row([operation_id], receipt_row)
     .optional()
@@ -290,6 +345,7 @@ fn collect_receipts(conn: &Connection, sql: &str) -> Result<Vec<MutationReceipt>
 fn receipt_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MutationReceipt> {
     let status: String = row.get(4)?;
     let response: Option<String> = row.get(5)?;
+    let details: Option<String> = row.get(8)?;
     let created: String = row.get(6)?;
     let completed: Option<String> = row.get(7)?;
     Ok(MutationReceipt {
@@ -302,6 +358,7 @@ fn receipt_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MutationReceipt> {
             .map(|value| serde_json::from_str(&value))
             .transpose()
             .map_err(sql_conv)?,
+        details: details.map(|value| serde_json::from_str(&value)).transpose().map_err(sql_conv)?,
         created_at: parse_time(created).map_err(sql_conv)?,
         completed_at: parse_time_opt(completed).map_err(sql_conv)?,
     })
@@ -461,6 +518,34 @@ mod tests {
         let (store, _dir) = store();
         let err = store.complete_receipt("op-nope", &json!({"success": true})).unwrap_err();
         assert!(err.to_string().contains("unknown receipt"), "{err}");
+    }
+
+    #[test]
+    fn set_details_persists_durably_and_rejects_late_updates() {
+        let (store, _dir) = store();
+
+        store.begin_receipt(&receipt("op-details-1", "hash-a")).unwrap();
+        store
+            .set_receipt_details("op-details-1", &json!({"wing": "wing_code", "room": "r"}))
+            .unwrap();
+
+        // Survives a store reopen (what a process restart looks like).
+        {
+            let reopened = MutationReceiptStore::new(_dir.path().join("storage.sqlite3"));
+            reopened.ensure_schema().unwrap();
+            let receipt = reopened.get_receipt("op-details-1").unwrap().unwrap();
+            assert_eq!(receipt.details, Some(json!({"wing": "wing_code", "room": "r"})));
+        }
+
+        // A completed receipt can no longer be annotated.
+        store.complete_receipt("op-details-1", &json!({"success": true})).unwrap();
+        let err =
+            store.set_receipt_details("op-details-1", &json!({"wing": "wing_code"})).unwrap_err();
+        assert!(err.to_string().contains("completed"), "{err}");
+
+        // Unknown receipts are rejected outright.
+        let err = store.set_receipt_details("op-nope", &json!({"wing": "wing_code"})).unwrap_err();
+        assert!(err.to_string().contains("unknown"), "{err}");
     }
 
     #[test]

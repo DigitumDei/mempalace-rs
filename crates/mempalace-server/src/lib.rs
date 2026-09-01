@@ -1668,6 +1668,12 @@ where
     let operation_id = params.operation_id.clone();
     let receipts = state.storage.receipt_store();
 
+    // Durable wing/room captured on a pending receipt by a prior attempt (see
+    // `set_receipt_details` below). Survives the crash window where the delete committed but the
+    // `drawer_deleted` change event never landed, so an absent target can still be recovered
+    // with scoped metadata.
+    let mut recovered_details: Option<Value> = None;
+
     // Idempotency gate. Without an `operation_id` the behaviour below is exactly the legacy one.
     if let Some(op) = &operation_id {
         let request_hash = mutation_request_hash(&[("drawer_id", json!(id))]);
@@ -1689,7 +1695,10 @@ where
                 let response = receipt.response.unwrap_or_else(|| json!({"success": true}));
                 return Ok(Json(response));
             }
-            ReceiptOutcome::Recover(_) | ReceiptOutcome::Fresh(_) => {}
+            ReceiptOutcome::Recover(receipt) => {
+                recovered_details = receipt.details;
+            }
+            ReceiptOutcome::Fresh(_) => {}
         }
     }
 
@@ -1705,6 +1714,12 @@ where
         // no wing it cannot read, so the legacy 404 becomes a 200 with the receipt completed.
         // Legacy requests (no `operation_id`) keep the 404.
         if let Some(op) = &operation_id {
+            // Recover the finding-6 crash window: the delete committed but the `drawer_deleted`
+            // change event was never appended. Restore exactly one event, with the wing/room
+            // captured on the receipt *before* the delete ran, so scoped change reads can see
+            // the deletion. A fresh operation on a never-existing drawer has no metadata and
+            // stays event-free, preserving the behaviour above.
+            restore_deleted_event(&state, &id, auth.0.0.as_str(), recovered_details.as_ref())?;
             let response = json!({"success": true});
             receipts.complete_receipt(op, &response)?;
             return Ok(Json(response));
@@ -1722,6 +1737,18 @@ where
         return Err(ServerError::NotFound(format!("drawer {id} not found")));
     }
     let identity = auth.0.0;
+
+    // Durably record the drawer's wing/room on the receipt *before* the delete runs. If the
+    // process crashes after the delete commits but before the `drawer_deleted` event is
+    // appended, a retry can no longer read the scope from the drawer (it is gone) — only this
+    // record survives. `set_receipt_details` commits in its own transaction, so it is durable
+    // the moment it returns.
+    if let Some(op) = &operation_id {
+        receipts.set_receipt_details(
+            op,
+            &json!({"wing": drawer.wing.as_str(), "room": drawer.room.as_str()}),
+        )?;
+    }
 
     let deleted =
         state.storage.drawer_store().delete_drawers(std::slice::from_ref(&drawer_id)).await?;
@@ -1751,6 +1778,40 @@ where
         receipts.complete_receipt(&op, &response)?;
     }
     Ok(Json(response))
+}
+
+/// Restore exactly one `drawer_deleted` change event for a drawer whose delete committed but
+/// whose change-event append never landed — the crash window recovered by `route_drawers_delete`.
+///
+/// Idempotent: skips whenever a `drawer_deleted` event already exists for the id, so a retry
+/// that crashes between the restore and `complete_receipt` cannot double-append. It uses only
+/// the wing/room durably captured on the pending receipt *before* the delete ran — never data
+/// re-read from the drawer (it is already gone). No metadata (a fresh operation on a
+/// never-existing drawer) means there is nothing to restore.
+fn restore_deleted_event<P>(
+    state: &Arc<ServerState<P>>,
+    entity_id: &str,
+    actor: &str,
+    details: Option<&Value>,
+) -> Result<(), ServerError>
+where
+    P: EmbeddingProvider + Send + Sync + 'static,
+{
+    let operational = state.storage.operational_store();
+    let Some(details) = details else {
+        return Ok(());
+    };
+    if operational.event_exists(entity_id, "drawer_deleted")? {
+        return Ok(());
+    }
+    operational.append_event(&ChangeEvent {
+        event_type: "drawer_deleted".to_owned(),
+        occurred_at: OffsetDateTime::now_utc(),
+        entity_id: entity_id.to_owned(),
+        actor: Some(actor.to_owned()),
+        details_json: Some(details.to_string()),
+    })?;
+    Ok(())
 }
 
 // ─── Drawers: list ───────────────────────────────────────────────────────────
@@ -5188,6 +5249,159 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(get_resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // Finding 6: operation-aware delete must survive the crash window where the drawer delete
+    // committed but the `drawer_deleted` change event never landed. On retry with the same
+    // operation_id, exactly one event is restored with scoped wing/room metadata so scoped
+    // change reads can see the deletion.
+    #[tokio::test]
+    async fn delete_recovers_missing_change_event_with_scoped_wing_room() {
+        let harness = make_harness().await;
+
+        // The drawer lives in wing_alpha so SCOPED_ALPHA_TOKEN (wing_alpha only) is the
+        // "scoped change read" the restored event must be visible to.
+        let add_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/drawers",
+                ALICE_TOKEN,
+                json!({
+                    "wing": "wing_alpha",
+                    "room": "delete-recover",
+                    "content": "drawer that survives its own deletion crash",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(add_resp.status(), StatusCode::OK);
+        let drawer_id = body_json(add_resp).await["drawer_id"].as_str().unwrap().to_owned();
+
+        let op = "op-del-crash-window-1";
+        let receipts = harness.state.storage.receipt_store();
+
+        // Simulate the crash window directly: a pending delete receipt whose delete already
+        // committed but whose change event was never appended. Recreate the exact durable state
+        // the handler leaves behind — begin the receipt, capture wing/room via
+        // `set_receipt_details` (the durable pre-delete record), then remove the drawer without
+        // producing any change event.
+        let request_hash = mutation_request_hash(&[("drawer_id", json!(drawer_id))]);
+        match receipts
+            .begin_receipt(&NewReceipt {
+                operation_id: op.to_owned(),
+                operation_kind: RECEIPT_KIND_DRAWER_DELETE.to_owned(),
+                request_hash,
+                target_id: drawer_id.clone(),
+            })
+            .unwrap()
+        {
+            ReceiptOutcome::Fresh(_) => {}
+            other => panic!("expected Fresh, got {other:?}"),
+        }
+        receipts
+            .set_receipt_details(op, &json!({"wing": "wing_alpha", "room": "delete-recover"}))
+            .unwrap();
+        let deleted = harness
+            .state
+            .storage
+            .drawer_store()
+            .delete_drawers(std::slice::from_ref(&DrawerId::new(&drawer_id).unwrap()))
+            .await
+            .unwrap();
+        assert_eq!(deleted, 1);
+
+        let delete_uri = format!("/v1/drawers/{drawer_id}?operation_id={op}");
+
+        // Prove the precondition: no `drawer_deleted` event exists for the drawer yet.
+        let before = harness
+            .router
+            .clone()
+            .oneshot(authed_get("/v1/changes?limit=50", ALICE_TOKEN))
+            .await
+            .unwrap();
+        let before_events = body_json(before).await["events"].as_array().unwrap().clone();
+        assert!(
+            !before_events
+                .iter()
+                .any(|e| e["event_type"] == "drawer_deleted" && e["entity_id"] == drawer_id),
+            "precondition: no deletion event must exist: {before_events:?}"
+        );
+
+        // Retry the same operation_id: recovery must complete the receipt and restore the event.
+        let retry_req = Request::builder()
+            .method(Method::DELETE)
+            .uri(&delete_uri)
+            .header(header::AUTHORIZATION, format!("Bearer {ALICE_TOKEN}"))
+            .body(Body::empty())
+            .unwrap();
+        let retry_resp = harness.router.clone().oneshot(retry_req).await.unwrap();
+        assert_eq!(retry_resp.status(), StatusCode::OK);
+        assert_eq!(body_json(retry_resp).await["success"], true);
+
+        let receipt = receipts.get_receipt(op).unwrap().expect("receipt exists");
+        assert_eq!(receipt.status, mempalace_storage::ReceiptState::Completed);
+        assert_eq!(
+            receipt.details,
+            Some(json!({"wing": "wing_alpha", "room": "delete-recover"})),
+            "durable delete metadata must survive the crash window"
+        );
+
+        // Exactly one restored event, carrying wing and room in its details.
+        let after = harness
+            .router
+            .clone()
+            .oneshot(authed_get("/v1/changes?limit=50", ALICE_TOKEN))
+            .await
+            .unwrap();
+        let after_events = body_json(after).await["events"].as_array().unwrap().clone();
+        let deleted_events: Vec<&Value> = after_events
+            .iter()
+            .filter(|e| e["event_type"] == "drawer_deleted" && e["entity_id"] == drawer_id)
+            .collect();
+        assert_eq!(deleted_events.len(), 1, "exactly one deletion event: {after_events:?}");
+        assert_eq!(deleted_events[0]["details"]["wing"], "wing_alpha");
+        assert_eq!(deleted_events[0]["details"]["room"], "delete-recover");
+
+        // A scoped change read of wing_alpha must see it. Group C filtering fails closed, so a
+        // wing-less event would be hidden here — visibility is itself proof the wing was
+        // restored, not just the event.
+        let scoped = harness
+            .router
+            .clone()
+            .oneshot(authed_get("/v1/changes?limit=50", SCOPED_ALPHA_TOKEN))
+            .await
+            .unwrap();
+        let scoped_events = body_json(scoped).await["events"].as_array().unwrap().clone();
+        assert!(
+            scoped_events.iter().any(|e| e["event_type"] == "drawer_deleted"
+                && e["entity_id"] == drawer_id
+                && e["details"]["wing"] == "wing_alpha"),
+            "scoped reader must see the restored wing-scoped event: {scoped_events:?}"
+        );
+
+        // Replay is idempotent and never double-restores the event.
+        let replay_req = Request::builder()
+            .method(Method::DELETE)
+            .uri(&delete_uri)
+            .header(header::AUTHORIZATION, format!("Bearer {ALICE_TOKEN}"))
+            .body(Body::empty())
+            .unwrap();
+        let replay_resp = harness.router.clone().oneshot(replay_req).await.unwrap();
+        assert_eq!(replay_resp.status(), StatusCode::OK);
+        let final_feed = harness
+            .router
+            .clone()
+            .oneshot(authed_get("/v1/changes?limit=50", ALICE_TOKEN))
+            .await
+            .unwrap();
+        let final_events = body_json(final_feed).await["events"].as_array().unwrap().clone();
+        let final_deleted: Vec<&Value> = final_events
+            .iter()
+            .filter(|e| e["event_type"] == "drawer_deleted" && e["entity_id"] == drawer_id)
+            .collect();
+        assert_eq!(final_deleted.len(), 1, "replay must not double-restore: {final_events:?}");
     }
 
     #[tokio::test]

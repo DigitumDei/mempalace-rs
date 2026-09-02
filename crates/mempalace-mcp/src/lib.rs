@@ -2729,12 +2729,8 @@ where
                     let Some(existing_id) = DrawerId::new(existing_drawer_id).ok() else {
                         continue;
                     };
-                    let Some(stored) = self
-                        .storage
-                        .drawer_store()
-                        .get_drawer(&existing_id)
-                        .await
-                        .map_tool()?
+                    let Some(stored) =
+                        self.storage.drawer_store().get_drawer(&existing_id).await.map_tool()?
                     else {
                         continue;
                     };
@@ -10953,7 +10949,8 @@ mod tests {
 
         assert_eq!(result["success"], true);
         assert_eq!(
-            result["drawer_id"], pinned_id.as_str(),
+            result["drawer_id"],
+            pinned_id.as_str(),
             "the retry must keep the cancelled intent's pinned drawer identity; got: {result}"
         );
         assert_eq!(result["applied_to"], "local");
@@ -10995,11 +10992,7 @@ mod tests {
             other => panic!("expected a drawer-add payload, got: {other:?}"),
         }
 
-        assert_eq!(
-            mock_for_assert.delete_call_count(),
-            0,
-            "the remote must not be called inline"
-        );
+        assert_eq!(mock_for_assert.delete_call_count(), 0, "the remote must not be called inline");
     }
 
     /// Seed a local drawer directly (bypassing `tool_add_drawer`, so no outbox intent

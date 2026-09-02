@@ -12,5 +12,9 @@ pub const DIARY_TOPIC_PREFIX: &str = "diary:";
 /// The wing shared by all agent-scoped diary entries.
 pub const SHARED_AGENT_DIARY_WING: &str = "wing_agents";
 
+/// Reserved wing name for coordination rows that existed before wings were introduced. Every
+/// task and event created before this stage upgraded its schema reads back with this wing.
+pub const UNSCOPED_WING: &str = "wing_unscoped";
+
 /// Maximum allowed length (in Unicode scalar values) for a diary summary.
 pub const DIARY_SUMMARY_MAX_CHARS: usize = 400;

@@ -1189,6 +1189,24 @@ key](#wing-is-the-authorization-key)). Per design this looks identical to the
 record genuinely not existing, so check the token's `scopes` entry for the wing in
 question rather than assuming the ID is wrong.
 
+### A coordination write returns 422 with code `unscoped_not_federated`
+The task (or the task owning the message/artifact/result you targeted) is still
+parked on `wing_unscoped` — the reserved backfill wing coordination rows get
+when they predate wings, assigned automatically by the storage upgrade path
+(see `CoordinationStore::ensure_schema`). There is no real wing on such a
+record to authorize federation against, so every write, claim, and idempotent
+replay against it is refused outright (issue #102 Stage 8), the same way
+`wing_agents` diary content is refused with `diary_not_federated`. A **read**
+against a `wing_unscoped` record is masked as 404 instead, so the 422 never
+becomes an existence oracle. It is also never returned by a fan-out fallback
+(`coordination_write_fallback`/`coordination_task_revisioned_fallback` in
+`mempalace-mcp`) as a soft miss — it surfaces as a hard tool error there,
+deliberately, because the record is confirmed to exist on that remote. The
+remedy is to move the task to a real wing (there is currently no in-place
+re-home operation; recreate it under the wing you want it federated from) —
+`wing_unscoped` itself can never be federated, no matter what
+`federation.coordination` says about it.
+
 ### A coordination write returns 409 with code `idempotency_key_conflict`
 You replayed an `idempotency_key` your token has used before, but the record
 storage originally created for it lives in a wing your token cannot currently see

@@ -549,7 +549,16 @@ override layered on top of the other four steps:
    `wing_agents`, room `diary` (within any wing), or a source whose name
    begins with `diary:`. Unconditionally resolved to local storage; any
    config rule that attempts to route diary content remote is warned about
-   and ignored.
+   and ignored. `resolve_coordination_route` applies the identical
+   unconditional override to `wing_unscoped` — the reserved backfill wing for
+   coordination rows that predate wings (issue #102 Stage 8) — for the same
+   reason: there is no real wing on such a record to authorize federation
+   against, so it always resolves local regardless of what
+   `federation.coordination` says about it. Attempting to write, claim, or
+   idempotently replay a `wing_unscoped` coordination record over the
+   federation HTTP API is refused outright with **422** `unscoped_not_federated`
+   (a read is masked as 404 instead) — see [Federation →
+   Troubleshooting](Federation.md#a-coordination-write-returns-422-with-code-unscoped_not_federated).
 2. Explicit per-wing rule in `federation.wings`
 3. Project `mempalace.yaml` `routing` block for the wing declared in that file
 4. `federation.default_mode`

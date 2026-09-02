@@ -409,7 +409,64 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
     }
 
     /// Create a task, or return the prior committed task for an idempotency replay.
+    ///
+    /// Always creates in [`TaskState::Pending`] — the only state the ordinary lifecycle
+    /// (`claim_task`/`transition_task`) can start a task in. See [`Self::import_task`] for the
+    /// deliberate exception: an imported task from a protocol adapter (A2A, MCP Tasks) may
+    /// already have lifecycle history on the other system, and forcing it through
+    /// `claim_task`/`transition_task` to reach that state would fabricate audit history (e.g. a
+    /// claim by a worker that never existed).
     pub fn create_task(&self, input: &NewTask) -> Result<Task> {
+        self.create_task_with_state(input, TaskState::Pending, false)
+    }
+
+    /// Create a task directly in `initial_state`, or return the prior committed task for an
+    /// idempotency replay, bypassing the transition state machine entirely.
+    ///
+    /// This exists for protocol adapters (A2A, MCP Tasks) importing a task that already carries
+    /// lifecycle history on another system: reaching, say, `Completed` via the ordinary route
+    /// would require `claim_task` (asserting a worker and lease that never existed) followed by
+    /// `transition_task`, which would fabricate audit history rather than record the truth ("this
+    /// task arrived already in this state"). An import is a creation event, not a lifecycle
+    /// transition, so it gets its own entry point rather than a hidden backdoor through
+    /// `NewTask`: `NewTask` itself gains no `initial_state` field, because it is deserialized
+    /// directly from `mempalace_task_create`'s MCP arguments, and a new field there would
+    /// silently widen that public wire schema.
+    ///
+    /// The created row always has `owner = NULL` and `lease_expires_at = NULL`, even for
+    /// `initial_state: Running` — an import asserts no real worker holds a lease, so none is
+    /// fabricated. `claim_task`'s ownership check only rejects a claim when the task already has
+    /// an owner, so an ownerless `Running` row remains claimable by any worker, and
+    /// `transition_task`'s ownership check is skipped the same way, so it remains transitionable.
+    /// Neither can be swept into `Expired` by an absent lease: the only automatic expiry check in
+    /// this module keys off `Task::expires_at` (the lifecycle deadline), not `lease_expires_at`,
+    /// and `NewTask::expires_at` is `None` unless the caller explicitly sets it.
+    ///
+    /// The `task_created` audit event records `initial_state` as `to_state` and carries
+    /// `details: {"imported": true}`, so the trail is honest about why a freshly created task can
+    /// already be non-`Pending`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Invariant`] if `initial_state` is [`TaskState::Expired`] —
+    /// expiry is a lifecycle outcome this palace produces itself (see `claim_task`'s lazy expiry
+    /// check), never something an importer may assert about a task it has not yet even placed
+    /// under this palace's lease/expiry rules.
+    pub fn import_task(&self, input: &NewTask, initial_state: TaskState) -> Result<Task> {
+        if initial_state == TaskState::Expired {
+            return Err(StorageError::Invariant(
+                "TaskState::Expired is a lifecycle outcome this palace produces itself; an imported task cannot assert it as an initial state".into(),
+            ));
+        }
+        self.create_task_with_state(input, initial_state, true)
+    }
+
+    fn create_task_with_state(
+        &self,
+        input: &NewTask,
+        initial_state: TaskState,
+        is_import: bool,
+    ) -> Result<Task> {
         validate_key(&input.idempotency_key)?;
         validate_actor(&input.created_by)?;
         bounded_text(&input.title, "task title")?;
@@ -437,7 +494,8 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
         }
         let now = OffsetDateTime::now_utc();
         let id = format!("task_{}", Uuid::new_v4().simple());
-        tx.execute("INSERT INTO coordination_tasks(task_id,title,description,state,revision,created_by,owner,parent_id,dependencies_json,budget_json,lease_expires_at,expires_at,idempotency_key,created_at,updated_at,wing) VALUES (?1,?2,?3,'pending',0,?4,NULL,?5,?6,?7,NULL,?8,?9,?10,?10,?11)", params![id,input.title,input.description,input.created_by,input.parent_id,serde_json::to_string(&input.dependencies)?,input.budget.as_ref().map(serde_json::to_string).transpose()?,format_time_opt(input.expires_at)?,input.idempotency_key,format_time(now)?,wing])?;
+        tx.execute("INSERT INTO coordination_tasks(task_id,title,description,state,revision,created_by,owner,parent_id,dependencies_json,budget_json,lease_expires_at,expires_at,idempotency_key,created_at,updated_at,wing) VALUES (?1,?2,?3,?12,0,?4,NULL,?5,?6,?7,NULL,?8,?9,?10,?10,?11)", params![id,input.title,input.description,input.created_by,input.parent_id,serde_json::to_string(&input.dependencies)?,input.budget.as_ref().map(serde_json::to_string).transpose()?,format_time_opt(input.expires_at)?,input.idempotency_key,format_time(now)?,wing,initial_state.as_str()])?;
+        let details = is_import.then(|| serde_json::json!({"imported": true}));
         append_event(
             &tx,
             "task",
@@ -447,9 +505,9 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
             "task_created",
             &input.created_by,
             None,
-            Some(TaskState::Pending),
+            Some(initial_state),
             Some(0),
-            None,
+            details.as_ref(),
             now,
         )?;
         let task = get_task_tx(&tx, &id)?
@@ -1414,6 +1472,121 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
         assert_eq!(a.task_id, b.task_id);
         assert_eq!(s.get_task(&a.task_id).expect("get"), Some(a));
         assert_eq!(s.get_task("task_missing").expect("miss"), None);
+    }
+    #[test]
+    fn import_task_creates_directly_in_the_given_state_and_marks_the_event_as_imported() {
+        let (_d, s) = store();
+        let imported = s
+            .import_task(
+                &NewTask {
+                    title: "already done elsewhere".into(),
+                    description: "imported from another system".into(),
+                    created_by: "importer".into(),
+                    wing: "wing_test".into(),
+                    idempotency_key: "import-completed-1".into(),
+                    parent_id: None,
+                    dependencies: vec![],
+                    budget: None,
+                    expires_at: None,
+                },
+                TaskState::Completed,
+            )
+            .expect("import");
+        assert_eq!(imported.state, TaskState::Completed);
+        assert_eq!(imported.revision, 0);
+        assert_eq!(imported.owner, None);
+        assert_eq!(imported.lease_expires_at, None);
+
+        let events = s
+            .events(None, Some(&imported.task_id), None, 20, CoordinationVisibility::Trusted)
+            .expect("events");
+        assert_eq!(events.events.len(), 1);
+        let event = &events.events[0];
+        assert_eq!(event.event_type, "task_created");
+        assert_eq!(event.to_state, Some(TaskState::Completed));
+        assert_eq!(event.details, Some(serde_json::json!({"imported": true})));
+    }
+    #[test]
+    fn import_task_rejects_expired_as_an_initial_state() {
+        let (_d, s) = store();
+        let err = s
+            .import_task(
+                &NewTask {
+                    title: "t".into(),
+                    description: "d".into(),
+                    created_by: "importer".into(),
+                    wing: "wing_test".into(),
+                    idempotency_key: "import-expired-1".into(),
+                    parent_id: None,
+                    dependencies: vec![],
+                    budget: None,
+                    expires_at: None,
+                },
+                TaskState::Expired,
+            )
+            .expect_err("Expired must never be an assertable initial state");
+        assert!(matches!(err, StorageError::Invariant(_)));
+    }
+    #[test]
+    fn import_task_is_idempotent_like_create_task() {
+        let (_d, s) = store();
+        let new_task = NewTask {
+            title: "t".into(),
+            description: "d".into(),
+            created_by: "importer".into(),
+            wing: "wing_test".into(),
+            idempotency_key: "import-idempotent-1".into(),
+            parent_id: None,
+            dependencies: vec![],
+            budget: None,
+            expires_at: None,
+        };
+        let first = s.import_task(&new_task, TaskState::Running).expect("first import");
+        let second = s.import_task(&new_task, TaskState::Running).expect("replay");
+        assert_eq!(first.task_id, second.task_id);
+        assert_eq!(first, second);
+    }
+    /// Point 5 verification: a task imported directly as `Running` has no real owner or lease
+    /// (an import asserts no worker ever actually claimed it), so it must remain claimable by any
+    /// worker rather than becoming stuck or being swept into `Expired`. `claim_task`'s "held by
+    /// another worker" check only fires when an owner already exists, so an ownerless `Running`
+    /// row is unaffected by it; the only automatic expiry check in this module keys off
+    /// `Task::expires_at` (which `import_task` never sets), not `lease_expires_at`.
+    #[test]
+    fn a_running_task_imported_with_no_owner_remains_claimable_and_is_not_swept_into_expired() {
+        let (_d, s) = store();
+        let imported = s
+            .import_task(
+                &NewTask {
+                    title: "in progress elsewhere".into(),
+                    description: "imported already running".into(),
+                    created_by: "importer".into(),
+                    wing: "wing_test".into(),
+                    idempotency_key: "import-running-1".into(),
+                    parent_id: None,
+                    dependencies: vec![],
+                    budget: None,
+                    expires_at: None,
+                },
+                TaskState::Running,
+            )
+            .expect("import");
+        assert_eq!(imported.state, TaskState::Running);
+        assert_eq!(imported.owner, None);
+        assert_eq!(imported.lease_expires_at, None);
+
+        // Any worker can claim it -- there is no existing owner to conflict with.
+        let claimed = applied_task(
+            s.claim_task(&imported.task_id, "worker-a", imported.revision, Duration::minutes(5))
+                .expect("an ownerless Running task must remain claimable"),
+        );
+        assert_eq!(claimed.owner.as_deref(), Some("worker-a"));
+        assert_eq!(claimed.state, TaskState::Running);
+
+        // Re-reading the freshly imported (unclaimed) task never reports it as Expired: the
+        // lifecycle-expiry check keys off `expires_at`, which import_task never populates.
+        let reread = s.get_task(&imported.task_id).expect("get").expect("still present");
+        assert_ne!(reread.state, TaskState::Expired);
     }
     #[test]
     fn claim_is_cas_and_expired_lease_is_reclaimable() {

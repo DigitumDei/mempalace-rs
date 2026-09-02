@@ -2,12 +2,18 @@
 
 mod federation;
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use blake3::Hasher;
+use mempalace_a2a::{
+    A2aArtifact, A2aError, A2aMessage, A2aTask, AgentCardInputs, NewTaskInputs as A2aNewTaskInputs,
+    a2a_artifact_to_new_artifact, a2a_message_to_new_message, a2a_task_to_new_task,
+    artifact_to_a2a_artifact, build_agent_card, envelope_artifact as a2a_envelope_artifact,
+    task_to_a2a_task,
+};
 use mempalace_config::{ConfigLoader, MempalaceConfig, ReplicationStatus, RouteMode, WriteTarget};
 use mempalace_core::{
     DIARY_HALL, DIARY_ROOM, DIARY_SUMMARY_MAX_CHARS, DIARY_TOPIC_PREFIX, DrawerId, DrawerRecord,
@@ -18,14 +24,19 @@ use mempalace_embeddings::{
     FastembedProviderConfig, env_flag,
 };
 use mempalace_federation::{
-    AckMessageRequest, CoordinationTaskState as WireTaskState,
-    NewArtifactRequest as WireNewArtifactRequest, NewMessageRequest as WireNewMessageRequest,
-    NewTaskRequest as WireNewTaskRequest, NewTaskResultRequest as WireNewTaskResultRequest,
-    TaskLeaseRequest, TransitionTaskRequest,
+    AckMessageRequest, CoordinationTaskState as WireTaskState, FEDERATION_API_VERSION,
+    InfoResponse, MaintenanceStatus, NewArtifactRequest as WireNewArtifactRequest,
+    NewMessageRequest as WireNewMessageRequest, NewTaskRequest as WireNewTaskRequest,
+    NewTaskResultRequest as WireNewTaskResultRequest, TaskLeaseRequest, TransitionTaskRequest,
 };
 use mempalace_graph::{
     AddFactRequest, EntityKind, KnowledgeGraphRuntime, PalaceGraphSnapshot, QueryDirection,
     derive_palace_graph_from_store, find_tunnels, traverse_graph,
+};
+use mempalace_mcp_tasks::{
+    CreateTaskResult, McpTaskStatus, McpTasksError, NewTaskInputs as McpTasksNewTaskInputs,
+    create_task_result_to_new_task, envelope_artifact as mcp_tasks_envelope_artifact,
+    map_inbound_task_status, task_to_detailed_task,
 };
 use mempalace_search::{SearchRuntime, SearchRuntimePolicy};
 use mempalace_storage::{
@@ -96,7 +107,14 @@ pub use mempalace_core as core;
 //   SelfObservationPropose, SelfObservationReview, IdentityPacket,
 //   MigrationRecord, GetAaaKSpec, CoordinationEventGet. Skill and delegation
 //   tools (SkillPropose..SkillReviews, DelegationSpanStart..DelegationTrace)
-//   are local-only too — they are not federated in this phase.
+//   are local-only too — they are not federated in this phase. The A2A and
+//   MCP Tasks protocol-adapter tools (issue #102 Stages 9-10: A2aAgentCard,
+//   A2aTaskImport, A2aTaskExport, A2aMessageImport, A2aArtifactImport,
+//   McpTasksGet, McpTasksUpdate, McpTasksCancel, McpTasksImport) are
+//   local-only too: each "import" tool translates AND persists (a create
+//   plus an envelope-artifact write), which is a two-write sequence with no
+//   remote transaction to make it atomic, so none of the nine attempt to
+//   federate. See docs/Coordination.md.
 //
 // **`kg_add`/`kg_invalidate` policy:** Both follow `resolve_kg_route()` and write
 //   to the write-target side ONLY (local or the configured remote). The response
@@ -166,6 +184,13 @@ pub enum McpError {
     Graph(#[from] mempalace_graph::GraphError),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+    /// A stored A2A-shaped record (artifact or message) failed to decode back into its A2A
+    /// type — our own stored row is malformed, not a caller-input problem. See
+    /// `map_a2a_tool_error`'s doc comment for the split between this and `ToolError::InvalidParams`.
+    #[error(transparent)]
+    A2a(#[from] mempalace_a2a::A2aError),
+    #[error(transparent)]
+    McpTasks(#[from] mempalace_mcp_tasks::McpTasksError),
     #[error("time formatting error: {0}")]
     TimeFormat(String),
     #[error("federation error: {0}")]
@@ -271,10 +296,19 @@ enum ToolName {
     SelfObservationReview,
     IdentityPacket,
     MigrationRecord,
+    A2aAgentCard,
+    A2aTaskImport,
+    A2aTaskExport,
+    A2aMessageImport,
+    A2aArtifactImport,
+    McpTasksGet,
+    McpTasksUpdate,
+    McpTasksCancel,
+    McpTasksImport,
 }
 
 impl ToolName {
-    fn all() -> [Self; 58] {
+    fn all() -> [Self; 67] {
         [
             Self::WakeUp,
             Self::Status,
@@ -334,6 +368,15 @@ impl ToolName {
             Self::SelfObservationReview,
             Self::IdentityPacket,
             Self::MigrationRecord,
+            Self::A2aAgentCard,
+            Self::A2aTaskImport,
+            Self::A2aTaskExport,
+            Self::A2aMessageImport,
+            Self::A2aArtifactImport,
+            Self::McpTasksGet,
+            Self::McpTasksUpdate,
+            Self::McpTasksCancel,
+            Self::McpTasksImport,
         ]
     }
 
@@ -397,6 +440,15 @@ impl ToolName {
             Self::SelfObservationReview => "mempalace_self_observation_review",
             Self::IdentityPacket => "mempalace_identity_packet",
             Self::MigrationRecord => "mempalace_migration_record",
+            Self::A2aAgentCard => "mempalace_a2a_agent_card",
+            Self::A2aTaskImport => "mempalace_a2a_task_import",
+            Self::A2aTaskExport => "mempalace_a2a_task_export",
+            Self::A2aMessageImport => "mempalace_a2a_message_import",
+            Self::A2aArtifactImport => "mempalace_a2a_artifact_import",
+            Self::McpTasksGet => "mempalace_mcp_tasks_get",
+            Self::McpTasksUpdate => "mempalace_mcp_tasks_update",
+            Self::McpTasksCancel => "mempalace_mcp_tasks_cancel",
+            Self::McpTasksImport => "mempalace_mcp_tasks_import",
         }
     }
 
@@ -914,6 +966,60 @@ impl ToolName {
                     "required":["lineage_id","to_model","to_harness","summary","continuities","changes","evidence","author"]
                 }),
             },
+            Self::A2aAgentCard => coordination_definition(
+                self,
+                "Build an A2A (Agent2Agent protocol) Agent Card describing this palace's coordination surface, with one skill per wing. Local-only: this is a pure translation and read from local configuration/storage, with no A2A HTTP surface of its own — `interfaces` (where an A2A caller would reach this palace) has no local source and must be supplied by the caller, possibly empty.",
+                json!({"name":{"type":"string","description":"Agent (palace) display name (optional, default: the server name)"},"description":{"type":"string","description":"Human-readable description of the palace's purpose (optional)"},"version":{"type":"string","description":"Agent (palace) version string (optional, default: the server version)"},"provider":{"type":"object","description":"Service provider, if any","properties":{"url":{"type":"string"},"organization":{"type":"string"}},"required":["url","organization"]},"interfaces":{"type":"array","description":"Interfaces this card advertises, e.g. where an A2A client would reach this palace over JSON-RPC (optional, default: empty — this crate has no HTTP surface of its own and cannot infer its own address)","items":{"type":"object","properties":{"url":{"type":"string"},"protocolBinding":{"type":"string"},"protocolVersion":{"type":"string"}},"required":["url","protocolBinding","protocolVersion"]}}}),
+                &[],
+            ),
+            Self::A2aTaskImport => coordination_definition(
+                self,
+                "Translate and persist an inbound A2A Task: creates the MemPalace task directly in the A2A status's mapped target_state (e.g. TASK_STATE_COMPLETED -> completed) — bypassing the claim/transition state machine entirely, since an import is a creation event, not a lifecycle transition, and forcing it through mempalace_task_claim/mempalace_task_transition would fabricate a worker/lease/transition history that never happened — and stores the exact wire JSON verbatim as an immutable protocol_envelope artifact for audit. `a2a_task` must be the raw JSON text exactly as received on the wire, not a re-serialized object — re-serializing changes key order/whitespace and therefore the envelope's content hash. A task imported directly into Running has no owner or lease (none is fabricated); it remains claimable by any worker via mempalace_task_claim. Returns the created task, the A2A status's mapped target_state (with any coercion reported, e.g. TASK_STATE_AUTH_REQUIRED -> input_required), and the envelope artifact id. Local-only: translate-and-persist is a two-write sequence (task, then envelope artifact) with no remote transaction to make it atomic.",
+                json!({"a2a_task":{"type":"string","description":"The raw A2A Task JSON exactly as received on the wire, byte-for-byte"},"wing":{"type":"string","description":"Owning wing, e.g. wing_myproject. Normalised on write."},"created_by":{"type":"string","description":"Actor recorded as having created the task"},"idempotency_key":{"type":"string"},"title":{"type":"string","description":"Human-readable task title — A2A has no equivalent field"},"description":{"type":"string","description":"Task description — A2A has no equivalent field distinct from its message history"}}),
+                &["a2a_task", "wing", "created_by", "idempotency_key", "title", "description"],
+            ),
+            Self::A2aTaskExport => coordination_definition(
+                self,
+                "Translate an authoritative MemPalace task into an A2A Task for export, returning found:false for a miss. Artifacts and messages are not bulk-fetched — pass the exact artifact_ids/message_ids to include (fetched from mempalace_coordination_events or already known to the caller); artifacts whose role is protocol_envelope are always excluded from the emitted A2A artifacts list, since they are audit records, not A2A artifacts. Returns {found, task, coercion} where coercion reports whether the task's MemPalace state required coercion to reach its A2A counterpart (only Expired does, coerced to TASK_STATE_FAILED). Local-only: this is a read-and-translate operation with no A2A HTTP surface.",
+                json!({"task_id":{"type":"string"},"artifact_ids":{"type":"array","items":{"type":"string"},"description":"Artifact IDs to include as A2A artifacts (optional; protocol_envelope-role artifacts are always excluded even if listed here)"},"message_ids":{"type":"array","items":{"type":"string"},"description":"Message IDs to include as A2A history, in the order given (optional)"},"status_message":{"type":"string","description":"Raw A2A Message JSON to report as the task status's current message (optional)"}}),
+                &["task_id"],
+            ),
+            Self::A2aMessageImport => coordination_definition(
+                self,
+                "Translate and persist an inbound A2A Message as a MemPalace task message. `a2a_message` must be the raw JSON text exactly as received on the wire. Local-only: translate-and-persist with no A2A HTTP surface of its own.",
+                json!({"a2a_message":{"type":"string","description":"The raw A2A Message JSON exactly as received on the wire, byte-for-byte"},"task_id":{"type":"string"},"sender":{"type":"string"},"recipient":{"type":"string"},"idempotency_key":{"type":"string"}}),
+                &["a2a_message", "task_id", "sender", "recipient", "idempotency_key"],
+            ),
+            Self::A2aArtifactImport => coordination_definition(
+                self,
+                "Translate and persist an inbound A2A Artifact as a MemPalace task artifact. `a2a_artifact` must be the raw JSON text exactly as received on the wire. Local-only: translate-and-persist with no A2A HTTP surface of its own.",
+                json!({"a2a_artifact":{"type":"string","description":"The raw A2A Artifact JSON exactly as received on the wire, byte-for-byte"},"task_id":{"type":"string"},"created_by":{"type":"string"},"idempotency_key":{"type":"string"}}),
+                &["a2a_artifact", "task_id", "created_by", "idempotency_key"],
+            ),
+            Self::McpTasksGet => coordination_definition(
+                self,
+                "Translate an authoritative MemPalace task into an MCP Tasks extension DetailedTask (the `tasks/get` result shape). `input_requests`/`result`/`error` must match exactly what the mapped status requires (working/cancelled: none; input_required: input_requests; completed: result; failed: error) — MemPalace's Task carries none of them directly, so passing the wrong combination for the mapped status is rejected as invalid params rather than silently patched over. A missing task_id is also rejected as invalid params (JSON-RPC -32602), matching the MCP Tasks extension's own mandate for an invalid tasks/get taskId. Returns {task, coercion} where coercion reports whether the task's MemPalace state required coercion to reach its MCP Tasks counterpart (Pending -> working, Expired -> failed). Local-only: read-and-translate with no MCP Tasks transport of its own.",
+                json!({"task_id":{"type":"string"},"status_message":{"type":"string","description":"Human-readable status detail (optional)"},"poll_interval_ms":{"type":"integer","description":"Recommended client polling interval in milliseconds (optional)"},"input_requests":{"type":"object","description":"Opaque server-to-client requests keyed by id — required when the mapped status is input_required, forbidden otherwise"},"result":{"type":"object","description":"The completed result payload, a JSON object — required when the mapped status is completed, forbidden otherwise"},"error":{"type":"object","description":"JSON-RPC error object {code, message, data} — required when the mapped status is failed, forbidden otherwise","properties":{"code":{"type":"integer"},"message":{"type":"string"},"data":{}},"required":["code","message"]}}),
+                &["task_id"],
+            ),
+            Self::McpTasksUpdate => coordination_definition(
+                self,
+                "Transition a task's lifecycle state using an inbound MCP Tasks extension status, under the same compare-and-swap revision semantics as mempalace_task_transition. `status` uses MCP Tasks wire spelling (working, input_required, completed, failed, cancelled — see mempalace_mcp_tasks_get's description for the reverse mapping); the inbound mapping is total, so every value maps to exactly one MemPalace state (working -> running, others map 1:1 by name). Returns {\"success\": true, \"task\": {...}} on success, or {\"success\": false, \"conflict\": {expected_revision, actual_revision, message}} when the expected revision no longer matches — a conflict is data, not an error. Local-only: no MCP Tasks transport of its own.",
+                json!({"task_id":{"type":"string"},"actor":{"type":"string"},"expected_revision":{"type":"integer"},"status":{"type":"string","enum":["working","input_required","completed","failed","cancelled"]},"details":{}}),
+                &["task_id", "actor", "expected_revision", "status"],
+            ),
+            Self::McpTasksCancel => coordination_definition(
+                self,
+                "Cancel a task on behalf of an inbound MCP Tasks `tasks/cancel` request, under the same compare-and-swap revision semantics as mempalace_task_transition. Equivalent to mempalace_mcp_tasks_update with status fixed to cancelled. Returns {\"success\": true, \"task\": {...}} on success, or {\"success\": false, \"conflict\": {expected_revision, actual_revision, message}} when the expected revision no longer matches — a conflict is data, not an error. Local-only: no MCP Tasks transport of its own.",
+                json!({"task_id":{"type":"string"},"actor":{"type":"string"},"expected_revision":{"type":"integer"},"details":{}}),
+                &["task_id", "actor", "expected_revision"],
+            ),
+            Self::McpTasksImport => coordination_definition(
+                self,
+                "Translate and persist an inbound MCP Tasks CreateTaskResult (the handle a third-party MCP server returns when it processes a request as an async task): creates the MemPalace task directly in the mapped target_state (e.g. completed -> completed) — bypassing the claim/transition state machine entirely, since an import is a creation event, not a lifecycle transition, and forcing it through mempalace_task_claim/mempalace_task_transition would fabricate a worker/lease/transition history that never happened — and stores the exact wire JSON verbatim as an immutable protocol_envelope artifact for audit. `create_task_result` must be the raw JSON text exactly as received on the wire, not a re-serialized object. A task imported directly into Running has no owner or lease (none is fabricated); it remains claimable by any worker via mempalace_task_claim. `ttlMs` is a retention hint, never MemPalace lifecycle — it is surfaced only under `provenance.retention_deadline`, never written to the task's expiry. Returns the created task, target_state (with any coercion), the envelope artifact id, and `provenance` — the source taskId/createdAt/lastUpdatedAt/retention_deadline this crate has no storage column for. The caller MUST persist `provenance` itself (e.g. as a knowledge-graph fact) if it needs to resolve the wire task id or round-trip the original timestamps after a restart; this tool does not do so on your behalf. Local-only: translate-and-persist is a two-write sequence with no remote transaction to make it atomic.",
+                json!({"create_task_result":{"type":"string","description":"The raw MCP Tasks CreateTaskResult JSON exactly as received on the wire, byte-for-byte"},"wing":{"type":"string","description":"Owning wing, e.g. wing_myproject. Normalised on write."},"created_by":{"type":"string","description":"Actor recorded as having created the task"},"idempotency_key":{"type":"string"},"title":{"type":"string","description":"Human-readable task title — MCP Tasks has no equivalent field"},"description":{"type":"string","description":"Task description — MCP Tasks has no equivalent field"}}),
+                &["create_task_result", "wing", "created_by", "idempotency_key", "title", "description"],
+            ),
         }
     }
 
@@ -951,7 +1057,19 @@ impl ToolName {
             | Self::DelegationCheckpointGet
             | Self::DelegationTrace
             // No wire counterpart to route to — see `ToolRoutingCategory::RoutableCoordination`.
-            | Self::CoordinationEventGet => ToolRoutingCategory::LocalOnly,
+            | Self::CoordinationEventGet
+            // Protocol-adapter tools (issue #102 Stages 9-10): translate-and-persist is a
+            // two-write sequence (record, then envelope artifact) with no remote transaction to
+            // make it atomic, so these never federate — see docs/Coordination.md.
+            | Self::A2aAgentCard
+            | Self::A2aTaskImport
+            | Self::A2aTaskExport
+            | Self::A2aMessageImport
+            | Self::A2aArtifactImport
+            | Self::McpTasksGet
+            | Self::McpTasksUpdate
+            | Self::McpTasksCancel
+            | Self::McpTasksImport => ToolRoutingCategory::LocalOnly,
             Self::TaskCreate
             | Self::TaskGet
             | Self::TaskClaim
@@ -1244,6 +1362,19 @@ where
                     runtime.tool_delegation_checkpoint_get(&call.arguments).await
                 }
                 ToolName::DelegationTrace => runtime.tool_delegation_trace(&call.arguments).await,
+                ToolName::A2aAgentCard => runtime.tool_a2a_agent_card(&call.arguments).await,
+                ToolName::A2aTaskImport => runtime.tool_a2a_task_import(&call.arguments).await,
+                ToolName::A2aTaskExport => runtime.tool_a2a_task_export(&call.arguments).await,
+                ToolName::A2aMessageImport => {
+                    runtime.tool_a2a_message_import(&call.arguments).await
+                }
+                ToolName::A2aArtifactImport => {
+                    runtime.tool_a2a_artifact_import(&call.arguments).await
+                }
+                ToolName::McpTasksGet => runtime.tool_mcp_tasks_get(&call.arguments).await,
+                ToolName::McpTasksUpdate => runtime.tool_mcp_tasks_update(&call.arguments).await,
+                ToolName::McpTasksCancel => runtime.tool_mcp_tasks_cancel(&call.arguments).await,
+                ToolName::McpTasksImport => runtime.tool_mcp_tasks_import(&call.arguments).await,
                 other => unreachable!(
                     "ToolName::routing() classified {other:?} as LocalOnly, \
                      but dispatch_tool's LocalOnly arm does not handle it"
@@ -3725,6 +3856,371 @@ where
         Ok(payload)
     }
 
+    /// Build a local [`InfoResponse`] describing this palace's capability surface, the same
+    /// fields `mempalace-server`'s `/v1/info` route reports, sourced from local config rather
+    /// than fabricated — `mempalace-mcp` has no maintenance run history of its own to report, so
+    /// `maintenance_last_run` is always `None` and `maintenance_status` reflects only whether
+    /// maintenance is configured as enabled.
+    fn local_info_response(&self) -> InfoResponse {
+        InfoResponse {
+            server_version: SERVER_VERSION.to_owned(),
+            federation_api_version: FEDERATION_API_VERSION,
+            embedding_profile: self.config.embedding_profile.as_str().to_owned(),
+            capabilities: vec![
+                "drawers".to_owned(),
+                "kg".to_owned(),
+                "changes".to_owned(),
+                "taxonomy".to_owned(),
+                "coordination".to_owned(),
+            ],
+            maintenance_enabled: self.config.maintenance.enabled,
+            maintenance_background_enabled: self.config.maintenance.background_enabled,
+            maintenance_idle_secs: self.config.maintenance.idle_secs as u64,
+            maintenance_last_run: None,
+            maintenance_status: if self.config.maintenance.enabled {
+                MaintenanceStatus::Idle
+            } else {
+                MaintenanceStatus::Disabled
+            },
+        }
+    }
+
+    /// Build an A2A Agent Card describing this palace's coordination surface, one skill per
+    /// wing. Local-only translation: `interfaces` (where an A2A caller would reach this palace)
+    /// has no local source and is caller-supplied, possibly empty — see
+    /// `mempalace_a2a::agent_card`'s module docs for why this crate cannot infer its own address.
+    async fn tool_a2a_agent_card(&mut self, arguments: &Value) -> ToolResult<Value> {
+        let name = optional_non_blank_string(arguments, "name")?.unwrap_or_else(|| SERVER_NAME.to_owned());
+        let description = optional_non_blank_string(arguments, "description")?
+            .unwrap_or_else(|| "MemPalace local-first memory and coordination palace.".to_owned());
+        let version =
+            optional_non_blank_string(arguments, "version")?.unwrap_or_else(|| SERVER_VERSION.to_owned());
+        let provider = match arguments.get("provider") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(
+                serde_json::from_value(value.clone())
+                    .map_err(|e| ToolError::InvalidParams(format!("invalid `provider`: {e}")))?,
+            ),
+        };
+        let interfaces = match arguments.get("interfaces") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(value) => serde_json::from_value(value.clone())
+                .map_err(|e| ToolError::InvalidParams(format!("invalid `interfaces`: {e}")))?,
+        };
+
+        let drawers = self.list_all_drawers().await?;
+        let mut wings: Vec<String> =
+            drawers.iter().map(|drawer| drawer.wing.as_str().to_owned()).collect();
+        wings.sort();
+        wings.dedup();
+
+        let info = self.local_info_response();
+        let inputs = AgentCardInputs {
+            name: &name,
+            description: &description,
+            version: &version,
+            provider,
+            wings: &wings,
+            info: &info,
+            interfaces,
+        };
+        Ok(json!(build_agent_card(&inputs)))
+    }
+
+    /// Translate and persist an inbound A2A Task: creates the local task directly in its mapped
+    /// `target_state` (via `CoordinationStore::import_task`, not `create_task` — an import is a
+    /// creation event, not a lifecycle transition, so it never fabricates a `claim_task`/
+    /// `transition_task` history to get there) and stores the raw wire JSON verbatim as an
+    /// immutable `protocol_envelope` artifact. `a2a_task` must be the raw wire text, not a
+    /// re-serialized value — see `mempalace_a2a::envelope::envelope_artifact`'s doc comment for
+    /// why re-serializing would silently change the envelope's idempotency key. This is a
+    /// two-write sequence (task, then envelope artifact) with no remote transaction to make it
+    /// atomic, hence local-only.
+    async fn tool_a2a_task_import(&mut self, arguments: &Value) -> ToolResult<Value> {
+        let raw_task = required_non_blank_string(arguments, "a2a_task")?;
+        let a2a_task: A2aTask = serde_json::from_str(&raw_task)
+            .map_err(|e| ToolError::InvalidParams(format!("invalid `a2a_task` JSON: {e}")))?;
+        let title = required_non_blank_string(arguments, "title")?;
+        let description = required_non_blank_string(arguments, "description")?;
+        let created_by = required_non_blank_string(arguments, "created_by")?;
+        let idempotency_key = required_non_blank_string(arguments, "idempotency_key")?;
+        let wing = parse_wing_id(&required_non_blank_string(arguments, "wing")?)?;
+
+        let conversion = a2a_task_to_new_task(
+            &a2a_task,
+            A2aNewTaskInputs {
+                title: &title,
+                description: &description,
+                wing: wing.as_str(),
+                created_by: &created_by,
+                idempotency_key,
+            },
+        )
+        .map_err(map_a2a_tool_error)?;
+
+        let task = self
+            .coordination
+            .import_task(&conversion.new_task, conversion.target_state.value)
+            .map_tool_internal()?;
+        let envelope = a2a_envelope_artifact(&task.task_id, &created_by, &raw_task);
+        let artifact = self.coordination.put_artifact(&envelope).map_tool_internal()?;
+
+        Ok(json!({
+            "task": task,
+            "target_state": conversion.target_state.value,
+            "coercion": a2a_coercion_json(conversion.target_state.coercion),
+            "envelope_artifact_id": artifact.artifact_id,
+        }))
+    }
+
+    /// Translate an authoritative MemPalace task into an A2A Task, returning `found: false` for
+    /// a miss. Artifacts and messages are not bulk-fetched by this crate (no such storage query
+    /// exists) — pass the exact `artifact_ids`/`message_ids` to include. Artifacts whose role is
+    /// `protocol_envelope` are always excluded from the emitted A2A artifacts list, since they
+    /// are audit records, not A2A artifacts.
+    async fn tool_a2a_task_export(&mut self, arguments: &Value) -> ToolResult<Value> {
+        let task_id = required_non_blank_string(arguments, "task_id")?;
+        let Some(task) = self.coordination.get_task(&task_id).map_tool_internal()? else {
+            return Ok(json!({"found": false}));
+        };
+
+        let artifact_ids = optional_string_array(arguments, "artifact_ids")?;
+        let mut a2a_artifacts: Vec<A2aArtifact> = Vec::with_capacity(artifact_ids.len());
+        for artifact_id in &artifact_ids {
+            let artifact =
+                self.coordination.get_artifact(artifact_id).map_tool_internal()?.ok_or_else(
+                    || ToolError::InvalidParams(format!("artifact `{artifact_id}` not found")),
+                )?;
+            if artifact.role == mempalace_a2a::PROTOCOL_ENVELOPE_ROLE {
+                continue;
+            }
+            a2a_artifacts.push(artifact_to_a2a_artifact(&artifact).map_err(map_a2a_tool_error)?);
+        }
+
+        let message_ids = optional_string_array(arguments, "message_ids")?;
+        let mut history: Vec<A2aMessage> = Vec::with_capacity(message_ids.len());
+        for message_id in &message_ids {
+            let message =
+                self.coordination.get_message(message_id).map_tool_internal()?.ok_or_else(
+                    || ToolError::InvalidParams(format!("message `{message_id}` not found")),
+                )?;
+            history.push(mempalace_a2a::message_to_a2a_message(&message).map_err(map_a2a_tool_error)?);
+        }
+
+        let status_message = match optional_string(arguments, "status_message")? {
+            None => None,
+            Some(raw) => Some(serde_json::from_str::<A2aMessage>(&raw).map_err(|e| {
+                ToolError::InvalidParams(format!("invalid `status_message` JSON: {e}"))
+            })?),
+        };
+
+        let mapped = task_to_a2a_task(&task, a2a_artifacts, history, status_message);
+        Ok(json!({
+            "found": true,
+            "task": mapped.value,
+            "coercion": a2a_coercion_json(mapped.coercion),
+        }))
+    }
+
+    /// Translate and persist an inbound A2A Message as a MemPalace task message. `a2a_message`
+    /// must be the raw wire text.
+    async fn tool_a2a_message_import(&mut self, arguments: &Value) -> ToolResult<Value> {
+        let raw_message = required_non_blank_string(arguments, "a2a_message")?;
+        let a2a_message: A2aMessage = serde_json::from_str(&raw_message)
+            .map_err(|e| ToolError::InvalidParams(format!("invalid `a2a_message` JSON: {e}")))?;
+        let task_id = required_non_blank_string(arguments, "task_id")?;
+        let sender = required_non_blank_string(arguments, "sender")?;
+        let recipient = required_non_blank_string(arguments, "recipient")?;
+        let idempotency_key = required_non_blank_string(arguments, "idempotency_key")?;
+
+        let new_message =
+            a2a_message_to_new_message(&a2a_message, &task_id, &sender, &recipient, idempotency_key)
+                .map_err(map_a2a_tool_error)?;
+        let message = self.coordination.send_message(&new_message).map_tool_internal()?;
+        Ok(json!(message))
+    }
+
+    /// Translate and persist an inbound A2A Artifact as a MemPalace task artifact.
+    /// `a2a_artifact` must be the raw wire text.
+    async fn tool_a2a_artifact_import(&mut self, arguments: &Value) -> ToolResult<Value> {
+        let raw_artifact = required_non_blank_string(arguments, "a2a_artifact")?;
+        let a2a_artifact: A2aArtifact = serde_json::from_str(&raw_artifact)
+            .map_err(|e| ToolError::InvalidParams(format!("invalid `a2a_artifact` JSON: {e}")))?;
+        let task_id = required_non_blank_string(arguments, "task_id")?;
+        let created_by = required_non_blank_string(arguments, "created_by")?;
+        let idempotency_key = required_non_blank_string(arguments, "idempotency_key")?;
+
+        let new_artifact =
+            a2a_artifact_to_new_artifact(&a2a_artifact, &task_id, &created_by, idempotency_key)
+                .map_err(map_a2a_tool_error)?;
+        let artifact = self.coordination.put_artifact(&new_artifact).map_tool_internal()?;
+        Ok(json!(artifact))
+    }
+
+    /// Translate an authoritative MemPalace task into an MCP Tasks extension `DetailedTask` (the
+    /// `tasks/get` result shape). A missing `task_id` is `ToolError::InvalidParams`, which the
+    /// transport maps to JSON-RPC `-32602` — the same code the extension mandates for an invalid
+    /// `taskId`. `input_requests`/`result`/`error` must match exactly what the mapped status
+    /// requires; a mismatch (e.g. a `completed` task's `result` passed for a task that maps to
+    /// `working`) is rejected as invalid params rather than silently patched over.
+    async fn tool_mcp_tasks_get(&mut self, arguments: &Value) -> ToolResult<Value> {
+        let task_id = required_non_blank_string(arguments, "task_id")?;
+        let task = self
+            .coordination
+            .get_task(&task_id)
+            .map_tool_internal()?
+            .ok_or_else(|| ToolError::InvalidParams(format!("task `{task_id}` not found")))?;
+
+        let status_message = optional_string(arguments, "status_message")?;
+        let poll_interval_ms = match optional_i64(arguments, "poll_interval_ms")? {
+            None => None,
+            Some(value) if value >= 0 => Some(value as u64),
+            Some(_) => {
+                return Err(ToolError::InvalidParams(
+                    "field `poll_interval_ms` cannot be negative".to_owned(),
+                ));
+            }
+        };
+        let input_requests: Option<HashMap<String, Value>> = match arguments.get("input_requests") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(serde_json::from_value(value.clone()).map_err(|e| {
+                ToolError::InvalidParams(format!("invalid `input_requests`: {e}"))
+            })?),
+        };
+        let result: Option<serde_json::Map<String, Value>> = match arguments.get("result") {
+            None | Some(Value::Null) => None,
+            Some(Value::Object(map)) => Some(map.clone()),
+            Some(_) => {
+                return Err(ToolError::InvalidParams("field `result` must be a JSON object".to_owned()));
+            }
+        };
+        let error: Option<mempalace_mcp_tasks::JsonRpcErrorObject> = match arguments.get("error") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(
+                serde_json::from_value(value.clone())
+                    .map_err(|e| ToolError::InvalidParams(format!("invalid `error`: {e}")))?,
+            ),
+        };
+
+        let mapped = task_to_detailed_task(
+            &task,
+            status_message,
+            poll_interval_ms,
+            input_requests,
+            result,
+            error,
+        )
+        .map_err(map_mcp_tasks_tool_error)?;
+        Ok(json!({
+            "task": mapped.value,
+            "coercion": mcp_tasks_coercion_json(mapped.coercion),
+        }))
+    }
+
+    /// Transition a task's lifecycle state using an inbound MCP Tasks extension status, under the
+    /// same compare-and-swap revision semantics as `mempalace_task_transition`. See
+    /// [`Self::tool_task_claim`] for the conflict-shape notes — identical here. Local-only: no
+    /// MCP Tasks transport of its own to fall back to.
+    async fn tool_mcp_tasks_update(&mut self, arguments: &Value) -> ToolResult<Value> {
+        let status_str = required_string(arguments, "status")?;
+        let status: McpTaskStatus = serde_json::from_value(json!(status_str))
+            .map_err(|e| ToolError::InvalidParams(e.to_string()))?;
+        let target = map_inbound_task_status(status);
+        let expected_revision = required_i64(arguments, "expected_revision")?;
+        let task_id = required_string(arguments, "task_id")?;
+        let actor = required_string(arguments, "actor")?;
+        let details = arguments.get("details").cloned();
+        match self.coordination.transition_task(
+            &task_id,
+            &actor,
+            expected_revision,
+            target.value,
+            details,
+        ) {
+            Ok(RevisionedWrite::Applied(task)) => Ok(json!({"success": true, "task": task})),
+            Ok(RevisionedWrite::Conflict { actual_revision }) => {
+                Ok(revision_conflict_payload(expected_revision, actual_revision))
+            }
+            Err(err) => Err(err).map_tool_internal(),
+        }
+    }
+
+    /// Cancel a task on behalf of an inbound MCP Tasks `tasks/cancel` request. Equivalent to
+    /// [`Self::tool_mcp_tasks_update`] with status fixed to `cancelled`.
+    async fn tool_mcp_tasks_cancel(&mut self, arguments: &Value) -> ToolResult<Value> {
+        let target = map_inbound_task_status(McpTaskStatus::Cancelled);
+        let expected_revision = required_i64(arguments, "expected_revision")?;
+        let task_id = required_string(arguments, "task_id")?;
+        let actor = required_string(arguments, "actor")?;
+        let details = arguments.get("details").cloned();
+        match self.coordination.transition_task(
+            &task_id,
+            &actor,
+            expected_revision,
+            target.value,
+            details,
+        ) {
+            Ok(RevisionedWrite::Applied(task)) => Ok(json!({"success": true, "task": task})),
+            Ok(RevisionedWrite::Conflict { actual_revision }) => {
+                Ok(revision_conflict_payload(expected_revision, actual_revision))
+            }
+            Err(err) => Err(err).map_tool_internal(),
+        }
+    }
+
+    /// Translate and persist an inbound MCP Tasks `CreateTaskResult`: creates the local task
+    /// directly in its mapped `target_state` (via `CoordinationStore::import_task`, not
+    /// `create_task` — an import is a creation event, not a lifecycle transition, so it never
+    /// fabricates a `claim_task`/`transition_task` history to get there) and stores the raw wire
+    /// JSON verbatim as an immutable `protocol_envelope` artifact. `create_task_result` must be
+    /// the raw wire text, not a re-serialized value. The caller MUST persist the returned
+    /// `provenance` itself — this crate has no storage column for the source
+    /// `taskId`/timestamps/retention deadline, and `ttlMs` is never written to the task's
+    /// lifecycle expiry (see `mempalace_mcp_tasks::ttl`'s module docs).
+    async fn tool_mcp_tasks_import(&mut self, arguments: &Value) -> ToolResult<Value> {
+        let raw = required_non_blank_string(arguments, "create_task_result")?;
+        let parsed: CreateTaskResult = serde_json::from_str(&raw).map_err(|e| {
+            ToolError::InvalidParams(format!("invalid `create_task_result` JSON: {e}"))
+        })?;
+        let title = required_non_blank_string(arguments, "title")?;
+        let description = required_non_blank_string(arguments, "description")?;
+        let created_by = required_non_blank_string(arguments, "created_by")?;
+        let idempotency_key = required_non_blank_string(arguments, "idempotency_key")?;
+        let wing = parse_wing_id(&required_non_blank_string(arguments, "wing")?)?;
+
+        let conversion = create_task_result_to_new_task(
+            &parsed,
+            McpTasksNewTaskInputs {
+                title: &title,
+                description: &description,
+                wing: wing.as_str(),
+                created_by: &created_by,
+                idempotency_key,
+            },
+        )
+        .map_err(map_mcp_tasks_tool_error)?;
+
+        let task = self
+            .coordination
+            .import_task(&conversion.new_task, conversion.target_state.value)
+            .map_tool_internal()?;
+        let envelope = mcp_tasks_envelope_artifact(&task.task_id, &created_by, &raw);
+        let artifact = self.coordination.put_artifact(&envelope).map_tool_internal()?;
+
+        Ok(json!({
+            "task": task,
+            "target_state": conversion.target_state.value,
+            "coercion": mcp_tasks_coercion_json(conversion.target_state.coercion),
+            "envelope_artifact_id": artifact.artifact_id,
+            "provenance": {
+                "source_task_id": conversion.provenance.source_task_id,
+                "source_created_at": format_rfc3339(conversion.provenance.source_created_at)?,
+                "source_last_updated_at": format_rfc3339(conversion.provenance.source_last_updated_at)?,
+                "retention_deadline": conversion.provenance.retention_deadline.map(format_rfc3339).transpose()?,
+            },
+        }))
+    }
+
     async fn tool_skill_propose(&self, arguments: &Value) -> ToolResult<Value> {
         let input: NewSkill = parse_coordination_input(arguments)?;
         Ok(json!(self.skills.propose_skill(&input).map_tool_internal()?))
@@ -4245,6 +4741,50 @@ fn exact_result<T: Serialize>(value: Option<T>) -> ToolResult<Value> {
         Some(value) => json!({"found":true,"value":value}),
         None => json!({"found":false}),
     })
+}
+
+/// Map an [`A2aError`] to the tool-error shape the caller should see.
+///
+/// [`A2aError::InvalidStoredShape`] means a record already committed to *our own* storage is
+/// malformed A2A shape — that is our bug, not the caller's input, so it maps to
+/// [`ToolError::Internal`]. Every other variant (`InvalidPart`, `EmptyArtifactParts`,
+/// `UnspecifiedTaskState`, `Serde`) is a fault in what the caller supplied this call, so it maps
+/// to [`ToolError::InvalidParams`].
+fn map_a2a_tool_error(error: A2aError) -> ToolError {
+    match error {
+        A2aError::InvalidStoredShape { .. } => ToolError::Internal(McpError::A2a(error)),
+        A2aError::UnspecifiedTaskState | A2aError::Serde(_) | A2aError::InvalidPart { .. }
+        | A2aError::EmptyArtifactParts => ToolError::InvalidParams(error.to_string()),
+    }
+}
+
+/// Render a [`mempalace_a2a::Coercion`] (or its absence) as JSON. `Coercion` itself is not
+/// `Serialize` — its whole point is that callers must engage with `Option<Coercion>` explicitly
+/// (see `mempalace_a2a::state::Mapped`'s doc comment) rather than something that silently
+/// serializes to `null`.
+fn a2a_coercion_json(coercion: Option<mempalace_a2a::Coercion>) -> Value {
+    match coercion {
+        None => Value::Null,
+        Some(c) => json!({"from": c.from, "to": c.to, "reason": c.reason}),
+    }
+}
+
+/// Map an [`McpTasksError`] to the tool-error shape the caller should see. Unlike
+/// [`map_a2a_tool_error`], every variant of this crate's error type (`MissingField`,
+/// `UnexpectedField`, `TtlOutOfRange`) is a fault in what the caller supplied this call — the
+/// crate has no "our own stored row is malformed" variant — so all of them map to
+/// [`ToolError::InvalidParams`].
+fn map_mcp_tasks_tool_error(error: McpTasksError) -> ToolError {
+    ToolError::InvalidParams(error.to_string())
+}
+
+/// Render a [`mempalace_mcp_tasks::Coercion`] (or its absence) as JSON. See
+/// [`a2a_coercion_json`]'s doc comment — same reasoning, independent type.
+fn mcp_tasks_coercion_json(coercion: Option<mempalace_mcp_tasks::Coercion>) -> Value {
+    match coercion {
+        None => Value::Null,
+        Some(c) => json!({"from": c.from, "to": c.to, "reason": c.reason}),
+    }
 }
 
 fn optional_f32(arguments: &Value, field: &'static str) -> ToolResult<Option<f32>> {
@@ -8615,6 +9155,695 @@ mod tests {
         assert_eq!(kg_event["details"]["object"], "Working");
     }
 
+    // ── A2A adapter tools (issue #102 Stage 9) ──────────────────────────────
+
+    #[tokio::test]
+    async fn a2a_agent_card_lists_one_skill_per_wing() {
+        let harness = test_harness().await;
+        let response =
+            harness.server.handle_request(tool_call(9000, "mempalace_a2a_agent_card", json!({}))).await;
+        let card = decode_tool_payload(&response).expect("agent card payload");
+        let skills = card["skills"].as_array().expect("skills array");
+        let ids: Vec<&str> = skills.iter().filter_map(|s| s["id"].as_str()).collect();
+        assert!(ids.contains(&"coordination:wing_code"), "got {ids:?}");
+        assert!(ids.contains(&"coordination:wing_team"), "got {ids:?}");
+        assert_eq!(card["capabilities"]["streaming"], false);
+        assert!(card["supportedInterfaces"].as_array().unwrap().is_empty());
+    }
+
+    /// Regression test: importing a `completed` A2A task must not silently downgrade it to
+    /// `Pending`. `import_task` creates the local task directly in its mapped `target_state`, so
+    /// the round trip must reproduce the inbound status, not the state a bare `create_task` would
+    /// have produced.
+    #[tokio::test]
+    async fn a2a_task_import_then_export_round_trips_the_actual_state() {
+        let harness = test_harness().await;
+        let raw_task = r#"{"id":"src_task_1","status":{"state":"TASK_STATE_COMPLETED"}}"#;
+        let imported = harness
+            .server
+            .handle_request(tool_call(
+                9010,
+                "mempalace_a2a_task_import",
+                json!({
+                    "a2a_task": raw_task,
+                    "wing": "wing_myproject",
+                    "created_by": "alice",
+                    "idempotency_key": "a2a-import-1",
+                    "title": "Investigate",
+                    "description": "desc",
+                }),
+            ))
+            .await;
+        let imported = decode_tool_payload(&imported).expect("import payload");
+        assert_eq!(imported["target_state"], "completed");
+        assert!(imported["coercion"].is_null());
+        assert_eq!(
+            imported["task"]["state"], "completed",
+            "the created task itself must already be in the imported state, not Pending"
+        );
+        let task_id = imported["task"]["task_id"].as_str().unwrap().to_owned();
+        let envelope_artifact_id = imported["envelope_artifact_id"].as_str().unwrap().to_owned();
+
+        let envelope = harness
+            .server
+            .handle_request(tool_call(
+                9011,
+                "mempalace_artifact_get",
+                json!({"artifact_id": envelope_artifact_id}),
+            ))
+            .await;
+        let envelope = decode_tool_payload(&envelope).expect("envelope payload");
+        assert_eq!(envelope["value"]["content"], raw_task);
+        assert_eq!(envelope["value"]["role"], "protocol_envelope");
+
+        let exported = harness
+            .server
+            .handle_request(tool_call(
+                9012,
+                "mempalace_a2a_task_export",
+                json!({"task_id": task_id}),
+            ))
+            .await;
+        let exported = decode_tool_payload(&exported).expect("export payload");
+        assert_eq!(exported["found"], true);
+        assert_eq!(exported["task"]["id"], task_id);
+        assert_eq!(exported["task"]["status"]["state"], "TASK_STATE_COMPLETED");
+        assert!(exported["coercion"].is_null());
+    }
+
+    /// Covers the remaining directly-created states (`cancelled`, `input_required`) and confirms
+    /// the `task_created` audit event records the imported state with an `"imported": true`
+    /// marker, per `CoordinationStore::import_task`'s contract.
+    #[tokio::test]
+    async fn a2a_task_import_supports_cancelled_and_input_required_and_marks_the_audit_event() {
+        let harness = test_harness().await;
+
+        let cancelled_raw = r#"{"id":"t_cancelled","status":{"state":"TASK_STATE_CANCELED"}}"#;
+        let cancelled = harness
+            .server
+            .handle_request(tool_call(
+                9013,
+                "mempalace_a2a_task_import",
+                json!({
+                    "a2a_task": cancelled_raw, "wing": "wing_myproject", "created_by": "alice",
+                    "idempotency_key": "a2a-import-cancelled-1", "title": "t", "description": "d",
+                }),
+            ))
+            .await;
+        let cancelled = decode_tool_payload(&cancelled).expect("import payload");
+        assert_eq!(cancelled["task"]["state"], "cancelled");
+        let cancelled_task_id = cancelled["task"]["task_id"].as_str().unwrap().to_owned();
+
+        let input_required_raw =
+            r#"{"id":"t_input_required","status":{"state":"TASK_STATE_INPUT_REQUIRED"}}"#;
+        let input_required = harness
+            .server
+            .handle_request(tool_call(
+                9014,
+                "mempalace_a2a_task_import",
+                json!({
+                    "a2a_task": input_required_raw, "wing": "wing_myproject", "created_by": "alice",
+                    "idempotency_key": "a2a-import-input-required-1", "title": "t", "description": "d",
+                }),
+            ))
+            .await;
+        let input_required = decode_tool_payload(&input_required).expect("import payload");
+        assert_eq!(input_required["task"]["state"], "input_required");
+
+        // The task_created event for the cancelled import must record the imported state and be
+        // marked as an import, not read as an ordinary Pending creation.
+        let events = harness
+            .server
+            .handle_request(tool_call(
+                9015,
+                "mempalace_coordination_events",
+                json!({"task_id": cancelled_task_id}),
+            ))
+            .await;
+        let events = decode_tool_payload(&events).expect("events payload");
+        let created_event = events["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|event| event["event_type"] == "task_created")
+            .expect("task_created event");
+        assert_eq!(created_event["to_state"], "cancelled");
+        assert_eq!(created_event["details"]["imported"], true);
+    }
+
+    /// `TaskState::Expired` is a lifecycle outcome the palace produces itself; an A2A import must
+    /// never be able to assert it directly. A2A's inbound mapping never actually produces
+    /// `Expired` (see `mempalace_a2a::state::map_inbound_task_state`), so this exercises the
+    /// storage-level guard would-be callers rely on, confirming the tool surfaces the rejection
+    /// as `ToolError::Internal` rather than silently succeeding or panicking.
+    #[tokio::test]
+    async fn a2a_task_import_cannot_reach_the_storage_layer_with_expired_as_a_target() {
+        // A2A has no wire state that maps inbound to Expired, so this is exercised directly
+        // against the storage primitive the tool calls, per `CoordinationStore::import_task`'s
+        // documented rejection.
+        let harness = test_harness().await;
+        let runtime = harness.server.runtime.lock().await;
+        let err = runtime
+            .coordination
+            .import_task(
+                &NewTask {
+                    title: "t".to_owned(),
+                    description: "d".to_owned(),
+                    created_by: "alice".to_owned(),
+                    wing: "wing_myproject".to_owned(),
+                    idempotency_key: "a2a-import-expired-guard-1".to_owned(),
+                    parent_id: None,
+                    dependencies: Vec::new(),
+                    budget: None,
+                    expires_at: None,
+                },
+                TaskState::Expired,
+            )
+            .expect_err("Expired must never be an assertable initial state for an import");
+        assert!(matches!(err, mempalace_storage::StorageError::Invariant(_)));
+    }
+
+    #[tokio::test]
+    async fn a2a_task_import_preserves_envelope_bytes_even_when_json_value_is_equal() {
+        let harness = test_harness().await;
+        let compact = r#"{"id":"t1","status":{"state":"TASK_STATE_WORKING"}}"#;
+        let padded = r#"{ "status": { "state": "TASK_STATE_WORKING" }, "id": "t1" }"#;
+
+        let mut artifact_ids = Vec::new();
+        for (idx, raw) in [compact, padded].into_iter().enumerate() {
+            let response = harness
+                .server
+                .handle_request(tool_call(
+                    9020 + idx as i64,
+                    "mempalace_a2a_task_import",
+                    json!({
+                        "a2a_task": raw,
+                        "wing": "wing_myproject",
+                        "created_by": "alice",
+                        "idempotency_key": format!("a2a-envelope-{idx}"),
+                        "title": "t",
+                        "description": "d",
+                    }),
+                ))
+                .await;
+            let payload = decode_tool_payload(&response).expect("import payload");
+            artifact_ids.push(payload["envelope_artifact_id"].as_str().unwrap().to_owned());
+        }
+        assert_ne!(artifact_ids[0], artifact_ids[1]);
+
+        for (idx, (raw, artifact_id)) in [compact, padded].into_iter().zip(&artifact_ids).enumerate() {
+            let response = harness
+                .server
+                .handle_request(tool_call(
+                    9025 + idx as i64,
+                    "mempalace_artifact_get",
+                    json!({"artifact_id": artifact_id}),
+                ))
+                .await;
+            let payload = decode_tool_payload(&response).expect("artifact payload");
+            assert_eq!(payload["value"]["content"], raw);
+        }
+    }
+
+    #[tokio::test]
+    async fn a2a_task_import_reports_inbound_coercion_for_auth_required() {
+        let harness = test_harness().await;
+        let raw_task = r#"{"id":"t1","status":{"state":"TASK_STATE_AUTH_REQUIRED"}}"#;
+        let response = harness
+            .server
+            .handle_request(tool_call(
+                9040,
+                "mempalace_a2a_task_import",
+                json!({
+                    "a2a_task": raw_task,
+                    "wing": "wing_myproject",
+                    "created_by": "alice",
+                    "idempotency_key": "a2a-coerce-1",
+                    "title": "t",
+                    "description": "d",
+                }),
+            ))
+            .await;
+        let payload = decode_tool_payload(&response).expect("import payload");
+        assert_eq!(payload["target_state"], "input_required");
+        assert_eq!(payload["coercion"]["from"], "TASK_STATE_AUTH_REQUIRED");
+        assert_eq!(payload["coercion"]["to"], "input_required");
+    }
+
+    #[tokio::test]
+    async fn a2a_task_export_reports_outbound_coercion_for_expired() {
+        let harness = test_harness().await;
+        let created = harness
+            .server
+            .handle_request(tool_call(
+                9050,
+                "mempalace_task_create",
+                json!({
+                    "title": "t", "description": "d", "created_by": "alice",
+                    "wing": "wing_myproject", "idempotency_key": "expired-src-1",
+                }),
+            ))
+            .await;
+        let task = decode_tool_payload(&created).expect("task payload");
+        let task_id = task["task_id"].as_str().unwrap().to_owned();
+        let revision = task["revision"].as_i64().unwrap();
+
+        let transitioned = harness
+            .server
+            .handle_request(tool_call(
+                9051,
+                "mempalace_task_transition",
+                json!({
+                    "task_id": task_id, "actor": "alice", "expected_revision": revision,
+                    "state": "expired",
+                }),
+            ))
+            .await;
+        let transitioned = decode_tool_payload(&transitioned).expect("transition payload");
+        assert_eq!(transitioned["success"], true);
+
+        let exported = harness
+            .server
+            .handle_request(tool_call(
+                9052,
+                "mempalace_a2a_task_export",
+                json!({"task_id": task_id}),
+            ))
+            .await;
+        let exported = decode_tool_payload(&exported).expect("export payload");
+        assert_eq!(exported["task"]["status"]["state"], "TASK_STATE_FAILED");
+        assert_eq!(exported["coercion"]["from"], "expired");
+        assert_eq!(exported["coercion"]["to"], "TASK_STATE_FAILED");
+    }
+
+    #[tokio::test]
+    async fn a2a_message_import_and_artifact_import_persist_and_reject_invalid_parts() {
+        let harness = test_harness().await;
+        let created = harness
+            .server
+            .handle_request(tool_call(
+                9060,
+                "mempalace_task_create",
+                json!({
+                    "title": "t", "description": "d", "created_by": "alice",
+                    "wing": "wing_myproject", "idempotency_key": "msg-src-1",
+                }),
+            ))
+            .await;
+        let task_id =
+            decode_tool_payload(&created).expect("task")["task_id"].as_str().unwrap().to_owned();
+
+        let raw_message = r#"{"messageId":"m1","role":"ROLE_AGENT","parts":[{"text":"hello"}]}"#;
+        let sent = harness
+            .server
+            .handle_request(tool_call(
+                9061,
+                "mempalace_a2a_message_import",
+                json!({
+                    "a2a_message": raw_message, "task_id": task_id, "sender": "agent-a",
+                    "recipient": "agent-b", "idempotency_key": "msg-key-1",
+                }),
+            ))
+            .await;
+        let message = decode_tool_payload(&sent).expect("message payload");
+        assert_eq!(message["task_id"], task_id);
+        assert_eq!(message["kind"], "a2a_message");
+
+        let raw_artifact = r#"{"artifactId":"a1","parts":[{"text":"done"}]}"#;
+        let put = harness
+            .server
+            .handle_request(tool_call(
+                9062,
+                "mempalace_a2a_artifact_import",
+                json!({
+                    "a2a_artifact": raw_artifact, "task_id": task_id, "created_by": "alice",
+                    "idempotency_key": "artifact-key-1",
+                }),
+            ))
+            .await;
+        let artifact = decode_tool_payload(&put).expect("artifact payload");
+        assert_eq!(artifact["task_id"], task_id);
+        assert_eq!(artifact["role"], "a2a_artifact");
+
+        // A Part violating the A2A `oneof` invariant (zero fields set) must be rejected as
+        // InvalidParams rather than silently accepted or crashing the server.
+        let raw_bad_message = r#"{"messageId":"m2","role":"ROLE_AGENT","parts":[{}]}"#;
+        let rejected = harness
+            .server
+            .handle_request(tool_call(
+                9063,
+                "mempalace_a2a_message_import",
+                json!({
+                    "a2a_message": raw_bad_message, "task_id": task_id, "sender": "agent-a",
+                    "recipient": "agent-b", "idempotency_key": "msg-key-2",
+                }),
+            ))
+            .await;
+        assert_eq!(rejected["error"]["code"], ErrorCode::InvalidParams as i32);
+    }
+
+    // ── MCP Tasks adapter tools (issue #102 Stage 10) ───────────────────────
+
+    #[tokio::test]
+    async fn mcp_tasks_get_reports_outbound_coercions_for_pending_and_expired() {
+        let harness = test_harness().await;
+        let created = harness
+            .server
+            .handle_request(tool_call(
+                9100,
+                "mempalace_task_create",
+                json!({
+                    "title": "t", "description": "d", "created_by": "alice",
+                    "wing": "wing_myproject", "idempotency_key": "mcp-tasks-get-1",
+                }),
+            ))
+            .await;
+        let task = decode_tool_payload(&created).expect("task payload");
+        let task_id = task["task_id"].as_str().unwrap().to_owned();
+        let revision = task["revision"].as_i64().unwrap();
+
+        // Freshly created (Pending) coerces outbound to `working`.
+        let pending_get = harness
+            .server
+            .handle_request(tool_call(
+                9101,
+                "mempalace_mcp_tasks_get",
+                json!({"task_id": task_id}),
+            ))
+            .await;
+        let pending_payload = decode_tool_payload(&pending_get).expect("get payload");
+        assert_eq!(pending_payload["task"]["status"], "working");
+        assert_eq!(pending_payload["coercion"]["from"], "pending");
+        assert_eq!(pending_payload["coercion"]["to"], "working");
+
+        // Expired coerces outbound to `failed`, which requires an `error` payload.
+        let transitioned = harness
+            .server
+            .handle_request(tool_call(
+                9102,
+                "mempalace_task_transition",
+                json!({
+                    "task_id": task_id, "actor": "alice", "expected_revision": revision,
+                    "state": "expired",
+                }),
+            ))
+            .await;
+        assert_eq!(decode_tool_payload(&transitioned).expect("transition")["success"], true);
+
+        let expired_get = harness
+            .server
+            .handle_request(tool_call(
+                9103,
+                "mempalace_mcp_tasks_get",
+                json!({
+                    "task_id": task_id,
+                    "error": {"code": -32603, "message": "lease expired"},
+                }),
+            ))
+            .await;
+        let expired_payload = decode_tool_payload(&expired_get).expect("get payload");
+        assert_eq!(expired_payload["task"]["status"], "failed");
+        assert_eq!(expired_payload["coercion"]["from"], "expired");
+        assert_eq!(expired_payload["coercion"]["to"], "failed");
+    }
+
+    #[tokio::test]
+    async fn mcp_tasks_get_rejects_a_completed_task_carrying_input_requests() {
+        let harness = test_harness().await;
+        let created = harness
+            .server
+            .handle_request(tool_call(
+                9110,
+                "mempalace_task_create",
+                json!({
+                    "title": "t", "description": "d", "created_by": "alice",
+                    "wing": "wing_myproject", "idempotency_key": "mcp-tasks-get-union-1",
+                }),
+            ))
+            .await;
+        let task_id =
+            decode_tool_payload(&created).expect("task")["task_id"].as_str().unwrap().to_owned();
+
+        let claimed = harness
+            .server
+            .handle_request(tool_call(
+                9111,
+                "mempalace_task_claim",
+                json!({
+                    "task_id": task_id, "worker": "worker-1", "expected_revision": 0,
+                    "lease_seconds": 60,
+                }),
+            ))
+            .await;
+        let claimed = decode_tool_payload(&claimed).expect("claim payload");
+        assert_eq!(claimed["success"], true);
+        let revision = claimed["task"]["revision"].as_i64().unwrap();
+
+        let completed = harness
+            .server
+            .handle_request(tool_call(
+                9112,
+                "mempalace_task_transition",
+                json!({
+                    "task_id": task_id, "actor": "worker-1", "expected_revision": revision,
+                    "state": "completed",
+                }),
+            ))
+            .await;
+        assert_eq!(decode_tool_payload(&completed).expect("transition")["success"], true);
+
+        // A DetailedTask union violation -- a `completed` task must not carry `inputRequests` --
+        // must be rejected as invalid params rather than silently accepted.
+        let rejected = harness
+            .server
+            .handle_request(tool_call(
+                9113,
+                "mempalace_mcp_tasks_get",
+                json!({
+                    "task_id": task_id,
+                    "result": {"ok": true},
+                    "input_requests": {"req_1": {}},
+                }),
+            ))
+            .await;
+        assert_eq!(rejected["error"]["code"], ErrorCode::InvalidParams as i32);
+    }
+
+    #[tokio::test]
+    async fn mcp_tasks_update_transitions_and_reports_conflicts_as_data() {
+        let harness = test_harness().await;
+        let created = harness
+            .server
+            .handle_request(tool_call(
+                9120,
+                "mempalace_task_create",
+                json!({
+                    "title": "t", "description": "d", "created_by": "alice",
+                    "wing": "wing_myproject", "idempotency_key": "mcp-tasks-update-1",
+                }),
+            ))
+            .await;
+        let task_id =
+            decode_tool_payload(&created).expect("task")["task_id"].as_str().unwrap().to_owned();
+
+        // Conflict is data, not a JSON-RPC error.
+        let conflict = harness
+            .server
+            .handle_request(tool_call(
+                9121,
+                "mempalace_mcp_tasks_update",
+                json!({
+                    "task_id": task_id, "actor": "alice", "expected_revision": 999,
+                    "status": "cancelled",
+                }),
+            ))
+            .await;
+        let conflict = decode_tool_payload(&conflict).expect("conflict payload");
+        assert_eq!(conflict["success"], false);
+        assert_eq!(conflict["conflict"]["expected_revision"], 999);
+
+        let updated = harness
+            .server
+            .handle_request(tool_call(
+                9122,
+                "mempalace_mcp_tasks_update",
+                json!({
+                    "task_id": task_id, "actor": "alice", "expected_revision": 0,
+                    "status": "cancelled",
+                }),
+            ))
+            .await;
+        let updated = decode_tool_payload(&updated).expect("update payload");
+        assert_eq!(updated["success"], true);
+        assert_eq!(updated["task"]["state"], "cancelled");
+    }
+
+    #[tokio::test]
+    async fn mcp_tasks_cancel_transitions_a_task_to_cancelled() {
+        let harness = test_harness().await;
+        let created = harness
+            .server
+            .handle_request(tool_call(
+                9130,
+                "mempalace_task_create",
+                json!({
+                    "title": "t", "description": "d", "created_by": "alice",
+                    "wing": "wing_myproject", "idempotency_key": "mcp-tasks-cancel-1",
+                }),
+            ))
+            .await;
+        let task_id =
+            decode_tool_payload(&created).expect("task")["task_id"].as_str().unwrap().to_owned();
+
+        let cancelled = harness
+            .server
+            .handle_request(tool_call(
+                9131,
+                "mempalace_mcp_tasks_cancel",
+                json!({"task_id": task_id, "actor": "alice", "expected_revision": 0}),
+            ))
+            .await;
+        let cancelled = decode_tool_payload(&cancelled).expect("cancel payload");
+        assert_eq!(cancelled["success"], true);
+        assert_eq!(cancelled["task"]["state"], "cancelled");
+    }
+
+    #[tokio::test]
+    async fn mcp_tasks_import_persists_task_and_surfaces_provenance_for_the_caller_to_store() {
+        let harness = test_harness().await;
+        let raw = r#"{"taskId":"src-1","status":"working","createdAt":"2026-01-01T00:00:00Z","lastUpdatedAt":"2026-01-01T00:05:00Z","ttlMs":3600000,"resultType":"task"}"#;
+        let imported = harness
+            .server
+            .handle_request(tool_call(
+                9140,
+                "mempalace_mcp_tasks_import",
+                json!({
+                    "create_task_result": raw,
+                    "wing": "wing_myproject",
+                    "created_by": "alice",
+                    "idempotency_key": "mcp-tasks-import-1",
+                    "title": "Summarize",
+                    "description": "desc",
+                }),
+            ))
+            .await;
+        let payload = decode_tool_payload(&imported).expect("import payload");
+        assert_eq!(payload["target_state"], "running");
+        assert!(payload["coercion"].is_null());
+        assert_eq!(
+            payload["task"]["state"], "running",
+            "the created task itself must already be in the imported state, not Pending"
+        );
+        assert!(payload["task"]["expires_at"].is_null(), "ttlMs must never populate expires_at");
+        assert_eq!(payload["provenance"]["source_task_id"], "src-1");
+        assert_eq!(payload["provenance"]["source_created_at"], "2026-01-01T00:00:00Z");
+        assert_eq!(payload["provenance"]["source_last_updated_at"], "2026-01-01T00:05:00Z");
+        assert_eq!(payload["provenance"]["retention_deadline"], "2026-01-01T01:00:00Z");
+
+        let envelope_artifact_id = payload["envelope_artifact_id"].as_str().unwrap().to_owned();
+        let envelope = harness
+            .server
+            .handle_request(tool_call(
+                9141,
+                "mempalace_artifact_get",
+                json!({"artifact_id": envelope_artifact_id}),
+            ))
+            .await;
+        let envelope = decode_tool_payload(&envelope).expect("envelope payload");
+        assert_eq!(envelope["value"]["content"], raw);
+        assert_eq!(envelope["value"]["role"], "protocol_envelope");
+    }
+
+    /// Regression test: importing a `completed`/`cancelled` MCP Tasks result must not silently
+    /// downgrade the task to `Pending`, and the `task_created` audit event must record the
+    /// imported state with an `"imported": true` marker.
+    #[tokio::test]
+    async fn mcp_tasks_import_supports_completed_and_cancelled_and_marks_the_audit_event() {
+        let harness = test_harness().await;
+
+        let completed_raw = r#"{"taskId":"src-completed","status":"completed","createdAt":"2026-01-01T00:00:00Z","lastUpdatedAt":"2026-01-01T00:05:00Z","ttlMs":null,"resultType":"task"}"#;
+        let completed = harness
+            .server
+            .handle_request(tool_call(
+                9142,
+                "mempalace_mcp_tasks_import",
+                json!({
+                    "create_task_result": completed_raw, "wing": "wing_myproject",
+                    "created_by": "alice", "idempotency_key": "mcp-tasks-import-completed-1",
+                    "title": "t", "description": "d",
+                }),
+            ))
+            .await;
+        let completed = decode_tool_payload(&completed).expect("import payload");
+        assert_eq!(completed["target_state"], "completed");
+        assert_eq!(completed["task"]["state"], "completed");
+        let completed_task_id = completed["task"]["task_id"].as_str().unwrap().to_owned();
+
+        let cancelled_raw = r#"{"taskId":"src-cancelled","status":"cancelled","createdAt":"2026-01-01T00:00:00Z","lastUpdatedAt":"2026-01-01T00:05:00Z","ttlMs":null,"resultType":"task"}"#;
+        let cancelled = harness
+            .server
+            .handle_request(tool_call(
+                9143,
+                "mempalace_mcp_tasks_import",
+                json!({
+                    "create_task_result": cancelled_raw, "wing": "wing_myproject",
+                    "created_by": "alice", "idempotency_key": "mcp-tasks-import-cancelled-1",
+                    "title": "t", "description": "d",
+                }),
+            ))
+            .await;
+        let cancelled = decode_tool_payload(&cancelled).expect("import payload");
+        assert_eq!(cancelled["target_state"], "cancelled");
+        assert_eq!(cancelled["task"]["state"], "cancelled");
+
+        let events = harness
+            .server
+            .handle_request(tool_call(
+                9144,
+                "mempalace_coordination_events",
+                json!({"task_id": completed_task_id}),
+            ))
+            .await;
+        let events = decode_tool_payload(&events).expect("events payload");
+        let created_event = events["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|event| event["event_type"] == "task_created")
+            .expect("task_created event");
+        assert_eq!(created_event["to_state"], "completed");
+        assert_eq!(created_event["details"]["imported"], true);
+    }
+
+    /// `TaskState::Expired` is a lifecycle outcome the palace produces itself; an MCP Tasks import
+    /// must never be able to assert it directly. MCP Tasks' inbound mapping never actually
+    /// produces `Expired` (see `mempalace_mcp_tasks::status::map_inbound_task_status`), so this
+    /// exercises the storage-level guard directly, confirming it rejects rather than silently
+    /// succeeding or panicking.
+    #[tokio::test]
+    async fn mcp_tasks_import_cannot_reach_the_storage_layer_with_expired_as_a_target() {
+        let harness = test_harness().await;
+        let runtime = harness.server.runtime.lock().await;
+        let err = runtime
+            .coordination
+            .import_task(
+                &NewTask {
+                    title: "t".to_owned(),
+                    description: "d".to_owned(),
+                    created_by: "alice".to_owned(),
+                    wing: "wing_myproject".to_owned(),
+                    idempotency_key: "mcp-tasks-import-expired-guard-1".to_owned(),
+                    parent_id: None,
+                    dependencies: Vec::new(),
+                    budget: None,
+                    expires_at: None,
+                },
+                TaskState::Expired,
+            )
+            .expect_err("Expired must never be an assertable initial state for an import");
+        assert!(matches!(err, mempalace_storage::StorageError::Invariant(_)));
+    }
+
     // ── Routing / Federation tests ─────────────────────────────────────────
 
     #[test]
@@ -8700,6 +9929,18 @@ mod tests {
         );
         assert_eq!(ToolName::DelegationCheckpointGet.routing(), ToolRoutingCategory::LocalOnly);
         assert_eq!(ToolName::DelegationTrace.routing(), ToolRoutingCategory::LocalOnly);
+
+        // Protocol-adapter tools (issue #102 Stages 9-10) stay LocalOnly — translate-and-persist
+        // is a two-write sequence with no remote transaction to make it atomic.
+        assert_eq!(ToolName::A2aAgentCard.routing(), ToolRoutingCategory::LocalOnly);
+        assert_eq!(ToolName::A2aTaskImport.routing(), ToolRoutingCategory::LocalOnly);
+        assert_eq!(ToolName::A2aTaskExport.routing(), ToolRoutingCategory::LocalOnly);
+        assert_eq!(ToolName::A2aMessageImport.routing(), ToolRoutingCategory::LocalOnly);
+        assert_eq!(ToolName::A2aArtifactImport.routing(), ToolRoutingCategory::LocalOnly);
+        assert_eq!(ToolName::McpTasksGet.routing(), ToolRoutingCategory::LocalOnly);
+        assert_eq!(ToolName::McpTasksUpdate.routing(), ToolRoutingCategory::LocalOnly);
+        assert_eq!(ToolName::McpTasksCancel.routing(), ToolRoutingCategory::LocalOnly);
+        assert_eq!(ToolName::McpTasksImport.routing(), ToolRoutingCategory::LocalOnly);
     }
 
     #[tokio::test]

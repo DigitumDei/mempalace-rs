@@ -2714,13 +2714,33 @@ where
         if !duplicates.is_empty() {
             // ── Both-mode: same wing+room → retry, reuse local, retry remote ──
             if is_both {
-                if let Some(existing) = duplicates.iter().find(|d| {
+                // Only a candidate whose stored record matches every mutation-affecting
+                // field of this request may be reused: staging this request's metadata
+                // under an existing drawer id whose stored metadata differs would leave
+                // the remote replica carrying different metadata than the local record.
+                // Non-matching candidates fall through to the normal duplicate result.
+                for existing in duplicates.iter().filter(|d| {
                     d.get("wing").and_then(|w| w.as_str()) == Some(wing.as_str())
                         && d.get("room").and_then(|r| r.as_str()) == Some(room.as_str())
                         && d.get("content_hash").and_then(|h| h.as_str())
                             == Some(content_hash.as_str())
                 }) {
-                    let existing_drawer_id = existing["id"].as_str().unwrap_or("");
+                    let Some(existing_drawer_id) = existing["id"].as_str() else { continue };
+                    let Some(existing_id) = DrawerId::new(existing_drawer_id).ok() else {
+                        continue;
+                    };
+                    let Some(stored) = self
+                        .storage
+                        .drawer_store()
+                        .get_drawer(&existing_id)
+                        .await
+                        .map_tool()?
+                    else {
+                        continue;
+                    };
+                    if stored.source_file != source_file || stored.added_by != added_by {
+                        continue;
+                    }
                     let remote =
                         route.as_ref().and_then(|value| value.remote.clone()).ok_or_else(|| {
                             ToolError::Internal(McpError::Federation(
@@ -10980,6 +11000,224 @@ mod tests {
             0,
             "the remote must not be called inline"
         );
+    }
+
+    /// Seed a local drawer directly (bypassing `tool_add_drawer`, so no outbox intent
+    /// exists for it) with a real stub embedding so `find_duplicates` can match it.
+    async fn seed_write_both_duplicate_drawer(
+        ctx: &mut DeleteDrawerTestCtx,
+        drawer_id: &str,
+        source_file: &str,
+        added_by: &str,
+        content: &str,
+    ) -> DrawerId {
+        let seeded_id = DrawerId::new(drawer_id).unwrap();
+        let record = ctx
+            .runtime
+            .build_drawer_record(
+                seeded_id.clone(),
+                parse_wing_id("wing_code").unwrap(),
+                parse_room_id("dup-room").unwrap(),
+                None,
+                None,
+                source_file.to_owned(),
+                added_by.to_owned(),
+                "mcp".to_owned(),
+                content.to_owned(),
+                OffsetDateTime::now_utc(),
+            )
+            .await
+            .unwrap();
+        ctx.runtime
+            .storage
+            .drawer_store()
+            .put_drawers(&[record], DuplicateStrategy::Error)
+            .await
+            .unwrap();
+        seeded_id
+    }
+
+    #[tokio::test]
+    async fn tool_add_drawer_write_both_duplicate_reuses_local_only_when_metadata_matches() {
+        // A write:both add whose content matches a local drawer must reuse that drawer
+        // only when the stored record's metadata (source_file, added_by) matches the
+        // request; the queued remote payload then describes the same mutation the local
+        // record carries, so replicas stay converged.
+        let mock = Arc::new(DeleteDrawerMock {
+            delete_succeeds: true,
+            delete_call_count: AtomicU64::new(0),
+            delete_unknown_outcome: false,
+        });
+        let remotes =
+            BTreeMap::from([("alpha".to_owned(), mock as Arc<dyn mempalace_remote::RemoteApi>)]);
+        let mut ctx = make_delete_drawer_ctx(remotes, WriteTarget::Both).await;
+        let seeded_id = seed_write_both_duplicate_drawer(
+            &mut ctx,
+            "drawer_wing_code_dup-room_seeded0001",
+            "notes.md",
+            "tester",
+            "duplicate metadata probe",
+        )
+        .await;
+
+        let result = ctx
+            .runtime
+            .tool_add_drawer(&json!({
+                "wing": "wing_code",
+                "room": "dup-room",
+                "content": "duplicate metadata probe",
+                "source_file": "notes.md",
+                "added_by": "tester",
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result["success"], true, "matching metadata must reuse the local drawer");
+        assert_eq!(result["drawer_id"], seeded_id.as_str());
+        assert_eq!(result["applied_to"], "local");
+        assert_eq!(result["replication"]["status"], "queued");
+        assert_eq!(result["replication"]["remote"], "alpha");
+
+        // The queued operation must carry the stored record's metadata under the stored
+        // drawer id — not a divergent payload.
+        let operation = ctx
+            .runtime
+            .outbox
+            .find_by_key(
+                OUTBOX_ACTOR,
+                &replication_idempotency_key(None, "drawer-add", seeded_id.as_str(), "alpha"),
+            )
+            .unwrap()
+            .expect("matching reuse must queue the remote operation");
+        assert_eq!(operation.entity_id, seeded_id.as_str());
+        match serde_json::from_value::<ReplicationMutation>(operation.payload).unwrap() {
+            ReplicationMutation::DrawerAdd { request } => {
+                assert_eq!(request.source_file.as_deref(), Some("notes.md"));
+                assert_eq!(request.added_by.as_deref(), Some("tester"));
+                assert_eq!(request.drawer_id.as_deref(), Some(seeded_id.as_str()));
+            }
+            other => panic!("expected a drawer-add payload, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_add_drawer_write_both_duplicate_source_file_mismatch_returns_duplicate() {
+        // A write:both add of identical content whose source_file differs from the stored
+        // record must return the normal duplicate result and must not queue a remote
+        // operation pinning the old drawer id under the new metadata.
+        let mock = Arc::new(DeleteDrawerMock {
+            delete_succeeds: true,
+            delete_call_count: AtomicU64::new(0),
+            delete_unknown_outcome: false,
+        });
+        let remotes =
+            BTreeMap::from([("alpha".to_owned(), mock as Arc<dyn mempalace_remote::RemoteApi>)]);
+        let mut ctx = make_delete_drawer_ctx(remotes, WriteTarget::Both).await;
+        let seeded_id = seed_write_both_duplicate_drawer(
+            &mut ctx,
+            "drawer_wing_code_dup-room_seeded0002",
+            "notes.md",
+            "tester",
+            "duplicate metadata probe",
+        )
+        .await;
+
+        let result = ctx
+            .runtime
+            .tool_add_drawer(&json!({
+                "wing": "wing_code",
+                "room": "dup-room",
+                "content": "duplicate metadata probe",
+                "source_file": "other.md",
+                "added_by": "tester",
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result["success"], false,
+            "a source_file mismatch must not reuse the local drawer: {result}"
+        );
+        assert_eq!(result["reason"], "duplicate");
+        assert!(
+            !result.as_object().unwrap().contains_key("replication"),
+            "a source_file-mismatched duplicate must not queue replication: {result}"
+        );
+        assert!(
+            ctx.runtime
+                .outbox
+                .find_by_key(
+                    OUTBOX_ACTOR,
+                    &replication_idempotency_key(None, "drawer-add", seeded_id.as_str(), "alpha")
+                )
+                .unwrap()
+                .is_none(),
+            "a source_file-mismatched duplicate must not stage a remote operation"
+        );
+        let stored =
+            ctx.runtime.storage.drawer_store().get_drawer(&seeded_id).await.unwrap().unwrap();
+        assert_eq!(stored.source_file, "notes.md");
+        assert_eq!(stored.added_by, "tester");
+    }
+
+    #[tokio::test]
+    async fn tool_add_drawer_write_both_duplicate_added_by_mismatch_returns_duplicate() {
+        // A write:both add of identical content whose added_by differs from the stored
+        // record must return the normal duplicate result and must not queue a remote
+        // operation. Omitting source_file on both sides exercises the empty-string
+        // source_file comparison.
+        let mock = Arc::new(DeleteDrawerMock {
+            delete_succeeds: true,
+            delete_call_count: AtomicU64::new(0),
+            delete_unknown_outcome: false,
+        });
+        let remotes =
+            BTreeMap::from([("alpha".to_owned(), mock as Arc<dyn mempalace_remote::RemoteApi>)]);
+        let mut ctx = make_delete_drawer_ctx(remotes, WriteTarget::Both).await;
+        let seeded_id = seed_write_both_duplicate_drawer(
+            &mut ctx,
+            "drawer_wing_code_dup-room_seeded0003",
+            "",
+            "tester",
+            "duplicate metadata probe",
+        )
+        .await;
+
+        let result = ctx
+            .runtime
+            .tool_add_drawer(&json!({
+                "wing": "wing_code",
+                "room": "dup-room",
+                "content": "duplicate metadata probe",
+                "added_by": "someone-else",
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result["success"], false,
+            "an added_by mismatch must not reuse the local drawer: {result}"
+        );
+        assert_eq!(result["reason"], "duplicate");
+        assert!(
+            !result.as_object().unwrap().contains_key("replication"),
+            "an added_by-mismatched duplicate must not queue replication: {result}"
+        );
+        assert!(
+            ctx.runtime
+                .outbox
+                .find_by_key(
+                    OUTBOX_ACTOR,
+                    &replication_idempotency_key(None, "drawer-add", seeded_id.as_str(), "alpha")
+                )
+                .unwrap()
+                .is_none(),
+            "an added_by-mismatched duplicate must not stage a remote operation"
+        );
+        let stored =
+            ctx.runtime.storage.drawer_store().get_drawer(&seeded_id).await.unwrap().unwrap();
+        assert_eq!(stored.source_file, "");
+        assert_eq!(stored.added_by, "tester");
     }
 
     #[tokio::test]

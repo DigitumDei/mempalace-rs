@@ -217,7 +217,11 @@ fn retry_backoff(operation: &OutboxOperation) -> Duration {
 fn bounded_error(error: &RemoteError) -> String {
     let mut message = error.to_string();
     if message.len() > 1_024 {
-        message.truncate(1_024);
+        let mut boundary = 1_024;
+        while boundary > 0 && !message.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        message.truncate(boundary);
     }
     message
 }
@@ -263,5 +267,26 @@ mod tests {
         assert_eq!(first, retry_backoff(&operation));
         assert!(first >= Duration::seconds(256));
         assert!(first < Duration::seconds(MAX_BACKOFF_SECONDS + 1));
+    }
+
+    #[test]
+    fn bounded_error_truncates_on_utf8_char_boundary_without_panic() {
+        // Construct a *formatted* error whose byte 1024 lands in the middle of a multibyte
+        // UTF-8 sequence. `bounded_error` truncates `to_string()`, which includes this prefix.
+        let prefix =
+            RemoteError::Unreachable { remote: "actuarius".into(), message: String::new() }
+                .to_string();
+        let mut msg = "a".repeat(1023 - prefix.len());
+        msg.push('\u{2014}');
+        msg.push_str("extra content after the boundary");
+
+        let err = RemoteError::Unreachable { remote: "actuarius".into(), message: msg };
+        let full = err.to_string();
+        assert!(full.len() > 1024);
+        assert_eq!(full.as_bytes()[1023], 0xE2);
+        assert!(!full.is_char_boundary(1024));
+        let truncated = bounded_error(&err);
+        assert!(truncated.len() <= 1024);
+        assert!(truncated.is_char_boundary(truncated.len()));
     }
 }

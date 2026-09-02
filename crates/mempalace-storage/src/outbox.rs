@@ -336,6 +336,19 @@ CREATE INDEX IF NOT EXISTS idx_replication_outbox_claim
                     input.idempotency_key
                 )));
             }
+            if op.state == OutboxState::Cancelled {
+                let now = OffsetDateTime::now_utc();
+                tx.execute(
+                    "UPDATE replication_outbox SET state='staged',revision=revision+1,updated_at=?2 \
+                     WHERE operation_id=?1 AND state='cancelled'",
+                    params![op.operation_id, format_time(now)?],
+                )?;
+                let restored = get_operation_tx(&tx, &op.operation_id)?.ok_or_else(|| {
+                    StorageError::Invariant("restored operation disappeared".into())
+                })?;
+                tx.commit()?;
+                return Ok(restored);
+            }
             tx.commit()?;
             return Ok(op);
         }
@@ -1393,6 +1406,60 @@ mod tests {
             )
             .expect_err("a cancelled operation must not be claimable");
         assert!(expect_invariant(&err).starts_with(OUTBOX_OPERATION_TERMINAL), "{err}");
+    }
+
+    #[test]
+    fn retry_cancelled_staged_operation_becomes_deliverable_again() {
+        let (_dir, outbox) = store();
+        let input = NewOutboxOperation {
+            created_by: "worker".into(),
+            idempotency_key: "retry-cancel-key".into(),
+            mutation_kind: "drawer_added".into(),
+            entity_id: "drawer_abc".into(),
+            destination_remote: "actuarius".into(),
+            ordering_key: "drawer_abc".into(),
+            payload: serde_json::json!({"content": "initial"}),
+            max_attempts: 5,
+        };
+        let staged = outbox.enqueue(&input).expect("enqueue");
+        assert_eq!(staged.state, OutboxState::Staged);
+        assert_eq!(staged.revision, 0);
+
+        // Cancel the staged intent (local mutation aborted).
+        let cancelled = expect_applied(
+            outbox.cancel(&staged.operation_id, staged.revision).expect("cancel staged"),
+        );
+        assert_eq!(cancelled.state, OutboxState::Cancelled);
+        assert_eq!(cancelled.revision, 1);
+
+        // Attempting to re-enqueue with a different payload is rejected.
+        let mut different_input = input.clone();
+        different_input.payload = serde_json::json!({"content": "different"});
+        let err = outbox.enqueue(&different_input).expect_err("reused key with different payload");
+        assert!(err.to_string().contains("reused with a different mutation"));
+
+        // Retrying with the same operation/payload revives the intent to staged.
+        let revived = outbox.enqueue(&input).expect("revive cancelled enqueue");
+        assert_eq!(revived.operation_id, staged.operation_id);
+        assert_eq!(revived.state, OutboxState::Staged);
+        assert_eq!(revived.revision, 2);
+
+        // Revived staged operation can now be activated after local commit succeeds.
+        let activated = expect_applied(
+            outbox.activate(&revived.operation_id, revived.revision).expect("activate revived"),
+        );
+        assert_eq!(activated.state, OutboxState::Pending);
+
+        // Activated operation is claimed and delivered normally.
+        let claimed = outbox
+            .claim_next("actuarius", "worker", Duration::minutes(1))
+            .expect("claim")
+            .expect("found pending");
+        assert_eq!(claimed.operation_id, staged.operation_id);
+        let acked = expect_applied(
+            outbox.acknowledge(&claimed.operation_id, "worker", claimed.revision).expect("ack"),
+        );
+        assert_eq!(acked.state, OutboxState::Replicated);
     }
 
     #[test]

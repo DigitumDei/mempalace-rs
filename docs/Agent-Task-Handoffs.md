@@ -48,10 +48,20 @@ in parallel, but the supervisor still owns integration and full-workspace verifi
   process became apparent only after the user pressed **Stop**. Supervisors should report the
   process/session ID explicitly and verify liveness from the process handle and durable task state;
   the UI indicator must not be treated as the authority.
-- **OpenCode needs its user-level runtime directory.** A sandboxed launch failed while opening
-  `~/.local/share/opencode/log/opencode.log`. Relaunching `opencode run` with explicit permission
-  for its session/log directory succeeded, and the MemPalace task remained intact. A launcher
-  should preflight this permission and distinguish launch failure from task failure.
+- **OpenCode needs its user-level runtime directory.** A launch from the Codex sandbox failed
+  while opening `~/.local/share/opencode/log/opencode.log`; no OpenCode process or Windows handle
+  owned the file, so this was a sandbox write restriction rather than a stale lock. Run the
+  long-lived server from a normal user PowerShell (or grant the runtime directory explicitly),
+  and distinguish launch failure from task failure. Do not force-close a supposedly locked log
+  handle when Resource Monitor finds no owner.
+- **A fresh XDG profile has no provider credentials.** Pointing an attached client at a temporary
+  `XDG_DATA_HOME` is useful for isolating client state, but it does not carry over OpenRouter
+  connections, model selection, or other user auth. Keep credentials in the authenticated
+  `opencode serve` profile and use `opencode run --attach http://127.0.0.1:<port>` for workers.
+- **Headless external-worktree permissions need an explicit policy.** An attached `opencode run`
+  without `--auto` hit a worktree `external_directory` prompt and exited after the prompt was
+  rejected. For a deliberately bounded task, launch with `--auto` only after the task has claimed
+  the exact worktree and ownership; otherwise use an interactive approval path.
 - **Late feedback is pull-based.** Sending a review message does not interrupt or wake an active
   OpenCode CLI turn. The worker must poll at sensible boundaries. A fast worker can publish a
   result and complete before seeing a late finding; `input_required` creates a safer review gate.

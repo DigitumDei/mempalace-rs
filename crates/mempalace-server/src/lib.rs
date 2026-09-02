@@ -1467,7 +1467,16 @@ where
                 // state: if the drawer already exists the add already applied, so converge on the
                 // pinned target id and complete the receipt instead of re-running the mutation.
                 let target = DrawerId::new(&receipt.target_id)?;
-                if state.storage.drawer_store().get_drawer(&target).await?.is_some() {
+                if let Some(existing) = state.storage.drawer_store().get_drawer(&target).await? {
+                    if existing.content != body.content
+                        || existing.wing.as_str() != wing.as_str()
+                        || existing.room.as_str() != room.as_str()
+                    {
+                        return Err(ServerError::IdempotencyConflict(format!(
+                            "operation `{op}` recovered drawer `{}` with mismatched content/wing/room",
+                            receipt.target_id
+                        )));
+                    }
                     let response = serde_json::to_value(add_drawer_response(
                         &receipt.target_id,
                         wing.as_str(),
@@ -4167,14 +4176,19 @@ fn canonical_kg_label(value: &str) -> String {
     normalized.trim_matches('_').to_owned()
 }
 
-/// Stable target identity for a KG mutation receipt: the canonicalised triple.
+/// Stable target identity for a KG mutation receipt: a fixed-length namespaced hash of the
+/// canonicalised triple (`kg:<blake3-hex>`).
+///
+/// Using a fixed-length hash guarantees `target_id` stays within storage length bounds even when
+/// the subject, predicate, or object are arbitrarily long strings.
 fn canonical_kg_triple(subject: &str, predicate: &str, object: &str) -> String {
-    format!(
+    let canonical = format!(
         "{} → {} → {}",
         canonical_kg_label(subject),
         canonical_kg_label(predicate),
         canonical_kg_label(object)
-    )
+    );
+    format!("kg:{}", hash_text(&canonical))
 }
 
 /// Inspect the stable target state for a KG fact-add: is the exact triple already present?
@@ -5628,6 +5642,131 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn kg_receipt_with_long_fields_succeeds_without_exceeding_target_length_limit() {
+        let harness = make_harness().await;
+
+        let subject = format!("Subject_{}", "s".repeat(120));
+        let predicate = format!("predicate_{}", "p".repeat(120));
+        let object = format!("Object_{}", "o".repeat(120));
+
+        let op = "op-kg-long-fields-1";
+        let payload = json!({
+            "subject": subject,
+            "predicate": predicate,
+            "object": object,
+            "operation_id": op,
+        });
+
+        let first = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/kg/facts",
+                ALICE_TOKEN,
+                payload.clone(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_body = body_json(first).await;
+        assert_eq!(first_body["success"], true);
+        let triple_id = first_body["triple_id"].as_str().unwrap().to_owned();
+
+        // Stored receipt target_id is fixed-length and within limits.
+        let receipt =
+            harness.state.storage.receipt_store().get_receipt(op).unwrap().expect("receipt exists");
+        assert_eq!(receipt.status, mempalace_storage::ReceiptState::Completed);
+        assert_eq!(receipt.target_id, canonical_kg_triple(&subject, &predicate, &object));
+        assert!(receipt.target_id.starts_with("kg:"));
+        assert!(receipt.target_id.len() <= 256);
+
+        // Identical replay succeeds and returns the same response.
+        let replay = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/kg/facts",
+                ALICE_TOKEN,
+                payload.clone(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::OK);
+        let replay_body = body_json(replay).await;
+        assert_eq!(replay_body["triple_id"], triple_id);
+
+        // Rewind receipt to pending (simulating crash) and verify retry recovers cleanly.
+        let sqlite_path = harness.state.storage.layout().sqlite_path.clone();
+        {
+            let conn = rusqlite::Connection::open(&sqlite_path).unwrap();
+            conn.execute(
+                "UPDATE mutation_receipts SET status='pending', response_json=NULL, completed_at=NULL \
+                 WHERE operation_id=?1",
+                [op],
+            )
+            .unwrap();
+        }
+        let recovered = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(Method::POST, "/v1/kg/facts", ALICE_TOKEN, payload))
+            .await
+            .unwrap();
+        assert_eq!(recovered.status(), StatusCode::OK);
+        let recovered_body = body_json(recovered).await;
+        assert_eq!(recovered_body["triple_id"], triple_id);
+
+        // Invalidate with long fields and operation_id also succeeds and replays.
+        let inv_op = "op-kg-inv-long-fields-1";
+        let inv_payload = json!({
+            "subject": subject,
+            "predicate": predicate,
+            "object": object,
+            "ended": "2026-08-01",
+            "operation_id": inv_op,
+        });
+        let inv_first = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/kg/facts/invalidate",
+                ALICE_TOKEN,
+                inv_payload.clone(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(inv_first.status(), StatusCode::OK);
+
+        let inv_receipt = harness
+            .state
+            .storage
+            .receipt_store()
+            .get_receipt(inv_op)
+            .unwrap()
+            .expect("invalidate receipt exists");
+        assert_eq!(inv_receipt.status, mempalace_storage::ReceiptState::Completed);
+        assert_eq!(inv_receipt.target_id, canonical_kg_triple(&subject, &predicate, &object));
+        assert!(inv_receipt.target_id.starts_with("kg:"));
+        assert!(inv_receipt.target_id.len() <= 256);
+
+        let inv_replay = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/kg/facts/invalidate",
+                ALICE_TOKEN,
+                inv_payload,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(inv_replay.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn add_recovers_pending_receipt_after_crash_without_effect() {
         let harness = make_harness().await;
 
@@ -5689,6 +5828,102 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(get_resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn add_recovers_pending_receipt_with_preapplied_effect_detects_mismatch() {
+        let harness = make_harness().await;
+
+        let op = "op-add-recover-mismatch-1";
+        let payload = json!({
+            "wing": "wing_code",
+            "room": "idem-test",
+            "content": "original drawer content",
+            "operation_id": op,
+        });
+
+        let first = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(Method::POST, "/v1/drawers", ALICE_TOKEN, payload.clone()))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let drawer_id = body_json(first).await["drawer_id"].as_str().unwrap().to_owned();
+
+        // Rewind receipt to pending (simulating crash before completion).
+        let sqlite_path = harness.state.storage.layout().sqlite_path.clone();
+        {
+            let conn = rusqlite::Connection::open(&sqlite_path).unwrap();
+            conn.execute(
+                "UPDATE mutation_receipts SET status='pending', response_json=NULL, completed_at=NULL \
+                 WHERE operation_id=?1",
+                [op],
+            )
+            .unwrap();
+        }
+
+        // Matching recovery succeeds.
+        let recovered = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(Method::POST, "/v1/drawers", ALICE_TOKEN, payload.clone()))
+            .await
+            .unwrap();
+        assert_eq!(recovered.status(), StatusCode::OK);
+        assert_eq!(body_json(recovered).await["drawer_id"], drawer_id);
+
+        // Rewind receipt to pending again.
+        {
+            let conn = rusqlite::Connection::open(&sqlite_path).unwrap();
+            conn.execute(
+                "UPDATE mutation_receipts SET status='pending', response_json=NULL, completed_at=NULL \
+                 WHERE operation_id=?1",
+                [op],
+            )
+            .unwrap();
+        }
+
+        // Mismatched content on the recovered drawer in the database triggers Conflict.
+        // Update the receipt request hash to match a modified request payload, but keep target_id pointing to the existing drawer.
+        let mismatched_payload = json!({
+            "wing": "wing_code",
+            "room": "idem-test",
+            "content": "different content entirely",
+            "drawer_id": drawer_id,
+            "operation_id": op,
+        });
+        let mismatched_hash = mutation_request_hash(&[
+            ("wing", json!("wing_code")),
+            ("room", json!("idem-test")),
+            ("content", json!("different content entirely")),
+            ("source_file", json!(Option::<String>::None)),
+            ("added_by", json!(Option::<String>::None)),
+            ("drawer_id", json!(Some(drawer_id.clone()))),
+        ]);
+        {
+            let conn = rusqlite::Connection::open(&sqlite_path).unwrap();
+            conn.execute(
+                "UPDATE mutation_receipts SET request_hash=?1 WHERE operation_id=?2",
+                rusqlite::params![mismatched_hash, op],
+            )
+            .unwrap();
+        }
+
+        let conflict_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/drawers",
+                ALICE_TOKEN,
+                mismatched_payload,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(conflict_resp.status(), StatusCode::CONFLICT);
+        let conflict_body = body_json(conflict_resp).await;
+        assert_eq!(conflict_body["code"], "operation_id_conflict");
     }
 
     #[tokio::test]

@@ -1476,14 +1476,21 @@ where
     ) -> Result<Option<bool>> {
         let runtime = KnowledgeGraphRuntime::new(self.storage.operational_store());
         match runtime.query_entity(subject, None, QueryDirection::Outgoing) {
-            Ok(rows) => Ok(rows
-                .into_iter()
-                .find(|row| {
-                    row.subject.eq_ignore_ascii_case(subject)
-                        && row.predicate.eq_ignore_ascii_case(predicate)
-                        && row.object.eq_ignore_ascii_case(object)
-                })
-                .map(|row| row.current)),
+            Ok(rows) => {
+                let matches: Vec<_> = rows
+                    .into_iter()
+                    .filter(|row| {
+                        row.subject.eq_ignore_ascii_case(subject)
+                            && row.predicate.eq_ignore_ascii_case(predicate)
+                            && row.object.eq_ignore_ascii_case(object)
+                    })
+                    .collect();
+                if matches.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(matches.iter().any(|row| row.current)))
+                }
+            }
             Err(mempalace_graph::GraphError::UnknownEntity { .. }) => Ok(None),
             Err(error) => Err(McpError::Graph(error)),
         }
@@ -3523,7 +3530,7 @@ where
                             subject: subject.clone(),
                             predicate: predicate.clone(),
                             object: object.clone(),
-                            ended: ended_text.clone(),
+                            ended: Some(ended.to_string()),
                             operation_id: None,
                         },
                     },
@@ -10782,6 +10789,165 @@ mod tests {
             .unwrap_or_else(|| panic!("no drawer_deleted event found for {drawer_id}: {events:?}"));
         assert_eq!(deleted_event["details"]["wing"], "wing_alpha");
         assert_eq!(deleted_event["details"]["room"], "alpha-room");
+    }
+
+    #[tokio::test]
+    async fn kg_invalidate_persists_resolved_date_in_queued_replication() {
+        let mut rules_remotes = BTreeMap::new();
+        rules_remotes.insert(
+            "alpha".to_owned(),
+            ResolvedRemote {
+                name: "alpha".to_owned(),
+                url: "http://127.0.0.1:9999".to_owned(),
+                token: Some("test".to_owned()),
+                timeout: std::time::Duration::from_secs(5),
+            },
+        );
+        let federation = FederationRuntimeConfig {
+            remotes: rules_remotes,
+            default_mode: RouteMode::Combined,
+            default_remote: Some("alpha".to_owned()),
+            wings: BTreeMap::new(),
+            kg: Some(ResolvedRouteRule {
+                mode: RouteMode::Combined,
+                remote: Some("alpha".to_owned()),
+                write: WriteTarget::Both,
+            }),
+            coordination: BTreeMap::new(),
+        };
+
+        let harness = test_harness_with_federation(federation).await;
+
+        // Add a fact directly to the local KG. Using the tool would queue a
+        // replication op for the add too; the point here is to inspect only the
+        // op the invalidation queues.
+        {
+            let runtime = harness.server.runtime.lock().await;
+            let kg_runtime = KnowledgeGraphRuntime::new(runtime.storage.operational_store());
+            let now = OffsetDateTime::now_utc();
+            kg_runtime
+                .add_fact(
+                    AddFactRequest {
+                        subject: "User1".into(),
+                        subject_type: EntityKind::Person,
+                        predicate: "works_on".into(),
+                        object: "ProjectX".into(),
+                        object_type: EntityKind::Concept,
+                        valid_from: None,
+                        valid_to: None,
+                        confidence: 1.0,
+                        source_drawer_id: None,
+                        source_file: None,
+                    },
+                    now,
+                )
+                .unwrap();
+        }
+
+        // Invalidate the fact without supplying an explicit `ended` date.
+        let inv_resp = harness
+            .server
+            .handle_request(tool_call(
+                2,
+                "mempalace_kg_invalidate",
+                json!({
+                    "subject": "User1",
+                    "predicate": "works_on",
+                    "object": "ProjectX",
+                }),
+            ))
+            .await;
+        let inv_payload = decode_tool_payload(&inv_resp).unwrap();
+        assert_eq!(inv_payload["success"], true);
+
+        // Inspect the queued outbox payload: `ended` must carry the locally resolved date.
+        let runtime = harness.server.runtime.lock().await;
+        let today = OffsetDateTime::now_utc().date().to_string();
+        let mut found_inv = false;
+        let count = runtime.outbox.backlog(None).unwrap();
+        assert!(count.total_count >= 1);
+        let op = runtime
+            .outbox
+            .claim_next("alpha", "worker-test", time::Duration::minutes(1))
+            .unwrap()
+            .expect("claimed op");
+        if let Ok(ReplicationMutation::KgInvalidate { request }) =
+            serde_json::from_value::<ReplicationMutation>(op.payload)
+        {
+            assert_eq!(request.subject, "User1");
+            assert_eq!(request.predicate, "works_on");
+            assert_eq!(request.object, "ProjectX");
+            assert_eq!(request.ended, Some(today));
+            found_inv = true;
+        }
+        assert!(
+            found_inv,
+            "outbox must carry ReplicationMutation::KgInvalidate with resolved ended date"
+        );
+    }
+
+    #[tokio::test]
+    async fn staged_kg_reconciliation_determines_current_state_across_all_historical_facts() {
+        let harness = test_harness_with_federation(FederationRuntimeConfig::default()).await;
+        let runtime = harness.server.runtime.lock().await;
+        let kg_store = runtime.storage.operational_store();
+        let kg_runtime = KnowledgeGraphRuntime::new(kg_store);
+
+        let now = OffsetDateTime::now_utc();
+        let today = now.date();
+        let yesterday = today.previous_day().unwrap();
+        let two_days_ago = yesterday.previous_day().unwrap();
+
+        // 1. Add older fact that is invalidated.
+        let _f1_id = kg_runtime
+            .add_fact(
+                mempalace_graph::AddFactRequest {
+                    subject: "PersonA".into(),
+                    subject_type: mempalace_graph::EntityKind::Person,
+                    predicate: "lives_in".into(),
+                    object: "CityA".into(),
+                    object_type: mempalace_graph::EntityKind::Concept,
+                    valid_from: Some(two_days_ago),
+                    valid_to: None,
+                    confidence: 1.0,
+                    source_drawer_id: None,
+                    source_file: None,
+                },
+                now,
+            )
+            .unwrap();
+        kg_runtime.invalidate("PersonA", "lives_in", "CityA", yesterday, now).unwrap();
+
+        // Check fact state before adding the second fact: should be Some(false)
+        assert_eq!(runtime.local_fact_state("PersonA", "lives_in", "CityA").unwrap(), Some(false));
+
+        // 2. Add newer active fact for the exact same (subject, predicate, object).
+        let _f2_id = kg_runtime
+            .add_fact(
+                mempalace_graph::AddFactRequest {
+                    subject: "PersonA".into(),
+                    subject_type: mempalace_graph::EntityKind::Person,
+                    predicate: "lives_in".into(),
+                    object: "CityA".into(),
+                    object_type: mempalace_graph::EntityKind::Concept,
+                    valid_from: Some(yesterday),
+                    valid_to: None,
+                    confidence: 1.0,
+                    source_drawer_id: None,
+                    source_file: None,
+                },
+                now,
+            )
+            .unwrap();
+
+        // local_fact_state must see the active fact and return Some(true), even though f1 is historical and invalidated.
+        assert_eq!(runtime.local_fact_state("PersonA", "lives_in", "CityA").unwrap(), Some(true));
+
+        // 3. Invalidate the newer active fact as well.
+        // `valid_to` is inclusive, so end on yesterday to make the newer row inactive for today.
+        kg_runtime.invalidate("PersonA", "lives_in", "CityA", yesterday, now).unwrap();
+        // Now all facts for this triple are inactive -> Some(false).
+        assert_eq!(runtime.local_fact_state("PersonA", "lives_in", "CityA").unwrap(), Some(false));
     }
 
     async fn test_harness_with_federation(federation: FederationRuntimeConfig) -> TestHarness {

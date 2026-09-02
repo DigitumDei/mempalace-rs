@@ -4120,15 +4120,16 @@ where
     /// Transition a task's lifecycle state using an inbound MCP Tasks extension status, under the
     /// same compare-and-swap revision semantics as `mempalace_task_transition`. See
     /// [`Self::tool_task_claim`] for the conflict-shape notes — identical here. Local-only: no
-    /// MCP Tasks transport of its own to fall back to.
+    /// MCP Tasks transport of its own to fall back to. A blank or unknown `task_id` is
+    /// `ToolError::InvalidParams`, matching `tool_mcp_tasks_get` and JSON-RPC `-32602`.
     async fn tool_mcp_tasks_update(&mut self, arguments: &Value) -> ToolResult<Value> {
         let status_str = required_string(arguments, "status")?;
         let status: McpTaskStatus = serde_json::from_value(json!(status_str))
             .map_err(|e| ToolError::InvalidParams(e.to_string()))?;
         let target = map_inbound_task_status(status);
         let expected_revision = required_i64(arguments, "expected_revision")?;
-        let task_id = required_string(arguments, "task_id")?;
-        let actor = required_string(arguments, "actor")?;
+        let task_id = required_non_blank_string(arguments, "task_id")?;
+        let actor = required_non_blank_string(arguments, "actor")?;
         let details = arguments.get("details").cloned();
         match self.coordination.transition_task(
             &task_id,
@@ -4141,17 +4142,22 @@ where
             Ok(RevisionedWrite::Conflict { actual_revision }) => {
                 Ok(revision_conflict_payload(expected_revision, actual_revision))
             }
+            Err(err) if is_local_record_missing(&err) => {
+                Err(ToolError::InvalidParams(format!("task `{task_id}` not found")))
+            }
             Err(err) => Err(err).map_tool_internal(),
         }
     }
 
     /// Cancel a task on behalf of an inbound MCP Tasks `tasks/cancel` request. Equivalent to
-    /// [`Self::tool_mcp_tasks_update`] with status fixed to `cancelled`.
+    /// [`Self::tool_mcp_tasks_update`] with status fixed to `cancelled`. A blank or unknown
+    /// `task_id` is `ToolError::InvalidParams`, matching `tool_mcp_tasks_get` and JSON-RPC
+    /// `-32602`.
     async fn tool_mcp_tasks_cancel(&mut self, arguments: &Value) -> ToolResult<Value> {
         let target = map_inbound_task_status(McpTaskStatus::Cancelled);
         let expected_revision = required_i64(arguments, "expected_revision")?;
-        let task_id = required_string(arguments, "task_id")?;
-        let actor = required_string(arguments, "actor")?;
+        let task_id = required_non_blank_string(arguments, "task_id")?;
+        let actor = required_non_blank_string(arguments, "actor")?;
         let details = arguments.get("details").cloned();
         match self.coordination.transition_task(
             &task_id,
@@ -4163,6 +4169,9 @@ where
             Ok(RevisionedWrite::Applied(task)) => Ok(json!({"success": true, "task": task})),
             Ok(RevisionedWrite::Conflict { actual_revision }) => {
                 Ok(revision_conflict_payload(expected_revision, actual_revision))
+            }
+            Err(err) if is_local_record_missing(&err) => {
+                Err(ToolError::InvalidParams(format!("task `{task_id}` not found")))
             }
             Err(err) => Err(err).map_tool_internal(),
         }
@@ -9676,6 +9685,33 @@ mod tests {
         let updated = decode_tool_payload(&updated).expect("update payload");
         assert_eq!(updated["success"], true);
         assert_eq!(updated["task"]["state"], "cancelled");
+
+        // Blank and unknown task IDs must be rejected as invalid params (-32602).
+        let blank_rejected = harness
+            .server
+            .handle_request(tool_call(
+                9123,
+                "mempalace_mcp_tasks_update",
+                json!({
+                    "task_id": "   ", "actor": "alice", "expected_revision": 0,
+                    "status": "cancelled",
+                }),
+            ))
+            .await;
+        assert_eq!(blank_rejected["error"]["code"], ErrorCode::InvalidParams as i32);
+
+        let unknown_rejected = harness
+            .server
+            .handle_request(tool_call(
+                9124,
+                "mempalace_mcp_tasks_update",
+                json!({
+                    "task_id": "nonexistent-task", "actor": "alice", "expected_revision": 0,
+                    "status": "cancelled",
+                }),
+            ))
+            .await;
+        assert_eq!(unknown_rejected["error"]["code"], ErrorCode::InvalidParams as i32);
     }
 
     #[tokio::test]
@@ -9706,6 +9742,27 @@ mod tests {
         let cancelled = decode_tool_payload(&cancelled).expect("cancel payload");
         assert_eq!(cancelled["success"], true);
         assert_eq!(cancelled["task"]["state"], "cancelled");
+
+        // Blank and unknown task IDs must be rejected as invalid params (-32602).
+        let blank_rejected = harness
+            .server
+            .handle_request(tool_call(
+                9132,
+                "mempalace_mcp_tasks_cancel",
+                json!({"task_id": "   ", "actor": "alice", "expected_revision": 0}),
+            ))
+            .await;
+        assert_eq!(blank_rejected["error"]["code"], ErrorCode::InvalidParams as i32);
+
+        let unknown_rejected = harness
+            .server
+            .handle_request(tool_call(
+                9133,
+                "mempalace_mcp_tasks_cancel",
+                json!({"task_id": "nonexistent-task", "actor": "alice", "expected_revision": 0}),
+            ))
+            .await;
+        assert_eq!(unknown_rejected["error"]["code"], ErrorCode::InvalidParams as i32);
     }
 
     #[tokio::test]

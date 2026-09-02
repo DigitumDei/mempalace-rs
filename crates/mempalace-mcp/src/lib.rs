@@ -2,7 +2,7 @@
 
 mod federation;
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -42,7 +42,7 @@ use mempalace_search::{SearchRuntime, SearchRuntimePolicy};
 use mempalace_storage::{
     AgentLineageRecord, ChangeEvent, ChangeLogStore, CoordinationCursor, CoordinationStore,
     CoordinationVisibility, DiaryStore, DrawerFilter, DrawerStore, DuplicateStrategy,
-    IngestCommitRequest,
+    IngestCommitRequest, MAX_PAYLOAD_BYTES,
     DelegationStore, LineageMigrationRecord, NewArtifact, NewCheckpoint, NewMessage, NewSkill,
     NewSkillOutcome, NewSpan, NewTask, NewTaskResult, RevisionedWrite, SelfModelStore,
     SelfObservationRecord, SelfObservationScope, SelfObservationStatus, SkillScope, SkillStatus,
@@ -3909,10 +3909,37 @@ where
         };
 
         let drawers = self.list_all_drawers().await?;
-        let mut wings: Vec<String> =
-            drawers.iter().map(|drawer| drawer.wing.as_str().to_owned()).collect();
-        wings.sort();
-        wings.dedup();
+        let mut wings_set = BTreeSet::new();
+        for drawer in drawers {
+            if let Ok(normalized) = WingId::normalized(drawer.wing.as_str()) {
+                wings_set.insert(normalized.as_str().to_owned());
+            }
+        }
+        if let Ok(coord_wings) = self.coordination.list_wings() {
+            for wing in coord_wings {
+                if let Ok(normalized) = WingId::normalized(&wing) {
+                    wings_set.insert(normalized.as_str().to_owned());
+                }
+            }
+        }
+        if let Ok(registry) = ConfigLoader::load_project_registry(None) {
+            for entry in registry.projects.values() {
+                if let Ok(normalized) = WingId::normalized(&entry.wing) {
+                    wings_set.insert(normalized.as_str().to_owned());
+                }
+            }
+        }
+        for wing in self.config.federation.wings.keys() {
+            if let Ok(normalized) = WingId::normalized(wing) {
+                wings_set.insert(normalized.as_str().to_owned());
+            }
+        }
+        for wing in self.config.federation.coordination.keys() {
+            if let Ok(normalized) = WingId::normalized(wing) {
+                wings_set.insert(normalized.as_str().to_owned());
+            }
+        }
+        let wings: Vec<String> = wings_set.into_iter().collect();
 
         let info = self.local_info_response();
         let inputs = AgentCardInputs {
@@ -3937,7 +3964,13 @@ where
     /// two-write sequence (task, then envelope artifact) with no remote transaction to make it
     /// atomic, hence local-only.
     async fn tool_a2a_task_import(&mut self, arguments: &Value) -> ToolResult<Value> {
-        let raw_task = required_non_blank_string(arguments, "a2a_task")?;
+        let raw_task = required_raw_envelope_string(arguments, "a2a_task")?;
+        if raw_task.len() > MAX_PAYLOAD_BYTES {
+            return Err(ToolError::InvalidParams(format!(
+                "field `a2a_task` exceeds maximum artifact payload size of 1 MiB ({} bytes)",
+                raw_task.len()
+            )));
+        }
         let a2a_task: A2aTask = serde_json::from_str(&raw_task)
             .map_err(|e| ToolError::InvalidParams(format!("invalid `a2a_task` JSON: {e}")))?;
         let title = required_non_blank_string(arguments, "title")?;
@@ -3991,6 +4024,12 @@ where
                 self.coordination.get_artifact(artifact_id).map_tool_internal()?.ok_or_else(
                     || ToolError::InvalidParams(format!("artifact `{artifact_id}` not found")),
                 )?;
+            if artifact.task_id != task_id {
+                return Err(ToolError::InvalidParams(format!(
+                    "artifact `{artifact_id}` belongs to task `{}` not `{task_id}`",
+                    artifact.task_id
+                )));
+            }
             if artifact.role == mempalace_a2a::PROTOCOL_ENVELOPE_ROLE {
                 continue;
             }
@@ -4004,6 +4043,12 @@ where
                 self.coordination.get_message(message_id).map_tool_internal()?.ok_or_else(
                     || ToolError::InvalidParams(format!("message `{message_id}` not found")),
                 )?;
+            if message.task_id != task_id {
+                return Err(ToolError::InvalidParams(format!(
+                    "message `{message_id}` belongs to task `{}` not `{task_id}`",
+                    message.task_id
+                )));
+            }
             history.push(mempalace_a2a::message_to_a2a_message(&message).map_err(map_a2a_tool_error)?);
         }
 
@@ -4025,7 +4070,7 @@ where
     /// Translate and persist an inbound A2A Message as a MemPalace task message. `a2a_message`
     /// must be the raw wire text.
     async fn tool_a2a_message_import(&mut self, arguments: &Value) -> ToolResult<Value> {
-        let raw_message = required_non_blank_string(arguments, "a2a_message")?;
+        let raw_message = required_raw_envelope_string(arguments, "a2a_message")?;
         let a2a_message: A2aMessage = serde_json::from_str(&raw_message)
             .map_err(|e| ToolError::InvalidParams(format!("invalid `a2a_message` JSON: {e}")))?;
         let task_id = required_non_blank_string(arguments, "task_id")?;
@@ -4043,7 +4088,7 @@ where
     /// Translate and persist an inbound A2A Artifact as a MemPalace task artifact.
     /// `a2a_artifact` must be the raw wire text.
     async fn tool_a2a_artifact_import(&mut self, arguments: &Value) -> ToolResult<Value> {
-        let raw_artifact = required_non_blank_string(arguments, "a2a_artifact")?;
+        let raw_artifact = required_raw_envelope_string(arguments, "a2a_artifact")?;
         let a2a_artifact: A2aArtifact = serde_json::from_str(&raw_artifact)
             .map_err(|e| ToolError::InvalidParams(format!("invalid `a2a_artifact` JSON: {e}")))?;
         let task_id = required_non_blank_string(arguments, "task_id")?;
@@ -4187,7 +4232,13 @@ where
     /// `taskId`/timestamps/retention deadline, and `ttlMs` is never written to the task's
     /// lifecycle expiry (see `mempalace_mcp_tasks::ttl`'s module docs).
     async fn tool_mcp_tasks_import(&mut self, arguments: &Value) -> ToolResult<Value> {
-        let raw = required_non_blank_string(arguments, "create_task_result")?;
+        let raw = required_raw_envelope_string(arguments, "create_task_result")?;
+        if raw.len() > MAX_PAYLOAD_BYTES {
+            return Err(ToolError::InvalidParams(format!(
+                "field `create_task_result` exceeds maximum artifact payload size of 1 MiB ({} bytes)",
+                raw.len()
+            )));
+        }
         let parsed: CreateTaskResult = serde_json::from_str(&raw).map_err(|e| {
             ToolError::InvalidParams(format!("invalid `create_task_result` JSON: {e}"))
         })?;
@@ -4592,6 +4643,14 @@ fn required_non_blank_string(arguments: &Value, field: &'static str) -> ToolResu
         return Err(ToolError::InvalidParams(format!("field `{field}` cannot be blank")));
     }
     Ok(value.to_owned())
+}
+
+fn required_raw_envelope_string(arguments: &Value, field: &'static str) -> ToolResult<String> {
+    let value = required_string(arguments, field)?;
+    if value.trim().is_empty() {
+        return Err(ToolError::InvalidParams(format!("field `{field}` cannot be blank")));
+    }
+    Ok(value)
 }
 
 fn optional_string(arguments: &Value, field: &'static str) -> ToolResult<Option<String>> {
@@ -9511,6 +9570,224 @@ mod tests {
         assert_eq!(rejected["error"]["code"], ErrorCode::InvalidParams as i32);
     }
 
+    #[tokio::test]
+    async fn a2a_agent_card_includes_coordination_only_wings() {
+        let harness = test_harness().await;
+        // Create a task in a wing with no drawer records.
+        let created = harness
+            .server
+            .handle_request(tool_call(
+                9070,
+                "mempalace_task_create",
+                json!({
+                    "title": "coord task",
+                    "description": "d",
+                    "created_by": "alice",
+                    "wing": "wing_coord_only",
+                    "idempotency_key": "coord-only-task-1",
+                }),
+            ))
+            .await;
+        assert!(decode_tool_payload(&created).is_some());
+
+        let response =
+            harness.server.handle_request(tool_call(9071, "mempalace_a2a_agent_card", json!({}))).await;
+        let card = decode_tool_payload(&response).expect("agent card payload");
+        let skills = card["skills"].as_array().expect("skills array");
+        let ids: Vec<&str> = skills.iter().filter_map(|s| s["id"].as_str()).collect();
+        assert!(ids.contains(&"coordination:wing_coord_only"), "got {ids:?}");
+    }
+
+    #[tokio::test]
+    async fn a2a_task_export_rejects_records_from_another_task() {
+        let harness = test_harness().await;
+        let t1 = decode_tool_payload(
+            &harness
+                .server
+                .handle_request(tool_call(
+                    9072,
+                    "mempalace_task_create",
+                    json!({
+                        "title": "t1", "description": "d1", "created_by": "alice",
+                        "wing": "wing_myproject", "idempotency_key": "export-task-1",
+                    }),
+                ))
+                .await,
+        )
+        .expect("task 1")["task_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let t2 = decode_tool_payload(
+            &harness
+                .server
+                .handle_request(tool_call(
+                    9073,
+                    "mempalace_task_create",
+                    json!({
+                        "title": "t2", "description": "d2", "created_by": "alice",
+                        "wing": "wing_myproject", "idempotency_key": "export-task-2",
+                    }),
+                ))
+                .await,
+        )
+        .expect("task 2")["task_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let art2 = decode_tool_payload(
+            &harness
+                .server
+                .handle_request(tool_call(
+                    9074,
+                    "mempalace_artifact_put",
+                    json!({
+                        "task_id": t2, "created_by": "alice", "role": "output",
+                        "media_type": "text/plain", "content": "hello",
+                        "idempotency_key": "art-t2-1",
+                    }),
+                ))
+                .await,
+        )
+        .expect("artifact 2")["artifact_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let msg2 = decode_tool_payload(
+            &harness
+                .server
+                .handle_request(tool_call(
+                    9075,
+                    "mempalace_message_send",
+                    json!({
+                        "task_id": t2, "sender": "alice", "recipient": "bob",
+                        "kind": "notice", "payload": {},
+                        "idempotency_key": "msg-t2-1",
+                    }),
+                ))
+                .await,
+        )
+        .expect("message 2")["message_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        // Calling export on t1 with art2 must fail with InvalidParams
+        let rejected_art = harness
+            .server
+            .handle_request(tool_call(
+                9076,
+                "mempalace_a2a_task_export",
+                json!({"task_id": t1, "artifact_ids": [art2]}),
+            ))
+            .await;
+        assert_eq!(rejected_art["error"]["code"], ErrorCode::InvalidParams as i32);
+
+        // Calling export on t1 with msg2 must fail with InvalidParams
+        let rejected_msg = harness
+            .server
+            .handle_request(tool_call(
+                9077,
+                "mempalace_a2a_task_export",
+                json!({"task_id": t1, "message_ids": [msg2]}),
+            ))
+            .await;
+        assert_eq!(rejected_msg["error"]["code"], ErrorCode::InvalidParams as i32);
+    }
+
+    #[tokio::test]
+    async fn a2a_task_import_rejects_payload_exceeding_1_mib_before_creating_task() {
+        let harness = test_harness().await;
+        let padding = "x".repeat(MAX_PAYLOAD_BYTES + 10);
+        let large_task = format!(r#"{{"id":"large","status":{{"state":"TASK_STATE_WORKING"}},"metadata":{{"pad":"{padding}"}}}}"#);
+        let response = harness
+            .server
+            .handle_request(tool_call(
+                9078,
+                "mempalace_a2a_task_import",
+                json!({
+                    "a2a_task": large_task,
+                    "wing": "wing_myproject",
+                    "created_by": "alice",
+                    "idempotency_key": "oversized-task-1",
+                    "title": "too large",
+                    "description": "d",
+                }),
+            ))
+            .await;
+        assert_eq!(response["error"]["code"], ErrorCode::InvalidParams as i32);
+
+        // Verify no task was created
+        let tasks_check = harness
+            .server
+            .handle_request(tool_call(
+                9079,
+                "mempalace_task_get",
+                json!({"task_id": "large"}),
+            ))
+            .await;
+        assert_eq!(decode_tool_payload(&tasks_check).unwrap()["found"], false);
+    }
+
+    #[tokio::test]
+    async fn a2a_task_import_rejects_nested_empty_artifact_parts() {
+        let harness = test_harness().await;
+        let malformed_task = r#"{"id":"bad_art","status":{"state":"TASK_STATE_WORKING"},"artifacts":[{"artifactId":"a_empty","parts":[]}]}"#;
+        let response = harness
+            .server
+            .handle_request(tool_call(
+                9080,
+                "mempalace_a2a_task_import",
+                json!({
+                    "a2a_task": malformed_task,
+                    "wing": "wing_myproject",
+                    "created_by": "alice",
+                    "idempotency_key": "bad-art-task-1",
+                    "title": "bad art",
+                    "description": "d",
+                }),
+            ))
+            .await;
+        assert_eq!(response["error"]["code"], ErrorCode::InvalidParams as i32);
+    }
+
+    #[tokio::test]
+    async fn a2a_task_import_preserves_envelope_exact_whitespace_bytes() {
+        let harness = test_harness().await;
+        let padded_whitespace = "  \n\t{\"id\":\"t_ws\",\"status\":{\"state\":\"TASK_STATE_WORKING\"}}  \n\t";
+        let response = harness
+            .server
+            .handle_request(tool_call(
+                9081,
+                "mempalace_a2a_task_import",
+                json!({
+                    "a2a_task": padded_whitespace,
+                    "wing": "wing_myproject",
+                    "created_by": "alice",
+                    "idempotency_key": "ws-task-1",
+                    "title": "whitespace",
+                    "description": "d",
+                }),
+            ))
+            .await;
+        let payload = decode_tool_payload(&response).expect("import payload");
+        let art_id = payload["envelope_artifact_id"].as_str().unwrap();
+
+        let art_resp = harness
+            .server
+            .handle_request(tool_call(
+                9082,
+                "mempalace_artifact_get",
+                json!({"artifact_id": art_id}),
+            ))
+            .await;
+        let art_payload = decode_tool_payload(&art_resp).expect("art payload");
+        assert_eq!(art_payload["value"]["content"], padded_whitespace);
+    }
+
     // ── MCP Tasks adapter tools (issue #102 Stage 10) ───────────────────────
 
     #[tokio::test]
@@ -9899,6 +10176,74 @@ mod tests {
             )
             .expect_err("Expired must never be an assertable initial state for an import");
         assert!(matches!(err, mempalace_storage::StorageError::Invariant(_)));
+    }
+
+    #[tokio::test]
+    async fn mcp_tasks_import_rejects_payload_exceeding_1_mib_before_creating_task() {
+        let harness = test_harness().await;
+        let padding = "x".repeat(MAX_PAYLOAD_BYTES + 10);
+        let large_result = format!(r#"{{"taskId":"src-large","status":"working","createdAt":"2026-01-01T00:00:00Z","lastUpdatedAt":"2026-01-01T00:05:00Z","ttlMs":null,"resultType":"task","meta":"{padding}"}}"#);
+        let response = harness
+            .server
+            .handle_request(tool_call(
+                9150,
+                "mempalace_mcp_tasks_import",
+                json!({
+                    "create_task_result": large_result,
+                    "wing": "wing_myproject",
+                    "created_by": "alice",
+                    "idempotency_key": "mcp-oversized-task-1",
+                    "title": "too large",
+                    "description": "d",
+                }),
+            ))
+            .await;
+        assert_eq!(response["error"]["code"], ErrorCode::InvalidParams as i32);
+
+        // Verify no task was created
+        let tasks_check = harness
+            .server
+            .handle_request(tool_call(
+                9151,
+                "mempalace_task_get",
+                json!({"task_id": "src-large"}),
+            ))
+            .await;
+        assert_eq!(decode_tool_payload(&tasks_check).unwrap()["found"], false);
+    }
+
+    #[tokio::test]
+    async fn mcp_tasks_import_preserves_envelope_exact_whitespace_bytes() {
+        let harness = test_harness().await;
+        let padded_ws = "  \n\t{\"taskId\":\"src-ws\",\"status\":\"working\",\"createdAt\":\"2026-01-01T00:00:00Z\",\"lastUpdatedAt\":\"2026-01-01T00:05:00Z\",\"ttlMs\":null,\"resultType\":\"task\"}  \n\t";
+        let response = harness
+            .server
+            .handle_request(tool_call(
+                9152,
+                "mempalace_mcp_tasks_import",
+                json!({
+                    "create_task_result": padded_ws,
+                    "wing": "wing_myproject",
+                    "created_by": "alice",
+                    "idempotency_key": "mcp-ws-task-1",
+                    "title": "ws",
+                    "description": "d",
+                }),
+            ))
+            .await;
+        let payload = decode_tool_payload(&response).expect("import payload");
+        let art_id = payload["envelope_artifact_id"].as_str().unwrap();
+
+        let art_resp = harness
+            .server
+            .handle_request(tool_call(
+                9153,
+                "mempalace_artifact_get",
+                json!({"artifact_id": art_id}),
+            ))
+            .await;
+        let art_payload = decode_tool_payload(&art_resp).expect("art payload");
+        assert_eq!(art_payload["value"]["content"], padded_ws);
     }
 
     // ── Routing / Federation tests ─────────────────────────────────────────

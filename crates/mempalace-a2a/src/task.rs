@@ -136,6 +136,35 @@ pub struct A2aTask {
     pub metadata: Option<Value>,
 }
 
+impl A2aTask {
+    /// Recursively validates the task's nested artifacts and messages.
+    ///
+    /// Fails with [`A2aError::EmptyArtifactParts`] if any artifact has an empty parts list,
+    /// or [`A2aError::InvalidPart`] if any part in an artifact, history message, or status message
+    /// violates the `Part.content` `oneof` invariant.
+    pub fn validate(&self) -> Result<(), A2aError> {
+        if let Some(msg) = &self.status.message {
+            for part in &msg.parts {
+                part.validate()?;
+            }
+        }
+        for artifact in &self.artifacts {
+            if artifact.parts.is_empty() {
+                return Err(A2aError::EmptyArtifactParts);
+            }
+            for part in &artifact.parts {
+                part.validate()?;
+            }
+        }
+        for message in &self.history {
+            for part in &message.parts {
+                part.validate()?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Caller-supplied fields [`NewTask`] requires that the A2A `Task` message has no source for.
 ///
 /// See the module docs' "The hard part" section for why these cannot be defaulted.
@@ -182,6 +211,8 @@ pub struct NewTaskConversion {
 ///
 /// Fails with [`A2aError::UnspecifiedTaskState`] if `a2a.status.state` is
 /// `TASK_STATE_UNSPECIFIED` — see [`crate::state::map_inbound_task_state`].
+/// Fails with [`A2aError::EmptyArtifactParts`] or [`A2aError::InvalidPart`] if any nested
+/// artifact or message is malformed (see [`A2aTask::validate`]).
 ///
 /// `NewTask::parent_id`, `dependencies`, `budget`, and `expires_at` are set to their empty/absent
 /// value: A2A carries no analogue for any of them (see the module docs).
@@ -189,6 +220,7 @@ pub fn a2a_task_to_new_task(
     a2a: &A2aTask,
     inputs: NewTaskInputs<'_>,
 ) -> Result<NewTaskConversion, A2aError> {
+    a2a.validate()?;
     let target_state = map_inbound_task_state(a2a.status.state)?;
     let new_task = NewTask {
         title: inputs.title.to_owned(),
@@ -404,5 +436,37 @@ mod tests {
         assert_eq!(decoded.id, a2a.id);
         assert_eq!(decoded.status.state, a2a.status.state);
         assert_eq!(decoded.metadata, a2a.metadata);
+    }
+
+    #[test]
+    fn a2a_task_validate_rejects_empty_artifact_parts() {
+        let mut a2a = sample_a2a_task(A2aTaskState::Working);
+        a2a.artifacts.push(A2aArtifact {
+            artifact_id: "art_empty".to_owned(),
+            name: None,
+            description: None,
+            parts: Vec::new(),
+            metadata: None,
+            extensions: Vec::new(),
+        });
+        let err = a2a_task_to_new_task(&a2a, sample_inputs()).unwrap_err();
+        assert!(matches!(err, A2aError::EmptyArtifactParts));
+    }
+
+    #[test]
+    fn a2a_task_validate_rejects_invalid_part_in_nested_message() {
+        let mut a2a = sample_a2a_task(A2aTaskState::Working);
+        a2a.history.push(A2aMessage {
+            message_id: "msg_bad".to_owned(),
+            context_id: None,
+            task_id: Some("task_1".to_owned()),
+            role: A2aRole::User,
+            parts: vec![A2aPart::default()], // 0 fields set -> invalid
+            metadata: None,
+            extensions: Vec::new(),
+            reference_task_ids: Vec::new(),
+        });
+        let err = a2a_task_to_new_task(&a2a, sample_inputs()).unwrap_err();
+        assert!(matches!(err, A2aError::InvalidPart { .. }));
     }
 }

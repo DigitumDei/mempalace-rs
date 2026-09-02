@@ -12,7 +12,7 @@ use uuid::Uuid;
 use crate::types::RevisionedWrite;
 use crate::{Result, StorageError};
 
-const MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
+pub const MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
 const MAX_TASK_TEXT_BYTES: usize = 1024 * 1024;
 
 /// Reserved wing name for coordination rows that existed before wings were introduced. Every
@@ -519,6 +519,24 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
     /// Retrieve a task by exact ID. `None` is an explicit authoritative miss.
     pub fn get_task(&self, id: &str) -> Result<Option<Task>> {
         get_task_conn(&self.connection()?, id)
+    }
+
+    /// List all distinct wings currently present in coordination tasks or events (excluding `wing_unscoped`).
+    pub fn list_wings(&self) -> Result<Vec<String>> {
+        let conn = self.connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT wing FROM (
+                SELECT wing FROM coordination_tasks WHERE wing != ?1
+                UNION
+                SELECT wing FROM coordination_events WHERE wing != ?1
+            ) ORDER BY wing",
+        )?;
+        let rows = stmt.query_map([UNSCOPED_WING], |row| row.get::<_, String>(0))?;
+        let mut wings = Vec::new();
+        for row in rows {
+            wings.push(row?);
+        }
+        Ok(wings)
     }
 
     /// Atomically claim a task revision, reclaiming an expired lease when needed.
@@ -1545,6 +1563,41 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
         let second = s.import_task(&new_task, TaskState::Running).expect("replay");
         assert_eq!(first.task_id, second.task_id);
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn list_wings_returns_distinct_coordination_wings_excluding_unscoped() {
+        let (_d, s) = store();
+        assert_eq!(s.list_wings().unwrap(), Vec::<String>::new());
+
+        let t1 = NewTask {
+            title: "t1".into(),
+            description: "d1".into(),
+            created_by: "creator".into(),
+            wing: "wing_alpha".into(),
+            idempotency_key: "task-alpha".into(),
+            parent_id: None,
+            dependencies: vec![],
+            budget: None,
+            expires_at: None,
+        };
+        s.create_task(&t1).unwrap();
+
+        let t2 = NewTask {
+            title: "t2".into(),
+            description: "d2".into(),
+            created_by: "creator".into(),
+            wing: "wing_beta".into(),
+            idempotency_key: "task-beta".into(),
+            parent_id: None,
+            dependencies: vec![],
+            budget: None,
+            expires_at: None,
+        };
+        s.create_task(&t2).unwrap();
+
+        let wings = s.list_wings().unwrap();
+        assert_eq!(wings, vec!["wing_alpha", "wing_beta"]);
     }
     /// Point 5 verification: a task imported directly as `Running` has no real owner or lease
     /// (an import asserts no worker ever actually claimed it), so it must remain claimable by any

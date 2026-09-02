@@ -5070,11 +5070,33 @@ fn delete_replication_replay_payload(operation: &OutboxOperation, drawer_id: &st
 fn kg_ordering_key(subject: &str, predicate: &str, object: &str) -> String {
     let canonical = format!(
         "{}\0{}\0{}",
-        subject.trim().to_lowercase(),
-        predicate.trim().to_lowercase(),
-        object.trim().to_lowercase()
+        canonicalize_kg_label(subject),
+        canonicalize_kg_label(predicate),
+        canonicalize_kg_label(object)
     );
     format!("kg:{}", blake3::hash(canonical.as_bytes()).to_hex())
+}
+
+/// Canonicalize a KG label with the same identity the graph layer uses for
+/// entities and predicates (mempalace-graph `canonicalize_label`): lowercase
+/// ASCII alphanumerics, collapse each run of non-alphanumeric characters to one
+/// underscore, and trim leading/trailing underscores. Replication ordering keys
+/// must share that identity so equivalent spellings ("works-on" and "works on")
+/// land in the same outbox `(destination_remote, ordering_key)` group and an
+/// equivalent-spelling invalidate cannot bypass a retryable add.
+fn canonicalize_kg_label(value: &str) -> String {
+    let mut normalized = String::new();
+    let mut last_was_sep = false;
+    for ch in value.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            normalized.push(ch.to_ascii_lowercase());
+            last_was_sep = false;
+        } else if !last_was_sep {
+            normalized.push('_');
+            last_was_sep = true;
+        }
+    }
+    normalized.trim_matches('_').to_owned()
 }
 
 fn generated_record_id(
@@ -10883,6 +10905,130 @@ mod tests {
         assert!(
             found_inv,
             "outbox must carry ReplicationMutation::KgInvalidate with resolved ended date"
+        );
+    }
+
+    #[test]
+    fn kg_ordering_key_uses_graph_label_canonicalization() {
+        // Equivalent label spellings must share one ordering key so the outbox
+        // groups them together and ordering between add and invalidate is kept.
+        let base = kg_ordering_key("User1", "works_on", "ProjectX");
+        for spelling in ["works-on", "works on", "Works On", "  WORKS--ON  ", "works...on"] {
+            assert_eq!(
+                kg_ordering_key("User1", spelling, "ProjectX"),
+                base,
+                "predicate spelling {spelling:?} must produce the same ordering key"
+            );
+        }
+        assert_eq!(
+            kg_ordering_key("  Alice-2 ", "works on", "  project--x "),
+            kg_ordering_key("alice_2", "works_on", "project_x"),
+            "subject and object labels must canonicalize like the graph layer"
+        );
+        assert_ne!(
+            kg_ordering_key("User1", "works on", "ProjectX"),
+            kg_ordering_key("User1", "manages on", "ProjectX"),
+            "genuinely different predicates must not collide"
+        );
+    }
+
+    #[tokio::test]
+    async fn kg_add_and_invalidate_equivalent_spellings_share_ordering_group() {
+        let mut rules_remotes = BTreeMap::new();
+        rules_remotes.insert(
+            "alpha".to_owned(),
+            ResolvedRemote {
+                name: "alpha".to_owned(),
+                url: "http://127.0.0.1:9999".to_owned(),
+                token: Some("test".to_owned()),
+                timeout: std::time::Duration::from_secs(5),
+            },
+        );
+        let federation = FederationRuntimeConfig {
+            remotes: rules_remotes,
+            default_mode: RouteMode::Combined,
+            default_remote: Some("alpha".to_owned()),
+            wings: BTreeMap::new(),
+            kg: Some(ResolvedRouteRule {
+                mode: RouteMode::Combined,
+                remote: Some("alpha".to_owned()),
+                write: WriteTarget::Both,
+            }),
+            coordination: BTreeMap::new(),
+        };
+
+        let harness = test_harness_with_federation(federation).await;
+
+        // Queue an add under one spelling of the predicate...
+        let add_resp = harness
+            .server
+            .handle_request(tool_call(
+                2,
+                "mempalace_kg_add",
+                json!({"subject":"User1","predicate":"works-on","object":"ProjectX"}),
+            ))
+            .await;
+        assert_eq!(decode_tool_payload(&add_resp).unwrap()["success"], true);
+
+        // ...then an invalidate using an equivalent spelling.
+        let inv_resp = harness
+            .server
+            .handle_request(tool_call(
+                3,
+                "mempalace_kg_invalidate",
+                json!({"subject":"User1","predicate":"works on","object":"ProjectX"}),
+            ))
+            .await;
+        assert_eq!(decode_tool_payload(&inv_resp).unwrap()["success"], true);
+
+        let runtime = harness.server.runtime.lock().await;
+        let add_op = runtime
+            .outbox
+            .claim_next("alpha", "worker-test", time::Duration::minutes(1))
+            .unwrap()
+            .expect("queued kg add must be the claimable head of the ordering group");
+        assert!(
+            matches!(
+                serde_json::from_value::<ReplicationMutation>(add_op.payload.clone()),
+                Ok(ReplicationMutation::KgAdd { .. })
+            ),
+            "first queued op must be the kg add"
+        );
+
+        // While the add is in flight, the equivalent-spelling invalidate must be
+        // blocked in the same (destination, ordering_key) group instead of being
+        // claimed past it on a different partition.
+        assert!(
+            runtime
+                .outbox
+                .claim_next("alpha", "worker-test", time::Duration::minutes(1))
+                .unwrap()
+                .is_none(),
+            "equivalent-spelling invalidate must be blocked behind the leased add"
+        );
+
+        // Completing the add releases the group; the invalidate is next in order
+        // and carries the identical ordering key.
+        expect_applied(
+            runtime
+                .outbox
+                .acknowledge(&add_op.operation_id, "worker-test", add_op.revision)
+                .unwrap(),
+            "acknowledgement",
+        )
+        .unwrap();
+        let inv_op = runtime
+            .outbox
+            .claim_next("alpha", "worker-test", time::Duration::minutes(1))
+            .unwrap()
+            .expect("invalidate must follow the completed add within the same group");
+        assert_eq!(inv_op.ordering_key, add_op.ordering_key);
+        assert!(
+            matches!(
+                serde_json::from_value::<ReplicationMutation>(inv_op.payload),
+                Ok(ReplicationMutation::KgInvalidate { .. })
+            ),
+            "second queued op must be the kg invalidate"
         );
     }
 

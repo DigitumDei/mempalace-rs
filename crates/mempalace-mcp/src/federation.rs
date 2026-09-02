@@ -8,11 +8,13 @@ use mempalace_config::{
 };
 use mempalace_core::{DIARY_ROOM, DIARY_TOPIC_PREFIX, SHARED_AGENT_DIARY_WING, WingId, hash_text};
 use mempalace_federation::{
-    AckMessageRequest, AddDrawerRequest, ChangesQuery, CoordinationEventsQuery, DrawerSearchRequest,
-    InboxQuery, NewArtifactRequest, NewMessageRequest, NewTaskRequest, NewTaskResultRequest,
-    RemoteDrawerResult, TaskLeaseRequest, TransitionTaskRequest,
+    AckMessageRequest, AddDrawerRequest, ChangesQuery, CoordinationEventsQuery,
+    DrawerSearchRequest, InboxQuery, NewArtifactRequest, NewMessageRequest, NewTaskRequest,
+    NewTaskResultRequest, RemoteDrawerResult, TaskLeaseRequest, TransitionTaskRequest,
 };
-use mempalace_remote::{RemoteApi, RemoteClient, RemoteEndpoint, RemoteError, RemoteRevisionedWrite};
+use mempalace_remote::{
+    RemoteApi, RemoteClient, RemoteEndpoint, RemoteError, RemoteRevisionedWrite,
+};
 use serde_json::{Value, json};
 use tokio::task::JoinSet;
 
@@ -365,11 +367,12 @@ impl FederationRouter {
         remote_targets: &[String],
     ) -> ToolResult<Value> {
         if remote_targets.is_empty() {
-            return Ok(search_payload(query, wing, room, local_results, &[]));
+            return Ok(search_payload(query, wing, room, local_results, &[], &[]));
         }
 
         // Fan out to all target remotes concurrently.
-        let mut set: JoinSet<(String, Result<Vec<Value>, String>)> = JoinSet::new();
+        let mut set: JoinSet<(String, Result<Vec<Value>, mempalace_remote::RemoteError>)> =
+            JoinSet::new();
         for name in remote_targets {
             let name = name.clone();
             let query_str = query.to_owned();
@@ -397,7 +400,7 @@ impl FederationRouter {
                             .collect();
                         (name, Ok(results))
                     }
-                    Err(e) => (name.clone(), Err(format!("remote `{name}` search failed: {e}"))),
+                    Err(e) => (name.clone(), Err(e)),
                 }
             });
         }
@@ -405,14 +408,16 @@ impl FederationRouter {
         // Collect results in deterministic name order.
         let mut remote_results_by_name: BTreeMap<String, Vec<Value>> = BTreeMap::new();
         let mut warnings: Vec<String> = Vec::new();
+        let mut degradations: Vec<Value> = Vec::new();
         while let Some(res) = set.join_next().await {
             match res {
                 Ok((name, Ok(results))) => {
                     remote_results_by_name.insert(name, results);
                 }
-                Ok((name, Err(msg))) => {
-                    tracing::warn!(remote = %name, "search degraded: {msg}");
-                    warnings.push(msg);
+                Ok((name, Err(error))) => {
+                    tracing::warn!(remote = %name, %error, "search degraded");
+                    warnings.push(format!("remote `{name}` search failed: {error}"));
+                    degradations.push(structured_degradation(&name, "search", &error));
                 }
                 Err(join_err) => {
                     tracing::warn!("search task panicked: {join_err}");
@@ -430,7 +435,7 @@ impl FederationRouter {
         }
 
         let merged = merge_search_results_nway(all_origins, limit);
-        Ok(search_payload(query, wing, room, merged, &warnings))
+        Ok(search_payload(query, wing, room, merged, &warnings, &degradations))
     }
 
     // ─── Add drawer ──────────────────────────────────────────────────────────────
@@ -463,6 +468,30 @@ impl FederationRouter {
         route: &ResolvedRouteRule,
         duplicate_threshold: f32,
     ) -> ToolResult<Option<Value>> {
+        self.add_drawer_remote_with_operation(
+            wing,
+            room,
+            content,
+            source_file,
+            added_by,
+            route,
+            duplicate_threshold,
+            None,
+        )
+        .await
+    }
+
+    pub async fn add_drawer_remote_with_operation(
+        &self,
+        wing: &str,
+        room: &str,
+        content: &str,
+        source_file: &str,
+        added_by: &str,
+        route: &ResolvedRouteRule,
+        duplicate_threshold: f32,
+        operation_id: Option<&str>,
+    ) -> ToolResult<Option<Value>> {
         // ── Diary guard: diary-shaped drawers never write remotely ──────────
         if wing == SHARED_AGENT_DIARY_WING
             || room == DIARY_ROOM
@@ -492,32 +521,50 @@ impl FederationRouter {
         };
 
         // ── Pre-add duplicate check ───────────────────────────────────────────
-        let pre_check_req = mempalace_federation::CheckDuplicateRequest {
-            content: content.to_owned(),
-            threshold: Some(duplicate_threshold),
-        };
-        match api.check_duplicate(pre_check_req).await {
-            Ok(resp) if resp.is_duplicate => {
-                let mut matches = resp.matches.as_array().cloned().unwrap_or_default();
-                for m in &mut matches {
-                    if let Some(obj) = m.as_object_mut() {
-                        obj.insert("origin".to_owned(), json!(remote_name));
+        // Operation-aware retries carry a stable operation_id, so the client-side
+        // semantic preflight must be bypassed entirely: the receiving receipt store
+        // authoritatively replays the mutation. Running the preflight on a retry whose
+        // first attempt committed but lost its response would short-circuit on the
+        // duplicate and never reach the server receipt replay, recreating the ambiguous
+        //-outcome incident #127 exists to fix. The preflight stays for legacy calls that
+        // carry no operation id.
+        if operation_id.is_none() {
+            let pre_check_req = mempalace_federation::CheckDuplicateRequest {
+                content: content.to_owned(),
+                threshold: Some(duplicate_threshold),
+            };
+            match api.check_duplicate(pre_check_req).await {
+                Ok(resp) if resp.is_duplicate => {
+                    let mut matches = resp.matches.as_array().cloned().unwrap_or_default();
+                    for m in &mut matches {
+                        if let Some(obj) = m.as_object_mut() {
+                            obj.insert("origin".to_owned(), json!(remote_name));
+                        }
                     }
+                    return Ok(Some(json!({
+                        "success": false,
+                        "reason": "duplicate",
+                        "matches": matches,
+                        "origin": remote_name,
+                        "applied_to": format_remote_origin(remote_name),
+                    })));
                 }
-                return Ok(Some(json!({
-                    "success": false,
-                    "reason": "duplicate",
-                    "matches": matches,
-                    "origin": remote_name,
-                    "applied_to": format_remote_origin(remote_name),
-                })));
-            }
-            Ok(_) => {}
-            Err(e) => {
-                tracing::warn!(
-                    remote = %remote_name,
-                    "pre-add duplicate check failed (proceeding with add): {e}"
-                );
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        remote = %remote_name,
+                        "pre-add duplicate check failed (proceeding with add): {e}"
+                    );
+                }
+            };
+        }
+
+        let generated_op_id;
+        let effective_operation_id = match operation_id {
+            Some(id) => id,
+            None => {
+                generated_op_id = generate_operation_id();
+                generated_op_id.as_str()
             }
         };
 
@@ -527,6 +574,8 @@ impl FederationRouter {
             content: content.to_owned(),
             source_file: if source_file.is_empty() { None } else { Some(source_file.to_owned()) },
             added_by: Some(added_by.to_owned()),
+            drawer_id: None,
+            operation_id: Some(effective_operation_id.to_owned()),
         };
         match api.add_drawer(req).await {
             Ok(resp) => {
@@ -559,6 +608,9 @@ impl FederationRouter {
                     "origin": remote_name,
                     "applied_to": format_remote_origin(remote_name),
                 })))
+            }
+            Err(e) if e.is_unknown_outcome() => {
+                Ok(Some(remote_mutation_unknown_outcome_value(&e, effective_operation_id)))
             }
             Err(e) => Err(ToolError::Internal(McpError::Federation(format!(
                 "remote `{remote_name}` add_drawer failed: {e}"
@@ -668,6 +720,8 @@ impl FederationRouter {
             content: content.to_owned(),
             source_file: if source_file.is_empty() { None } else { Some(source_file.to_owned()) },
             added_by: Some(added_by.to_owned()),
+            drawer_id: None,
+            operation_id: None,
         };
         match api.add_drawer(req).await {
             Ok(resp) if resp.success => {
@@ -765,12 +819,71 @@ impl FederationRouter {
 
     // ─── Delete drawer ───────────────────────────────────────────────────────────
 
+    pub async fn delete_drawer_routed_remote(
+        &self,
+        drawer_id: &str,
+        route: &ResolvedRouteRule,
+        operation_id: Option<&str>,
+    ) -> ToolResult<Option<Value>> {
+        let remote_name = match self.resolve_write_target(route) {
+            WriteTarget::Remote => route.remote.as_deref(),
+            WriteTarget::Local | WriteTarget::Both => None,
+        };
+        let Some(remote_name) = remote_name else {
+            return Ok(None);
+        };
+        let Some(api) = self.remotes.get(remote_name) else {
+            return Err(ToolError::Internal(McpError::Federation(format!(
+                "no client available for remote `{remote_name}`"
+            ))));
+        };
+        let generated_op_id;
+        let effective_operation_id = match operation_id {
+            Some(id) => id,
+            None => {
+                generated_op_id = generate_operation_id();
+                generated_op_id.as_str()
+            }
+        };
+        match api.delete_drawer_with_operation_id(drawer_id, Some(effective_operation_id)).await {
+            Ok(()) => Ok(Some(json!({
+                "success": true,
+                "drawer_id": drawer_id,
+                "origin": remote_name,
+                "applied_to": format_remote_origin(remote_name),
+            }))),
+            Err(e) if e.is_unknown_outcome() => {
+                Ok(Some(remote_mutation_unknown_outcome_value(&e, effective_operation_id)))
+            }
+            Err(e) => Err(ToolError::Internal(McpError::Federation(format!(
+                "remote `{remote_name}` delete_drawer failed: {e}"
+            )))),
+        }
+    }
+
     /// Try to delete a drawer from ALL configured remotes in config order (BTreeMap
     /// name order — deterministic). Returns the first success with "origin".
     /// Deletion is by drawer id; the wing is not known here.
     pub async fn delete_drawer_remote(&self, drawer_id: &str) -> ToolResult<Option<Value>> {
+        self.delete_drawer_remote_with_operation(drawer_id, None).await
+    }
+
+    pub async fn delete_drawer_remote_with_operation(
+        &self,
+        drawer_id: &str,
+        operation_id: Option<&str>,
+    ) -> ToolResult<Option<Value>> {
+        let generated_op_id;
+        let effective_operation_id = match operation_id {
+            Some(id) => id,
+            None => {
+                generated_op_id = generate_operation_id();
+                generated_op_id.as_str()
+            }
+        };
         for (name, api) in &self.remotes {
-            match api.delete_drawer(drawer_id).await {
+            match api.delete_drawer_with_operation_id(drawer_id, Some(effective_operation_id)).await
+            {
                 Ok(()) => {
                     return Ok(Some(json!({
                         "success": true,
@@ -778,6 +891,14 @@ impl FederationRouter {
                         "origin": name,
                         "applied_to": format_remote_origin(name),
                     })));
+                }
+                // The request may have committed but its outcome is unconfirmed: surface the
+                // ambiguity honestly instead of swallowing it into a false not-found.
+                Err(e) if e.is_unknown_outcome() => {
+                    return Ok(Some(remote_mutation_unknown_outcome_value(
+                        &e,
+                        effective_operation_id,
+                    )));
                 }
                 Err(e) if e.is_degradable() => continue,
                 Err(e) => {
@@ -1116,10 +1237,7 @@ impl FederationRouter {
                     remote = %remote_name,
                     "kg_query failed: {e}"
                 );
-                let mut payload = local_payload;
-                let warn_msg = format!("remote `{remote_name}` kg_query failed: {e}");
-                payload["warnings"] = json!([warn_msg]);
-                return Ok(payload);
+                return Ok(degraded_read_payload(local_payload, remote_name, "kg_query", &e));
             }
         };
         match route.mode {
@@ -1141,6 +1259,18 @@ impl FederationRouter {
         valid_from: Option<&str>,
         route: &ResolvedRouteRule,
     ) -> ToolResult<Option<Value>> {
+        self.kg_add_remote_with_operation(subject, predicate, object, valid_from, route, None).await
+    }
+
+    pub async fn kg_add_remote_with_operation(
+        &self,
+        subject: &str,
+        predicate: &str,
+        object: &str,
+        valid_from: Option<&str>,
+        route: &ResolvedRouteRule,
+        operation_id: Option<&str>,
+    ) -> ToolResult<Option<Value>> {
         // ── Resolve the target remote for remote-only writes ───────────────
         // Dual-write (Both) routes are handled by kg_add_replicate and
         // should not reach this method. We keep Both as a defensive arm.
@@ -1160,11 +1290,20 @@ impl FederationRouter {
         let Some(api) = self.remotes.get(remote_name) else {
             return Ok(None);
         };
+        let generated_op_id;
+        let effective_operation_id = match operation_id {
+            Some(id) => id,
+            None => {
+                generated_op_id = generate_operation_id();
+                generated_op_id.as_str()
+            }
+        };
         let req = mempalace_federation::KgAddFactRequest {
             subject: subject.to_owned(),
             predicate: predicate.to_owned(),
             object: object.to_owned(),
             valid_from: valid_from.map(|s| s.to_owned()),
+            operation_id: Some(effective_operation_id.to_owned()),
         };
         match api.kg_add_fact(req).await {
             Ok(mut resp) => {
@@ -1172,6 +1311,9 @@ impl FederationRouter {
                     obj.insert("applied_to".to_owned(), json!(format_remote_origin(remote_name)));
                 }
                 Ok(Some(resp))
+            }
+            Err(e) if e.is_unknown_outcome() => {
+                Ok(Some(remote_mutation_unknown_outcome_value(&e, effective_operation_id)))
             }
             Err(e) => Err(ToolError::Internal(McpError::Federation(format!(
                 "remote `{remote_name}` kg_add_fact failed: {e}"
@@ -1210,6 +1352,7 @@ impl FederationRouter {
             predicate: predicate.to_owned(),
             object: object.to_owned(),
             valid_from: valid_from.map(|s| s.to_owned()),
+            operation_id: None,
         };
         match api.kg_add_fact(req).await {
             Ok(_) => {
@@ -1243,6 +1386,19 @@ impl FederationRouter {
         ended: Option<&str>,
         route: &ResolvedRouteRule,
     ) -> ToolResult<Option<Value>> {
+        self.kg_invalidate_remote_with_operation(subject, predicate, object, ended, route, None)
+            .await
+    }
+
+    pub async fn kg_invalidate_remote_with_operation(
+        &self,
+        subject: &str,
+        predicate: &str,
+        object: &str,
+        ended: Option<&str>,
+        route: &ResolvedRouteRule,
+        operation_id: Option<&str>,
+    ) -> ToolResult<Option<Value>> {
         // ── Resolve the target remote for remote-only writes ───────────────
         // Dual-write (Both) routes are handled by kg_invalidate_replicate and
         // should not reach this method. We keep Both as a defensive arm.
@@ -1262,11 +1418,20 @@ impl FederationRouter {
         let Some(api) = self.remotes.get(remote_name) else {
             return Ok(None);
         };
+        let generated_op_id;
+        let effective_operation_id = match operation_id {
+            Some(id) => id,
+            None => {
+                generated_op_id = generate_operation_id();
+                generated_op_id.as_str()
+            }
+        };
         let req = mempalace_federation::KgInvalidateRequest {
             subject: subject.to_owned(),
             predicate: predicate.to_owned(),
             object: object.to_owned(),
             ended: ended.map(|s| s.to_owned()),
+            operation_id: Some(effective_operation_id.to_owned()),
         };
         match api.kg_invalidate(req).await {
             Ok(mut resp) => {
@@ -1274,6 +1439,9 @@ impl FederationRouter {
                     obj.insert("applied_to".to_owned(), json!(format_remote_origin(remote_name)));
                 }
                 Ok(Some(resp))
+            }
+            Err(e) if e.is_unknown_outcome() => {
+                Ok(Some(remote_mutation_unknown_outcome_value(&e, effective_operation_id)))
             }
             Err(e) => Err(ToolError::Internal(McpError::Federation(format!(
                 "remote `{remote_name}` kg_invalidate failed: {e}"
@@ -1312,6 +1480,7 @@ impl FederationRouter {
             predicate: predicate.to_owned(),
             object: object.to_owned(),
             ended: ended.map(|s| s.to_owned()),
+            operation_id: None,
         };
         match api.kg_invalidate(req).await {
             Ok(_) => {
@@ -1357,10 +1526,7 @@ impl FederationRouter {
                     remote = %remote_name,
                     "kg_timeline failed: {e}"
                 );
-                let mut payload = local_payload;
-                let warn_msg = format!("remote `{remote_name}` kg_timeline failed: {e}");
-                payload["warnings"] = json!([warn_msg]);
-                return Ok(payload);
+                return Ok(degraded_read_payload(local_payload, remote_name, "kg_timeline", &e));
             }
         };
         match route.mode {
@@ -1395,10 +1561,7 @@ impl FederationRouter {
                     remote = %remote_name,
                     "kg_stats failed: {e}"
                 );
-                let mut payload = local_payload;
-                let warn_msg = format!("remote `{remote_name}` kg_stats failed: {e}");
-                payload["warnings"] = json!([warn_msg]);
-                return Ok(payload);
+                return Ok(degraded_read_payload(local_payload, remote_name, "kg_stats", &e));
             }
         };
         match route.mode {
@@ -1754,7 +1917,9 @@ impl FederationRouter {
     where
         F: Fn(Arc<dyn RemoteApi>, String, Req) -> Fut,
         Fut: std::future::Future<
-                Output = mempalace_remote::Result<RemoteRevisionedWrite<mempalace_federation::CoordinationTaskDto>>,
+                Output = mempalace_remote::Result<
+                    RemoteRevisionedWrite<mempalace_federation::CoordinationTaskDto>,
+                >,
             >,
         Req: Clone,
     {
@@ -2182,6 +2347,96 @@ fn format_remote_origin(name: &str) -> String {
     if name.starts_with("remote:") { name.to_owned() } else { format!("remote:{name}") }
 }
 
+static OPERATION_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Generate a unique, stable operation identifier for direct remote mutations when the caller
+/// omitted one.
+fn generate_operation_id() -> String {
+    let now = time::OffsetDateTime::now_utc().unix_timestamp_nanos();
+    let count = OPERATION_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&now.to_le_bytes());
+    hasher.update(&count.to_le_bytes());
+    hasher.update(&std::process::id().to_le_bytes());
+    let hash = hasher.finalize();
+    format!("op_{}", &hash.to_hex()[..32])
+}
+
+/// Build the caller-visible structured result for a direct remote mutation whose outcome
+/// could not be confirmed ([`RemoteError::UnknownOutcome`]).
+///
+/// This is deliberately a distinguishable *outcome*, not a generic internal error and not an
+/// authoritative failure: the request may have committed before the response was lost, so the
+/// caller can retry with the same stable `operation_id` and the receiving receipt store will
+/// authoritatively replay (or dedupe) it.
+fn remote_mutation_unknown_outcome_value(error: &RemoteError, operation_id: &str) -> Value {
+    let RemoteError::UnknownOutcome { remote, message } = error else {
+        // Misuse guard: this helper is only reachable from `is_unknown_outcome()` arms.
+        return json!({ "success": false, "outcome": "unknown_outcome" });
+    };
+    json!({
+        "success": false,
+        "outcome": "unknown_outcome",
+        "remote": remote,
+        "operation_id": operation_id,
+        "error": message,
+        "retry": "safe to retry with the same operation_id; the remote may already have applied the mutation",
+    })
+}
+
+/// Machine-actionable classification of a [`RemoteError`] for structured read-degradation
+/// warnings.
+fn remote_error_classification(error: &RemoteError) -> &'static str {
+    match error {
+        RemoteError::Unreachable { .. } => "unreachable",
+        RemoteError::Unauthorized { .. } => "unauthorized",
+        RemoteError::VersionSkew { .. } => "version_skew",
+        RemoteError::RemoteRejected { .. } => "rejected",
+        RemoteError::InvalidResponse { .. } => "invalid_response",
+        RemoteError::InvalidConfig { .. } => "invalid_config",
+        RemoteError::CapabilityMissing { .. } => "capability_missing",
+        RemoteError::UnknownOutcome { .. } => "unknown_outcome",
+    }
+}
+
+/// Structured partial-read degradation record (issue #127 requires machine-actionable
+/// degradation, not bare strings).
+fn structured_degradation(remote: &str, kind: &str, error: &RemoteError) -> Value {
+    json!({
+        "code": "remote_read_degraded",
+        "remote": remote,
+        "kind": kind,
+        "error": error.to_string(),
+        "classification": remote_error_classification(error),
+    })
+}
+
+/// Attach a structured degradation to a combined-read payload while preserving the legacy
+/// string `warnings` field for backward compatibility. Both arrays append, so a payload that
+/// already carries degradation from an earlier merge keeps every record.
+fn degraded_read_payload(
+    mut payload: Value,
+    remote: &str,
+    kind: &str,
+    error: &RemoteError,
+) -> Value {
+    let warn_msg = format!("remote `{remote}` {kind} failed: {error}");
+    match payload.get_mut("warnings").and_then(|v| v.as_array_mut()) {
+        Some(arr) => arr.push(json!(warn_msg)),
+        None => {
+            payload["warnings"] = json!([warn_msg]);
+        }
+    }
+    let degradation = structured_degradation(remote, kind, error);
+    match payload.get_mut("degradations").and_then(|v| v.as_array_mut()) {
+        Some(arr) => arr.push(degradation),
+        None => {
+            payload["degradations"] = json!([degradation]);
+        }
+    }
+    payload
+}
+
 /// Merge two KG stats payloads: sum numeric fields, union relationship types.
 fn merge_kg_stats(local: Value, remote: Value) -> Value {
     let mut merged = local.clone();
@@ -2234,6 +2489,7 @@ fn kg_timeline_dedup_key(row: &Value) -> String {
 
 fn drawer_result_to_value(result: RemoteDrawerResult, origin: &str) -> Value {
     let mut v = json!({
+        "drawer_id": result.drawer_id,
         "wing": result.wing,
         "room": result.room,
         "similarity": crate::round_similarity(result.score),
@@ -2256,6 +2512,7 @@ fn search_payload(
     room: Option<&str>,
     results: Vec<Value>,
     warnings: &[String],
+    degradations: &[Value],
 ) -> Value {
     let mut payload = json!({
         "query": query,
@@ -2267,6 +2524,9 @@ fn search_payload(
     });
     if !warnings.is_empty() {
         payload["warnings"] = json!(warnings);
+    }
+    if !degradations.is_empty() {
+        payload["degradations"] = json!(degradations);
     }
     payload
 }
@@ -2300,6 +2560,7 @@ pub(crate) fn merge_search_results_nway(
     }
 
     let mut merged: Vec<Value> = Vec::with_capacity(limit);
+    let mut seen_ids = std::collections::HashSet::new();
     let mut seen_hashes = std::collections::HashSet::new();
     let mut seen_texts = std::collections::HashSet::new();
 
@@ -2311,7 +2572,8 @@ pub(crate) fn merge_search_results_nway(
             }
             if rank < results.len() {
                 let item = &results[rank];
-                if !is_duplicate_search_item(item, &mut seen_hashes, &mut seen_texts) {
+                if !is_duplicate_search_item(item, &mut seen_ids, &mut seen_hashes, &mut seen_texts)
+                {
                     let mut annotated = item.clone();
                     if annotated.get("origin").is_none() {
                         annotated["origin"] = json!(origin_name);
@@ -2328,23 +2590,37 @@ pub(crate) fn merge_search_results_nway(
 
 fn is_duplicate_search_item(
     item: &Value,
+    seen_ids: &mut std::collections::HashSet<String>,
     seen_hashes: &mut std::collections::HashSet<String>,
     seen_texts: &mut std::collections::HashSet<String>,
 ) -> bool {
-    // An item is a duplicate if EITHER its hash (if non-empty) is already seen
-    // OR its text is already seen. This prevents a local item (no hash) and a
-    // remote item (with hash, same text) from both appearing.
+    // Stable drawer identity is authoritative. An item carrying a non-empty
+    // drawer_id is deduped only against other IDs — never against hash or text
+    // similarity, so replicated copies of logically distinct drawers (same
+    // content, different stable identity) stay visible. Hash/text remain
+    // compatibility fallbacks for legacy peers that do not return an ID, while
+    // an ID-bearing row still seeds those fallback keys so a later no-ID peer
+    // with identical content can be collapsed against it.
+    let drawer_id = item["drawer_id"].as_str().filter(|id| !id.is_empty());
     let hash = item["content_hash"].as_str().filter(|h| !h.is_empty());
     let text = item["text"].as_str();
 
-    let hash_dup = hash.map(|h| seen_hashes.contains(h)).unwrap_or(false);
-    let text_dup = text.map(|t| seen_texts.contains(t)).unwrap_or(false);
-
-    if hash_dup || text_dup {
+    let duplicate = match drawer_id {
+        Some(id) => seen_ids.contains(id),
+        None => {
+            let hash_dup = hash.map(|h| seen_hashes.contains(h)).unwrap_or(false);
+            let text_dup = text.map(|t| seen_texts.contains(t)).unwrap_or(false);
+            hash_dup || text_dup
+        }
+    };
+    if duplicate {
         return true;
     }
 
-    // Not a duplicate — register both hash and text for future items.
+    // Not a duplicate — register stable identity, hash and text for future items.
+    if let Some(id) = drawer_id {
+        seen_ids.insert(id.to_owned());
+    }
     if let Some(h) = hash {
         seen_hashes.insert(h.to_owned());
     }
@@ -2489,6 +2765,52 @@ mod tests {
         let merged = merge_search_results_nway(two_origins(local, remote), 10);
         // No content_hash, falls back to text dedupe.
         assert_eq!(merged.len(), 1);
+    }
+
+    #[test]
+    fn merge_same_id_dedupes_even_with_different_content() {
+        // Replicated copy of the same logical drawer: identical stable ID must be
+        // one result even though the content differs between peers.
+        let local = vec![json!({
+            "wing":"w","room":"r1","text":"local copy","drawer_id":"d0001"
+        })];
+        let remote = vec![json!({
+            "wing":"w","room":"r2","text":"remote copy","drawer_id":"d0001"
+        })];
+        let merged = merge_search_results_nway(two_origins(local, remote), 10);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0]["drawer_id"], "d0001");
+    }
+
+    #[test]
+    fn merge_different_ids_with_same_content_keeps_both() {
+        // Logically distinct drawers with identical content must remain two
+        // results — dedupe is by stable identity, not semantic/content similarity.
+        let local = vec![json!({
+            "wing":"w","room":"r1","text":"same content","content_hash":"abc123","drawer_id":"d0001"
+        })];
+        let remote = vec![json!({
+            "wing":"w","room":"r2","text":"same content","content_hash":"abc123","drawer_id":"d0002"
+        })];
+        let merged = merge_search_results_nway(two_origins(local, remote), 10);
+        assert_eq!(merged.len(), 2);
+        let ids: Vec<&str> = merged.iter().filter_map(|v| v["drawer_id"].as_str()).collect();
+        assert_eq!(ids, vec!["d0001", "d0002"]);
+    }
+
+    #[test]
+    fn merge_id_bearing_row_seeds_fallback_for_legacy_peer() {
+        // A legacy no-ID peer with identical content is collapsed against an
+        // earlier ID-bearing row via the seeded hash/text keys.
+        let local = vec![json!({
+            "wing":"w","room":"r1","text":"same content","content_hash":"abc123","drawer_id":"d0001"
+        })];
+        let remote = vec![json!({
+            "wing":"w","room":"r2","text":"same content","content_hash":"abc123"
+        })];
+        let merged = merge_search_results_nway(two_origins(local, remote), 10);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0]["drawer_id"], "d0001");
     }
 
     #[test]
@@ -2932,6 +3254,26 @@ mod tests {
         kg_invalidate_response: Value,
         delete_succeeds: bool,
         fail_on: Option<String>,
+        /// Endpoint that returns [`RemoteError::UnknownOutcome`] instead of its normal result
+        /// (e.g. `"add_drawer"`, `"delete"`, `"kg_add"`, `"kg_invalidate"`).
+        fail_unknown_on: Option<String>,
+        /// When set, the first `add_drawer` returns [`RemoteError::UnknownOutcome`] (simulating a
+        /// mutation that committed remotely but whose response was lost) and every later call
+        /// succeeds — the shape of a server receipt-store replay.
+        add_drawer_commit_then_unknown: bool,
+        /// Number of `check_duplicate` calls, so a test can assert the operation-aware preflight
+        /// bypass never reached the remote.
+        check_duplicate_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        /// `operation_id` received by every `add_drawer` call, in order.
+        received_add_operation_ids: std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>>,
+        /// `operation_id` received by every `delete_drawer_with_operation_id` call, in order.
+        received_delete_operation_ids: std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>>,
+        /// `operation_id` received by every `kg_add_fact` call, in order.
+        received_kg_add_operation_ids: std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>>,
+        /// `operation_id` received by every `kg_invalidate` call, in order.
+        received_kg_invalidate_operation_ids: std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>>,
+        /// Number of `add_drawer` calls, so the commit-then-lost mock can fail only the first.
+        add_drawer_attempts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         changes_events: Vec<mempalace_federation::ChangeEventDto>,
         changes_next_cursor: Option<String>,
         /// When set, the `changes` call records the incoming cursor here.
@@ -2975,6 +3317,20 @@ mod tests {
                 kg_invalidate_response: json!({"success": true}),
                 delete_succeeds: true,
                 fail_on: None,
+                fail_unknown_on: None,
+                add_drawer_commit_then_unknown: false,
+                check_duplicate_calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                received_add_operation_ids: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                received_delete_operation_ids: std::sync::Arc::new(std::sync::Mutex::new(
+                    Vec::new(),
+                )),
+                received_kg_add_operation_ids: std::sync::Arc::new(std::sync::Mutex::new(
+                    Vec::new(),
+                )),
+                received_kg_invalidate_operation_ids: std::sync::Arc::new(std::sync::Mutex::new(
+                    Vec::new(),
+                )),
+                add_drawer_attempts: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 changes_events: vec![],
                 changes_next_cursor: None,
                 received_cursor: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -3058,9 +3414,9 @@ mod tests {
                     remote: "mock".to_owned(),
                     message: "undecodable body".to_owned(),
                 },
-                Self::Applied(_) | Self::Conflict(_) => unreachable!(
-                    "into_error is only called for the non-success/non-conflict arms"
-                ),
+                Self::Applied(_) | Self::Conflict(_) => {
+                    unreachable!("into_error is only called for the non-success/non-conflict arms")
+                }
             }
         }
     }
@@ -3125,6 +3481,7 @@ mod tests {
             &self,
             _req: CheckDuplicateRequest,
         ) -> mempalace_remote::Result<CheckDuplicateResponse> {
+            self.check_duplicate_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.check_fail("check_duplicate")?;
             Ok(CheckDuplicateResponse {
                 is_duplicate: !self.duplicate_matches.is_empty(),
@@ -3136,7 +3493,16 @@ mod tests {
             &self,
             req: AddDrawerRequest,
         ) -> mempalace_remote::Result<AddDrawerResponse> {
+            self.received_add_operation_ids.lock().unwrap().push(req.operation_id.clone());
+            let attempt =
+                self.add_drawer_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.check_fail("add_drawer")?;
+            if self.add_drawer_commit_then_unknown && attempt == 0 {
+                return Err(RemoteError::UnknownOutcome {
+                    remote: "mock".to_owned(),
+                    message: "committed but response lost".to_owned(),
+                });
+            }
             if self.add_drawer_409 {
                 return Err(RemoteError::RemoteRejected {
                     remote: "mock".to_owned(),
@@ -3178,20 +3544,34 @@ mod tests {
             }
         }
 
+        async fn delete_drawer_with_operation_id(
+            &self,
+            drawer_id: &str,
+            operation_id: Option<&str>,
+        ) -> mempalace_remote::Result<()> {
+            self.received_delete_operation_ids
+                .lock()
+                .unwrap()
+                .push(operation_id.map(ToOwned::to_owned));
+            self.delete_drawer(drawer_id).await
+        }
+
         async fn kg_query(&self, _req: KgQueryRequest) -> mempalace_remote::Result<Value> {
             self.check_fail("kg_query")?;
             Ok(self.kg_query_response.clone())
         }
 
-        async fn kg_add_fact(&self, _req: KgAddFactRequest) -> mempalace_remote::Result<Value> {
+        async fn kg_add_fact(&self, req: KgAddFactRequest) -> mempalace_remote::Result<Value> {
+            self.received_kg_add_operation_ids.lock().unwrap().push(req.operation_id.clone());
             self.check_fail("kg_add")?;
             Ok(self.kg_add_response.clone())
         }
 
-        async fn kg_invalidate(
-            &self,
-            _req: KgInvalidateRequest,
-        ) -> mempalace_remote::Result<Value> {
+        async fn kg_invalidate(&self, req: KgInvalidateRequest) -> mempalace_remote::Result<Value> {
+            self.received_kg_invalidate_operation_ids
+                .lock()
+                .unwrap()
+                .push(req.operation_id.clone());
             self.check_fail("kg_invalidate")?;
             Ok(self.kg_invalidate_response.clone())
         }
@@ -3305,6 +3685,11 @@ mod tests {
                     remote: "mock".to_owned(),
                     message: "mock failure".to_owned(),
                 })
+            } else if self.fail_unknown_on.as_deref() == Some(endpoint) {
+                Err(RemoteError::UnknownOutcome {
+                    remote: "mock".to_owned(),
+                    message: format!("mock {endpoint} outcome lost"),
+                })
             } else {
                 Ok(())
             }
@@ -3403,14 +3788,8 @@ mod tests {
         );
 
         // Reads: task get, message get.
-        assert_eq!(
-            router.coordination_task_get_fallback("task_missing").await.unwrap(),
-            None
-        );
-        assert_eq!(
-            router.coordination_message_get_fallback("msg_missing").await.unwrap(),
-            None
-        );
+        assert_eq!(router.coordination_task_get_fallback("task_missing").await.unwrap(), None);
+        assert_eq!(router.coordination_message_get_fallback("msg_missing").await.unwrap(), None);
 
         // ID-referencing writes: claim, and message send (via coordination_write_fallback).
         let claim = router
@@ -3426,7 +3805,11 @@ mod tests {
             .expect("gate must short-circuit before any remote call, not error");
         assert_eq!(claim, None);
 
-        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0, "zero coordination calls must have reached the mock remote");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "zero coordination calls must have reached the mock remote"
+        );
     }
 
     // ── Coordination read-fallback error policy (Codex finding 1) ───────────────
@@ -3899,9 +4282,18 @@ mod tests {
             let nested = value.get("task").unwrap_or_else(|| {
                 panic!("{name}: envelope must carry a non-empty `task`: {value}")
             });
-            assert_eq!(nested["task_id"], "task-envelope", "{name}: task fields must be reachable under `task`");
-            assert_eq!(nested["wing"], "wing_team", "{name}: task fields must be reachable under `task`");
-            assert_eq!(value["applied_to"], "remote:alpha", "{name}: applied_to stays at envelope level");
+            assert_eq!(
+                nested["task_id"], "task-envelope",
+                "{name}: task fields must be reachable under `task`"
+            );
+            assert_eq!(
+                nested["wing"], "wing_team",
+                "{name}: task fields must be reachable under `task`"
+            );
+            assert_eq!(
+                value["applied_to"], "remote:alpha",
+                "{name}: applied_to stays at envelope level"
+            );
         }
     }
 
@@ -4255,6 +4647,14 @@ mod tests {
         assert_eq!(warnings.len(), 1);
         // Use Display format (not "unreachable"); check it mentions the remote name
         assert!(warnings[0].as_str().unwrap().contains("alpha"));
+        // Structured degradation accompanies the legacy string warning.
+        let degradations = result["degradations"].as_array().unwrap();
+        assert_eq!(degradations.len(), 1);
+        assert_eq!(degradations[0]["code"], "remote_read_degraded");
+        assert_eq!(degradations[0]["remote"], "alpha");
+        assert_eq!(degradations[0]["kind"], "search");
+        assert_eq!(degradations[0]["classification"], "unreachable");
+        assert!(!degradations[0]["error"].as_str().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -4322,6 +4722,515 @@ mod tests {
         assert_eq!(result["applied_to"], "remote:alpha");
         let matches = result["matches"].as_array().unwrap();
         assert_eq!(matches.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn replay_commit_then_lost_response_bypasses_preflight_and_reaches_receipt_replay() {
+        // Regression for #127: the first operation-aware attempt commits remotely but loses its
+        // response (UnknownOutcome). Retrying the SAME operation_id must bypass the client-side
+        // semantic preflight and re-send the mutation so the receiving receipt store authoritatively
+        // replays it — otherwise the preflight would short-circuit on the now-committed duplicate and
+        // never reach the replay.
+        let mut mock = MockRemote::default();
+        // A legacy preflight WOULD report this content as a duplicate of the committed attempt.
+        mock.duplicate_matches = vec![json!({"drawer_id": "rem-drawer-1", "similarity": 0.99})];
+        mock.add_drawer_commit_then_unknown = true;
+        let check_duplicate_calls = std::sync::Arc::clone(&mock.check_duplicate_calls);
+        let received_ids = std::sync::Arc::clone(&mock.received_add_operation_ids);
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+
+        let route = make_combined_route("alpha");
+
+        // First attempt: committed but response lost.
+        let first = router
+            .add_drawer_remote_with_operation(
+                "w",
+                "r",
+                "content",
+                "file.txt",
+                "agent",
+                &route,
+                0.9,
+                Some("op-replay-1"),
+            )
+            .await
+            .unwrap()
+            .expect("routed remote add must return a result");
+        assert_eq!(first["outcome"], "unknown_outcome");
+        assert_eq!(first["success"], false);
+        assert_eq!(first["operation_id"], "op-replay-1");
+
+        // Retry with the same operation_id: the receipt store replay returns the original result.
+        let second = router
+            .add_drawer_remote_with_operation(
+                "w",
+                "r",
+                "content",
+                "file.txt",
+                "agent",
+                &route,
+                0.9,
+                Some("op-replay-1"),
+            )
+            .await
+            .unwrap()
+            .expect("routed remote add retry must return a result");
+        assert_eq!(second["success"], true);
+        assert_eq!(second["drawer_id"], "rem-drawer-1");
+
+        // Both attempts reached the remote carrying the SAME stable operation_id...
+        let seen = received_ids.lock().unwrap();
+        assert_eq!(
+            seen.as_slice(),
+            &[Some("op-replay-1".to_owned()), Some("op-replay-1".to_owned())]
+        );
+        drop(seen);
+        // ...and the semantic preflight was NEVER invoked for either operation-aware attempt.
+        assert_eq!(
+            check_duplicate_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "operation-aware retries must bypass the client preflight"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_drawer_unknown_outcome_returns_structured_result() {
+        let mut mock = MockRemote::default();
+        mock.fail_unknown_on = Some("add_drawer".to_owned());
+        let received_ids = std::sync::Arc::clone(&mock.received_add_operation_ids);
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+
+        let route = make_combined_route("alpha");
+        let result = router
+            .add_drawer_remote_with_operation(
+                "w",
+                "r",
+                "content",
+                "file.txt",
+                "agent",
+                &route,
+                0.9,
+                Some("op-unknown-1"),
+            )
+            .await
+            .unwrap()
+            .expect("unknown outcome must still return a structured result, not an error");
+
+        assert_eq!(result["outcome"], "unknown_outcome");
+        assert_eq!(result["success"], false);
+        assert_eq!(result["remote"], "mock");
+        assert_eq!(result["operation_id"], "op-unknown-1");
+        assert!(result["error"].as_str().unwrap().contains("outcome lost"));
+        assert!(
+            result["retry"].as_str().unwrap().contains("same operation_id"),
+            "structured result must carry safe-retry guidance"
+        );
+        let seen = received_ids.lock().unwrap();
+        assert_eq!(seen.as_slice(), &[Some("op-unknown-1".to_owned())]);
+    }
+
+    #[tokio::test]
+    async fn add_drawer_omitted_operation_id_generates_and_returns_same_id_on_unknown_outcome() {
+        let mut mock = MockRemote::default();
+        mock.fail_unknown_on = Some("add_drawer".to_owned());
+        let received_ids = std::sync::Arc::clone(&mock.received_add_operation_ids);
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+
+        let route = make_combined_route("alpha");
+        let result = router
+            .add_drawer_remote_with_operation(
+                "w", "r", "content", "file.txt", "agent", &route, 0.9, None,
+            )
+            .await
+            .unwrap()
+            .expect("unknown outcome must return a structured result");
+
+        assert_eq!(result["outcome"], "unknown_outcome");
+        assert_eq!(result["success"], false);
+        assert_eq!(result["remote"], "mock");
+        let op_id =
+            result["operation_id"].as_str().expect("generated operation_id must be a string");
+        assert!(!op_id.is_empty(), "generated operation_id must be non-empty");
+        assert!(result["error"].as_str().unwrap().contains("outcome lost"));
+        assert!(result["retry"].as_str().unwrap().contains("same operation_id"));
+
+        let seen = received_ids.lock().unwrap();
+        assert_eq!(
+            seen.as_slice(),
+            &[Some(op_id.to_owned())],
+            "remote must receive the exact generated operation_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn routed_remote_delete_unknown_outcome_returns_structured_result() {
+        let mut mock = MockRemote::default();
+        mock.fail_unknown_on = Some("delete".to_owned());
+        let received_ids = std::sync::Arc::clone(&mock.received_delete_operation_ids);
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+
+        let route = make_combined_route("alpha");
+        let result = router
+            .delete_drawer_routed_remote("d-1", &route, Some("op-del-unknown-1"))
+            .await
+            .unwrap()
+            .expect("unknown delete outcome must return a structured result");
+
+        assert_eq!(result["outcome"], "unknown_outcome");
+        assert_eq!(result["success"], false);
+        assert_eq!(result["remote"], "mock");
+        assert_eq!(result["operation_id"], "op-del-unknown-1");
+        assert!(result["retry"].as_str().unwrap().contains("same operation_id"));
+        let seen = received_ids.lock().unwrap();
+        assert_eq!(seen.as_slice(), &[Some("op-del-unknown-1".to_owned())]);
+    }
+
+    #[tokio::test]
+    async fn routed_delete_drawer_omitted_operation_id_generates_and_returns_same_id_on_unknown_outcome()
+     {
+        let mut mock = MockRemote::default();
+        mock.fail_unknown_on = Some("delete".to_owned());
+        let received_ids = std::sync::Arc::clone(&mock.received_delete_operation_ids);
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+
+        let route = make_combined_route("alpha");
+        let result = router
+            .delete_drawer_routed_remote("d-1", &route, None)
+            .await
+            .unwrap()
+            .expect("unknown delete outcome must return a structured result");
+
+        assert_eq!(result["outcome"], "unknown_outcome");
+        assert_eq!(result["success"], false);
+        assert_eq!(result["remote"], "mock");
+        let op_id =
+            result["operation_id"].as_str().expect("generated operation_id must be a string");
+        assert!(!op_id.is_empty(), "generated operation_id must be non-empty");
+        assert!(result["retry"].as_str().unwrap().contains("same operation_id"));
+
+        let seen = received_ids.lock().unwrap();
+        assert_eq!(
+            seen.as_slice(),
+            &[Some(op_id.to_owned())],
+            "remote must receive the exact generated operation_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn all_remote_delete_unknown_outcome_is_not_swallowed_as_not_found() {
+        // The all-remote fallback must surface an ambiguous delete rather than swallowing it into
+        // `Ok(None)`, which the caller would render as a false "not found".
+        let mut mock = MockRemote::default();
+        mock.fail_unknown_on = Some("delete".to_owned());
+        let received_ids = std::sync::Arc::clone(&mock.received_delete_operation_ids);
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+
+        let result = router
+            .delete_drawer_remote_with_operation("d-1", Some("op-del-unknown-2"))
+            .await
+            .unwrap()
+            .expect("unknown delete outcome must not be swallowed");
+
+        assert_eq!(result["outcome"], "unknown_outcome");
+        assert_eq!(result["operation_id"], "op-del-unknown-2");
+        let seen = received_ids.lock().unwrap();
+        assert_eq!(seen.as_slice(), &[Some("op-del-unknown-2".to_owned())]);
+    }
+
+    #[tokio::test]
+    async fn all_remote_delete_drawer_omitted_operation_id_generates_and_returns_same_id_on_unknown_outcome()
+     {
+        let mut mock = MockRemote::default();
+        mock.fail_unknown_on = Some("delete".to_owned());
+        let received_ids = std::sync::Arc::clone(&mock.received_delete_operation_ids);
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+
+        let result = router
+            .delete_drawer_remote_with_operation("d-1", None)
+            .await
+            .unwrap()
+            .expect("unknown delete outcome must return a structured result");
+
+        assert_eq!(result["outcome"], "unknown_outcome");
+        assert_eq!(result["success"], false);
+        let op_id =
+            result["operation_id"].as_str().expect("generated operation_id must be a string");
+        assert!(!op_id.is_empty(), "generated operation_id must be non-empty");
+
+        let seen = received_ids.lock().unwrap();
+        assert_eq!(
+            seen.as_slice(),
+            &[Some(op_id.to_owned())],
+            "remote must receive the exact generated operation_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn kg_add_unknown_outcome_returns_structured_result() {
+        let mut mock = MockRemote::default();
+        mock.fail_unknown_on = Some("kg_add".to_owned());
+        let received_ids = std::sync::Arc::clone(&mock.received_kg_add_operation_ids);
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+
+        let route = make_combined_route("alpha");
+        let result = router
+            .kg_add_remote_with_operation(
+                "Alice",
+                "loves",
+                "Bob",
+                Some("2026-01-01"),
+                &route,
+                Some("op-kg-unknown-1"),
+            )
+            .await
+            .unwrap()
+            .expect("unknown kg_add outcome must return a structured result");
+
+        assert_eq!(result["outcome"], "unknown_outcome");
+        assert_eq!(result["success"], false);
+        assert_eq!(result["remote"], "mock");
+        assert_eq!(result["operation_id"], "op-kg-unknown-1");
+        assert!(result["retry"].as_str().unwrap().contains("same operation_id"));
+        let seen = received_ids.lock().unwrap();
+        assert_eq!(seen.as_slice(), &[Some("op-kg-unknown-1".to_owned())]);
+    }
+
+    #[tokio::test]
+    async fn kg_add_omitted_operation_id_generates_and_returns_same_id_on_unknown_outcome() {
+        let mut mock = MockRemote::default();
+        mock.fail_unknown_on = Some("kg_add".to_owned());
+        let received_ids = std::sync::Arc::clone(&mock.received_kg_add_operation_ids);
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+
+        let route = make_combined_route("alpha");
+        let result = router
+            .kg_add_remote_with_operation("Alice", "loves", "Bob", Some("2026-01-01"), &route, None)
+            .await
+            .unwrap()
+            .expect("unknown kg_add outcome must return a structured result");
+
+        assert_eq!(result["outcome"], "unknown_outcome");
+        assert_eq!(result["success"], false);
+        assert_eq!(result["remote"], "mock");
+        let op_id =
+            result["operation_id"].as_str().expect("generated operation_id must be a string");
+        assert!(!op_id.is_empty(), "generated operation_id must be non-empty");
+        assert!(result["retry"].as_str().unwrap().contains("same operation_id"));
+
+        let seen = received_ids.lock().unwrap();
+        assert_eq!(
+            seen.as_slice(),
+            &[Some(op_id.to_owned())],
+            "remote must receive the exact generated operation_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn kg_invalidate_unknown_outcome_returns_structured_result() {
+        let mut mock = MockRemote::default();
+        mock.fail_unknown_on = Some("kg_invalidate".to_owned());
+        let received_ids = std::sync::Arc::clone(&mock.received_kg_invalidate_operation_ids);
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+
+        let route = make_combined_route("alpha");
+        let result = router
+            .kg_invalidate_remote_with_operation(
+                "Alice",
+                "loves",
+                "Bob",
+                Some("2026-02-01"),
+                &route,
+                Some("op-kg-unknown-2"),
+            )
+            .await
+            .unwrap()
+            .expect("unknown kg_invalidate outcome must return a structured result");
+
+        assert_eq!(result["outcome"], "unknown_outcome");
+        assert_eq!(result["success"], false);
+        assert_eq!(result["remote"], "mock");
+        assert_eq!(result["operation_id"], "op-kg-unknown-2");
+        assert!(result["retry"].as_str().unwrap().contains("same operation_id"));
+        let seen = received_ids.lock().unwrap();
+        assert_eq!(seen.as_slice(), &[Some("op-kg-unknown-2".to_owned())]);
+    }
+
+    #[tokio::test]
+    async fn kg_invalidate_omitted_operation_id_generates_and_returns_same_id_on_unknown_outcome() {
+        let mut mock = MockRemote::default();
+        mock.fail_unknown_on = Some("kg_invalidate".to_owned());
+        let received_ids = std::sync::Arc::clone(&mock.received_kg_invalidate_operation_ids);
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+
+        let route = make_combined_route("alpha");
+        let result = router
+            .kg_invalidate_remote_with_operation(
+                "Alice",
+                "loves",
+                "Bob",
+                Some("2026-02-01"),
+                &route,
+                None,
+            )
+            .await
+            .unwrap()
+            .expect("unknown kg_invalidate outcome must return a structured result");
+
+        assert_eq!(result["outcome"], "unknown_outcome");
+        assert_eq!(result["success"], false);
+        assert_eq!(result["remote"], "mock");
+        let op_id =
+            result["operation_id"].as_str().expect("generated operation_id must be a string");
+        assert!(!op_id.is_empty(), "generated operation_id must be non-empty");
+        assert!(result["retry"].as_str().unwrap().contains("same operation_id"));
+
+        let seen = received_ids.lock().unwrap();
+        assert_eq!(
+            seen.as_slice(),
+            &[Some(op_id.to_owned())],
+            "remote must receive the exact generated operation_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_drawer_omitted_operation_id_sends_generated_id_to_remote_on_success() {
+        let mock = MockRemote::default();
+        let received_ids = std::sync::Arc::clone(&mock.received_add_operation_ids);
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+
+        let route = make_combined_route("alpha");
+        let result = router
+            .add_drawer_remote_with_operation(
+                "w", "r", "content", "file.txt", "agent", &route, 0.9, None,
+            )
+            .await
+            .unwrap()
+            .expect("add must succeed");
+
+        assert_eq!(result["success"], true);
+        let seen = received_ids.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        let op_id = seen[0].as_deref().expect("must send generated operation_id");
+        assert!(!op_id.is_empty(), "generated operation_id must be non-empty");
+    }
+
+    #[tokio::test]
+    async fn routed_delete_drawer_omitted_operation_id_sends_generated_id_to_remote_on_success() {
+        let mock = MockRemote::default();
+        let received_ids = std::sync::Arc::clone(&mock.received_delete_operation_ids);
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+
+        let route = make_combined_route("alpha");
+        let result = router
+            .delete_drawer_routed_remote("d-1", &route, None)
+            .await
+            .unwrap()
+            .expect("delete must succeed");
+
+        assert_eq!(result["success"], true);
+        let seen = received_ids.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        let op_id = seen[0].as_deref().expect("must send generated operation_id");
+        assert!(!op_id.is_empty(), "generated operation_id must be non-empty");
+    }
+
+    #[tokio::test]
+    async fn all_remote_delete_drawer_omitted_operation_id_sends_generated_id_to_remote_on_success()
+    {
+        let mock = MockRemote::default();
+        let received_ids = std::sync::Arc::clone(&mock.received_delete_operation_ids);
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+
+        let result = router
+            .delete_drawer_remote_with_operation("d-1", None)
+            .await
+            .unwrap()
+            .expect("delete must succeed");
+
+        assert_eq!(result["success"], true);
+        let seen = received_ids.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        let op_id = seen[0].as_deref().expect("must send generated operation_id");
+        assert!(!op_id.is_empty(), "generated operation_id must be non-empty");
+    }
+
+    #[tokio::test]
+    async fn kg_add_omitted_operation_id_sends_generated_id_to_remote_on_success() {
+        let mock = MockRemote::default();
+        let received_ids = std::sync::Arc::clone(&mock.received_kg_add_operation_ids);
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+
+        let route = make_combined_route("alpha");
+        let result = router
+            .kg_add_remote_with_operation("Alice", "loves", "Bob", Some("2026-01-01"), &route, None)
+            .await
+            .unwrap()
+            .expect("kg_add must succeed");
+
+        assert_eq!(result["success"], true);
+        let seen = received_ids.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        let op_id = seen[0].as_deref().expect("must send generated operation_id");
+        assert!(!op_id.is_empty(), "generated operation_id must be non-empty");
+    }
+
+    #[tokio::test]
+    async fn kg_invalidate_omitted_operation_id_sends_generated_id_to_remote_on_success() {
+        let mock = MockRemote::default();
+        let received_ids = std::sync::Arc::clone(&mock.received_kg_invalidate_operation_ids);
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+
+        let route = make_combined_route("alpha");
+        let result = router
+            .kg_invalidate_remote_with_operation(
+                "Alice",
+                "loves",
+                "Bob",
+                Some("2026-02-01"),
+                &route,
+                None,
+            )
+            .await
+            .unwrap()
+            .expect("kg_invalidate must succeed");
+
+        assert_eq!(result["success"], true);
+        let seen = received_ids.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        let op_id = seen[0].as_deref().expect("must send generated operation_id");
+        assert!(!op_id.is_empty(), "generated operation_id must be non-empty");
     }
 
     #[tokio::test]
@@ -4660,6 +5569,13 @@ mod tests {
         let warnings = result["warnings"].as_array().unwrap();
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].as_str().unwrap().contains("alpha"));
+        // Structured degradation accompanies the legacy string warning.
+        let degradations = result["degradations"].as_array().unwrap();
+        assert_eq!(degradations.len(), 1);
+        assert_eq!(degradations[0]["code"], "remote_read_degraded");
+        assert_eq!(degradations[0]["remote"], "alpha");
+        assert_eq!(degradations[0]["kind"], "kg_query");
+        assert_eq!(degradations[0]["classification"], "unreachable");
     }
 
     #[tokio::test]
@@ -4886,6 +5802,10 @@ mod tests {
         let result = router.kg_timeline_merge(local, None, &route).await.unwrap();
         let warnings = result["warnings"].as_array().unwrap();
         assert!(warnings[0].as_str().unwrap().contains("alpha"));
+        let degradations = result["degradations"].as_array().unwrap();
+        assert_eq!(degradations[0]["kind"], "kg_timeline");
+        assert_eq!(degradations[0]["remote"], "alpha");
+        assert_eq!(degradations[0]["classification"], "unreachable");
     }
 
     #[tokio::test]
@@ -4906,6 +5826,10 @@ mod tests {
         assert_eq!(result["entities"], 5);
         let warnings = result["warnings"].as_array().unwrap();
         assert!(warnings[0].as_str().unwrap().contains("alpha"));
+        let degradations = result["degradations"].as_array().unwrap();
+        assert_eq!(degradations[0]["kind"], "kg_stats");
+        assert_eq!(degradations[0]["remote"], "alpha");
+        assert_eq!(degradations[0]["classification"], "unreachable");
     }
 
     // ─── plan_search_targets unit tests ─────────────────────────────────────

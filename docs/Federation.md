@@ -47,11 +47,25 @@ it all locally for dev testing.
   (`local` or `remote:<name>`).
 - **Reads degrade, writes do not (except `both`).** A remote that is unreachable
   during a read is reported as a warning and skipped — the local side still
-  returns. A write to a down remote (`write: remote`) is an explicit error with
-  **no silent local fallback**. The `write: both` target is the exception: the
-  local write must succeed first, and a remote failure is reported as a
-  `replication` field on the response without aborting the operation or
+  returns. Degradation is reported twice, side by side: the legacy `warnings`
+  array of human-readable strings and a machine-actionable `degradations` array
+  whose entries carry `code` (`"remote_read_degraded"`), `remote`, `kind` (e.g.
+  `search`, `kg_query`, `kg_timeline`, `kg_stats`), `error`, and a
+  `classification` (e.g. `unreachable`, `unauthorized`, `rejected`,
+  `unknown_outcome`). A write to a down remote (`write: remote`) is an explicit
+  error with **no silent local fallback**. The `write: both` target is the
+  exception: the local write must succeed first, and a remote failure is reported
+  as a `replication` field on the response without aborting the operation or
   rolling back the local write.
+- **A direct remote write whose outcome cannot be confirmed is surfaced, not
+  swallowed.** If a `write: remote` mutation (drawer add/delete, KG add/invalidate)
+  commits on the remote but the response is lost (timeout, undecodable 2xx), the
+  tool returns a structured result with `outcome: "unknown_outcome"`, the remote
+  name, the stable `operation_id`, the underlying error, and safe-retry guidance —
+  it is **not** an authoritative failure and **not** an unreachable error. The
+  same key can be retried: operation-aware remote writes bypass the client-side
+  semantic duplicate preflight so the receiving receipt store authoritatively
+  replays the mutation.
 - **Diary is always local.** `wing_agents`, the `diary` room, and `diary:`-prefixed
   sources are hard-pinned to local storage. Any config that tries to route them
   remote is warned about and ignored, and the server rejects diary-shaped writes
@@ -177,8 +191,20 @@ requires `Authorization: Bearer <token>`.
 a client checks before attempting federated mining, and the `"coordination"`
 capability (added in issue #102 Stage 3) is what a client would check before
 calling any `/v1/coordination/*` route — see
-[Part 7](#part-7--federated-coordination). The wire DTOs live in the
+[Part 7](#part-7--federated-coordination). The `"idempotent_mutations"`
+capability (added in issue #127) is what the durable replication worker checks
+before delivering an outbox operation: a remote that does not advertise it can
+only be reached by non-replicated legacy writes, because there would be no way
+to apply a replayed mutation exactly once. The wire DTOs live in the
 `mempalace-federation` crate and are shared verbatim by server and client.
+Federated mutation routes (`POST /v1/drawers`, `DELETE /v1/drawers/{id}`,
+`POST /v1/kg/facts`, `POST /v1/kg/facts/invalidate`) accept an optional
+`operation_id`; when present, the server pins the mutation's target identity in
+a receipt table so an idempotent replay — whether from a retried outbox worker
+or a crash-recovered re-apply — lands exactly once and never double-applies.
+Semantic/content similarity is *not* used as replay detection: a duplicate with
+a different stable `drawer_id` is an authoritative 409 conflict, not
+convergence.
 
 ### 1.5 Authorization scopes
 
@@ -363,64 +389,101 @@ routing:
 This sits at precedence step 2 — a global `federation.wings` rule for the same
 wing still overrides it.
 
-### `write: both` — local-first dual-write semantics
+### `write: both` — durable local-first dual-write semantics
 
 When `write: both` is configured, every federatable write operation follows a
-local-first protocol:
+**durable, local-first, asynchronous** protocol (issue #127):
 
-1. **Local write must complete first.** The local storage commit finishes
-   before any remote attempt begins.
-2. **Best-effort remote replication** is then attempted against the configured
-   remote. Transport errors, duplicate rejections, and server errors are all
-   caught and reported — they never roll back or abort the local write.
-3. **Partial-success reporting.** When the route is `write: both`, the response
-   carries a `replication` field typed as
-   [`ReplicationStatus`](Config-Schema.md#replicationstatus):
-   - `{"status": "replicated", "remote": "<name>"}` — remote succeeded.
-   - `{"status": "converged", "remote": "<name>"}` — remote already had
-     the exact content (content-hash match); state is converged.
-   - `{"status": "failed", "remote": "<name>", "reason": "..."}` — remote
-     failed; the local write is unaffected.
+1. **A durable intent is staged before the local mutation.** The MCP process
+   persists a replication operation into its local outbox (SQLite,
+   `replication_outbox`) *before* committing the local mutation. The outbox
+   operation carries a stable `operation_id` (e.g. `outbox_…`) and an
+   idempotency key derived from the mutation's identity, so a crash between
+   "intent persisted" and "local write committed" is reconciled at startup,
+   and a replayed call reuses the same intent instead of double-writing.
+2. **Local write must complete first.** The local storage commit finishes
+   before the intent is activated and made deliverable.
+3. **The tool returns before any remote work.** The response carries a
+   `replication` field typed as [`ReplicationStatus`](Config-Schema.md#replicationstatus):
+   - `{"status": "queued", "remote": "<name>", "operation_id": "outbox_…"}`
+     — the local write committed and the replication is durably queued. This is
+     the *only* status the MCP tool reports for `write: both`; it never waits on
+     the remote and never reports a remote outcome inline.
    Non-`both` routes and diary-local writes omit the `replication` field
    entirely.
-4. **Idempotency of the local write.** The local path uses content-hash
-   deduplication for drawer writes and triple-identity checks for KG facts, so
-   retrying the whole MCP tool call is safe for the local side. The **remote
-   leg** is not universally idempotent: the drawer pre-check uses similarity
-   detection (not exact match), and replaying a full MCP `add_drawer` produces
-   a new local drawer ID — there is no end-to-end operation ID. Replaying a
-   failed remote replication may succeed or encounter a duplicate; in either
-   case the local side is not double-written.
-5. **No retry is built in.** The replication attempt fires once. Operators
-   monitoring `{"status": "failed", ...}` should fix the connectivity issue
-   and re-apply the originating write at the MCP tool level. Because there is
-   no cross-side operation ID, retry safety depends on operation-specific
-   handling — duplicate pre-checks help but are not a full guarantee.
-6. **Diary-local-only override still applies.** Even with `write: both`, diary
+4. **A background worker delivers asynchronously.** The MCP process runs a
+   replication worker that claims due outbox operations and delivers them with
+   the stable `operation_id` (so the remote can apply them idempotently — see
+   [§1.4 REST surface](#14-rest-surface)'s `idempotent_mutations`
+   capability note). The
+   worker:
+   - checks the remote advertises the `idempotent_mutations` capability before
+     delivering;
+   - retries **indefinitely** with bounded exponential backoff + jitter for
+     retryable outcomes (unreachable-before-send, unknown outcomes, transient
+     HTTP 408/425/429/5xx);
+   - records authoritative permanent rejections (e.g. HTTP 401, semantic/content
+     duplicate 409, capability missing) as a **terminal failure**;
+   - preserves the delivery order of operations sharing the same
+     `(destination_remote, ordering_key)`.
+5. **Outcomes are observable, not inline.** Delivery progress — pending,
+   leased, retryable counts, the backlog, the most recent terminal failures —
+   is surfaced by `mempalace_status` (and `mempalace_wake_up`'s embedded
+   status) under `replication.backlog` and `replication.recent_terminal_failures`.
+   An operator can therefore answer "did my queued write actually replicate?"
+   by reading the outbox state rather than by resubmitting the write.
+6. **Startup reconciliation settles staged intents.** On `McpServer` start, any
+   outbox intent whose local mutation never committed is cancelled; a committed
+   mutation (its drawer/fact exists locally) is activated and delivered. This
+   closes the crash window between intent persistence and local commit.
+7. **Semantic/similarity duplicates are NOT convergence.** issue #127 forbids
+   treating a 409 "content duplicate with a different remote `drawer_id`" as
+   successful replication. Logical replay identity is the operation id + the
+   stable `drawer_id`, not content similarity. If the remote authoritatively
+   rejects a mutation whose drawer_id does not match the replica it already
+   holds, the worker records a **terminal identity/content conflict** in
+   `replication.recent_terminal_failures` rather than claiming convergence.
+8. **Diary-local-only override still applies.** Even with `write: both`, diary
    targets (`wing_agents`, `diary` room, `diary:`-prefixed sources) are always
    local-only — routing resolves to local before `write: both` is detected, so
    no replication leg is attempted and the response carries no `replication`
    field. No config can federate diary content.
 
-This applies to all federated write paths:
-- **Drawer writes** (`mempalace_add_drawer` via MCP) — local commit, then
-  pre-check duplicate on remote before writing.
-- **KG fact adds** (`mempalace_kg_add`) — local KG commit, then remote.
-- **KG fact invalidations** (`mempalace_kg_invalidate`) — local invalidation,
-  then remote.
-- **Mining** (`mempalace-cli mine` with `write: both`) — local mine completes
-  fully (embedding, storage, summary), then a best-effort remote push is
-  attempted. The remote result is appended to the mine output; a remote failure
-  is reported without rolling back the local mine.
+This applies to all federated write paths that go through the MCP tools:
+- **Drawer writes** (`mempalace_add_drawer`) — durable intent, local commit,
+  queued remote delivery.
+- **Drawer deletes** (`mempalace_delete_drawer` on a locally-known drawer) — same
+  protocol: durable intent, local delete, queued remote delivery.
+- **KG fact adds** (`mempalace_kg_add`) — durable intent, local commit, queued
+  remote delivery.
+- **KG fact invalidations** (`mempalace_kg_invalidate`) — durable intent, local
+  invalidation, queued remote delivery.
 
-> **DeleteDrawer is excluded from write routing.** `mempalace_delete_drawer` does
-> not use `write` target resolution. It always deletes by drawer ID in the local
-> palace first. If the drawer is not found locally, it falls back by attempting
-> deletion on ALL configured remotes (in deterministic name order), regardless of
-> wing routing. This is because dual-written drawers have independent IDs on each
-> side with no durable cross-palace ID mapping — routing cannot select the
-> "correct" remote by wing. The response reports `applied_to: "local"` or
-> `"remote:<name>"` and never carries a `replication` field.
+> **DeleteDrawer's remote fallback is unchanged.** Unknown drawer IDs are not
+> `write: both`-routed: `mempalace_delete_drawer` first deletes a *known* local
+> drawer (applying the resolved `write` target, which is what produces durable
+> replication for `both` routes). If the ID is not found locally it falls back by
+> attempting deletion on ALL configured remotes (in deterministic name order), as
+> before, and the response reports `applied_to: "remote:<name>"` with no
+> `replication` field.
+>
+> **Keyed delete retries replay the original intent.** Retrying a `write: both`
+> delete with the same caller `operation_id` after the local drawer is gone (or
+> after a restart) recovers the durable outbox operation by that key and returns
+> its current state — `queued` with the same outbox `operation_id`, or the
+> terminal `replicated`/`failed` outcome — instead of re-resolving the route from
+> now-absent local drawer metadata and falling into the synchronous all-remote
+> fallback. The outbox row is authoritative for the destination remote and state.
+> A no-key second delete preserves the legacy fallback behavior.
+
+**Retry safety now has a real backbone.** Previously "no retry was built in"
+and replay safety relied on content-hash deduplication. Under issue #127 a
+replayed tool call reuses the same outbox `operation_id`/idempotency key and
+the remote applies it exactly once, while the background worker itself retries
+transport/unknown failures with the same stable operation id forever. Fixing
+the connectivity issue and letting the worker converge (or inspecting
+`replication.recent_terminal_failures` for an authoritative rejection) replaces
+"re-apply the write" as the operational remedy.
 
 ## Part 3 — Federated mining
 
@@ -470,8 +533,35 @@ a purely local concept — see [Part 4](#part-4--branch-aware-mining).
    the mine output appends `Remote replication: failed — <reason>` as a text
    line (not JSON) without rolling back the local mine.
 - A bad single file → reported `failed` in the 200 response body; the rest of the
-  batch still commits.
+   batch still commits.
 - Diary-shaped wing/room → rejected with HTTP 422.
+
+> **Batch-ingest replication is synchronous, not durable (known gap — issue #127).
+> ** The MCP tool paths (`mempalace_add_drawer`, `mempalace_delete_drawer`,
+> `mempalace_kg_add`, `mempalace_kg_invalidate`) route `write: both` through the
+> durable replication outbox described in Part 2. **`mempalace-cli mine` does not.**
+> Its `write: both` leg still pushes prepared files to `/v1/ingest/batch` inline and
+> best-effort, with no outbox intent and no replay identity: a crash mid-push can
+> leave the local mine committed and part of the remote batch unapplied, and a retry
+> is not resumable. Because issue #127's acceptance required either durable/resumable
+> batch semantics *or* a clearly identified linked follow-up, this gap is intentionally
+> tracked as its own issue rather than silently absorbed into the MCP-only outbox work.
+>
+> **Tracked follow-up:** [issue #131](https://github.com/DigitumDei/mempalace-rs/issues/131)
+> carries the durable, resumable batch-ingest work split from issue #127:
+>
+> - **Title:** `Durable resumable batch-ingest replication for write: both (issue #127 follow-up)`
+> - **Body:** `mempalace-cli mine` currently replicates `write: both` batches to
+>   `POST /v1/ingest/batch` inline and best-effort. Make it durable and resumable on
+>   the same outbox as the MCP tool paths: stage a batch-ingest intent (with a stable
+>   batch id and per-file manifest) before local commit, deliver via the background
+>   worker with bounded backoff, record terminal per-file failures in the outbox, and
+>   make a retried mine resume the partially-applied batch instead of resending whole
+>   files. Acceptance: a crash mid-push is reconciled at next start; a retry never
+>   double-applies an already-replicated file; status exposes the pending/retryable/
+>   failed batch count.`
+> Creating and linking issue #131 satisfies issue #127's explicit split-follow-up
+> requirement; implementation of the batch-specific guarantees remains scoped to #131.
 
 ## Part 4 — Branch-aware mining
 

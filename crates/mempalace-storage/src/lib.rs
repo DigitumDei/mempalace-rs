@@ -6,6 +6,8 @@ mod engine;
 mod error;
 mod lance;
 mod maintenance;
+mod outbox;
+mod receipt;
 mod skills;
 mod sqlite;
 mod types;
@@ -28,6 +30,18 @@ pub use lance::{FragmentStats, LanceDrawerStore, OptimizeMetrics, PruneMetrics, 
 pub use maintenance::{
     MaintenanceAbortReason, MaintenanceOutcome, MaintenanceRunStatus, MaintenanceRunSummary,
     MaintenanceSettings, MaintenanceSkipReason, MaintenanceTier, MaintenanceTierResult,
+};
+pub use outbox::{
+    NewOutboxOperation, OUTBOX_CANCELLABLE_STATE_REQUIRED, OUTBOX_LEASE_DURATION_OUT_OF_RANGE,
+    OUTBOX_LEASE_HAS_EXPIRED, OUTBOX_LEASE_HELD_BY_ANOTHER_WORKER, OUTBOX_ONLY_LEASE_OWNER,
+    OUTBOX_ONLY_STAGED_MAY_ACTIVATE, OUTBOX_OPERATION_NOT_ACTIVATED,
+    OUTBOX_OPERATION_NOT_IN_FLIGHT, OUTBOX_OPERATION_TERMINAL, OUTBOX_PREDECESSOR_IN_FLIGHT,
+    OUTBOX_RETRY_NOT_DUE, OutboxBacklog, OutboxOperation, OutboxState, OutboxStore,
+};
+pub use receipt::{
+    MutationReceipt, MutationReceiptStore, NewReceipt, RECEIPT_KIND_DRAWER_ADD,
+    RECEIPT_KIND_DRAWER_DELETE, RECEIPT_KIND_KG_ADD, RECEIPT_KIND_KG_INVALIDATE, ReceiptOutcome,
+    ReceiptState,
 };
 pub use skills::{
     NewSkill, NewSkillOutcome, Skill, SkillOutcome, SkillOutcomeResult, SkillReview, SkillScope,

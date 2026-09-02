@@ -988,7 +988,7 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
 /// error code for it (it comes back as a generic `SQLITE_ERROR` with a message), so this matches
 /// on the message text, which is a stable, documented SQLite error string for this exact
 /// condition, not a moving target we control.
-fn add_column_if_missing(conn: &Connection, table: &str, column: &str, ddl: &str) -> Result<()> {
+pub(crate) fn add_column_if_missing(conn: &Connection, table: &str, column: &str, ddl: &str) -> Result<()> {
     let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
     let exists = statement
         .query_map([], |row| row.get::<_, String>(1))?

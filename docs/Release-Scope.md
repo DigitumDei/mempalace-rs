@@ -142,8 +142,21 @@ Added after the initial v1 freeze; now part of the shipped surface.
   audit feed). See [Federation §1.4](Federation.md#14-rest-surface).
 - Client routing (`federation` config section): per-wing and KG `local` / `remote`
   / `combined` modes with `write` target `local` / `remote` / `both`;
-  local-first dual-write with best-effort remote replication in `both` mode;
-  federated mining and `mine --branch` branch-delta mining.
+  durable local-first dual-write with **asynchronous, queued replication** in
+  `both` mode (issue #127): the tool commits locally and returns
+  `replication.status: "queued"` with a stable `operation_id`, a background
+  worker delivers idempotently, and outcomes surface via `mempalace_status`
+  (`replication.backlog` / `replication.recent_terminal_failures`) and
+  `replication.phase_metrics`; federated mining and `mine --branch` branch-delta
+  mining.
+- Structured federation outcomes (issue #127 review hardening): direct `write:
+  remote` mutations whose outcome is unconfirmed return a structured
+  `outcome: "unknown_outcome"` result (remote + stable `operation_id` + safe-retry
+  guidance) rather than a generic internal error, and a keyed `write: both` delete
+  retried after the local delete replays the original queued/terminal outbox state
+  by the caller `operation_id`. Combined reads report partial failures both as
+  legacy string `warnings` and as a machine-actionable `degradations` array
+  (`code`, `remote`, `kind`, `error`, `classification`).
 - MCP read fan-out: combined search/taxonomy/status, plus `remote_changes` in
   `mempalace_wake_up`, remote merge in `mempalace_get_changes_since`, and (issue #102 Stage 4)
   `remote_messages`/`remote_events` in `mempalace_inbox_read`/`mempalace_coordination_events`.

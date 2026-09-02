@@ -29,6 +29,7 @@ tracing.workspace = true
 tempfile = "3.23.0"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+rusqlite = { version = "0.39.0", features = ["bundled"] }
 
 [lints]
 workspace = true

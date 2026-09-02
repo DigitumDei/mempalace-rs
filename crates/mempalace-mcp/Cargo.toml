@@ -20,7 +20,7 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 time.workspace = true
-tokio = { version = "1.48.0", features = ["io-std", "io-util", "macros", "rt-multi-thread", "sync"] }
+tokio = { version = "1.48.0", features = ["io-std", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
 tracing.workspace = true
 
 [dev-dependencies]

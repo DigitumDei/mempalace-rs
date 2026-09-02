@@ -2702,10 +2702,14 @@ fn authorize_replay_wing(auth: &AuthIdentity, wing: &str) -> Result<(), ServerEr
     // `resolve_owning_task`) because this function takes a bare wing string,
     // not a task: a replayed idempotent write whose stored record turns out
     // to be `wing_unscoped` never goes through `resolve_owning_task` at all.
-    if is_diary_wing_or_room(wing, "")
-        || wing == UNSCOPED_WING
-        || !auth.allows_wing(Operation::CoordinationWrite, wing)
-    {
+    // Unlike an unauthorized wing which returns 409 conflict to avoid disclosing
+    // the stored record's wing, `wing_unscoped` returns the typed 422
+    // `UnscopedNotFederated` refusal so callers know the legacy task must be
+    // re-homed.
+    if wing == UNSCOPED_WING {
+        return Err(ServerError::UnscopedNotFederated);
+    }
+    if is_diary_wing_or_room(wing, "") || !auth.allows_wing(Operation::CoordinationWrite, wing) {
         return Err(coordination_replay_conflict());
     }
     Ok(())
@@ -7954,6 +7958,43 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(get_resp.status(), StatusCode::NOT_FOUND, "a read stays masked as 404");
+    }
+
+    /// Replaying a task-create idempotency key whose stored legacy task is on `wing_unscoped`
+    /// must return 422 `unscoped_not_federated`, not 409 `idempotency_key_conflict`
+    /// (issue #102 Stage 8).
+    #[tokio::test]
+    async fn coordination_task_create_replay_in_wing_unscoped_is_rejected_with_422() {
+        let harness = make_harness().await;
+        let db_path = harness.state.config.palace_path.join("storage.sqlite3");
+        {
+            let conn = rusqlite::Connection::open(&db_path).expect("open storage db");
+            conn.execute(
+                "INSERT INTO coordination_tasks(task_id,title,description,state,revision,created_by,dependencies_json,idempotency_key,created_at,updated_at,wing) \
+                 VALUES ('task_unscoped_replay_seed','legacy','d','pending',0,'alice','[]','unscoped-replay-key-1','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','wing_unscoped')",
+                [],
+            )
+            .expect("seed legacy wing_unscoped task row");
+        }
+
+        let replay_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/coordination/tasks",
+                ALICE_TOKEN,
+                json!({
+                    "title": "replayed task",
+                    "description": "d",
+                    "wing": "wing_alpha",
+                    "idempotency_key": "unscoped-replay-key-1",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(replay_resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body_json(replay_resp).await["code"], "unscoped_not_federated");
     }
 
     /// Seeds a task directly in `wing_agents` via the coordination store

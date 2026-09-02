@@ -475,6 +475,17 @@ This applies to all federated write paths that go through the MCP tools:
 > now-absent local drawer metadata and falling into the synchronous all-remote
 > fallback. The outbox row is authoritative for the destination remote and state.
 > A no-key second delete preserves the legacy fallback behavior.
+>
+> **Keyed add retries reuse the cancelled intent's pinned target.** A `write: both`
+> add with a caller `operation_id` stages its durable intent — pinning the
+> time-derived `drawer_id` in the payload — before the local commit; a failed local
+> commit cancels that intent. Retrying the same caller `operation_id` with the same
+> mutation recovers the pinned target from the outbox: the add commits under the
+> original `drawer_id` and reactivates the original outbox operation instead of
+> generating a fresh time-derived id, which would present a different
+> entity/payload under the same idempotency key and be rejected by the outbox. A
+> different mutation under the same `operation_id` still conflicts — key reuse with
+> a different mutation remains an error.
 
 **Retry safety now has a real backbone.** Previously "no retry was built in"
 and replay safety relied on content-hash deduplication. Under issue #127 a

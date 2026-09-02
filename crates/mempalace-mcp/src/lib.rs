@@ -1577,6 +1577,68 @@ where
         }
     }
 
+    /// Recover a keyed `write:both` add's pinned drawer target from the caller's stable
+    /// operation id, before a fresh time-derived drawer id is generated.
+    ///
+    /// A `write:both` add stages a durable outbox intent (keyed by the caller's operation
+    /// id) before committing locally; a failed local commit cancels that intent, and the
+    /// intent's payload pins the drawer id the first attempt generated. A retry of the
+    /// same operation must reuse that pinned target: generating a fresh time-derived id
+    /// would present a different entity/payload under the same idempotency key, which the
+    /// outbox rejects as a key reused with a different mutation.
+    ///
+    /// Returns `Ok(None)` — letting the normal paths proceed unchanged — when there is no
+    /// staged/cancelled `drawer_added` intent under this operation id, when its payload is
+    /// not this exact mutation (same wing, room, content, source file, and added_by), or
+    /// when the pinned drawer already exists locally (the duplicate/replay paths own that
+    /// case).
+    async fn recover_keyed_add_target(
+        &self,
+        requested_operation_id: &str,
+        wing: &str,
+        room: &str,
+        content: &str,
+        source_file: Option<&str>,
+        added_by: Option<&str>,
+    ) -> Result<Option<DrawerId>> {
+        let Some(operation) = self.outbox.find_by_key(OUTBOX_ACTOR, requested_operation_id)? else {
+            return Ok(None);
+        };
+        if operation.mutation_kind != "drawer_added" {
+            return Ok(None);
+        }
+        // Only an intent whose local commit never landed (still staged, or cancelled as
+        // uncommitted) needs target recovery; every other state means the local commit
+        // confirmed and the normal duplicate/replay paths own the retry.
+        if !matches!(operation.state, OutboxState::Staged | OutboxState::Cancelled) {
+            return Ok(None);
+        }
+        let Ok(ReplicationMutation::DrawerAdd { request: staged }) =
+            serde_json::from_value::<ReplicationMutation>(operation.payload.clone())
+        else {
+            return Ok(None);
+        };
+        let Some(pinned_drawer_id) = staged.drawer_id.as_deref() else {
+            return Ok(None);
+        };
+        if staged.wing != wing
+            || staged.room != room
+            || staged.content != content
+            || staged.source_file.as_deref() != source_file
+            || staged.added_by.as_deref() != added_by
+        {
+            return Ok(None);
+        }
+        let pinned = parse_drawer_id(pinned_drawer_id).map_err(|error| match error {
+            ToolError::InvalidParams(message) => McpError::Replication(message),
+            ToolError::Internal(error) => error,
+        })?;
+        if self.storage.drawer_store().get_drawer(&pinned).await?.is_some() {
+            return Ok(None);
+        }
+        Ok(Some(pinned))
+    }
+
     async fn tool_wake_up(&mut self, arguments: &Value) -> ToolResult<Value> {
         let wing =
             optional_string(arguments, "wing")?.map(|value| parse_wing_id(&value)).transpose()?;
@@ -2685,7 +2747,36 @@ where
         }
 
         let now = OffsetDateTime::now_utc();
-        let drawer_id = generated_drawer_id("drawer", wing.as_str(), room.as_str(), &content, now)?;
+        // ── Keyed replay recovery ─────────────────────────────────────────────
+        // A write:both add stages a durable outbox intent (keyed by the caller's
+        // operation_id) before committing locally; a failed local commit cancels that
+        // intent. Retrying the same operation_id must reuse the intent's pinned drawer
+        // target: a fresh time-derived id would present a different entity/payload under
+        // the same idempotency key, which the outbox rejects as a key reused with a
+        // different mutation.
+        let staged_source_file = (!source_file.is_empty()).then(|| source_file.clone());
+        let pinned_add_target = if is_both {
+            match requested_operation_id.as_deref() {
+                Some(operation_id) => self
+                    .recover_keyed_add_target(
+                        operation_id,
+                        wing.as_str(),
+                        room.as_str(),
+                        &content,
+                        staged_source_file.as_deref(),
+                        Some(added_by.as_str()),
+                    )
+                    .await
+                    .map_tool()?,
+                None => None,
+            }
+        } else {
+            None
+        };
+        let drawer_id = match pinned_add_target {
+            Some(pinned) => pinned,
+            None => generated_drawer_id("drawer", wing.as_str(), room.as_str(), &content, now)?,
+        };
         let staged = if is_both {
             let remote =
                 route.as_ref().and_then(|value| value.remote.clone()).ok_or_else(|| {
@@ -2710,7 +2801,7 @@ where
                             wing: wing.as_str().to_owned(),
                             room: room.as_str().to_owned(),
                             content: content.clone(),
-                            source_file: (!source_file.is_empty()).then(|| source_file.clone()),
+                            source_file: staged_source_file.clone(),
                             added_by: Some(added_by.clone()),
                             drawer_id: Some(drawer_id.as_str().to_owned()),
                             operation_id: None,
@@ -10698,6 +10789,154 @@ mod tests {
         assert!(
             stored.is_none(),
             "local diary drawer deletion must remove its SQLite summary; got: {stored:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_add_drawer_write_both_retry_after_cancelled_intent_reuses_pinned_target() {
+        // A write:both add stages a durable outbox intent keyed by the caller's
+        // operation_id before committing locally; a failed local commit cancels that
+        // intent. Retrying the same operation_id must reuse the cancelled intent's
+        // pinned drawer target — a fresh time-derived id would present a different
+        // entity/payload under the same idempotency key, which the outbox rejects —
+        // reactivate the original operation, and keep the same drawer identity.
+        let mock = Arc::new(DeleteDrawerMock {
+            delete_succeeds: true,
+            delete_call_count: AtomicU64::new(0),
+            delete_unknown_outcome: false,
+        });
+        let mock_for_assert = mock.clone();
+        let remotes =
+            BTreeMap::from([("alpha".to_owned(), mock as Arc<dyn mempalace_remote::RemoteApi>)]);
+        let mut ctx = make_delete_drawer_ctx(remotes, WriteTarget::Both).await;
+
+        // Simulate the cancelled intent: an add staged under the caller's operation_id
+        // and cancelled before its local commit, pinning this drawer target.
+        let pinned_id = DrawerId::new("drawer_wing_code_retry-room_0123456789abcdef").unwrap();
+        let staged = ctx
+            .runtime
+            .stage_replication(
+                "op-cancelled-add-retry".to_owned(),
+                "drawer_added",
+                pinned_id.as_str().to_owned(),
+                "alpha".to_owned(),
+                pinned_id.as_str().to_owned(),
+                ReplicationMutation::DrawerAdd {
+                    request: AddDrawerRequest {
+                        wing: "wing_code".to_owned(),
+                        room: "retry-room".to_owned(),
+                        content: "retry content".to_owned(),
+                        source_file: None,
+                        added_by: Some("mcp".to_owned()),
+                        drawer_id: Some(pinned_id.as_str().to_owned()),
+                        operation_id: None,
+                    },
+                },
+            )
+            .unwrap();
+        let original_operation_id = staged.operation_id.clone();
+        ctx.runtime.cancel_staged_replication(&staged);
+        assert_eq!(
+            ctx.runtime
+                .outbox
+                .find_by_key(OUTBOX_ACTOR, "op-cancelled-add-retry")
+                .unwrap()
+                .expect("cancelled intent must be recoverable by key")
+                .state,
+            OutboxState::Cancelled
+        );
+
+        // A different mutation under the same caller operation_id must still conflict:
+        // the idempotency key stays bound to the mutation it was staged with. No local
+        // drawer exists yet, so the conflict surfaces straight from the outbox enqueue.
+        let conflict = ctx
+            .runtime
+            .tool_add_drawer(&json!({
+                "wing": "wing_code",
+                "room": "retry-room",
+                "content": "retry content",
+                "added_by": "someone-else",
+                "operation_id": "op-cancelled-add-retry",
+            }))
+            .await;
+        assert!(
+            conflict.is_err(),
+            "reusing the operation id for a different mutation must conflict; got: {conflict:?}"
+        );
+        assert_eq!(
+            ctx.runtime
+                .outbox
+                .find_by_key(OUTBOX_ACTOR, "op-cancelled-add-retry")
+                .unwrap()
+                .expect("intent must survive the rejected replay")
+                .state,
+            OutboxState::Cancelled,
+            "a rejected different-mutation replay must not disturb the cancelled intent"
+        );
+        assert!(
+            ctx.runtime.storage.drawer_store().get_drawer(&pinned_id).await.unwrap().is_none(),
+            "a rejected different-mutation replay must not commit anything locally"
+        );
+
+        let result = ctx
+            .runtime
+            .tool_add_drawer(&json!({
+                "wing": "wing_code",
+                "room": "retry-room",
+                "content": "retry content",
+                "operation_id": "op-cancelled-add-retry",
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result["success"], true);
+        assert_eq!(
+            result["drawer_id"], pinned_id.as_str(),
+            "the retry must keep the cancelled intent's pinned drawer identity; got: {result}"
+        );
+        assert_eq!(result["applied_to"], "local");
+        assert_eq!(result["replication"]["status"], "queued");
+        assert_eq!(result["replication"]["remote"], "alpha");
+        assert_eq!(
+            result["replication"]["operation_id"], original_operation_id,
+            "the retry must reactivate the original operation, not enqueue a new one"
+        );
+
+        let stored = ctx
+            .runtime
+            .storage
+            .drawer_store()
+            .get_drawer(&pinned_id)
+            .await
+            .unwrap()
+            .expect("the retried add must commit locally under the pinned id");
+        assert_eq!(stored.content, "retry content");
+
+        let operation = ctx
+            .runtime
+            .outbox
+            .find_by_key(OUTBOX_ACTOR, "op-cancelled-add-retry")
+            .unwrap()
+            .expect("operation must survive the retry");
+        assert_eq!(operation.operation_id, original_operation_id);
+        assert_eq!(operation.entity_id, pinned_id.as_str());
+        assert_eq!(operation.ordering_key, pinned_id.as_str());
+        assert_eq!(
+            operation.state,
+            OutboxState::Pending,
+            "the original operation must be activated, not replaced"
+        );
+        match serde_json::from_value::<ReplicationMutation>(operation.payload).unwrap() {
+            ReplicationMutation::DrawerAdd { request } => {
+                assert_eq!(request.drawer_id.as_deref(), Some(pinned_id.as_str()));
+            }
+            other => panic!("expected a drawer-add payload, got: {other:?}"),
+        }
+
+        assert_eq!(
+            mock_for_assert.delete_call_count(),
+            0,
+            "the remote must not be called inline"
         );
     }
 

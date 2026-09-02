@@ -1348,6 +1348,26 @@ where
     }
 }
 
+/// How long a staged replication intent counts as owned by the live process that enqueued it
+/// and is therefore shielded from startup reconciliation.
+///
+/// `McpRuntime::new` runs `reconcile_staged_replication` before serving requests, and every MCP
+/// process sharing a palace does so. A second process starting while the first is still between
+/// staging an intent and committing its local mutation would otherwise observe the uncommitted
+/// local state, cancel the intent, and make the originating process's later activation fail —
+/// leaving the local mutation unreplicated. Staged rows carry durable `created_at` timestamps, so
+/// reconciliation defers uncommitted intents younger than this bounded grace period and treats
+/// only older staged rows as abandoned pre-crash work. The cost is bounded: a row genuinely
+/// abandoned by a crash inside the window stays staged (and undeliverable) until a later startup
+/// reconciliation observes it past the grace period.
+const STAGED_INTENT_RECONCILIATION_GRACE: Duration = Duration::minutes(5);
+
+/// Whether a staged intent's durable `created_at` is old enough for startup reconciliation to
+/// treat it as abandoned rather than as currently fresh work.
+fn staged_intent_exceeded_grace(created_at: OffsetDateTime, now: OffsetDateTime) -> bool {
+    now - created_at >= STAGED_INTENT_RECONCILIATION_GRACE
+}
+
 #[derive(Debug)]
 struct McpRuntime<P> {
     config: MempalaceConfig,
@@ -1403,15 +1423,30 @@ where
 
     /// Settle every pre-crash staged intent before a dispatcher can claim work. The local
     /// logical state is authoritative: a committed mutation is activated, while an intent whose
-    /// local mutation never landed is cancelled.
+    /// local mutation never landed is cancelled — unless the intent is still inside
+    /// [`STAGED_INTENT_RECONCILIATION_GRACE`], so a second process starting mid-write cannot
+    /// cancel work the originating process is still applying.
     async fn reconcile_staged_replication(&mut self) -> Result<()> {
         loop {
             let staged = self.outbox.list_staged(10_000)?;
             if staged.is_empty() {
                 return Ok(());
             }
+            let mut settled = 0usize;
             for operation in staged {
                 let committed = self.replication_intent_committed(&operation).await?;
+                if !committed
+                    && !staged_intent_exceeded_grace(
+                        operation.created_at,
+                        OffsetDateTime::now_utc(),
+                    )
+                {
+                    tracing::debug!(
+                        operation_id = %operation.operation_id,
+                        "deferring startup reconciliation of a fresh staged replication intent"
+                    );
+                    continue;
+                }
                 let transition = if committed {
                     self.outbox.activate(&operation.operation_id, operation.revision)?
                 } else {
@@ -1424,6 +1459,13 @@ where
                     committed,
                     "reconciled staged durable replication intent"
                 );
+                settled += 1;
+            }
+            if settled == 0 {
+                // Every remaining staged intent is inside the ownership grace period with its
+                // local mutation still uncommitted, so nothing can be settled this pass and
+                // looping again would revisit the same rows forever.
+                return Ok(());
             }
         }
     }
@@ -11333,6 +11375,121 @@ mod tests {
         kg_runtime.invalidate("PersonA", "lives_in", "CityA", yesterday, now).unwrap();
         // Now all facts for this triple are inactive -> Some(false).
         assert_eq!(runtime.local_fact_state("PersonA", "lives_in", "CityA").unwrap(), Some(false));
+    }
+
+    /// Stage a `kg_fact_added` replication intent for a triple without touching local KG state,
+    /// mirroring the write:both `mempalace_kg_add` flow's stage-before-commit ordering.
+    fn stage_kg_add_intent(
+        runtime: &McpRuntime<DeterministicStubProvider>,
+        subject: &str,
+        predicate: &str,
+        object: &str,
+    ) -> OutboxOperation {
+        let ordering_key = format!("{subject}:{predicate}:{object}");
+        runtime
+            .stage_replication(
+                format!("kg-add-reconciliation:{ordering_key}"),
+                "kg_fact_added",
+                ordering_key.clone(),
+                "alpha".to_owned(),
+                ordering_key.clone(),
+                ReplicationMutation::KgAdd {
+                    request: KgAddFactRequest {
+                        subject: subject.to_owned(),
+                        predicate: predicate.to_owned(),
+                        object: object.to_owned(),
+                        valid_from: None,
+                        operation_id: None,
+                    },
+                },
+            )
+            .unwrap()
+    }
+
+    /// Backdate a staged intent's durable timestamps past the reconciliation grace period,
+    /// modelling a row that has sat in storage long enough to be abandoned pre-crash work.
+    fn backdate_staged_intent(runtime: &McpRuntime<DeterministicStubProvider>, operation_id: &str) {
+        let abandoned_at =
+            OffsetDateTime::now_utc() - STAGED_INTENT_RECONCILIATION_GRACE - Duration::minutes(1);
+        let conn =
+            rusqlite::Connection::open(runtime.config.palace_path.join("storage.sqlite3")).unwrap();
+        conn.execute(
+            "UPDATE replication_outbox SET created_at=?1, updated_at=?1 WHERE operation_id=?2",
+            rusqlite::params![abandoned_at.format(&Rfc3339).unwrap(), operation_id],
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_reconciliation_preserves_fresh_uncommitted_staged_intent() {
+        let harness = test_harness_with_federation(FederationRuntimeConfig::default()).await;
+        let mut runtime = harness.server.runtime.lock().await;
+        let staged = stage_kg_add_intent(&runtime, "ReconFresh", "lives_in", "ReconCity");
+        assert_eq!(staged.state, OutboxState::Staged);
+
+        runtime.reconcile_staged_replication().await.unwrap();
+
+        let survived = runtime.outbox.get_operation(&staged.operation_id).unwrap().unwrap();
+        assert_eq!(
+            survived.state,
+            OutboxState::Staged,
+            "a fresh staged intent whose local mutation has not landed must survive startup \
+             reconciliation: a second process starting mid-write must not cancel live work"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_reconciliation_cancels_stale_abandoned_staged_intent() {
+        let harness = test_harness_with_federation(FederationRuntimeConfig::default()).await;
+        let mut runtime = harness.server.runtime.lock().await;
+        let staged = stage_kg_add_intent(&runtime, "ReconStale", "lives_in", "ReconCity");
+        backdate_staged_intent(&runtime, &staged.operation_id);
+
+        runtime.reconcile_staged_replication().await.unwrap();
+
+        let cancelled = runtime.outbox.get_operation(&staged.operation_id).unwrap().unwrap();
+        assert_eq!(
+            cancelled.state,
+            OutboxState::Cancelled,
+            "an uncommitted staged intent older than the grace period is abandoned pre-crash \
+             work and must still be cancelled"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_reconciliation_activates_fresh_committed_staged_intent() {
+        let harness = test_harness_with_federation(FederationRuntimeConfig::default()).await;
+        let mut runtime = harness.server.runtime.lock().await;
+        let kg_runtime = KnowledgeGraphRuntime::new(runtime.storage.operational_store());
+        kg_runtime
+            .add_fact(
+                AddFactRequest {
+                    subject: "ReconCommitted".into(),
+                    subject_type: EntityKind::Person,
+                    predicate: "lives_in".into(),
+                    object: "ReconCity".into(),
+                    object_type: EntityKind::Concept,
+                    valid_from: None,
+                    valid_to: None,
+                    confidence: 1.0,
+                    source_drawer_id: None,
+                    source_file: None,
+                },
+                OffsetDateTime::now_utc(),
+            )
+            .unwrap();
+        let staged = stage_kg_add_intent(&runtime, "ReconCommitted", "lives_in", "ReconCity");
+        assert_eq!(staged.state, OutboxState::Staged);
+
+        runtime.reconcile_staged_replication().await.unwrap();
+
+        let activated = runtime.outbox.get_operation(&staged.operation_id).unwrap().unwrap();
+        assert_eq!(
+            activated.state,
+            OutboxState::Pending,
+            "the age safeguard must not block activation of committed effects, even when the \
+             intent is fresh"
+        );
     }
 
     async fn test_harness_with_federation(federation: FederationRuntimeConfig) -> TestHarness {

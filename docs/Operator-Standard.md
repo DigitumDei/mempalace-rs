@@ -441,9 +441,15 @@ Operational rules:
   `last_error` instead.
 - On restart, startup reconciliation settles intents whose local mutation never
   committed: committed mutations are activated and delivered, uncommitted
-  intents are cancelled. You do not need to intervene for a clean shutdown, but
-  a hard power loss mid-write leaves exactly this two-step recovery to the next
-  `McpServer` start.
+  intents are cancelled. Uncommitted intents younger than a five-minute
+  ownership grace period (measured against each row's durable `created_at`) are
+  left staged instead: another MCP process may share the palace and still be
+  applying that mutation, and cancelling it mid-write would make the
+  originating process's activation fail and strand the mutation unreplicated.
+  Abandoned rows inside that window therefore stay staged — and undeliverable —
+  until a later startup reconciliation observes them past the grace period. You
+  do not need to intervene for a clean shutdown, but a hard power loss mid-write
+  leaves exactly this two-step recovery to the next `McpServer` start.
 
 ## Troubleshooting
 

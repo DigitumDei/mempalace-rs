@@ -27,6 +27,7 @@ tracing.workspace = true
 async-trait = "0.1.89"
 axum = { version = "0.8", default-features = true }
 mempalace-server = { path = "../mempalace-server" }
+rusqlite = "0.39.0"
 tempfile = "3.23.0"
 
 [lints]

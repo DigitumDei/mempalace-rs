@@ -205,7 +205,16 @@ or a crash-recovered re-apply — lands exactly once and never double-applies.
 When a crash lands between the storage commit and the change-event append, a
 recovered drawer add or delete also restores the missing `drawer_added`/
 `drawer_deleted` event exactly once — via an atomic append-if-absent — before
-completing the receipt, so `/v1/changes` reports the converged state.
+completing the receipt, so `/v1/changes` reports the converged state. A keyed
+delete returns success on an absent target only when the receipt proves the
+delete was genuinely in flight — a replay of a completed receipt, or a recovery
+whose pending receipt carries the wing/room metadata recorded *before* the
+delete ran. A **fresh** keyed delete of a target the server does not have is a
+**404** (its receipt is left pending without metadata, so a retry can never
+fabricate the success response): the 404 leaks no scoped existence and lets a
+federated fallback continue past a remote that lacks the drawer instead of
+stopping at the first false success. The legacy (no `operation_id`) delete
+keeps its 404 on an absent target.
 Semantic/content similarity is *not* used as replay detection: a duplicate with
 a different stable `drawer_id` is an authoritative 409 conflict, not
 convergence.

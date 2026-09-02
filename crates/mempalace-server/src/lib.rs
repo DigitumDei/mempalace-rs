@@ -1727,24 +1727,31 @@ where
     let drawer = state.storage.drawer_store().get_drawer(&drawer_id).await?;
 
     let Some(drawer) = drawer else {
-        // Target absent. With an `operation_id` this is a converged end state — exactly the
-        // "operation-aware delete is idempotent when already absent" requirement: a crash that
-        // applied the delete but never completed the receipt, or a delete racing a concurrent
-        // delete, leaves the same durable state as a fresh delete would. The per-route operation
-        // gate already proved the caller holds the `delete` operation, and an absent target leaks
-        // no wing it cannot read, so the legacy 404 becomes a 200 with the receipt completed.
-        // Legacy requests (no `operation_id`) keep the 404.
-        if let Some(op) = &operation_id {
+        // Target absent. Success is reserved for receipts that durably prove a prior attempt of
+        // this operation found the drawer: `set_receipt_details` commits wing/room *before* the
+        // delete runs, so pending metadata is evidence the delete was genuinely in flight — the
+        // finding-6 crash window (delete committed, `drawer_deleted` event lost). Everything else
+        // — a fresh operation, or a recovery whose receipt carries no metadata — means no attempt
+        // of this operation ever observed the drawer, so this stays a 404: it leaks no scoped
+        // existence and lets a federated fallback continue past a remote that lacks the drawer
+        // instead of stopping at the first false success. Legacy requests (no `operation_id`)
+        // keep the 404.
+        if let (Some(op), Some(details)) = (&operation_id, recovered_details.as_ref()) {
             // Recover the finding-6 crash window: the delete committed but the `drawer_deleted`
             // change event was never appended. Restore exactly one event, with the wing/room
             // captured on the receipt *before* the delete ran, so scoped change reads can see
-            // the deletion. A fresh operation on a never-existing drawer has no metadata and
-            // stays event-free, preserving the behaviour above.
-            restore_deleted_event(&state, &id, auth.0.0.as_str(), recovered_details.as_ref())?;
+            // the deletion.
+            restore_deleted_event(&state, &id, auth.0.0.as_str(), Some(details))?;
             let response = json!({"success": true});
             receipts.complete_receipt(op, &response)?;
             return Ok(Json(response));
         }
+        // Fresh (or metadata-less) not-found: the receipt begun above is deliberately left
+        // pending **without** details. A retry against a still-absent target classifies as
+        // `Recover` with no metadata and returns this same 404, so a retry can never fabricate
+        // the success response; the pending receipt also pins the operation id against a
+        // different request hash. Should the drawer exist again by the time of a retry, the
+        // retry proceeds through the normal delete flow and succeeds genuinely.
         return Err(ServerError::NotFound(format!("drawer {id} not found")));
     };
 
@@ -1775,10 +1782,11 @@ where
         state.storage.drawer_store().delete_drawers(std::slice::from_ref(&drawer_id)).await?;
     let response = json!({"success": true});
 
-    // Operation-aware delete is idempotent when the target is already absent: whether the delete
-    // removed a row now or the row was already gone (a racing concurrent delete), the converged
-    // state is identical, so `deleted == 0` is success rather than a 404. Legacy requests (no
-    // `operation_id`) keep the exact historical edge behaviour: a zero-row delete is a 404.
+    // A keyed delete that raced a concurrent delete (`deleted == 0` after the drawer was
+    // witnessed at lookup, its scope already recorded above) is converged success: the operation
+    // durably observed the drawer, and the pending receipt's metadata keeps a later crash
+    // recovery on the same path. Legacy requests (no `operation_id`) keep the exact historical
+    // edge behaviour: a zero-row delete is a 404.
     if deleted == 0 && operation_id.is_none() {
         return Err(ServerError::NotFound(format!("drawer {id} not found")));
     }
@@ -1810,8 +1818,9 @@ where
 /// double-append, and two concurrent retries of the same pending operation cannot both observe
 /// absence and append duplicate events — exactly one wins. It uses only the wing/room durably
 /// captured on the pending receipt *before* the delete ran — never data re-read from the drawer
-/// (it is already gone). No metadata (a fresh operation on a never-existing drawer) means there
-/// is nothing to restore.
+/// (it is already gone). The caller invokes this only for a recovery whose receipt carries that
+/// durable delete metadata: a fresh operation on an absent drawer is a 404 before any recovery
+/// runs.
 fn restore_deleted_event<P>(
     state: &Arc<ServerState<P>>,
     entity_id: &str,
@@ -5238,24 +5247,58 @@ mod tests {
         assert_eq!(get_body["id"], supplied_id);
     }
 
+    // PR #130 review comment 3917112262: a fresh keyed delete of an absent target must stay a
+    // 404 — success is reserved for a completed-receipt replay or a recovery whose pending
+    // receipt carries the durable wing/room metadata recorded before the delete ran. A false 200
+    // would leak scoped existence and stop federated remote fallback at the first remote that
+    // lacks the drawer. The fresh not-found receipt is deliberately left pending without
+    // metadata, so no retry can fabricate the success response.
     #[tokio::test]
-    async fn delete_with_operation_id_is_idempotent_when_already_absent() {
+    async fn delete_fresh_keyed_absent_target_404s_and_retry_cannot_fabricate_success() {
         let harness = make_harness().await;
 
-        // Operation-aware delete of a never-existing drawer succeeds and is replayable.
         let absent_id = "drawer_that_never_existed_42";
-        for _ in 0..2 {
-            let req = Request::builder()
-                .method(Method::DELETE)
-                .uri(format!("/v1/drawers/{absent_id}?operation_id=op-del-absent-1"))
-                .header(header::AUTHORIZATION, format!("Bearer {ALICE_TOKEN}"))
-                .body(Body::empty())
-                .unwrap();
-            let resp = harness.router.clone().oneshot(req).await.unwrap();
-            assert_eq!(resp.status(), StatusCode::OK, "op-aware delete of absent target");
-            let body = body_json(resp).await;
-            assert_eq!(body["success"], true);
-        }
+        let op = "op-del-absent-1";
+        let delete_uri = format!("/v1/drawers/{absent_id}?operation_id={op}");
+        let receipts = harness.state.storage.receipt_store();
+
+        // Fresh keyed delete of a never-existing drawer: 404, not a fabricated success.
+        let first_req = Request::builder()
+            .method(Method::DELETE)
+            .uri(&delete_uri)
+            .header(header::AUTHORIZATION, format!("Bearer {ALICE_TOKEN}"))
+            .body(Body::empty())
+            .unwrap();
+        let first_resp = harness.router.clone().oneshot(first_req).await.unwrap();
+        assert_eq!(
+            first_resp.status(),
+            StatusCode::NOT_FOUND,
+            "fresh keyed delete of absent target"
+        );
+
+        // The receipt begun by the fresh attempt is left pending, without details or response —
+        // there is nothing to replay into a success.
+        let receipt = receipts.get_receipt(op).unwrap().expect("fresh attempt begins a receipt");
+        assert_eq!(receipt.status, mempalace_storage::ReceiptState::Pending);
+        assert!(
+            receipt.details.is_none(),
+            "no durable delete metadata may exist without a witnessed drawer: {receipt:?}"
+        );
+        assert!(receipt.response.is_none(), "a 404 must not leave a replayable success response");
+
+        // Retry of the same operation against the still-absent target: Recover without metadata
+        // → the same 404, never the success response.
+        let retry_req = Request::builder()
+            .method(Method::DELETE)
+            .uri(&delete_uri)
+            .header(header::AUTHORIZATION, format!("Bearer {ALICE_TOKEN}"))
+            .body(Body::empty())
+            .unwrap();
+        let retry_resp = harness.router.clone().oneshot(retry_req).await.unwrap();
+        assert_eq!(retry_resp.status(), StatusCode::NOT_FOUND, "metadata-less retry stays a 404");
+        let receipt = receipts.get_receipt(op).unwrap().expect("receipt exists");
+        assert_eq!(receipt.status, mempalace_storage::ReceiptState::Pending);
+        assert!(receipt.details.is_none() && receipt.response.is_none());
 
         // Legacy delete of the same absent drawer still 404s.
         let legacy_req = Request::builder()
@@ -5267,7 +5310,8 @@ mod tests {
         let legacy_resp = harness.router.clone().oneshot(legacy_req).await.unwrap();
         assert_eq!(legacy_resp.status(), StatusCode::NOT_FOUND);
 
-        // Operation-aware delete of a real drawer: first delete, then replay.
+        // The drawer comes into existence under the same id (e.g. a replica arrives): the retry
+        // now performs a genuine delete and succeeds, completing the receipt.
         let add_resp = harness
             .router
             .clone()
@@ -5278,31 +5322,64 @@ mod tests {
                 json!({
                     "wing": "wing_code",
                     "room": "idem-test",
-                    "content": "drawer to delete idempotently",
+                    "content": "drawer that appears before the keyed retry",
+                    "drawer_id": absent_id,
                 }),
             ))
             .await
             .unwrap();
         assert_eq!(add_resp.status(), StatusCode::OK);
-        let drawer_id = body_json(add_resp).await["drawer_id"].as_str().unwrap().to_owned();
+        assert_eq!(body_json(add_resp).await["drawer_id"], absent_id);
 
-        let delete_uri = format!("/v1/drawers/{drawer_id}?operation_id=op-del-real-1");
-        for _ in 0..2 {
-            let req = Request::builder()
-                .method(Method::DELETE)
-                .uri(&delete_uri)
-                .header(header::AUTHORIZATION, format!("Bearer {ALICE_TOKEN}"))
-                .body(Body::empty())
-                .unwrap();
-            let resp = harness.router.clone().oneshot(req).await.unwrap();
-            assert_eq!(resp.status(), StatusCode::OK, "replay of a completed delete");
-        }
+        let retry2_req = Request::builder()
+            .method(Method::DELETE)
+            .uri(&delete_uri)
+            .header(header::AUTHORIZATION, format!("Bearer {ALICE_TOKEN}"))
+            .body(Body::empty())
+            .unwrap();
+        let retry2_resp = harness.router.clone().oneshot(retry2_req).await.unwrap();
+        assert_eq!(retry2_resp.status(), StatusCode::OK, "genuine delete after the drawer appears");
+        assert_eq!(body_json(retry2_resp).await["success"], true);
+
+        let receipt = receipts.get_receipt(op).unwrap().expect("receipt exists");
+        assert_eq!(receipt.status, mempalace_storage::ReceiptState::Completed);
+        assert_eq!(
+            receipt.details,
+            Some(json!({"wing": "wing_code", "room": "idem-test"})),
+            "genuine delete records its scope before running"
+        );
+        assert_eq!(receipt.response, Some(json!({"success": true})));
+
+        // Completed replay is idempotent: the same operation replays the stored response, and
+        // the change feed still holds exactly one `drawer_deleted` event.
+        let replay_req = Request::builder()
+            .method(Method::DELETE)
+            .uri(&delete_uri)
+            .header(header::AUTHORIZATION, format!("Bearer {ALICE_TOKEN}"))
+            .body(Body::empty())
+            .unwrap();
+        let replay_resp = harness.router.clone().oneshot(replay_req).await.unwrap();
+        assert_eq!(replay_resp.status(), StatusCode::OK, "replay of a completed delete");
+        assert_eq!(body_json(replay_resp).await["success"], true);
+
+        let feed = harness
+            .router
+            .clone()
+            .oneshot(authed_get("/v1/changes?limit=50", ALICE_TOKEN))
+            .await
+            .unwrap();
+        let events = body_json(feed).await["events"].as_array().unwrap().clone();
+        let deleted_events: Vec<&Value> = events
+            .iter()
+            .filter(|e| e["event_type"] == "drawer_deleted" && e["entity_id"] == absent_id)
+            .collect();
+        assert_eq!(deleted_events.len(), 1, "exactly one deletion event: {events:?}");
 
         // The drawer is gone.
         let get_resp = harness
             .router
             .clone()
-            .oneshot(authed_get(&format!("/v1/drawers/{drawer_id}"), ALICE_TOKEN))
+            .oneshot(authed_get(&format!("/v1/drawers/{absent_id}"), ALICE_TOKEN))
             .await
             .unwrap();
         assert_eq!(get_resp.status(), StatusCode::NOT_FOUND);

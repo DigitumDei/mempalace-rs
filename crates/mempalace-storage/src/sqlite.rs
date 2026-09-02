@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, params_from_iter};
 use time::{Duration, OffsetDateTime};
 
 use crate::error::{Result, StorageError};
@@ -451,6 +451,12 @@ pub trait ChangeLogStore {
     /// `entity_id` and `event_type`. Used to make crash-window recovery idempotent: a handler
     /// restores a lost side-effect event only when none already exists.
     fn event_exists(&self, entity_id: &str, event_type: &str) -> Result<bool>;
+    /// Check-then-insert performed as a single immediate transaction: insert `event` iff no
+    /// event with the same `entity_id` and `event_type` already exists. Two concurrent callers
+    /// racing to restore the same lost event cannot both observe absence and double-append —
+    /// exactly one wins. Returns `true` when the event was inserted and `false` when it was
+    /// skipped because a matching event already existed.
+    fn append_event_if_absent(&self, event: &ChangeEvent) -> Result<bool>;
     fn get_changes_since(&self, since: OffsetDateTime, limit: usize) -> Result<Vec<ChangeEvent>>;
     fn get_recent_changes(&self, limit: usize) -> Result<Vec<ChangeEvent>>;
     /// Cursor-paginated forward scan of the change log.
@@ -1980,6 +1986,42 @@ impl ChangeLogStore for SqliteOperationalStore {
         Ok(exists)
     }
 
+    fn append_event_if_absent(&self, event: &ChangeEvent) -> Result<bool> {
+        let change_id = format!("{}:{}", event.occurred_at.unix_timestamp_nanos(), event.entity_id);
+        // `open_connection` leaves the busy timeout unset (SQLITE_BUSY on the spot). Concurrent
+        // recovery retries must instead block until the winning writer commits — otherwise the
+        // loser of the race surfaces an error rather than a clean "already restored" skip —
+        // so this method arms a bounded busy handler before `BEGIN IMMEDIATE`.
+        let mut connection = self.open_connection()?;
+        connection.busy_timeout(std::time::Duration::from_millis(5_000))?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let exists: bool = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM change_log WHERE entity_id=?1 AND event_type=?2)",
+                params![event.entity_id, event.event_type],
+                |row| row.get(0),
+            )
+            .map_err(StorageError::from)?;
+        if exists {
+            return Ok(false);
+        }
+        transaction.execute(
+            "INSERT INTO change_log
+                 (change_id, event_type, occurred_at, entity_id, actor, details_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                change_id,
+                event.event_type,
+                encode_time(event.occurred_at),
+                event.entity_id,
+                event.actor,
+                event.details_json,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
     fn get_changes_since(&self, since: OffsetDateTime, limit: usize) -> Result<Vec<ChangeEvent>> {
         let connection = self.open_connection()?;
         let mut statement = connection.prepare(
@@ -2617,6 +2659,60 @@ mod tests {
         let limited = store.get_changes_since(t0, 1).unwrap();
         assert_eq!(limited.len(), 1);
         assert_eq!(limited[0].event_type, "drawer_added");
+    }
+
+    #[test]
+    fn append_event_if_absent_allows_exactly_one_event_under_concurrent_racing_retries() {
+        let tempdir = tempdir().unwrap();
+        let store = SqliteOperationalStore::new(tempdir.path().join("storage.sqlite3"));
+        store.ensure_schema().unwrap();
+
+        let entity_id = "drawer_wing_alpha_delete_recover";
+        let base = OffsetDateTime::now_utc();
+
+        // Every racing retry carries its own timestamp (mirroring recovery, which stamps each
+        // restored event with `OffsetDateTime::now_utc()`), so the `change_id` primary key differs
+        // per caller. Only the atomic (entity_id, event_type) check-then-insert can dedupe them —
+        // a non-atomic `event_exists` + `append_event` pair would let two callers both observe
+        // absence and append duplicates.
+        let handles: Vec<_> = (0..8u64)
+            .map(|i| {
+                let store = store.clone();
+                std::thread::spawn(move || {
+                    store.append_event_if_absent(&ChangeEvent {
+                        event_type: "drawer_deleted".to_owned(),
+                        occurred_at: base + Duration::nanoseconds(i as i64),
+                        entity_id: entity_id.to_owned(),
+                        actor: Some("alice".to_owned()),
+                        details_json: Some(
+                            json!({"wing": "wing_alpha", "room": "delete-recover"}).to_string(),
+                        ),
+                    })
+                })
+            })
+            .collect();
+
+        let winners = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("racer thread panicked").expect("append failed"))
+            .filter(|&inserted| inserted)
+            .count();
+
+        assert_eq!(winners, 1, "exactly one racing retry may restore the event");
+
+        let all = store.get_recent_changes(50).unwrap();
+        let restored: Vec<&ChangeEvent> = all
+            .iter()
+            .filter(|e| e.event_type == "drawer_deleted" && e.entity_id == entity_id)
+            .collect();
+        assert_eq!(restored.len(), 1, "at most one drawer_deleted event may exist");
+        let details: serde_json::Value =
+            serde_json::from_str(restored[0].details_json.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            details,
+            json!({"wing": "wing_alpha", "room": "delete-recover"}),
+            "restored event must keep the scoped wing/room metadata"
+        );
     }
 
     #[test]

@@ -1783,11 +1783,14 @@ where
 /// Restore exactly one `drawer_deleted` change event for a drawer whose delete committed but
 /// whose change-event append never landed — the crash window recovered by `route_drawers_delete`.
 ///
-/// Idempotent: skips whenever a `drawer_deleted` event already exists for the id, so a retry
-/// that crashes between the restore and `complete_receipt` cannot double-append. It uses only
-/// the wing/room durably captured on the pending receipt *before* the delete ran — never data
-/// re-read from the drawer (it is already gone). No metadata (a fresh operation on a
-/// never-existing drawer) means there is nothing to restore.
+/// Idempotent and concurrency-safe: the check-then-insert is atomic
+/// ([`ChangeLogStore::append_event_if_absent`] runs inside a single immediate SQLite
+/// transaction), so a retry that crashes between the restore and `complete_receipt` cannot
+/// double-append, and two concurrent retries of the same pending operation cannot both observe
+/// absence and append duplicate events — exactly one wins. It uses only the wing/room durably
+/// captured on the pending receipt *before* the delete ran — never data re-read from the drawer
+/// (it is already gone). No metadata (a fresh operation on a never-existing drawer) means there
+/// is nothing to restore.
 fn restore_deleted_event<P>(
     state: &Arc<ServerState<P>>,
     entity_id: &str,
@@ -1801,10 +1804,7 @@ where
     let Some(details) = details else {
         return Ok(());
     };
-    if operational.event_exists(entity_id, "drawer_deleted")? {
-        return Ok(());
-    }
-    operational.append_event(&ChangeEvent {
+    operational.append_event_if_absent(&ChangeEvent {
         event_type: "drawer_deleted".to_owned(),
         occurred_at: OffsetDateTime::now_utc(),
         entity_id: entity_id.to_owned(),

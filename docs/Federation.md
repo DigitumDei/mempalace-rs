@@ -384,18 +384,18 @@ local-first protocol:
    Non-`both` routes and diary-local writes omit the `replication` field
    entirely.
 4. **Idempotency of the local write.** The local path uses content-hash
-   deduplication for drawer writes and triple-identity checks for KG facts, so
-   retrying the whole MCP tool call is safe for the local side. The **remote
-   leg** is not universally idempotent: the drawer pre-check uses similarity
-   detection (not exact match), and replaying a full MCP `add_drawer` produces
-   a new local drawer ID — there is no end-to-end operation ID. Replaying a
-   failed remote replication may succeed or encounter a duplicate; in either
-   case the local side is not double-written.
-5. **No retry is built in.** The replication attempt fires once. Operators
-   monitoring `{"status": "failed", ...}` should fix the connectivity issue
-   and re-apply the originating write at the MCP tool level. Because there is
-   no cross-side operation ID, retry safety depends on operation-specific
-   handling — duplicate pre-checks help but are not a full guarantee.
+   deduplication for drawer writes and triple-identity checks for KG facts. A
+   retry therefore does not double-write local state. For drawers in `both`
+   mode, if the same wing, room, and content already exist locally, the MCP
+   server reuses that local result and retries the remote replication leg rather
+   than creating another local drawer. The remote leg still has no end-to-end
+   operation ID, so callers should treat the remote result as best effort.
+5. **No automatic retry.** Each MCP call attempts the remote leg once. Operators
+   monitoring `{"status": "failed", ...}` should fix connectivity and re-apply
+   the originating write at the MCP tool level. In `both` mode, the duplicate
+   path reuses the existing local drawer and gives the remote leg another
+   opportunity; a remote duplicate or other server response is reported in the
+   replication status.
 6. **Diary-local-only override still applies.** Even with `write: both`, diary
    targets (`wing_agents`, `diary` room, `diary:`-prefixed sources) are always
    local-only — routing resolves to local before `write: both` is detected, so

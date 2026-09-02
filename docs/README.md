@@ -15,6 +15,7 @@ This directory documents the Rust release surface that exists in `mempalace-rs/`
 - [Delegation Telemetry](Delegation-Telemetry.md) — delegated-run spans, derived depth/fan-out, bounded checkpoints, stop reasons, trace export
 - [Coordination Phase 2 Design](Coordination-Phase-2-Design.md) — the design proposal behind the skill registry and delegation telemetry
 - [Coordination Phase 3 Design](Coordination-Phase-3-Design.md) — the design proposal for opt-in federated coordination, scoped tokens, and the A2A and MCP Tasks adapters
+- [A2A Broker Design](A2A-Broker-Design.html) — proposal for exposing the A2A adapter through a broker model
 - [CLI Surface](CLI-Surface.md) — every `mempalace-cli` command and flag
 - [Config Schema](Config-Schema.md) — `config.json`, `projects.json`, `mempalace.yaml`, env overrides
 - [Mined Storage](Mined-Storage.md) — locator model, repository views, stale semantics, discovery rules
@@ -29,6 +30,7 @@ This directory documents the Rust release surface that exists in `mempalace-rs/`
 - [Cloud Environment](Cloud-Environment.md) — building and testing in a cloud sandbox or CI runner
 - [Release Operations](Release-Operations.md) — signed candidate and stable release runbook
 - [Packaging And Validation](Packaging-And-Validation.md) — release artifacts and gate rows
+- [Deferred CLI Commands](rust-phase-plans/Phase09-Deferred-Commands.md) — rationale and boundary for `split` and `compress`
 
 ### Historical
 

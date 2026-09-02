@@ -198,7 +198,7 @@ tool `description`, which is a pre-existing documentation gap rather than a chan
 ## Explicitly Deferred Or Out Of Scope
 
 - CLI `split` is deferred. It remains visible in help and fails with an explicit deferral
-  message pointing at a Phase 9 decision record that is not published in this repository.
+  message pointing at the [Phase 9 deferral record](rust-phase-plans/Phase09-Deferred-Commands.md).
 - CLI `compress` is deferred, on the same terms as `split`.
 - Federated **branch views**. `POST /v1/ingest/batch` is canonical-only; the batch DTOs carry
   no view metadata, so branch deltas stay in the client's local palace.

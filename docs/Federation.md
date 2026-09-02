@@ -191,6 +191,20 @@ of its scope entries. `operations` is closed: `read`, `write`, `delete`, `ingest
 authorization, actor identity, and cursors work on those routes specifically;
 the group rules below (A–D) describe the routes that existed before Stage 3.
 
+A `coordination_claim` grant also authorizes `coordination_write`, on the same
+wing (issue #102 Stage 7): claiming a task inherently requires the writes
+claiming itself entails (creating it, sending messages against it, acking
+them, attaching artifacts and results), so a token scoped to claim tasks would
+otherwise be unable to perform the writes claiming requires. The implication
+is one-way — a `coordination_write` grant does **not** imply
+`coordination_claim` — and `coordination_read` is unaffected either way. A
+token file still lists exactly the operations the operator wrote; nothing is
+expanded when the file is loaded. The widening happens only in the
+authorization check itself (`scope_grants` in
+`crates/mempalace-server/src/lib.rs`), applied consistently to the coarse
+per-route gate, the per-wing check, and the aggregate wing-visibility
+computation.
+
 Every route requires an operation; most also involve a wing. Routes fall into
 four groups, and each group is authorized differently:
 

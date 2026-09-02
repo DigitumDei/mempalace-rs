@@ -391,7 +391,17 @@ token entries, not a field of `config.json`. Its shape (`token`/`name`/
       `coordination_claim` is separate from `coordination_write` on purpose:
       claiming, renewing, and transitioning a task takes a lease and can
       starve other workers, while creating a task or filing an artifact
-      cannot, so a token can hold one without the other.
+      cannot, so a token can hold one without the other in the file. As of
+      issue #102 Stage 7, holding `coordination_claim` on a wing also
+      authorizes `coordination_write` on that same wing at authorization
+      time — a claim-only token can create tasks, send and ack messages, and
+      attach artifacts and results, because claiming a task inherently
+      requires the writes claiming itself entails. The implication runs
+      claim → write only (a `coordination_write` grant does not imply
+      `coordination_claim`), `coordination_read` is unaffected, and the file
+      itself is never rewritten — the widening happens only in the
+      authorization check (`scope_grants` in
+      `crates/mempalace-server/src/lib.rs`), not at load time.
     - Validation: an `operations` string outside that enum, or a malformed
       `wings` entry, fails the token file load — same fail-closed behaviour
       as any other malformed reload (see `TokenRegistry` in

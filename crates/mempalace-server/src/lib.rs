@@ -718,7 +718,7 @@ impl AuthIdentity {
     fn allows_operation(&self, op: Operation) -> bool {
         match &self.1 {
             None => true,
-            Some(scopes) => scopes.iter().any(|s| s.operations.contains(&op)),
+            Some(scopes) => scopes.iter().any(|s| scope_grants(s, op)),
         }
     }
 
@@ -726,9 +726,9 @@ impl AuthIdentity {
     fn allows_wing(&self, op: Operation, wing: &str) -> bool {
         match &self.1 {
             None => true,
-            Some(scopes) => scopes.iter().any(|s| {
-                s.operations.contains(&op) && s.wings.iter().any(|w| w == "*" || w == wing)
-            }),
+            Some(scopes) => scopes
+                .iter()
+                .any(|s| scope_grants(s, op) && s.wings.iter().any(|w| w == "*" || w == wing)),
         }
     }
 
@@ -740,7 +740,7 @@ impl AuthIdentity {
             Some(scopes) => {
                 let mut wings = std::collections::BTreeSet::new();
                 for scope in scopes {
-                    if !scope.operations.contains(&op) {
+                    if !scope_grants(scope, op) {
                         continue;
                     }
                     if scope.wings.iter().any(|w| w == "*") {
@@ -752,6 +752,24 @@ impl AuthIdentity {
             }
         }
     }
+}
+
+/// True when `entry` grants `op`, either directly or via the one-way
+/// implication that a `coordination_claim` grant also authorizes
+/// `coordination_write`. Claiming a coordination task inherently requires
+/// creating/mutating it, so a token scoped to claim tasks would otherwise be
+/// unable to perform the writes claiming itself entails. The implication
+/// runs claim → write only: a `coordination_write` grant does NOT imply
+/// `coordination_claim`, and `coordination_read` is unaffected.
+///
+/// This is an authorization-time rule, deliberately not expanded when the
+/// token file is parsed (`RawTokenScope`/`normalize_scope_wing`) — the
+/// closed set of operations an operator wrote in their token file stays
+/// exactly as written; only the check applied to it is widened.
+fn scope_grants(entry: &TokenScopeEntry, op: Operation) -> bool {
+    entry.operations.contains(&op)
+        || (op == Operation::CoordinationWrite
+            && entry.operations.contains(&Operation::CoordinationClaim))
 }
 
 // ─── Server state ─────────────────────────────────────────────────────────────
@@ -3911,6 +3929,11 @@ mod tests {
     /// `coordination_claim`) — proves a writer can create a task but not
     /// claim it.
     const COORD_WRITE_ONLY_TOKEN: &str = "coord-write-only-secret-token";
+    /// Scoped to `wing_alpha` only, `coordination_claim` alone (no
+    /// `coordination_write`) — proves the one-way implication (issue #102
+    /// Stage 7): a claim grant reaches every write route, but a token with
+    /// only `coordination_read` alongside it still gets nowhere near a write.
+    const COORD_CLAIM_ONLY_TOKEN: &str = "coord-claim-only-secret-token";
     /// Scoped to `"*"` (every wing) with all three coordination operations —
     /// used only by the idempotency-replay-narrowing test, which rewrites
     /// this token's scope on disk mid-test (mirroring
@@ -4032,6 +4055,10 @@ mod tests {
             {
                 "token": COORD_WRITE_ONLY_TOKEN, "name": "coord_write_only", "enabled": true,
                 "scopes": [{"wings": ["wing_alpha"], "operations": ["coordination_write"]}],
+            },
+            {
+                "token": COORD_CLAIM_ONLY_TOKEN, "name": "coord_claim_only", "enabled": true,
+                "scopes": [{"wings": ["wing_alpha"], "operations": ["coordination_claim"]}],
             },
             {
                 "token": COORD_WIDE_TOKEN, "name": "coord_wide", "enabled": true,
@@ -7673,6 +7700,125 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(claim_resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn coordination_claim_scope_implies_write_on_every_write_route() {
+        // issue #102 Stage 7: a token scoped to `coordination_claim` alone
+        // (no `coordination_write`) must reach every write route, because
+        // claiming a task inherently requires the writes claiming itself
+        // entails. `COORD_CLAIM_ONLY_TOKEN` carries no `coordination_read`
+        // either, so this also proves the implication runs claim -> write
+        // only, not claim -> read.
+        let harness = make_harness().await;
+
+        let create_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/coordination/tasks",
+                COORD_CLAIM_ONLY_TOKEN,
+                json!({
+                    "title": "t", "description": "d", "wing": "wing_alpha",
+                    "idempotency_key": "claim-only-create-1",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(create_resp.status(), StatusCode::OK, "claim-only token should create a task");
+        let task_id = body_json(create_resp).await["task_id"].as_str().unwrap().to_owned();
+
+        let message_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/coordination/messages",
+                COORD_CLAIM_ONLY_TOKEN,
+                json!({
+                    "task_id": task_id, "recipient": "someone", "kind": "status",
+                    "payload": {}, "idempotency_key": "claim-only-message-1",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(message_resp.status(), StatusCode::OK, "claim-only token should send a message");
+        let message_id = body_json(message_resp).await["message_id"].as_str().unwrap().to_owned();
+
+        let ack_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                &format!("/v1/coordination/messages/{message_id}/ack"),
+                COORD_CLAIM_ONLY_TOKEN,
+                json!({"actor": "someone"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(ack_resp.status(), StatusCode::OK, "claim-only token should ack a message");
+
+        let artifact_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/coordination/artifacts",
+                COORD_CLAIM_ONLY_TOKEN,
+                json!({
+                    "task_id": task_id, "role": "output", "media_type": "text/plain",
+                    "content": "claim-only artifact", "idempotency_key": "claim-only-artifact-1",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            artifact_resp.status(),
+            StatusCode::OK,
+            "claim-only token should put an artifact"
+        );
+
+        let result_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/coordination/results",
+                COORD_CLAIM_ONLY_TOKEN,
+                json!({
+                    "task_id": task_id, "payload": {},
+                    "idempotency_key": "claim-only-result-1",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(result_resp.status(), StatusCode::OK, "claim-only token should put a result");
+
+        // The implication does not extend to reads: no `coordination_read`
+        // grant means the coarse operation gate rejects before the
+        // handler's wing check ever runs.
+        let get_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_get(
+                &format!("/v1/coordination/tasks/{task_id}"),
+                COORD_CLAIM_ONLY_TOKEN,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(get_resp.status(), StatusCode::FORBIDDEN);
+
+        let inbox_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_get(
+                "/v1/coordination/inbox?recipient=someone",
+                COORD_CLAIM_ONLY_TOKEN,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(inbox_resp.status(), StatusCode::FORBIDDEN);
     }
 
     // ─── Coordination review-finding regressions (2026-08-20) ───────────────

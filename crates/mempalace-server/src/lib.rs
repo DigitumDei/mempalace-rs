@@ -1482,6 +1482,18 @@ where
                         wing.as_str(),
                         room.as_str(),
                     ))?;
+                    // Recover the finding-6-class crash window: the add committed but the
+                    // `drawer_added` change event never landed. Restore exactly one event —
+                    // atomically, so a crash between the restore and `complete_receipt`, or two
+                    // concurrent retries, cannot double-append — before completing the receipt.
+                    // Wing/room come from the request, verified above to match the drawer.
+                    restore_added_event(
+                        &state,
+                        &receipt.target_id,
+                        auth.0.0.as_str(),
+                        wing.as_str(),
+                        room.as_str(),
+                    )?;
                     receipts.complete_receipt(op, &response)?;
                     return Ok(Json(response));
                 }
@@ -1819,6 +1831,37 @@ where
         entity_id: entity_id.to_owned(),
         actor: Some(actor.to_owned()),
         details_json: Some(details.to_string()),
+    })?;
+    Ok(())
+}
+
+/// Restore exactly one `drawer_added` change event for a drawer whose add committed but whose
+/// change-event append never landed — the crash window recovered by `route_drawers_add`.
+///
+/// Idempotent and concurrency-safe for the same reason as [`restore_deleted_event`]:
+/// [`ChangeLogStore::append_event_if_absent`] runs its check-then-insert inside a single
+/// immediate SQLite transaction, so a retry that crashes between the restore and
+/// `complete_receipt` cannot double-append, and two concurrent retries of the same pending
+/// operation cannot both observe absence and append duplicate events — exactly one wins. Unlike
+/// delete recovery the drawer still exists at recovery time (its presence and its
+/// content/wing/room match are verified by the caller before this runs), so the wing/room
+/// metadata comes from the validated request rather than receipt details.
+fn restore_added_event<P>(
+    state: &Arc<ServerState<P>>,
+    entity_id: &str,
+    actor: &str,
+    wing: &str,
+    room: &str,
+) -> Result<(), ServerError>
+where
+    P: EmbeddingProvider + Send + Sync + 'static,
+{
+    state.storage.operational_store().append_event_if_absent(&ChangeEvent {
+        event_type: "drawer_added".to_owned(),
+        occurred_at: OffsetDateTime::now_utc(),
+        entity_id: entity_id.to_owned(),
+        actor: Some(actor.to_owned()),
+        details_json: Some(json!({"wing": wing, "room": room}).to_string()),
     })?;
     Ok(())
 }
@@ -6010,6 +6053,107 @@ mod tests {
         let duplicates =
             all.iter().filter(|drawer| drawer.id.as_str() == drawer_id).collect::<Vec<_>>();
         assert_eq!(duplicates.len(), 1, "recovery must not duplicate the drawer");
+    }
+
+    // Crash window for operation-aware adds: the drawer committed but the
+    // `drawer_added` change event never landed before the crash. Recovery must
+    // restore exactly one event with scoped wing/room details before completing
+    // the receipt — and a repeated recovery (a second crash after the restore)
+    // must not duplicate it.
+    #[tokio::test]
+    async fn add_recovery_restores_missing_drawer_added_event_exactly_once() {
+        let harness = make_harness().await;
+
+        let op = "op-add-recover-event-1";
+        let drawer_id = "recover-missing-event-0001";
+        let payload = json!({
+            "wing": "wing_code",
+            "room": "idem-test",
+            "content": "recover missing event content",
+            "drawer_id": Some(drawer_id),
+            "operation_id": op,
+        });
+
+        // First attempt applies fully: drawer, change event, and completed receipt.
+        let first = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(Method::POST, "/v1/drawers", ALICE_TOKEN, payload.clone()))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(body_json(first).await["drawer_id"], drawer_id);
+
+        let sqlite_path = harness.state.storage.layout().sqlite_path.clone();
+        // Rewind to the crash signature: drawer committed, event missing, receipt pending.
+        {
+            let conn = rusqlite::Connection::open(&sqlite_path).unwrap();
+            conn.execute(
+                "DELETE FROM change_log WHERE entity_id=?1 AND event_type='drawer_added'",
+                [drawer_id],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE mutation_receipts SET status='pending', response_json=NULL, completed_at=NULL \
+                 WHERE operation_id=?1",
+                [op],
+            )
+            .unwrap();
+        }
+
+        // Recovery succeeds and restores exactly one event with scoped metadata.
+        let recovered = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(Method::POST, "/v1/drawers", ALICE_TOKEN, payload.clone()))
+            .await
+            .unwrap();
+        assert_eq!(recovered.status(), StatusCode::OK);
+        assert_eq!(body_json(recovered).await["drawer_id"], drawer_id);
+        assert_eq!(
+            harness.state.storage.receipt_store().get_receipt(op).unwrap().unwrap().status,
+            mempalace_storage::ReceiptState::Completed
+        );
+
+        let restored_events = |harness: &Harness| -> Vec<ChangeEvent> {
+            harness
+                .state
+                .storage
+                .operational_store()
+                .get_changes_since(OffsetDateTime::UNIX_EPOCH, 10_000)
+                .unwrap()
+                .into_iter()
+                .filter(|e| e.event_type == "drawer_added" && e.entity_id == drawer_id)
+                .collect()
+        };
+
+        let restored = restored_events(&harness);
+        assert_eq!(restored.len(), 1, "recovery must restore exactly one drawer_added event");
+        assert_eq!(restored[0].actor.as_deref(), Some("alice"));
+        let details: Value =
+            serde_json::from_str(restored[0].details_json.as_deref().unwrap_or_default()).unwrap();
+        assert_eq!(details["wing"], "wing_code");
+        assert_eq!(details["room"], "idem-test");
+
+        // A second crash after the restore (receipt rewound again) must not duplicate the
+        // event: the atomic append-if-absent restore sees the already-restored event.
+        {
+            let conn = rusqlite::Connection::open(&sqlite_path).unwrap();
+            conn.execute(
+                "UPDATE mutation_receipts SET status='pending', response_json=NULL, completed_at=NULL \
+                 WHERE operation_id=?1",
+                [op],
+            )
+            .unwrap();
+        }
+        let again = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(Method::POST, "/v1/drawers", ALICE_TOKEN, payload))
+            .await
+            .unwrap();
+        assert_eq!(again.status(), StatusCode::OK);
+        assert_eq!(restored_events(&harness).len(), 1, "repeated recovery must not duplicate");
     }
 
     /// URL-encodes the cursor string so it can be embedded in a query string.

@@ -202,6 +202,10 @@ Federated mutation routes (`POST /v1/drawers`, `DELETE /v1/drawers/{id}`,
 `operation_id`; when present, the server pins the mutation's target identity in
 a receipt table so an idempotent replay — whether from a retried outbox worker
 or a crash-recovered re-apply — lands exactly once and never double-applies.
+When a crash lands between the storage commit and the change-event append, a
+recovered drawer add or delete also restores the missing `drawer_added`/
+`drawer_deleted` event exactly once — via an atomic append-if-absent — before
+completing the receipt, so `/v1/changes` reports the converged state.
 Semantic/content similarity is *not* used as replay detection: a duplicate with
 a different stable `drawer_id` is an authoritative 409 conflict, not
 convergence.

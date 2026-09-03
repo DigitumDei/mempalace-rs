@@ -126,6 +126,7 @@ fn main() {
         &CliContext::production(),
         fastembed_provider,
         fastembed_validation_provider,
+        fastembed_download_provider,
     );
 
     match result {
@@ -322,6 +323,11 @@ enum Commands {
             help = "Limit to specific tools (comma-separated): claude,codex,gemini,opencode,copilot,antigravity,jules"
         )]
         tools: Option<Vec<String>>,
+        #[arg(
+            long = "no-model-warmup",
+            help = "Skip the embedding-model warm-up and offline startup check (e.g. air-gapped operators who stage the model cache themselves)"
+        )]
+        no_model_warmup: bool,
     },
     /// Deferred in Rust Phase 9. See the linked decision record.
     Split {
@@ -446,14 +452,24 @@ where
     F: Fn(EmbeddingProfile, PathBuf) -> Result<P, Box<dyn std::error::Error>> + Copy,
     P: EmbeddingProvider + Send + Sync + 'static,
 {
-    run_cli_with_validation_factory(args, context, provider_factory, provider_factory)
+    // The test harness has no download-capable provider, so the warm-up factory
+    // is the regular stub factory: warm-up and the offline startup check are
+    // trivially satisfied.
+    run_cli_with_validation_factory(
+        args,
+        context,
+        provider_factory,
+        provider_factory,
+        provider_factory,
+    )
 }
 
-fn run_cli_with_validation_factory<I, T, F, P, G, Q>(
+fn run_cli_with_validation_factory<I, T, F, P, G, Q, H>(
     args: I,
     context: &CliContext,
     provider_factory: F,
     validation_provider_factory: G,
+    warmup_provider_factory: H,
 ) -> Result<CliOutput, clap::Error>
 where
     I: IntoIterator<Item = T>,
@@ -462,6 +478,7 @@ where
     P: EmbeddingProvider + Send + Sync + 'static,
     G: Fn(EmbeddingProfile, PathBuf) -> Result<Q, Box<dyn std::error::Error>>,
     Q: EmbeddingProvider,
+    H: Fn(EmbeddingProfile, PathBuf) -> Result<P, Box<dyn std::error::Error>>,
 {
     let argv = std::iter::once(std::ffi::OsString::from("mempalace-cli"))
         .chain(args.into_iter().map(Into::into))
@@ -481,7 +498,13 @@ where
         return Ok(CliOutput::success(render_help()));
     }
 
-    execute(cli, context, provider_factory, validation_provider_factory)
+    execute(
+        cli,
+        context,
+        provider_factory,
+        validation_provider_factory,
+        warmup_provider_factory,
+    )
 }
 
 fn render_help() -> String {
@@ -493,17 +516,19 @@ fn render_help() -> String {
     String::from_utf8_lossy(&buffer).into_owned()
 }
 
-fn execute<F, P, G, Q>(
+fn execute<F, P, G, Q, H>(
     cli: Cli,
     context: &CliContext,
     provider_factory: F,
     validation_provider_factory: G,
+    warmup_provider_factory: H,
 ) -> Result<CliOutput, clap::Error>
 where
     F: Fn(EmbeddingProfile, PathBuf) -> Result<P, Box<dyn std::error::Error>>,
     P: EmbeddingProvider + Send + Sync + 'static,
     G: Fn(EmbeddingProfile, PathBuf) -> Result<Q, Box<dyn std::error::Error>>,
     Q: EmbeddingProvider,
+    H: Fn(EmbeddingProfile, PathBuf) -> Result<P, Box<dyn std::error::Error>>,
 {
     let Some(command) = cli.command else {
         return Ok(CliOutput::success(render_help()));
@@ -578,9 +603,21 @@ where
         Commands::WakeUp { wing } => {
             execute_wake_up(wing, cli.palace.as_deref(), context, provider_factory)
         }
-        Commands::Setup { dry_run, mcp_path, tools } => {
+        Commands::Setup { dry_run, mcp_path, tools, no_model_warmup } => {
             let report = setup::run_setup(&setup::SetupOptions { mcp_path, dry_run, only: tools });
-            Ok(CliOutput::success(report.render()))
+            let mut text = report.render();
+            if dry_run || no_model_warmup {
+                let reason = if dry_run { "dry run" } else { "--no-model-warmup" };
+                text.push_str(&format!("  (embedding model warm-up skipped: {reason})\n\n"));
+                return Ok(CliOutput::success(text));
+            }
+            let warmup = run_setup_model_warmup(provider_factory, warmup_provider_factory);
+            text.push_str(&warmup.text);
+            Ok(CliOutput {
+                exit_code: if warmup.offline_ok { 0 } else { 1 },
+                stdout: text,
+                stderr: String::new(),
+            })
         }
         Commands::Split { .. } => Ok(deferred_command("split")),
         Commands::Compress { .. } => Ok(deferred_command("compress")),
@@ -2742,6 +2779,115 @@ fn fastembed_provider_config(cache_root: PathBuf) -> FastembedProviderConfig {
     config
 }
 
+/// Provider factory for the `setup` warm-up phase. Unlike
+/// [`fastembed_provider`] it always permits downloads: `mempalace-cli setup` is
+/// the one step every install path runs, so it is the deliberate place to
+/// bootstrap missing embedding assets. Air-gapped operators who stage the cache
+/// themselves pass `--no-model-warmup` to skip it.
+fn fastembed_download_provider(
+    profile: EmbeddingProfile,
+    cache_root: PathBuf,
+) -> Result<FastembedProvider, Box<dyn std::error::Error>> {
+    let mut config = FastembedProviderConfig::new(cache_root);
+    config.allow_downloads = true;
+    config.show_download_progress = true;
+    Ok(FastembedProvider::new(profile, config).try_initialize()?)
+}
+
+/// Result of a `setup` embedding-model warm-up phase.
+struct ModelWarmup {
+    /// Human-readable summary appended to the `setup` report.
+    text: String,
+    /// Whether the model cache is usable without network access. `false` makes
+    /// `setup` exit non-zero so install scripts surface the failure.
+    offline_ok: bool,
+}
+
+/// Warm and verify the embedding model as part of `setup`.
+///
+/// Phase 1 initialises a download-enabled provider so a fresh machine fetches
+/// the missing model assets (a no-op on a warm cache). Phase 2 re-initialises
+/// with the regular provider factory — exactly how `mempalace-mcp` starts by
+/// default — proving the cache is complete before the MCP server is ever
+/// launched. A warm cache adds no more than the model init time.
+fn run_setup_model_warmup<F, H, P>(
+    offline_factory: F,
+    download_factory: H,
+) -> ModelWarmup
+where
+    F: Fn(EmbeddingProfile, PathBuf) -> Result<P, Box<dyn std::error::Error>>,
+    H: Fn(EmbeddingProfile, PathBuf) -> Result<P, Box<dyn std::error::Error>>,
+    P: EmbeddingProvider,
+{
+    let profile = setup_embedding_profile();
+    let cache_dir = default_embedding_cache_dir();
+    let metadata = profile.metadata();
+
+    let warm = match download_factory(profile, cache_dir.clone()) {
+        Ok(_) => "ok".to_owned(),
+        Err(error) => format!("failed — {}", one_line_error(error.as_ref())),
+    };
+
+    let (offline, offline_ok) = match offline_factory(profile, cache_dir) {
+        Ok(provider) => match provider.startup_validation() {
+            Ok(validation) => (
+                format!("ok — {}", validation.detail),
+                validation.is_ready(),
+            ),
+            Err(error) => (format!("failed — {}", one_line_error(&error)), false),
+        },
+        Err(error) => (format!("failed — {}", one_line_error(error.as_ref())), false),
+    };
+
+    let mut lines = vec![
+        format!("\n{}", "=".repeat(55)),
+        "  Embedding model warm-up".to_owned(),
+        "=".repeat(55),
+        format!("  model : {}", metadata.model_id),
+        format!("  cache : {}", effective_embedding_cache_dir().display()),
+        format!("  warm  : {warm}"),
+        format!("  check : {offline}"),
+    ];
+    if !offline_ok {
+        lines.push(String::new());
+        lines.push(
+            "  ! embedding model is not usable offline; the MCP server will abort with".to_owned(),
+        );
+        lines.push("    OfflineStartup until the model cache is complete.".to_owned());
+        lines.push(String::new());
+        lines.push(
+            "  ! fix: re-run `mempalace-cli setup` with network access to download the model,".to_owned(),
+        );
+        lines.push("    or stage the cache yourself and re-run with `--no-model-warmup`.".to_owned());
+    }
+    lines.push(String::new());
+
+    ModelWarmup { text: lines.join("\n"), offline_ok }
+}
+
+/// Resolves the embedding profile `setup` warms, mirroring how `mempalace-mcp`
+/// resolves its own profile at startup. Falls back to the default profile when
+/// no config can be loaded (e.g. a machine with no palace yet) rather than
+/// failing the install path on an unreadable config.
+fn setup_embedding_profile() -> EmbeddingProfile {
+    ConfigLoader::load_with_env(None).map(|config| config.embedding_profile).unwrap_or_default()
+}
+
+/// Cache directory actually consulted by the embedding provider: an `HF_HOME`
+/// env var overrides the default root (see `mempalace-embeddings`). Used only
+/// for display in the warm-up summary.
+fn effective_embedding_cache_dir() -> PathBuf {
+    match std::env::var_os("HF_HOME") {
+        Some(hf_home) => PathBuf::from(hf_home),
+        None => default_embedding_cache_dir(),
+    }
+}
+
+/// First non-empty line of an error, for compact one-line summaries.
+fn one_line_error(error: &dyn std::error::Error) -> String {
+    error.to_string().lines().next().map(str::trim).unwrap_or("unknown error").to_owned()
+}
+
 fn config_error(error: mempalace_core::MempalaceError) -> clap::Error {
     clap::Error::raw(clap::error::ErrorKind::Io, error.to_string())
 }
@@ -2839,6 +2985,18 @@ mod tests {
         _cache_root: PathBuf,
     ) -> Result<StubProvider, Box<dyn std::error::Error>> {
         Ok(StubProvider::new(profile))
+    }
+
+    /// Simulates a provider that cannot initialise because the model cache is
+    /// missing — the cold-machine, no-network shape `setup` must detect.
+    fn offline_only_provider(
+        _profile: EmbeddingProfile,
+        _cache_root: PathBuf,
+    ) -> Result<StubProvider, Box<dyn std::error::Error>> {
+        Err(Box::new(mempalace_embeddings::EmbeddingError::OfflineStartup {
+            model_id: "stub".to_owned(),
+            detail: "no local cache assets found for test stub".to_owned(),
+        }))
     }
 
     fn stub_vector(text: &str, dimensions: usize) -> Vec<f32> {
@@ -2944,6 +3102,79 @@ mod tests {
         let compress = run_cli(["compress"], &CliContext::production(), stub_provider).unwrap();
         assert_eq!(compress.exit_code, 1);
         assert!(compress.stderr.contains("deferred"));
+    }
+
+    #[test]
+    fn setup_help_lists_no_model_warmup_flag() {
+        let output = run_cli(["setup", "--help"], &CliContext::production(), stub_provider).unwrap();
+        assert_eq!(output.exit_code, 0);
+        assert!(output.stdout.contains("--no-model-warmup"));
+    }
+
+    #[test]
+    fn setup_dry_run_skips_model_warmup() {
+        let output = run_cli(
+            ["setup", "--tools", "jules", "--dry-run"],
+            &CliContext::production(),
+            stub_provider,
+        )
+        .unwrap();
+        assert_eq!(output.exit_code, 0);
+        assert!(output.stdout.contains("(dry run — nothing was written)"));
+        assert!(output.stdout.contains("warm-up skipped"));
+    }
+
+    #[test]
+    fn setup_no_model_warmup_flag_skips_warmup() {
+        let output = run_cli(
+            ["setup", "--tools", "jules", "--no-model-warmup"],
+            &CliContext::production(),
+            stub_provider,
+        )
+        .unwrap();
+        assert_eq!(output.exit_code, 0);
+        assert!(output.stdout.contains("warm-up skipped"));
+        assert!(output.stdout.contains("--no-model-warmup"));
+    }
+
+    #[test]
+    fn setup_warmup_succeeds_with_stub_provider() {
+        let output = run_cli(
+            ["setup", "--tools", "jules"],
+            &CliContext::production(),
+            stub_provider,
+        )
+        .unwrap();
+        assert_eq!(output.exit_code, 0);
+        assert!(output.stdout.contains("Embedding model warm-up"));
+        assert!(output.stdout.contains("check : ok"));
+    }
+
+    #[test]
+    fn setup_warmup_failure_exits_nonzero_with_remediation() {
+        let output = run_cli(
+            ["setup", "--tools", "jules"],
+            &CliContext::production(),
+            offline_only_provider,
+        )
+        .unwrap();
+        assert_eq!(output.exit_code, 1);
+        assert!(output.stdout.contains("embedding model is not usable offline"));
+        assert!(output.stdout.contains("re-run `mempalace-cli setup` with network access"));
+    }
+
+    #[test]
+    fn setup_model_warmup_offline_check_is_authoritative() {
+        // Warm-up download failure alone must not fail setup when the offline
+        // check passes (e.g. a warm cache on a machine whose download phase
+        // hiccups): the offline startup check is what gates the exit code.
+        let warm_fail = run_setup_model_warmup(stub_provider, offline_only_provider);
+        assert!(warm_fail.offline_ok);
+        assert!(warm_fail.text.contains("warm  : failed"));
+
+        let cold = run_setup_model_warmup(offline_only_provider, offline_only_provider);
+        assert!(!cold.offline_ok);
+        assert!(cold.text.contains("embedding model is not usable offline"));
     }
 
     #[test]

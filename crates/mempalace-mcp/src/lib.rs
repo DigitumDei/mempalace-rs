@@ -1504,8 +1504,11 @@ where
                     == Some(true))
             }
             ReplicationMutation::KgInvalidate { request } => {
+                // An already-inactive fact is a committed no-op for invalidation, but an
+                // unknown entity means the local mutation could not have committed. Keep those
+                // cases distinct so startup never activates a remote-only invalidation.
                 Ok(self.local_fact_state(&request.subject, &request.predicate, &request.object)?
-                    != Some(true))
+                    == Some(false))
             }
         }
     }
@@ -1517,26 +1520,29 @@ where
         object: &str,
     ) -> Result<Option<bool>> {
         let runtime = KnowledgeGraphRuntime::new(self.storage.operational_store());
-        match runtime.query_entity(subject, None, QueryDirection::Outgoing) {
-            Ok(rows) => {
-                let matches: Vec<_> = rows
-                    .into_iter()
-                    .filter(|row| {
-                        canonicalize_kg_label(&row.subject) == canonicalize_kg_label(subject)
-                            && canonicalize_kg_label(&row.predicate)
-                                == canonicalize_kg_label(predicate)
-                            && canonicalize_kg_label(&row.object) == canonicalize_kg_label(object)
-                    })
-                    .collect();
-                if matches.is_empty() {
-                    Ok(None)
-                } else {
-                    Ok(Some(matches.iter().any(|row| row.current)))
-                }
-            }
-            Err(mempalace_graph::GraphError::UnknownEntity { .. }) => Ok(None),
-            Err(error) => Err(McpError::Graph(error)),
+        let rows = match runtime.query_entity(subject, None, QueryDirection::Outgoing) {
+            Ok(rows) => rows,
+            Err(mempalace_graph::GraphError::UnknownEntity { .. }) => return Ok(None),
+            Err(error) => return Err(McpError::Graph(error)),
+        };
+        // `query_entity(subject)` only proves the subject exists. Invalidation resolves both
+        // endpoints, so probe the object as well before classifying an absent matching fact as a
+        // committed no-op. A known entity can legitimately have no facts and still yields an
+        // empty successful query.
+        match runtime.query_entity(object, None, QueryDirection::Both) {
+            Ok(_) => {}
+            Err(mempalace_graph::GraphError::UnknownEntity { .. }) => return Ok(None),
+            Err(error) => return Err(McpError::Graph(error)),
         }
+        let matches: Vec<_> = rows
+            .into_iter()
+            .filter(|row| {
+                canonicalize_kg_label(&row.subject) == canonicalize_kg_label(subject)
+                    && canonicalize_kg_label(&row.predicate) == canonicalize_kg_label(predicate)
+                    && canonicalize_kg_label(&row.object) == canonicalize_kg_label(object)
+            })
+            .collect();
+        Ok(Some(matches.iter().any(|row| row.current)))
     }
 
     fn stage_replication(
@@ -1562,7 +1568,25 @@ where
 
     fn activate_replication(&self, operation: &OutboxOperation) -> Result<OutboxOperation> {
         let transition = self.outbox.activate(&operation.operation_id, operation.revision)?;
-        expect_applied(transition, "activation").map_err(McpError::Replication)
+        match transition {
+            RevisionedWrite::Applied(value) => Ok(value),
+            RevisionedWrite::Conflict { actual_revision } => {
+                // Two keyed requests can both observe the same staged row and commit the same
+                // idempotent local mutation. If the other process won activation, the CAS
+                // conflict is harmless: reload its compatible non-staged state and report the
+                // already-queued operation instead of failing the foreground request.
+                let current = self.outbox.get_operation(&operation.operation_id)?;
+                if let (Some(current), Some(actual_revision)) = (current, actual_revision)
+                    && current.revision == actual_revision
+                    && !matches!(current.state, OutboxState::Staged | OutboxState::Cancelled)
+                {
+                    return Ok(current);
+                }
+                Err(McpError::Replication(format!(
+                    "outbox activation lost a revision race (actual revision {actual_revision:?})"
+                )))
+            }
+        }
     }
 
     fn cancel_staged_replication(&self, operation: &OutboxOperation) {
@@ -11760,6 +11784,30 @@ mod tests {
         kg_runtime.invalidate("PersonA", "lives_in", "CityA", yesterday, now).unwrap();
         // Now all facts for this triple are inactive -> Some(false).
         assert_eq!(runtime.local_fact_state("PersonA", "lives_in", "CityA").unwrap(), Some(false));
+        assert_eq!(
+            runtime.local_fact_state("PersonA", "lives_in", "UnknownCity").unwrap(),
+            None,
+            "an unknown endpoint must not be mistaken for an already-inactive fact"
+        );
+    }
+
+    #[tokio::test]
+    async fn keyed_activation_race_reuses_already_activated_operation() {
+        let harness = test_harness_with_federation(FederationRuntimeConfig::default()).await;
+        let runtime = harness.server.runtime.lock().await;
+        let staged = stage_kg_add_intent(&runtime, "ActivationRace", "owns", "Item");
+        let activated = expect_applied(
+            runtime.outbox.activate(&staged.operation_id, staged.revision).unwrap(),
+            "activate",
+        )
+        .unwrap();
+
+        // A second request still holds the stale staged snapshot. The helper must accept the
+        // first request's compatible activation rather than surface an internal CAS error.
+        let recovered = runtime.activate_replication(&staged).unwrap();
+        assert_eq!(recovered.operation_id, activated.operation_id);
+        assert_eq!(recovered.revision, activated.revision);
+        assert_eq!(recovered.state, OutboxState::Pending);
     }
 
     /// Stage a `kg_fact_added` replication intent for a triple without touching local KG state,

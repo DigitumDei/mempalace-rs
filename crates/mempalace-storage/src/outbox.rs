@@ -338,10 +338,33 @@ CREATE INDEX IF NOT EXISTS idx_replication_outbox_claim
             }
             if op.state == OutboxState::Cancelled {
                 let now = OffsetDateTime::now_utc();
+                // A revived intent is a new local commit attempt. Give it a fresh global and
+                // per-entity ordering position so it stays behind mutations that committed
+                // while this operation was cancelled. Reset both timestamps as well: startup
+                // reconciliation uses `created_at` as the ownership/grace marker, and must not
+                // mistake an actively retried old row for abandoned work.
+                let next_sequence: i64 = tx.query_row(
+                    "SELECT COALESCE(MAX(sequence),0)+1 FROM replication_outbox",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let next_entity_sequence: i64 = tx.query_row(
+                    "SELECT COALESCE(MAX(entity_sequence),0)+1 FROM replication_outbox \
+                     WHERE entity_id=?1 AND destination_remote=?2",
+                    params![input.entity_id, input.destination_remote],
+                    |row| row.get(0),
+                )?;
                 tx.execute(
-                    "UPDATE replication_outbox SET state='staged',revision=revision+1,updated_at=?2 \
+                    "UPDATE replication_outbox SET sequence=?2,entity_sequence=?3,state='staged',\
+                     revision=revision+1,lease_owner=NULL,lease_expires_at=NULL,retry_after=NULL,\
+                     last_error=NULL,created_at=?4,updated_at=?4 \
                      WHERE operation_id=?1 AND state='cancelled'",
-                    params![op.operation_id, format_time(now)?],
+                    params![
+                        op.operation_id,
+                        next_sequence,
+                        next_entity_sequence,
+                        format_time(now)?,
+                    ],
                 )?;
                 let restored = get_operation_tx(&tx, &op.operation_id)?.ok_or_else(|| {
                     StorageError::Invariant("restored operation disappeared".into())
@@ -1457,6 +1480,18 @@ mod tests {
         assert_eq!(cancelled.state, OutboxState::Cancelled);
         assert_eq!(cancelled.revision, 1);
 
+        // A newer mutation may commit while the original operation is cancelled. Its fresh
+        // ordering position must remain ahead of the revived retry.
+        let newer_input = NewOutboxOperation {
+            idempotency_key: "retry-cancel-key-newer".into(),
+            ..input.clone()
+        };
+        let newer = outbox.enqueue(&newer_input).expect("enqueue newer operation");
+        assert!(newer.sequence > cancelled.sequence);
+        let newer = expect_applied(
+            outbox.activate(&newer.operation_id, newer.revision).expect("activate newer operation"),
+        );
+
         // Attempting to re-enqueue with a different payload is rejected.
         let mut different_input = input.clone();
         different_input.payload = serde_json::json!({"content": "different"});
@@ -1468,6 +1503,20 @@ mod tests {
         assert_eq!(revived.operation_id, staged.operation_id);
         assert_eq!(revived.state, OutboxState::Staged);
         assert_eq!(revived.revision, 2);
+        assert!(
+            revived.sequence > newer.sequence,
+            "revived retry must be ordered after newer work"
+        );
+        assert!(revived.entity_sequence > newer.entity_sequence);
+        assert!(revived.created_at >= cancelled.updated_at);
+
+        // A subsequent insert must continue after the moved primary-key sequence.
+        let after_revival = NewOutboxOperation {
+            idempotency_key: "retry-cancel-key-after-revival".into(),
+            ..input.clone()
+        };
+        let after_revival = outbox.enqueue(&after_revival).expect("enqueue after revival");
+        assert!(after_revival.sequence > revived.sequence);
 
         // Revived staged operation can now be activated after local commit succeeds.
         let activated = expect_applied(
@@ -1475,11 +1524,23 @@ mod tests {
         );
         assert_eq!(activated.state, OutboxState::Pending);
 
-        // Activated operation is claimed and delivered normally.
-        let claimed = outbox
+        // The newer mutation remains ahead of the revived retry and is delivered first.
+        let claimed_newer = outbox
             .claim_next("actuarius", "worker", Duration::minutes(1))
             .expect("claim")
             .expect("found pending");
+        assert_eq!(claimed_newer.operation_id, newer.operation_id);
+        let acked = expect_applied(
+            outbox
+                .acknowledge(&claimed_newer.operation_id, "worker", claimed_newer.revision)
+                .expect("ack"),
+        );
+        assert_eq!(acked.state, OutboxState::Replicated);
+
+        let claimed = outbox
+            .claim_next("actuarius", "worker", Duration::minutes(1))
+            .expect("claim revived")
+            .expect("found revived pending");
         assert_eq!(claimed.operation_id, staged.operation_id);
         let acked = expect_applied(
             outbox.acknowledge(&claimed.operation_id, "worker", claimed.revision).expect("ack"),

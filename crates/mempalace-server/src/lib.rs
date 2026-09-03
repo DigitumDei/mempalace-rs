@@ -2274,7 +2274,7 @@ where
     let runtime = KnowledgeGraphRuntime::new(state.storage.operational_store());
 
     let operation_id = body.operation_id.clone();
-    let mut recovering = false;
+    let mut recovery_effect_applied = false;
     let receipts = state.storage.receipt_store();
 
     // Idempotency gate for the invalidate replay path.
@@ -2302,17 +2302,15 @@ where
                 return Ok(Json(response));
             }
             ReceiptOutcome::Recover(receipt) => {
-                recovering = true;
                 // A missing `ended` means "today" on the first attempt. Pin that
                 // resolved date in the pending receipt so a retry after midnight
                 // applies the same graph transition and emits the same event.
-                if let Some(pinned) = receipt
-                    .details
-                    .as_ref()
-                    .and_then(|details| details.get("ended"))
-                    .and_then(Value::as_str)
-                {
-                    ended = parse_date(pinned)?;
+                if let Some(details) = receipt.details.as_ref() {
+                    if let Some(pinned) = details.get("ended").and_then(Value::as_str) {
+                        ended = parse_date(pinned)?;
+                    }
+                    recovery_effect_applied =
+                        details.get("effect_applied").and_then(Value::as_bool).unwrap_or(false);
                 }
             }
             ReceiptOutcome::Fresh(_) => {
@@ -2331,7 +2329,21 @@ where
             Err(error) => return Err(error.into()),
         };
 
-    if invalidated > 0 || recovering {
+    // Record the post-effect marker before restoring the event. Recovery can then distinguish a
+    // pre-effect crash (pending receipt with no marker and `invalidated == 0`) from the crash
+    // window after the graph mutation, where the durable marker proves this operation performed
+    // the transition.
+    if invalidated > 0 {
+        recovery_effect_applied = true;
+        if let Some(op) = &operation_id {
+            receipts.set_receipt_details(
+                op,
+                &json!({"ended": format_date(ended), "effect_applied": true}),
+            )?;
+        }
+    }
+
+    if invalidated > 0 || recovery_effect_applied {
         let event = ChangeEvent {
             event_type: "kg_fact_invalidated".to_owned(),
             occurred_at: now,
@@ -6226,6 +6238,87 @@ mod tests {
                     .details_json
                     .as_deref()
                     .is_some_and(|details| details.contains("2026-01-02"))
+        }));
+    }
+
+    #[tokio::test]
+    async fn kg_invalidate_recovery_does_not_emit_event_before_effect() {
+        let harness = make_harness().await;
+        let add = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/kg/facts",
+                ALICE_TOKEN,
+                json!({"subject": "PreEffect", "predicate": "owns", "object": "Item"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(add.status(), StatusCode::OK);
+
+        // Make the fact inactive before the operation receipt exists. This models a pending
+        // receipt left by a crash immediately after begin_receipt, before invalidation ran.
+        let ended = OffsetDateTime::now_utc().date().previous_day().unwrap();
+        let runtime = KnowledgeGraphRuntime::new(harness.state.storage.operational_store());
+        assert_eq!(
+            runtime
+                .invalidate("PreEffect", "owns", "Item", ended, OffsetDateTime::now_utc())
+                .unwrap(),
+            1
+        );
+
+        let op = "op-kg-invalidate-pre-effect-1";
+        let ended_text = format_date(ended);
+        let receipts = harness.state.storage.receipt_store();
+        assert!(matches!(
+            receipts
+                .begin_receipt(&NewReceipt {
+                    operation_id: op.to_owned(),
+                    operation_kind: RECEIPT_KIND_KG_INVALIDATE.to_owned(),
+                    request_hash: mutation_request_hash(&[
+                        ("subject", json!("PreEffect")),
+                        ("predicate", json!("owns")),
+                        ("object", json!("Item")),
+                        ("ended", json!(Some(ended_text.clone()))),
+                    ]),
+                    target_id: canonical_kg_triple("PreEffect", "owns", "Item"),
+                })
+                .unwrap(),
+            ReceiptOutcome::Fresh(_)
+        ));
+        // The date is pinned, but there is deliberately no post-effect marker.
+        receipts.set_receipt_details(op, &json!({"ended": ended_text})).unwrap();
+
+        let retry = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/kg/facts/invalidate",
+                ALICE_TOKEN,
+                json!({
+                    "subject": "PreEffect",
+                    "predicate": "owns",
+                    "object": "Item",
+                    "ended": format_date(ended),
+                    "operation_id": op,
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(retry.status(), StatusCode::OK);
+        assert_eq!(body_json(retry).await["invalidated"], 0);
+
+        let events = harness
+            .state
+            .storage
+            .operational_store()
+            .get_changes_since(OffsetDateTime::UNIX_EPOCH, 10_000)
+            .unwrap();
+        assert!(!events.iter().any(|event| {
+            event.event_type == "kg_fact_invalidated"
+                && event.entity_id == "PreEffect → owns → Item"
         }));
     }
 

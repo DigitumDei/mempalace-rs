@@ -23,13 +23,13 @@
 //!
 //! `ordering_key` identifies a partition/group (e.g. one logical drawer or entity), not a global
 //! priority. Claiming may pick any *due head* across groups, and a candidate `c` is eligible only
-//! when no earlier operation currently active for delivery — `pending`, `leased`, or `retryable` —
-//! shares `c`'s `(destination_remote, ordering_key)` with `p.sequence < c.sequence`. An in-flight
-//! or retry-not-yet-due predecessor therefore blocks only its own group and never starves
-//! unrelated groups. Terminal operations (replicated, failed, cancelled) stop blocking, and
-//! [`OutboxState::Staged`] operations — durable but not yet deliverable — do not participate in
-//! delivery ordering at all until activated: startup reconciliation runs before delivery is
-//! started. Ordering within a group follows the global insertion `sequence`.
+//! when no earlier operation currently active for delivery — `staged`, `pending`, `leased`, or
+//! `retryable` —
+//! shares `c`'s `(destination_remote, ordering_key)` with `p.sequence < c.sequence`. An in-flight,
+//! retry-not-yet-due, or staged predecessor therefore blocks only its own group and never starves
+//! unrelated groups. Terminal operations (replicated, failed, cancelled) stop blocking. Staged
+//! operations are not claimable, but remain an ordering barrier until startup reconciliation
+//! activates or cancels them. Ordering within a group follows the global insertion `sequence`.
 //!
 //! # State machine
 //!
@@ -114,10 +114,10 @@ pub const OUTBOX_LEASE_DURATION_OUT_OF_RANGE: &str = "outbox lease duration is o
 #[serde(rename_all = "snake_case")]
 pub enum OutboxState {
     /// Intent persisted, but the local mutation it records has not been confirmed committed.
-    /// Not deliverable: no claim path returns a staged operation, and it neither blocks nor
-    /// advances delivery ordering until it is activated (commit confirmed) or cancelled
-    /// (uncommitted mutation). Startup reconciliation decides every staged intent before delivery
-    /// starts.
+    /// Not deliverable: no claim path returns a staged operation. It remains an ordering barrier
+    /// for later operations in the same group until it is activated (commit confirmed) or
+    /// cancelled (uncommitted mutation). Startup reconciliation decides every staged intent before
+    /// delivery starts.
     Staged,
     /// Local commit confirmed; awaiting a claim.
     Pending,
@@ -314,9 +314,9 @@ CREATE INDEX IF NOT EXISTS idx_replication_outbox_claim
         validate_key(&input.idempotency_key)?;
         bounded_identifier(&input.created_by, "created_by")?;
         bounded_identifier(&input.mutation_kind, "mutation_kind")?;
-        bounded_identifier(&input.entity_id, "entity_id")?;
+        nonempty_identifier(&input.entity_id, "entity_id")?;
         bounded_identifier(&input.destination_remote, "destination_remote")?;
-        bounded_identifier(&input.ordering_key, "ordering_key")?;
+        nonempty_identifier(&input.ordering_key, "ordering_key")?;
         bounded_json(&input.payload)?;
         if input.max_attempts < 1 {
             return Err(StorageError::Invariant("max_attempts must be at least 1".into()));
@@ -521,10 +521,10 @@ CREATE INDEX IF NOT EXISTS idx_replication_outbox_claim
     ///
     /// Eligible candidates are **due heads**: a `pending` operation, or a `retryable` one whose
     /// `retry_after` has passed, with no earlier operation currently active for delivery (`p.state
-    /// IN pending/leased/retryable`) sharing the same `(destination_remote, ordering_key)` and
-    /// `p.sequence < c.sequence`. An active predecessor blocks only its own group;
-    /// [`OutboxState::Staged`] operations never participate — nor do they block — until activated,
-    /// so startup reconciliation can run before delivery begins. Among due heads the lowest
+    /// IN staged/pending/leased/retryable`) sharing the same `(destination_remote, ordering_key)`
+    /// and `p.sequence < c.sequence`. An active predecessor blocks only its own group; staged
+    /// operations are not claimable themselves, but remain a barrier until startup reconciliation
+    /// activates or cancels them. Among due heads the lowest
     /// `sequence` wins, and **every** group head is considered: the scan is never truncated, so an
     /// eligible due head can never be hidden behind blocked or not-yet-due groups.
     ///
@@ -546,8 +546,9 @@ CREATE INDEX IF NOT EXISTS idx_replication_outbox_claim
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = OffsetDateTime::now_utc();
         // Candidate heads only: `NOT EXISTS` an earlier active-delivery predecessor in the same
-        // (destination_remote, ordering_key) group. Terminal states do not block and staged does
-        // not participate (nor block) until activated. `retry_after` eligibility is decided in
+        // (destination_remote, ordering_key) group. Terminal states do not block; staged rows are
+        // not candidates but do block later operations until reconciliation settles them.
+        // `retry_after` eligibility is decided in
         // Rust after parsing, never by SQL string comparison: RFC 3339 fractional-second widths
         // differ between rows, which would make a pure lexicographic `<=` unreliable. No LIMIT is
         // applied: skipping any head could report "no work" while an eligible due head exists.
@@ -559,7 +560,7 @@ CREATE INDEX IF NOT EXISTS idx_replication_outbox_claim
                                   WHERE p.destination_remote=c.destination_remote \
                                     AND p.ordering_key=c.ordering_key \
                                     AND p.sequence<c.sequence \
-                                    AND p.state IN ('pending','leased','retryable')) \
+                                    AND p.state IN ('staged','pending','leased','retryable')) \
                  ORDER BY c.sequence",
             )?;
             let rows = statement
@@ -1022,8 +1023,8 @@ fn ensure_in_flight(op: &OutboxOperation, worker: &str, now: OffsetDateTime) -> 
 
 /// Whether an earlier operation currently active for delivery shares `candidate`'s
 /// `(destination_remote, ordering_key)` with a smaller `sequence`. Terminal operations
-/// (replicated, failed, cancelled) never block, and staged operations do not participate in
-/// delivery ordering until activated.
+/// (replicated, failed, cancelled) never block. Staged operations are not claimable, but remain
+/// barriers until activated or cancelled.
 fn has_predecessor(
     conn: &Connection,
     destination_remote: &str,
@@ -1033,7 +1034,7 @@ fn has_predecessor(
     let exists: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM replication_outbox p \
          WHERE p.destination_remote=?1 AND p.ordering_key=?2 AND p.sequence<?3 \
-           AND p.state IN ('pending','leased','retryable'))",
+           AND p.state IN ('staged','pending','leased','retryable'))",
         params![destination_remote, ordering_key, sequence],
         |row| row.get(0),
     )?;
@@ -1117,6 +1118,13 @@ fn bounded_identifier(value: &str, name: &str) -> Result<()> {
         Err(StorageError::Invariant(format!("{name} must not be empty")))
     } else if value.len() > MAX_IDENTIFIER_BYTES {
         Err(StorageError::Invariant(format!("{name} must be at most {MAX_IDENTIFIER_BYTES} bytes")))
+    } else {
+        Ok(())
+    }
+}
+fn nonempty_identifier(value: &str, name: &str) -> Result<()> {
+    if value.trim().is_empty() {
+        Err(StorageError::Invariant(format!("{name} must not be empty")))
     } else {
         Ok(())
     }
@@ -1303,7 +1311,7 @@ mod tests {
     }
 
     #[test]
-    fn staged_operations_are_not_claimable_and_do_not_block_until_activated() {
+    fn staged_operations_are_not_claimable_but_block_later_same_group() {
         let (_dir, outbox) = store();
         let staged = enqueue(&outbox, "entity-a", "g", "op-staged");
         // Neither the batch claimer nor the exact claimer may deliver a staged operation.
@@ -1319,18 +1327,17 @@ mod tests {
             .expect_err("staged claim must fail");
         assert!(expect_invariant(&err).starts_with(OUTBOX_OPERATION_NOT_ACTIVATED), "{err}");
 
-        // A staged operation does not block its own group: startup reconciliation must settle the
-        // staged intent before delivery *starts*, but a staged row alone never holds a later
-        // activated operation back.
+        // A staged operation remains an ordering barrier for its own group: startup
+        // reconciliation must settle the staged intent before the later operation can deliver.
         let later = enqueue_active(&outbox, "entity-a", "g", "op-later");
         assert_eq!(
             outbox
                 .claim_next("actuarius", "worker-a", Duration::minutes(1))
                 .expect("claim_next")
-                .expect("later")
-                .operation_id,
-            later.operation_id,
-            "a staged operation must not block an activated later operation in its group"
+                .as_ref()
+                .map(|op| &op.operation_id),
+            None,
+            "a staged predecessor must block an activated later operation in its group"
         );
         // Another group is unaffected (sanity — no shared blocking state).
         let other = enqueue_active(&outbox, "entity-b", "h", "op-other");
@@ -1343,6 +1350,24 @@ mod tests {
             other.operation_id,
             "unrelated groups stay independent"
         );
+
+        // Once reconciliation activates the staged predecessor, it is claimable first; the later
+        // operation remains behind it until that predecessor is acknowledged.
+        let activated = expect_applied(
+            outbox.activate(&staged.operation_id, staged.revision).expect("activate staged"),
+        );
+        assert_eq!(
+            outbox
+                .claim_next("actuarius", "worker-a", Duration::minutes(1))
+                .expect("claim_next")
+                .expect("activated predecessor")
+                .operation_id,
+            activated.operation_id
+        );
+        let blocked = outbox
+            .claim_by_id(&later.operation_id, "worker-b", later.revision, Duration::minutes(1))
+            .expect_err("later operation remains blocked");
+        assert_eq!(expect_invariant(&blocked), OUTBOX_PREDECESSOR_IN_FLIGHT);
     }
 
     #[test]
@@ -2075,6 +2100,25 @@ mod tests {
     #[test]
     fn federation_sized_payloads_are_accepted_and_oversized_rejected() {
         let (_dir, outbox) = store();
+        // Generated drawer IDs are composed from caller-controlled wing/room IDs and can exceed
+        // the 256-byte limit reserved for protocol/idempotency identifiers. Entity and ordering
+        // identities must preserve the full value rather than rejecting a valid drawer.
+        let long_drawer_id = format!("drawer_{}", "x".repeat(512));
+        let long = outbox
+            .enqueue(&NewOutboxOperation {
+                created_by: "repl-worker".into(),
+                idempotency_key: "op-long-drawer".into(),
+                mutation_kind: "drawer_added".into(),
+                entity_id: long_drawer_id.clone(),
+                destination_remote: "actuarius".into(),
+                ordering_key: long_drawer_id.clone(),
+                payload: serde_json::json!({"drawer_id": long_drawer_id}),
+                max_attempts: 3,
+            })
+            .expect("a valid long drawer identity must be accepted");
+        assert_eq!(long.entity_id.len(), 519);
+        assert_eq!(long.ordering_key, long.entity_id);
+
         // A single drawer's content can legally approach 256 KiB and batch mutation bodies scale
         // to the 16 MiB federation limit — a payload comfortably above the old 1 MiB coordination
         // cap must be stored.

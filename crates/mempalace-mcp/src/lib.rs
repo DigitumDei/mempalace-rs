@@ -1015,7 +1015,7 @@ impl ToolName {
             ),
             Self::McpTasksCancel => coordination_definition(
                 self,
-                "Cancel a task on behalf of an inbound MCP Tasks `tasks/cancel` request, under the same compare-and-swap revision semantics as mempalace_task_transition. Equivalent to mempalace_mcp_tasks_update with status fixed to cancelled. Returns {\"success\": true, \"task\": {...}} on success, or {\"success\": false, \"conflict\": {expected_revision, actual_revision, message}} when the expected revision no longer matches — a conflict is data, not an error. Local-only: no MCP Tasks transport of its own.",
+                "Cancel a task on behalf of an inbound MCP Tasks `tasks/cancel` request, under the same compare-and-swap revision semantics as mempalace_task_transition. Equivalent to mempalace_mcp_tasks_update with status fixed to cancelled. Cancelling an already-cancelled task succeeds as a no-op (reported as no_op:true) rather than failing, since no transition out of a terminal state is permitted; the expected_revision check still applies. Returns {\"success\": true, \"task\": {...}} on success, or {\"success\": false, \"conflict\": {expected_revision, actual_revision, message}} when the expected revision no longer matches — a conflict is data, not an error. Local-only: no MCP Tasks transport of its own.",
                 json!({"task_id":{"type":"string"},"actor":{"type":"string"},"expected_revision":{"type":"integer"},"details":{}}),
                 &["task_id", "actor", "expected_revision"],
             ),
@@ -4319,6 +4319,30 @@ where
         let task_id = required_non_blank_string(arguments, "task_id")?;
         let actor = required_non_blank_string(arguments, "actor")?;
         let details = arguments.get("details").cloned();
+
+        // Same reasoning as `tool_mcp_tasks_update`: `tasks/cancel` is naturally retried, and
+        // `allowed_transition` refuses any transition out of a terminal state, so cancelling an
+        // already-cancelled task would surface as an internal -32000 for a harmless repeat.
+        let current = self
+            .coordination
+            .get_task(&task_id)
+            .map_tool_internal()?
+            .ok_or_else(|| ToolError::InvalidParams(format!("task `{task_id}` not found")))?;
+        if current.state == target.value {
+            if current.revision != expected_revision {
+                return Ok(revision_conflict_payload(
+                    expected_revision,
+                    Some(current.revision),
+                ));
+            }
+            return Ok(json!({
+                "success": true,
+                "task": current,
+                "no_op": true,
+                "details_recorded": false,
+            }));
+        }
+
         match self.coordination.transition_task(
             &task_id,
             &actor,
@@ -4326,7 +4350,12 @@ where
             target.value,
             details,
         ) {
-            Ok(RevisionedWrite::Applied(task)) => Ok(json!({"success": true, "task": task})),
+            Ok(RevisionedWrite::Applied(task)) => Ok(json!({
+                "success": true,
+                "task": task,
+                "no_op": false,
+                "details_recorded": true,
+            })),
             Ok(RevisionedWrite::Conflict { actual_revision }) => {
                 Ok(revision_conflict_payload(expected_revision, actual_revision))
             }
@@ -10126,6 +10155,52 @@ mod tests {
             .await;
         let stale = decode_tool_payload(&stale).expect("stale update");
         assert_eq!(stale["success"], false, "{stale}");
+    }
+
+    /// `tasks/cancel` is naturally retried, and no transition out of a terminal state is
+    /// permitted, so a repeat cancel must be a no-op rather than an internal error.
+    #[tokio::test]
+    async fn mcp_tasks_cancel_is_idempotent_on_an_already_cancelled_task() {
+        let harness = test_harness().await;
+        let created = harness
+            .server
+            .handle_request(tool_call(
+                9190,
+                "mempalace_task_create",
+                json!({
+                    "title": "t", "description": "d", "created_by": "alice",
+                    "wing": "wing_myproject", "idempotency_key": "mcp-tasks-cancel-noop-1",
+                }),
+            ))
+            .await;
+        let task_id =
+            decode_tool_payload(&created).expect("task")["task_id"].as_str().unwrap().to_owned();
+
+        let first = harness
+            .server
+            .handle_request(tool_call(
+                9191,
+                "mempalace_mcp_tasks_cancel",
+                json!({"task_id": task_id, "actor": "alice", "expected_revision": 0}),
+            ))
+            .await;
+        let first = decode_tool_payload(&first).expect("first cancel");
+        assert_eq!(first["success"], true, "{first}");
+        assert_eq!(first["task"]["state"], "cancelled");
+        let revision = first["task"]["revision"].as_i64().expect("revision");
+
+        let repeat = harness
+            .server
+            .handle_request(tool_call(
+                9192,
+                "mempalace_mcp_tasks_cancel",
+                json!({"task_id": task_id, "actor": "alice", "expected_revision": revision}),
+            ))
+            .await;
+        let repeat = decode_tool_payload(&repeat).expect("repeat cancel");
+        assert_eq!(repeat["success"], true, "{repeat}");
+        assert_eq!(repeat["no_op"], true);
+        assert_eq!(repeat["task"]["state"], "cancelled");
     }
 
     /// `find_task_by_key` matches on `(created_by, idempotency_key)` alone, so a replay carrying a

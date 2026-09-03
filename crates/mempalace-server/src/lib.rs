@@ -1412,6 +1412,15 @@ where
         return Err(ServerError::Forbidden);
     }
 
+    let identity = auth.0.0.clone();
+    // Normalize metadata exactly as the apply path below does. Recovery must verify every
+    // mutation-affecting field before treating a pre-applied drawer as this operation's effect.
+    let effective_source_file = body.source_file.as_deref().unwrap_or("");
+    let effective_added_by = match body.added_by.as_deref() {
+        Some(claimed) if claimed != identity.as_str() => format!("{identity}:{claimed}"),
+        _ => identity.clone(),
+    };
+
     let operation_id = body.operation_id.clone();
     // Resolve the drawer identity. A caller-supplied `drawer_id` is preserved
     // verbatim so replicated adds converge on a stable identity instead of the
@@ -1471,9 +1480,11 @@ where
                     if existing.content != body.content
                         || existing.wing.as_str() != wing.as_str()
                         || existing.room.as_str() != room.as_str()
+                        || existing.source_file != effective_source_file
+                        || existing.added_by != effective_added_by
                     {
                         return Err(ServerError::IdempotencyConflict(format!(
-                            "operation `{op}` recovered drawer `{}` with mismatched content/wing/room",
+                            "operation `{op}` recovered drawer `{}` with mismatched content/wing/room/source_file/added_by",
                             receipt.target_id
                         )));
                     }
@@ -1490,7 +1501,7 @@ where
                     restore_added_event(
                         &state,
                         &receipt.target_id,
-                        auth.0.0.as_str(),
+                        identity.as_str(),
                         wing.as_str(),
                         room.as_str(),
                     )?;
@@ -1533,14 +1544,6 @@ where
             serde_json::to_value(&duplicates).unwrap_or(Value::Array(vec![])),
         ));
     }
-    let identity = auth.0.0;
-
-    // Determine added_by: identity[:claimed]
-    let added_by = match &body.added_by {
-        Some(claimed) if claimed != &identity => format!("{identity}:{claimed}"),
-        _ => identity.clone(),
-    };
-
     let now = OffsetDateTime::now_utc();
     // When an operation_id is present the identity was pinned by the receipt's `target_id` on the
     // first attempt — either the caller-supplied id (preserved verbatim) or the derived one — so a
@@ -1550,6 +1553,7 @@ where
         None => resolved_target_id,
     };
     let source_file = body.source_file.unwrap_or_default();
+    let added_by = effective_added_by;
     let record = build_drawer_record(
         &state,
         drawer_id.clone(),
@@ -1712,11 +1716,21 @@ where
             }
             ReceiptOutcome::Replay(receipt) => {
                 // Identical request already completed: replay the durable response, performing no
-                // side effects.
+                // side effects. The response itself is not an authorization proof: enforce the
+                // wing captured before the original delete so a scoped token cannot replay a
+                // completed delete from another wing.
+                authorize_delete_receipt_scope(&auth.0, receipt.details.as_ref())?;
                 let response = receipt.response.unwrap_or_else(|| json!({"success": true}));
                 return Ok(Json(response));
             }
             ReceiptOutcome::Recover(receipt) => {
+                // A receipt with durable scope must be authorized before any recovery work. A
+                // metadata-less pending receipt is allowed through to the normal drawer lookup
+                // (it may be a fresh absent delete that later finds a drawer), but cannot recover
+                // an absent target into success below.
+                if receipt.details.is_some() {
+                    authorize_delete_receipt_scope(&auth.0, receipt.details.as_ref())?;
+                }
                 recovered_details = receipt.details;
             }
             ReceiptOutcome::Fresh(_) => {}
@@ -1841,6 +1855,23 @@ where
         actor: Some(actor.to_owned()),
         details_json: Some(details.to_string()),
     })?;
+    Ok(())
+}
+
+/// Authorize a delete replay/recovery from the wing and room captured on its receipt before the
+/// drawer was removed. Missing or malformed scope fails closed as not-found: the receipt must not
+/// become an existence oracle for a wing the caller cannot delete.
+fn authorize_delete_receipt_scope(
+    auth: &AuthIdentity,
+    details: Option<&Value>,
+) -> Result<(), ServerError> {
+    let not_found = || ServerError::NotFound("drawer not found".to_owned());
+    let Some(details) = details else { return Err(not_found()) };
+    let wing = details.get("wing").and_then(Value::as_str).ok_or_else(not_found)?;
+    let room = details.get("room").and_then(Value::as_str).ok_or_else(not_found)?;
+    if is_diary_wing_or_room(wing, room) || !auth.allows_wing(Operation::Delete, wing) {
+        return Err(not_found());
+    }
     Ok(())
 }
 
@@ -5539,6 +5570,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_receipt_replay_is_masked_when_token_cannot_delete_receipt_wing() {
+        let harness = make_harness().await;
+        let add = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/drawers",
+                ALICE_TOKEN,
+                json!({
+                    "wing": "wing_beta",
+                    "room": "receipt-auth",
+                    "content": "receipt authorization replay content",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(add.status(), StatusCode::OK);
+        let drawer_id = body_json(add).await["drawer_id"].as_str().unwrap().to_owned();
+        let op = "op-delete-replay-auth-1";
+        let uri = format!("/v1/drawers/{drawer_id}?operation_id={op}");
+
+        let deleted = harness
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(&uri)
+                    .header(header::AUTHORIZATION, format!("Bearer {ALICE_TOKEN}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(deleted.status(), StatusCode::OK);
+
+        // The receipt proves a delete in wing_beta, but the scoped token can only delete
+        // wing_alpha. Replaying the stored success must be masked as not-found.
+        let replay = harness
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(&uri)
+                    .header(header::AUTHORIZATION, format!("Bearer {SCOPED_ALPHA_TOKEN}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            harness.state.storage.receipt_store().get_receipt(op).unwrap().unwrap().status,
+            mempalace_storage::ReceiptState::Completed,
+            "an unauthorized replay must not mutate the completed receipt"
+        );
+    }
+
+    #[tokio::test]
     async fn kg_add_with_operation_id_replays_without_duplicating_fact() {
         let harness = make_harness().await;
 
@@ -6044,6 +6136,80 @@ mod tests {
         assert_eq!(conflict_resp.status(), StatusCode::CONFLICT);
         let conflict_body = body_json(conflict_resp).await;
         assert_eq!(conflict_body["code"], "operation_id_conflict");
+    }
+
+    #[tokio::test]
+    async fn add_recovery_rejects_mismatched_source_file_and_added_by() {
+        let harness = make_harness().await;
+        let op = "op-add-recover-metadata-mismatch-1";
+        let original = json!({
+            "wing": "wing_code",
+            "room": "metadata-recovery",
+            "content": "metadata recovery content",
+            "source_file": "original.md",
+            "added_by": "importer",
+            "operation_id": op,
+        });
+        let first = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(Method::POST, "/v1/drawers", ALICE_TOKEN, original))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let drawer_id = body_json(first).await["drawer_id"].as_str().unwrap().to_owned();
+
+        let sqlite_path = harness.state.storage.layout().sqlite_path.clone();
+        {
+            let conn = rusqlite::Connection::open(&sqlite_path).unwrap();
+            conn.execute(
+                "UPDATE mutation_receipts SET status='pending', response_json=NULL, completed_at=NULL \
+                 WHERE operation_id=?1",
+                [op],
+            )
+            .unwrap();
+        }
+
+        // Rewind the request hash to the metadata-mismatched retry so the handler reaches its
+        // pre-applied-effect validation instead of stopping at the receipt hash conflict.
+        let mismatched = json!({
+            "wing": "wing_code",
+            "room": "metadata-recovery",
+            "content": "metadata recovery content",
+            "source_file": "different.md",
+            "added_by": "other-importer",
+            "drawer_id": drawer_id,
+            "operation_id": op,
+        });
+        let mismatched_hash = mutation_request_hash(&[
+            ("wing", json!("wing_code")),
+            ("room", json!("metadata-recovery")),
+            ("content", json!("metadata recovery content")),
+            ("source_file", json!(Some("different.md"))),
+            ("added_by", json!(Some("other-importer"))),
+            ("drawer_id", json!(Some(drawer_id.clone()))),
+        ]);
+        {
+            let conn = rusqlite::Connection::open(&sqlite_path).unwrap();
+            conn.execute(
+                "UPDATE mutation_receipts SET request_hash=?1 WHERE operation_id=?2",
+                rusqlite::params![mismatched_hash, op],
+            )
+            .unwrap();
+        }
+
+        let conflict = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(Method::POST, "/v1/drawers", ALICE_TOKEN, mismatched))
+            .await
+            .unwrap();
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        assert_eq!(body_json(conflict).await["code"], "operation_id_conflict");
+        assert_eq!(
+            harness.state.storage.receipt_store().get_receipt(op).unwrap().unwrap().status,
+            mempalace_storage::ReceiptState::Pending
+        );
     }
 
     #[tokio::test]

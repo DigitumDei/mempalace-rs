@@ -393,6 +393,12 @@ impl RemoteApi for RemoteClient {
         Ok(self.ensure_handshake().await?.clone())
     }
 
+    /// Return whether the remote handshake advertised receipt-backed mutation idempotency.
+    async fn idempotent_mutations_capability(&self) -> Result<Option<bool>> {
+        let info = self.ensure_handshake().await?;
+        Ok(Some(info.capabilities.iter().any(|capability| capability == "idempotent_mutations")))
+    }
+
     /// Search drawers using semantic full-text matching (`POST /v1/drawers/search`).
     async fn search_drawers(&self, req: DrawerSearchRequest) -> Result<DrawerSearchResponse> {
         self.ensure_handshake().await?;

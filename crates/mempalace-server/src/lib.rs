@@ -65,8 +65,8 @@ use mempalace_storage::{
     MaintenanceSettings, MaintenanceSkipReason, Message as CoordinationMessage, NewArtifact,
     NewMessage, NewReceipt, NewTask, NewTaskResult, RECEIPT_KIND_DRAWER_ADD,
     RECEIPT_KIND_DRAWER_DELETE, RECEIPT_KIND_KG_ADD, RECEIPT_KIND_KG_INVALIDATE, ReceiptOutcome,
-    RevisionedWrite, StorageEngine, Task as CoordinationTask, TaskResult as CoordinationTaskResult,
-    TaskState,
+    ReceiptState, RevisionedWrite, StorageEngine, Task as CoordinationTask,
+    TaskResult as CoordinationTaskResult, TaskState,
 };
 use serde_json::{Value, json};
 use subtle::ConstantTimeEq;
@@ -791,6 +791,11 @@ pub struct ServerState<P> {
     pub last_maintenance_status: std::sync::Mutex<Option<MaintenanceRunSummary>>,
     /// Typed status of the maintenance subsystem.
     pub maintenance_status: std::sync::Mutex<MaintenanceStatus>,
+    /// Serializes operation-aware KG invalidations in this process. The graph effect and its
+    /// receipt marker are separate durable writes; keeping overlapping recoveries out of the
+    /// effect-to-marker window prevents a no-op recovery from completing the receipt before the
+    /// effecting handler can append its event.
+    operation_aware_kg_invalidation_lock: Arc<Mutex<()>>,
 }
 
 // ─── Router builder ──────────────────────────────────────────────────────────
@@ -858,6 +863,7 @@ where
         tokens: Arc::new(tokens),
         last_maintenance_status: std::sync::Mutex::new(None),
         maintenance_status: std::sync::Mutex::new(initial_status),
+        operation_aware_kg_invalidation_lock: Arc::new(Mutex::new(())),
     });
 
     // ── Background maintenance task ──────────────────────────────────────────
@@ -2274,6 +2280,15 @@ where
     let runtime = KnowledgeGraphRuntime::new(state.storage.operational_store());
 
     let operation_id = body.operation_id.clone();
+    // A graph invalidation and its post-effect receipt marker cannot share one SQLite
+    // transaction today. Serialize operation-aware handlers in this server so a concurrent
+    // recovery waits for the first handler to record its marker and event, then replays the
+    // completed receipt instead of completing a no-op in the window between those writes.
+    let _operation_lock = if operation_id.is_some() {
+        Some(state.operation_aware_kg_invalidation_lock.lock().await)
+    } else {
+        None
+    };
     let mut recovery_effect_applied = false;
     let receipts = state.storage.receipt_store();
 
@@ -2336,10 +2351,21 @@ where
     if invalidated > 0 {
         recovery_effect_applied = true;
         if let Some(op) = &operation_id {
-            receipts.set_receipt_details(
+            if let Err(error) = receipts.set_receipt_details(
                 op,
                 &json!({"ended": format_date(ended), "effect_applied": true}),
-            )?;
+            ) {
+                // A concurrent recovery request may have completed the receipt during the
+                // graph-effect-to-marker window. The mutation in this handler still proves the
+                // effect occurred, so keep going and append the operation-scoped event; a late
+                // marker write must not turn that repair into a lost event.
+                let completed = receipts
+                    .get_receipt(op)?
+                    .is_some_and(|receipt| receipt.status == ReceiptState::Completed);
+                if !completed {
+                    return Err(error.into());
+                }
+            }
         }
     }
 

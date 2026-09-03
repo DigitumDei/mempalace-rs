@@ -520,6 +520,11 @@ impl FederationRouter {
             return Ok(None);
         };
 
+        let generated_op_id = generate_operation_id();
+        let effective_operation_id =
+            operation_id_for_remote(api.as_ref(), remote_name, operation_id, &generated_op_id)
+                .await?;
+
         // ── Pre-add duplicate check ───────────────────────────────────────────
         // Operation-aware retries carry a stable operation_id, so the client-side
         // semantic preflight must be bypassed entirely: the receiving receipt store
@@ -559,15 +564,6 @@ impl FederationRouter {
             };
         }
 
-        let generated_op_id;
-        let effective_operation_id = match operation_id {
-            Some(id) => id,
-            None => {
-                generated_op_id = generate_operation_id();
-                generated_op_id.as_str()
-            }
-        };
-
         let req = AddDrawerRequest {
             wing: wing.to_owned(),
             room: room.to_owned(),
@@ -575,7 +571,7 @@ impl FederationRouter {
             source_file: if source_file.is_empty() { None } else { Some(source_file.to_owned()) },
             added_by: Some(added_by.to_owned()),
             drawer_id: None,
-            operation_id: Some(effective_operation_id.to_owned()),
+            operation_id: effective_operation_id.clone(),
         };
         match api.add_drawer(req).await {
             Ok(resp) => {
@@ -613,9 +609,10 @@ impl FederationRouter {
                     "applied_to": format_remote_origin(remote_name),
                 })))
             }
-            Err(e) if e.is_unknown_outcome() => {
-                Ok(Some(remote_mutation_unknown_outcome_value(&e, effective_operation_id)))
-            }
+            Err(e) if e.is_unknown_outcome() => Ok(Some(remote_mutation_unknown_outcome_value(
+                &e,
+                effective_operation_id.as_deref(),
+            ))),
             Err(e) => Err(ToolError::Internal(McpError::Federation(format!(
                 "remote `{remote_name}` add_drawer failed: {e}"
             )))),
@@ -855,24 +852,24 @@ impl FederationRouter {
                 "no client available for remote `{remote_name}`"
             ))));
         };
-        let generated_op_id;
-        let effective_operation_id = match operation_id {
-            Some(id) => id,
-            None => {
-                generated_op_id = generate_operation_id();
-                generated_op_id.as_str()
-            }
-        };
-        match api.delete_drawer_with_operation_id(drawer_id, Some(effective_operation_id)).await {
+        let generated_op_id = generate_operation_id();
+        let effective_operation_id =
+            operation_id_for_remote(api.as_ref(), remote_name, operation_id, &generated_op_id)
+                .await?;
+        match api
+            .delete_drawer_with_operation_id(drawer_id, effective_operation_id.as_deref())
+            .await
+        {
             Ok(()) => Ok(Some(json!({
                 "success": true,
                 "drawer_id": drawer_id,
                 "origin": remote_name,
                 "applied_to": format_remote_origin(remote_name),
             }))),
-            Err(e) if e.is_unknown_outcome() => {
-                Ok(Some(remote_mutation_unknown_outcome_value(&e, effective_operation_id)))
-            }
+            Err(e) if e.is_unknown_outcome() => Ok(Some(remote_mutation_unknown_outcome_value(
+                &e,
+                effective_operation_id.as_deref(),
+            ))),
             Err(e) => Err(ToolError::Internal(McpError::Federation(format!(
                 "remote `{remote_name}` delete_drawer failed: {e}"
             )))),
@@ -891,16 +888,13 @@ impl FederationRouter {
         drawer_id: &str,
         operation_id: Option<&str>,
     ) -> ToolResult<Option<Value>> {
-        let generated_op_id;
-        let effective_operation_id = match operation_id {
-            Some(id) => id,
-            None => {
-                generated_op_id = generate_operation_id();
-                generated_op_id.as_str()
-            }
-        };
+        let generated_op_id = generate_operation_id();
         for (name, api) in &self.remotes {
-            match api.delete_drawer_with_operation_id(drawer_id, Some(effective_operation_id)).await
+            let effective_operation_id =
+                operation_id_for_remote(api.as_ref(), name, operation_id, &generated_op_id).await?;
+            match api
+                .delete_drawer_with_operation_id(drawer_id, effective_operation_id.as_deref())
+                .await
             {
                 Ok(()) => {
                     return Ok(Some(json!({
@@ -915,7 +909,7 @@ impl FederationRouter {
                 Err(e) if e.is_unknown_outcome() => {
                     return Ok(Some(remote_mutation_unknown_outcome_value(
                         &e,
-                        effective_operation_id,
+                        effective_operation_id.as_deref(),
                     )));
                 }
                 Err(e) if e.is_degradable() => continue,
@@ -1308,20 +1302,16 @@ impl FederationRouter {
         let Some(api) = self.remotes.get(remote_name) else {
             return Ok(None);
         };
-        let generated_op_id;
-        let effective_operation_id = match operation_id {
-            Some(id) => id,
-            None => {
-                generated_op_id = generate_operation_id();
-                generated_op_id.as_str()
-            }
-        };
+        let generated_op_id = generate_operation_id();
+        let effective_operation_id =
+            operation_id_for_remote(api.as_ref(), remote_name, operation_id, &generated_op_id)
+                .await?;
         let req = mempalace_federation::KgAddFactRequest {
             subject: subject.to_owned(),
             predicate: predicate.to_owned(),
             object: object.to_owned(),
             valid_from: valid_from.map(|s| s.to_owned()),
-            operation_id: Some(effective_operation_id.to_owned()),
+            operation_id: effective_operation_id.clone(),
         };
         match api.kg_add_fact(req).await {
             Ok(mut resp) => {
@@ -1330,9 +1320,10 @@ impl FederationRouter {
                 }
                 Ok(Some(resp))
             }
-            Err(e) if e.is_unknown_outcome() => {
-                Ok(Some(remote_mutation_unknown_outcome_value(&e, effective_operation_id)))
-            }
+            Err(e) if e.is_unknown_outcome() => Ok(Some(remote_mutation_unknown_outcome_value(
+                &e,
+                effective_operation_id.as_deref(),
+            ))),
             Err(e) => Err(ToolError::Internal(McpError::Federation(format!(
                 "remote `{remote_name}` kg_add_fact failed: {e}"
             )))),
@@ -1436,20 +1427,16 @@ impl FederationRouter {
         let Some(api) = self.remotes.get(remote_name) else {
             return Ok(None);
         };
-        let generated_op_id;
-        let effective_operation_id = match operation_id {
-            Some(id) => id,
-            None => {
-                generated_op_id = generate_operation_id();
-                generated_op_id.as_str()
-            }
-        };
+        let generated_op_id = generate_operation_id();
+        let effective_operation_id =
+            operation_id_for_remote(api.as_ref(), remote_name, operation_id, &generated_op_id)
+                .await?;
         let req = mempalace_federation::KgInvalidateRequest {
             subject: subject.to_owned(),
             predicate: predicate.to_owned(),
             object: object.to_owned(),
             ended: ended.map(|s| s.to_owned()),
-            operation_id: Some(effective_operation_id.to_owned()),
+            operation_id: effective_operation_id.clone(),
         };
         match api.kg_invalidate(req).await {
             Ok(mut resp) => {
@@ -1458,9 +1445,10 @@ impl FederationRouter {
                 }
                 Ok(Some(resp))
             }
-            Err(e) if e.is_unknown_outcome() => {
-                Ok(Some(remote_mutation_unknown_outcome_value(&e, effective_operation_id)))
-            }
+            Err(e) if e.is_unknown_outcome() => Ok(Some(remote_mutation_unknown_outcome_value(
+                &e,
+                effective_operation_id.as_deref(),
+            ))),
             Err(e) => Err(ToolError::Internal(McpError::Federation(format!(
                 "remote `{remote_name}` kg_invalidate failed: {e}"
             )))),
@@ -2391,6 +2379,32 @@ fn generate_operation_id() -> String {
     format!("op_{}", &hash.to_hex()[..32])
 }
 
+/// Select an operation id only when the target peer advertises the receipt capability that makes
+/// retries safe. Older federation-v1 peers accept the DTOs but ignore `operation_id`; sending one
+/// to those peers would make an unknown outcome look safely replayable when it is not.
+async fn operation_id_for_remote(
+    api: &dyn RemoteApi,
+    remote_name: &str,
+    requested: Option<&str>,
+    generated: &str,
+) -> ToolResult<Option<String>> {
+    let capability = api.idempotent_mutations_capability().await.map_err(|error| {
+        ToolError::Internal(McpError::Federation(format!(
+            "remote `{remote_name}` idempotency capability check failed: {error}"
+        )))
+    })?;
+    if capability != Some(false) {
+        return Ok(Some(requested.unwrap_or(generated).to_owned()));
+    }
+    if requested.is_some() {
+        tracing::warn!(
+            remote = %remote_name,
+            "remote does not advertise idempotent_mutations; sending this direct mutation without an operation id"
+        );
+    }
+    Ok(None)
+}
+
 /// Build the caller-visible structured result for a direct remote mutation whose outcome
 /// could not be confirmed ([`RemoteError::UnknownOutcome`]).
 ///
@@ -2398,18 +2412,22 @@ fn generate_operation_id() -> String {
 /// authoritative failure: the request may have committed before the response was lost, so the
 /// caller can retry with the same stable `operation_id` and the receiving receipt store will
 /// authoritatively replay (or dedupe) it.
-fn remote_mutation_unknown_outcome_value(error: &RemoteError, operation_id: &str) -> Value {
+fn remote_mutation_unknown_outcome_value(error: &RemoteError, operation_id: Option<&str>) -> Value {
     let RemoteError::UnknownOutcome { remote, message } = error else {
         // Misuse guard: this helper is only reachable from `is_unknown_outcome()` arms.
         return json!({ "success": false, "outcome": "unknown_outcome" });
     };
+    let retry = operation_id.map_or(
+        "not safe to retry without a stable operation_id; the remote may already have applied the mutation",
+        |_| "safe to retry with the same operation_id; the remote may already have applied the mutation",
+    );
     json!({
         "success": false,
         "outcome": "unknown_outcome",
         "remote": remote,
         "operation_id": operation_id,
         "error": message,
-        "retry": "safe to retry with the same operation_id; the remote may already have applied the mutation",
+        "retry": retry,
     })
 }
 
@@ -3331,7 +3349,7 @@ mod tests {
                     "server_version": "1.0.0-test",
                     "federation_api_version": 1,
                     "embedding_profile": "balanced",
-                    "capabilities": ["drawers", "kg"]
+                    "capabilities": ["drawers", "kg", "idempotent_mutations"]
                 }),
                 search_results: vec![],
                 add_drawer_success: true,

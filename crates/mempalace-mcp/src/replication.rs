@@ -21,10 +21,22 @@ pub(crate) const OUTBOX_MAX_ATTEMPTS: i64 = 10;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum ReplicationMutation {
-    DrawerAdd { request: AddDrawerRequest },
-    DrawerDelete { drawer_id: String },
-    KgAdd { request: KgAddFactRequest },
-    KgInvalidate { request: KgInvalidateRequest },
+    DrawerAdd {
+        request: AddDrawerRequest,
+    },
+    DrawerDelete {
+        drawer_id: String,
+    },
+    KgAdd {
+        request: KgAddFactRequest,
+        /// Local source provenance used for idempotency checks. The remote wire DTO does not
+        /// carry this field, but a keyed local retry must still reject a provenance mismatch.
+        #[serde(default)]
+        source_closet: Option<String>,
+    },
+    KgInvalidate {
+        request: KgInvalidateRequest,
+    },
 }
 
 impl ReplicationMutation {
@@ -90,74 +102,102 @@ async fn deliver_claimed(
     metrics.record("delivery_attempt", std::time::Duration::from_millis(elapsed_ms));
     match result {
         Ok(()) => {
-            if let Err(error) =
-                outbox.acknowledge(&operation.operation_id, WORKER_ID, operation.revision)
-            {
-                tracing::warn!(
-                    operation_id = %operation.operation_id,
-                    %error,
-                    "remote mutation succeeded but outbox acknowledgement failed; safe replay will follow"
-                );
-            } else {
-                metrics.record("remote_acknowledge", started_at.elapsed());
-                tracing::info!(
-                    operation_id = %operation.operation_id,
-                    remote = %operation.destination_remote,
-                    attempt = operation.attempt_count + 1,
-                    elapsed_ms,
-                    queue_age_ms = (OffsetDateTime::now_utc() - operation.created_at)
-                        .whole_milliseconds(),
-                    "durable replication operation acknowledged"
-                );
+            match outbox.acknowledge(&operation.operation_id, WORKER_ID, operation.revision) {
+                Ok(RevisionedWrite::Applied(_)) => {
+                    metrics.record("remote_acknowledge", started_at.elapsed());
+                    tracing::info!(
+                        operation_id = %operation.operation_id,
+                        remote = %operation.destination_remote,
+                        attempt = operation.attempt_count + 1,
+                        elapsed_ms,
+                        queue_age_ms = (OffsetDateTime::now_utc() - operation.created_at)
+                            .whole_milliseconds(),
+                        "durable replication operation acknowledged"
+                    );
+                }
+                Ok(RevisionedWrite::Conflict { actual_revision }) => {
+                    tracing::warn!(
+                        operation_id = %operation.operation_id,
+                        ?actual_revision,
+                        "remote mutation succeeded but outbox acknowledgement lost a revision race; safe replay will follow"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        operation_id = %operation.operation_id,
+                        %error,
+                        "remote mutation succeeded but outbox acknowledgement failed; safe replay will follow"
+                    );
+                }
             }
         }
         Err(error) if error.is_retryable() => {
             let retry_at = OffsetDateTime::now_utc() + retry_backoff(&operation);
-            if let Err(store_error) = outbox.schedule_retry(
+            match outbox.schedule_retry(
                 &operation.operation_id,
                 WORKER_ID,
                 operation.revision,
                 &bounded_error(&error),
                 retry_at,
             ) {
-                tracing::warn!(
-                    operation_id = %operation.operation_id,
-                    %store_error,
-                    "failed to persist durable replication retry"
-                );
-            } else {
-                tracing::warn!(
-                    operation_id = %operation.operation_id,
-                    remote = %operation.destination_remote,
-                    attempt = operation.attempt_count + 1,
-                    retry_at = %retry_at,
-                    elapsed_ms,
-                    %error,
-                    "durable replication attempt will retry"
-                );
+                Ok(RevisionedWrite::Applied(_)) => {
+                    tracing::warn!(
+                        operation_id = %operation.operation_id,
+                        remote = %operation.destination_remote,
+                        attempt = operation.attempt_count + 1,
+                        retry_at = %retry_at,
+                        elapsed_ms,
+                        %error,
+                        "durable replication attempt will retry"
+                    );
+                }
+                Ok(RevisionedWrite::Conflict { actual_revision }) => {
+                    tracing::warn!(
+                        operation_id = %operation.operation_id,
+                        ?actual_revision,
+                        "failed to persist durable replication retry because the lease was reclaimed"
+                    );
+                }
+                Err(store_error) => {
+                    tracing::warn!(
+                        operation_id = %operation.operation_id,
+                        %store_error,
+                        "failed to persist durable replication retry"
+                    );
+                }
             }
         }
         Err(error) => {
-            if let Err(store_error) = outbox.fail(
+            match outbox.fail(
                 &operation.operation_id,
                 WORKER_ID,
                 operation.revision,
                 &bounded_error(&error),
             ) {
-                tracing::warn!(
-                    operation_id = %operation.operation_id,
-                    %store_error,
-                    "failed to persist terminal replication failure"
-                );
-            } else {
-                tracing::error!(
-                    operation_id = %operation.operation_id,
-                    remote = %operation.destination_remote,
-                    attempt = operation.attempt_count + 1,
-                    elapsed_ms,
-                    %error,
-                    "durable replication operation failed permanently"
-                );
+                Ok(RevisionedWrite::Applied(_)) => {
+                    tracing::error!(
+                        operation_id = %operation.operation_id,
+                        remote = %operation.destination_remote,
+                        attempt = operation.attempt_count + 1,
+                        elapsed_ms,
+                        %error,
+                        "durable replication operation failed permanently"
+                    );
+                }
+                Ok(RevisionedWrite::Conflict { actual_revision }) => {
+                    tracing::warn!(
+                        operation_id = %operation.operation_id,
+                        ?actual_revision,
+                        "failed to persist terminal replication failure because the lease was reclaimed"
+                    );
+                }
+                Err(store_error) => {
+                    tracing::warn!(
+                        operation_id = %operation.operation_id,
+                        %store_error,
+                        "failed to persist terminal replication failure"
+                    );
+                }
             }
         }
     }
@@ -193,7 +233,7 @@ async fn deliver(remote: &dyn RemoteApi, operation: &OutboxOperation) -> Result<
         ReplicationMutation::DrawerDelete { drawer_id } => {
             remote.delete_drawer_with_operation_id(&drawer_id, Some(&operation.operation_id)).await
         }
-        ReplicationMutation::KgAdd { mut request } => {
+        ReplicationMutation::KgAdd { mut request, .. } => {
             request.operation_id = Some(operation.operation_id.clone());
             remote.kg_add_fact(request).await.map(|_| ())
         }

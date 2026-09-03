@@ -1026,7 +1026,7 @@ pub async fn serve_transport<P, R, W>(
     mut writer: W,
 ) -> std::result::Result<(), Box<dyn std::error::Error>>
 where
-    P: EmbeddingProvider + Send,
+    P: EmbeddingProvider + Send + 'static,
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin,
 {
@@ -1092,7 +1092,7 @@ pub fn default_provider(profile: EmbeddingProfile) -> Result<FastembedProvider> 
 
 impl<P> McpServer<P>
 where
-    P: EmbeddingProvider + Send,
+    P: EmbeddingProvider + Send + 'static,
 {
     pub async fn from_parts(config: MempalaceConfig, provider: P) -> Result<Self> {
         Self::from_parts_with_lineage(config, provider, None).await
@@ -1109,20 +1109,16 @@ where
             .map_err(McpError::InvalidLineageBinding)?;
         let queue_limit = config.low_cpu.effective_queue_limit().min(Semaphore::MAX_PERMITS);
         let runtime = McpRuntime::new(config, provider, lineage_id).await?;
-        if let Some(router) = &runtime.federation {
-            let remotes = router.remotes.clone();
-            if !remotes.is_empty() {
-                tokio::spawn(run_replication_worker(
-                    runtime.outbox.clone(),
-                    remotes,
-                    runtime.metrics.clone(),
-                ));
-            }
+        let federation_worker = runtime.federation.as_ref().and_then(|router| {
+            (!router.remotes.is_empty())
+                .then(|| (runtime.outbox.clone(), router.remotes.clone(), runtime.metrics.clone()))
+        });
+        let runtime = Arc::new(Mutex::new(runtime));
+        if let Some((outbox, remotes, metrics)) = federation_worker {
+            tokio::spawn(run_replication_worker(outbox, remotes, metrics));
+            tokio::spawn(run_staged_reconciliation(runtime.clone()));
         }
-        Ok(Self {
-            runtime: Arc::new(Mutex::new(runtime)),
-            queue_limit: Arc::new(Semaphore::new(queue_limit)),
-        })
+        Ok(Self { runtime, queue_limit: Arc::new(Semaphore::new(queue_limit)) })
     }
 
     pub async fn handle_json_value(&self, request: Value) -> Value {
@@ -1362,10 +1358,31 @@ where
 /// reconciliation observes it past the grace period.
 const STAGED_INTENT_RECONCILIATION_GRACE: Duration = Duration::minutes(5);
 
+/// Poll interval for the in-process reconciliation loop. Startup reconciliation protects the
+/// crash window, while this periodic pass eventually settles a row that was still inside the
+/// ownership grace period when another process started.
+const STAGED_INTENT_RECONCILIATION_POLL: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Whether a staged intent's durable `created_at` is old enough for startup reconciliation to
 /// treat it as abandoned rather than as currently fresh work.
 fn staged_intent_exceeded_grace(created_at: OffsetDateTime, now: OffsetDateTime) -> bool {
     now - created_at >= STAGED_INTENT_RECONCILIATION_GRACE
+}
+
+async fn run_staged_reconciliation<P>(runtime: Arc<Mutex<McpRuntime<P>>>)
+where
+    P: EmbeddingProvider + Send + 'static,
+{
+    loop {
+        tokio::time::sleep(STAGED_INTENT_RECONCILIATION_POLL).await;
+        let result = {
+            let mut runtime = runtime.lock().await;
+            runtime.reconcile_staged_replication().await
+        };
+        if let Err(error) = result {
+            tracing::warn!(%error, "periodic staged replication reconciliation failed");
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1434,7 +1451,11 @@ where
             }
             let mut settled = 0usize;
             for operation in staged {
-                let committed = self.replication_intent_committed(&operation).await?;
+                // Clone the storage handles before awaiting the local-state probe.  This keeps
+                // the reconciliation future independent of the embedding provider held by the
+                // runtime, so it remains `Send` without requiring providers to be `Sync`.
+                let committed =
+                    Self::replication_intent_committed(self.storage.clone(), &operation).await?;
                 if !committed
                     && !staged_intent_exceeded_grace(
                         operation.created_at,
@@ -1452,8 +1473,33 @@ where
                 } else {
                     self.outbox.cancel(&operation.operation_id, operation.revision)?
                 };
-                expect_applied(transition, if committed { "activation" } else { "cancellation" })
-                    .map_err(McpError::Replication)?;
+                match transition {
+                    RevisionedWrite::Applied(_) => {}
+                    RevisionedWrite::Conflict { actual_revision } => {
+                        let current = self.outbox.get_operation(&operation.operation_id)?;
+                        let compatible = match (current.as_ref(), actual_revision) {
+                            (Some(current), Some(actual_revision))
+                                if current.revision == actual_revision =>
+                            {
+                                if committed {
+                                    !matches!(
+                                        current.state,
+                                        OutboxState::Staged | OutboxState::Cancelled
+                                    )
+                                } else {
+                                    current.state == OutboxState::Cancelled
+                                }
+                            }
+                            _ => false,
+                        };
+                        if !compatible {
+                            return Err(McpError::Replication(format!(
+                                "outbox {} lost a revision race (actual revision {actual_revision:?})",
+                                if committed { "activation" } else { "cancellation" }
+                            )));
+                        }
+                    }
+                }
                 tracing::info!(
                     operation_id = %operation.operation_id,
                     committed,
@@ -1470,7 +1516,10 @@ where
         }
     }
 
-    async fn replication_intent_committed(&self, operation: &OutboxOperation) -> Result<bool> {
+    async fn replication_intent_committed(
+        storage: StorageEngine,
+        operation: &OutboxOperation,
+    ) -> Result<bool> {
         let mutation = serde_json::from_value::<ReplicationMutation>(operation.payload.clone())
             .map_err(|error| {
                 McpError::Replication(format!(
@@ -1490,25 +1539,31 @@ where
                     ToolError::InvalidParams(message) => McpError::Replication(message),
                     ToolError::Internal(error) => error,
                 })?;
-                Ok(self.storage.drawer_store().get_drawer(&drawer_id).await?.is_some())
+                Ok(storage.drawer_store().get_drawer(&drawer_id).await?.is_some())
             }
             ReplicationMutation::DrawerDelete { drawer_id } => {
                 let drawer_id = parse_drawer_id(&drawer_id).map_err(|error| match error {
                     ToolError::InvalidParams(message) => McpError::Replication(message),
                     ToolError::Internal(error) => error,
                 })?;
-                Ok(self.storage.drawer_store().get_drawer(&drawer_id).await?.is_none())
+                Ok(storage.drawer_store().get_drawer(&drawer_id).await?.is_none())
             }
-            ReplicationMutation::KgAdd { request } => {
-                Ok(self.local_fact_state(&request.subject, &request.predicate, &request.object)?
-                    == Some(true))
-            }
+            ReplicationMutation::KgAdd { request, .. } => Ok(Self::local_fact_state_from_storage(
+                &storage,
+                &request.subject,
+                &request.predicate,
+                &request.object,
+            )? == Some(true)),
             ReplicationMutation::KgInvalidate { request } => {
                 // An already-inactive fact is a committed no-op for invalidation, but an
                 // unknown entity means the local mutation could not have committed. Keep those
                 // cases distinct so startup never activates a remote-only invalidation.
-                Ok(self.local_fact_state(&request.subject, &request.predicate, &request.object)?
-                    == Some(false))
+                Ok(Self::local_fact_state_from_storage(
+                    &storage,
+                    &request.subject,
+                    &request.predicate,
+                    &request.object,
+                )? == Some(false))
             }
         }
     }
@@ -1519,7 +1574,16 @@ where
         predicate: &str,
         object: &str,
     ) -> Result<Option<bool>> {
-        let runtime = KnowledgeGraphRuntime::new(self.storage.operational_store());
+        Self::local_fact_state_from_storage(&self.storage, subject, predicate, object)
+    }
+
+    fn local_fact_state_from_storage(
+        storage: &StorageEngine,
+        subject: &str,
+        predicate: &str,
+        object: &str,
+    ) -> Result<Option<bool>> {
+        let runtime = KnowledgeGraphRuntime::new(storage.operational_store());
         let rows = match runtime.query_entity(subject, None, QueryDirection::Outgoing) {
             Ok(rows) => rows,
             Err(mempalace_graph::GraphError::UnknownEntity { .. }) => return Ok(None),
@@ -3548,6 +3612,7 @@ where
                             valid_from: valid_from_text.clone(),
                             operation_id: None,
                         },
+                        source_closet: source_closet.clone(),
                     },
                 )
                 .map_tool()?,
@@ -3584,7 +3649,7 @@ where
         let sub = subject.clone();
         let pred = predicate.clone();
         let obj = object.clone();
-        self.log_change(ChangeEvent {
+        let change_event = ChangeEvent {
             event_type: "kg_fact_added".to_owned(),
             occurred_at: now,
             entity_id: triple_id.clone(),
@@ -3592,7 +3657,12 @@ where
             details_json: Some(
                 json!({"subject": subject, "predicate": predicate, "object": object}).to_string(),
             ),
-        });
+        };
+        if let Some(operation_id) = requested_operation_id.as_deref() {
+            self.log_change_if_absent_with_operation(&change_event, operation_id);
+        } else {
+            self.log_change(change_event);
+        }
 
         let mut payload = json!({
             "success": true,
@@ -3631,7 +3701,7 @@ where
         let object = required_string(arguments, "object")?;
         let ended_text = optional_string(arguments, "ended")?;
         let requested_operation_id = optional_string(arguments, "operation_id")?;
-        let ended = ended_text
+        let mut ended = ended_text
             .as_deref()
             .map(parse_date)
             .transpose()?
@@ -3643,6 +3713,26 @@ where
             (Some(router), Some(route)) => router.is_dual_write(route),
             _ => false,
         };
+
+        // A keyed retry must reuse the date pinned in its existing durable outbox payload. If
+        // `ended` was omitted on the first attempt, resolving it again after midnight would make
+        // the same operation's local and remote invalidations disagree (and would make enqueue
+        // reject the retry as a changed mutation).
+        if is_both {
+            if let Some(operation_id) = requested_operation_id.as_deref() {
+                if let Some(operation) =
+                    self.outbox.find_by_key(OUTBOX_ACTOR, operation_id).map_tool()?
+                {
+                    if let Ok(ReplicationMutation::KgInvalidate { request }) =
+                        serde_json::from_value::<ReplicationMutation>(operation.payload)
+                    {
+                        if let Some(pinned) = request.ended.as_deref() {
+                            ended = parse_date(pinned)?;
+                        }
+                    }
+                }
+            }
+        }
 
         // ── Non-Both federation: remote-only or local-only ──
         if !is_both {
@@ -3720,7 +3810,7 @@ where
         let obj = object.clone();
 
         if invalidated > 0 {
-            self.log_change(ChangeEvent {
+            let change_event = ChangeEvent {
                 event_type: "kg_fact_invalidated".to_owned(),
                 occurred_at: now,
                 entity_id: format!("{subject} → {predicate} → {object}"),
@@ -3730,14 +3820,21 @@ where
                            "ended": format_date(ended)})
                     .to_string(),
                 ),
-            });
+            };
+            if let Some(operation_id) = requested_operation_id.as_deref() {
+                self.log_change_if_absent_with_operation(&change_event, operation_id);
+            } else {
+                self.log_change(change_event);
+            }
         }
 
+        let keyed_replay = requested_operation_id.is_some()
+            && staged.as_ref().is_some_and(|operation| operation.state != OutboxState::Staged);
         let mut payload = json!({
-            "success": invalidated > 0,
+            "success": invalidated > 0 || keyed_replay,
             "invalidated": invalidated,
             "fact": format!("{sub} → {pred} → {obj}"),
-            "ended": ended_text.as_deref().unwrap_or("today"),
+            "ended": format_date(ended),
         });
         if self.federation.is_some() {
             if let Some(obj) = payload.as_object_mut() {
@@ -3895,6 +3992,13 @@ where
 
     fn log_change(&self, event: ChangeEvent) {
         let _ = self.storage.operational_store().append_event(&event);
+    }
+
+    fn log_change_if_absent_with_operation(&self, event: &ChangeEvent, operation_id: &str) {
+        let _ = self
+            .storage
+            .operational_store()
+            .append_event_if_absent_with_operation(event, operation_id);
     }
 
     fn identity_path(&self) -> PathBuf {
@@ -11834,6 +11938,7 @@ mod tests {
                         valid_from: None,
                         operation_id: None,
                     },
+                    source_closet: None,
                 },
             )
             .unwrap()

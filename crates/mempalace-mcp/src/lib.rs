@@ -2789,10 +2789,7 @@ where
                     if let Some(obj) = result.as_object_mut() {
                         obj.insert(
                             "replication".to_owned(),
-                            json!(ReplicationStatus::Queued {
-                                remote,
-                                operation_id: operation.operation_id,
-                            }),
+                            replication_status_for_operation(&operation),
                         );
                     }
                     return Ok(result);
@@ -2943,13 +2940,7 @@ where
                 staged
             };
             if let Some(obj) = result.as_object_mut() {
-                obj.insert(
-                    "replication".to_owned(),
-                    json!(ReplicationStatus::Queued {
-                        remote: operation.destination_remote.clone(),
-                        operation_id: operation.operation_id,
-                    }),
-                );
+                obj.insert("replication".to_owned(), replication_status_for_operation(&operation));
             }
         }
 
@@ -3065,10 +3056,7 @@ where
                     "success": true,
                     "drawer_id": drawer_id,
                     "applied_to": "local",
-                    "replication": ReplicationStatus::Queued {
-                        remote: operation.destination_remote,
-                        operation_id: operation.operation_id,
-                    },
+                    "replication": replication_status_for_operation(&operation),
                 }));
             }
             // ── Federation fallback ──
@@ -3137,13 +3125,7 @@ where
                 staged
             };
             if let Some(obj) = result.as_object_mut() {
-                obj.insert(
-                    "replication".to_owned(),
-                    json!(ReplicationStatus::Queued {
-                        remote: operation.destination_remote.clone(),
-                        operation_id: operation.operation_id,
-                    }),
-                );
+                obj.insert("replication".to_owned(), replication_status_for_operation(&operation));
             }
         }
         Ok(result)
@@ -3606,13 +3588,7 @@ where
                 staged
             };
             if let Some(obj) = payload.as_object_mut() {
-                obj.insert(
-                    "replication".to_owned(),
-                    json!(ReplicationStatus::Queued {
-                        remote: operation.destination_remote.clone(),
-                        operation_id: operation.operation_id,
-                    }),
-                );
+                obj.insert("replication".to_owned(), replication_status_for_operation(&operation));
             }
         }
 
@@ -3752,13 +3728,7 @@ where
                 staged
             };
             if let Some(obj) = payload.as_object_mut() {
-                obj.insert(
-                    "replication".to_owned(),
-                    json!(ReplicationStatus::Queued {
-                        remote: operation.destination_remote.clone(),
-                        operation_id: operation.operation_id,
-                    }),
-                );
+                obj.insert("replication".to_owned(), replication_status_for_operation(&operation));
             }
         }
 
@@ -5209,7 +5179,20 @@ fn replication_idempotency_key(
 /// keyed retry after the local delete returns the original queued/terminal replication state
 /// consistently instead of re-executing or falling back.
 fn delete_replication_replay_payload(operation: &OutboxOperation, drawer_id: &str) -> Value {
-    let replication = match operation.state {
+    let replication = replication_status_for_operation(operation);
+    json!({
+        "success": true,
+        "drawer_id": drawer_id,
+        "applied_to": "local",
+        "replication": replication,
+    })
+}
+
+/// Render the persisted outbox state for mutation responses. Keyed retries can
+/// return an already-terminal row, so reporting `queued` unconditionally would
+/// hide whether the remote has replicated or permanently failed the operation.
+fn replication_status_for_operation(operation: &OutboxOperation) -> Value {
+    match operation.state {
         OutboxState::Replicated => {
             json!(ReplicationStatus::Replicated { remote: operation.destination_remote.clone() })
         }
@@ -5224,13 +5207,7 @@ fn delete_replication_replay_payload(operation: &OutboxOperation, drawer_id: &st
             remote: operation.destination_remote.clone(),
             operation_id: operation.operation_id.clone(),
         }),
-    };
-    json!({
-        "success": true,
-        "drawer_id": drawer_id,
-        "applied_to": "local",
-        "replication": replication,
-    })
+    }
 }
 
 fn kg_ordering_key(subject: &str, predicate: &str, object: &str) -> String {
@@ -11599,16 +11576,53 @@ mod tests {
             .await;
         let first_add_payload = decode_tool_payload(&first_add).unwrap();
         assert_eq!(first_add_payload["success"], true);
-        let second_add = harness
-            .server
-            .handle_request(tool_call(11, "mempalace_kg_add", add_args))
-            .await;
+        let second_add =
+            harness.server.handle_request(tool_call(11, "mempalace_kg_add", add_args)).await;
         let second_add_payload = decode_tool_payload(&second_add).unwrap();
         assert_eq!(second_add_payload["success"], true);
         assert_eq!(
             second_add_payload["replication"]["operation_id"],
             first_add_payload["replication"]["operation_id"]
         );
+
+        // A keyed replay must reflect a terminal outbox state instead of
+        // regressing to `queued` after the remote has acknowledged the row.
+        let add_operation_id =
+            first_add_payload["replication"]["operation_id"].as_str().unwrap().to_owned();
+        {
+            let runtime = harness.server.runtime.lock().await;
+            let operation = runtime.outbox.get_operation(&add_operation_id).unwrap().unwrap();
+            let leased = runtime
+                .outbox
+                .claim_next("alpha", "worker-terminal-test", time::Duration::minutes(1))
+                .unwrap()
+                .expect("queued add must be claimable");
+            assert_eq!(leased.operation_id, operation.operation_id);
+            expect_applied(
+                runtime
+                    .outbox
+                    .acknowledge(&leased.operation_id, "worker-terminal-test", leased.revision)
+                    .unwrap(),
+                "acknowledgement",
+            )
+            .unwrap();
+        }
+        let terminal_add = harness
+            .server
+            .handle_request(tool_call(
+                14,
+                "mempalace_kg_add",
+                json!({
+                    "subject": "ReusePerson",
+                    "predicate": "lives-in",
+                    "object": "ReuseCity",
+                    "operation_id": "kg-add-reused",
+                }),
+            ))
+            .await;
+        let terminal_add_payload = decode_tool_payload(&terminal_add).unwrap();
+        assert_eq!(terminal_add_payload["replication"]["status"], "replicated");
+        assert_eq!(terminal_add_payload["replication"]["remote"], "alpha");
 
         let invalidate_args = json!({
             "subject": "ReusePerson",
@@ -11631,6 +11645,51 @@ mod tests {
         assert_eq!(
             second_payload["replication"]["operation_id"],
             first_invalidate_payload["replication"]["operation_id"]
+        );
+
+        // The same mapping must preserve a terminal failure and its reason.
+        let invalidate_operation_id =
+            first_invalidate_payload["replication"]["operation_id"].as_str().unwrap().to_owned();
+        {
+            let runtime = harness.server.runtime.lock().await;
+            let leased = runtime
+                .outbox
+                .claim_next("alpha", "worker-terminal-test", time::Duration::minutes(1))
+                .unwrap()
+                .expect("queued invalidate must be claimable");
+            assert_eq!(leased.operation_id, invalidate_operation_id);
+            expect_applied(
+                runtime
+                    .outbox
+                    .fail(
+                        &leased.operation_id,
+                        "worker-terminal-test",
+                        leased.revision,
+                        "remote rejected test mutation",
+                    )
+                    .unwrap(),
+                "terminal failure",
+            )
+            .unwrap();
+        }
+        let terminal_invalidate = harness
+            .server
+            .handle_request(tool_call(
+                15,
+                "mempalace_kg_invalidate",
+                json!({
+                    "subject": "ReusePerson",
+                    "predicate": "lives_in",
+                    "object": "ReuseCity",
+                    "operation_id": "kg-invalidate-reused",
+                }),
+            ))
+            .await;
+        let terminal_invalidate_payload = decode_tool_payload(&terminal_invalidate).unwrap();
+        assert_eq!(terminal_invalidate_payload["replication"]["status"], "failed");
+        assert_eq!(
+            terminal_invalidate_payload["replication"]["reason"],
+            "remote rejected test mutation"
         );
     }
 

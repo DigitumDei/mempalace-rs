@@ -1588,7 +1588,7 @@ where
         details_json: Some(json!({"wing": wing.as_str(), "room": room.as_str()}).to_string()),
     };
     if let Some(op) = &operation_id {
-        state.storage.operational_store().append_event_with_operation(&event, op)?;
+        state.storage.operational_store().append_event_if_absent_with_operation(&event, op)?;
     } else {
         state.storage.operational_store().append_event(&event)?;
     }
@@ -1756,7 +1756,16 @@ where
         // existence and lets a federated fallback continue past a remote that lacks the drawer
         // instead of stopping at the first false success. Legacy requests (no `operation_id`)
         // keep the 404.
+        // The receipt snapshot taken by `begin_receipt` can race the winner's
+        // durable metadata write. Refresh it once the row is absent so the
+        // losing request still converges instead of returning a transient 404.
+        if recovered_details.is_none() {
+            if let Some(op) = operation_id.as_ref() {
+                recovered_details = receipts.get_receipt(op)?.and_then(|receipt| receipt.details);
+            }
+        }
         if let (Some(op), Some(details)) = (&operation_id, recovered_details.as_ref()) {
+            authorize_delete_receipt_scope(&auth.0, Some(details))?;
             // Recover the finding-6 crash window: the delete committed but the `drawer_deleted`
             // change event was never appended. Restore exactly one event, with the wing/room
             // captured on the receipt *before* the delete ran, so scoped change reads can see
@@ -1786,16 +1795,41 @@ where
     }
     let identity = auth.0.0;
 
+    // A pending keyed delete may be recovering after the target id was re-used. The
+    // receipt's incarnation marker distinguishes the original row from its replacement;
+    // in that case restore the original event and leave the replacement untouched.
+    if let Some(details) = recovered_details.as_ref() {
+        if !drawer_matches_delete_incarnation(&drawer, details)? {
+            let Some(op) = operation_id.as_ref() else {
+                return Err(ServerError::NotFound(format!("drawer {id} not found")));
+            };
+            restore_deleted_event(&state, &id, op, identity.as_str(), Some(details))?;
+            let response = json!({"success": true});
+            receipts.complete_receipt(op, &response)?;
+            return Ok(Json(response));
+        }
+    }
+
     // Durably record the drawer's wing/room on the receipt *before* the delete runs. If the
     // process crashes after the delete commits but before the `drawer_deleted` event is
     // appended, a retry can no longer read the scope from the drawer (it is gone) — only this
     // record survives. `set_receipt_details` commits in its own transaction, so it is durable
     // the moment it returns.
+    let delete_details = json!({
+        "wing": drawer.wing.as_str(),
+        "room": drawer.room.as_str(),
+        "incarnation": {
+            "filed_at": format_rfc3339(drawer.filed_at)?,
+            "content_hash": drawer.content_hash.clone(),
+        },
+    });
     if let Some(op) = &operation_id {
-        receipts.set_receipt_details(
-            op,
-            &json!({"wing": drawer.wing.as_str(), "room": drawer.room.as_str()}),
-        )?;
+        // Fresh attempts capture the row before deleting it. Recoveries retain the
+        // original details so a replacement row can never overwrite the marker.
+        if recovered_details.is_none() {
+            receipts.set_receipt_details(op, &delete_details)?;
+            recovered_details = Some(delete_details.clone());
+        }
     }
 
     let deleted =
@@ -1818,15 +1852,25 @@ where
             actor: Some(identity),
             // wing/room recorded so `/v1/changes` (Group C) can filter deletion
             // events by scope the same way it already filters `drawer_added`.
-            details_json: Some(
-                json!({"wing": drawer.wing.as_str(), "room": drawer.room.as_str()}).to_string(),
-            ),
+            details_json: Some(recovered_details.as_ref().unwrap_or(&delete_details).to_string()),
         };
         if let Some(op) = &operation_id {
-            state.storage.operational_store().append_event_with_operation(&event, op)?;
+            state.storage.operational_store().append_event_if_absent_with_operation(&event, op)?;
         } else {
             state.storage.operational_store().append_event(&event)?;
         }
+    } else if let Some(op) = &operation_id {
+        // Another identical delete may have won between lookup and delete. The
+        // losing request still owns the same operation and must restore the event
+        // before completing its receipt, otherwise a failed winner/event append can
+        // leave the operation permanently without an audit record.
+        restore_deleted_event(
+            &state,
+            &id,
+            op,
+            identity.as_str(),
+            recovered_details.as_ref().or(Some(&delete_details)),
+        )?;
     }
     if let Some(op) = operation_id {
         receipts.complete_receipt(&op, &response)?;
@@ -1860,13 +1904,16 @@ where
     let Some(details) = details else {
         return Ok(());
     };
-    operational.append_event_if_absent_with_operation(&ChangeEvent {
-        event_type: "drawer_deleted".to_owned(),
-        occurred_at: OffsetDateTime::now_utc(),
-        entity_id: entity_id.to_owned(),
-        actor: Some(actor.to_owned()),
-        details_json: Some(details.to_string()),
-    }, operation_id)?;
+    operational.append_event_if_absent_with_operation(
+        &ChangeEvent {
+            event_type: "drawer_deleted".to_owned(),
+            occurred_at: OffsetDateTime::now_utc(),
+            entity_id: entity_id.to_owned(),
+            actor: Some(actor.to_owned()),
+            details_json: Some(details.to_string()),
+        },
+        operation_id,
+    )?;
     Ok(())
 }
 
@@ -1885,6 +1932,26 @@ fn authorize_delete_receipt_scope(
         return Err(not_found());
     }
     Ok(())
+}
+
+/// Compare the durable incarnation marker captured before a keyed delete with the
+/// currently visible row. Receipts written before incarnation markers existed only
+/// contain wing/room and remain compatible; new receipts carry both fields below.
+fn drawer_matches_delete_incarnation(
+    drawer: &DrawerRecord,
+    details: &Value,
+) -> Result<bool, ServerError> {
+    let Some(marker) = details.get("incarnation") else {
+        return Ok(true);
+    };
+    let Some(expected_filed_at) = marker.get("filed_at").and_then(Value::as_str) else {
+        return Ok(false);
+    };
+    let Some(expected_content_hash) = marker.get("content_hash").and_then(Value::as_str) else {
+        return Ok(false);
+    };
+    Ok(expected_filed_at == format_rfc3339(drawer.filed_at)?
+        && expected_content_hash == drawer.content_hash)
 }
 
 /// Restore exactly one `drawer_added` change event for a drawer whose add committed but whose
@@ -1909,13 +1976,16 @@ fn restore_added_event<P>(
 where
     P: EmbeddingProvider + Send + Sync + 'static,
 {
-    state.storage.operational_store().append_event_if_absent_with_operation(&ChangeEvent {
-        event_type: "drawer_added".to_owned(),
-        occurred_at: OffsetDateTime::now_utc(),
-        entity_id: entity_id.to_owned(),
-        actor: Some(actor.to_owned()),
-        details_json: Some(json!({"wing": wing, "room": room}).to_string()),
-    }, operation_id)?;
+    state.storage.operational_store().append_event_if_absent_with_operation(
+        &ChangeEvent {
+            event_type: "drawer_added".to_owned(),
+            occurred_at: OffsetDateTime::now_utc(),
+            entity_id: entity_id.to_owned(),
+            actor: Some(actor.to_owned()),
+            details_json: Some(json!({"wing": wing, "room": room}).to_string()),
+        },
+        operation_id,
+    )?;
     Ok(())
 }
 
@@ -2164,7 +2234,7 @@ where
         ),
     };
     if let Some(op) = &operation_id {
-        state.storage.operational_store().append_event_with_operation(&event, op)?;
+        state.storage.operational_store().append_event_if_absent_with_operation(&event, op)?;
     } else {
         state.storage.operational_store().append_event(&event)?;
     }
@@ -2195,7 +2265,7 @@ where
     validate_kg_field("predicate", &body.predicate)?;
     validate_kg_field("object", &body.object)?;
     let ended_text = body.ended.clone();
-    let ended = ended_text
+    let mut ended = ended_text
         .as_deref()
         .map(parse_date)
         .transpose()?
@@ -2231,8 +2301,23 @@ where
                 let response = receipt.response.unwrap_or_else(|| json!({"success": true}));
                 return Ok(Json(response));
             }
-            ReceiptOutcome::Recover(_) => recovering = true,
-            ReceiptOutcome::Fresh(_) => {}
+            ReceiptOutcome::Recover(receipt) => {
+                recovering = true;
+                // A missing `ended` means "today" on the first attempt. Pin that
+                // resolved date in the pending receipt so a retry after midnight
+                // applies the same graph transition and emits the same event.
+                if let Some(pinned) = receipt
+                    .details
+                    .as_ref()
+                    .and_then(|details| details.get("ended"))
+                    .and_then(Value::as_str)
+                {
+                    ended = parse_date(pinned)?;
+                }
+            }
+            ReceiptOutcome::Fresh(_) => {
+                receipts.set_receipt_details(op, &json!({"ended": format_date(ended)}))?;
+            }
         }
     }
 
@@ -2259,10 +2344,7 @@ where
             ),
         };
         if let Some(op) = &operation_id {
-            state
-                .storage
-                .operational_store()
-                .append_event_if_absent_with_operation(&event, op)?;
+            state.storage.operational_store().append_event_if_absent_with_operation(&event, op)?;
         } else {
             state.storage.operational_store().append_event(&event)?;
         }
@@ -2279,7 +2361,7 @@ where
         "success": success,
         "invalidated": invalidated,
         "fact": format!("{} → {} → {}", body.subject, body.predicate, body.object),
-        "ended": body.ended.unwrap_or_else(|| "today".to_owned()),
+        "ended": format_date(ended),
     });
     if let Some(op) = operation_id {
         receipts.complete_receipt(&op, &response)?;
@@ -5242,7 +5324,9 @@ mod tests {
     async fn add_with_supplied_drawer_id_preserves_it() {
         let harness = make_harness().await;
 
-        let supplied_id = "custom-replicated-drawer-id-0001";
+        // DrawerId has no 256-byte ceiling; the receipt must preserve the full
+        // caller-supplied identity so recovery/replay can address it verbatim.
+        let supplied_id = format!("custom-replicated-drawer-{}", "x".repeat(300));
         let resp = harness
             .router
             .clone()
@@ -5371,11 +5455,9 @@ mod tests {
 
         let receipt = receipts.get_receipt(op).unwrap().expect("receipt exists");
         assert_eq!(receipt.status, mempalace_storage::ReceiptState::Completed);
-        assert_eq!(
-            receipt.details,
-            Some(json!({"wing": "wing_code", "room": "idem-test"})),
-            "genuine delete records its scope before running"
-        );
+        assert_eq!(receipt.details.as_ref().and_then(|v| v.get("wing")), Some(&json!("wing_code")));
+        assert_eq!(receipt.details.as_ref().and_then(|v| v.get("room")), Some(&json!("idem-test")));
+        assert!(receipt.details.as_ref().and_then(|v| v.get("incarnation")).is_some());
         assert_eq!(receipt.response, Some(json!({"success": true})));
 
         // Completed replay is idempotent: the same operation replays the stored response, and
@@ -5505,9 +5587,12 @@ mod tests {
         let receipt = receipts.get_receipt(op).unwrap().expect("receipt exists");
         assert_eq!(receipt.status, mempalace_storage::ReceiptState::Completed);
         assert_eq!(
-            receipt.details,
-            Some(json!({"wing": "wing_alpha", "room": "delete-recover"})),
-            "durable delete metadata must survive the crash window"
+            receipt.details.as_ref().and_then(|v| v.get("wing")),
+            Some(&json!("wing_alpha"))
+        );
+        assert_eq!(
+            receipt.details.as_ref().and_then(|v| v.get("room")),
+            Some(&json!("delete-recover"))
         );
 
         // Exactly one restored event, carrying wing and room in its details.
@@ -5564,6 +5649,122 @@ mod tests {
             .filter(|e| e["event_type"] == "drawer_deleted" && e["entity_id"] == drawer_id)
             .collect();
         assert_eq!(final_deleted.len(), 1, "replay must not double-restore: {final_events:?}");
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_does_not_remove_a_recreated_drawer() {
+        let harness = make_harness().await;
+        let drawer_id = "reused-delete-target-0001";
+        let original = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/drawers",
+                ALICE_TOKEN,
+                json!({
+                    "wing": "wing_alpha",
+                    "room": "delete-recreated",
+                    "content": "original content before the delete",
+                    "drawer_id": drawer_id,
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(original.status(), StatusCode::OK);
+        let original_record = harness
+            .state
+            .storage
+            .drawer_store()
+            .get_drawer(&DrawerId::new(drawer_id).unwrap())
+            .await
+            .unwrap()
+            .expect("original drawer exists");
+
+        let op = "op-delete-recreated-1";
+        let receipts = harness.state.storage.receipt_store();
+        let request_hash = mutation_request_hash(&[("drawer_id", json!(drawer_id))]);
+        assert!(matches!(
+            receipts
+                .begin_receipt(&NewReceipt {
+                    operation_id: op.to_owned(),
+                    operation_kind: RECEIPT_KIND_DRAWER_DELETE.to_owned(),
+                    request_hash,
+                    target_id: drawer_id.to_owned(),
+                })
+                .unwrap(),
+            ReceiptOutcome::Fresh(_)
+        ));
+        receipts
+            .set_receipt_details(
+                op,
+                &json!({
+                    "wing": original_record.wing.as_str(),
+                    "room": original_record.room.as_str(),
+                    "incarnation": {
+                        "filed_at": format_rfc3339(original_record.filed_at).unwrap(),
+                        "content_hash": original_record.content_hash,
+                    },
+                }),
+            )
+            .unwrap();
+        let deleted = harness
+            .state
+            .storage
+            .drawer_store()
+            .delete_drawers(std::slice::from_ref(&DrawerId::new(drawer_id).unwrap()))
+            .await
+            .unwrap();
+        assert_eq!(deleted, 1);
+
+        // The caller reuses the id for a new incarnation before the pending delete is retried.
+        let replacement = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/drawers",
+                ALICE_TOKEN,
+                json!({
+                    "wing": "wing_alpha",
+                    "room": "delete-recreated",
+                    "content": "replacement content after the delete",
+                    "drawer_id": drawer_id,
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(replacement.status(), StatusCode::OK);
+
+        let retry = harness
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(format!("/v1/drawers/{drawer_id}?operation_id={op}"))
+                    .header(header::AUTHORIZATION, format!("Bearer {ALICE_TOKEN}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(retry.status(), StatusCode::OK);
+        assert_eq!(body_json(retry).await["success"], true);
+
+        let remaining = harness
+            .state
+            .storage
+            .drawer_store()
+            .get_drawer(&DrawerId::new(drawer_id).unwrap())
+            .await
+            .unwrap()
+            .expect("replacement drawer must survive old delete recovery");
+        assert_eq!(remaining.content, "replacement content after the delete");
+        assert_eq!(
+            receipts.get_receipt(op).unwrap().unwrap().status,
+            mempalace_storage::ReceiptState::Completed
+        );
     }
 
     #[tokio::test]
@@ -5946,6 +6147,86 @@ mod tests {
             })
             .count();
         assert_eq!(restored, 1, "recovery must restore the invalidation event exactly once");
+    }
+
+    #[tokio::test]
+    async fn kg_invalidate_recovery_reuses_pinned_implicit_end_date() {
+        let harness = make_harness().await;
+        let add = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/kg/facts",
+                ALICE_TOKEN,
+                json!({"subject": "PinnedDate", "predicate": "owns", "object": "Item"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(add.status(), StatusCode::OK);
+
+        let op = "op-kg-invalidate-pinned-date-1";
+        let request_hash = mutation_request_hash(&[
+            ("subject", json!("PinnedDate")),
+            ("predicate", json!("owns")),
+            ("object", json!("Item")),
+            ("ended", json!(Option::<String>::None)),
+        ]);
+        let receipts = harness.state.storage.receipt_store();
+        assert!(matches!(
+            receipts
+                .begin_receipt(&NewReceipt {
+                    operation_id: op.to_owned(),
+                    operation_kind: RECEIPT_KIND_KG_INVALIDATE.to_owned(),
+                    request_hash,
+                    target_id: canonical_kg_triple("PinnedDate", "owns", "Item"),
+                })
+                .unwrap(),
+            ReceiptOutcome::Fresh(_)
+        ));
+        // Model the first attempt resolving an omitted date, then crashing before
+        // applying the graph mutation. The retry must use this durable date even
+        // if the wall clock has crossed midnight.
+        receipts.set_receipt_details(op, &json!({"ended": "2026-01-02"})).unwrap();
+
+        let retry = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/kg/facts/invalidate",
+                ALICE_TOKEN,
+                json!({
+                    "subject": "PinnedDate",
+                    "predicate": "owns",
+                    "object": "Item",
+                    "operation_id": op,
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(retry.status(), StatusCode::OK);
+        assert_eq!(body_json(retry).await["ended"], "2026-01-02");
+
+        let runtime = KnowledgeGraphRuntime::new(harness.state.storage.operational_store());
+        let rows = runtime.query_entity("PinnedDate", None, QueryDirection::Outgoing).unwrap();
+        assert_eq!(
+            rows.iter().find(|row| row.object == "Item").and_then(|row| row.valid_to.as_deref()),
+            Some("2026-01-02")
+        );
+        let events = harness
+            .state
+            .storage
+            .operational_store()
+            .get_changes_since(OffsetDateTime::UNIX_EPOCH, 10_000)
+            .unwrap();
+        assert!(events.iter().any(|event| {
+            event.event_type == "kg_fact_invalidated"
+                && event
+                    .details_json
+                    .as_deref()
+                    .is_some_and(|details| details.contains("2026-01-02"))
+        }));
     }
 
     #[tokio::test]

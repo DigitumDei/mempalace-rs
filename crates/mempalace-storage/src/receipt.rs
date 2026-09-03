@@ -192,7 +192,11 @@ CREATE INDEX IF NOT EXISTS idx_mutation_receipts_status
         bounded_identifier(&input.operation_id, "operation_id")?;
         bounded_identifier(&input.operation_kind, "operation_kind")?;
         bounded_identifier(&input.request_hash, "request_hash")?;
-        bounded_identifier(&input.target_id, "target_id")?;
+        // Target ids are validated by the owning domain (e.g. `DrawerId`), which
+        // deliberately has no artificial byte ceiling.  Keep the receipt's
+        // operation metadata bounded, but preserve the full target so a retry
+        // can address the exact same entity.
+        nonempty_identifier(&input.target_id, "target_id")?;
 
         let mut conn = self.connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -373,10 +377,16 @@ fn sql_conv<E: std::fmt::Display>(error: E) -> rusqlite::Error {
 }
 
 fn bounded_identifier(value: &str, name: &str) -> Result<()> {
+    if value.len() > MAX_IDENTIFIER_BYTES {
+        Err(StorageError::Invariant(format!("{name} must be at most {MAX_IDENTIFIER_BYTES} bytes")))
+    } else {
+        nonempty_identifier(value, name)
+    }
+}
+
+fn nonempty_identifier(value: &str, name: &str) -> Result<()> {
     if value.trim().is_empty() {
         Err(StorageError::Invariant(format!("{name} must not be empty")))
-    } else if value.len() > MAX_IDENTIFIER_BYTES {
-        Err(StorageError::Invariant(format!("{name} must be at most {MAX_IDENTIFIER_BYTES} bytes")))
     } else {
         Ok(())
     }
@@ -553,5 +563,23 @@ mod tests {
         let (store, _dir) = store();
         let err = store.begin_receipt(&receipt("", "hash-a")).unwrap_err();
         assert!(err.to_string().contains("operation_id"), "{err}");
+    }
+
+    #[test]
+    fn target_id_is_not_limited_to_operation_metadata_size() {
+        let (store, _dir) = store();
+        let target_id = format!("drawer_{}", "x".repeat(512));
+        let outcome = store
+            .begin_receipt(&NewReceipt {
+                operation_id: "op-long-target".to_owned(),
+                operation_kind: RECEIPT_KIND_DRAWER_ADD.to_owned(),
+                request_hash: "hash-long-target".to_owned(),
+                target_id: target_id.clone(),
+            })
+            .unwrap();
+        let ReceiptOutcome::Fresh(receipt) = outcome else {
+            panic!("expected Fresh, got {outcome:?}");
+        };
+        assert_eq!(receipt.target_id, target_id);
     }
 }

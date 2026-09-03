@@ -1522,9 +1522,10 @@ where
                 let matches: Vec<_> = rows
                     .into_iter()
                     .filter(|row| {
-                        row.subject.eq_ignore_ascii_case(subject)
-                            && row.predicate.eq_ignore_ascii_case(predicate)
-                            && row.object.eq_ignore_ascii_case(object)
+                        canonicalize_kg_label(&row.subject) == canonicalize_kg_label(subject)
+                            && canonicalize_kg_label(&row.predicate)
+                                == canonicalize_kg_label(predicate)
+                            && canonicalize_kg_label(&row.object) == canonicalize_kg_label(object)
                     })
                     .collect();
                 if matches.is_empty() {
@@ -2936,7 +2937,11 @@ where
         }
 
         if let Some(staged) = staged {
-            let operation = self.activate_replication(&staged).map_tool()?;
+            let operation = if staged.state == OutboxState::Staged {
+                self.activate_replication(&staged).map_tool()?
+            } else {
+                staged
+            };
             if let Some(obj) = result.as_object_mut() {
                 obj.insert(
                     "replication".to_owned(),
@@ -3126,7 +3131,11 @@ where
             }
         }
         if let Some(staged) = staged {
-            let operation = self.activate_replication(&staged).map_tool()?;
+            let operation = if staged.state == OutboxState::Staged {
+                self.activate_replication(&staged).map_tool()?
+            } else {
+                staged
+            };
             if let Some(obj) = result.as_object_mut() {
                 obj.insert(
                     "replication".to_owned(),
@@ -3591,7 +3600,11 @@ where
         }
 
         if let Some(staged) = staged {
-            let operation = self.activate_replication(&staged).map_tool()?;
+            let operation = if staged.state == OutboxState::Staged {
+                self.activate_replication(&staged).map_tool()?
+            } else {
+                staged
+            };
             if let Some(obj) = payload.as_object_mut() {
                 obj.insert(
                     "replication".to_owned(),
@@ -3733,7 +3746,11 @@ where
         }
 
         if let Some(staged) = staged {
-            let operation = self.activate_replication(&staged).map_tool()?;
+            let operation = if staged.state == OutboxState::Staged {
+                self.activate_replication(&staged).map_tool()?
+            } else {
+                staged
+            };
             if let Some(obj) = payload.as_object_mut() {
                 obj.insert(
                     "replication".to_owned(),
@@ -11545,6 +11562,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn keyed_kg_operations_reuse_already_activated_outbox_rows() {
+        let mut rules_remotes = BTreeMap::new();
+        rules_remotes.insert(
+            "alpha".to_owned(),
+            ResolvedRemote {
+                name: "alpha".to_owned(),
+                url: "http://127.0.0.1:9999".to_owned(),
+                token: Some("test".to_owned()),
+                timeout: std::time::Duration::from_secs(5),
+            },
+        );
+        let federation = FederationRuntimeConfig {
+            remotes: rules_remotes,
+            default_mode: RouteMode::Combined,
+            default_remote: Some("alpha".to_owned()),
+            wings: BTreeMap::new(),
+            kg: Some(ResolvedRouteRule {
+                mode: RouteMode::Combined,
+                remote: Some("alpha".to_owned()),
+                write: WriteTarget::Both,
+            }),
+            coordination: BTreeMap::new(),
+        };
+        let harness = test_harness_with_federation(federation).await;
+
+        let add_args = json!({
+            "subject": "ReusePerson",
+            "predicate": "lives-in",
+            "object": "ReuseCity",
+            "operation_id": "kg-add-reused"
+        });
+        let first_add = harness
+            .server
+            .handle_request(tool_call(10, "mempalace_kg_add", add_args.clone()))
+            .await;
+        let first_add_payload = decode_tool_payload(&first_add).unwrap();
+        assert_eq!(first_add_payload["success"], true);
+        let second_add = harness
+            .server
+            .handle_request(tool_call(11, "mempalace_kg_add", add_args))
+            .await;
+        let second_add_payload = decode_tool_payload(&second_add).unwrap();
+        assert_eq!(second_add_payload["success"], true);
+        assert_eq!(
+            second_add_payload["replication"]["operation_id"],
+            first_add_payload["replication"]["operation_id"]
+        );
+
+        let invalidate_args = json!({
+            "subject": "ReusePerson",
+            "predicate": "lives_in",
+            "object": "ReuseCity",
+            "operation_id": "kg-invalidate-reused"
+        });
+        let first_invalidate = harness
+            .server
+            .handle_request(tool_call(12, "mempalace_kg_invalidate", invalidate_args.clone()))
+            .await;
+        let first_invalidate_payload = decode_tool_payload(&first_invalidate).unwrap();
+        assert_eq!(first_invalidate_payload["success"], true);
+        let second_invalidate = harness
+            .server
+            .handle_request(tool_call(13, "mempalace_kg_invalidate", invalidate_args))
+            .await;
+        let second_payload = decode_tool_payload(&second_invalidate).unwrap();
+        assert_eq!(second_payload["invalidated"], 0);
+        assert_eq!(
+            second_payload["replication"]["operation_id"],
+            first_invalidate_payload["replication"]["operation_id"]
+        );
+    }
+
+    #[tokio::test]
     async fn staged_kg_reconciliation_determines_current_state_across_all_historical_facts() {
         let harness = test_harness_with_federation(FederationRuntimeConfig::default()).await;
         let runtime = harness.server.runtime.lock().await;
@@ -11600,6 +11690,11 @@ mod tests {
 
         // local_fact_state must see the active fact and return Some(true), even though f1 is historical and invalidated.
         assert_eq!(runtime.local_fact_state("PersonA", "lives_in", "CityA").unwrap(), Some(true));
+        assert_eq!(
+            runtime.local_fact_state("PersonA", "lives-in", "City-A").unwrap(),
+            Some(true),
+            "staged reconciliation must compare canonical graph labels, not raw punctuation"
+        );
 
         // 3. Invalidate the newer active fact as well.
         // `valid_to` is inclusive, so end on yesterday to make the newer row inactive for today.

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # MemPalace installer — downloads the stable build for this platform, verifies
-# its signed manifest and checksums, installs to ~/.mempalace/bin, and registers the MCP
-# server with detected AI tools.
+# its signed manifest and checksums, installs to ~/.mempalace/bin, registers the MCP
+# server with detected AI tools, and warms the embedding model.
 #
 #   curl -fsSL https://raw.githubusercontent.com/DigitumDei/mempalace-rs/main/install.sh | sh
 #
 # Options (pass via `sh -s -- <flags>` when piping):
-#   --no-setup           skip `mempalace-cli setup` (MCP registration)
+#   --no-setup           skip `mempalace-cli setup` (MCP registration + embedding-model warm-up)
 #   --no-path            skip adding the install dir to your shell PATH
 #   --install-dir <dir>  install somewhere other than ~/.mempalace/bin
 #   --channel <channel>  stable (default) or explicit nightly candidate
@@ -43,11 +43,11 @@ while [ $# -gt 0 ]; do
         -h|--help)
             cat <<'EOF'
 MemPalace installer — downloads the stable build for this platform, verifies
-its signed manifest and checksums, installs to ~/.mempalace/bin, and registers the MCP
-server with detected AI tools.
+its signed manifest and checksums, installs to ~/.mempalace/bin, registers the MCP
+server with detected AI tools, and warms the embedding model.
 
 Options (pass via `sh -s -- <flags>` when piping):
-  --no-setup           skip `mempalace-cli setup` (MCP registration)
+  --no-setup           skip `mempalace-cli setup` (MCP registration + embedding-model warm-up)
   --no-path            skip adding the install dir to your shell PATH
   --install-dir <dir>  install somewhere other than ~/.mempalace/bin
   --channel <channel>  stable (default) or explicit nightly candidate
@@ -267,11 +267,25 @@ if [ "${UPDATE_PATH}" -eq 1 ]; then
     fi
 fi
 
-# --- MCP setup ----------------------------------------------------------------
+# --- MCP setup + model warm-up ----------------------------------------------
 if [ "${RUN_SETUP}" -eq 1 ]; then
-    "${INSTALL_DIR}/mempalace-cli" setup
+    if ! "${INSTALL_DIR}/mempalace-cli" setup; then
+        # setup exits non-zero only when the embedding model could not be made
+        # usable offline (see the "check :" line above). The install itself
+        # succeeded, so warn with remediation rather than aborting the script.
+        cat >&2 <<EOF
+
+warning: the embedding-model warm-up in \`setup\` failed.
+  mempalace-cli and mempalace-mcp are installed and usable, but the MCP server
+  will abort with OfflineStartup until the model cache is complete.
+  Fix: re-run \`setup\` with network access to download the model:
+    ${INSTALL_DIR}/mempalace-cli setup
+  or stage the model cache yourself and re-run with the warm-up skipped:
+    ${INSTALL_DIR}/mempalace-cli setup --no-model-warmup
+EOF
+    fi
 else
-    echo "Skipped MCP registration. Run it later with:"
+    echo "Skipped MCP registration and model warm-up. Run them later with:"
     echo "  ${INSTALL_DIR}/mempalace-cli setup"
 fi
 

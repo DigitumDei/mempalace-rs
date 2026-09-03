@@ -22,7 +22,7 @@ Options:
 
 | sh flag | ps1 parameter | Effect |
 |---|---|---|
-| `--no-setup` | `-NoSetup` (or `$env:MEMPALACE_NO_SETUP='1'`) | skip MCP registration |
+| `--no-setup` | `-NoSetup` (or `$env:MEMPALACE_NO_SETUP='1'`) | skip MCP registration and model warm-up |
 | `--no-path` | `-NoPath` (or `$env:MEMPALACE_NO_PATH='1'`) | don't touch your PATH |
 | `--install-dir <dir>` | `-InstallDir <dir>` (or `$env:MEMPALACE_INSTALL_DIR`) | install elsewhere |
 | `--channel nightly --version v<version>-nightly.<full-commit-sha>` | `-Channel nightly -Version v<version>-nightly.<full-commit-sha>` | explicitly install an immutable test candidate |
@@ -118,7 +118,7 @@ mempalace-cli setup --tools claude      # restrict to a comma-separated subset
 mempalace-cli setup --no-model-warmup   # skip the model warm-up (air-gapped, staged cache)
 ```
 
-If the warm-up's offline check fails (no network on a fresh machine), `setup` exits non-zero and prints the remediation — re-run it with network access, or stage the cache yourself and use `--no-model-warmup`.
+If the warm-up's offline check fails (no network on a fresh machine), `setup` exits non-zero and prints the remediation — re-run it with network access, or stage the cache yourself and use `--no-model-warmup`. When the installer runs it, that failure is a warning: the binaries are already installed, so the installer finishes and tells you exactly what to run later to complete the warm-up.
 
 For tools `setup` doesn't cover, point them at `~/.mempalace/bin/mempalace-mcp` manually:
 

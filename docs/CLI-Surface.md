@@ -320,7 +320,7 @@ Behavior:
 - Embedding-model warm-up (unless `--dry-run` or `--no-model-warmup`):
   1. Initialises a download-enabled provider so missing model assets are fetched on a fresh machine (a no-op on a warm cache). The profile and cache are resolved the same way `mempalace-mcp` resolves them at startup.
   2. Re-initialises with downloads disabled — exactly how `mempalace-mcp` starts by default — proving the cache is complete before the MCP server is ever launched.
-  3. Prints a summary (model, cache path, warm and offline-check status). If the offline check fails, the command prints the remediation explicitly and exits non-zero so install scripts surface it.
+  3. Prints a summary (model, cache path, warm and offline-check status). If the offline check fails, the command prints the remediation explicitly and exits non-zero. The installers (`install.sh`/`install.ps1`) treat that as a warning — the install itself has already succeeded — and print their own remediation, so a no-network fresh install still completes.
 - Exit codes:
   - `0` — tools registered/checked; when a warm-up ran, the model is usable offline.
   - `1` — the embedding model is not usable offline (warm-up ran and the offline startup check failed), with the remediation printed.

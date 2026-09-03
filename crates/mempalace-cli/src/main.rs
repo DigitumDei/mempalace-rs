@@ -611,7 +611,11 @@ where
                 text.push_str(&format!("  (embedding model warm-up skipped: {reason})\n\n"));
                 return Ok(CliOutput::success(text));
             }
-            let warmup = run_setup_model_warmup(provider_factory, warmup_provider_factory);
+            let warmup = run_setup_model_warmup(
+                context.config_base_dir.as_deref(),
+                provider_factory,
+                warmup_provider_factory,
+            );
             text.push_str(&warmup.text);
             Ok(CliOutput {
                 exit_code: if warmup.offline_ok { 0 } else { 1 },
@@ -2811,6 +2815,7 @@ struct ModelWarmup {
 /// default — proving the cache is complete before the MCP server is ever
 /// launched. A warm cache adds no more than the model init time.
 fn run_setup_model_warmup<F, H, P>(
+    config_base_dir: Option<&Path>,
     offline_factory: F,
     download_factory: H,
 ) -> ModelWarmup
@@ -2819,7 +2824,7 @@ where
     H: Fn(EmbeddingProfile, PathBuf) -> Result<P, Box<dyn std::error::Error>>,
     P: EmbeddingProvider,
 {
-    let profile = setup_embedding_profile();
+    let profile = setup_embedding_profile(config_base_dir);
     let cache_dir = default_embedding_cache_dir();
     let metadata = profile.metadata();
 
@@ -2866,11 +2871,16 @@ where
 }
 
 /// Resolves the embedding profile `setup` warms, mirroring how `mempalace-mcp`
-/// resolves its own profile at startup. Falls back to the default profile when
-/// no config can be loaded (e.g. a machine with no palace yet) rather than
-/// failing the install path on an unreadable config.
-fn setup_embedding_profile() -> EmbeddingProfile {
-    ConfigLoader::load_with_env(None).map(|config| config.embedding_profile).unwrap_or_default()
+/// resolves its own profile at startup. `config_base_dir` is the test-isolation
+/// base dir threaded from [`CliContext`] (see [`ConfigLoader::load_with_env`]);
+/// `None` resolves the real environment config, like `mempalace-mcp` does.
+/// Falls back to the default profile when no config can be loaded (e.g. a
+/// machine with no palace yet) rather than failing the install path on an
+/// unreadable config.
+fn setup_embedding_profile(config_base_dir: Option<&Path>) -> EmbeddingProfile {
+    ConfigLoader::load_with_env(config_base_dir)
+        .map(|config| config.embedding_profile)
+        .unwrap_or_default()
 }
 
 /// Cache directory actually consulted by the embedding provider: an `HF_HOME`
@@ -3168,13 +3178,40 @@ mod tests {
         // Warm-up download failure alone must not fail setup when the offline
         // check passes (e.g. a warm cache on a machine whose download phase
         // hiccups): the offline startup check is what gates the exit code.
-        let warm_fail = run_setup_model_warmup(stub_provider, offline_only_provider);
+        let warm_fail = run_setup_model_warmup(None, stub_provider, offline_only_provider);
         assert!(warm_fail.offline_ok);
         assert!(warm_fail.text.contains("warm  : failed"));
 
-        let cold = run_setup_model_warmup(offline_only_provider, offline_only_provider);
+        let cold = run_setup_model_warmup(None, offline_only_provider, offline_only_provider);
         assert!(!cold.offline_ok);
         assert!(cold.text.contains("embedding model is not usable offline"));
+    }
+
+    #[test]
+    fn setup_warmup_uses_configured_embedding_profile_from_config_base_dir() {
+        // `setup` must resolve its embedding profile through the same config
+        // source as every other command (CliContext::for_tests base dir), so a
+        // hermetic test can prove a configured low_cpu profile is honoured
+        // rather than silently warming the default.
+        let config_root = temp_config_root("setup-profile");
+        write_file(
+            &config_root.join("config.json"),
+            "{\"embedding_profile\": \"low_cpu\", \"palace_path\": \"palace\"}\n",
+        );
+        let context = CliContext::for_tests(config_root.clone());
+
+        let output = run_cli(["setup", "--tools", "jules"], &context, stub_provider).unwrap();
+
+        assert_eq!(output.exit_code, 0);
+        assert!(output.stdout.contains("Embedding model warm-up"));
+        assert!(
+            output.stdout.contains("Xenova/all-MiniLM-L6-v2"),
+            "warm-up must use the configured low_cpu profile:\n{}",
+            output.stdout
+        );
+        assert!(!output.stdout.contains("sentence-transformers/all-MiniLM-L6-v2"));
+
+        remove_dir_all_if_exists(&config_root);
     }
 
     #[test]

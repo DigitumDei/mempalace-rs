@@ -1,12 +1,12 @@
 # MemPalace installer - downloads the Windows x86_64 stable build, verifies its
-# signed manifest and checksums, installs to ~\.mempalace\bin, and registers the MCP server with
-# detected AI tools.
+# signed manifest and checksums, installs to ~\.mempalace\bin, registers the MCP server with
+# detected AI tools, and warms the embedding model.
 #
 #   irm https://raw.githubusercontent.com/DigitumDei/mempalace-rs/main/install.ps1 | iex
 #
 # Piped `iex` cannot pass parameters; either download the script first and run
 # it with parameters, or set the env-var equivalents before the one-liner:
-#   -NoSetup      / $env:MEMPALACE_NO_SETUP = '1'   skip MCP registration
+#   -NoSetup      / $env:MEMPALACE_NO_SETUP = '1'   skip MCP registration + model warm-up
 #   -NoPath       / $env:MEMPALACE_NO_PATH  = '1'   skip PATH update
 #   -InstallDir   / $env:MEMPALACE_INSTALL_DIR      install somewhere else
 
@@ -219,8 +219,22 @@ try {
 
     if (-not $NoSetup) {
         & (Join-Path $InstallDir 'mempalace-cli.exe') setup
+        if ($LASTEXITCODE -ne 0) {
+            # setup exits non-zero only when the embedding model could not be
+            # made usable offline (see the "check:" line above). The install
+            # itself succeeded, so warn with remediation rather than aborting.
+            Write-Warning @"
+The embedding-model warm-up in setup failed.
+mempalace-cli and mempalace-mcp are installed and usable, but the MCP server
+will abort with OfflineStartup until the model cache is complete.
+Fix: re-run setup with network access to download the model:
+  $(Join-Path $InstallDir 'mempalace-cli.exe') setup
+or stage the model cache yourself and re-run with the warm-up skipped:
+  $(Join-Path $InstallDir 'mempalace-cli.exe') setup --no-model-warmup
+"@
+        }
     } else {
-        Write-Host 'Skipped MCP registration. Run it later with:'
+        Write-Host 'Skipped MCP registration and model warm-up. Run them later with:'
         Write-Host "  $(Join-Path $InstallDir 'mempalace-cli.exe') setup"
     }
 

@@ -6,7 +6,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use mempalace_core::{
-    DIARY_ROOM, DIARY_TOPIC_PREFIX, MempalaceError, Result, SHARED_AGENT_DIARY_WING, WingId,
+    DIARY_ROOM, DIARY_TOPIC_PREFIX, MempalaceError, Result, SHARED_AGENT_DIARY_WING, UNSCOPED_WING,
+    WingId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -571,6 +572,12 @@ pub fn resolve_kg_route(federation: &FederationRuntimeConfig) -> ResolvedRouteRu
 ///   central authorization key for the whole feature (see `docs/Federation.md`'s "Wing is the
 ///   authorization key"), so `wing_agents` coordination must stay local unconditionally, the
 ///   same way the diary is protected everywhere else in the palace.
+/// - **`wing_unscoped` gets the same hard override** (issue #102 Stage 8): it is the reserved
+///   backfill wing for coordination rows that predate wings, has no real wing to authorize
+///   federation against until re-homed, and the server refuses to federate it outright (see
+///   `ServerError::UnscopedNotFederated`). This function is the actual authorization gate for
+///   coordination egress (see the note below), so it already fails closed on it, rather than
+///   relying solely on the server-side refusal.
 pub fn resolve_coordination_route(federation: &FederationRuntimeConfig, wing: &str) -> ResolvedRouteRule {
     // Defence in depth: normalise here too, even though `mempalace-mcp`'s `tool_task_create`
     // already normalises before calling in. This function is the actual authorization gate for
@@ -585,7 +592,7 @@ pub fn resolve_coordination_route(federation: &FederationRuntimeConfig, wing: &s
         return local_rule();
     };
     let wing = canonical.as_str();
-    if wing == SHARED_AGENT_DIARY_WING {
+    if wing == SHARED_AGENT_DIARY_WING || wing == UNSCOPED_WING {
         return local_rule();
     }
     if let Some(rule) = federation.coordination.get(wing) {
@@ -1793,6 +1800,30 @@ mod tests {
             FederationRuntimeConfig { coordination, ..base }
         };
         let result = resolve_coordination_route(&fed, SHARED_AGENT_DIARY_WING);
+        assert_eq!(result.mode, RouteMode::Local);
+        assert_eq!(result.remote, None);
+    }
+
+    /// `wing_unscoped` coordination is hard-overridden to local the same way `wing_agents` is
+    /// (issue #102 Stage 8): it is the reserved backfill wing for pre-wings rows and has no real
+    /// wing to authorize federation against, so an explicit `federation.coordination` entry for
+    /// it must not be honoured.
+    #[test]
+    fn resolve_coordination_route_wing_unscoped_hard_override() {
+        let fed = {
+            let base = work_remote_federation();
+            let mut coordination = BTreeMap::new();
+            coordination.insert(
+                "wing_unscoped".to_owned(),
+                ResolvedRouteRule {
+                    mode: RouteMode::Remote,
+                    remote: Some("work".to_owned()),
+                    write: WriteTarget::Local,
+                },
+            );
+            FederationRuntimeConfig { coordination, ..base }
+        };
+        let result = resolve_coordination_route(&fed, "wing_unscoped");
         assert_eq!(result.mode, RouteMode::Local);
         assert_eq!(result.remote, None);
     }

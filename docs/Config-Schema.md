@@ -391,7 +391,17 @@ token entries, not a field of `config.json`. Its shape (`token`/`name`/
       `coordination_claim` is separate from `coordination_write` on purpose:
       claiming, renewing, and transitioning a task takes a lease and can
       starve other workers, while creating a task or filing an artifact
-      cannot, so a token can hold one without the other.
+      cannot, so a token can hold one without the other in the file. As of
+      issue #102 Stage 7, holding `coordination_claim` on a wing also
+      authorizes `coordination_write` on that same wing at authorization
+      time — a claim-only token can create tasks, send and ack messages, and
+      attach artifacts and results, because claiming a task inherently
+      requires the writes claiming itself entails. The implication runs
+      claim → write only (a `coordination_write` grant does not imply
+      `coordination_claim`), `coordination_read` is unaffected, and the file
+      itself is never rewritten — the widening happens only in the
+      authorization check (`scope_grants` in
+      `crates/mempalace-server/src/lib.rs`), not at load time.
     - Validation: an `operations` string outside that enum, or a malformed
       `wings` entry, fails the token file load — same fail-closed behaviour
       as any other malformed reload (see `TokenRegistry` in
@@ -539,7 +549,16 @@ override layered on top of the other four steps:
    `wing_agents`, room `diary` (within any wing), or a source whose name
    begins with `diary:`. Unconditionally resolved to local storage; any
    config rule that attempts to route diary content remote is warned about
-   and ignored.
+   and ignored. `resolve_coordination_route` applies the identical
+   unconditional override to `wing_unscoped` — the reserved backfill wing for
+   coordination rows that predate wings (issue #102 Stage 8) — for the same
+   reason: there is no real wing on such a record to authorize federation
+   against, so it always resolves local regardless of what
+   `federation.coordination` says about it. Attempting to write, claim, or
+   idempotently replay a `wing_unscoped` coordination record over the
+   federation HTTP API is refused outright with **422** `unscoped_not_federated`
+   (a read is masked as 404 instead) — see [Federation →
+   Troubleshooting](Federation.md#a-coordination-write-returns-422-with-code-unscoped_not_federated).
 2. Explicit per-wing rule in `federation.wings`
 3. Project `mempalace.yaml` `routing` block for the wing declared in that file
 4. `federation.default_mode`

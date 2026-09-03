@@ -6,44 +6,16 @@
 
 Rust implementation of MemPalace — a persistent, structured memory system for LLM agents.
 
-MemPalace stores conversation and project context locally so your AI can search decisions, debugging history, and project knowledge instead of starting from zero each session. No external API calls, no cloud — everything runs on your machine.
-
-## Quick start
-
-Install the latest stable build — downloads the signed release manifest and binaries for your platform, verifies both before installing to `~/.mempalace/bin`, adds it to your PATH, and registers the MCP server with detected AI tools (Claude Code, Codex, Gemini, and more):
-
-**macOS (Apple Silicon) / Linux (x86_64, glibc 2.38+):**
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/DigitumDei/mempalace-rs/main/install.sh | sh
-```
-
-**Windows (x86_64):**
-
-```powershell
-irm https://raw.githubusercontent.com/DigitumDei/mempalace-rs/main/install.ps1 | iex
-```
-
-Then create and fill a palace for a project:
-
-```bash
-mempalace-cli init /path/to/project
-mempalace-cli mine /path/to/project
-```
-
-Stable releases are immutable. Test a candidate only with the explicit `--channel nightly --version v<version>-nightly.<full-commit-sha>` installer options. Other platforms (Intel macOS, ARM Linux, musl) need a [source build](docs/Quickstart.md#1b-build-from-source-alternative).
-
-See the [Quickstart guide](docs/Quickstart.md) for the full walkthrough — installing, initializing, mining, searching, and connecting to Claude/Cursor/Cline.
-Release operators should follow the [signed release runbook](docs/Release-Operations.md).
-
 ## Overview
 
-MemPalace provides a palace-style memory store with:
+MemPalace stores conversation and project context locally so your AI can search decisions, debugging history, and project knowledge instead of starting from zero each session. Embeddings, search, and graph operations run locally with no third-party inference API, telemetry, or analytics. Federation is an explicit opt-in exception for sharing selected wings with a palace endpoint you configure.
+
+It provides:
 
 - Semantic search via local embeddings (no external API calls)
 - A knowledge graph for structured facts, relationships, and timelines
-- An AAAK dialect for compact, human-readable memory storage
 - An MCP server (`mempalace-mcp`) for agent integration (67 tools)
+- Durable task coordination for agent workflows: tasks, messages, artifacts, results, leases, and audit events, available locally and optionally through the federation API
 - Provider-neutral agent lineages and reviewed identity packets that preserve a coherent self
   across model and harness changes
 - A CLI (`mempalace-cli`) for direct palace management
@@ -53,6 +25,35 @@ MemPalace provides a palace-style memory store with:
 - Background maintenance: fragment compaction, version retention, and vector-index optimization, run automatically by the hub and on demand via `mempalace-cli maintain`
 - Federated project mining: when a wing's route targets a remote palace, `mine` prepares chunks locally and pushes them to the remote server via `POST /v1/ingest/batch`; the server embeds and stores them, so teams can share a single mined index without distributing embedding workload to every client
 - Federation: an HTTP server (`mempalace-cli serve`) shares a palace with other clients; per-wing `local`/`remote`/`combined` routing merges remote and local results, with bearer-token auth and `write: both` local-first dual-write support — see the [Federation guide](docs/Federation.md)
+
+## Quick start
+
+The fastest path is to install the latest stable release, initialize a palace for your project, mine its files, and connect the MCP server to your AI tool. The installer verifies the signed release manifest and artifacts, installs into `~/.mempalace/bin`, updates your PATH, and registers the server with supported tools when they are detected.
+
+**macOS (Apple Silicon) / Linux (x86_64, glibc 2.38+):**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/DigitumDei/mempalace-rs/main/install.sh | sh
+```
+
+**Windows (x86_64, PowerShell 7.1+):**
+
+```powershell
+irm https://raw.githubusercontent.com/DigitumDei/mempalace-rs/main/install.ps1 | iex
+```
+
+Then initialize and mine a project:
+
+```bash
+mempalace-cli init /path/to/project
+mempalace-cli mine /path/to/project
+mempalace-cli status
+mempalace-cli search "your query"
+```
+
+Stable releases are the default and are immutable. To install an immutable test candidate, pass `--channel nightly --version v<version>-nightly.<full-commit-sha>` explicitly. Intel macOS, ARM Linux, musl, and other unsupported prebuilt targets require a [source build](docs/Quickstart.md#1b-build-from-source-alternative).
+
+The [Quickstart guide](docs/Quickstart.md) covers source builds, conversation imports, repository views, MCP setup, and lineage configuration. Release operators should follow the [signed release runbook](docs/Release-Operations.md).
 
 ## Crates
 
@@ -77,7 +78,7 @@ MemPalace provides a palace-style memory store with:
 
 ## Requirements
 
-These apply only when building from source — the prebuilt nightly install above needs none of them (including the corporate-SSL configuration below).
+These apply only when building from source — the prebuilt stable or nightly installers need none of them (including the corporate-SSL configuration below).
 
 - Rust 1.88+
 - `protobuf-compiler` (for storage layer)

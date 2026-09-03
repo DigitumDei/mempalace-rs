@@ -387,8 +387,8 @@ These commands are intentionally visible but not shipped as working Rust v1 func
 - `compress`
 
 Each returns a non-zero result and prints a pointer to the Phase 9 deferral decision record
-(`docs/rust-phase-plans/Phase09-Deferred-Commands.md`). That record is not published in this
-repository — the deferral itself is recorded in [Release Scope](Release-Scope.md).
+(`docs/rust-phase-plans/Phase09-Deferred-Commands.md`). See that record for the rationale and
+the current boundary of the deferred commands.
 
 ## Exit Behavior
 

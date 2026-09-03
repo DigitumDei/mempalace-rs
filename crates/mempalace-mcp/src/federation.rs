@@ -599,8 +599,12 @@ impl FederationRouter {
                     })))
                 }
             }
-            Err(RemoteError::RemoteRejected { status: 409, .. }) => {
-                // Race condition: duplicate inserted between pre-check and add.
+            Err(error @ RemoteError::RemoteRejected { status: 409, .. })
+                if is_duplicate_rejection(&error) =>
+            {
+                // Race condition: duplicate inserted between pre-check and add.  A different
+                // 409 (notably operation_id_conflict) is authoritative and must not be hidden as
+                // a harmless duplicate.
                 Ok(Some(json!({
                     "success": false,
                     "reason": "duplicate",
@@ -745,16 +749,30 @@ impl FederationRouter {
                     reason: "remote rejected the write".to_owned(),
                 }
             }
-            Err(RemoteError::RemoteRejected { status: 409, .. }) => {
-                tracing::warn!(
-                    remote = %remote_name,
-                    wing = %wing,
-                    room = %room,
-                    "add_drawer replicate: remote duplicate (409)"
-                );
-                ReplicationStatus::Failed {
-                    remote: remote_name.to_owned(),
-                    reason: "duplicate (409) on remote".to_owned(),
+            Err(error @ RemoteError::RemoteRejected { status: 409, .. }) => {
+                if is_duplicate_rejection(&error) {
+                    tracing::warn!(
+                        remote = %remote_name,
+                        wing = %wing,
+                        room = %room,
+                        "add_drawer replicate: remote duplicate (409)"
+                    );
+                    ReplicationStatus::Failed {
+                        remote: remote_name.to_owned(),
+                        reason: "duplicate (409) on remote".to_owned(),
+                    }
+                } else {
+                    tracing::warn!(
+                        remote = %remote_name,
+                        wing = %wing,
+                        room = %room,
+                        error = %error,
+                        "add_drawer replicate: remote rejected the write"
+                    );
+                    ReplicationStatus::Failed {
+                        remote: remote_name.to_owned(),
+                        reason: format!("remote rejection: {error}"),
+                    }
                 }
             }
             Err(e) => {
@@ -2347,6 +2365,17 @@ fn format_remote_origin(name: &str) -> String {
     if name.starts_with("remote:") { name.to_owned() } else { format!("remote:{name}") }
 }
 
+/// Return whether a remote's HTTP 409 is the semantic duplicate response.  Federation errors
+/// encode the server's machine-readable error code at the beginning of the body (`code: message`);
+/// treating every 409 as a duplicate would hide operation-id conflicts and other authoritative
+/// rejections from callers.
+fn is_duplicate_rejection(error: &RemoteError) -> bool {
+    let RemoteError::RemoteRejected { status: 409, body, .. } = error else {
+        return false;
+    };
+    body.split_once(':').map(|(code, _)| code.trim()) == Some("duplicate")
+}
+
 static OPERATION_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// Generate a unique, stable operation identifier for direct remote mutations when the caller
@@ -3243,6 +3272,7 @@ mod tests {
         search_results: Vec<Value>,
         add_drawer_success: bool,
         add_drawer_409: bool,
+        add_drawer_409_body: String,
         duplicate_matches: Vec<Value>,
         taxonomy: Value,
         wings: Value,
@@ -3306,6 +3336,7 @@ mod tests {
                 search_results: vec![],
                 add_drawer_success: true,
                 add_drawer_409: false,
+                add_drawer_409_body: "duplicate: near-duplicate content".to_owned(),
                 duplicate_matches: vec![],
                 taxonomy: json!({"taxonomy": {}}),
                 wings: json!({"wings": {}}),
@@ -3507,7 +3538,7 @@ mod tests {
                 return Err(RemoteError::RemoteRejected {
                     remote: "mock".to_owned(),
                     status: 409,
-                    body: "conflict".to_owned(),
+                    body: self.add_drawer_409_body.clone(),
                 });
             }
             Ok(AddDrawerResponse {
@@ -4722,6 +4753,39 @@ mod tests {
         assert_eq!(result["applied_to"], "remote:alpha");
         let matches = result["matches"].as_array().unwrap();
         assert_eq!(matches.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn e2e_add_drawer_operation_conflict_is_not_reported_as_duplicate() {
+        let mut mock = MockRemote::default();
+        mock.add_drawer_409 = true;
+        mock.add_drawer_409_body = "operation_id_conflict: operation already used".to_owned();
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+
+        let route = make_combined_route("alpha");
+        let error = router
+            .add_drawer_remote_with_operation(
+                "w",
+                "r",
+                "content",
+                "file.txt",
+                "agent",
+                &route,
+                0.9,
+                Some("op-conflict-1"),
+            )
+            .await
+            .expect_err("operation-id conflict must remain an authoritative error");
+
+        match error {
+            ToolError::Internal(McpError::Federation(message)) => {
+                assert!(message.contains("operation_id_conflict"));
+                assert!(!message.contains("reason: duplicate"));
+            }
+            other => panic!("expected federation error, got {other:?}"),
+        }
     }
 
     #[tokio::test]

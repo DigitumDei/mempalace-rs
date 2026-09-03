@@ -1501,6 +1501,7 @@ where
                     restore_added_event(
                         &state,
                         &receipt.target_id,
+                        op,
                         identity.as_str(),
                         wing.as_str(),
                         room.as_str(),
@@ -1579,13 +1580,18 @@ where
         })
         .await?;
 
-    state.storage.operational_store().append_event(&ChangeEvent {
+    let event = ChangeEvent {
         event_type: "drawer_added".to_owned(),
         occurred_at: now,
         entity_id: drawer_id.as_str().to_owned(),
         actor: Some(identity),
         details_json: Some(json!({"wing": wing.as_str(), "room": room.as_str()}).to_string()),
-    })?;
+    };
+    if let Some(op) = &operation_id {
+        state.storage.operational_store().append_event_with_operation(&event, op)?;
+    } else {
+        state.storage.operational_store().append_event(&event)?;
+    }
 
     let response = serde_json::to_value(add_drawer_response(
         drawer_id.as_str(),
@@ -1755,7 +1761,7 @@ where
             // change event was never appended. Restore exactly one event, with the wing/room
             // captured on the receipt *before* the delete ran, so scoped change reads can see
             // the deletion.
-            restore_deleted_event(&state, &id, auth.0.0.as_str(), Some(details))?;
+            restore_deleted_event(&state, &id, op, auth.0.0.as_str(), Some(details))?;
             let response = json!({"success": true});
             receipts.complete_receipt(op, &response)?;
             return Ok(Json(response));
@@ -1805,7 +1811,7 @@ where
         return Err(ServerError::NotFound(format!("drawer {id} not found")));
     }
     if deleted > 0 {
-        state.storage.operational_store().append_event(&ChangeEvent {
+        let event = ChangeEvent {
             event_type: "drawer_deleted".to_owned(),
             occurred_at: OffsetDateTime::now_utc(),
             entity_id: id,
@@ -1815,7 +1821,12 @@ where
             details_json: Some(
                 json!({"wing": drawer.wing.as_str(), "room": drawer.room.as_str()}).to_string(),
             ),
-        })?;
+        };
+        if let Some(op) = &operation_id {
+            state.storage.operational_store().append_event_with_operation(&event, op)?;
+        } else {
+            state.storage.operational_store().append_event(&event)?;
+        }
     }
     if let Some(op) = operation_id {
         receipts.complete_receipt(&op, &response)?;
@@ -1838,6 +1849,7 @@ where
 fn restore_deleted_event<P>(
     state: &Arc<ServerState<P>>,
     entity_id: &str,
+    operation_id: &str,
     actor: &str,
     details: Option<&Value>,
 ) -> Result<(), ServerError>
@@ -1848,13 +1860,13 @@ where
     let Some(details) = details else {
         return Ok(());
     };
-    operational.append_event_if_absent(&ChangeEvent {
+    operational.append_event_if_absent_with_operation(&ChangeEvent {
         event_type: "drawer_deleted".to_owned(),
         occurred_at: OffsetDateTime::now_utc(),
         entity_id: entity_id.to_owned(),
         actor: Some(actor.to_owned()),
         details_json: Some(details.to_string()),
-    })?;
+    }, operation_id)?;
     Ok(())
 }
 
@@ -1889,6 +1901,7 @@ fn authorize_delete_receipt_scope(
 fn restore_added_event<P>(
     state: &Arc<ServerState<P>>,
     entity_id: &str,
+    operation_id: &str,
     actor: &str,
     wing: &str,
     room: &str,
@@ -1896,13 +1909,13 @@ fn restore_added_event<P>(
 where
     P: EmbeddingProvider + Send + Sync + 'static,
 {
-    state.storage.operational_store().append_event_if_absent(&ChangeEvent {
+    state.storage.operational_store().append_event_if_absent_with_operation(&ChangeEvent {
         event_type: "drawer_added".to_owned(),
         occurred_at: OffsetDateTime::now_utc(),
         entity_id: entity_id.to_owned(),
         actor: Some(actor.to_owned()),
         details_json: Some(json!({"wing": wing, "room": room}).to_string()),
-    })?;
+    }, operation_id)?;
     Ok(())
 }
 
@@ -2075,16 +2088,9 @@ where
                 return Ok(Json(response));
             }
             ReceiptOutcome::Recover(_receipt) => {
-                // A prior attempt started but never completed (crash). Inspect the stable target
-                // state: if the exact triple is already present the add already took effect, so
-                // converge (the receipt's target id is that triple) and skip the change event.
-                let effect_present = kg_fact_exists(
-                    &runtime,
-                    &body.subject,
-                    &body.predicate,
-                    &body.object,
-                    valid_from,
-                )?;
+                // A prior attempt started but never completed (crash). Re-applying the add is
+                // idempotent over the triple; the event below is restored for this operation even
+                // when the graph effect was already present.
                 let triple_id = runtime.add_fact(
                     AddFactRequest {
                         subject: body.subject.clone(),
@@ -2100,19 +2106,24 @@ where
                     },
                     now,
                 )?;
-                if !effect_present {
-                    state.storage.operational_store().append_event(&ChangeEvent {
-                        event_type: "kg_fact_added".to_owned(),
-                        occurred_at: now,
-                        entity_id: triple_id.clone(),
-                        actor: Some(identity),
-                        details_json: Some(
-                            json!({"subject": body.subject, "predicate": body.predicate,
-                                   "object": body.object})
-                            .to_string(),
-                        ),
-                    })?;
-                }
+                // Whether or not the graph effect was already present, the event is part of the
+                // same operation's durable outcome. Restore it atomically before completing the
+                // receipt; operation-scoped deduplication also handles a crash after this call.
+                let event = ChangeEvent {
+                    event_type: "kg_fact_added".to_owned(),
+                    occurred_at: now,
+                    entity_id: triple_id.clone(),
+                    actor: Some(identity.clone()),
+                    details_json: Some(
+                        json!({"subject": body.subject, "predicate": body.predicate,
+                               "object": body.object})
+                        .to_string(),
+                    ),
+                };
+                state
+                    .storage
+                    .operational_store()
+                    .append_event_if_absent_with_operation(&event, op)?;
                 let response = json!({
                     "success": true,
                     "triple_id": triple_id,
@@ -2142,7 +2153,7 @@ where
         now,
     )?;
 
-    state.storage.operational_store().append_event(&ChangeEvent {
+    let event = ChangeEvent {
         event_type: "kg_fact_added".to_owned(),
         occurred_at: now,
         entity_id: triple_id.clone(),
@@ -2151,7 +2162,12 @@ where
             json!({"subject": body.subject, "predicate": body.predicate, "object": body.object})
                 .to_string(),
         ),
-    })?;
+    };
+    if let Some(op) = &operation_id {
+        state.storage.operational_store().append_event_with_operation(&event, op)?;
+    } else {
+        state.storage.operational_store().append_event(&event)?;
+    }
 
     let response = json!({
         "success": true,
@@ -2188,6 +2204,7 @@ where
     let runtime = KnowledgeGraphRuntime::new(state.storage.operational_store());
 
     let operation_id = body.operation_id.clone();
+    let mut recovering = false;
     let receipts = state.storage.receipt_store();
 
     // Idempotency gate for the invalidate replay path.
@@ -2214,7 +2231,8 @@ where
                 let response = receipt.response.unwrap_or_else(|| json!({"success": true}));
                 return Ok(Json(response));
             }
-            ReceiptOutcome::Recover(_) | ReceiptOutcome::Fresh(_) => {}
+            ReceiptOutcome::Recover(_) => recovering = true,
+            ReceiptOutcome::Fresh(_) => {}
         }
     }
 
@@ -2228,8 +2246,8 @@ where
             Err(error) => return Err(error.into()),
         };
 
-    if invalidated > 0 {
-        state.storage.operational_store().append_event(&ChangeEvent {
+    if invalidated > 0 || recovering {
+        let event = ChangeEvent {
             event_type: "kg_fact_invalidated".to_owned(),
             occurred_at: now,
             entity_id: format!("{} → {} → {}", body.subject, body.predicate, body.object),
@@ -2239,7 +2257,15 @@ where
                        "ended": format_date(ended)})
                 .to_string(),
             ),
-        })?;
+        };
+        if let Some(op) = &operation_id {
+            state
+                .storage
+                .operational_store()
+                .append_event_if_absent_with_operation(&event, op)?;
+        } else {
+            state.storage.operational_store().append_event(&event)?;
+        }
     }
 
     // Legacy shape: `success` mirrors whether a row was invalidated. Operation-aware requests treat
@@ -4274,35 +4300,6 @@ fn canonical_kg_triple(subject: &str, predicate: &str, object: &str) -> String {
     format!("kg:{}", hash_text(&canonical))
 }
 
-/// Inspect the stable target state for a KG fact-add: is the exact triple already present?
-///
-/// This is the "recover safely by inspecting stable target state" check for the KG-add handler. A
-/// pending receipt means the prior attempt may have applied the add before crashing; querying the
-/// entity avoids re-running the mutation (and re-appending the change event) when its effect is
-/// already durable. Unknown subject entities are treated as *not present* — the add cannot have
-/// taken effect because the entity does not exist — rather than as an error.
-fn kg_fact_exists<S>(
-    runtime: &KnowledgeGraphRuntime<'_, S>,
-    subject: &str,
-    predicate: &str,
-    object: &str,
-    valid_from: Option<Date>,
-) -> Result<bool, ServerError>
-where
-    S: EntityRegistryStore + KnowledgeGraphStore,
-{
-    let expected_predicate = canonical_kg_label(predicate);
-    match runtime.query_entity(subject, None, QueryDirection::Outgoing) {
-        Err(mempalace_graph::GraphError::UnknownEntity { .. }) => Ok(false),
-        Err(error) => Err(error.into()),
-        Ok(rows) => Ok(rows.iter().any(|row| {
-            row.predicate == expected_predicate
-                && row.object.eq_ignore_ascii_case(object)
-                && row.valid_from == valid_from.map(format_date)
-        })),
-    }
-}
-
 /// Formats an `OffsetDateTime` as RFC 3339.
 fn format_rfc3339(dt: OffsetDateTime) -> Result<String, ServerError> {
     dt.format(&Rfc3339).map_err(|err| ServerError::InvalidParams(err.to_string()))
@@ -5730,9 +5727,9 @@ mod tests {
         assert_eq!(first.status(), StatusCode::OK);
         let triple_id = body_json(first).await["triple_id"].as_str().unwrap().to_owned();
 
-        // Rewind the completed receipt to pending — the crash signature of "fact applied but the
-        // receipt was never completed". Recovery must detect the effect and converge without
-        // duplicating the fact or re-appending a change event.
+        // Rewind the completed receipt to pending and remove its event — the crash signature of
+        // "fact applied and event/receipt completion were never durable". Recovery must detect
+        // the effect and restore the event without duplicating the fact.
         let sqlite_path = harness.state.storage.layout().sqlite_path.clone();
         {
             let conn = rusqlite::Connection::open(&sqlite_path).unwrap();
@@ -5740,6 +5737,11 @@ mod tests {
                 "UPDATE mutation_receipts SET status='pending', response_json=NULL, completed_at=NULL \
                  WHERE operation_id=?1",
                 [op],
+            )
+            .unwrap();
+            conn.execute(
+                "DELETE FROM change_log WHERE entity_id=?1 AND event_type='kg_fact_added'",
+                [triple_id.as_str()],
             )
             .unwrap();
         }
@@ -5776,6 +5778,16 @@ mod tests {
             harness.state.storage.receipt_store().get_receipt(op).unwrap().unwrap().status,
             mempalace_storage::ReceiptState::Completed
         );
+        let restored = harness
+            .state
+            .storage
+            .operational_store()
+            .get_changes_since(OffsetDateTime::UNIX_EPOCH, 10_000)
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.event_type == "kg_fact_added" && event.entity_id == triple_id)
+            .count();
+        assert_eq!(restored, 1, "KG add recovery must restore its missing event exactly once");
     }
 
     #[tokio::test]
@@ -5851,6 +5863,89 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(never_added.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn kg_invalidate_recovery_restores_missing_event_when_effect_is_already_gone() {
+        let harness = make_harness().await;
+        let add = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/kg/facts",
+                ALICE_TOKEN,
+                json!({"subject": "RecoverInvalidate", "predicate": "owns", "object": "Item"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(add.status(), StatusCode::OK);
+
+        let op = "op-kg-invalidate-recover-event-1";
+        let payload = json!({
+            "subject": "RecoverInvalidate",
+            "predicate": "owns",
+            "object": "Item",
+            "ended": "2026-08-01",
+            "operation_id": op,
+        });
+        let first = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/kg/facts/invalidate",
+                ALICE_TOKEN,
+                payload.clone(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(body_json(first).await["invalidated"], 1);
+
+        let sqlite_path = harness.state.storage.layout().sqlite_path.clone();
+        {
+            let conn = rusqlite::Connection::open(&sqlite_path).unwrap();
+            conn.execute(
+                "UPDATE mutation_receipts SET status='pending', response_json=NULL, completed_at=NULL \
+                 WHERE operation_id=?1",
+                [op],
+            )
+            .unwrap();
+            conn.execute(
+                "DELETE FROM change_log WHERE entity_id=?1 AND event_type='kg_fact_invalidated'",
+                ["RecoverInvalidate → owns → Item"],
+            )
+            .unwrap();
+        }
+
+        let recovered = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/kg/facts/invalidate",
+                ALICE_TOKEN,
+                payload,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(recovered.status(), StatusCode::OK);
+        assert_eq!(body_json(recovered).await["success"], true);
+
+        let restored = harness
+            .state
+            .storage
+            .operational_store()
+            .get_changes_since(OffsetDateTime::UNIX_EPOCH, 10_000)
+            .unwrap()
+            .into_iter()
+            .filter(|event| {
+                event.event_type == "kg_fact_invalidated"
+                    && event.entity_id == "RecoverInvalidate → owns → Item"
+            })
+            .count();
+        assert_eq!(restored, 1, "recovery must restore the invalidation event exactly once");
     }
 
     #[tokio::test]

@@ -254,6 +254,15 @@ CREATE INDEX IF NOT EXISTS idx_lineage_migrations_lineage_created
 ON lineage_migrations(lineage_id, created_at DESC);
         "#,
     ),
+    (
+        "0010_change_log_operation_identity",
+        r#"
+ALTER TABLE change_log ADD COLUMN operation_id TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_change_log_operation_event
+ON change_log(operation_id, event_type);
+        "#,
+    ),
 ];
 
 pub trait IngestManifestStore {
@@ -447,6 +456,9 @@ pub struct ChangeEvent {
 
 pub trait ChangeLogStore {
     fn append_event(&self, event: &ChangeEvent) -> Result<()>;
+    /// Append a change event carrying the stable mutation operation identity. Operation-aware
+    /// recovery uses this identity to distinguish separate mutations of the same entity.
+    fn append_event_with_operation(&self, event: &ChangeEvent, operation_id: &str) -> Result<()>;
     /// Whether the change log already contains at least one event with the given
     /// `entity_id` and `event_type`. Used to make crash-window recovery idempotent: a handler
     /// restores a lost side-effect event only when none already exists.
@@ -457,6 +469,14 @@ pub trait ChangeLogStore {
     /// exactly one wins. Returns `true` when the event was inserted and `false` when it was
     /// skipped because a matching event already existed.
     fn append_event_if_absent(&self, event: &ChangeEvent) -> Result<bool>;
+    /// Atomically append a recovered event iff this operation has not already recorded the same
+    /// event type. Unlike the legacy entity/type check, this allows later operations on a reused
+    /// entity id to produce their own event.
+    fn append_event_if_absent_with_operation(
+        &self,
+        event: &ChangeEvent,
+        operation_id: &str,
+    ) -> Result<bool>;
     fn get_changes_since(&self, since: OffsetDateTime, limit: usize) -> Result<Vec<ChangeEvent>>;
     fn get_recent_changes(&self, limit: usize) -> Result<Vec<ChangeEvent>>;
     /// Cursor-paginated forward scan of the change log.
@@ -526,6 +546,7 @@ impl SqliteOperationalStore {
             "0007_diary_summary_length_constraint",
             "0008_maintenance_leases",
             "0009_agent_lineages",
+            "0010_change_log_operation_identity",
         ]
     }
 
@@ -1956,22 +1977,19 @@ impl SelfModelStore for SqliteOperationalStore {
 
 impl ChangeLogStore for SqliteOperationalStore {
     fn append_event(&self, event: &ChangeEvent) -> Result<()> {
-        let change_id = format!("{}:{}", event.occurred_at.unix_timestamp_nanos(), event.entity_id);
-        let connection = self.open_connection()?;
-        connection.execute(
-            "INSERT OR IGNORE INTO change_log
-                 (change_id, event_type, occurred_at, entity_id, actor, details_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                change_id,
-                event.event_type,
-                encode_time(event.occurred_at),
-                event.entity_id,
-                event.actor,
-                event.details_json,
-            ],
-        )?;
-        Ok(())
+        append_event_inner(self, event, None)
+    }
+
+    fn append_event_with_operation(&self, event: &ChangeEvent, operation_id: &str) -> Result<()> {
+        append_event_inner(self, event, Some(operation_id))
+    }
+
+    fn append_event_if_absent_with_operation(
+        &self,
+        event: &ChangeEvent,
+        operation_id: &str,
+    ) -> Result<bool> {
+        append_event_if_absent_inner(self, event, Some(operation_id))
     }
 
     fn event_exists(&self, entity_id: &str, event_type: &str) -> Result<bool> {
@@ -1987,39 +2005,7 @@ impl ChangeLogStore for SqliteOperationalStore {
     }
 
     fn append_event_if_absent(&self, event: &ChangeEvent) -> Result<bool> {
-        let change_id = format!("{}:{}", event.occurred_at.unix_timestamp_nanos(), event.entity_id);
-        // `open_connection` leaves the busy timeout unset (SQLITE_BUSY on the spot). Concurrent
-        // recovery retries must instead block until the winning writer commits — otherwise the
-        // loser of the race surfaces an error rather than a clean "already restored" skip —
-        // so this method arms a bounded busy handler before `BEGIN IMMEDIATE`.
-        let mut connection = self.open_connection()?;
-        connection.busy_timeout(std::time::Duration::from_millis(5_000))?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let exists: bool = transaction
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM change_log WHERE entity_id=?1 AND event_type=?2)",
-                params![event.entity_id, event.event_type],
-                |row| row.get(0),
-            )
-            .map_err(StorageError::from)?;
-        if exists {
-            return Ok(false);
-        }
-        transaction.execute(
-            "INSERT INTO change_log
-                 (change_id, event_type, occurred_at, entity_id, actor, details_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                change_id,
-                event.event_type,
-                encode_time(event.occurred_at),
-                event.entity_id,
-                event.actor,
-                event.details_json,
-            ],
-        )?;
-        transaction.commit()?;
-        Ok(true)
+        append_event_if_absent_inner(self, event, None)
     }
 
     fn get_changes_since(&self, since: OffsetDateTime, limit: usize) -> Result<Vec<ChangeEvent>> {
@@ -2150,6 +2136,93 @@ impl ChangeLogStore for SqliteOperationalStore {
 
         Ok(ChangePage { events: rows.into_iter().map(|(_, event)| event).collect(), next_cursor })
     }
+}
+
+fn change_id_for_event(event: &ChangeEvent, operation_id: Option<&str>) -> String {
+    match operation_id {
+        Some(operation_id) => format!(
+            "{}:{}:{}:{}",
+            event.occurred_at.unix_timestamp_nanos(),
+            operation_id,
+            event.event_type,
+            event.entity_id
+        ),
+        None => format!("{}:{}", event.occurred_at.unix_timestamp_nanos(), event.entity_id),
+    }
+}
+
+fn append_event_inner(
+    store: &SqliteOperationalStore,
+    event: &ChangeEvent,
+    operation_id: Option<&str>,
+) -> Result<()> {
+    let change_id = change_id_for_event(event, operation_id);
+    let connection = store.open_connection()?;
+    connection.execute(
+        "INSERT OR IGNORE INTO change_log
+             (change_id, event_type, occurred_at, entity_id, actor, details_json, operation_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            change_id,
+            event.event_type,
+            encode_time(event.occurred_at),
+            event.entity_id,
+            event.actor,
+            event.details_json,
+            operation_id,
+        ],
+    )?;
+    Ok(())
+}
+
+fn append_event_if_absent_inner(
+    store: &SqliteOperationalStore,
+    event: &ChangeEvent,
+    operation_id: Option<&str>,
+) -> Result<bool> {
+    let change_id = change_id_for_event(event, operation_id);
+    // `open_connection` leaves the busy timeout unset (SQLITE_BUSY on the spot). Concurrent
+    // recovery retries must instead block until the winning writer commits — otherwise the
+    // loser of the race surfaces an error rather than a clean "already restored" skip —
+    // so this method arms a bounded busy handler before `BEGIN IMMEDIATE`.
+    let mut connection = store.open_connection()?;
+    connection.busy_timeout(std::time::Duration::from_millis(5_000))?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let exists: bool = match operation_id {
+        Some(operation_id) => transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM change_log WHERE operation_id=?1 AND event_type=?2)",
+                params![operation_id, event.event_type],
+                |row| row.get(0),
+            )
+            .map_err(StorageError::from)?,
+        None => transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM change_log WHERE entity_id=?1 AND event_type=?2)",
+                params![event.entity_id, event.event_type],
+                |row| row.get(0),
+            )
+            .map_err(StorageError::from)?,
+    };
+    if exists {
+        return Ok(false);
+    }
+    transaction.execute(
+        "INSERT INTO change_log
+             (change_id, event_type, occurred_at, entity_id, actor, details_json, operation_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            change_id,
+            event.event_type,
+            encode_time(event.occurred_at),
+            event.entity_id,
+            event.actor,
+            event.details_json,
+            operation_id,
+        ],
+    )?;
+    transaction.commit()?;
+    Ok(true)
 }
 
 impl MaintenanceLeaseStore for SqliteOperationalStore {
@@ -2713,6 +2786,53 @@ mod tests {
             json!({"wing": "wing_alpha", "room": "delete-recover"}),
             "restored event must keep the scoped wing/room metadata"
         );
+    }
+
+    #[test]
+    fn operation_scoped_event_recovery_allows_reused_entity_ids() {
+        let tempdir = tempdir().unwrap();
+        let store = SqliteOperationalStore::new(tempdir.path().join("storage.sqlite3"));
+        store.ensure_schema().unwrap();
+
+        let event = |timestamp, operation_id| {
+            store.append_event_if_absent_with_operation(
+                &ChangeEvent {
+                    event_type: "drawer_deleted".to_owned(),
+                    occurred_at: timestamp,
+                    entity_id: "reused-drawer".to_owned(),
+                    actor: Some("alice".to_owned()),
+                    details_json: Some(
+                        json!({"wing": "wing_alpha", "room": "reused"}).to_string(),
+                    ),
+                },
+                operation_id,
+            )
+        };
+
+        assert!(event(datetime!(2026-06-01 12:00:00 UTC), "delete-op-1").unwrap());
+        assert!(!event(datetime!(2026-06-01 12:00:01 UTC), "delete-op-1").unwrap());
+        assert!(
+            event(datetime!(2026-06-01 12:00:02 UTC), "delete-op-2").unwrap(),
+            "a distinct operation must not be suppressed by the prior operation's event"
+        );
+
+        let conn = rusqlite::Connection::open(store.path()).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM change_log WHERE entity_id='reused-drawer' AND event_type='drawer_deleted'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+        let operation_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM change_log WHERE operation_id IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(operation_count, 2);
     }
 
     #[test]

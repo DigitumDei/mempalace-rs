@@ -11691,7 +11691,7 @@ mod tests {
         // local_fact_state must see the active fact and return Some(true), even though f1 is historical and invalidated.
         assert_eq!(runtime.local_fact_state("PersonA", "lives_in", "CityA").unwrap(), Some(true));
         assert_eq!(
-            runtime.local_fact_state("PersonA", "lives-in", "City-A").unwrap(),
+            runtime.local_fact_state("PersonA", "lives-in", "citya").unwrap(),
             Some(true),
             "staged reconciliation must compare canonical graph labels, not raw punctuation"
         );

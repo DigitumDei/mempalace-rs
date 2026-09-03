@@ -40,6 +40,94 @@ Treat returned cursors as opaque and persist them with worker state. After resta
 
 As of issue #102 Stage 4, this tool surface is federation-aware: `mempalace_task_create` routes by its wing's `federation.coordination` rule, and every other tool above falls back across configured remotes by ID after a local miss (mirroring `mempalace_delete_drawer`'s existing local-first pattern) — a task's `wing` is never supplied to those calls, so there is nothing else to route by. `mempalace_inbox_read`/`mempalace_coordination_events` always read local and additionally fan out to every configured remote, reporting `remote_messages`/`remote_events` alongside the local result — `mempalace_coordination_event_get` is the one exception, staying local-only because Stage 3 never exposed a single-event GET route on the wire. Both fan-out tools also accept a `remote_cursors` object argument (`{"<remote_name>": "<opaque_cursor>"}`) to continue a specific remote's page independently of the local `cursor`; a page's own `remote_messages`/`remote_events` entries carry the `next_cursor` to feed back for that remote. See [Federation → Part 7, Federated coordination](Federation.md#part-7--federated-coordination) for the full routing rules, the server-side REST surface used by a remote peer, and the conflict/capability-gate error shapes.
 
+## Protocol adapter tools (A2A and MCP Tasks)
+
+Issue #102 Stages 6-8 added two pure-translation crates — `mempalace-a2a` (the
+[A2A protocol](https://a2a-protocol.org), v1.0) and `mempalace-mcp-tasks` (the
+[MCP Tasks extension](https://github.com/modelcontextprotocol/ext-tasks),
+`io.modelcontextprotocol/tasks`) — that translate between those wire protocols and the
+`coordination_tasks`/`coordination_messages`/`coordination_artifacts` model above. Neither crate
+has an MCP tool, an HTTP route, or any storage handle of its own; Stages 9-10 are what wires them
+into the MCP tool surface, so a caller can actually reach the translation. There is still no A2A
+HTTP surface and no MCP Tasks transport — these tools translate a wire payload the caller already
+received or is about to send over its own transport, they do not speak either protocol on the
+network themselves.
+
+Both adapters follow the same "translate AND persist" contract: an "import" tool does not just
+convert a wire shape into a MemPalace type and hand it back — it also performs the storage write
+and, for task imports, records the raw wire JSON verbatim as an immutable `protocol_envelope`-role
+artifact. The audit trail exists only because the tool writes it; a caller that instead calls a
+bare translation function and does its own storage writes would not automatically produce one.
+`a2a_task`/`a2a_message`/`a2a_artifact`/`create_task_result` arguments must be the **exact wire
+JSON text**, not a re-serialized object — re-serializing normalises whitespace and key order and
+so silently changes the envelope's content hash (its idempotency key). `mempalace-a2a` and
+`mempalace-mcp-tasks` share the `protocol_envelope` artifact role but use distinct `media_type`s
+and distinct idempotency-key prefixes (`a2a_envelope:`/`mcp_tasks_envelope:`) so their envelope
+artifacts for the same task never collide.
+
+**Task imports create directly in the mapped state, not always `Pending`.** A task arriving from
+another system may already be `completed`, `cancelled`, or otherwise past `Pending` on that
+system, and the ordinary lifecycle (`create_task` then `claim_task`/`transition_task`) cannot
+reach most of those states without asserting a worker identity, a lease, and a transition history
+that never actually happened here — `claim_task` is the only route into `Running`, and reaching
+`Completed`/`Failed`/`InputRequired` from a fresh task requires it first. Fabricating that history
+to make an import land in the right state would be strictly worse than the state being wrong: the
+audit trail would lie about who did what. `CoordinationStore::import_task` exists for exactly this
+case: it creates the task directly in a caller-supplied `initial_state`, bypassing the transition
+machine entirely, and records the `task_created` audit event's `to_state` as that state with
+`details: {"imported": true}`, so the trail is honest about why a freshly created task can already
+be non-`Pending`. `NewTask` itself gains no `initial_state` field for this — it is deserialized
+directly from `mempalace_task_create`'s MCP arguments, and a new field there would silently widen
+that public wire schema — so `import_task` is a separate entry point, not a hidden option on
+`create_task`. A task imported directly into `Running` has `owner = NULL` and
+`lease_expires_at = NULL` (no worker or lease is fabricated); it remains claimable by any worker
+via `mempalace_task_claim`, since the "lease held by another worker" check only fires when an
+owner already exists, and it cannot be swept into `Expired` by the absent lease — the only
+automatic expiry check in `mempalace-storage` keys off `Task::expires_at` (the lifecycle deadline),
+never `lease_expires_at`, and an import never sets `expires_at`. `import_task` rejects
+`TaskState::Expired` as an initial state outright: expiry is a lifecycle outcome this palace
+produces itself, never something an importer may assert about a task it has not yet placed under
+this palace's lease/expiry rules.
+
+The nine adapter tools are all `LocalOnly` — never federated, even when a wing routes coordination
+writes to a remote:
+
+- `mempalace_a2a_agent_card` — builds an A2A Agent Card (one skill per wing) from local wings and
+  capabilities. `interfaces` (where an A2A client would reach this palace) has no local source and
+  must be caller-supplied, possibly empty.
+- `mempalace_a2a_task_import` — translates and persists an inbound A2A `Task` directly into its
+  mapped `target_state` (with any coercion reported, e.g. `TASK_STATE_AUTH_REQUIRED` ->
+  `input_required`) via `import_task`, per the state-preservation rule above.
+- `mempalace_a2a_message_import` / `mempalace_a2a_artifact_import` — translate and persist an
+  inbound A2A `Message`/`Artifact` via the ordinary `send_message`/`put_artifact` calls (messages
+  and artifacts have no lifecycle state of their own to preserve).
+- `mempalace_a2a_task_export` — translates an authoritative task back into an A2A `Task`.
+  Artifacts and messages are not bulk-fetched (no such storage query exists); the caller passes
+  the exact `artifact_ids`/`message_ids` to include, and any artifact with role `protocol_envelope`
+  is always excluded from the emitted A2A artifacts list — it is an audit record, not an A2A
+  artifact.
+- `mempalace_mcp_tasks_get` — translates an authoritative task into an MCP Tasks `DetailedTask`
+  (the `tasks/get` result shape). A missing `task_id` is rejected as invalid params (JSON-RPC
+  `-32602`), matching the extension's own mandate for an invalid `taskId`.
+- `mempalace_mcp_tasks_update` / `mempalace_mcp_tasks_cancel` — transition a task using an inbound
+  MCP Tasks status, under the same compare-and-swap revision semantics as
+  `mempalace_task_transition`: a revision conflict is returned as `{"success": false, "conflict":
+  {...}}` data, never a JSON-RPC error.
+- `mempalace_mcp_tasks_import` — translates and persists an inbound `CreateTaskResult` directly
+  into its mapped `target_state` via `import_task`, per the state-preservation rule above. `ttlMs`
+  is a retention hint, never a MemPalace lifecycle deadline — it is surfaced only as
+  `provenance.retention_deadline`, never written to the task's `expires_at`. `NewTask` has no
+  column for the source `taskId`/`createdAt`/`lastUpdatedAt` either, so this tool returns them all
+  as `provenance`; **the caller must persist `provenance` itself** (e.g. as a knowledge-graph fact)
+  if it needs to resolve the wire task id or round-trip the original timestamps after a restart —
+  this tool has no side channel to do that on the caller's behalf.
+
+Why `LocalOnly`: translate-and-persist is a two-write sequence (the task or message/artifact
+write, then the envelope-artifact write for task imports) with no remote transaction to make it
+atomic. Federating either write independently would risk a task committed on one side with no
+matching envelope, or vice versa, so these tools always run entirely against the local palace
+regardless of the wing's `federation.coordination` rule.
+
 ## Recovery and maintenance
 
 Coordination tables participate in the same SQLite WAL and backup procedures as other operational state. Back up `storage.sqlite3` consistently with the palace. Restore it before restarting workers; workers should then reread exact references and resume polling from their last committed cursor. No semantic index rebuild is needed for coordination state.

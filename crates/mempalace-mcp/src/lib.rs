@@ -1676,7 +1676,7 @@ where
     /// Returns `Ok(None)` when there is no live terminal/queued intent for this drawer under
     /// this key (a genuinely fresh delete, a no-key delete, or a still-staged intent whose
     /// local delete never committed — the normal path handles those).
-    fn recover_keyed_delete_replication(
+    async fn recover_keyed_delete_replication(
         &self,
         requested_operation_id: &str,
         drawer_id: &str,
@@ -1700,10 +1700,22 @@ where
             return Ok(None);
         }
         match operation.state {
-            // A staged intent means the local delete never committed; the retry must
-            // perform the delete and activate this same operation (idempotent enqueue
-            // replay), so the normal path handles it.
-            OutboxState::Staged | OutboxState::Cancelled => Ok(None),
+            // A staged intent normally means the local delete never committed. If the target is
+            // already absent, however, another process committed the delete and crashed before
+            // activation; preserve this operation's pinned destination and activate it here
+            // instead of falling through to an unrelated all-remote lookup.
+            OutboxState::Staged => {
+                let target = parse_drawer_id(drawer_id).map_err(|error| match error {
+                    ToolError::InvalidParams(message) => McpError::Replication(message),
+                    ToolError::Internal(error) => error,
+                })?;
+                if self.storage.drawer_store().get_drawer(&target).await?.is_none() {
+                    let operation = self.activate_replication(&operation)?;
+                    return Ok(Some(delete_replication_replay_payload(&operation, drawer_id)));
+                }
+                Ok(None)
+            }
+            OutboxState::Cancelled => Ok(None),
             _ => Ok(Some(delete_replication_replay_payload(&operation, drawer_id))),
         }
     }
@@ -1768,6 +1780,62 @@ where
             return Ok(None);
         }
         Ok(Some(pinned))
+    }
+
+    /// Replay a completed keyed `write:both` add whose local drawer was subsequently removed.
+    /// The outbox operation remains the authority for the original target and replication state;
+    /// do not mint a new drawer id or attempt to enqueue the same key as a different mutation.
+    async fn recover_keyed_add_replay(
+        &self,
+        requested_operation_id: &str,
+        wing: &str,
+        room: &str,
+        content: &str,
+        source_file: Option<&str>,
+        added_by: Option<&str>,
+    ) -> Result<Option<Value>> {
+        let Some(operation) = self.outbox.find_by_key(OUTBOX_ACTOR, requested_operation_id)? else {
+            return Ok(None);
+        };
+        if operation.mutation_kind != "drawer_added"
+            || matches!(operation.state, OutboxState::Staged | OutboxState::Cancelled)
+        {
+            return Ok(None);
+        }
+        let Ok(ReplicationMutation::DrawerAdd { request: staged }) =
+            serde_json::from_value::<ReplicationMutation>(operation.payload.clone())
+        else {
+            return Ok(None);
+        };
+        let Some(pinned_drawer_id) = staged.drawer_id.as_deref() else {
+            return Ok(None);
+        };
+        if staged.wing != wing
+            || staged.room != room
+            || staged.content != content
+            || staged.source_file.as_deref() != source_file
+            || staged.added_by.as_deref() != added_by
+        {
+            return Ok(None);
+        }
+        let pinned = parse_drawer_id(pinned_drawer_id).map_err(|error| match error {
+            ToolError::InvalidParams(message) => McpError::Replication(message),
+            ToolError::Internal(error) => error,
+        })?;
+        if self.storage.drawer_store().get_drawer(&pinned).await?.is_some() {
+            return Ok(None);
+        }
+        let result = json!({
+            "success": true,
+            "drawer_id": pinned_drawer_id,
+            "wing": wing,
+            "room": room,
+            "applied_to": "local",
+            "replication": replication_status_for_operation(&operation),
+        });
+        // Keep this as an object construction (rather than returning the outbox row directly) so
+        // the replay remains wire-compatible with a normal add response.
+        Ok(Some(result))
     }
 
     async fn tool_wake_up(&mut self, arguments: &Value) -> ToolResult<Value> {
@@ -2797,6 +2865,27 @@ where
             }
         }
 
+        // A completed keyed add is replayable even if a later delete removed its local target.
+        // Consult this durable identity before duplicate search or time-derived id generation.
+        if is_both {
+            if let Some(operation_id) = requested_operation_id.as_deref() {
+                if let Some(replay) = self
+                    .recover_keyed_add_replay(
+                        operation_id,
+                        wing.as_str(),
+                        room.as_str(),
+                        &content,
+                        (!source_file.is_empty()).then_some(source_file.as_str()),
+                        Some(added_by.as_str()),
+                    )
+                    .await
+                    .map_tool()?
+                {
+                    return Ok(replay);
+                }
+            }
+        }
+
         let duplicates_started = std::time::Instant::now();
         let duplicates = self.find_duplicates(&content, DEFAULT_DUPLICATE_THRESHOLD).await?;
         self.metrics.record("duplicate_search", duplicates_started.elapsed());
@@ -3049,6 +3138,7 @@ where
         if let Some(operation_id) = requested_operation_id.as_deref() {
             if let Some(replay) = self
                 .recover_keyed_delete_replication(operation_id, drawer_id.as_str())
+                .await
                 .map_tool()?
             {
                 return Ok(replay);
@@ -3716,18 +3806,39 @@ where
 
         // A keyed retry must reuse the date pinned in its existing durable outbox payload. If
         // `ended` was omitted on the first attempt, resolving it again after midnight would make
-        // the same operation's local and remote invalidations disagree (and would make enqueue
-        // reject the retry as a changed mutation).
+        // the same operation's local and remote invalidations disagree. An explicitly supplied
+        // date, however, is part of the idempotent request and must conflict when it differs.
+        let mut keyed_replay_operation = None;
         if is_both {
             if let Some(operation_id) = requested_operation_id.as_deref() {
                 if let Some(operation) =
                     self.outbox.find_by_key(OUTBOX_ACTOR, operation_id).map_tool()?
                 {
                     if let Ok(ReplicationMutation::KgInvalidate { request }) =
-                        serde_json::from_value::<ReplicationMutation>(operation.payload)
+                        serde_json::from_value::<ReplicationMutation>(operation.payload.clone())
                     {
+                        if request.subject != subject
+                            || request.predicate != predicate
+                            || request.object != object
+                        {
+                            return Err(ToolError::InvalidParams(format!(
+                                "operation `{operation_id}` was already used by a different KG invalidation"
+                            )));
+                        }
                         if let Some(pinned) = request.ended.as_deref() {
-                            ended = parse_date(pinned)?;
+                            let pinned_date = parse_date(pinned)?;
+                            if ended_text.is_some() && ended != pinned_date {
+                                return Err(ToolError::InvalidParams(format!(
+                                    "operation `{operation_id}` was already used with ended `{pinned}`"
+                                )));
+                            }
+                            if ended_text.is_none() {
+                                ended = pinned_date;
+                            }
+                        }
+                        if !matches!(operation.state, OutboxState::Staged | OutboxState::Cancelled)
+                        {
+                            keyed_replay_operation = Some(operation);
                         }
                     }
                 }
@@ -3753,6 +3864,20 @@ where
                     }
                 }
             }
+        }
+
+        // The local fact may have been re-added since the original invalidation completed. A
+        // non-staged keyed operation is already authoritative, so replay its persisted outcome
+        // without applying the old invalidation to the newer fact.
+        if let Some(operation) = keyed_replay_operation {
+            return Ok(json!({
+                "success": true,
+                "invalidated": 0,
+                "fact": format!("{subject} → {predicate} → {object}"),
+                "ended": format_date(ended),
+                "applied_to": "local",
+                "replication": replication_status_for_operation(&operation),
+            }));
         }
 
         let now = OffsetDateTime::now_utc();

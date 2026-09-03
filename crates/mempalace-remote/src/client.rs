@@ -460,8 +460,16 @@ impl RemoteApi for RemoteClient {
         operation_id: Option<&str>,
     ) -> Result<()> {
         self.ensure_handshake().await?;
-        let path = format!("v1/drawers/{drawer_id}");
-        let url = self.url(&path)?;
+        // Build the final path segment through `Url` rather than interpolating it into a
+        // string. Drawer ids may legitimately contain `/` (for example `wing/room/hash`),
+        // which must be percent-encoded as one segment for the server's `{id}` route.
+        let mut url = self.url("v1/drawers/")?;
+        url.path_segments_mut()
+            .map_err(|_| RemoteError::InvalidConfig {
+                remote: self.name.clone(),
+                message: "cannot append drawer id to a non-hierarchical URL".to_owned(),
+            })?
+            .push(drawer_id);
         let rb = self.http.delete(url);
         let rb = match operation_id {
             Some(op) => rb.query(&[("operation_id", op)]),

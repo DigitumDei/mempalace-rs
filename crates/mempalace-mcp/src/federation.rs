@@ -523,7 +523,12 @@ impl FederationRouter {
         let generated_op_id = generate_operation_id();
         let effective_operation_id =
             operation_id_for_remote(api.as_ref(), remote_name, operation_id, &generated_op_id)
-                .await?;
+                .await
+                .map_err(|error| {
+                    ToolError::Internal(McpError::Federation(format!(
+                        "remote `{remote_name}` idempotency capability check failed: {error}"
+                    )))
+                })?;
 
         // ── Pre-add duplicate check ───────────────────────────────────────────
         // Operation-aware retries carry a stable operation_id, so the client-side
@@ -855,7 +860,12 @@ impl FederationRouter {
         let generated_op_id = generate_operation_id();
         let effective_operation_id =
             operation_id_for_remote(api.as_ref(), remote_name, operation_id, &generated_op_id)
-                .await?;
+                .await
+                .map_err(|error| {
+                    ToolError::Internal(McpError::Federation(format!(
+                        "remote `{remote_name}` idempotency capability check failed: {error}"
+                    )))
+                })?;
         match api
             .delete_drawer_with_operation_id(drawer_id, effective_operation_id.as_deref())
             .await
@@ -890,8 +900,31 @@ impl FederationRouter {
     ) -> ToolResult<Option<Value>> {
         let generated_op_id = generate_operation_id();
         for (name, api) in &self.remotes {
-            let effective_operation_id =
-                operation_id_for_remote(api.as_ref(), name, operation_id, &generated_op_id).await?;
+            let effective_operation_id = match operation_id_for_remote(
+                api.as_ref(),
+                name,
+                operation_id,
+                &generated_op_id,
+            )
+            .await
+            {
+                Ok(operation_id) => operation_id,
+                // A capability probe uses the same handshake transport as the mutation. If that
+                // remote is unreachable, keep the deterministic all-remote fallback moving.
+                Err(error) if error.is_degradable() => {
+                    tracing::warn!(
+                        remote = %name,
+                        %error,
+                        "skipping unreachable remote during all-remote drawer delete"
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    return Err(ToolError::Internal(McpError::Federation(format!(
+                        "remote `{name}` idempotency capability check failed: {error}"
+                    ))));
+                }
+            };
             match api
                 .delete_drawer_with_operation_id(drawer_id, effective_operation_id.as_deref())
                 .await
@@ -1305,7 +1338,12 @@ impl FederationRouter {
         let generated_op_id = generate_operation_id();
         let effective_operation_id =
             operation_id_for_remote(api.as_ref(), remote_name, operation_id, &generated_op_id)
-                .await?;
+                .await
+                .map_err(|error| {
+                    ToolError::Internal(McpError::Federation(format!(
+                        "remote `{remote_name}` idempotency capability check failed: {error}"
+                    )))
+                })?;
         let req = mempalace_federation::KgAddFactRequest {
             subject: subject.to_owned(),
             predicate: predicate.to_owned(),
@@ -1430,7 +1468,12 @@ impl FederationRouter {
         let generated_op_id = generate_operation_id();
         let effective_operation_id =
             operation_id_for_remote(api.as_ref(), remote_name, operation_id, &generated_op_id)
-                .await?;
+                .await
+                .map_err(|error| {
+                    ToolError::Internal(McpError::Federation(format!(
+                        "remote `{remote_name}` idempotency capability check failed: {error}"
+                    )))
+                })?;
         let req = mempalace_federation::KgInvalidateRequest {
             subject: subject.to_owned(),
             predicate: predicate.to_owned(),
@@ -2387,12 +2430,8 @@ async fn operation_id_for_remote(
     remote_name: &str,
     requested: Option<&str>,
     generated: &str,
-) -> ToolResult<Option<String>> {
-    let capability = api.idempotent_mutations_capability().await.map_err(|error| {
-        ToolError::Internal(McpError::Federation(format!(
-            "remote `{remote_name}` idempotency capability check failed: {error}"
-        )))
-    })?;
+) -> Result<Option<String>, RemoteError> {
+    let capability = api.idempotent_mutations_capability().await?;
     if capability != Some(false) {
         return Ok(Some(requested.unwrap_or(generated).to_owned()));
     }

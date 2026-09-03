@@ -1454,7 +1454,10 @@ where
             ("room", json!(body.room)),
             ("content", json!(&body.content)),
             ("source_file", json!(&body.source_file)),
-            ("added_by", json!(&body.added_by)),
+            // The stored author is derived from the authenticated identity and the optional
+            // claimed provenance. Hash that effective value so two bearer identities cannot
+            // replay or race the same receipt and receive credit for one another's drawer.
+            ("effective_added_by", json!(&effective_added_by)),
             ("drawer_id", json!(&body.drawer_id)),
         ]);
         let outcome = receipts.begin_receipt(&NewReceipt {
@@ -6487,7 +6490,7 @@ mod tests {
             ("room", json!("idem-test")),
             ("content", json!("recover pending receipt content")),
             ("source_file", json!(Option::<String>::None)),
-            ("added_by", json!(Option::<String>::None)),
+            ("effective_added_by", json!("alice")),
             ("drawer_id", json!(Some(drawer_id.to_owned()))),
         ]);
         let receipts = harness.state.storage.receipt_store();

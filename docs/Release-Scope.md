@@ -47,7 +47,7 @@ Full flag reference: [CLI Surface](CLI-Surface.md).
 - `balanced`
 - `low_cpu`
 
-### MCP tool surface (58 tools)
+### MCP tool surface (67 tools)
 
 - `mempalace_wake_up`
 - `mempalace_status`
@@ -107,6 +107,23 @@ Full flag reference: [CLI Surface](CLI-Surface.md).
 - `mempalace_self_observation_review`
 - `mempalace_identity_packet`
 - `mempalace_migration_record`
+- `mempalace_a2a_agent_card`
+- `mempalace_a2a_task_import`
+- `mempalace_a2a_task_export`
+- `mempalace_a2a_message_import`
+- `mempalace_a2a_artifact_import`
+- `mempalace_mcp_tasks_get`
+- `mempalace_mcp_tasks_update`
+- `mempalace_mcp_tasks_cancel`
+- `mempalace_mcp_tasks_import`
+
+The nine protocol-adapter tools (`mempalace_a2a_*`, `mempalace_mcp_tasks_*`) translate between
+MemPalace coordination records and the A2A and `io.modelcontextprotocol/tasks` wire models
+(issue #102 Stages 9-10). They are all local-only: the import tools translate *and* persist,
+which is a two-write sequence (the record, then the raw wire envelope stored as a
+`protocol_envelope` artifact) with no remote transaction available to make it atomic, so no
+remote path is offered rather than one that can half-apply. Neither adapter has an HTTP surface
+of its own; this tool surface is the only entry point.
 
 The five self-continuity tools are local-only. `mempalace_wake_up` compiles the MCP-bound or
 palace-default lineage into an identity packet; model-facing calls cannot select or override it.

@@ -62,36 +62,32 @@
 //! supplied parameters, the same pattern `mempalace_a2a::task::NewTaskInputs` uses for the
 //! identical problem.
 //!
-//! # `NewTask` has no `state` field: a new task is always `Pending`
+//! # `NewTask` has no `state` field; the caller chooses the creation state
 //!
-//! Exactly the constraint `mempalace_a2a::task` documents: `CoordinationStore::create_task`
-//! always creates a task in [`TaskState::Pending`], so an inbound MCP Tasks object whose `status`
-//! is not something that maps to `Pending` (nothing does directly — see [`crate::status`], since
-//! MCP Tasks has no queued state) cannot be reflected at creation time.
-//! [`detailed_task_to_new_task`]/[`create_task_result_to_new_task`] still run the source status
-//! through [`crate::status::map_inbound_task_status`] and return the result alongside the
-//! [`NewTask`], so the caller can see what the *target* state should be.
+//! Exactly the constraint `mempalace_a2a::task` documents: [`NewTask`] carries no state, so an
+//! inbound MCP Tasks object's status cannot be reflected in it directly (and nothing maps to
+//! `Pending` anyway - see [`crate::status`], since MCP Tasks has no queued state).
+//! [`detailed_task_to_new_task`]/[`create_task_result_to_new_task`] run the source status through
+//! [`crate::status::map_inbound_task_status`] and return the result alongside the [`NewTask`], so
+//! the caller sees what the target state should be.
 //!
-//! # Reaching `target_state` is not always one call
+//! # How the caller should apply `target_state`
 //!
-//! Identical constraint to `mempalace_a2a::task`, because it comes from
-//! `CoordinationStore::allowed_transition` (`crates/mempalace-storage/src/coordination.rs`), not
-//! from anything protocol-specific: `Pending -> Cancelled | Expired`, `Running -> InputRequired |
-//! Completed | Cancelled | Failed | Expired`, `InputRequired -> Pending | Running | Cancelled |
-//! Failed | Expired`. `Pending -> Running` is not in that table — the only way out of `Pending`
-//! into `Running` is `CoordinationStore::claim_task`, which needs a worker identity and lease
-//! `ttl` this crate has no source for. So, per [`NewTaskConversion::target_state`]:
+//! Use `CoordinationStore::import_task(&new_task, target_state.value)`, which creates the task
+//! *directly* in that state. Do **not** route it through the transition machine.
+//! `allowed_transition` (`crates/mempalace-storage/src/coordination.rs`) has no
+//! `Pending -> Running` edge; the only route into `Running` is `claim_task`, which needs a worker
+//! identity and lease `ttl` this crate has no source for. Creating and then transitioning would
+//! therefore mean **fabricating a claim by a worker that never existed** to land an inbound
+//! `completed` or `failed` task - audit history asserting something that did not happen.
 //!
-//! - [`TaskState::Pending`] — never the target here: MCP Tasks has no status that maps to it.
-//! - [`TaskState::Cancelled`]/[`TaskState::Expired`] — a single `transition_task` call.
-//! - [`TaskState::Running`] — `claim_task`, not `transition_task`.
-//! - [`TaskState::InputRequired`]/[`TaskState::Completed`]/[`TaskState::Failed`] — `claim_task`
-//!   first (to reach `Running`), then `transition_task` from `Running` to the target.
+//! `import_task` avoids that: an import is a *creation*, not a lifecycle event, so it bypasses
+//! the transition machine, records the imported state on the `task_created` event with an
+//! `imported` marker, and rejects [`TaskState::Expired`] as an initial state.
 //!
-//! This crate does not provide a helper that performs that sequence, for the same reason
+//! This crate still provides no helper that performs the storage call, for the same reason
 //! `mempalace_a2a::task` does not: it is a pure translation library with no live
-//! `CoordinationStore` dependency, and no source for the worker identity/lease TTL `claim_task`
-//! requires. Do not assume a single call always suffices.
+//! `CoordinationStore` dependency.
 //!
 //! # `ttlMs`, and fields with no home in `NewTask`
 //!

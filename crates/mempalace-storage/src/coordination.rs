@@ -15,6 +15,21 @@ use crate::{Result, StorageError};
 pub const MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
 const MAX_TASK_TEXT_BYTES: usize = 1024 * 1024;
 
+/// Outcome of [`CoordinationStore::import_task`].
+///
+/// `replayed` distinguishes a task this call created from one returned by idempotent replay of
+/// an `idempotency_key` already used by the same `created_by`. Callers that write a protocol
+/// envelope or report a translated state alongside the task need that distinction: on a replay
+/// the stored task is authoritative and was created from an *earlier* payload, so reporting the
+/// new payload's state as though it had been applied would be a lie.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImportedTask {
+    /// The committed task, whether newly created or replayed.
+    pub task: Task,
+    /// True when an existing task was returned rather than a new one created.
+    pub replayed: bool,
+}
+
 /// Reserved wing name for coordination rows that existed before wings were introduced. Every
 /// task and event created before this stage upgraded its schema reads back with this wing.
 pub const UNSCOPED_WING: &str = "wing_unscoped";
@@ -417,7 +432,7 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
     /// `claim_task`/`transition_task` to reach that state would fabricate audit history (e.g. a
     /// claim by a worker that never existed).
     pub fn create_task(&self, input: &NewTask) -> Result<Task> {
-        self.create_task_with_state(input, TaskState::Pending, false)
+        Ok(self.create_task_with_state(input, TaskState::Pending, false)?.0)
     }
 
     /// Create a task directly in `initial_state`, or return the prior committed task for an
@@ -452,13 +467,18 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
     /// expiry is a lifecycle outcome this palace produces itself (see `claim_task`'s lazy expiry
     /// check), never something an importer may assert about a task it has not yet even placed
     /// under this palace's lease/expiry rules.
-    pub fn import_task(&self, input: &NewTask, initial_state: TaskState) -> Result<Task> {
+    pub fn import_task(
+        &self,
+        input: &NewTask,
+        initial_state: TaskState,
+    ) -> Result<ImportedTask> {
         if initial_state == TaskState::Expired {
             return Err(StorageError::Invariant(
                 "TaskState::Expired is a lifecycle outcome this palace produces itself; an imported task cannot assert it as an initial state".into(),
             ));
         }
-        self.create_task_with_state(input, initial_state, true)
+        let (task, replayed) = self.create_task_with_state(input, initial_state, true)?;
+        Ok(ImportedTask { task, replayed })
     }
 
     fn create_task_with_state(
@@ -466,7 +486,7 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
         input: &NewTask,
         initial_state: TaskState,
         is_import: bool,
-    ) -> Result<Task> {
+    ) -> Result<(Task, bool)> {
         validate_key(&input.idempotency_key)?;
         validate_actor(&input.created_by)?;
         bounded_text(&input.title, "task title")?;
@@ -484,7 +504,7 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some(task) = find_task_by_key(&tx, &input.created_by, &input.idempotency_key)? {
             tx.commit()?;
-            return Ok(task);
+            return Ok((task, true));
         }
         for dependency in &input.dependencies {
             require_task(&tx, dependency)?;
@@ -513,7 +533,7 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
         let task = get_task_tx(&tx, &id)?
             .ok_or_else(|| StorageError::Invariant("created task disappeared".into()))?;
         tx.commit()?;
-        Ok(task)
+        Ok((task, false))
     }
 
     /// Retrieve a task by exact ID. `None` is an explicit authoritative miss.
@@ -1510,13 +1530,13 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
                 TaskState::Completed,
             )
             .expect("import");
-        assert_eq!(imported.state, TaskState::Completed);
-        assert_eq!(imported.revision, 0);
-        assert_eq!(imported.owner, None);
-        assert_eq!(imported.lease_expires_at, None);
+        assert_eq!(imported.task.state, TaskState::Completed);
+        assert_eq!(imported.task.revision, 0);
+        assert_eq!(imported.task.owner, None);
+        assert_eq!(imported.task.lease_expires_at, None);
 
         let events = s
-            .events(None, Some(&imported.task_id), None, 20, CoordinationVisibility::Trusted)
+            .events(None, Some(&imported.task.task_id), None, 20, CoordinationVisibility::Trusted)
             .expect("events");
         assert_eq!(events.events.len(), 1);
         let event = &events.events[0];
@@ -1561,8 +1581,17 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
         };
         let first = s.import_task(&new_task, TaskState::Running).expect("first import");
         let second = s.import_task(&new_task, TaskState::Running).expect("replay");
-        assert_eq!(first.task_id, second.task_id);
-        assert_eq!(first, second);
+        assert!(!first.replayed, "the first import creates the task");
+        assert!(second.replayed, "the second import replays it");
+        assert_eq!(first.task.task_id, second.task.task_id);
+        assert_eq!(first.task, second.task);
+
+        // A replay whose stored state differs from the one now requested must still report the
+        // *stored* task, so a caller can detect the disagreement rather than be told its new
+        // state was applied.
+        let third = s.import_task(&new_task, TaskState::Completed).expect("replay, other state");
+        assert!(third.replayed);
+        assert_eq!(third.task.state, TaskState::Running, "the stored state is authoritative");
     }
 
     #[test]
@@ -1624,13 +1653,13 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
                 TaskState::Running,
             )
             .expect("import");
-        assert_eq!(imported.state, TaskState::Running);
-        assert_eq!(imported.owner, None);
-        assert_eq!(imported.lease_expires_at, None);
+        assert_eq!(imported.task.state, TaskState::Running);
+        assert_eq!(imported.task.owner, None);
+        assert_eq!(imported.task.lease_expires_at, None);
 
         // Any worker can claim it -- there is no existing owner to conflict with.
         let claimed = applied_task(
-            s.claim_task(&imported.task_id, "worker-a", imported.revision, Duration::minutes(5))
+            s.claim_task(&imported.task.task_id, "worker-a", imported.task.revision, Duration::minutes(5))
                 .expect("an ownerless Running task must remain claimable"),
         );
         assert_eq!(claimed.owner.as_deref(), Some("worker-a"));
@@ -1638,7 +1667,7 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
 
         // Re-reading the freshly imported (unclaimed) task never reports it as Expired: the
         // lifecycle-expiry check keys off `expires_at`, which import_task never populates.
-        let reread = s.get_task(&imported.task_id).expect("get").expect("still present");
+        let reread = s.get_task(&imported.task.task_id).expect("get").expect("still present");
         assert_ne!(reread.state, TaskState::Expired);
     }
     #[test]

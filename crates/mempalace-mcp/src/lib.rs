@@ -160,6 +160,11 @@ const DUPLICATE_SEARCH_LIMIT: usize = 5;
 // are interleaved across wings, but stops collecting as soon as the limit is met.
 const WAKE_UP_PROJECT_SEARCH_MULTIPLIER: usize = 20;
 const WAKE_UP_PROJECT_MIN_SEARCH_LIMIT: usize = 50;
+/// Lease granted when `mempalace_mcp_tasks_update` has to bridge a `Pending` task into
+/// `Running` on the caller's behalf, in seconds. The MCP Tasks extension has no lease concept,
+/// so a caller that never passes `lease_seconds` still needs one; the caller can renew it with
+/// `mempalace_task_renew` like any other claim.
+const MCP_TASKS_BRIDGE_LEASE_SECONDS: i64 = 300;
 const IDENTITY_UPDATE_MAX_CONTENT_BYTES: usize = 16 * 1024;
 const IDENTITY_MAX_BYTES: usize = 64 * 1024;
 pub const LINEAGE_ID_ENV: &str = "MEMPALACE_LINEAGE_ID";
@@ -1004,8 +1009,8 @@ impl ToolName {
             ),
             Self::McpTasksUpdate => coordination_definition(
                 self,
-                "Transition a task's lifecycle state using an inbound MCP Tasks extension status, under the same compare-and-swap revision semantics as mempalace_task_transition. `status` uses MCP Tasks wire spelling (working, input_required, completed, failed, cancelled — see mempalace_mcp_tasks_get's description for the reverse mapping); the inbound mapping is total, so every value maps to exactly one MemPalace state (working -> running, others map 1:1 by name). Returns {\"success\": true, \"task\": {...}} on success, or {\"success\": false, \"conflict\": {expected_revision, actual_revision, message}} when the expected revision no longer matches — a conflict is data, not an error. Local-only: no MCP Tasks transport of its own.",
-                json!({"task_id":{"type":"string"},"actor":{"type":"string"},"expected_revision":{"type":"integer"},"status":{"type":"string","enum":["working","input_required","completed","failed","cancelled"]},"details":{}}),
+                "Transition a task's lifecycle state using an inbound MCP Tasks extension status, under the same compare-and-swap revision semantics as mempalace_task_transition. `status` uses MCP Tasks wire spelling (working, input_required, completed, failed, cancelled — see mempalace_mcp_tasks_get's description for the reverse mapping); the inbound mapping is total, so every value maps to exactly one MemPalace state (working -> running, others map 1:1 by name). Returns {\"success\": true, \"task\": {...}} on success, or {\"success\": false, \"conflict\": {expected_revision, actual_revision, message}} when the expected revision no longer matches — a conflict is data, not an error. A Pending task is bridged into Running first by claiming it for actor (MCP Tasks has no claim/lease concept and there is no Pending -> Running transition, so an MCP-only client shown a Pending task as working could not otherwise advance it); the response reports bridged_from_pending, and lease_seconds sets the lease taken. Local-only: no MCP Tasks transport of its own.",
+                json!({"task_id":{"type":"string"},"actor":{"type":"string"},"expected_revision":{"type":"integer"},"status":{"type":"string","enum":["working","input_required","completed","failed","cancelled"]},"details":{},"lease_seconds":{"type":"integer","description":"Lease to take when bridging a Pending task into Running on your behalf (optional, default 300). Ignored when the task is not Pending."}}),
                 &["task_id", "actor", "expected_revision", "status"],
             ),
             Self::McpTasksCancel => coordination_definition(
@@ -3871,6 +3876,7 @@ where
                 "kg".to_owned(),
                 "changes".to_owned(),
                 "taxonomy".to_owned(),
+                "ingest".to_owned(),
                 "coordination".to_owned(),
             ],
             maintenance_enabled: self.config.maintenance.enabled,
@@ -4054,9 +4060,19 @@ where
 
         let status_message = match optional_string(arguments, "status_message")? {
             None => None,
-            Some(raw) => Some(serde_json::from_str::<A2aMessage>(&raw).map_err(|e| {
-                ToolError::InvalidParams(format!("invalid `status_message` JSON: {e}"))
-            })?),
+            Some(raw) => {
+                let message: A2aMessage = serde_json::from_str(&raw).map_err(|e| {
+                    ToolError::InvalidParams(format!("invalid `status_message` JSON: {e}"))
+                })?;
+                // `task_to_a2a_task` is infallible, so the `Part` oneof invariant that
+                // `a2a_message_to_new_message` enforces on the way in has to be enforced here on
+                // the way out too - otherwise this is the one path that can emit a malformed A2A
+                // task.
+                for part in &message.parts {
+                    part.validate().map_err(map_a2a_tool_error)?;
+                }
+                Some(message)
+            }
         };
 
         let mapped = task_to_a2a_task(&task, a2a_artifacts, history, status_message);
@@ -4172,10 +4188,59 @@ where
         let status: McpTaskStatus = serde_json::from_value(json!(status_str))
             .map_err(|e| ToolError::InvalidParams(e.to_string()))?;
         let target = map_inbound_task_status(status);
-        let expected_revision = required_i64(arguments, "expected_revision")?;
+        let mut expected_revision = required_i64(arguments, "expected_revision")?;
         let task_id = required_non_blank_string(arguments, "task_id")?;
         let actor = required_non_blank_string(arguments, "actor")?;
         let details = arguments.get("details").cloned();
+
+        // MCP Tasks has no claim or lease concept, and `allowed_transition` has no
+        // `Pending -> Running` edge: the only route into `Running` is `claim_task`. Since
+        // `mempalace_mcp_tasks_get` reports a `Pending` task as `working`, an MCP-only consumer
+        // would otherwise be unable to advance the very task it was just shown. Bridge it by
+        // claiming for `actor` first. Nothing is fabricated: the caller declaring the task is
+        // being worked *is* the claim, so the audit trail records a real claim by the real actor
+        // and then the transition, rather than a synthetic worker.
+        let mut bridged_from_pending = false;
+        let current = self
+            .coordination
+            .get_task(&task_id)
+            .map_tool_internal()?
+            .ok_or_else(|| ToolError::InvalidParams(format!("task `{task_id}` not found")))?;
+        if current.state == TaskState::Pending
+            && !matches!(target.value, TaskState::Cancelled | TaskState::Expired)
+        {
+            let lease_seconds = optional_i64(arguments, "lease_seconds")?
+                .unwrap_or(MCP_TASKS_BRIDGE_LEASE_SECONDS);
+            if lease_seconds <= 0 {
+                return Err(ToolError::InvalidParams(
+                    "`lease_seconds` must be a positive number of seconds".to_owned(),
+                ));
+            }
+            match self.coordination.claim_task(
+                &task_id,
+                &actor,
+                expected_revision,
+                Duration::seconds(lease_seconds),
+            ) {
+                Ok(RevisionedWrite::Applied(task)) => {
+                    bridged_from_pending = true;
+                    expected_revision = task.revision;
+                    if target.value == TaskState::Running {
+                        return Ok(
+                            json!({"success": true, "task": task, "bridged_from_pending": true}),
+                        );
+                    }
+                }
+                Ok(RevisionedWrite::Conflict { actual_revision }) => {
+                    return Ok(revision_conflict_payload(expected_revision, actual_revision));
+                }
+                Err(err) if is_local_record_missing(&err) => {
+                    return Err(ToolError::InvalidParams(format!("task `{task_id}` not found")));
+                }
+                Err(err) => return Err(err).map_tool_internal(),
+            }
+        }
+
         match self.coordination.transition_task(
             &task_id,
             &actor,
@@ -4183,7 +4248,9 @@ where
             target.value,
             details,
         ) {
-            Ok(RevisionedWrite::Applied(task)) => Ok(json!({"success": true, "task": task})),
+            Ok(RevisionedWrite::Applied(task)) => {
+                Ok(json!({"success": true, "task": task, "bridged_from_pending": bridged_from_pending}))
+            }
             Ok(RevisionedWrite::Conflict { actual_revision }) => {
                 Ok(revision_conflict_payload(expected_revision, actual_revision))
             }
@@ -9913,6 +9980,181 @@ mod tests {
             ))
             .await;
         assert_eq!(rejected["error"]["code"], ErrorCode::InvalidParams as i32);
+    }
+
+    /// `mempalace_mcp_tasks_get` reports a `Pending` task as MCP status `working`, but
+    /// `allowed_transition` has no `Pending -> Running` edge and reserves entry into `Running`
+    /// for `claim_task`. Without the bridge, an MCP-only consumer could not advance the very
+    /// task it was just shown.
+    #[tokio::test]
+    async fn mcp_tasks_update_bridges_a_pending_task_into_running() {
+        let harness = test_harness().await;
+        let created = harness
+            .server
+            .handle_request(tool_call(
+                9150,
+                "mempalace_task_create",
+                json!({
+                    "title": "t", "description": "d", "created_by": "alice",
+                    "wing": "wing_myproject", "idempotency_key": "mcp-tasks-bridge-1",
+                }),
+            ))
+            .await;
+        let task_id =
+            decode_tool_payload(&created).expect("task")["task_id"].as_str().unwrap().to_owned();
+
+        // The task is Pending, and mcp_tasks_get shows it as `working`.
+        let shown = harness
+            .server
+            .handle_request(tool_call(
+                9151,
+                "mempalace_mcp_tasks_get",
+                json!({"task_id": task_id}),
+            ))
+            .await;
+        let shown = decode_tool_payload(&shown).expect("get payload");
+        assert_eq!(shown["task"]["status"], "working");
+
+        let updated = harness
+            .server
+            .handle_request(tool_call(
+                9152,
+                "mempalace_mcp_tasks_update",
+                json!({
+                    "task_id": task_id, "actor": "alice", "expected_revision": 0,
+                    "status": "working",
+                }),
+            ))
+            .await;
+        let updated = decode_tool_payload(&updated).expect("update payload");
+        assert_eq!(updated["success"], true, "{updated}");
+        assert_eq!(updated["task"]["state"], "running");
+        assert_eq!(updated["bridged_from_pending"], true);
+        assert_eq!(
+            updated["task"]["owner"], "alice",
+            "the bridge claims for the real actor, it does not invent a worker"
+        );
+    }
+
+    /// The bridge also has to carry a `Pending` task all the way to a terminal MCP status, since
+    /// `Pending -> Completed` is likewise unreachable through the transition table.
+    #[tokio::test]
+    async fn mcp_tasks_update_bridges_a_pending_task_to_a_terminal_status() {
+        let harness = test_harness().await;
+        let created = harness
+            .server
+            .handle_request(tool_call(
+                9155,
+                "mempalace_task_create",
+                json!({
+                    "title": "t", "description": "d", "created_by": "alice",
+                    "wing": "wing_myproject", "idempotency_key": "mcp-tasks-bridge-2",
+                }),
+            ))
+            .await;
+        let task_id =
+            decode_tool_payload(&created).expect("task")["task_id"].as_str().unwrap().to_owned();
+
+        let updated = harness
+            .server
+            .handle_request(tool_call(
+                9156,
+                "mempalace_mcp_tasks_update",
+                json!({
+                    "task_id": task_id, "actor": "alice", "expected_revision": 0,
+                    "status": "completed",
+                }),
+            ))
+            .await;
+        let updated = decode_tool_payload(&updated).expect("update payload");
+        assert_eq!(updated["success"], true, "{updated}");
+        assert_eq!(updated["task"]["state"], "completed");
+        assert_eq!(updated["bridged_from_pending"], true);
+    }
+
+    /// Cancelling a `Pending` task is already a legal transition, so it must NOT be bridged -
+    /// claiming it first would invent an ownership record for a task nobody worked on.
+    #[tokio::test]
+    async fn mcp_tasks_cancel_of_a_pending_task_is_not_bridged() {
+        let harness = test_harness().await;
+        let created = harness
+            .server
+            .handle_request(tool_call(
+                9158,
+                "mempalace_task_create",
+                json!({
+                    "title": "t", "description": "d", "created_by": "alice",
+                    "wing": "wing_myproject", "idempotency_key": "mcp-tasks-bridge-3",
+                }),
+            ))
+            .await;
+        let task_id =
+            decode_tool_payload(&created).expect("task")["task_id"].as_str().unwrap().to_owned();
+
+        let updated = harness
+            .server
+            .handle_request(tool_call(
+                9159,
+                "mempalace_mcp_tasks_update",
+                json!({
+                    "task_id": task_id, "actor": "alice", "expected_revision": 0,
+                    "status": "cancelled",
+                }),
+            ))
+            .await;
+        let updated = decode_tool_payload(&updated).expect("update payload");
+        assert_eq!(updated["success"], true, "{updated}");
+        assert_eq!(updated["task"]["state"], "cancelled");
+        assert_eq!(updated["bridged_from_pending"], false);
+        assert!(updated["task"]["owner"].is_null(), "no owner should be invented");
+    }
+
+    /// `task_to_a2a_task` is infallible, so the `Part` oneof invariant has to be enforced on the
+    /// export path too - otherwise this is the one route that can emit a malformed A2A task.
+    #[tokio::test]
+    async fn a2a_task_export_rejects_a_status_message_with_an_invalid_part() {
+        let harness = test_harness().await;
+        let created = harness
+            .server
+            .handle_request(tool_call(
+                9160,
+                "mempalace_task_create",
+                json!({
+                    "title": "t", "description": "d", "created_by": "alice",
+                    "wing": "wing_myproject", "idempotency_key": "a2a-status-msg-1",
+                }),
+            ))
+            .await;
+        let task_id =
+            decode_tool_payload(&created).expect("task")["task_id"].as_str().unwrap().to_owned();
+
+        // Two `oneof` content fields set at once.
+        let bad_status = r#"{"messageId":"m1","role":"ROLE_AGENT","parts":[{"text":"a","url":"http://x"}]}"#;
+        let rejected = harness
+            .server
+            .handle_request(tool_call(
+                9161,
+                "mempalace_a2a_task_export",
+                json!({"task_id": task_id, "status_message": bad_status}),
+            ))
+            .await;
+        assert_eq!(rejected["error"]["code"], ErrorCode::InvalidParams as i32);
+    }
+
+    /// The agent card's skill tags are the palace's capability list, which must match what
+    /// `mempalace-server` advertises on `/v1/info` - `ingest` included.
+    #[tokio::test]
+    async fn a2a_agent_card_advertises_the_same_capabilities_as_the_server() {
+        let harness = test_harness().await;
+        let card = harness
+            .server
+            .handle_request(tool_call(9165, "mempalace_a2a_agent_card", json!({})))
+            .await;
+        let card = decode_tool_payload(&card).expect("agent card payload");
+        let tags = serde_json::to_string(&card).expect("card json");
+        for capability in ["drawers", "kg", "changes", "taxonomy", "ingest", "coordination"] {
+            assert!(tags.contains(capability), "agent card omits `{capability}`: {tags}");
+        }
     }
 
     #[tokio::test]

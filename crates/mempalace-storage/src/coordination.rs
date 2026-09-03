@@ -1568,7 +1568,7 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
     #[test]
     fn list_wings_returns_distinct_coordination_wings_excluding_unscoped() {
         let (_d, s) = store();
-        assert_eq!(s.list_wings().unwrap(), Vec::<String>::new());
+        assert_eq!(s.list_wings().expect("empty wing list"), Vec::<String>::new());
 
         let t1 = NewTask {
             title: "t1".into(),
@@ -1581,7 +1581,7 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
             budget: None,
             expires_at: None,
         };
-        s.create_task(&t1).unwrap();
+        s.create_task(&t1).expect("create t1");
 
         let t2 = NewTask {
             title: "t2".into(),
@@ -1594,9 +1594,9 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
             budget: None,
             expires_at: None,
         };
-        s.create_task(&t2).unwrap();
+        s.create_task(&t2).expect("create t2");
 
-        let wings = s.list_wings().unwrap();
+        let wings = s.list_wings().expect("wing list");
         assert_eq!(wings, vec!["wing_alpha", "wing_beta"]);
     }
     /// Point 5 verification: a task imported directly as `Running` has no real owner or lease

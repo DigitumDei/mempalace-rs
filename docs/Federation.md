@@ -1195,7 +1195,7 @@ parked on `wing_unscoped` — the reserved backfill wing coordination rows get
 when they predate wings, assigned automatically by the storage upgrade path
 (see `CoordinationStore::ensure_schema`). There is no real wing on such a
 record to authorize federation against, so every write, claim, and idempotent
-replay against it is refused outright (issue #102 Stage 8), the same way
+replay against it is refused outright (issue #102 Stage 8), mirroring the way
 `wing_agents` diary content is refused with `diary_not_federated`. A **read**
 against a `wing_unscoped` record is masked as 404 instead, so the 422 never
 becomes an existence oracle. It is also never returned by a fan-out fallback
@@ -1207,14 +1207,31 @@ re-home operation; recreate it under the wing you want it federated from) —
 `wing_unscoped` itself can never be federated, no matter what
 `federation.coordination` says about it.
 
+The two refusals part company on one path: an **idempotent replay** whose
+stored record turns out to be on the diary wing is masked as 409
+`idempotency_key_conflict`, whereas an unscoped one returns this typed 422.
+That is deliberate. The 409 masking exists so a replay cannot be used to probe
+for records in wings the caller is not allowed to see, and `wing_unscoped` is
+refused to *every* caller regardless of scope — so there is no authorization
+state to disclose, and the only thing the 422 reveals is the actionable fact
+that the stored task needs re-homing. See `authorize_replay_wing` in
+`crates/mempalace-server/src/lib.rs`.
+
 ### A coordination write returns 409 with code `idempotency_key_conflict`
 You replayed an `idempotency_key` your token has used before, but the record
 storage originally created for it lives in a wing your token cannot currently see
-— most often because its `scopes` narrowed since the original write, or because
-the same key was reused across two different wings. The response deliberately
-does not say which wing or repeat any of the record's content. See [Part 7 → Wing
-is the authorization key](#wing-is-the-authorization-key). Use a distinct
-`idempotency_key` per wing to avoid this.
+— most often because its `scopes` narrowed since the original write, because
+the same key was reused across two different wings, or because the stored
+record lives in the `wing_agents` diary wing, which no token can reach over
+federation. The response deliberately does not say which wing or repeat any of
+the record's content. See [Part 7 → Wing is the authorization
+key](#wing-is-the-authorization-key). Use a distinct `idempotency_key` per wing
+to avoid this.
+
+One replay case is *not* masked this way: if the stored record is on
+`wing_unscoped`, the response is [422 `unscoped_not_federated`](#a-coordination-write-returns-422-with-code-unscoped_not_federated)
+rather than this 409, because that wing is refused to every caller and so
+discloses no authorization state.
 
 ### A coordination claim/renew returns 400 for `lease_seconds`
 `lease_seconds` must be a positive integer no greater than roughly 100 years'

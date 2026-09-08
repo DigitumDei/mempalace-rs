@@ -82,7 +82,7 @@ Operational rule:
 
 - Do not treat `init` as proof that assets are already present.
 - Treat the startup validation status as the source of truth.
-- By default both `mempalace-cli` and `mempalace-mcp` stay offline and will not download embedding assets.
+- By default both `mempalace-cli` and `mempalace-mcp` stay offline and will not download embedding assets. The one deliberate exception is `mempalace-cli setup`, which runs a model warm-up phase (download-enabled) precisely because it is the step every install path executes; pass `--no-model-warmup` to skip it when you stage the cache yourself.
 - Set `MEMPALACE_EMBED_ALLOW_DOWNLOADS` to an explicit truthy value (`1`, `true`, or `yes`) on first run when you want either binary to bootstrap missing model assets into the local cache.
 
 Recommended sequence:
@@ -90,6 +90,7 @@ Recommended sequence:
 1. Run `init`.
 2. If validation is not `ready`, either:
    set `MEMPALACE_EMBED_ALLOW_DOWNLOADS=1` and re-run the command to let the binary fetch missing assets, or
+   run `mempalace-cli setup` to warm the embedding model (installer users get this for free), or
    pre-stage/repair the embedding cache out of band before relying on offline operation.
 3. Run a small `mine` or `search` flow to warm the chosen profile on the target host.
 4. Re-run `search` once to confirm warm-path behavior before calling the host production-ready.

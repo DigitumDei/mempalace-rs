@@ -13,6 +13,7 @@ use mempalace_federation::{
     RemoteDrawerResult, TaskLeaseRequest, TransitionTaskRequest,
 };
 use mempalace_remote::{RemoteApi, RemoteClient, RemoteEndpoint, RemoteError, RemoteRevisionedWrite};
+use mempalace_storage::UNSCOPED_WING;
 use serde_json::{Value, json};
 use tokio::task::JoinSet;
 
@@ -1592,6 +1593,19 @@ impl FederationRouter {
     /// guess past a remote it could not actually confirm an answer from, because moving on could
     /// create a second, divergent record for the same task on the wrong palace. `Ok(None)` means
     /// every candidate was tried and genuinely does not have the referenced record.
+    ///
+    /// **Deliberately not pre-flighted against `wing_unscoped` (issue #102 Stage 8).** This
+    /// method (and `coordination_task_revisioned_fallback` below) sends by id — the wing is not
+    /// known until a remote actually answers, so there is nothing to check before dispatch, unlike
+    /// `tool_task_create`'s `wing_blocks_coordination_fanout` pre-flight. If the remote record
+    /// turns out to live on `wing_unscoped`, the remote's own `resolve_owning_task`/
+    /// `authorize_replay_wing` refuses it with a 422 (`unscoped_not_federated` /
+    /// `idempotency_key_conflict`), which is not in the `404`/`CapabilityMissing`/degradable set
+    /// handled above, so it falls to the terminal arm and surfaces as a hard `ToolError` instead
+    /// of silently moving on to the next candidate. That is intentional: treating it as a soft
+    /// miss would let this loop try a second remote for a record already known to exist (on the
+    /// first), risking exactly the divergent-record duplication this method's error policy exists
+    /// to prevent.
     async fn coordination_write_fallback<F, Fut, T>(&self, op: F) -> ToolResult<Option<Value>>
     where
         F: Fn(Arc<dyn RemoteApi>) -> Fut,
@@ -2094,17 +2108,23 @@ impl CoordinationFanoutFailure {
 ///
 /// `None` (no wing filter) never blocks — an unfiltered aggregate read has no wing to protect
 /// and is unchanged by this fix. A `Some(wing)` blocks when it normalises to
-/// [`SHARED_AGENT_DIARY_WING`] under [`WingId::normalized`] — trimmed, lowercased and prefixed,
-/// so `"agents"`, `"Wing_Agents"` and `" wing_agents "` all match even though none of them `==`
-/// the constant verbatim. This is exactly the bypass `c1166d7` closed on `tool_task_create`; a
-/// verbatim `==` here would silently reopen it on the aggregate-read routes. A wing that fails to
+/// [`SHARED_AGENT_DIARY_WING`] or [`UNSCOPED_WING`] under [`WingId::normalized`] — trimmed,
+/// lowercased and prefixed, so `"agents"`, `"Wing_Agents"` and `" wing_agents "` all match even
+/// though none of them `==` the constant verbatim. This is exactly the bypass `c1166d7` closed on
+/// `tool_task_create`; a verbatim `==` here would silently reopen it on the aggregate-read
+/// routes. `UNSCOPED_WING` joins the diary wing here for the same reason it does everywhere else
+/// in this module (issue #102 Stage 8): it is the reserved backfill wing for coordination rows
+/// that predate wings and has no real wing to authorize federation against. A wing that fails to
 /// normalise at all (e.g. empty after stripping) fails CLOSED — block rather than fan out —
 /// mirroring `resolve_coordination_route`'s fail-closed direction on the same condition.
 fn wing_blocks_coordination_fanout(wing: Option<&str>) -> bool {
     match wing {
         None => false,
         Some(raw) => match WingId::normalized(raw) {
-            Ok(canonical) => canonical.as_str() == SHARED_AGENT_DIARY_WING,
+            Ok(canonical) => {
+                canonical.as_str() == SHARED_AGENT_DIARY_WING
+                    || canonical.as_str() == UNSCOPED_WING
+            }
             Err(_) => true,
         },
     }
@@ -2758,6 +2778,40 @@ mod tests {
 
         let coord_avail = router.coordination_availability(&local_wings);
         assert_eq!(coord_avail["wing_agents"], "local");
+    }
+
+    #[test]
+    fn coordination_availability_wing_unscoped_always_local() {
+        // wing_unscoped must report "local" unconditionally, the same as
+        // wing_agents (issue #102 Stage 8): it is the reserved backfill wing
+        // for coordination rows that predate wings, and has no real wing to
+        // authorize federation against. This must fall out of
+        // resolve_coordination_route's hard override, not a special case here.
+        let mut coordination = BTreeMap::new();
+        coordination.insert(
+            "wing_unscoped".to_owned(),
+            ResolvedRouteRule {
+                mode: RouteMode::Remote,
+                remote: Some("alpha".to_owned()),
+                write: WriteTarget::Remote,
+            },
+        );
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), make_resolved_remote("alpha"));
+        let rules = FederationRuntimeConfig {
+            remotes,
+            default_mode: RouteMode::Remote,
+            default_remote: Some("alpha".to_owned()),
+            wings: BTreeMap::new(),
+            kg: None,
+            coordination,
+        };
+        let router = FederationRouter::new(rules);
+        let mut local_wings = BTreeMap::new();
+        local_wings.insert("wing_unscoped".to_owned(), 3);
+
+        let coord_avail = router.coordination_availability(&local_wings);
+        assert_eq!(coord_avail["wing_unscoped"], "local");
     }
 
     #[test]

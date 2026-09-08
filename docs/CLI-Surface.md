@@ -296,14 +296,17 @@ Behavior:
 
 Purpose:
 - Detect which supported AI coding tools are installed and register the mempalace MCP server (`mempalace-mcp`) with each, idempotently.
+- Warm and verify the embedding model so the very next `mempalace-mcp` start succeeds even with no `MEMPALACE_EMBED_ALLOW_DOWNLOADS` set.
 
 Flags:
 - `--dry-run`
-  Preview what would change — print the command that would run / file that would be written for each detected tool — without running anything or writing any file.
+  Preview what would change — print the command that would run / file that would be written for each detected tool — without running anything or writing any file. The embedding model warm-up is skipped.
 - `--mcp-path <PATH>` default: `~/.mempalace/bin/mempalace-mcp` (`.exe` on Windows)
   Absolute path to the `mempalace-mcp` binary that tools are pointed at. A warning is printed if the binary is not present there yet (tools are still configured to launch it once installed).
 - `--tools <LIST>` default: all
   Comma-separated subset of tool keys to limit setup to: `claude,codex,gemini,opencode,copilot,antigravity,jules`.
+- `--no-model-warmup`
+  Skip the embedding-model warm-up and offline startup check entirely. For air-gapped operators who stage the model cache themselves.
 
 Behavior:
 - Per-tool mechanism (verified against each tool's official docs):
@@ -313,7 +316,14 @@ Behavior:
   - **antigravity** — merges a `mcpServers.mempalace` entry into both `~/.gemini/config/mcp_config.json` and `~/.gemini/antigravity-cli/mcp_config.json` (the config location differs across Antigravity versions; writing both is harmless). Detection keys off the antigravity-owned `~/.gemini/antigravity-cli/` directory (not the bare `~/.gemini/config/`, which is shared with the Gemini CLI).
   - **jules** — reported as unsupported and skipped: it is a cloud agent that only allows a curated set of remote MCP integrations configured in its web UI, so it cannot run a local stdio server.
 - JSON merges preserve all other keys and are idempotent (re-running reports "already configured"). If an existing config file is not valid JSON, setup refuses to clobber it and reports a failure for that tool.
-- Tools that are not installed are skipped with a note. The command always exits 0 (best-effort across tools); per-tool status is shown in the summary.
+- Tools that are not installed are skipped with a note. Tool registration is best-effort across tools; per-tool status is shown in the summary.
+- Embedding-model warm-up (unless `--dry-run` or `--no-model-warmup`):
+  1. Initialises a download-enabled provider so missing model assets are fetched on a fresh machine (a no-op on a warm cache). The profile and cache are resolved the same way `mempalace-mcp` resolves them at startup.
+  2. Re-initialises with downloads disabled — exactly how `mempalace-mcp` starts by default — proving the cache is complete before the MCP server is ever launched.
+  3. Prints a summary (model, cache path, warm and offline-check status). If the offline check fails, the command prints the remediation explicitly and exits non-zero. The installers (`install.sh`/`install.ps1`) treat that as a warning — the install itself has already succeeded — and print their own remediation, so a no-network fresh install still completes.
+- Exit codes:
+  - `0` — tools registered/checked; when a warm-up ran, the model is usable offline.
+  - `1` — the embedding model is not usable offline (warm-up ran and the offline startup check failed), with the remediation printed.
 
 ### `maintain`
 

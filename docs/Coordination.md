@@ -97,7 +97,13 @@ writes to a remote:
   must be caller-supplied, possibly empty.
 - `mempalace_a2a_task_import` — translates and persists an inbound A2A `Task` directly into its
   mapped `target_state` (with any coercion reported, e.g. `TASK_STATE_AUTH_REQUIRED` ->
-  `input_required`) via `import_task`, per the state-preservation rule above.
+  `input_required`) via `import_task`, per the state-preservation rule above. The response
+  reports `replayed`: idempotency matches on `(created_by, idempotency_key)` alone, so a replay
+  returns the task the *first* payload created rather than applying this one. A replay whose
+  stored state disagrees with the state this payload maps to is refused as invalid params — the
+  stored task is authoritative, and silently reporting the new payload's state, or filing a
+  second protocol envelope contradicting the first, would misrepresent it. Use a distinct
+  `idempotency_key` per task state.
 - `mempalace_a2a_message_import` / `mempalace_a2a_artifact_import` — translate and persist an
   inbound A2A `Message`/`Artifact` via the ordinary `send_message`/`put_artifact` calls (messages
   and artifacts have no lifecycle state of their own to preserve).
@@ -112,9 +118,26 @@ writes to a remote:
 - `mempalace_mcp_tasks_update` / `mempalace_mcp_tasks_cancel` — transition a task using an inbound
   MCP Tasks status, under the same compare-and-swap revision semantics as
   `mempalace_task_transition`: a revision conflict is returned as `{"success": false, "conflict":
-  {...}}` data, never a JSON-RPC error.
+  {...}}` data, never a JSON-RPC error. Three behaviours are specific to this surface, because
+  MCP Tasks has neither a queued state nor a claim/lease concept:
+  - **Pending -> Running bridge.** `allowed_transition` has no `Pending -> Running` edge — the
+    only route into `Running` is a claim. Since `mempalace_mcp_tasks_get` shows a `Pending` task
+    as `working`, an MCP-only client would otherwise be unable to advance the task it was just
+    shown. `mempalace_mcp_tasks_update` therefore claims it first, for `actor`, with
+    `lease_seconds`, and reports `bridged_from_pending`.
+  - **Same-status updates are a no-op.** Re-sending the status a task already holds is an
+    ordinary progress ping, but there is no self-transition edge, so it would otherwise fail.
+    It returns `no_op: true` instead. `expected_revision` is still checked, so a stale repeat
+    conflicts; and ownership is still enforced, so an actor who never claimed the task is
+    refused exactly as it would be for any other target state. (Cancellation is never
+    owner-gated, so `mempalace_mcp_tasks_cancel`'s equivalent no-op has no such check.)
+  - **`details` on the bridge.** A `task_claimed` audit event carries no `details` field, so a
+    `details` payload cannot be recorded when the call resolves as a claim. The response reports
+    `details_recorded` rather than discarding it silently.
 - `mempalace_mcp_tasks_import` — translates and persists an inbound `CreateTaskResult` directly
-  into its mapped `target_state` via `import_task`, per the state-preservation rule above. `ttlMs`
+  into its mapped `target_state` via `import_task`, per the state-preservation rule above. It
+  reports `replayed` and refuses a state-mismatched replay on the same terms as
+  `mempalace_a2a_task_import`. `ttlMs`
   is a retention hint, never a MemPalace lifecycle deadline — it is surfaced only as
   `provenance.retention_deadline`, never written to the task's `expires_at`. `NewTask` has no
   column for the source `taskId`/`createdAt`/`lastUpdatedAt` either, so this tool returns them all

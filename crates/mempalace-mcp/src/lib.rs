@@ -46,7 +46,8 @@ use mempalace_storage::{
     DelegationStore, LineageMigrationRecord, NewArtifact, NewCheckpoint, NewMessage, NewSkill,
     NewSkillOutcome, NewSpan, NewTask, NewTaskResult, RevisionedWrite, SelfModelStore,
     SelfObservationRecord, SelfObservationScope, SelfObservationStatus, SkillScope, SkillStatus,
-    ImportedTask, SkillStore, SpanStatus, StopReason, StorageEngine, TaskState,
+    ImportedTask, ONLY_OWNER_MAY_TRANSITION, SkillStore, SpanStatus, StopReason,
+    StorageEngine, TaskState,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -4233,6 +4234,17 @@ where
                     expected_revision,
                     Some(current.revision),
                 ));
+            }
+            // The no-op path must still enforce the ownership rule it is bypassing.
+            // `transition_task` rejects a non-owner unless the target is `Cancelled`, but that
+            // check runs *after* `allowed_transition`, so simply falling through would report
+            // an invalid transition rather than the ownership failure. Without this, an actor
+            // who never claimed the task would get `success: true` back for resending the
+            // status it already holds, while being refused for every other target.
+            if current.owner.is_some() && current.owner.as_deref() != Some(actor.as_str()) {
+                return Err(ToolError::Internal(McpError::Storage(
+                    mempalace_storage::StorageError::Invariant(ONLY_OWNER_MAY_TRANSITION.into()),
+                )));
             }
             return Ok(json!({
                 "success": true,
@@ -10201,6 +10213,72 @@ mod tests {
         assert_eq!(repeat["success"], true, "{repeat}");
         assert_eq!(repeat["no_op"], true);
         assert_eq!(repeat["task"]["state"], "cancelled");
+    }
+
+    /// The same-status no-op must not become an ownership bypass: `transition_task` refuses a
+    /// non-owner for every other target, so it must refuse one here too.
+    #[tokio::test]
+    async fn mcp_tasks_update_no_op_still_enforces_ownership() {
+        let harness = test_harness().await;
+        let created = harness
+            .server
+            .handle_request(tool_call(
+                9195,
+                "mempalace_task_create",
+                json!({
+                    "title": "t", "description": "d", "created_by": "alice",
+                    "wing": "wing_myproject", "idempotency_key": "mcp-tasks-owner-noop-1",
+                }),
+            ))
+            .await;
+        let task_id =
+            decode_tool_payload(&created).expect("task")["task_id"].as_str().unwrap().to_owned();
+
+        // alice claims it, so the task is Running and owned.
+        let claimed = harness
+            .server
+            .handle_request(tool_call(
+                9196,
+                "mempalace_task_claim",
+                json!({
+                    "task_id": task_id, "worker": "alice", "expected_revision": 0,
+                    "lease_seconds": 600,
+                }),
+            ))
+            .await;
+        let claimed = decode_tool_payload(&claimed).expect("claim");
+        assert_eq!(claimed["success"], true, "{claimed}");
+        let revision = claimed["task"]["revision"].as_i64().expect("revision");
+
+        // bob never claimed it; resending the status it already holds must not succeed.
+        let bob = harness
+            .server
+            .handle_request(tool_call(
+                9197,
+                "mempalace_mcp_tasks_update",
+                json!({
+                    "task_id": task_id, "actor": "bob", "expected_revision": revision,
+                    "status": "working",
+                }),
+            ))
+            .await;
+        assert!(bob["error"].is_object(), "a non-owner must be refused: {bob}");
+
+        // The owner still gets the no-op.
+        let alice = harness
+            .server
+            .handle_request(tool_call(
+                9198,
+                "mempalace_mcp_tasks_update",
+                json!({
+                    "task_id": task_id, "actor": "alice", "expected_revision": revision,
+                    "status": "working",
+                }),
+            ))
+            .await;
+        let alice = decode_tool_payload(&alice).expect("owner update");
+        assert_eq!(alice["success"], true, "{alice}");
+        assert_eq!(alice["no_op"], true);
     }
 
     /// `find_task_by_key` matches on `(created_by, idempotency_key)` alone, so a replay carrying a

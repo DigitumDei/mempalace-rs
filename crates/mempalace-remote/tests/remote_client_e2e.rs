@@ -691,6 +691,27 @@ async fn coordination_capability_gate_rejects_unsupported_remote() {
     );
 }
 
+#[tokio::test]
+async fn task_list_requires_its_additive_capability() {
+    let app = axum::Router::new()
+        .route(
+            "/v1/info",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({"server_version":"old","federation_api_version":1,
+            "embedding_profile":"balanced","capabilities":["coordination"]}))
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let result = client_for(addr, None).coordination_tasks(Default::default()).await;
+    assert!(
+        matches!(result,Err(RemoteError::CapabilityMissing { capability, .. }) if capability=="coordination_task_list")
+    );
+}
+
 // ─── Test 13: coordination_round_trip ─────────────────────────────────────────
 
 #[tokio::test]
@@ -717,6 +738,20 @@ async fn coordination_round_trip() {
         .unwrap();
     assert_eq!(task.state, mempalace_federation::CoordinationTaskState::Pending);
     assert_eq!(task.revision, 0);
+
+    let page = client
+        .coordination_tasks(mempalace_federation::CoordinationTasksQuery {
+            wing: Some("rt_coord".into()),
+            state: Some("pending".into()),
+            limit: Some(1),
+            byte_budget: Some(4096),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(page.tasks[0].task_id, task.task_id);
+    assert_eq!(page.tasks[0].revision, task.revision);
+    assert!(page.next_cursor.is_none());
 
     let fetched = client.coordination_task_get(&task.task_id).await.unwrap();
     assert_eq!(fetched.task_id, task.task_id);

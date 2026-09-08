@@ -852,6 +852,67 @@ pub struct CoordinationEventDto {
     pub occurred_at: String,
 }
 
+/// Discovery filters for GET /v1/coordination/tasks. Cursors are per origin.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct CoordinationTasksQuery {
+    /// Opaque continuation cursor for this origin.
+    pub cursor: Option<String>,
+    /// Owning wing, or an optional wing filter.
+    pub wing: Option<String>,
+    /// Task lifecycle state.
+    pub state: Option<String>,
+    /// Exact lease owner identity, when present.
+    pub owner: Option<String>,
+    /// Exact task creator identity.
+    pub created_by: Option<String>,
+    /// Parent task identity, when present.
+    pub parent_id: Option<String>,
+    /// Maximum rows requested; the server caps this at 200.
+    pub limit: Option<usize>,
+    /// Encoded page budget, capped by the server. Used to budget federation before fetching.
+    pub byte_budget: Option<usize>,
+}
+
+/// Compact discovery metadata. Count does not imply dependency readiness.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CoordinationTaskListItem {
+    /// Immutable task identity.
+    pub task_id: String,
+    /// Owning wing, or an optional wing filter.
+    pub wing: String,
+    /// Task lifecycle state.
+    pub state: String,
+    /// Current revision for optimistic claim concurrency.
+    pub revision: i64,
+    /// UTF-8 title prefix, at most 1024 bytes.
+    pub title: String,
+    /// Whether the title is a prefix of the stored title.
+    pub title_truncated: bool,
+    /// Exact lease owner identity, when present.
+    pub owner: Option<String>,
+    /// Lease deadline in RFC3339; the owning server decides expiry.
+    pub lease_expires_at: Option<String>,
+    /// Parent task identity, when present.
+    pub parent_id: Option<String>,
+    /// Number of declared dependencies, not unresolved dependencies.
+    pub dependency_count: usize,
+    /// Exact task creator identity.
+    pub created_by: String,
+    /// Creation timestamp in RFC3339.
+    pub created_at: String,
+    /// Task deadline in RFC3339, when set.
+    pub expires_at: Option<String>,
+}
+
+/// Encoded-byte-bounded task discovery page from one authoritative origin.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CoordinationTasksResponse {
+    /// Discovery items in immutable sequence order.
+    pub tasks: Vec<CoordinationTaskListItem>,
+    /// Opaque cursor after the last emitted item; null when exhausted.
+    pub next_cursor: Option<String>,
+}
+
 /// Query parameters for `GET /v1/coordination/events`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CoordinationEventsQuery {

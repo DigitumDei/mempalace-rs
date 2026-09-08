@@ -47,7 +47,7 @@ Full flag reference: [CLI Surface](CLI-Surface.md).
 - `balanced`
 - `low_cpu`
 
-### MCP tool surface (67 tools)
+### MCP tool surface (68 tools)
 
 - `mempalace_wake_up`
 - `mempalace_status`
@@ -73,6 +73,7 @@ Full flag reference: [CLI Surface](CLI-Surface.md).
 - `mempalace_identity_read`
 - `mempalace_identity_update`
 - `mempalace_task_create`
+- `mempalace_task_list`
 - `mempalace_task_get`
 - `mempalace_task_claim`
 - `mempalace_task_renew`
@@ -130,7 +131,7 @@ palace-default lineage into an identity packet; model-facing calls cannot select
 See [Self-Continuity Across Models](Self-Continuity.md).
 
 The eight skill-registry tools and the seven delegation-telemetry tools are local-only and
-are not federated. The fifteen coordination tools, by contrast, are federation-aware as of
+are not federated. The sixteen coordination tools, by contrast, are federation-aware as of
 issue #102 Stage 4, opt-in per wing via `federation.coordination`: `mempalace_task_create` routes
 by the task's wing; every other ID-keyed tool (get/claim/renew/transition, message send/get/ack,
 artifact/result put/get) tries local storage first and falls back to each configured remote in

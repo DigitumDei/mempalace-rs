@@ -1044,7 +1044,11 @@ where
         .route(
             "/v1/coordination/tasks",
             post(route_coordination_task_create::<P>)
-                .layer(middleware::from_fn(require_coordination_write)),
+                .layer(middleware::from_fn(require_coordination_write))
+                .merge(
+                    get(route_coordination_tasks::<P>)
+                        .layer(middleware::from_fn(require_coordination_read)),
+                ),
         )
         .route(
             "/v1/coordination/tasks/{id}",
@@ -1309,6 +1313,7 @@ where
             "taxonomy".to_owned(),
             "ingest".to_owned(),
             "coordination".to_owned(),
+            "coordination_task_list".to_owned(),
             "idempotent_mutations".to_owned(),
         ],
         maintenance_enabled: state.config.maintenance.enabled,
@@ -4064,6 +4069,45 @@ where
 }
 
 // ─── Coordination: events ───────────────────────────────────────────────────
+
+async fn route_coordination_tasks<P>(
+    State(state): State<Arc<ServerState<P>>>,
+    auth: axum::extract::Extension<AuthIdentity>,
+    Query(params): Query<mempalace_federation::CoordinationTasksQuery>,
+) -> Result<impl IntoResponse, ServerError>
+where
+    P: EmbeddingProvider + Send + Sync + 'static,
+{
+    // Unfiltered reads are allowed, exactly as for events; SQL scopes the visible rows.
+    let scope = CoordinationReadScope::resolve(&auth.0);
+    let cursor = params.cursor.as_deref().map(decode_coordination_cursor).transpose()?;
+    if cursor.is_some_and(|c| c.0 < 0) {
+        return Err(ServerError::InvalidParams("negative task cursor".into()));
+    }
+    let filter = mempalace_storage::TaskListFilter {
+        wing: params.wing,
+        state: params
+            .state
+            .as_deref()
+            .map(mempalace_storage::TaskState::parse)
+            .transpose()
+            .map_err(coordination_storage_error)?,
+        owner: params.owner,
+        created_by: params.created_by,
+        parent_id: params.parent_id,
+    };
+    let page = state
+        .coordination
+        .tasks(
+            cursor,
+            &filter,
+            params.limit.unwrap_or(50),
+            params.byte_budget.unwrap_or(mempalace_storage::TASK_LIST_PAGE_BYTES),
+            scope.visibility(),
+        )
+        .map_err(coordination_storage_error)?;
+    Ok(Json(page))
+}
 
 async fn route_coordination_events<P>(
     State(state): State<Arc<ServerState<P>>>,
@@ -9754,6 +9798,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn coordination_task_list_authorization_pagination_and_claim() {
+        let harness = make_harness().await;
+        let a = create_task(&harness, COORD_ALPHA_TOKEN, "wing_alpha", "list-a").await;
+        create_task(&harness, ALICE_TOKEN, "wing_beta", "list-hidden").await;
+        let b = create_task(&harness, COORD_ALPHA_TOKEN, "wing_alpha", "list-b").await;
+        let response = harness
+            .router
+            .clone()
+            .oneshot(authed_get("/v1/coordination/tasks?limit=1", COORD_ALPHA_TOKEN))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let page = body_json(response).await;
+        assert_eq!(page["tasks"][0]["task_id"], a);
+        assert!(page["tasks"][0].get("description").is_none());
+        let cursor = page["next_cursor"].as_str().unwrap();
+        let response = harness
+            .router
+            .clone()
+            .oneshot(authed_get(
+                &format!("/v1/coordination/tasks?limit=1&cursor={cursor}"),
+                COORD_ALPHA_TOKEN,
+            ))
+            .await
+            .unwrap();
+        let page = body_json(response).await;
+        assert_eq!(page["tasks"][0]["task_id"], b);
+        assert!(page["next_cursor"].is_null());
+        for wing in ["wing_beta", "wing_agents", "wing_unscoped"] {
+            let response = harness
+                .router
+                .clone()
+                .oneshot(authed_get(
+                    &format!("/v1/coordination/tasks?wing={wing}"),
+                    COORD_ALPHA_TOKEN,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let hidden = body_json(response).await;
+            assert_eq!(hidden["tasks"], json!([]));
+            assert!(hidden["next_cursor"].is_null());
+        }
+        let denied = harness
+            .router
+            .clone()
+            .oneshot(authed_get("/v1/coordination/tasks", "invalid-token"))
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+        let forbidden = harness
+            .router
+            .clone()
+            .oneshot(authed_get("/v1/coordination/tasks", COORD_WRITE_ONLY_TOKEN))
+            .await
+            .unwrap();
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+        let invalid = harness
+            .router
+            .clone()
+            .oneshot(authed_get("/v1/coordination/tasks?cursor=bad", COORD_ALPHA_TOKEN))
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        let tiny = harness
+            .router
+            .clone()
+            .oneshot(authed_get("/v1/coordination/tasks?byte_budget=128", COORD_ALPHA_TOKEN))
+            .await
+            .unwrap();
+        assert!(!tiny.status().is_success());
+        let claimed = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                &format!("/v1/coordination/tasks/{b}/claim"),
+                COORD_ALPHA_TOKEN,
+                json!({"expected_revision":page["tasks"][0]["revision"],"lease_seconds":300}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(claimed.status(), StatusCode::OK);
+        assert!(body_json(claimed).await.get("description").is_some());
+    }
+
+    #[tokio::test]
     async fn coordination_events_feed_pages_with_cursor() {
         let harness = make_harness().await;
         let task_id = create_task(&harness, COORD_ALPHA_TOKEN, "wing_alpha", "events-task").await;
@@ -10191,10 +10322,7 @@ mod tests {
         let inbox_resp = harness
             .router
             .clone()
-            .oneshot(authed_get(
-                "/v1/coordination/inbox?recipient=someone",
-                COORD_CLAIM_ONLY_TOKEN,
-            ))
+            .oneshot(authed_get("/v1/coordination/inbox?recipient=someone", COORD_CLAIM_ONLY_TOKEN))
             .await
             .unwrap();
         assert_eq!(inbox_resp.status(), StatusCode::FORBIDDEN);

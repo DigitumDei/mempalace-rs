@@ -30,7 +30,7 @@ Task titles, descriptions, JSON payloads and budgets, and artifact content are l
 
 The native local tool surface is:
 
-- `mempalace_task_create` (requires `wing`), `mempalace_task_get`, `mempalace_task_claim`, `mempalace_task_renew`, `mempalace_task_transition`
+- `mempalace_task_create` (requires `wing`), `mempalace_task_list`, `mempalace_task_get`, `mempalace_task_claim`, `mempalace_task_renew`, `mempalace_task_transition`
 - `mempalace_message_send`, `mempalace_message_get`, `mempalace_message_acknowledge`, `mempalace_inbox_read` (takes an optional `wing` filter)
 - `mempalace_artifact_put`, `mempalace_artifact_get`
 - `mempalace_result_put`, `mempalace_result_get`
@@ -38,7 +38,75 @@ The native local tool surface is:
 
 Treat returned cursors as opaque and persist them with worker state. After restart, retrieve known task, message, result, and artifact IDs directly, then continue the inbox or event stream from the stored cursor.
 
-As of issue #102 Stage 4, this tool surface is federation-aware: `mempalace_task_create` routes by its wing's `federation.coordination` rule, and every other tool above falls back across configured remotes by ID after a local miss (mirroring `mempalace_delete_drawer`'s existing local-first pattern) — a task's `wing` is never supplied to those calls, so there is nothing else to route by. `mempalace_inbox_read`/`mempalace_coordination_events` always read local and additionally fan out to every configured remote, reporting `remote_messages`/`remote_events` alongside the local result — `mempalace_coordination_event_get` is the one exception, staying local-only because Stage 3 never exposed a single-event GET route on the wire. Both fan-out tools also accept a `remote_cursors` object argument (`{"<remote_name>": "<opaque_cursor>"}`) to continue a specific remote's page independently of the local `cursor`; a page's own `remote_messages`/`remote_events` entries carry the `next_cursor` to feed back for that remote. See [Federation → Part 7, Federated coordination](Federation.md#part-7--federated-coordination) for the full routing rules, the server-side REST surface used by a remote peer, and the conflict/capability-gate error shapes.
+As of issue #102 Stage 4, this tool surface is federation-aware: `mempalace_task_create` routes by its wing's `federation.coordination` rule, and the other ID-keyed tools above fall back across configured remotes by ID after a local miss (mirroring `mempalace_delete_drawer`'s existing local-first pattern) — a task's `wing` is never supplied to those calls, so there is nothing else to route by. `mempalace_inbox_read`/`mempalace_coordination_events` always read local and additionally fan out to every configured remote, reporting `remote_messages`/`remote_events` alongside the local result — `mempalace_coordination_event_get` is the one exception, staying local-only because Stage 3 never exposed a single-event GET route on the wire. Both fan-out tools also accept a `remote_cursors` object argument (`{"<remote_name>": "<opaque_cursor>"}`) to continue a specific remote's page independently of the local `cursor`; a page's own `remote_messages`/`remote_events` entries carry the `next_cursor` to feed back for that remote. See [Federation → Part 7, Federated coordination](Federation.md#part-7--federated-coordination) for the full routing rules, the server-side REST surface used by a remote peer, and the conflict/capability-gate error shapes.
+
+## Task discovery
+
+`mempalace_task_list` is a `RoutableCoordination` read. It returns a local
+`{tasks, next_cursor}` page and, when coordination federation is enabled,
+independent pages under `remote_tasks[remote_name]`. It never merges origins.
+The matching REST route is `GET /v1/coordination/tasks`; `RemoteApi::coordination_tasks`
+requires the additive `coordination_task_list` capability. Older peers return
+`capability_missing` in-band; other remote failures return `unreachable` and a
+bounded error message. A failure preserves that origin's supplied cursor.
+
+Filters are `wing`, `state`, `owner`, `created_by`, and `parent_id`. `limit` defaults
+to 50 and is clamped to 1–200. Results follow immutable insertion sequence, with
+no selectable sort. The schema upgrade adds `coordination_tasks.sequence`,
+backfills existing tasks by parsed creation time and task ID, and uses an
+AUTOINCREMENT allocator plus an insert trigger so deletion or VACUUM cannot
+reuse sequence values. Cursors are opaque strings, using the same sequence
+encoding as the REST coordination feeds. State and ownership filters observe
+current rows, not a snapshot: a task that becomes eligible behind a cursor
+requires a new scan to discover.
+
+**Unfiltered REST lists are allowed.** The `require_coordination_read` gate and
+`CoordinationReadScope` apply exactly as for events. SQL excludes invisible,
+diary and unscoped wings before pagination; explicitly filtering an excluded
+wing returns an empty page, not 403. Local MCP reads use trusted visibility.
+
+Each `TaskListItem` contains `task_id`, `wing`, `state`, `revision`, `title`,
+`title_truncated`, `owner`, `lease_expires_at`, `parent_id`, `dependency_count`,
+`created_by`, `created_at`, and `expires_at`. Title prefixes are limited to 1,024
+UTF-8 bytes without splitting a character. Description, budget and dependency
+IDs are omitted. A zero dependency count means no declared dependencies; a
+positive count does not imply unmet dependencies, and claiming does not check
+dependency completion. Lease timestamps identify reclaim candidates; the
+owning palace's clock and claim checks decide whether claiming succeeds.
+
+The worker flow is `task_list → choose → task_claim(expected_revision) → execute
+the full task returned by claim`. A racing revision produces the normal CAS
+conflict. `task_get` remains available for inspection and refreshes.
+
+Task-list budgets are separate from the existing 1 MiB field/payload bounds:
+
+- Local and REST pages cap their encoded JSON at 256 KiB, including escaping and
+  the page envelope. REST accepts a smaller `byte_budget` (minimum 128 bytes).
+  Pagination reserves cursor space and stops before an item that would exceed
+  the budget; the cursor is derived from the last emitted item.
+- If one item cannot fit an empty page, the call returns an explicit error.
+  Existing unbounded actor strings remain valid and are never truncated or
+  silently skipped. Use `task_get` to inspect the task; a larger page budget
+  helps only below the 256 KiB ceiling. Resolving a permanently oversized record
+  requires a separate data-repair decision. No write-time actor limits or
+  automatic migration of identities are introduced here.
+- The MCP compact aggregate payload caps at 1 MiB. The router reserves encoded
+  remote names, original cursors and error envelopes, then divides the remaining
+  budget across selected origins before making requests. Remote pages exceeding
+  their allocation are rejected whole, preserving the original cursor. If an
+  origin receives less than 128 bytes, it is not contacted and returns
+  `budget_exhausted:true` with its original cursor. Excessive origin metadata
+  returns an explicit error asking for fewer origins. The actual MCP result
+  envelope (which embeds pretty-printed JSON as text) has an additional 4 MiB
+  encoded ceiling. These limits stay below the remote client's 10 MiB ceiling.
+
+Pass `remote_cursors:{"work":"<cursor>"}` to resume remote work. For an independent
+remote continuation, use `include_local:false, remotes:["work"]`; this preserves
+the supplied local cursor and leaves other remotes untouched. Selecting fewer
+remotes also gives each one more of the aggregate budget. Omitted `remotes`
+means all coordination candidates; `remotes:[]` means no remote reads. Keep
+exhausted origins out of subsequent requests: an omitted cursor starts a new
+scan, not an implicit continuation.
 
 ## Protocol adapter tools (A2A and MCP Tasks)
 

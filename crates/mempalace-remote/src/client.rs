@@ -723,6 +723,22 @@ impl RemoteApi for RemoteClient {
         self.execute(rb, CallKind::Read).await
     }
 
+    /// Discover tasks with compact metadata and an opaque cursor (`GET /v1/coordination/tasks`).
+    async fn coordination_tasks(
+        &self,
+        query: mempalace_federation::CoordinationTasksQuery,
+    ) -> Result<mempalace_federation::CoordinationTasksResponse> {
+        let info = self.ensure_handshake().await?;
+        if !info.capabilities.iter().any(|c| c == "coordination_task_list") {
+            return Err(RemoteError::CapabilityMissing {
+                remote: self.name.clone(),
+                capability: "coordination_task_list".into(),
+            });
+        }
+        let url = self.url("v1/coordination/tasks")?;
+        self.execute(self.http.get(url).query(&query), CallKind::Read).await
+    }
+
     /// Read the coordination audit-event feed, cursor-paginated (`GET /v1/coordination/events`).
     async fn coordination_events(
         &self,

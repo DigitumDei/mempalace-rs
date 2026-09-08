@@ -1,6 +1,8 @@
 #![allow(missing_docs)]
 
 mod federation;
+mod metrics;
+mod replication;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
@@ -24,8 +26,9 @@ use mempalace_embeddings::{
     FastembedProviderConfig, env_flag,
 };
 use mempalace_federation::{
-    AckMessageRequest, CoordinationTaskState as WireTaskState, FEDERATION_API_VERSION,
-    InfoResponse, MaintenanceStatus, NewArtifactRequest as WireNewArtifactRequest,
+    AckMessageRequest, AddDrawerRequest, CoordinationTaskState as WireTaskState,
+    FEDERATION_API_VERSION, InfoResponse, KgAddFactRequest, KgInvalidateRequest,
+    MaintenanceStatus, NewArtifactRequest as WireNewArtifactRequest,
     NewMessageRequest as WireNewMessageRequest, NewTaskRequest as WireNewTaskRequest,
     NewTaskResultRequest as WireNewTaskResultRequest, TaskLeaseRequest, TransitionTaskRequest,
 };
@@ -41,13 +44,13 @@ use mempalace_mcp_tasks::{
 use mempalace_search::{SearchRuntime, SearchRuntimePolicy};
 use mempalace_storage::{
     AgentLineageRecord, ChangeEvent, ChangeLogStore, CoordinationCursor, CoordinationStore,
-    CoordinationVisibility, DiaryStore, DrawerFilter, DrawerStore, DuplicateStrategy,
-    IngestCommitRequest, MAX_PAYLOAD_BYTES,
-    DelegationStore, LineageMigrationRecord, NewArtifact, NewCheckpoint, NewMessage, NewSkill,
-    NewSkillOutcome, NewSpan, NewTask, NewTaskResult, RevisionedWrite, SelfModelStore,
-    SelfObservationRecord, SelfObservationScope, SelfObservationStatus, SkillScope, SkillStatus,
-    ImportedTask, ONLY_OWNER_MAY_TRANSITION, SkillStore, SpanStatus, StopReason,
-    StorageEngine, TaskState,
+    CoordinationVisibility, DelegationStore, DiaryStore, DrawerFilter, DrawerStore,
+    DuplicateStrategy, ImportedTask, IngestCommitRequest, LineageMigrationRecord,
+    MAX_PAYLOAD_BYTES, NewArtifact, NewCheckpoint, NewMessage, NewOutboxOperation, NewSkill,
+    NewSkillOutcome, NewSpan, NewTask, NewTaskResult, ONLY_OWNER_MAY_TRANSITION, OutboxOperation,
+    OutboxState, OutboxStore, RevisionedWrite, SelfModelStore, SelfObservationRecord,
+    SelfObservationScope, SelfObservationStatus, SkillScope, SkillStatus, SkillStore, SpanStatus,
+    StopReason, StorageEngine, TaskState,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -58,6 +61,10 @@ use tokio::sync::{Mutex, Semaphore, TryAcquireError};
 
 use federation::FederationRouter;
 pub use mempalace_core as core;
+use metrics::PhaseMeter;
+use replication::{
+    OUTBOX_ACTOR, OUTBOX_MAX_ATTEMPTS, ReplicationMutation, expect_applied, run_replication_worker,
+};
 
 // ─── Federation routing semantics ─────────────────────────────────────────────
 //
@@ -201,6 +208,8 @@ pub enum McpError {
     TimeFormat(String),
     #[error("federation error: {0}")]
     Federation(String),
+    #[error("replication state error: {0}")]
+    Replication(String),
     #[error("invalid {LINEAGE_ID_ENV}: {0}")]
     InvalidLineageBinding(String),
     #[error("io error at {path}: {source}")]
@@ -533,7 +542,8 @@ impl ToolName {
                         "predicate":{"type":"string","description":"The relationship type (e.g. 'loves', 'works_on', 'daughter_of')"},
                         "object":{"type":"string","description":"The entity being connected to"},
                         "valid_from":{"type":"string","description":"When this became true (YYYY-MM-DD, optional)"},
-                        "source_closet":{"type":"string","description":"Closet ID where this fact appears (optional)"}
+                        "source_closet":{"type":"string","description":"Closet ID where this fact appears (optional)"},
+                        "operation_id":{"type":"string","description":"Stable idempotency key for a remote or durable dual-write retry (optional)"}
                     },
                     "required":["subject","predicate","object"]
                 }),
@@ -547,7 +557,8 @@ impl ToolName {
                         "subject":{"type":"string","description":"Entity"},
                         "predicate":{"type":"string","description":"Relationship"},
                         "object":{"type":"string","description":"Connected entity"},
-                        "ended":{"type":"string","description":"When it stopped being true (YYYY-MM-DD, default: today)"}
+                        "ended":{"type":"string","description":"When it stopped being true (YYYY-MM-DD, default: today)"},
+                        "operation_id":{"type":"string","description":"Stable idempotency key for a remote or durable dual-write retry (optional)"}
                     },
                     "required":["subject","predicate","object"]
                 }),
@@ -630,17 +641,21 @@ impl ToolName {
                         "room":{"type":"string","description":"Room (aspect: backend, decisions, meetings...)"},
                         "content":{"type":"string","description":"Verbatim content to store — exact words, never summarized"},
                         "source_file":{"type":"string","description":"Where this came from (optional)"},
-                        "added_by":{"type":"string","description":"Who is filing this (default: mcp)"}
+                        "added_by":{"type":"string","description":"Who is filing this (default: mcp)"},
+                        "operation_id":{"type":"string","description":"Stable idempotency key for a remote or durable dual-write retry (optional)"}
                     },
                     "required":["wing","room","content"]
                 }),
             },
             Self::DeleteDrawer => ToolDefinition {
                 name: self.as_str(),
-                description: "Delete a drawer by ID. Irreversible. Local deletion first by ID; if not found locally, falls back to remotes in name order. Does not use write routing.",
+                description: "Delete a drawer by ID. Irreversible. Known local drawers follow write routing; write:both commits locally and queues durable replication. Unknown IDs fall back across remotes.",
                 input_schema: json!({
                     "type":"object",
-                    "properties":{"drawer_id":{"type":"string","description":"ID of the drawer to delete"}},
+                    "properties":{
+                        "drawer_id":{"type":"string","description":"ID of the drawer to delete"},
+                        "operation_id":{"type":"string","description":"Stable idempotency key for a remote or durable dual-write retry (optional)"}
+                    },
                     "required":["drawer_id"]
                 }),
             },
@@ -799,7 +814,15 @@ impl ToolName {
                 self,
                 "Propose a reusable procedure as a candidate skill version. The version is derived automatically as one past the highest existing version for skill_id; it is never caller-supplied. `scope: project` requires a `wing` naming the owning project, and the other scopes must omit it; a skill stays bound to that wing for its whole life. Replaying the same author and idempotency_key returns the committed version. Candidates are not authoritative until promoted.",
                 json!({"skill_id":{"type":"string"},"scope":{"type":"string","enum":["agent","project","organization"]},"wing":{"type":"string","description":"Owning project wing, e.g. wing_myproject. Required for project scope, rejected otherwise."},"applicability":{"type":"string"},"instructions_ref":{"type":"string"},"required_capabilities":{"type":"array","items":{"type":"string"}},"required_tools":{"type":"array","items":{"type":"string"}},"required_permissions":{"type":"array","items":{"type":"string"}},"author":{"type":"string"},"provenance":{},"confidence":{"type":"number","minimum":0,"maximum":1},"idempotency_key":{"type":"string"}}),
-                &["skill_id", "scope", "applicability", "instructions_ref", "author", "confidence", "idempotency_key"],
+                &[
+                    "skill_id",
+                    "scope",
+                    "applicability",
+                    "instructions_ref",
+                    "author",
+                    "confidence",
+                    "idempotency_key",
+                ],
             ),
             Self::SkillGet => coordination_definition(
                 self,
@@ -1128,7 +1151,7 @@ pub async fn serve_transport<P, R, W>(
     mut writer: W,
 ) -> std::result::Result<(), Box<dyn std::error::Error>>
 where
-    P: EmbeddingProvider + Send,
+    P: EmbeddingProvider + Send + 'static,
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin,
 {
@@ -1169,13 +1192,13 @@ impl McpServer<FastembedProvider> {
 
 pub fn configured_lineage_id_from_env() -> Result<Option<String>> {
     match std::env::var(LINEAGE_ID_ENV) {
-        Ok(value) => validate_record_id_value(&value)
-            .map(Some)
-            .map_err(McpError::InvalidLineageBinding),
+        Ok(value) => {
+            validate_record_id_value(&value).map(Some).map_err(McpError::InvalidLineageBinding)
+        }
         Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(std::env::VarError::NotUnicode(_)) => Err(McpError::InvalidLineageBinding(
-            "must be valid Unicode".to_owned(),
-        )),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(McpError::InvalidLineageBinding("must be valid Unicode".to_owned()))
+        }
     }
 }
 
@@ -1194,7 +1217,7 @@ pub fn default_provider(profile: EmbeddingProfile) -> Result<FastembedProvider> 
 
 impl<P> McpServer<P>
 where
-    P: EmbeddingProvider + Send,
+    P: EmbeddingProvider + Send + 'static,
 {
     pub async fn from_parts(config: MempalaceConfig, provider: P) -> Result<Self> {
         Self::from_parts_with_lineage(config, provider, None).await
@@ -1211,10 +1234,16 @@ where
             .map_err(McpError::InvalidLineageBinding)?;
         let queue_limit = config.low_cpu.effective_queue_limit().min(Semaphore::MAX_PERMITS);
         let runtime = McpRuntime::new(config, provider, lineage_id).await?;
-        Ok(Self {
-            runtime: Arc::new(Mutex::new(runtime)),
-            queue_limit: Arc::new(Semaphore::new(queue_limit)),
-        })
+        let federation_worker = runtime.federation.as_ref().and_then(|router| {
+            (!router.remotes.is_empty())
+                .then(|| (runtime.outbox.clone(), router.remotes.clone(), runtime.metrics.clone()))
+        });
+        let runtime = Arc::new(Mutex::new(runtime));
+        if let Some((outbox, remotes, metrics)) = federation_worker {
+            tokio::spawn(run_replication_worker(outbox, remotes, metrics));
+            tokio::spawn(run_staged_reconciliation(runtime.clone()));
+        }
+        Ok(Self { runtime, queue_limit: Arc::new(Semaphore::new(queue_limit)) })
     }
 
     pub async fn handle_json_value(&self, request: Value) -> Value {
@@ -1453,6 +1482,47 @@ where
     }
 }
 
+/// How long a staged replication intent counts as owned by the live process that enqueued it
+/// and is therefore shielded from startup reconciliation.
+///
+/// `McpRuntime::new` runs `reconcile_staged_replication` before serving requests, and every MCP
+/// process sharing a palace does so. A second process starting while the first is still between
+/// staging an intent and committing its local mutation would otherwise observe the uncommitted
+/// local state, cancel the intent, and make the originating process's later activation fail —
+/// leaving the local mutation unreplicated. Staged rows carry durable `created_at` timestamps, so
+/// reconciliation defers uncommitted intents younger than this bounded grace period and treats
+/// only older staged rows as abandoned pre-crash work. The cost is bounded: a row genuinely
+/// abandoned by a crash inside the window stays staged (and undeliverable) until a later startup
+/// reconciliation observes it past the grace period.
+const STAGED_INTENT_RECONCILIATION_GRACE: Duration = Duration::minutes(5);
+
+/// Poll interval for the in-process reconciliation loop. Startup reconciliation protects the
+/// crash window, while this periodic pass eventually settles a row that was still inside the
+/// ownership grace period when another process started.
+const STAGED_INTENT_RECONCILIATION_POLL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Whether a staged intent's durable `created_at` is old enough for startup reconciliation to
+/// treat it as abandoned rather than as currently fresh work.
+fn staged_intent_exceeded_grace(created_at: OffsetDateTime, now: OffsetDateTime) -> bool {
+    now - created_at >= STAGED_INTENT_RECONCILIATION_GRACE
+}
+
+async fn run_staged_reconciliation<P>(runtime: Arc<Mutex<McpRuntime<P>>>)
+where
+    P: EmbeddingProvider + Send + 'static,
+{
+    loop {
+        tokio::time::sleep(STAGED_INTENT_RECONCILIATION_POLL).await;
+        let result = {
+            let mut runtime = runtime.lock().await;
+            runtime.reconcile_staged_replication().await
+        };
+        if let Err(error) = result {
+            tracing::warn!(%error, "periodic staged replication reconciliation failed");
+        }
+    }
+}
+
 #[derive(Debug)]
 struct McpRuntime<P> {
     config: MempalaceConfig,
@@ -1461,8 +1531,10 @@ struct McpRuntime<P> {
     coordination: CoordinationStore,
     skills: SkillStore,
     delegation: DelegationStore,
+    outbox: OutboxStore,
     search: SearchRuntime<P>,
     federation: Option<FederationRouter>,
+    metrics: PhaseMeter,
 }
 
 impl<P> McpRuntime<P>
@@ -1481,9 +1553,11 @@ where
         skills.ensure_schema()?;
         let delegation = DelegationStore::new(config.palace_path.join("storage.sqlite3"));
         delegation.ensure_schema()?;
+        let outbox = OutboxStore::new(config.palace_path.join("storage.sqlite3"));
+        outbox.ensure_schema()?;
         let router = FederationRouter::new(config.federation.clone());
         let federation = if router.has_remotes() { Some(router) } else { None };
-        Ok(Self {
+        let mut runtime = Self {
             search: SearchRuntime::with_policy(
                 provider,
                 SearchRuntimePolicy { rerank_enabled: config.low_cpu.effective_rerank_enabled() },
@@ -1494,8 +1568,412 @@ where
             coordination,
             skills,
             delegation,
+            outbox,
             federation,
-        })
+            metrics: PhaseMeter::default(),
+        };
+        runtime.reconcile_staged_replication().await?;
+        Ok(runtime)
+    }
+
+    /// Settle every pre-crash staged intent before a dispatcher can claim work. The local
+    /// logical state is authoritative: a committed mutation is activated, while an intent whose
+    /// local mutation never landed is cancelled — unless the intent is still inside
+    /// [`STAGED_INTENT_RECONCILIATION_GRACE`], so a second process starting mid-write cannot
+    /// cancel work the originating process is still applying.
+    async fn reconcile_staged_replication(&mut self) -> Result<()> {
+        loop {
+            let staged = self.outbox.list_staged(10_000)?;
+            if staged.is_empty() {
+                return Ok(());
+            }
+            let mut settled = 0usize;
+            for operation in staged {
+                // Clone the storage handles before awaiting the local-state probe.  This keeps
+                // the reconciliation future independent of the embedding provider held by the
+                // runtime, so it remains `Send` without requiring providers to be `Sync`.
+                let committed =
+                    Self::replication_intent_committed(self.storage.clone(), &operation).await?;
+                if !committed
+                    && !staged_intent_exceeded_grace(
+                        operation.created_at,
+                        OffsetDateTime::now_utc(),
+                    )
+                {
+                    tracing::debug!(
+                        operation_id = %operation.operation_id,
+                        "deferring startup reconciliation of a fresh staged replication intent"
+                    );
+                    continue;
+                }
+                let transition = if committed {
+                    self.outbox.activate(&operation.operation_id, operation.revision)?
+                } else {
+                    self.outbox.cancel(&operation.operation_id, operation.revision)?
+                };
+                match transition {
+                    RevisionedWrite::Applied(_) => {}
+                    RevisionedWrite::Conflict { actual_revision } => {
+                        let current = self.outbox.get_operation(&operation.operation_id)?;
+                        let compatible = match (current.as_ref(), actual_revision) {
+                            (Some(current), Some(actual_revision))
+                                if current.revision == actual_revision =>
+                            {
+                                if committed {
+                                    !matches!(
+                                        current.state,
+                                        OutboxState::Staged | OutboxState::Cancelled
+                                    )
+                                } else {
+                                    current.state == OutboxState::Cancelled
+                                }
+                            }
+                            _ => false,
+                        };
+                        if !compatible {
+                            return Err(McpError::Replication(format!(
+                                "outbox {} lost a revision race (actual revision {actual_revision:?})",
+                                if committed { "activation" } else { "cancellation" }
+                            )));
+                        }
+                    }
+                }
+                tracing::info!(
+                    operation_id = %operation.operation_id,
+                    committed,
+                    "reconciled staged durable replication intent"
+                );
+                settled += 1;
+            }
+            if settled == 0 {
+                // Every remaining staged intent is inside the ownership grace period with its
+                // local mutation still uncommitted, so nothing can be settled this pass and
+                // looping again would revisit the same rows forever.
+                return Ok(());
+            }
+        }
+    }
+
+    async fn replication_intent_committed(
+        storage: StorageEngine,
+        operation: &OutboxOperation,
+    ) -> Result<bool> {
+        let mutation = serde_json::from_value::<ReplicationMutation>(operation.payload.clone())
+            .map_err(|error| {
+                McpError::Replication(format!(
+                    "invalid staged replication payload {}: {error}",
+                    operation.operation_id
+                ))
+            })?;
+        match mutation {
+            ReplicationMutation::DrawerAdd { request } => {
+                let drawer_id = request.drawer_id.ok_or_else(|| {
+                    McpError::Replication(format!(
+                        "staged drawer add {} has no stable drawer id",
+                        operation.operation_id
+                    ))
+                })?;
+                let drawer_id = parse_drawer_id(&drawer_id).map_err(|error| match error {
+                    ToolError::InvalidParams(message) => McpError::Replication(message),
+                    ToolError::Internal(error) => error,
+                })?;
+                Ok(storage.drawer_store().get_drawer(&drawer_id).await?.is_some())
+            }
+            ReplicationMutation::DrawerDelete { drawer_id } => {
+                let drawer_id = parse_drawer_id(&drawer_id).map_err(|error| match error {
+                    ToolError::InvalidParams(message) => McpError::Replication(message),
+                    ToolError::Internal(error) => error,
+                })?;
+                Ok(storage.drawer_store().get_drawer(&drawer_id).await?.is_none())
+            }
+            ReplicationMutation::KgAdd { request, .. } => Ok(Self::local_fact_state_from_storage(
+                &storage,
+                &request.subject,
+                &request.predicate,
+                &request.object,
+            )? == Some(true)),
+            ReplicationMutation::KgInvalidate { request } => {
+                // An already-inactive fact is a committed no-op for invalidation, but an
+                // unknown entity means the local mutation could not have committed. Keep those
+                // cases distinct so startup never activates a remote-only invalidation.
+                Ok(Self::local_fact_state_from_storage(
+                    &storage,
+                    &request.subject,
+                    &request.predicate,
+                    &request.object,
+                )? == Some(false))
+            }
+        }
+    }
+
+    fn local_fact_state(
+        &self,
+        subject: &str,
+        predicate: &str,
+        object: &str,
+    ) -> Result<Option<bool>> {
+        Self::local_fact_state_from_storage(&self.storage, subject, predicate, object)
+    }
+
+    fn local_fact_state_from_storage(
+        storage: &StorageEngine,
+        subject: &str,
+        predicate: &str,
+        object: &str,
+    ) -> Result<Option<bool>> {
+        let runtime = KnowledgeGraphRuntime::new(storage.operational_store());
+        let rows = match runtime.query_entity(subject, None, QueryDirection::Outgoing) {
+            Ok(rows) => rows,
+            Err(mempalace_graph::GraphError::UnknownEntity { .. }) => return Ok(None),
+            Err(error) => return Err(McpError::Graph(error)),
+        };
+        // `query_entity(subject)` only proves the subject exists. Invalidation resolves both
+        // endpoints, so probe the object as well before classifying an absent matching fact as a
+        // committed no-op. A known entity can legitimately have no facts and still yields an
+        // empty successful query.
+        match runtime.query_entity(object, None, QueryDirection::Both) {
+            Ok(_) => {}
+            Err(mempalace_graph::GraphError::UnknownEntity { .. }) => return Ok(None),
+            Err(error) => return Err(McpError::Graph(error)),
+        }
+        let matches: Vec<_> = rows
+            .into_iter()
+            .filter(|row| {
+                canonicalize_kg_label(&row.subject) == canonicalize_kg_label(subject)
+                    && canonicalize_kg_label(&row.predicate) == canonicalize_kg_label(predicate)
+                    && canonicalize_kg_label(&row.object) == canonicalize_kg_label(object)
+            })
+            .collect();
+        Ok(Some(matches.iter().any(|row| row.current)))
+    }
+
+    fn stage_replication(
+        &self,
+        idempotency_key: String,
+        mutation_kind: &str,
+        entity_id: String,
+        destination_remote: String,
+        ordering_key: String,
+        mutation: ReplicationMutation,
+    ) -> Result<OutboxOperation> {
+        Ok(self.outbox.enqueue(&NewOutboxOperation {
+            created_by: OUTBOX_ACTOR.to_owned(),
+            idempotency_key,
+            mutation_kind: mutation_kind.to_owned(),
+            entity_id,
+            destination_remote,
+            ordering_key,
+            payload: mutation.into_value()?,
+            max_attempts: OUTBOX_MAX_ATTEMPTS,
+        })?)
+    }
+
+    fn activate_replication(&self, operation: &OutboxOperation) -> Result<OutboxOperation> {
+        let transition = self.outbox.activate(&operation.operation_id, operation.revision)?;
+        match transition {
+            RevisionedWrite::Applied(value) => Ok(value),
+            RevisionedWrite::Conflict { actual_revision } => {
+                // Two keyed requests can both observe the same staged row and commit the same
+                // idempotent local mutation. If the other process won activation, the CAS
+                // conflict is harmless: reload its compatible non-staged state and report the
+                // already-queued operation instead of failing the foreground request.
+                let current = self.outbox.get_operation(&operation.operation_id)?;
+                if let (Some(current), Some(actual_revision)) = (current, actual_revision)
+                    && current.revision == actual_revision
+                    && !matches!(current.state, OutboxState::Staged | OutboxState::Cancelled)
+                {
+                    return Ok(current);
+                }
+                Err(McpError::Replication(format!(
+                    "outbox activation lost a revision race (actual revision {actual_revision:?})"
+                )))
+            }
+        }
+    }
+
+    fn cancel_staged_replication(&self, operation: &OutboxOperation) {
+        if let Err(error) = self.outbox.cancel(&operation.operation_id, operation.revision) {
+            tracing::warn!(
+                operation_id = %operation.operation_id,
+                %error,
+                "failed to cancel uncommitted replication intent; startup reconciliation will retry"
+            );
+        }
+    }
+
+    /// Recover a keyed `write:both` delete's durable outbox intent from the caller's
+    /// stable operation id alone, before any local drawer metadata is consulted.
+    ///
+    /// The outbox row is authoritative: it names the destination remote and the current
+    /// queued/terminal state, neither of which can be re-derived after the local drawer is
+    /// gone. Retrying the same `operation_id` after a successful local deletion (or a crash
+    /// after delete, once startup reconciliation has activated the intent) must therefore
+    /// return that original state rather than falling into the synchronous all-remote
+    /// fallback / false-not-found path.
+    ///
+    /// Returns `Ok(None)` when there is no live terminal/queued intent for this drawer under
+    /// this key (a genuinely fresh delete, a no-key delete, or a still-staged intent whose
+    /// local delete never committed — the normal path handles those).
+    async fn recover_keyed_delete_replication(
+        &self,
+        requested_operation_id: &str,
+        drawer_id: &str,
+    ) -> Result<Option<Value>> {
+        let Some(operation) = self.outbox.find_by_key(OUTBOX_ACTOR, requested_operation_id)? else {
+            return Ok(None);
+        };
+        if operation.mutation_kind != "drawer_deleted" {
+            return Ok(None);
+        }
+        let matches_drawer =
+            serde_json::from_value::<ReplicationMutation>(operation.payload.clone())
+                .ok()
+                .is_some_and(|mutation| {
+                    matches!(
+                        mutation,
+                        ReplicationMutation::DrawerDelete { drawer_id: id } if id == drawer_id
+                    )
+                });
+        if !matches_drawer {
+            return Ok(None);
+        }
+        match operation.state {
+            // A staged intent normally means the local delete never committed. If the target is
+            // already absent, however, another process committed the delete and crashed before
+            // activation; preserve this operation's pinned destination and activate it here
+            // instead of falling through to an unrelated all-remote lookup.
+            OutboxState::Staged => {
+                let target = parse_drawer_id(drawer_id).map_err(|error| match error {
+                    ToolError::InvalidParams(message) => McpError::Replication(message),
+                    ToolError::Internal(error) => error,
+                })?;
+                if self.storage.drawer_store().get_drawer(&target).await?.is_none() {
+                    let operation = self.activate_replication(&operation)?;
+                    return Ok(Some(delete_replication_replay_payload(&operation, drawer_id)));
+                }
+                Ok(None)
+            }
+            OutboxState::Cancelled => Ok(None),
+            _ => Ok(Some(delete_replication_replay_payload(&operation, drawer_id))),
+        }
+    }
+
+    /// Recover a keyed `write:both` add's pinned drawer target from the caller's stable
+    /// operation id, before a fresh time-derived drawer id is generated.
+    ///
+    /// A `write:both` add stages a durable outbox intent (keyed by the caller's operation
+    /// id) before committing locally; a failed local commit cancels that intent, and the
+    /// intent's payload pins the drawer id the first attempt generated. A retry of the
+    /// same operation must reuse that pinned target: generating a fresh time-derived id
+    /// would present a different entity/payload under the same idempotency key, which the
+    /// outbox rejects as a key reused with a different mutation.
+    ///
+    /// Returns `Ok(None)` — letting the normal paths proceed unchanged — when there is no
+    /// staged/cancelled `drawer_added` intent under this operation id, when its payload is
+    /// not this exact mutation (same wing, room, content, source file, and added_by), or
+    /// when the pinned drawer already exists locally (the duplicate/replay paths own that
+    /// case).
+    async fn recover_keyed_add_target(
+        &self,
+        requested_operation_id: &str,
+        wing: &str,
+        room: &str,
+        content: &str,
+        source_file: Option<&str>,
+        added_by: Option<&str>,
+    ) -> Result<Option<DrawerId>> {
+        let Some(operation) = self.outbox.find_by_key(OUTBOX_ACTOR, requested_operation_id)? else {
+            return Ok(None);
+        };
+        if operation.mutation_kind != "drawer_added" {
+            return Ok(None);
+        }
+        // Only an intent whose local commit never landed (still staged, or cancelled as
+        // uncommitted) needs target recovery; every other state means the local commit
+        // confirmed and the normal duplicate/replay paths own the retry.
+        if !matches!(operation.state, OutboxState::Staged | OutboxState::Cancelled) {
+            return Ok(None);
+        }
+        let Ok(ReplicationMutation::DrawerAdd { request: staged }) =
+            serde_json::from_value::<ReplicationMutation>(operation.payload.clone())
+        else {
+            return Ok(None);
+        };
+        let Some(pinned_drawer_id) = staged.drawer_id.as_deref() else {
+            return Ok(None);
+        };
+        if staged.wing != wing
+            || staged.room != room
+            || staged.content != content
+            || staged.source_file.as_deref() != source_file
+            || staged.added_by.as_deref() != added_by
+        {
+            return Ok(None);
+        }
+        let pinned = parse_drawer_id(pinned_drawer_id).map_err(|error| match error {
+            ToolError::InvalidParams(message) => McpError::Replication(message),
+            ToolError::Internal(error) => error,
+        })?;
+        if self.storage.drawer_store().get_drawer(&pinned).await?.is_some() {
+            return Ok(None);
+        }
+        Ok(Some(pinned))
+    }
+
+    /// Replay a completed keyed `write:both` add whose local drawer was subsequently removed.
+    /// The outbox operation remains the authority for the original target and replication state;
+    /// do not mint a new drawer id or attempt to enqueue the same key as a different mutation.
+    async fn recover_keyed_add_replay(
+        &self,
+        requested_operation_id: &str,
+        wing: &str,
+        room: &str,
+        content: &str,
+        source_file: Option<&str>,
+        added_by: Option<&str>,
+    ) -> Result<Option<Value>> {
+        let Some(operation) = self.outbox.find_by_key(OUTBOX_ACTOR, requested_operation_id)? else {
+            return Ok(None);
+        };
+        if operation.mutation_kind != "drawer_added"
+            || matches!(operation.state, OutboxState::Staged | OutboxState::Cancelled)
+        {
+            return Ok(None);
+        }
+        let Ok(ReplicationMutation::DrawerAdd { request: staged }) =
+            serde_json::from_value::<ReplicationMutation>(operation.payload.clone())
+        else {
+            return Ok(None);
+        };
+        let Some(pinned_drawer_id) = staged.drawer_id.as_deref() else {
+            return Ok(None);
+        };
+        if staged.wing != wing
+            || staged.room != room
+            || staged.content != content
+            || staged.source_file.as_deref() != source_file
+            || staged.added_by.as_deref() != added_by
+        {
+            return Ok(None);
+        }
+        let pinned = parse_drawer_id(pinned_drawer_id).map_err(|error| match error {
+            ToolError::InvalidParams(message) => McpError::Replication(message),
+            ToolError::Internal(error) => error,
+        })?;
+        if self.storage.drawer_store().get_drawer(&pinned).await?.is_some() {
+            return Ok(None);
+        }
+        let result = json!({
+            "success": true,
+            "drawer_id": pinned_drawer_id,
+            "wing": wing,
+            "room": room,
+            "applied_to": "local",
+            "replication": replication_status_for_operation(&operation),
+        });
+        // Keep this as an object construction (rather than returning the outbox row directly) so
+        // the replay remains wire-compatible with a normal add response.
+        Ok(Some(result))
     }
 
     async fn tool_wake_up(&mut self, arguments: &Value) -> ToolResult<Value> {
@@ -1629,6 +2107,44 @@ where
         if let Some(rooms) = rooms {
             payload["rooms"] = json!(rooms);
         }
+        let backlog = self.outbox.backlog(None).map_tool()?;
+        let failures = self
+            .outbox
+            .list_failed(10)
+            .map_tool()?
+            .into_iter()
+            .map(|operation| {
+                json!({
+                    "operation_id": operation.operation_id,
+                    "remote": operation.destination_remote,
+                    "mutation_kind": operation.mutation_kind,
+                    "entity_id": operation.entity_id,
+                    "attempt_count": operation.attempt_count,
+                    "last_error": operation.last_error,
+                    "failed_at": operation.updated_at,
+                })
+            })
+            .collect::<Vec<_>>();
+        let metrics = self.metrics.snapshot();
+        let phase_metrics = metrics
+            .into_iter()
+            .map(|(phase, stats)| {
+                let phase = phase.to_owned();
+                let value = json!({
+                    "count": stats.count,
+                    "last_ms": stats.last_ms,
+                    "total_ms": stats.total_ms,
+                    "max_ms": stats.max_ms,
+                    "avg_ms": stats.avg_ms(),
+                });
+                (phase, value)
+            })
+            .collect::<BTreeMap<_, _>>();
+        payload["replication"] = json!({
+            "backlog": backlog,
+            "recent_terminal_failures": failures,
+            "phase_metrics": phase_metrics,
+        });
         Ok(payload)
     }
 
@@ -1753,20 +2269,12 @@ where
         Ok(json!({"success": true, "lineage": lineage}))
     }
 
-    async fn tool_self_observation_propose(
-        &mut self,
-        arguments: &Value,
-    ) -> ToolResult<Value> {
+    async fn tool_self_observation_propose(&mut self, arguments: &Value) -> ToolResult<Value> {
         let lineage_id = required_record_id(arguments, "lineage_id")?;
-        let Some(_) = self
-            .storage
-            .operational_store()
-            .get_lineage(&lineage_id)
-            .map_tool_internal()?
+        let Some(_) =
+            self.storage.operational_store().get_lineage(&lineage_id).map_tool_internal()?
         else {
-            return Err(ToolError::InvalidParams(format!(
-                "lineage `{lineage_id}` does not exist"
-            )));
+            return Err(ToolError::InvalidParams(format!("lineage `{lineage_id}` does not exist")));
         };
         let statement = required_non_blank_string(arguments, "statement")?;
         let behavioral_consequence =
@@ -1854,10 +2362,7 @@ where
         Ok(json!({"success": true, "observation": observation}))
     }
 
-    async fn tool_self_observation_review(
-        &mut self,
-        arguments: &Value,
-    ) -> ToolResult<Value> {
+    async fn tool_self_observation_review(&mut self, arguments: &Value) -> ToolResult<Value> {
         let observation_id = required_record_id(arguments, "observation_id")?;
         let decision = required_non_blank_string(arguments, "decision")?;
         let expected_revision = required_positive_i64(arguments, "expected_revision")?;
@@ -1933,15 +2438,10 @@ where
 
     async fn tool_migration_record(&mut self, arguments: &Value) -> ToolResult<Value> {
         let lineage_id = required_record_id(arguments, "lineage_id")?;
-        let Some(_) = self
-            .storage
-            .operational_store()
-            .get_lineage(&lineage_id)
-            .map_tool_internal()?
+        let Some(_) =
+            self.storage.operational_store().get_lineage(&lineage_id).map_tool_internal()?
         else {
-            return Err(ToolError::InvalidParams(format!(
-                "lineage `{lineage_id}` does not exist"
-            )));
+            return Err(ToolError::InvalidParams(format!("lineage `{lineage_id}` does not exist")));
         };
         let from_model = optional_non_blank_string(arguments, "from_model")?;
         let from_harness = optional_non_blank_string(arguments, "from_harness")?;
@@ -2006,7 +2506,8 @@ where
         let model = optional_non_blank_string(arguments, "model")?;
         let harness = optional_non_blank_string(arguments, "harness")?;
         let include_candidates = optional_bool(arguments, "include_candidates")?.unwrap_or(false);
-        let observation_limit = optional_usize(arguments, "observation_limit")?.unwrap_or(20).min(50);
+        let observation_limit =
+            optional_usize(arguments, "observation_limit")?.unwrap_or(20).min(50);
         let migration_limit = optional_usize(arguments, "migration_limit")?.unwrap_or(5).min(25);
         let operational_store = self.storage.operational_store();
         let (lineage, lineage_selection) = match self.bound_lineage_id.as_deref() {
@@ -2022,7 +2523,8 @@ where
                         }),
                     ),
                     None => {
-                        let fallback = operational_store.get_default_lineage().map_tool_internal()?;
+                        let fallback =
+                            operational_store.get_default_lineage().map_tool_internal()?;
                         let fallback_id = fallback.as_ref().map(|record| record.lineage_id.clone());
                         let message = if fallback_id.is_some() {
                             format!(
@@ -2290,6 +2792,7 @@ where
                             .into_iter()
                             .map(|result| {
                                 let mut obj = json!({
+                                    "drawer_id": result.drawer_id,
                                     "wing": result.wing,
                                     "room": result.room,
                                     "similarity": round_similarity(result.score),
@@ -2461,6 +2964,7 @@ where
         let content = required_string(arguments, "content")?;
         let source_file = optional_string(arguments, "source_file")?.unwrap_or_default();
         let added_by = optional_string(arguments, "added_by")?.unwrap_or_else(|| "mcp".to_owned());
+        let requested_operation_id = optional_string(arguments, "operation_id")?;
         let content_hash = hash_text(&content);
 
         // ── Resolve federation route once, reuse for dual-write decisions ──
@@ -2481,7 +2985,7 @@ where
             if let Some(router) = &self.federation {
                 if let Some(route) = &route {
                     if let Some(remote_resp) = router
-                        .add_drawer_remote(
+                        .add_drawer_remote_with_operation(
                             wing.as_str(),
                             room.as_str(),
                             &content,
@@ -2489,6 +2993,7 @@ where
                             &added_by,
                             route,
                             DEFAULT_DUPLICATE_THRESHOLD,
+                            requested_operation_id.as_deref(),
                         )
                         .await?
                     {
@@ -2498,17 +3003,93 @@ where
             }
         }
 
+        // A completed keyed add is replayable even if a later delete removed its local target.
+        // Consult this durable identity before duplicate search or time-derived id generation.
+        if is_both {
+            if let Some(operation_id) = requested_operation_id.as_deref() {
+                if let Some(replay) = self
+                    .recover_keyed_add_replay(
+                        operation_id,
+                        wing.as_str(),
+                        room.as_str(),
+                        &content,
+                        (!source_file.is_empty()).then_some(source_file.as_str()),
+                        Some(added_by.as_str()),
+                    )
+                    .await
+                    .map_tool()?
+                {
+                    return Ok(replay);
+                }
+            }
+        }
+
+        let duplicates_started = std::time::Instant::now();
         let duplicates = self.find_duplicates(&content, DEFAULT_DUPLICATE_THRESHOLD).await?;
+        self.metrics.record("duplicate_search", duplicates_started.elapsed());
         if !duplicates.is_empty() {
             // ── Both-mode: same wing+room → retry, reuse local, retry remote ──
             if is_both {
-                if let Some(existing) = duplicates.iter().find(|d| {
+                // Only a candidate whose stored record matches every mutation-affecting
+                // field of this request may be reused: staging this request's metadata
+                // under an existing drawer id whose stored metadata differs would leave
+                // the remote replica carrying different metadata than the local record.
+                // Non-matching candidates fall through to the normal duplicate result.
+                for existing in duplicates.iter().filter(|d| {
                     d.get("wing").and_then(|w| w.as_str()) == Some(wing.as_str())
                         && d.get("room").and_then(|r| r.as_str()) == Some(room.as_str())
                         && d.get("content_hash").and_then(|h| h.as_str())
                             == Some(content_hash.as_str())
                 }) {
-                    let existing_drawer_id = existing["id"].as_str().unwrap_or("");
+                    let Some(existing_drawer_id) = existing["id"].as_str() else { continue };
+                    let Some(existing_id) = DrawerId::new(existing_drawer_id).ok() else {
+                        continue;
+                    };
+                    let Some(stored) =
+                        self.storage.drawer_store().get_drawer(&existing_id).await.map_tool()?
+                    else {
+                        continue;
+                    };
+                    if stored.source_file != source_file || stored.added_by != added_by {
+                        continue;
+                    }
+                    let remote =
+                        route.as_ref().and_then(|value| value.remote.clone()).ok_or_else(|| {
+                            ToolError::Internal(McpError::Federation(
+                                "write:both route has no remote configured".to_owned(),
+                            ))
+                        })?;
+                    let operation = self
+                        .stage_replication(
+                            replication_idempotency_key(
+                                requested_operation_id.as_deref(),
+                                "drawer-add",
+                                existing_drawer_id,
+                                &remote,
+                            ),
+                            "drawer_added",
+                            existing_drawer_id.to_owned(),
+                            remote.clone(),
+                            existing_drawer_id.to_owned(),
+                            ReplicationMutation::DrawerAdd {
+                                request: AddDrawerRequest {
+                                    wing: wing.as_str().to_owned(),
+                                    room: room.as_str().to_owned(),
+                                    content: content.clone(),
+                                    source_file: (!source_file.is_empty())
+                                        .then(|| source_file.clone()),
+                                    added_by: Some(added_by.clone()),
+                                    drawer_id: Some(existing_drawer_id.to_owned()),
+                                    operation_id: None,
+                                },
+                            },
+                        )
+                        .map_tool()?;
+                    let operation = if operation.state == OutboxState::Staged {
+                        self.activate_replication(&operation).map_tool()?
+                    } else {
+                        operation
+                    };
                     let mut result = json!({
                         "success": true,
                         "drawer_id": existing_drawer_id,
@@ -2520,29 +3101,11 @@ where
                             obj.insert("applied_to".to_owned(), json!("local"));
                         }
                     }
-                    if let Some(router) = &self.federation {
-                        if let Some(route) = &route {
-                            let replication = router
-                                .add_drawer_replicate(
-                                    wing.as_str(),
-                                    room.as_str(),
-                                    &content,
-                                    &source_file,
-                                    &added_by,
-                                    route,
-                                    DEFAULT_DUPLICATE_THRESHOLD,
-                                )
-                                .await;
-                            if let Some(obj) = result.as_object_mut() {
-                                obj.insert("replication".to_owned(), json!(replication));
-                                if matches!(replication, ReplicationStatus::Failed { .. }) {
-                                    obj.insert(
-                                        "warnings".to_owned(),
-                                        json!(["local content already existed; remote replication failed"]),
-                                    );
-                                }
-                            }
-                        }
+                    if let Some(obj) = result.as_object_mut() {
+                        obj.insert(
+                            "replication".to_owned(),
+                            replication_status_for_operation(&operation),
+                        );
                     }
                     return Ok(result);
                 }
@@ -2555,9 +3118,73 @@ where
         }
 
         let now = OffsetDateTime::now_utc();
-        let drawer_id = generated_drawer_id("drawer", wing.as_str(), room.as_str(), &content, now)?;
-        let content_clone = content.clone();
-        let record = self
+        // ── Keyed replay recovery ─────────────────────────────────────────────
+        // A write:both add stages a durable outbox intent (keyed by the caller's
+        // operation_id) before committing locally; a failed local commit cancels that
+        // intent. Retrying the same operation_id must reuse the intent's pinned drawer
+        // target: a fresh time-derived id would present a different entity/payload under
+        // the same idempotency key, which the outbox rejects as a key reused with a
+        // different mutation.
+        let staged_source_file = (!source_file.is_empty()).then(|| source_file.clone());
+        let pinned_add_target = if is_both {
+            match requested_operation_id.as_deref() {
+                Some(operation_id) => self
+                    .recover_keyed_add_target(
+                        operation_id,
+                        wing.as_str(),
+                        room.as_str(),
+                        &content,
+                        staged_source_file.as_deref(),
+                        Some(added_by.as_str()),
+                    )
+                    .await
+                    .map_tool()?,
+                None => None,
+            }
+        } else {
+            None
+        };
+        let drawer_id = match pinned_add_target {
+            Some(pinned) => pinned,
+            None => generated_drawer_id("drawer", wing.as_str(), room.as_str(), &content, now)?,
+        };
+        let staged = if is_both {
+            let remote =
+                route.as_ref().and_then(|value| value.remote.clone()).ok_or_else(|| {
+                    ToolError::Internal(McpError::Federation(
+                        "write:both route has no remote configured".to_owned(),
+                    ))
+                })?;
+            Some(
+                self.stage_replication(
+                    replication_idempotency_key(
+                        requested_operation_id.as_deref(),
+                        "drawer-add",
+                        drawer_id.as_str(),
+                        &remote,
+                    ),
+                    "drawer_added",
+                    drawer_id.as_str().to_owned(),
+                    remote,
+                    drawer_id.as_str().to_owned(),
+                    ReplicationMutation::DrawerAdd {
+                        request: AddDrawerRequest {
+                            wing: wing.as_str().to_owned(),
+                            room: room.as_str().to_owned(),
+                            content: content.clone(),
+                            source_file: staged_source_file.clone(),
+                            added_by: Some(added_by.clone()),
+                            drawer_id: Some(drawer_id.as_str().to_owned()),
+                            operation_id: None,
+                        },
+                    },
+                )
+                .map_tool()?,
+            )
+        } else {
+            None
+        };
+        let record = match self
             .build_drawer_record(
                 drawer_id.clone(),
                 wing.clone(),
@@ -2570,9 +3197,20 @@ where
                 content,
                 now,
             )
-            .await?;
+            .await
+        {
+            Ok(record) => record,
+            Err(error) => {
+                if let Some(operation) = &staged {
+                    self.cancel_staged_replication(operation);
+                }
+                return Err(error);
+            }
+        };
 
-        self.storage
+        let commit_started = std::time::Instant::now();
+        if let Err(error) = self
+            .storage
             .commit_ingest(IngestCommitRequest {
                 ingest_kind: "mcp_write".to_owned(),
                 source_key: format!("mcp:{}", drawer_id.as_str()),
@@ -2582,7 +3220,13 @@ where
                 duplicate_strategy: DuplicateStrategy::Error,
             })
             .await
-            .map_tool()?;
+        {
+            if let Some(operation) = &staged {
+                self.cancel_staged_replication(operation);
+            }
+            return Err(ToolError::Internal(error.into()));
+        }
+        self.metrics.record("commit", commit_started.elapsed());
 
         self.log_change(ChangeEvent {
             event_type: "drawer_added".to_owned(),
@@ -2604,31 +3248,14 @@ where
             }
         }
 
-        // ── Both-mode: best-effort remote replication after local write ──
-        if is_both {
-            if let Some(router) = &self.federation {
-                if let Some(route) = &route {
-                    let replication = router
-                        .add_drawer_replicate(
-                            wing.as_str(),
-                            room.as_str(),
-                            &content_clone,
-                            &source_file,
-                            &added_by,
-                            route,
-                            DEFAULT_DUPLICATE_THRESHOLD,
-                        )
-                        .await;
-                    if let Some(obj) = result.as_object_mut() {
-                        obj.insert("replication".to_owned(), json!(replication));
-                        if matches!(replication, ReplicationStatus::Failed { .. }) {
-                            obj.insert(
-                                "warnings".to_owned(),
-                                json!(["local write succeeded but remote replication failed"]),
-                            );
-                        }
-                    }
-                }
+        if let Some(staged) = staged {
+            let operation = if staged.state == OutboxState::Staged {
+                self.activate_replication(&staged).map_tool()?
+            } else {
+                staged
+            };
+            if let Some(obj) = result.as_object_mut() {
+                obj.insert("replication".to_owned(), replication_status_for_operation(&operation));
             }
         }
 
@@ -2637,6 +3264,24 @@ where
 
     async fn tool_delete_drawer(&mut self, arguments: &Value) -> ToolResult<Value> {
         let drawer_id = parse_drawer_id(&required_string(arguments, "drawer_id")?)?;
+        let requested_operation_id = optional_string(arguments, "operation_id")?;
+
+        // ── Keyed replay recovery ─────────────────────────────────────────────
+        // A write:both delete stages a durable outbox intent (keyed by the caller's
+        // operation_id) before committing locally. Retrying the same operation_id after
+        // the local drawer is gone must recover that original intent from the outbox —
+        // which names the destination remote and the current queued/terminal state that
+        // local drawer metadata can no longer provide — rather than falling into the
+        // synchronous all-remote fallback / false-not-found path.
+        if let Some(operation_id) = requested_operation_id.as_deref() {
+            if let Some(replay) = self
+                .recover_keyed_delete_replication(operation_id, drawer_id.as_str())
+                .await
+                .map_tool()?
+            {
+                return Ok(replay);
+            }
+        }
         // Look the drawer up before deleting so its wing/room can be recorded
         // on the `drawer_deleted` change event below. There is no way to
         // recover them afterward, and a `drawer_deleted` event with no wing
@@ -2646,16 +3291,99 @@ where
         // docs/Federation.md §1.5), so leaving it out here would make every
         // local deletion silently invisible to scoped remote readers.
         let existing = self.storage.drawer_store().get_drawer(&drawer_id).await.map_tool()?;
-        let deleted = self
+        let route = existing.as_ref().and_then(|drawer| {
+            self.federation.as_ref().map(|router| {
+                router.resolve_drawer_route(
+                    Some(drawer.wing.as_str()),
+                    Some(drawer.room.as_str()),
+                    (!drawer.source_file.is_empty()).then_some(drawer.source_file.as_str()),
+                )
+            })
+        });
+        if let (Some(router), Some(route)) = (&self.federation, &route) {
+            if router.resolve_write_target(route) == WriteTarget::Remote {
+                if let Some(response) = router
+                    .delete_drawer_routed_remote(
+                        drawer_id.as_str(),
+                        route,
+                        requested_operation_id.as_deref(),
+                    )
+                    .await?
+                {
+                    return Ok(response);
+                }
+            }
+        }
+        let is_both = match (&self.federation, &route) {
+            (Some(router), Some(route)) => router.is_dual_write(route),
+            _ => false,
+        };
+        let staged = if is_both {
+            let remote =
+                route.as_ref().and_then(|value| value.remote.clone()).ok_or_else(|| {
+                    ToolError::Internal(McpError::Federation(
+                        "write:both delete route has no remote configured".to_owned(),
+                    ))
+                })?;
+            let unique_entity = format!(
+                "{}:{}",
+                drawer_id.as_str(),
+                OffsetDateTime::now_utc().unix_timestamp_nanos()
+            );
+            Some(
+                self.stage_replication(
+                    replication_idempotency_key(
+                        requested_operation_id.as_deref(),
+                        "drawer-delete",
+                        &unique_entity,
+                        &remote,
+                    ),
+                    "drawer_deleted",
+                    drawer_id.as_str().to_owned(),
+                    remote,
+                    drawer_id.as_str().to_owned(),
+                    ReplicationMutation::DrawerDelete { drawer_id: drawer_id.as_str().to_owned() },
+                )
+                .map_tool()?,
+            )
+        } else {
+            None
+        };
+        let commit_started = std::time::Instant::now();
+        let deleted = match self
             .storage
             .drawer_store()
             .delete_drawers(std::slice::from_ref(&drawer_id))
             .await
-            .map_tool()?;
+        {
+            Ok(deleted) => deleted,
+            Err(error) => {
+                if let Some(operation) = &staged {
+                    self.cancel_staged_replication(operation);
+                }
+                return Err(ToolError::Internal(error.into()));
+            }
+        };
+        self.metrics.record("commit", commit_started.elapsed());
         if deleted == 0 {
+            if let Some(staged) = &staged {
+                let operation = self.activate_replication(staged).map_tool()?;
+                return Ok(json!({
+                    "success": true,
+                    "drawer_id": drawer_id,
+                    "applied_to": "local",
+                    "replication": replication_status_for_operation(&operation),
+                }));
+            }
             // ── Federation fallback ──
             if let Some(router) = &self.federation {
-                if let Some(remote_resp) = router.delete_drawer_remote(drawer_id.as_str()).await? {
+                if let Some(remote_resp) = router
+                    .delete_drawer_remote_with_operation(
+                        drawer_id.as_str(),
+                        requested_operation_id.as_deref(),
+                    )
+                    .await?
+                {
                     // `existing` is almost always `None` here in practice —
                     // `deleted == 0` means this palace never had the row, so
                     // there was nothing to look up — but populate wing/room
@@ -2704,6 +3432,16 @@ where
         if self.federation.is_some() {
             if let Some(obj) = result.as_object_mut() {
                 obj.insert("applied_to".to_owned(), json!("local"));
+            }
+        }
+        if let Some(staged) = staged {
+            let operation = if staged.state == OutboxState::Staged {
+                self.activate_replication(&staged).map_tool()?
+            } else {
+                staged
+            };
+            if let Some(obj) = result.as_object_mut() {
+                obj.insert("replication".to_owned(), replication_status_for_operation(&operation));
             }
         }
         Ok(result)
@@ -3037,6 +3775,7 @@ where
         let predicate = required_string(arguments, "predicate")?;
         let object = required_string(arguments, "object")?;
         let valid_from_text = optional_string(arguments, "valid_from")?;
+        let requested_operation_id = optional_string(arguments, "operation_id")?;
 
         // ── Resolve federation route once, reuse for dual-write decisions ──
         let route = self.federation.as_ref().map(|router| router.resolve_kg_route());
@@ -3050,12 +3789,13 @@ where
             if let Some(router) = &self.federation {
                 if let Some(route) = &route {
                     if let Some(remote_resp) = router
-                        .kg_add_remote(
+                        .kg_add_remote_with_operation(
                             &subject,
                             &predicate,
                             &object,
                             valid_from_text.as_deref(),
                             route,
+                            requested_operation_id.as_deref(),
                         )
                         .await?
                     {
@@ -3071,28 +3811,73 @@ where
             source_closet.as_deref().and_then(|value| parse_drawer_id(value).ok());
         let runtime = KnowledgeGraphRuntime::new(self.storage.operational_store());
         let now = OffsetDateTime::now_utc();
-        let triple_id = runtime
-            .add_fact(
-                AddFactRequest {
-                    subject: subject.clone(),
-                    subject_type: infer_entity_kind(&subject),
-                    predicate: predicate.clone(),
-                    object_type: infer_entity_kind(&object),
-                    object: object.clone(),
-                    valid_from,
-                    valid_to: None,
-                    confidence: 1.0,
-                    source_drawer_id,
-                    source_file: source_closet,
-                },
-                now,
+        let ordering_key = kg_ordering_key(&subject, &predicate, &object);
+        let staged = if is_both {
+            let remote =
+                route.as_ref().and_then(|value| value.remote.clone()).ok_or_else(|| {
+                    ToolError::Internal(McpError::Federation(
+                        "write:both KG route has no remote configured".to_owned(),
+                    ))
+                })?;
+            let idempotency_entity = format!("{ordering_key}:{}", now.unix_timestamp_nanos());
+            Some(
+                self.stage_replication(
+                    replication_idempotency_key(
+                        requested_operation_id.as_deref(),
+                        "kg-add",
+                        &idempotency_entity,
+                        &remote,
+                    ),
+                    "kg_fact_added",
+                    ordering_key.clone(),
+                    remote,
+                    ordering_key.clone(),
+                    ReplicationMutation::KgAdd {
+                        request: KgAddFactRequest {
+                            subject: subject.clone(),
+                            predicate: predicate.clone(),
+                            object: object.clone(),
+                            valid_from: valid_from_text.clone(),
+                            operation_id: None,
+                        },
+                        source_closet: source_closet.clone(),
+                    },
+                )
+                .map_tool()?,
             )
-            .map_tool_internal()?;
+        } else {
+            None
+        };
+        let commit_started = std::time::Instant::now();
+        let triple_id = match runtime.add_fact(
+            AddFactRequest {
+                subject: subject.clone(),
+                subject_type: infer_entity_kind(&subject),
+                predicate: predicate.clone(),
+                object_type: infer_entity_kind(&object),
+                object: object.clone(),
+                valid_from,
+                valid_to: None,
+                confidence: 1.0,
+                source_drawer_id,
+                source_file: source_closet,
+            },
+            now,
+        ) {
+            Ok(triple_id) => triple_id,
+            Err(error) => {
+                if let Some(operation) = &staged {
+                    self.cancel_staged_replication(operation);
+                }
+                return Err(ToolError::Internal(error.into()));
+            }
+        };
+        self.metrics.record("commit", commit_started.elapsed());
 
         let sub = subject.clone();
         let pred = predicate.clone();
         let obj = object.clone();
-        self.log_change(ChangeEvent {
+        let change_event = ChangeEvent {
             event_type: "kg_fact_added".to_owned(),
             occurred_at: now,
             entity_id: triple_id.clone(),
@@ -3100,7 +3885,12 @@ where
             details_json: Some(
                 json!({"subject": subject, "predicate": predicate, "object": object}).to_string(),
             ),
-        });
+        };
+        if let Some(operation_id) = requested_operation_id.as_deref() {
+            self.log_change_if_absent_with_operation(&change_event, operation_id);
+        } else {
+            self.log_change(change_event);
+        }
 
         let mut payload = json!({
             "success": true,
@@ -3113,23 +3903,14 @@ where
             }
         }
 
-        // ── Both-mode: best-effort remote replication after local KG add ──
-        if is_both {
-            if let Some(router) = &self.federation {
-                if let Some(route) = &route {
-                    let replication = router
-                        .kg_add_replicate(&sub, &pred, &obj, valid_from_text.as_deref(), route)
-                        .await;
-                    if let Some(p) = payload.as_object_mut() {
-                        p.insert("replication".to_owned(), json!(replication));
-                        if matches!(replication, ReplicationStatus::Failed { .. }) {
-                            p.insert(
-                                "warnings".to_owned(),
-                                json!(["local write succeeded but remote replication failed"]),
-                            );
-                        }
-                    }
-                }
+        if let Some(staged) = staged {
+            let operation = if staged.state == OutboxState::Staged {
+                self.activate_replication(&staged).map_tool()?
+            } else {
+                staged
+            };
+            if let Some(obj) = payload.as_object_mut() {
+                obj.insert("replication".to_owned(), replication_status_for_operation(&operation));
             }
         }
 
@@ -3147,7 +3928,8 @@ where
         let predicate = required_string(arguments, "predicate")?;
         let object = required_string(arguments, "object")?;
         let ended_text = optional_string(arguments, "ended")?;
-        let ended = ended_text
+        let requested_operation_id = optional_string(arguments, "operation_id")?;
+        let mut ended = ended_text
             .as_deref()
             .map(parse_date)
             .transpose()?
@@ -3160,17 +3942,59 @@ where
             _ => false,
         };
 
+        // A keyed retry must reuse the date pinned in its existing durable outbox payload. If
+        // `ended` was omitted on the first attempt, resolving it again after midnight would make
+        // the same operation's local and remote invalidations disagree. An explicitly supplied
+        // date, however, is part of the idempotent request and must conflict when it differs.
+        let mut keyed_replay_operation = None;
+        if is_both {
+            if let Some(operation_id) = requested_operation_id.as_deref() {
+                if let Some(operation) =
+                    self.outbox.find_by_key(OUTBOX_ACTOR, operation_id).map_tool()?
+                {
+                    if let Ok(ReplicationMutation::KgInvalidate { request }) =
+                        serde_json::from_value::<ReplicationMutation>(operation.payload.clone())
+                    {
+                        if request.subject != subject
+                            || request.predicate != predicate
+                            || request.object != object
+                        {
+                            return Err(ToolError::InvalidParams(format!(
+                                "operation `{operation_id}` was already used by a different KG invalidation"
+                            )));
+                        }
+                        if let Some(pinned) = request.ended.as_deref() {
+                            let pinned_date = parse_date(pinned)?;
+                            if ended_text.is_some() && ended != pinned_date {
+                                return Err(ToolError::InvalidParams(format!(
+                                    "operation `{operation_id}` was already used with ended `{pinned}`"
+                                )));
+                            }
+                            if ended_text.is_none() {
+                                ended = pinned_date;
+                            }
+                        }
+                        if !matches!(operation.state, OutboxState::Staged | OutboxState::Cancelled)
+                        {
+                            keyed_replay_operation = Some(operation);
+                        }
+                    }
+                }
+            }
+        }
+
         // ── Non-Both federation: remote-only or local-only ──
         if !is_both {
             if let Some(router) = &self.federation {
                 if let Some(route) = &route {
                     if let Some(remote_resp) = router
-                        .kg_invalidate_remote(
+                        .kg_invalidate_remote_with_operation(
                             &subject,
                             &predicate,
                             &object,
                             ended_text.as_deref(),
                             route,
+                            requested_operation_id.as_deref(),
                         )
                         .await?
                     {
@@ -3180,17 +4004,76 @@ where
             }
         }
 
+        // The local fact may have been re-added since the original invalidation completed. A
+        // non-staged keyed operation is already authoritative, so replay its persisted outcome
+        // without applying the old invalidation to the newer fact.
+        if let Some(operation) = keyed_replay_operation {
+            return Ok(json!({
+                "success": true,
+                "invalidated": 0,
+                "fact": format!("{subject} → {predicate} → {object}"),
+                "ended": format_date(ended),
+                "applied_to": "local",
+                "replication": replication_status_for_operation(&operation),
+            }));
+        }
+
         let now = OffsetDateTime::now_utc();
+        let ordering_key = kg_ordering_key(&subject, &predicate, &object);
+        let staged = if is_both {
+            let remote =
+                route.as_ref().and_then(|value| value.remote.clone()).ok_or_else(|| {
+                    ToolError::Internal(McpError::Federation(
+                        "write:both KG route has no remote configured".to_owned(),
+                    ))
+                })?;
+            let idempotency_entity = format!("{ordering_key}:{}", now.unix_timestamp_nanos());
+            Some(
+                self.stage_replication(
+                    replication_idempotency_key(
+                        requested_operation_id.as_deref(),
+                        "kg-invalidate",
+                        &idempotency_entity,
+                        &remote,
+                    ),
+                    "kg_fact_invalidated",
+                    ordering_key.clone(),
+                    remote,
+                    ordering_key,
+                    ReplicationMutation::KgInvalidate {
+                        request: KgInvalidateRequest {
+                            subject: subject.clone(),
+                            predicate: predicate.clone(),
+                            object: object.clone(),
+                            ended: Some(ended.to_string()),
+                            operation_id: None,
+                        },
+                    },
+                )
+                .map_tool()?,
+            )
+        } else {
+            None
+        };
         let runtime = KnowledgeGraphRuntime::new(self.storage.operational_store());
-        let invalidated =
-            runtime.invalidate(&subject, &predicate, &object, ended, now).map_tool_internal()?;
+        let commit_started = std::time::Instant::now();
+        let invalidated = match runtime.invalidate(&subject, &predicate, &object, ended, now) {
+            Ok(invalidated) => invalidated,
+            Err(error) => {
+                if let Some(operation) = &staged {
+                    self.cancel_staged_replication(operation);
+                }
+                return Err(ToolError::Internal(error.into()));
+            }
+        };
+        self.metrics.record("commit", commit_started.elapsed());
 
         let sub = subject.clone();
         let pred = predicate.clone();
         let obj = object.clone();
 
         if invalidated > 0 {
-            self.log_change(ChangeEvent {
+            let change_event = ChangeEvent {
                 event_type: "kg_fact_invalidated".to_owned(),
                 occurred_at: now,
                 entity_id: format!("{subject} → {predicate} → {object}"),
@@ -3200,14 +4083,21 @@ where
                            "ended": format_date(ended)})
                     .to_string(),
                 ),
-            });
+            };
+            if let Some(operation_id) = requested_operation_id.as_deref() {
+                self.log_change_if_absent_with_operation(&change_event, operation_id);
+            } else {
+                self.log_change(change_event);
+            }
         }
 
+        let keyed_replay = requested_operation_id.is_some()
+            && staged.as_ref().is_some_and(|operation| operation.state != OutboxState::Staged);
         let mut payload = json!({
-            "success": invalidated > 0,
+            "success": invalidated > 0 || keyed_replay,
             "invalidated": invalidated,
             "fact": format!("{sub} → {pred} → {obj}"),
-            "ended": ended_text.as_deref().unwrap_or("today"),
+            "ended": format_date(ended),
         });
         if self.federation.is_some() {
             if let Some(obj) = payload.as_object_mut() {
@@ -3215,23 +4105,14 @@ where
             }
         }
 
-        // ── Both-mode: best-effort remote replication after local KG invalidation ──
-        if is_both {
-            if let Some(router) = &self.federation {
-                if let Some(route) = &route {
-                    let replication = router
-                        .kg_invalidate_replicate(&sub, &pred, &obj, ended_text.as_deref(), route)
-                        .await;
-                    if let Some(p) = payload.as_object_mut() {
-                        p.insert("replication".to_owned(), json!(replication));
-                        if matches!(replication, ReplicationStatus::Failed { .. }) {
-                            p.insert(
-                                "warnings".to_owned(),
-                                json!(["local write succeeded but remote replication failed"]),
-                            );
-                        }
-                    }
-                }
+        if let Some(staged) = staged {
+            let operation = if staged.state == OutboxState::Staged {
+                self.activate_replication(&staged).map_tool()?
+            } else {
+                staged
+            };
+            if let Some(obj) = payload.as_object_mut() {
+                obj.insert("replication".to_owned(), replication_status_for_operation(&operation));
             }
         }
 
@@ -3340,8 +4221,10 @@ where
         content: String,
         filed_at: OffsetDateTime,
     ) -> ToolResult<DrawerRecord> {
+        let embed_started = std::time::Instant::now();
         let request = EmbeddingRequest::new(vec![content.clone()]).map_tool_internal()?;
         let response = self.search.provider_mut().embed(&request).map_tool_internal()?;
+        self.metrics.record("embedding", embed_started.elapsed());
         let embedding = response.vectors().first().cloned().ok_or_else(|| {
             ToolError::Internal(McpError::Embeddings(EmbeddingError::ProviderContract(
                 "provider returned no vector for single-drawer ingest".to_owned(),
@@ -3372,6 +4255,13 @@ where
 
     fn log_change(&self, event: ChangeEvent) {
         let _ = self.storage.operational_store().append_event(&event);
+    }
+
+    fn log_change_if_absent_with_operation(&self, event: &ChangeEvent, operation_id: &str) {
+        let _ = self
+            .storage
+            .operational_store()
+            .append_event_if_absent_with_operation(event, operation_id);
     }
 
     fn identity_path(&self) -> PathBuf {
@@ -3578,11 +4468,8 @@ where
             }
             Err(err) if is_local_record_missing(&err) => {
                 if let Some(router) = &self.federation {
-                    let req = TaskLeaseRequest {
-                        expected_revision,
-                        lease_seconds,
-                        worker: Some(worker),
-                    };
+                    let req =
+                        TaskLeaseRequest { expected_revision, lease_seconds, worker: Some(worker) };
                     if let Some(value) =
                         router.coordination_task_claim_fallback(&task_id, req).await?
                     {
@@ -3613,11 +4500,8 @@ where
             }
             Err(err) if is_local_record_missing(&err) => {
                 if let Some(router) = &self.federation {
-                    let req = TaskLeaseRequest {
-                        expected_revision,
-                        lease_seconds,
-                        worker: Some(worker),
-                    };
+                    let req =
+                        TaskLeaseRequest { expected_revision, lease_seconds, worker: Some(worker) };
                     if let Some(value) =
                         router.coordination_task_renew_fallback(&task_id, req).await?
                     {
@@ -3751,7 +4635,13 @@ where
         if let Some(router) = self.federation.as_ref().filter(|r| r.has_remotes()) {
             let cursors = parse_cursors_arg(arguments, "remote_cursors")?;
             let remote_messages = router
-                .coordination_inbox_fanout(recipient, wing, Some(limit), unacknowledged_only, &cursors)
+                .coordination_inbox_fanout(
+                    recipient,
+                    wing,
+                    Some(limit),
+                    unacknowledged_only,
+                    &cursors,
+                )
                 .await;
             payload["remote_messages"] = json!(remote_messages);
         }
@@ -3797,8 +4687,9 @@ where
             Ok(result) => Ok(json!(result)),
             Err(err) if is_local_record_missing(&err) => {
                 if let Some(router) = &self.federation {
-                    let req: WireNewTaskResultRequest = serde_json::from_value(arguments.clone())
-                        .map_err(|e| ToolError::InvalidParams(e.to_string()))?;
+                    let req: WireNewTaskResultRequest =
+                        serde_json::from_value(arguments.clone())
+                            .map_err(|e| ToolError::InvalidParams(e.to_string()))?;
                     if let Some(value) = router.coordination_result_put_fallback(req).await? {
                         return Ok(value);
                     }
@@ -4888,9 +5779,7 @@ fn required_string_array(
         };
         let value = value.trim();
         if value.is_empty() {
-            return Err(ToolError::InvalidParams(format!(
-                "items in `{field}` cannot be blank"
-            )));
+            return Err(ToolError::InvalidParams(format!("items in `{field}` cannot be blank")));
         }
         parsed.push(value.to_owned());
     }
@@ -4929,7 +5818,7 @@ fn validate_record_id_value(value: &str) -> std::result::Result<String, String> 
         .all(|character| character.is_ascii_alphanumeric() || "-_.:/".contains(character))
     {
         return Err(
-            "may contain only ASCII letters, digits, '-', '_', '.', ':', and '/'".to_owned(),
+            "may contain only ASCII letters, digits, '-', '_', '.', ':', and '/'".to_owned()
         );
     }
     Ok(value.to_owned())
@@ -5102,10 +5991,8 @@ fn observation_applies_to_runtime(
         return true;
     }
     let model_matches = observation.model.as_deref().is_none_or(|expected| model == Some(expected));
-    let harness_matches = observation
-        .harness
-        .as_deref()
-        .is_none_or(|expected| harness == Some(expected));
+    let harness_matches =
+        observation.harness.as_deref().is_none_or(|expected| harness == Some(expected));
     model_matches && harness_matches
 }
 
@@ -5147,7 +6034,10 @@ fn is_local_record_missing(err: &mempalace_storage::StorageError) -> bool {
 /// Parses an optional `{remote_name: cursor}` object argument into a per-remote cursor map, the
 /// same shape `mempalace_get_changes_since`'s inline `cursors` parsing already uses — factored
 /// out here so `tool_coordination_events`/`tool_inbox_read` do not duplicate it a second time.
-fn parse_cursors_arg(arguments: &Value, field: &'static str) -> ToolResult<BTreeMap<String, String>> {
+fn parse_cursors_arg(
+    arguments: &Value,
+    field: &'static str,
+) -> ToolResult<BTreeMap<String, String>> {
     match arguments.get(field) {
         None | Some(Value::Null) => Ok(BTreeMap::new()),
         Some(Value::Object(map)) => {
@@ -5317,6 +6207,85 @@ fn generated_drawer_id(
     let suffix = hasher.finalize().to_hex().chars().take(16).collect::<String>();
     DrawerId::new(format!("{prefix}_{wing}_{room}_{suffix}"))
         .map_err(|error| ToolError::InvalidParams(error.to_string()))
+}
+
+fn replication_idempotency_key(
+    requested: Option<&str>,
+    kind: &str,
+    entity_id: &str,
+    remote: &str,
+) -> String {
+    requested.map(ToOwned::to_owned).unwrap_or_else(|| {
+        let digest = blake3::hash(format!("{kind}\0{entity_id}\0{remote}").as_bytes());
+        format!("{kind}:{}", digest.to_hex())
+    })
+}
+
+/// Render a recovered outbox operation's state as the delete tool's response shape, so a
+/// keyed retry after the local delete returns the original queued/terminal replication state
+/// consistently instead of re-executing or falling back.
+fn delete_replication_replay_payload(operation: &OutboxOperation, drawer_id: &str) -> Value {
+    let replication = replication_status_for_operation(operation);
+    json!({
+        "success": true,
+        "drawer_id": drawer_id,
+        "applied_to": "local",
+        "replication": replication,
+    })
+}
+
+/// Render the persisted outbox state for mutation responses. Keyed retries can
+/// return an already-terminal row, so reporting `queued` unconditionally would
+/// hide whether the remote has replicated or permanently failed the operation.
+fn replication_status_for_operation(operation: &OutboxOperation) -> Value {
+    match operation.state {
+        OutboxState::Replicated => {
+            json!(ReplicationStatus::Replicated { remote: operation.destination_remote.clone() })
+        }
+        OutboxState::Failed => json!(ReplicationStatus::Failed {
+            remote: operation.destination_remote.clone(),
+            reason: operation
+                .last_error
+                .clone()
+                .unwrap_or_else(|| "replication failed terminally".to_owned()),
+        }),
+        _ => json!(ReplicationStatus::Queued {
+            remote: operation.destination_remote.clone(),
+            operation_id: operation.operation_id.clone(),
+        }),
+    }
+}
+
+fn kg_ordering_key(subject: &str, predicate: &str, object: &str) -> String {
+    let canonical = format!(
+        "{}\0{}\0{}",
+        canonicalize_kg_label(subject),
+        canonicalize_kg_label(predicate),
+        canonicalize_kg_label(object)
+    );
+    format!("kg:{}", blake3::hash(canonical.as_bytes()).to_hex())
+}
+
+/// Canonicalize a KG label with the same identity the graph layer uses for
+/// entities and predicates (mempalace-graph `canonicalize_label`): lowercase
+/// ASCII alphanumerics, collapse each run of non-alphanumeric characters to one
+/// underscore, and trim leading/trailing underscores. Replication ordering keys
+/// must share that identity so equivalent spellings ("works-on" and "works on")
+/// land in the same outbox `(destination_remote, ordering_key)` group and an
+/// equivalent-spelling invalidate cannot bypass a retryable add.
+fn canonicalize_kg_label(value: &str) -> String {
+    let mut normalized = String::new();
+    let mut last_was_sep = false;
+    for ch in value.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            normalized.push(ch.to_ascii_lowercase());
+            last_was_sep = false;
+        } else if !last_was_sep {
+            normalized.push('_');
+            last_was_sep = true;
+        }
+    }
+    normalized.trim_matches('_').to_owned()
 }
 
 fn generated_record_id(
@@ -5757,10 +6726,7 @@ mod tests {
     #[test]
     fn identity_tools_do_not_expose_model_selectable_lineage_ids() {
         for tool_name in ["mempalace_wake_up", "mempalace_identity_packet"] {
-            let tool = tool_definitions()
-                .into_iter()
-                .find(|tool| tool.name == tool_name)
-                .unwrap();
+            let tool = tool_definitions().into_iter().find(|tool| tool.name == tool_name).unwrap();
             assert!(
                 tool.input_schema["properties"].get("lineage_id").is_none(),
                 "{tool_name} must not let the model select its lineage"
@@ -5900,11 +6866,7 @@ mod tests {
             .to_owned();
         let exact_result_response = harness
             .server
-            .handle_request(tool_call(
-                908,
-                "mempalace_result_get",
-                json!({"result_id":result_id}),
-            ))
+            .handle_request(tool_call(908, "mempalace_result_get", json!({"result_id":result_id})))
             .await;
         assert_eq!(
             decode_tool_payload(&exact_result_response).expect("exact result")["found"],
@@ -6078,8 +7040,9 @@ mod tests {
                 }),
             ))
             .await;
-        decode_tool_payload(&created)
-            .unwrap_or_else(|| panic!("expected a successful local task for wing \"secret\", got: {created}"));
+        decode_tool_payload(&created).unwrap_or_else(|| {
+            panic!("expected a successful local task for wing \"secret\", got: {created}")
+        });
         let observed = calls.load(std::sync::atomic::Ordering::SeqCst);
         assert_eq!(
             observed, 0,
@@ -6509,7 +7472,8 @@ mod tests {
     #[test]
     fn is_local_record_missing_matches_real_missing_task_and_message_errors() {
         let tempdir = TempDir::new().unwrap();
-        let store = mempalace_storage::CoordinationStore::new(tempdir.path().join("storage.sqlite3"));
+        let store =
+            mempalace_storage::CoordinationStore::new(tempdir.path().join("storage.sqlite3"));
         store.ensure_schema().unwrap();
 
         let err = store
@@ -6563,8 +7527,10 @@ mod tests {
                 }),
             ))
             .await;
-        let alpha_id =
-            decode_tool_payload(&alpha).expect("alpha task")["task_id"].as_str().unwrap().to_owned();
+        let alpha_id = decode_tool_payload(&alpha).expect("alpha task")["task_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
 
         let beta = harness
             .server
@@ -6791,11 +7757,7 @@ mod tests {
 
         let list = harness
             .server
-            .handle_request(tool_call(
-                931,
-                "mempalace_skill_list",
-                json!({"wing":"myproject"}),
-            ))
+            .handle_request(tool_call(931, "mempalace_skill_list", json!({"wing":"myproject"})))
             .await;
         let list = decode_tool_payload(&list).expect("list payload");
         let ids = list
@@ -7300,10 +8262,7 @@ mod tests {
         assert_eq!(payload["identity_packet"]["constitution"]["identity_ref"], "$.identity");
         assert!(payload["identity_packet"]["constitution"].get("identity").is_none());
         assert!(
-            payload["identity_packet"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("No default lineage")
+            payload["identity_packet"]["message"].as_str().unwrap().contains("No default lineage")
         );
         assert_eq!(payload["status"]["total_drawers"], 5);
         assert_eq!(payload["status"]["protocol"], PALACE_PROTOCOL);
@@ -7571,10 +8530,7 @@ mod tests {
         assert!(message.contains("expected_revision 0"));
 
         let wake = decode_tool_payload(
-            &harness
-                .server
-                .handle_request(tool_call(6076, "mempalace_wake_up", json!({})))
-                .await,
+            &harness.server.handle_request(tool_call(6076, "mempalace_wake_up", json!({}))).await,
         )
         .unwrap();
         assert_eq!(
@@ -7674,15 +8630,14 @@ mod tests {
                 scope: SelfObservationScope::Lineage,
                 statement: "A newer lineage-scoped observation must not hide shared context."
                     .to_owned(),
-                behavioral_consequence: "Filter applicability before applying the limit.".to_owned(),
+                behavioral_consequence: "Filter applicability before applying the limit."
+                    .to_owned(),
                 evidence: vec!["test:newer-lineage-observation".to_owned()],
                 created_at: now + Duration::minutes(4),
                 updated_at: now + Duration::minutes(4),
                 ..shared
             };
-            store
-                .propose_self_observation(&newer_lineage_observation)
-                .unwrap();
+            store.propose_self_observation(&newer_lineage_observation).unwrap();
             store
                 .review_self_observation(
                     &newer_lineage_observation.observation_id,
@@ -7920,11 +8875,7 @@ mod tests {
         let changes = decode_tool_payload(
             &harness
                 .server
-                .handle_request(tool_call(
-                    617,
-                    "mempalace_get_changes_since",
-                    json!({"limit":100}),
-                ))
+                .handle_request(tool_call(617, "mempalace_get_changes_since", json!({"limit":100})))
                 .await,
         )
         .unwrap();
@@ -10961,10 +11912,7 @@ mod tests {
         assert_eq!(ToolName::DelegationSpanGet.routing(), ToolRoutingCategory::LocalOnly);
         assert_eq!(ToolName::DelegationSpanClose.routing(), ToolRoutingCategory::LocalOnly);
         assert_eq!(ToolName::DelegationSpansForTask.routing(), ToolRoutingCategory::LocalOnly);
-        assert_eq!(
-            ToolName::DelegationCheckpointAppend.routing(),
-            ToolRoutingCategory::LocalOnly
-        );
+        assert_eq!(ToolName::DelegationCheckpointAppend.routing(), ToolRoutingCategory::LocalOnly);
         assert_eq!(ToolName::DelegationCheckpointGet.routing(), ToolRoutingCategory::LocalOnly);
         assert_eq!(ToolName::DelegationTrace.routing(), ToolRoutingCategory::LocalOnly);
 
@@ -11252,6 +12200,10 @@ mod tests {
         /// drive the aggregate fan-outs' `CapabilityMissing` vs. genuinely-unreachable
         /// distinction (finding 1b) without hand-building a non-`Clone` `RemoteError`.
         coordination_fanout_outcome: LibMockFanoutOutcome,
+        /// When set, `add_drawer`/`kg_add_fact`/`kg_invalidate` return
+        /// [`RemoteError::UnknownOutcome`] so the MCP tool surface's structured unknown-outcome
+        /// result can be asserted end to end.
+        mutation_unknown_outcome: bool,
     }
 
     /// Canned outcomes for `LibMockRemote::coordination_events`/`coordination_inbox`.
@@ -11278,6 +12230,23 @@ mod tests {
                 fail: false,
                 coordination_calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 coordination_fanout_outcome: LibMockFanoutOutcome::default(),
+                mutation_unknown_outcome: false,
+            }
+        }
+    }
+
+    impl LibMockRemote {
+        fn mutation_result<T>(&self) -> mempalace_remote::Result<T> {
+            if self.mutation_unknown_outcome {
+                Err(mempalace_remote::RemoteError::UnknownOutcome {
+                    remote: "mock".to_owned(),
+                    message: "committed but response lost".to_owned(),
+                })
+            } else {
+                Err(mempalace_remote::RemoteError::Unreachable {
+                    remote: "mock".to_owned(),
+                    message: "not used".to_owned(),
+                })
             }
         }
     }
@@ -11309,10 +12278,7 @@ mod tests {
             &self,
             _req: mempalace_federation::AddDrawerRequest,
         ) -> mempalace_remote::Result<mempalace_federation::AddDrawerResponse> {
-            Err(mempalace_remote::RemoteError::Unreachable {
-                remote: "mock".to_owned(),
-                message: "not used".to_owned(),
-            })
+            self.mutation_result()
         }
         async fn list_drawers(
             &self,
@@ -11336,13 +12302,13 @@ mod tests {
             &self,
             _req: mempalace_federation::KgAddFactRequest,
         ) -> mempalace_remote::Result<Value> {
-            Ok(json!({"success":true}))
+            self.mutation_result()
         }
         async fn kg_invalidate(
             &self,
             _req: mempalace_federation::KgInvalidateRequest,
         ) -> mempalace_remote::Result<Value> {
-            Ok(json!({"success":true}))
+            self.mutation_result()
         }
         async fn kg_timeline(&self, _entity: Option<&str>) -> mempalace_remote::Result<Value> {
             Ok(json!({"entity":"all","timeline":[],"count":0}))
@@ -11409,19 +12375,22 @@ mod tests {
             self.coordination_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let _ = query;
             match self.coordination_fanout_outcome {
-                LibMockFanoutOutcome::Success => {
-                    Ok(mempalace_federation::InboxPageResponse { messages: vec![], next_cursor: None })
-                }
+                LibMockFanoutOutcome::Success => Ok(mempalace_federation::InboxPageResponse {
+                    messages: vec![],
+                    next_cursor: None,
+                }),
                 LibMockFanoutOutcome::CapabilityMissing => {
                     Err(mempalace_remote::RemoteError::CapabilityMissing {
                         remote: "mock".to_owned(),
                         capability: "coordination".to_owned(),
                     })
                 }
-                LibMockFanoutOutcome::Unreachable => Err(mempalace_remote::RemoteError::Unreachable {
-                    remote: "mock".to_owned(),
-                    message: "mock remote is down".to_owned(),
-                }),
+                LibMockFanoutOutcome::Unreachable => {
+                    Err(mempalace_remote::RemoteError::Unreachable {
+                        remote: "mock".to_owned(),
+                        message: "mock remote is down".to_owned(),
+                    })
+                }
             }
         }
         /// See [`Self::coordination_inbox`] — same recording purpose, for
@@ -11433,20 +12402,24 @@ mod tests {
             self.coordination_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let _ = query;
             match self.coordination_fanout_outcome {
-                LibMockFanoutOutcome::Success => Ok(mempalace_federation::CoordinationEventsResponse {
-                    events: vec![],
-                    next_cursor: None,
-                }),
+                LibMockFanoutOutcome::Success => {
+                    Ok(mempalace_federation::CoordinationEventsResponse {
+                        events: vec![],
+                        next_cursor: None,
+                    })
+                }
                 LibMockFanoutOutcome::CapabilityMissing => {
                     Err(mempalace_remote::RemoteError::CapabilityMissing {
                         remote: "mock".to_owned(),
                         capability: "coordination".to_owned(),
                     })
                 }
-                LibMockFanoutOutcome::Unreachable => Err(mempalace_remote::RemoteError::Unreachable {
-                    remote: "mock".to_owned(),
-                    message: "mock remote is down".to_owned(),
-                }),
+                LibMockFanoutOutcome::Unreachable => {
+                    Err(mempalace_remote::RemoteError::Unreachable {
+                        remote: "mock".to_owned(),
+                        message: "mock remote is down".to_owned(),
+                    })
+                }
             }
         }
     }
@@ -11833,6 +12806,9 @@ mod tests {
     struct DeleteDrawerMock {
         delete_succeeds: bool,
         delete_call_count: AtomicU64,
+        /// When set, `delete_drawer` returns [`RemoteError::UnknownOutcome`] — the
+        /// committed-but-lost-response case the MCP surface must surface honestly.
+        delete_unknown_outcome: bool,
     }
 
     impl DeleteDrawerMock {
@@ -11878,6 +12854,12 @@ mod tests {
         }
         async fn delete_drawer(&self, _drawer_id: &str) -> mempalace_remote::Result<()> {
             self.delete_call_count.fetch_add(1, Ordering::SeqCst);
+            if self.delete_unknown_outcome {
+                return Err(mempalace_remote::RemoteError::UnknownOutcome {
+                    remote: "mock".to_owned(),
+                    message: "committed but response lost".to_owned(),
+                });
+            }
             if self.delete_succeeds {
                 Ok(())
             } else {
@@ -12004,17 +12986,19 @@ mod tests {
     #[tokio::test]
     async fn tool_delete_drawer_with_write_remote_local_hit() {
         // Given a Combined/write:Remote wing route, and a drawer that exists
-        // locally, DeleteDrawer must delete locally — not forward to the remote.
+        // locally, DeleteDrawer follows write routing: the delete targets the
+        // remote, not the local store, and is not synchronously replicated.
         let mock = Arc::new(DeleteDrawerMock {
             delete_succeeds: true,
             delete_call_count: AtomicU64::new(0),
+            delete_unknown_outcome: false,
         });
         let mock_for_assert = mock.clone();
         let remotes =
             BTreeMap::from([("alpha".to_owned(), mock as Arc<dyn mempalace_remote::RemoteApi>)]);
         let mut ctx = make_delete_drawer_ctx(remotes, WriteTarget::Remote).await;
 
-        // Seed a drawer into the local store so it will be found locally.
+        // Seed a drawer into the local store so it can be resolved to a route.
         let local_id = DrawerId::new("local-test-drawer-001").unwrap();
         let now = OffsetDateTime::now_utc();
         ctx.runtime
@@ -12052,25 +13036,206 @@ mod tests {
 
         assert_eq!(result["success"], true);
         assert_eq!(result["drawer_id"], local_id.as_str());
-        assert_eq!(result["applied_to"], "local");
+        assert_eq!(result["applied_to"], "remote:alpha");
+        assert_eq!(result["origin"], "alpha");
         assert!(
             !result.as_object().unwrap().contains_key("replication"),
-            "DeleteDrawer must never produce a replication field; got: {result}"
+            "routed remote delete must not report queued replication; got: {result}"
         );
         assert_eq!(
             mock_for_assert.delete_call_count(),
-            0,
-            "write:Remote local hit must not call the remote"
+            1,
+            "write:Remote local hit must forward the delete to the remote"
+        );
+        // The local row must be left untouched under write:Remote routing.
+        let still_local = ctx.runtime.storage.drawer_store().get_drawer(&local_id).await.unwrap();
+        assert!(still_local.is_some(), "write:Remote must not delete the local row");
+    }
+
+    #[tokio::test]
+    async fn tool_delete_drawer_with_write_remote_unknown_outcome_returns_structured_result() {
+        // An operation-aware remote delete whose outcome cannot be confirmed must surface a
+        // structured unknown_outcome result (remote, operation_id, safe-retry guidance) through
+        // the MCP tool — never a generic internal JSON-RPC error and never an authoritative
+        // "not found".
+        let mock = Arc::new(DeleteDrawerMock {
+            delete_succeeds: true,
+            delete_call_count: AtomicU64::new(0),
+            delete_unknown_outcome: true,
+        });
+        let remotes =
+            BTreeMap::from([("alpha".to_owned(), mock as Arc<dyn mempalace_remote::RemoteApi>)]);
+        let mut ctx = make_delete_drawer_ctx(remotes, WriteTarget::Remote).await;
+
+        let local_id = DrawerId::new("local-unknown-outcome-drawer").unwrap();
+        let now = OffsetDateTime::now_utc();
+        ctx.runtime
+            .storage
+            .drawer_store()
+            .put_drawers(
+                &[DrawerRecord {
+                    id: local_id.clone(),
+                    wing: WingId::new("wing_code").unwrap(),
+                    room: RoomId::new("test-room").unwrap(),
+                    hall: None,
+                    date: Some(now.date()),
+                    source_file: "test.txt".to_owned(),
+                    chunk_index: 0,
+                    ingest_mode: "test".to_owned(),
+                    extract_mode: None,
+                    added_by: "test".to_owned(),
+                    filed_at: now,
+                    importance: None,
+                    emotional_weight: None,
+                    weight: None,
+                    content: "test content".to_owned(),
+                    content_hash: mempalace_core::hash_text("test content"),
+                    embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
+                    locator: None,
+                    view_metadata: None,
+                }],
+                DuplicateStrategy::Error,
+            )
+            .await
+            .unwrap();
+
+        let result = ctx
+            .runtime
+            .tool_delete_drawer(&json!({
+                "drawer_id": local_id.as_str(),
+                "operation_id": "op-del-mcp-unknown",
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result["outcome"], "unknown_outcome");
+        assert_eq!(result["success"], false);
+        assert_eq!(result["remote"], "mock");
+        assert_eq!(result["operation_id"], "op-del-mcp-unknown");
+        assert!(
+            result["retry"].as_str().unwrap().contains("same operation_id"),
+            "structured result must carry safe-retry guidance: {result}"
+        );
+        // The local row stays untouched: the delete was routed remote and its outcome is
+        // unconfirmed.
+        let still_local = ctx.runtime.storage.drawer_store().get_drawer(&local_id).await.unwrap();
+        assert!(still_local.is_some(), "unknown outcome must not delete the local row");
+    }
+
+    /// A `Combined/write:Remote` wing rule router wired to a mock whose mutation endpoints return
+    /// [`RemoteError::UnknownOutcome`], built through the full `McpServer` handle path.
+    async fn unknown_outcome_mutation_harness() -> TestHarness {
+        let mut remote = LibMockRemote::default();
+        remote.mutation_unknown_outcome = true;
+        let mut remotes: BTreeMap<String, Arc<dyn mempalace_remote::RemoteApi>> = BTreeMap::new();
+        remotes.insert("hub".to_owned(), Arc::new(remote));
+        let mut router = make_lib_router(remotes);
+        router.rules.wings.insert(
+            "wing_code".to_owned(),
+            ResolvedRouteRule {
+                mode: RouteMode::Combined,
+                remote: Some("hub".to_owned()),
+                write: WriteTarget::Remote,
+            },
+        );
+        test_harness_with_mock_router(router).await
+    }
+
+    #[tokio::test]
+    async fn tool_add_drawer_write_remote_unknown_outcome_returns_structured_result() {
+        let harness = unknown_outcome_mutation_harness().await;
+        let response = harness
+            .server
+            .handle_request(tool_call(
+                1,
+                "mempalace_add_drawer",
+                json!({
+                    "wing": "wing_code",
+                    "room": "general",
+                    "content": "unknown outcome mcp add test content",
+                    "added_by": "mcp-test",
+                    "operation_id": "op-add-mcp-unknown",
+                }),
+            ))
+            .await;
+        let result = decode_tool_payload(&response).expect("structured result expected");
+
+        assert_eq!(result["outcome"], "unknown_outcome");
+        assert_eq!(result["success"], false);
+        assert_eq!(result["remote"], "mock");
+        assert_eq!(result["operation_id"], "op-add-mcp-unknown");
+        assert!(
+            result["retry"].as_str().unwrap().contains("same operation_id"),
+            "structured result must carry safe-retry guidance: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_kg_add_unknown_outcome_returns_structured_result() {
+        let harness = unknown_outcome_mutation_harness().await;
+        let response = harness
+            .server
+            .handle_request(tool_call(
+                1,
+                "mempalace_kg_add",
+                json!({
+                    "subject": "Alice",
+                    "predicate": "loves",
+                    "object": "Bob",
+                    "operation_id": "op-kgadd-mcp-unknown",
+                }),
+            ))
+            .await;
+        let result = decode_tool_payload(&response).expect("structured result expected");
+
+        assert_eq!(result["outcome"], "unknown_outcome");
+        assert_eq!(result["success"], false);
+        assert_eq!(result["remote"], "mock");
+        assert_eq!(result["operation_id"], "op-kgadd-mcp-unknown");
+        assert!(
+            result["retry"].as_str().unwrap().contains("same operation_id"),
+            "structured result must carry safe-retry guidance: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_kg_invalidate_unknown_outcome_returns_structured_result() {
+        let harness = unknown_outcome_mutation_harness().await;
+        let response = harness
+            .server
+            .handle_request(tool_call(
+                1,
+                "mempalace_kg_invalidate",
+                json!({
+                    "subject": "Alice",
+                    "predicate": "loves",
+                    "object": "Bob",
+                    "operation_id": "op-kginv-mcp-unknown",
+                }),
+            ))
+            .await;
+        let result = decode_tool_payload(&response).expect("structured result expected");
+
+        assert_eq!(result["outcome"], "unknown_outcome");
+        assert_eq!(result["success"], false);
+        assert_eq!(result["remote"], "mock");
+        assert_eq!(result["operation_id"], "op-kginv-mcp-unknown");
+        assert!(
+            result["retry"].as_str().unwrap().contains("same operation_id"),
+            "structured result must carry safe-retry guidance: {result}"
         );
     }
 
     #[tokio::test]
     async fn tool_delete_drawer_with_write_both_local_hit() {
         // Given a Combined/write:Both wing route, and a drawer that exists
-        // locally, DeleteDrawer must delete locally — no replication attempt.
+        // locally, DeleteDrawer commits the local deletion and queues durable
+        // replication with a stable operation id — it must not call the remote
+        // inline.
         let mock = Arc::new(DeleteDrawerMock {
             delete_succeeds: true,
             delete_call_count: AtomicU64::new(0),
+            delete_unknown_outcome: false,
         });
         let mock_for_assert = mock.clone();
         let remotes =
@@ -12115,14 +13280,21 @@ mod tests {
         assert_eq!(result["success"], true);
         assert_eq!(result["drawer_id"], local_id.as_str());
         assert_eq!(result["applied_to"], "local");
+        assert_eq!(
+            result["replication"]["status"], "queued",
+            "write:Both local hit must queue durable replication; got: {result}"
+        );
+        assert_eq!(result["replication"]["remote"], "alpha");
         assert!(
-            !result.as_object().unwrap().contains_key("replication"),
-            "DeleteDrawer must never produce a replication field; got: {result}"
+            result["replication"]["operation_id"]
+                .as_str()
+                .map_or(false, |id| id.starts_with("outbox_")),
+            "queued replication must expose a stable operation id; got: {result}"
         );
         assert_eq!(
             mock_for_assert.delete_call_count(),
             0,
-            "write:Both local hit must not call the remote"
+            "write:Both local hit must not call the remote inline"
         );
     }
 
@@ -12134,6 +13306,7 @@ mod tests {
         let mock = Arc::new(DeleteDrawerMock {
             delete_succeeds: true,
             delete_call_count: AtomicU64::new(0),
+            delete_unknown_outcome: false,
         });
         let mock_for_assert = mock.clone();
         let remotes =
@@ -12205,6 +13378,369 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tool_add_drawer_write_both_retry_after_cancelled_intent_reuses_pinned_target() {
+        // A write:both add stages a durable outbox intent keyed by the caller's
+        // operation_id before committing locally; a failed local commit cancels that
+        // intent. Retrying the same operation_id must reuse the cancelled intent's
+        // pinned drawer target — a fresh time-derived id would present a different
+        // entity/payload under the same idempotency key, which the outbox rejects —
+        // reactivate the original operation, and keep the same drawer identity.
+        let mock = Arc::new(DeleteDrawerMock {
+            delete_succeeds: true,
+            delete_call_count: AtomicU64::new(0),
+            delete_unknown_outcome: false,
+        });
+        let mock_for_assert = mock.clone();
+        let remotes =
+            BTreeMap::from([("alpha".to_owned(), mock as Arc<dyn mempalace_remote::RemoteApi>)]);
+        let mut ctx = make_delete_drawer_ctx(remotes, WriteTarget::Both).await;
+
+        // Simulate the cancelled intent: an add staged under the caller's operation_id
+        // and cancelled before its local commit, pinning this drawer target.
+        let pinned_id = DrawerId::new("drawer_wing_code_retry-room_0123456789abcdef").unwrap();
+        let staged = ctx
+            .runtime
+            .stage_replication(
+                "op-cancelled-add-retry".to_owned(),
+                "drawer_added",
+                pinned_id.as_str().to_owned(),
+                "alpha".to_owned(),
+                pinned_id.as_str().to_owned(),
+                ReplicationMutation::DrawerAdd {
+                    request: AddDrawerRequest {
+                        wing: "wing_code".to_owned(),
+                        room: "retry-room".to_owned(),
+                        content: "retry content".to_owned(),
+                        source_file: None,
+                        added_by: Some("mcp".to_owned()),
+                        drawer_id: Some(pinned_id.as_str().to_owned()),
+                        operation_id: None,
+                    },
+                },
+            )
+            .unwrap();
+        let original_operation_id = staged.operation_id.clone();
+        ctx.runtime.cancel_staged_replication(&staged);
+        assert_eq!(
+            ctx.runtime
+                .outbox
+                .find_by_key(OUTBOX_ACTOR, "op-cancelled-add-retry")
+                .unwrap()
+                .expect("cancelled intent must be recoverable by key")
+                .state,
+            OutboxState::Cancelled
+        );
+
+        // A different mutation under the same caller operation_id must still conflict:
+        // the idempotency key stays bound to the mutation it was staged with. No local
+        // drawer exists yet, so the conflict surfaces straight from the outbox enqueue.
+        let conflict = ctx
+            .runtime
+            .tool_add_drawer(&json!({
+                "wing": "wing_code",
+                "room": "retry-room",
+                "content": "retry content",
+                "added_by": "someone-else",
+                "operation_id": "op-cancelled-add-retry",
+            }))
+            .await;
+        assert!(
+            conflict.is_err(),
+            "reusing the operation id for a different mutation must conflict; got: {conflict:?}"
+        );
+        assert_eq!(
+            ctx.runtime
+                .outbox
+                .find_by_key(OUTBOX_ACTOR, "op-cancelled-add-retry")
+                .unwrap()
+                .expect("intent must survive the rejected replay")
+                .state,
+            OutboxState::Cancelled,
+            "a rejected different-mutation replay must not disturb the cancelled intent"
+        );
+        assert!(
+            ctx.runtime.storage.drawer_store().get_drawer(&pinned_id).await.unwrap().is_none(),
+            "a rejected different-mutation replay must not commit anything locally"
+        );
+
+        let result = ctx
+            .runtime
+            .tool_add_drawer(&json!({
+                "wing": "wing_code",
+                "room": "retry-room",
+                "content": "retry content",
+                "operation_id": "op-cancelled-add-retry",
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result["success"], true);
+        assert_eq!(
+            result["drawer_id"],
+            pinned_id.as_str(),
+            "the retry must keep the cancelled intent's pinned drawer identity; got: {result}"
+        );
+        assert_eq!(result["applied_to"], "local");
+        assert_eq!(result["replication"]["status"], "queued");
+        assert_eq!(result["replication"]["remote"], "alpha");
+        assert_eq!(
+            result["replication"]["operation_id"], original_operation_id,
+            "the retry must reactivate the original operation, not enqueue a new one"
+        );
+
+        let stored = ctx
+            .runtime
+            .storage
+            .drawer_store()
+            .get_drawer(&pinned_id)
+            .await
+            .unwrap()
+            .expect("the retried add must commit locally under the pinned id");
+        assert_eq!(stored.content, "retry content");
+
+        let operation = ctx
+            .runtime
+            .outbox
+            .find_by_key(OUTBOX_ACTOR, "op-cancelled-add-retry")
+            .unwrap()
+            .expect("operation must survive the retry");
+        assert_eq!(operation.operation_id, original_operation_id);
+        assert_eq!(operation.entity_id, pinned_id.as_str());
+        assert_eq!(operation.ordering_key, pinned_id.as_str());
+        assert_eq!(
+            operation.state,
+            OutboxState::Pending,
+            "the original operation must be activated, not replaced"
+        );
+        match serde_json::from_value::<ReplicationMutation>(operation.payload).unwrap() {
+            ReplicationMutation::DrawerAdd { request } => {
+                assert_eq!(request.drawer_id.as_deref(), Some(pinned_id.as_str()));
+            }
+            other => panic!("expected a drawer-add payload, got: {other:?}"),
+        }
+
+        assert_eq!(mock_for_assert.delete_call_count(), 0, "the remote must not be called inline");
+    }
+
+    /// Seed a local drawer directly (bypassing `tool_add_drawer`, so no outbox intent
+    /// exists for it) with a real stub embedding so `find_duplicates` can match it.
+    async fn seed_write_both_duplicate_drawer(
+        ctx: &mut DeleteDrawerTestCtx,
+        drawer_id: &str,
+        source_file: &str,
+        added_by: &str,
+        content: &str,
+    ) -> DrawerId {
+        let seeded_id = DrawerId::new(drawer_id).unwrap();
+        let record = ctx
+            .runtime
+            .build_drawer_record(
+                seeded_id.clone(),
+                parse_wing_id("wing_code").unwrap(),
+                parse_room_id("dup-room").unwrap(),
+                None,
+                None,
+                source_file.to_owned(),
+                added_by.to_owned(),
+                "mcp".to_owned(),
+                content.to_owned(),
+                OffsetDateTime::now_utc(),
+            )
+            .await
+            .unwrap();
+        ctx.runtime
+            .storage
+            .drawer_store()
+            .put_drawers(&[record], DuplicateStrategy::Error)
+            .await
+            .unwrap();
+        seeded_id
+    }
+
+    #[tokio::test]
+    async fn tool_add_drawer_write_both_duplicate_reuses_local_only_when_metadata_matches() {
+        // A write:both add whose content matches a local drawer must reuse that drawer
+        // only when the stored record's metadata (source_file, added_by) matches the
+        // request; the queued remote payload then describes the same mutation the local
+        // record carries, so replicas stay converged.
+        let mock = Arc::new(DeleteDrawerMock {
+            delete_succeeds: true,
+            delete_call_count: AtomicU64::new(0),
+            delete_unknown_outcome: false,
+        });
+        let remotes =
+            BTreeMap::from([("alpha".to_owned(), mock as Arc<dyn mempalace_remote::RemoteApi>)]);
+        let mut ctx = make_delete_drawer_ctx(remotes, WriteTarget::Both).await;
+        let seeded_id = seed_write_both_duplicate_drawer(
+            &mut ctx,
+            "drawer_wing_code_dup-room_seeded0001",
+            "notes.md",
+            "tester",
+            "duplicate metadata probe",
+        )
+        .await;
+
+        let result = ctx
+            .runtime
+            .tool_add_drawer(&json!({
+                "wing": "wing_code",
+                "room": "dup-room",
+                "content": "duplicate metadata probe",
+                "source_file": "notes.md",
+                "added_by": "tester",
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result["success"], true, "matching metadata must reuse the local drawer");
+        assert_eq!(result["drawer_id"], seeded_id.as_str());
+        assert_eq!(result["applied_to"], "local");
+        assert_eq!(result["replication"]["status"], "queued");
+        assert_eq!(result["replication"]["remote"], "alpha");
+
+        // The queued operation must carry the stored record's metadata under the stored
+        // drawer id — not a divergent payload.
+        let operation = ctx
+            .runtime
+            .outbox
+            .find_by_key(
+                OUTBOX_ACTOR,
+                &replication_idempotency_key(None, "drawer-add", seeded_id.as_str(), "alpha"),
+            )
+            .unwrap()
+            .expect("matching reuse must queue the remote operation");
+        assert_eq!(operation.entity_id, seeded_id.as_str());
+        match serde_json::from_value::<ReplicationMutation>(operation.payload).unwrap() {
+            ReplicationMutation::DrawerAdd { request } => {
+                assert_eq!(request.source_file.as_deref(), Some("notes.md"));
+                assert_eq!(request.added_by.as_deref(), Some("tester"));
+                assert_eq!(request.drawer_id.as_deref(), Some(seeded_id.as_str()));
+            }
+            other => panic!("expected a drawer-add payload, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_add_drawer_write_both_duplicate_source_file_mismatch_returns_duplicate() {
+        // A write:both add of identical content whose source_file differs from the stored
+        // record must return the normal duplicate result and must not queue a remote
+        // operation pinning the old drawer id under the new metadata.
+        let mock = Arc::new(DeleteDrawerMock {
+            delete_succeeds: true,
+            delete_call_count: AtomicU64::new(0),
+            delete_unknown_outcome: false,
+        });
+        let remotes =
+            BTreeMap::from([("alpha".to_owned(), mock as Arc<dyn mempalace_remote::RemoteApi>)]);
+        let mut ctx = make_delete_drawer_ctx(remotes, WriteTarget::Both).await;
+        let seeded_id = seed_write_both_duplicate_drawer(
+            &mut ctx,
+            "drawer_wing_code_dup-room_seeded0002",
+            "notes.md",
+            "tester",
+            "duplicate metadata probe",
+        )
+        .await;
+
+        let result = ctx
+            .runtime
+            .tool_add_drawer(&json!({
+                "wing": "wing_code",
+                "room": "dup-room",
+                "content": "duplicate metadata probe",
+                "source_file": "other.md",
+                "added_by": "tester",
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result["success"], false,
+            "a source_file mismatch must not reuse the local drawer: {result}"
+        );
+        assert_eq!(result["reason"], "duplicate");
+        assert!(
+            !result.as_object().unwrap().contains_key("replication"),
+            "a source_file-mismatched duplicate must not queue replication: {result}"
+        );
+        assert!(
+            ctx.runtime
+                .outbox
+                .find_by_key(
+                    OUTBOX_ACTOR,
+                    &replication_idempotency_key(None, "drawer-add", seeded_id.as_str(), "alpha")
+                )
+                .unwrap()
+                .is_none(),
+            "a source_file-mismatched duplicate must not stage a remote operation"
+        );
+        let stored =
+            ctx.runtime.storage.drawer_store().get_drawer(&seeded_id).await.unwrap().unwrap();
+        assert_eq!(stored.source_file, "notes.md");
+        assert_eq!(stored.added_by, "tester");
+    }
+
+    #[tokio::test]
+    async fn tool_add_drawer_write_both_duplicate_added_by_mismatch_returns_duplicate() {
+        // A write:both add of identical content whose added_by differs from the stored
+        // record must return the normal duplicate result and must not queue a remote
+        // operation. Omitting source_file on both sides exercises the empty-string
+        // source_file comparison.
+        let mock = Arc::new(DeleteDrawerMock {
+            delete_succeeds: true,
+            delete_call_count: AtomicU64::new(0),
+            delete_unknown_outcome: false,
+        });
+        let remotes =
+            BTreeMap::from([("alpha".to_owned(), mock as Arc<dyn mempalace_remote::RemoteApi>)]);
+        let mut ctx = make_delete_drawer_ctx(remotes, WriteTarget::Both).await;
+        let seeded_id = seed_write_both_duplicate_drawer(
+            &mut ctx,
+            "drawer_wing_code_dup-room_seeded0003",
+            "",
+            "tester",
+            "duplicate metadata probe",
+        )
+        .await;
+
+        let result = ctx
+            .runtime
+            .tool_add_drawer(&json!({
+                "wing": "wing_code",
+                "room": "dup-room",
+                "content": "duplicate metadata probe",
+                "added_by": "someone-else",
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result["success"], false,
+            "an added_by mismatch must not reuse the local drawer: {result}"
+        );
+        assert_eq!(result["reason"], "duplicate");
+        assert!(
+            !result.as_object().unwrap().contains_key("replication"),
+            "an added_by-mismatched duplicate must not queue replication: {result}"
+        );
+        assert!(
+            ctx.runtime
+                .outbox
+                .find_by_key(
+                    OUTBOX_ACTOR,
+                    &replication_idempotency_key(None, "drawer-add", seeded_id.as_str(), "alpha")
+                )
+                .unwrap()
+                .is_none(),
+            "an added_by-mismatched duplicate must not stage a remote operation"
+        );
+        let stored =
+            ctx.runtime.storage.drawer_store().get_drawer(&seeded_id).await.unwrap().unwrap();
+        assert_eq!(stored.source_file, "");
+        assert_eq!(stored.added_by, "tester");
+    }
+
+    #[tokio::test]
     async fn tool_delete_drawer_does_not_remove_diary_summary_on_remote_fallback() {
         // Given a remote-only fallback (drawer not found locally, remote
         // succeeds), a locally stored diary summary must NOT be removed.
@@ -12213,6 +13749,7 @@ mod tests {
         let mock = Arc::new(DeleteDrawerMock {
             delete_succeeds: true,
             delete_call_count: AtomicU64::new(0),
+            delete_unknown_outcome: false,
         });
         let remotes =
             BTreeMap::from([("alpha".to_owned(), mock as Arc<dyn mempalace_remote::RemoteApi>)]);
@@ -12298,8 +13835,11 @@ mod tests {
             .await
             .unwrap();
 
-        let result =
-            ctx.runtime.tool_delete_drawer(&json!({"drawer_id": drawer_id.as_str()})).await.unwrap();
+        let result = ctx
+            .runtime
+            .tool_delete_drawer(&json!({"drawer_id": drawer_id.as_str()}))
+            .await
+            .unwrap();
         assert_eq!(result["success"], true);
 
         let changes = ctx.runtime.tool_get_changes_since(&json!({})).await.unwrap();
@@ -12310,6 +13850,589 @@ mod tests {
             .unwrap_or_else(|| panic!("no drawer_deleted event found for {drawer_id}: {events:?}"));
         assert_eq!(deleted_event["details"]["wing"], "wing_alpha");
         assert_eq!(deleted_event["details"]["room"], "alpha-room");
+    }
+
+    #[tokio::test]
+    async fn kg_invalidate_persists_resolved_date_in_queued_replication() {
+        let mut rules_remotes = BTreeMap::new();
+        rules_remotes.insert(
+            "alpha".to_owned(),
+            ResolvedRemote {
+                name: "alpha".to_owned(),
+                url: "http://127.0.0.1:9999".to_owned(),
+                token: Some("test".to_owned()),
+                timeout: std::time::Duration::from_secs(5),
+            },
+        );
+        let federation = FederationRuntimeConfig {
+            remotes: rules_remotes,
+            default_mode: RouteMode::Combined,
+            default_remote: Some("alpha".to_owned()),
+            wings: BTreeMap::new(),
+            kg: Some(ResolvedRouteRule {
+                mode: RouteMode::Combined,
+                remote: Some("alpha".to_owned()),
+                write: WriteTarget::Both,
+            }),
+            coordination: BTreeMap::new(),
+        };
+
+        let harness = test_harness_with_federation(federation).await;
+
+        // Add a fact directly to the local KG. Using the tool would queue a
+        // replication op for the add too; the point here is to inspect only the
+        // op the invalidation queues.
+        {
+            let runtime = harness.server.runtime.lock().await;
+            let kg_runtime = KnowledgeGraphRuntime::new(runtime.storage.operational_store());
+            let now = OffsetDateTime::now_utc();
+            kg_runtime
+                .add_fact(
+                    AddFactRequest {
+                        subject: "User1".into(),
+                        subject_type: EntityKind::Person,
+                        predicate: "works_on".into(),
+                        object: "ProjectX".into(),
+                        object_type: EntityKind::Concept,
+                        valid_from: None,
+                        valid_to: None,
+                        confidence: 1.0,
+                        source_drawer_id: None,
+                        source_file: None,
+                    },
+                    now,
+                )
+                .unwrap();
+        }
+
+        // Invalidate the fact without supplying an explicit `ended` date.
+        let inv_resp = harness
+            .server
+            .handle_request(tool_call(
+                2,
+                "mempalace_kg_invalidate",
+                json!({
+                    "subject": "User1",
+                    "predicate": "works_on",
+                    "object": "ProjectX",
+                }),
+            ))
+            .await;
+        let inv_payload = decode_tool_payload(&inv_resp).unwrap();
+        assert_eq!(inv_payload["success"], true);
+
+        // Inspect the queued outbox payload: `ended` must carry the locally resolved date.
+        let runtime = harness.server.runtime.lock().await;
+        let today = OffsetDateTime::now_utc().date().to_string();
+        let mut found_inv = false;
+        let count = runtime.outbox.backlog(None).unwrap();
+        assert!(count.total_count >= 1);
+        let op = runtime
+            .outbox
+            .claim_next("alpha", "worker-test", time::Duration::minutes(1))
+            .unwrap()
+            .expect("claimed op");
+        if let Ok(ReplicationMutation::KgInvalidate { request }) =
+            serde_json::from_value::<ReplicationMutation>(op.payload)
+        {
+            assert_eq!(request.subject, "User1");
+            assert_eq!(request.predicate, "works_on");
+            assert_eq!(request.object, "ProjectX");
+            assert_eq!(request.ended, Some(today));
+            found_inv = true;
+        }
+        assert!(
+            found_inv,
+            "outbox must carry ReplicationMutation::KgInvalidate with resolved ended date"
+        );
+    }
+
+    #[test]
+    fn kg_ordering_key_uses_graph_label_canonicalization() {
+        // Equivalent label spellings must share one ordering key so the outbox
+        // groups them together and ordering between add and invalidate is kept.
+        let base = kg_ordering_key("User1", "works_on", "ProjectX");
+        for spelling in ["works-on", "works on", "Works On", "  WORKS--ON  ", "works...on"] {
+            assert_eq!(
+                kg_ordering_key("User1", spelling, "ProjectX"),
+                base,
+                "predicate spelling {spelling:?} must produce the same ordering key"
+            );
+        }
+        assert_eq!(
+            kg_ordering_key("  Alice-2 ", "works on", "  project--x "),
+            kg_ordering_key("alice_2", "works_on", "project_x"),
+            "subject and object labels must canonicalize like the graph layer"
+        );
+        assert_ne!(
+            kg_ordering_key("User1", "works on", "ProjectX"),
+            kg_ordering_key("User1", "manages on", "ProjectX"),
+            "genuinely different predicates must not collide"
+        );
+    }
+
+    #[tokio::test]
+    async fn kg_add_and_invalidate_equivalent_spellings_share_ordering_group() {
+        let mut rules_remotes = BTreeMap::new();
+        rules_remotes.insert(
+            "alpha".to_owned(),
+            ResolvedRemote {
+                name: "alpha".to_owned(),
+                url: "http://127.0.0.1:9999".to_owned(),
+                token: Some("test".to_owned()),
+                timeout: std::time::Duration::from_secs(5),
+            },
+        );
+        let federation = FederationRuntimeConfig {
+            remotes: rules_remotes,
+            default_mode: RouteMode::Combined,
+            default_remote: Some("alpha".to_owned()),
+            wings: BTreeMap::new(),
+            kg: Some(ResolvedRouteRule {
+                mode: RouteMode::Combined,
+                remote: Some("alpha".to_owned()),
+                write: WriteTarget::Both,
+            }),
+            coordination: BTreeMap::new(),
+        };
+
+        let harness = test_harness_with_federation(federation).await;
+
+        // Queue an add under one spelling of the predicate...
+        let add_resp = harness
+            .server
+            .handle_request(tool_call(
+                2,
+                "mempalace_kg_add",
+                json!({"subject":"User1","predicate":"works-on","object":"ProjectX"}),
+            ))
+            .await;
+        assert_eq!(decode_tool_payload(&add_resp).unwrap()["success"], true);
+
+        // ...then an invalidate using an equivalent spelling.
+        let inv_resp = harness
+            .server
+            .handle_request(tool_call(
+                3,
+                "mempalace_kg_invalidate",
+                json!({"subject":"User1","predicate":"works on","object":"ProjectX"}),
+            ))
+            .await;
+        assert_eq!(decode_tool_payload(&inv_resp).unwrap()["success"], true);
+
+        let runtime = harness.server.runtime.lock().await;
+        let add_op = runtime
+            .outbox
+            .claim_next("alpha", "worker-test", time::Duration::minutes(1))
+            .unwrap()
+            .expect("queued kg add must be the claimable head of the ordering group");
+        assert!(
+            matches!(
+                serde_json::from_value::<ReplicationMutation>(add_op.payload.clone()),
+                Ok(ReplicationMutation::KgAdd { .. })
+            ),
+            "first queued op must be the kg add"
+        );
+
+        // While the add is in flight, the equivalent-spelling invalidate must be
+        // blocked in the same (destination, ordering_key) group instead of being
+        // claimed past it on a different partition.
+        assert!(
+            runtime
+                .outbox
+                .claim_next("alpha", "worker-test", time::Duration::minutes(1))
+                .unwrap()
+                .is_none(),
+            "equivalent-spelling invalidate must be blocked behind the leased add"
+        );
+
+        // Completing the add releases the group; the invalidate is next in order
+        // and carries the identical ordering key.
+        expect_applied(
+            runtime
+                .outbox
+                .acknowledge(&add_op.operation_id, "worker-test", add_op.revision)
+                .unwrap(),
+            "acknowledgement",
+        )
+        .unwrap();
+        let inv_op = runtime
+            .outbox
+            .claim_next("alpha", "worker-test", time::Duration::minutes(1))
+            .unwrap()
+            .expect("invalidate must follow the completed add within the same group");
+        assert_eq!(inv_op.ordering_key, add_op.ordering_key);
+        assert!(
+            matches!(
+                serde_json::from_value::<ReplicationMutation>(inv_op.payload),
+                Ok(ReplicationMutation::KgInvalidate { .. })
+            ),
+            "second queued op must be the kg invalidate"
+        );
+    }
+
+    #[tokio::test]
+    async fn keyed_kg_operations_reuse_already_activated_outbox_rows() {
+        let mut rules_remotes = BTreeMap::new();
+        rules_remotes.insert(
+            "alpha".to_owned(),
+            ResolvedRemote {
+                name: "alpha".to_owned(),
+                url: "http://127.0.0.1:9999".to_owned(),
+                token: Some("test".to_owned()),
+                timeout: std::time::Duration::from_secs(5),
+            },
+        );
+        let federation = FederationRuntimeConfig {
+            remotes: rules_remotes,
+            default_mode: RouteMode::Combined,
+            default_remote: Some("alpha".to_owned()),
+            wings: BTreeMap::new(),
+            kg: Some(ResolvedRouteRule {
+                mode: RouteMode::Combined,
+                remote: Some("alpha".to_owned()),
+                write: WriteTarget::Both,
+            }),
+            coordination: BTreeMap::new(),
+        };
+        let harness = test_harness_with_federation(federation).await;
+
+        let add_args = json!({
+            "subject": "ReusePerson",
+            "predicate": "lives-in",
+            "object": "ReuseCity",
+            "operation_id": "kg-add-reused"
+        });
+        let first_add = harness
+            .server
+            .handle_request(tool_call(10, "mempalace_kg_add", add_args.clone()))
+            .await;
+        let first_add_payload = decode_tool_payload(&first_add).unwrap();
+        assert_eq!(first_add_payload["success"], true);
+        let second_add =
+            harness.server.handle_request(tool_call(11, "mempalace_kg_add", add_args)).await;
+        let second_add_payload = decode_tool_payload(&second_add).unwrap();
+        assert_eq!(second_add_payload["success"], true);
+        assert_eq!(
+            second_add_payload["replication"]["operation_id"],
+            first_add_payload["replication"]["operation_id"]
+        );
+
+        // A keyed replay must reflect a terminal outbox state instead of
+        // regressing to `queued` after the remote has acknowledged the row.
+        let add_operation_id =
+            first_add_payload["replication"]["operation_id"].as_str().unwrap().to_owned();
+        {
+            let runtime = harness.server.runtime.lock().await;
+            let operation = runtime.outbox.get_operation(&add_operation_id).unwrap().unwrap();
+            let leased = runtime
+                .outbox
+                .claim_next("alpha", "worker-terminal-test", time::Duration::minutes(1))
+                .unwrap()
+                .expect("queued add must be claimable");
+            assert_eq!(leased.operation_id, operation.operation_id);
+            expect_applied(
+                runtime
+                    .outbox
+                    .acknowledge(&leased.operation_id, "worker-terminal-test", leased.revision)
+                    .unwrap(),
+                "acknowledgement",
+            )
+            .unwrap();
+        }
+        let terminal_add = harness
+            .server
+            .handle_request(tool_call(
+                14,
+                "mempalace_kg_add",
+                json!({
+                    "subject": "ReusePerson",
+                    "predicate": "lives-in",
+                    "object": "ReuseCity",
+                    "operation_id": "kg-add-reused",
+                }),
+            ))
+            .await;
+        let terminal_add_payload = decode_tool_payload(&terminal_add).unwrap();
+        assert_eq!(terminal_add_payload["replication"]["status"], "replicated");
+        assert_eq!(terminal_add_payload["replication"]["remote"], "alpha");
+
+        let invalidate_args = json!({
+            "subject": "ReusePerson",
+            "predicate": "lives_in",
+            "object": "ReuseCity",
+            "operation_id": "kg-invalidate-reused"
+        });
+        let first_invalidate = harness
+            .server
+            .handle_request(tool_call(12, "mempalace_kg_invalidate", invalidate_args.clone()))
+            .await;
+        let first_invalidate_payload = decode_tool_payload(&first_invalidate).unwrap();
+        assert_eq!(first_invalidate_payload["success"], true);
+        let second_invalidate = harness
+            .server
+            .handle_request(tool_call(13, "mempalace_kg_invalidate", invalidate_args))
+            .await;
+        let second_payload = decode_tool_payload(&second_invalidate).unwrap();
+        assert_eq!(second_payload["invalidated"], 0);
+        assert_eq!(
+            second_payload["replication"]["operation_id"],
+            first_invalidate_payload["replication"]["operation_id"]
+        );
+
+        // The same mapping must preserve a terminal failure and its reason.
+        let invalidate_operation_id =
+            first_invalidate_payload["replication"]["operation_id"].as_str().unwrap().to_owned();
+        {
+            let runtime = harness.server.runtime.lock().await;
+            let leased = runtime
+                .outbox
+                .claim_next("alpha", "worker-terminal-test", time::Duration::minutes(1))
+                .unwrap()
+                .expect("queued invalidate must be claimable");
+            assert_eq!(leased.operation_id, invalidate_operation_id);
+            expect_applied(
+                runtime
+                    .outbox
+                    .fail(
+                        &leased.operation_id,
+                        "worker-terminal-test",
+                        leased.revision,
+                        "remote rejected test mutation",
+                    )
+                    .unwrap(),
+                "terminal failure",
+            )
+            .unwrap();
+        }
+        let terminal_invalidate = harness
+            .server
+            .handle_request(tool_call(
+                15,
+                "mempalace_kg_invalidate",
+                json!({
+                    "subject": "ReusePerson",
+                    "predicate": "lives_in",
+                    "object": "ReuseCity",
+                    "operation_id": "kg-invalidate-reused",
+                }),
+            ))
+            .await;
+        let terminal_invalidate_payload = decode_tool_payload(&terminal_invalidate).unwrap();
+        assert_eq!(terminal_invalidate_payload["replication"]["status"], "failed");
+        assert_eq!(
+            terminal_invalidate_payload["replication"]["reason"],
+            "remote rejected test mutation"
+        );
+    }
+
+    #[tokio::test]
+    async fn staged_kg_reconciliation_determines_current_state_across_all_historical_facts() {
+        let harness = test_harness_with_federation(FederationRuntimeConfig::default()).await;
+        let runtime = harness.server.runtime.lock().await;
+        let kg_store = runtime.storage.operational_store();
+        let kg_runtime = KnowledgeGraphRuntime::new(kg_store);
+
+        let now = OffsetDateTime::now_utc();
+        let today = now.date();
+        let yesterday = today.previous_day().unwrap();
+        let two_days_ago = yesterday.previous_day().unwrap();
+
+        // 1. Add older fact that is invalidated.
+        let _f1_id = kg_runtime
+            .add_fact(
+                mempalace_graph::AddFactRequest {
+                    subject: "PersonA".into(),
+                    subject_type: mempalace_graph::EntityKind::Person,
+                    predicate: "lives_in".into(),
+                    object: "CityA".into(),
+                    object_type: mempalace_graph::EntityKind::Concept,
+                    valid_from: Some(two_days_ago),
+                    valid_to: None,
+                    confidence: 1.0,
+                    source_drawer_id: None,
+                    source_file: None,
+                },
+                now,
+            )
+            .unwrap();
+        kg_runtime.invalidate("PersonA", "lives_in", "CityA", yesterday, now).unwrap();
+
+        // Check fact state before adding the second fact: should be Some(false)
+        assert_eq!(runtime.local_fact_state("PersonA", "lives_in", "CityA").unwrap(), Some(false));
+
+        // 2. Add newer active fact for the exact same (subject, predicate, object).
+        let _f2_id = kg_runtime
+            .add_fact(
+                mempalace_graph::AddFactRequest {
+                    subject: "PersonA".into(),
+                    subject_type: mempalace_graph::EntityKind::Person,
+                    predicate: "lives_in".into(),
+                    object: "CityA".into(),
+                    object_type: mempalace_graph::EntityKind::Concept,
+                    valid_from: Some(yesterday),
+                    valid_to: None,
+                    confidence: 1.0,
+                    source_drawer_id: None,
+                    source_file: None,
+                },
+                now,
+            )
+            .unwrap();
+
+        // local_fact_state must see the active fact and return Some(true), even though f1 is historical and invalidated.
+        assert_eq!(runtime.local_fact_state("PersonA", "lives_in", "CityA").unwrap(), Some(true));
+        assert_eq!(
+            runtime.local_fact_state("PersonA", "lives-in", "citya").unwrap(),
+            Some(true),
+            "staged reconciliation must compare canonical graph labels, not raw punctuation"
+        );
+
+        // 3. Invalidate the newer active fact as well.
+        // `valid_to` is inclusive, so end on yesterday to make the newer row inactive for today.
+        kg_runtime.invalidate("PersonA", "lives_in", "CityA", yesterday, now).unwrap();
+        // Now all facts for this triple are inactive -> Some(false).
+        assert_eq!(runtime.local_fact_state("PersonA", "lives_in", "CityA").unwrap(), Some(false));
+        assert_eq!(
+            runtime.local_fact_state("PersonA", "lives_in", "UnknownCity").unwrap(),
+            None,
+            "an unknown endpoint must not be mistaken for an already-inactive fact"
+        );
+    }
+
+    #[tokio::test]
+    async fn keyed_activation_race_reuses_already_activated_operation() {
+        let harness = test_harness_with_federation(FederationRuntimeConfig::default()).await;
+        let runtime = harness.server.runtime.lock().await;
+        let staged = stage_kg_add_intent(&runtime, "ActivationRace", "owns", "Item");
+        let activated = expect_applied(
+            runtime.outbox.activate(&staged.operation_id, staged.revision).unwrap(),
+            "activate",
+        )
+        .unwrap();
+
+        // A second request still holds the stale staged snapshot. The helper must accept the
+        // first request's compatible activation rather than surface an internal CAS error.
+        let recovered = runtime.activate_replication(&staged).unwrap();
+        assert_eq!(recovered.operation_id, activated.operation_id);
+        assert_eq!(recovered.revision, activated.revision);
+        assert_eq!(recovered.state, OutboxState::Pending);
+    }
+
+    /// Stage a `kg_fact_added` replication intent for a triple without touching local KG state,
+    /// mirroring the write:both `mempalace_kg_add` flow's stage-before-commit ordering.
+    fn stage_kg_add_intent(
+        runtime: &McpRuntime<DeterministicStubProvider>,
+        subject: &str,
+        predicate: &str,
+        object: &str,
+    ) -> OutboxOperation {
+        let ordering_key = format!("{subject}:{predicate}:{object}");
+        runtime
+            .stage_replication(
+                format!("kg-add-reconciliation:{ordering_key}"),
+                "kg_fact_added",
+                ordering_key.clone(),
+                "alpha".to_owned(),
+                ordering_key.clone(),
+                ReplicationMutation::KgAdd {
+                    request: KgAddFactRequest {
+                        subject: subject.to_owned(),
+                        predicate: predicate.to_owned(),
+                        object: object.to_owned(),
+                        valid_from: None,
+                        operation_id: None,
+                    },
+                    source_closet: None,
+                },
+            )
+            .unwrap()
+    }
+
+    /// Backdate a staged intent's durable timestamps past the reconciliation grace period,
+    /// modelling a row that has sat in storage long enough to be abandoned pre-crash work.
+    fn backdate_staged_intent(runtime: &McpRuntime<DeterministicStubProvider>, operation_id: &str) {
+        let abandoned_at =
+            OffsetDateTime::now_utc() - STAGED_INTENT_RECONCILIATION_GRACE - Duration::minutes(1);
+        let conn =
+            rusqlite::Connection::open(runtime.config.palace_path.join("storage.sqlite3")).unwrap();
+        conn.execute(
+            "UPDATE replication_outbox SET created_at=?1, updated_at=?1 WHERE operation_id=?2",
+            rusqlite::params![abandoned_at.format(&Rfc3339).unwrap(), operation_id],
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_reconciliation_preserves_fresh_uncommitted_staged_intent() {
+        let harness = test_harness_with_federation(FederationRuntimeConfig::default()).await;
+        let mut runtime = harness.server.runtime.lock().await;
+        let staged = stage_kg_add_intent(&runtime, "ReconFresh", "lives_in", "ReconCity");
+        assert_eq!(staged.state, OutboxState::Staged);
+
+        runtime.reconcile_staged_replication().await.unwrap();
+
+        let survived = runtime.outbox.get_operation(&staged.operation_id).unwrap().unwrap();
+        assert_eq!(
+            survived.state,
+            OutboxState::Staged,
+            "a fresh staged intent whose local mutation has not landed must survive startup \
+             reconciliation: a second process starting mid-write must not cancel live work"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_reconciliation_cancels_stale_abandoned_staged_intent() {
+        let harness = test_harness_with_federation(FederationRuntimeConfig::default()).await;
+        let mut runtime = harness.server.runtime.lock().await;
+        let staged = stage_kg_add_intent(&runtime, "ReconStale", "lives_in", "ReconCity");
+        backdate_staged_intent(&runtime, &staged.operation_id);
+
+        runtime.reconcile_staged_replication().await.unwrap();
+
+        let cancelled = runtime.outbox.get_operation(&staged.operation_id).unwrap().unwrap();
+        assert_eq!(
+            cancelled.state,
+            OutboxState::Cancelled,
+            "an uncommitted staged intent older than the grace period is abandoned pre-crash \
+             work and must still be cancelled"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_reconciliation_activates_fresh_committed_staged_intent() {
+        let harness = test_harness_with_federation(FederationRuntimeConfig::default()).await;
+        let mut runtime = harness.server.runtime.lock().await;
+        let kg_runtime = KnowledgeGraphRuntime::new(runtime.storage.operational_store());
+        kg_runtime
+            .add_fact(
+                AddFactRequest {
+                    subject: "ReconCommitted".into(),
+                    subject_type: EntityKind::Person,
+                    predicate: "lives_in".into(),
+                    object: "ReconCity".into(),
+                    object_type: EntityKind::Concept,
+                    valid_from: None,
+                    valid_to: None,
+                    confidence: 1.0,
+                    source_drawer_id: None,
+                    source_file: None,
+                },
+                OffsetDateTime::now_utc(),
+            )
+            .unwrap();
+        let staged = stage_kg_add_intent(&runtime, "ReconCommitted", "lives_in", "ReconCity");
+        assert_eq!(staged.state, OutboxState::Staged);
+
+        runtime.reconcile_staged_replication().await.unwrap();
+
+        let activated = runtime.outbox.get_operation(&staged.operation_id).unwrap().unwrap();
+        assert_eq!(
+            activated.state,
+            OutboxState::Pending,
+            "the age safeguard must not block activation of committed effects, even when the \
+             intent is fresh"
+        );
     }
 
     async fn test_harness_with_federation(federation: FederationRuntimeConfig) -> TestHarness {

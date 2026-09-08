@@ -85,16 +85,23 @@ pub enum WriteTarget {
     Local,
     /// Writes go to the remote server.
     Remote,
-    /// Writes go to both local and remote (best-effort remote replication).
+    /// Writes commit locally, then replicate durably to the remote in the background.
     Both,
 }
 
-/// Result of a best-effort remote replication attempt (for [`WriteTarget::Both`]).
+/// State reported for remote replication associated with [`WriteTarget::Both`].
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "status")]
 pub enum ReplicationStatus {
     /// No replication was attempted (route is not `write: both`).
     Skipped,
+    /// The local mutation committed and its durable remote replication is queued.
+    Queued {
+        /// Remote that will receive the replication.
+        remote: String,
+        /// Stable operation identifier used for retries and remote idempotency.
+        operation_id: String,
+    },
     /// Best-effort replication to the remote succeeded.
     Replicated {
         /// Remote that received the replication.
@@ -1084,6 +1091,16 @@ mod tests {
         let val = serde_json::to_value(ReplicationStatus::Skipped).unwrap();
         assert_eq!(val["status"], "skipped");
 
+        // Queued
+        let val = serde_json::to_value(ReplicationStatus::Queued {
+            remote: "hub".to_owned(),
+            operation_id: "op-123".to_owned(),
+        })
+        .unwrap();
+        assert_eq!(val["status"], "queued");
+        assert_eq!(val["remote"], "hub");
+        assert_eq!(val["operation_id"], "op-123");
+
         // Replicated
         let val = serde_json::to_value(ReplicationStatus::Replicated { remote: "hub".to_owned() })
             .unwrap();
@@ -1771,7 +1788,11 @@ mod tests {
                 let mut m = BTreeMap::new();
                 m.insert(
                     "wing_team".to_owned(),
-                    RouteRuleV1 { mode: RouteMode::Combined, remote: Some("hub".to_owned()), write: Some(WriteTarget::Remote) },
+                    RouteRuleV1 {
+                        mode: RouteMode::Combined,
+                        remote: Some("hub".to_owned()),
+                        write: Some(WriteTarget::Remote),
+                    },
                 );
                 m
             },
@@ -1905,7 +1926,11 @@ mod tests {
             let mut coordination = BTreeMap::new();
             coordination.insert(
                 "wing_secret".to_owned(),
-                ResolvedRouteRule { mode: RouteMode::Local, remote: None, write: WriteTarget::Local },
+                ResolvedRouteRule {
+                    mode: RouteMode::Local,
+                    remote: None,
+                    write: WriteTarget::Local,
+                },
             );
             FederationRuntimeConfig {
                 default_mode: RouteMode::Remote,

@@ -197,6 +197,26 @@ pub struct AddDrawerRequest {
     /// Client-declared agent name.
     #[serde(default)]
     pub added_by: Option<String>,
+    /// Optional caller-supplied stable drawer id.
+    ///
+    /// When present, durable replication preserves the local logical drawer id
+    /// on the remote instead of letting the server generate a fresh one, so
+    /// dual-written (local-first, replicated) drawers converge on a single
+    /// stable identity. Absent for all pre-replication callers.
+    ///
+    /// Omitted from the JSON wire when `None` so old servers see no new field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drawer_id: Option<String>,
+    /// Optional stable operation / idempotency identity for the whole mutation.
+    ///
+    /// Lets a durable replication outbox retry an add safely: the receiving
+    /// endpoint can dedupe a replayed mutation and a caller that got back an
+    /// `UnknownOutcome` can distinguish a re-run from a fresh add. Absent for
+    /// all pre-replication callers.
+    ///
+    /// Omitted from the JSON wire when `None` so old servers see no new field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
 }
 
 /// Response body for `POST /drawers`.
@@ -265,6 +285,24 @@ pub struct ListDrawersResponse {
     pub next_cursor: Option<String>,
 }
 
+// ─── Delete drawer ────────────────────────────────────────────────────────────
+
+/// Query parameters for `DELETE /drawers/{id}`.
+///
+/// Adds a backward-compatible way for a delete-by-ID to carry an optional
+/// stable operation id, without changing the trailing-slash path that old
+/// callers already use. Old callers omit `operation_id` entirely (`{}`); it
+/// defaults to `None`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DeleteDrawerQuery {
+    /// Optional stable operation / idempotency identity (see
+    /// [`AddDrawerRequest::operation_id`]), passed as a query parameter so the
+    /// receiving endpoint can dedupe a replayed delete. Absent for
+    /// pre-replication callers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
+}
+
 // ─── Knowledge graph ──────────────────────────────────────────────────────────
 
 /// Request body for `POST /kg/query`.
@@ -292,6 +330,12 @@ pub struct KgAddFactRequest {
     /// Optional `YYYY-MM-DD` date when the fact became true.
     #[serde(default)]
     pub valid_from: Option<String>,
+    /// Optional stable operation / idempotency identity (see
+    /// [`AddDrawerRequest::operation_id`]). Absent for pre-replication callers.
+    ///
+    /// Omitted from the JSON wire when `None` so old servers see no new field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
 }
 
 /// Request body for `POST /kg/invalidate`.
@@ -306,6 +350,12 @@ pub struct KgInvalidateRequest {
     /// Optional `YYYY-MM-DD` date when the fact stopped being true.
     #[serde(default)]
     pub ended: Option<String>,
+    /// Optional stable operation / idempotency identity (see
+    /// [`AddDrawerRequest::operation_id`]). Absent for pre-replication callers.
+    ///
+    /// Omitted from the JSON wire when `None` so old servers see no new field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
 }
 
 // KG responses are plain `serde_json::Value` pass-throughs (server mirrors MCP
@@ -1028,6 +1078,44 @@ mod tests {
         assert_eq!(req.wing, "w");
         assert!(req.source_file.is_none());
         assert!(req.added_by.is_none());
+        assert!(req.drawer_id.is_none());
+        assert!(req.operation_id.is_none());
+    }
+
+    #[test]
+    fn add_drawer_request_round_trips_with_replication_fields() {
+        let original = AddDrawerRequest {
+            wing: "w".to_owned(),
+            room: "r".to_owned(),
+            content: "c".to_owned(),
+            source_file: None,
+            added_by: Some("claude".to_owned()),
+            drawer_id: Some("drw_stable_local_id".to_owned()),
+            operation_id: Some("op-add-42".to_owned()),
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        assert!(json.contains("drw_stable_local_id"), "drawer_id must serialize: {json}");
+        assert!(json.contains("op-add-42"), "operation_id must serialize: {json}");
+        let decoded: AddDrawerRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn add_drawer_request_omits_new_fields_when_none() {
+        // A pre-replication caller sends no operation identity at all: the new
+        // fields must be absent from the wire, not `null`.
+        let req = AddDrawerRequest {
+            wing: "w".to_owned(),
+            room: "r".to_owned(),
+            content: "c".to_owned(),
+            source_file: None,
+            added_by: None,
+            drawer_id: None,
+            operation_id: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(!json.contains("drawer_id"), "None drawer_id must be omitted: {json}");
+        assert!(!json.contains("operation_id"), "None operation_id must be omitted: {json}");
     }
 
     #[test]
@@ -1053,6 +1141,7 @@ mod tests {
             predicate: "works_on".to_owned(),
             object: "MemPalace".to_owned(),
             valid_from: Some("2026-01-01".to_owned()),
+            operation_id: None,
         };
         let json = serde_json::to_string(&add).unwrap();
         let decoded: KgAddFactRequest = serde_json::from_str(&json).unwrap();
@@ -1063,10 +1152,68 @@ mod tests {
             predicate: "works_on".to_owned(),
             object: "MemPalace".to_owned(),
             ended: None,
+            operation_id: None,
         };
         let json = serde_json::to_string(&inv).unwrap();
         let decoded: KgInvalidateRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(inv, decoded);
+    }
+
+    #[test]
+    fn kg_mutation_requests_round_trip_with_operation_id() {
+        let add = KgAddFactRequest {
+            subject: "Alice".to_owned(),
+            predicate: "works_on".to_owned(),
+            object: "MemPalace".to_owned(),
+            valid_from: None,
+            operation_id: Some("rg-op-add-1".to_owned()),
+        };
+        let json = serde_json::to_string(&add).unwrap();
+        assert!(json.contains("rg-op-add-1"), "operation_id must serialize: {json}");
+        let decoded: KgAddFactRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(add, decoded);
+    }
+
+    #[test]
+    fn kg_mutation_requests_sparse_json_deserialises_and_omits_when_none() {
+        // Old caller JSON without the new field.
+        let add: KgAddFactRequest =
+            serde_json::from_str(r#"{"subject":"A","predicate":"p","object":"B"}"#).unwrap();
+        assert!(add.operation_id.is_none());
+
+        let inv: KgInvalidateRequest =
+            serde_json::from_str(r#"{"subject":"A","predicate":"p","object":"B"}"#).unwrap();
+        assert!(inv.operation_id.is_none());
+
+        // Fresh struct with `None` must not put the field on the wire.
+        let fresh = KgAddFactRequest {
+            subject: "A".to_owned(),
+            predicate: "p".to_owned(),
+            object: "B".to_owned(),
+            valid_from: None,
+            operation_id: None,
+        };
+        let json = serde_json::to_string(&fresh).unwrap();
+        assert!(!json.contains("operation_id"), "None must omit the field: {json}");
+    }
+
+    #[test]
+    fn delete_drawer_query_round_trips() {
+        let original = DeleteDrawerQuery { operation_id: Some("op-del-7".to_owned()) };
+        let json = serde_json::to_string(&original).unwrap();
+        assert!(json.contains("op-del-7"), "operation_id must serialize: {json}");
+        let decoded: DeleteDrawerQuery = serde_json::from_str(&json).unwrap();
+        assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn delete_drawer_query_sparse_json_deserialises() {
+        let empty: DeleteDrawerQuery = serde_json::from_str("{}").unwrap();
+        assert!(empty.operation_id.is_none());
+
+        let fresh = DeleteDrawerQuery { operation_id: None };
+        let json = serde_json::to_string(&fresh).unwrap();
+        assert!(!json.contains("operation_id"), "None must omit the field: {json}");
     }
 
     #[test]
@@ -1290,8 +1437,11 @@ mod tests {
 
     #[test]
     fn task_lease_request_round_trips() {
-        let original =
-            TaskLeaseRequest { expected_revision: 3, lease_seconds: 600, worker: Some("worker-1".to_owned()) };
+        let original = TaskLeaseRequest {
+            expected_revision: 3,
+            lease_seconds: 600,
+            worker: Some("worker-1".to_owned()),
+        };
         let json = serde_json::to_string(&original).unwrap();
         let decoded: TaskLeaseRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(original, decoded);

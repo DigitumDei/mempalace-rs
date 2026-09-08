@@ -91,7 +91,10 @@ pub enum RemoteRevisionedWrite<T> {
 /// remote's error for no benefit.
 fn coordination_unsupported(operation: &str) -> RemoteError {
     tracing::debug!(operation, "RemoteApi coordination default invoked: not implemented");
-    RemoteError::CapabilityMissing { remote: "<unbound>".to_owned(), capability: "coordination".to_owned() }
+    RemoteError::CapabilityMissing {
+        remote: "<unbound>".to_owned(),
+        capability: "coordination".to_owned(),
+    }
 }
 
 /// Connection parameters for one remote palace.
@@ -121,6 +124,16 @@ pub trait RemoteApi: Send + Sync {
     /// Return server information and capabilities (`GET /v1/info`).
     async fn info(&self) -> Result<InfoResponse>;
 
+    /// Return whether this peer advertises receipt-backed idempotent mutations.
+    ///
+    /// `Some(false)` is authoritative and means operation-aware retries must not be sent. The
+    /// default `None` keeps older in-process [`RemoteApi`] implementations source-compatible;
+    /// concrete clients that perform the `/v1/info` handshake override it with the peer's
+    /// capability bit.
+    async fn idempotent_mutations_capability(&self) -> Result<Option<bool>> {
+        Ok(None)
+    }
+
     /// Search drawers using semantic full-text matching (`POST /v1/drawers/search`).
     async fn search_drawers(&self, req: DrawerSearchRequest) -> Result<DrawerSearchResponse>;
 
@@ -139,6 +152,28 @@ pub trait RemoteApi: Send + Sync {
 
     /// Delete a drawer by its stable identifier (`DELETE /v1/drawers/{id}`).
     async fn delete_drawer(&self, drawer_id: &str) -> Result<()>;
+
+    /// Delete a drawer by its stable identifier, optionally carrying a stable
+    /// operation id on the query string (`DELETE /v1/drawers/{id}?operation_id=`).
+    ///
+    /// The operation id is the delete side of the idempotent-replication wire
+    /// contract (issue #127, slice 2): a durable outbox can retry a delete after
+    /// an [`RemoteError::UnknownOutcome`] and have the receiving endpoint dedupe
+    /// the replay instead of double-applying.
+    ///
+    /// Backward compatible by construction: the default body ignores
+    /// `operation_id` and defers to [`Self::delete_drawer`], so existing
+    /// implementors keep compiling and keep their old behaviour (operation id
+    /// omitted) until they opt in. [`RemoteClient`] overrides it and sends the
+    /// query parameter.
+    async fn delete_drawer_with_operation_id(
+        &self,
+        drawer_id: &str,
+        operation_id: Option<&str>,
+    ) -> Result<()> {
+        let _ = operation_id;
+        self.delete_drawer(drawer_id).await
+    }
 
     /// Query the knowledge graph for an entity (`POST /v1/kg/query`).
     async fn kg_query(&self, req: KgQueryRequest) -> Result<serde_json::Value>;

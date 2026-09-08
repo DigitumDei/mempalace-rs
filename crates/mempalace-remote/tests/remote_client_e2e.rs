@@ -21,7 +21,9 @@ use mempalace_federation::{
     KgAddFactRequest, KgInvalidateRequest, KgQueryRequest, ListDrawersQuery, NewArtifactRequest,
     NewMessageRequest, NewTaskRequest, NewTaskResultRequest, TaskLeaseRequest,
 };
-use mempalace_remote::{RemoteApi, RemoteClient, RemoteEndpoint, RemoteError, RemoteRevisionedWrite};
+use mempalace_remote::{
+    RemoteApi, RemoteClient, RemoteEndpoint, RemoteError, RemoteRevisionedWrite,
+};
 use mempalace_server::{TokenRegistry, build_router};
 use tempfile::TempDir;
 
@@ -128,6 +130,8 @@ async fn round_trip_drawers_and_changes() {
             content: "round trip e2e distinctive drawer content xyzzy".to_owned(),
             source_file: None,
             added_by: Some("e2e".to_owned()),
+            drawer_id: None,
+            operation_id: None,
         })
         .await
         .unwrap();
@@ -218,6 +222,7 @@ async fn kg_round_trip() {
             predicate: "works_at".to_owned(),
             object: "acme".to_owned(),
             valid_from: None,
+            operation_id: None,
         })
         .await
         .unwrap();
@@ -247,6 +252,7 @@ async fn kg_round_trip() {
             predicate: "works_at".to_owned(),
             object: "acme".to_owned(),
             ended: None,
+            operation_id: None,
         })
         .await
         .unwrap();
@@ -269,6 +275,8 @@ async fn duplicate_add_is_remote_rejected_409() {
         content: "duplicate detection e2e test content unique quux".to_owned(),
         source_file: None,
         added_by: None,
+        drawer_id: None,
+        operation_id: None,
     };
 
     // First add — must succeed
@@ -307,6 +315,8 @@ async fn diary_write_is_remote_rejected() {
             content: "diary entry content via federation".to_owned(),
             source_file: None,
             added_by: None,
+            drawer_id: None,
+            operation_id: None,
         })
         .await;
 
@@ -947,4 +957,52 @@ async fn coordination_lease_conflict_is_a_hard_error_not_a_revisioned_conflict()
         }
         other => panic!("expected RemoteRejected(409), got: {other:?}"),
     }
+}
+
+// ─── Test 16: replication_wire_fields_accepted_by_server ─────────────────────
+
+#[tokio::test]
+async fn replication_wire_fields_accepted_by_server() {
+    // The slice adds additive wire fields (drawer_id, operation_id on adds and
+    // the delete query). The server tolerates them end-to-end even though it
+    // does not persist/dedupe them yet (that is a later slice): sends with the
+    // fields set must succeed, and the delete path must accept an operation id
+    // without changing its response shape.
+    let tempdir = TempDir::new().unwrap();
+    let token_file = write_token_file(&tempdir);
+    let config = test_config(&tempdir);
+    let addr = spawn_server(config, token_file).await;
+    let client = client_for(addr, Some(TEST_TOKEN));
+
+    let add_resp = client
+        .add_drawer(AddDrawerRequest {
+            wing: "wing_repl".to_owned(),
+            room: "general".to_owned(),
+            content: "replication wire field e2e distinctive content zorblat".to_owned(),
+            source_file: None,
+            added_by: Some("e2e".to_owned()),
+            drawer_id: Some("stable-local-drawer-id-e2e".to_owned()),
+            operation_id: Some("op-add-e2e-1".to_owned()),
+        })
+        .await
+        .unwrap();
+    assert!(add_resp.success, "add with replication fields must succeed");
+    let drawer_id = add_resp.drawer_id.expect("must return a drawer id");
+
+    // Delete carrying an operation id on the query string.
+    client.delete_drawer_with_operation_id(&drawer_id, Some("op-delete-e2e-1")).await.unwrap();
+
+    // Omitting the operation id (the old shape) must behave identically.
+    let again = client.add_drawer(AddDrawerRequest {
+        wing: "wing_repl".to_owned(),
+        room: "general".to_owned(),
+        content: "replication wire field e2e second distinctive content zorblat2".to_owned(),
+        source_file: None,
+        added_by: None,
+        drawer_id: None,
+        operation_id: None,
+    });
+    let second = again.await.unwrap();
+    assert!(second.success);
+    client.delete_drawer(&second.drawer_id.expect("must return a drawer id")).await.unwrap();
 }

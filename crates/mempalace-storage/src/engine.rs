@@ -16,6 +16,7 @@ use crate::maintenance::{
     MaintenanceAbortReason, MaintenanceOutcome, MaintenanceRunStatus, MaintenanceRunSummary,
     MaintenanceSettings, MaintenanceSkipReason, MaintenanceTier, MaintenanceTierResult,
 };
+use crate::receipt::MutationReceiptStore;
 use crate::sqlite::{
     DiaryStore, IngestManifestStore, MaintenanceLeaseStore, SqliteOperationalStore,
 };
@@ -31,6 +32,7 @@ pub struct StorageEngine {
     layout: StorageLayout,
     drawer_store: LanceDrawerStore,
     operational_store: SqliteOperationalStore,
+    receipt_store: MutationReceiptStore,
     stale_after: Duration,
     activity_signal: Arc<AtomicBool>,
     last_activity_at: Arc<Mutex<Instant>>,
@@ -51,6 +53,7 @@ impl StorageEngine {
         let engine = Self {
             drawer_store: LanceDrawerStore::new(&layout.lancedb_dir, profile),
             operational_store: SqliteOperationalStore::new(&layout.sqlite_path),
+            receipt_store: MutationReceiptStore::new(&layout.sqlite_path),
             layout,
             stale_after: Duration::hours(1),
             activity_signal: Arc::new(AtomicBool::new(false)),
@@ -63,6 +66,7 @@ impl StorageEngine {
 
         engine.operational_store.ensure_schema()?;
         engine.drawer_store.ensure_schema().await?;
+        engine.receipt_store.ensure_schema()?;
         engine.reconcile().await?;
         Ok(engine)
     }
@@ -77,6 +81,14 @@ impl StorageEngine {
 
     pub fn operational_store(&self) -> &SqliteOperationalStore {
         &self.operational_store
+    }
+
+    /// Access the durable mutation receipt store backing idempotent federation mutations.
+    ///
+    /// Receipts share the palace's operational SQLite database. The table schema is installed by
+    /// [`StorageEngine::open`]; callers only use the read/write methods.
+    pub fn receipt_store(&self) -> &MutationReceiptStore {
+        &self.receipt_store
     }
 
     /// Signal that a write operation has occurred or is about to occur.

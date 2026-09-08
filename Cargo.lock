@@ -4070,6 +4070,7 @@ dependencies = [
  "mempalace-search",
  "mempalace-server",
  "mempalace-storage",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

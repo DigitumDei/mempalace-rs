@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Broker, Not Peer — MemPalace A2A design</title>
-<meta name="description" content="Design proposal resolving open question 3 of issue #102: MemPalace as an A2A broker rather than a peer, with wing_registry for agent cards.">
+<meta name="description" content="Not adopted: a design proposal for MemPalace as an A2A broker rather than a peer. Open question 3 of issue #102 was settled the other way - the adapters are reached through the MCP tool surface instead.">
 <!--
   Self-contained by design: no webfonts, no scripts, no external requests of any
   kind. Open it straight from the filesystem. See docs/Coordination-Phase-3-Design.md
@@ -84,6 +84,15 @@
     display: flex;
     flex-direction: column;
     gap: 18px;
+  }
+
+  .verdict {
+    margin: 18px 0 0;
+    padding: 14px 16px;
+    border-left: 3px solid currentColor;
+    opacity: 0.85;
+    font-size: 15px;
+    line-height: 1.55;
   }
 
   .status {
@@ -306,11 +315,19 @@
 
   <header class="masthead">
     <div class="status">
-      <span class="chip">Proposal</span>
-      <span class="chip plain">Resolves open question 3</span>
+      <span class="chip">Not adopted</span>
+      <span class="chip plain">Answered open question 3</span>
       <span class="chip plain">Issue #102 &middot; Phase 3</span>
     </div>
     <h1>Broker, Not Peer</h1>
+    <p class="verdict"><strong>Considered and not adopted.</strong> Open question 3 was settled
+    the other way: both protocol adapters are reached through MemPalace's existing MCP tool
+    surface, and no A2A HTTP endpoint was built. The reasoning below still holds if a live A2A
+    transport is ever wanted &mdash; it was not adopted because the MCP tool surface already
+    gives every caller MemPalace serves a way to reach the adapters, without standing up an
+    inbound broker surface and an outbound HTTP client. Deviation 25 therefore stands: the Agent
+    Card is not spec-compliant for a live A2A transport, and <code>interfaces</code> must be
+    caller-supplied. See <a href="Coordination-Phase-3-Design.md">Coordination-Phase-3-Design.md</a>.</p>
     <p class="standfirst">A2A assumes every agent is a server with a URL. MemPalace is a mailbox. Reconciling those is not a compromise &mdash; the A2A spec already has first-class vocabulary for it, and using that vocabulary is what lets an agent on a laptop participate without ever opening a port.</p>
   </header>
 

@@ -145,7 +145,11 @@ Operational notes:
   an explicit `"scopes": []` is the opposite — a deliberate lockout with no
   access at all. Like `enabled`, scope edits are picked up on the next request
   via the same hot reload — no restart needed to tighten or loosen a token's
-  access. See [Federation → 1.5 Authorization scopes](Federation.md#15-authorization-scopes)
+  access. One implication is worth knowing when writing a worker token:
+  `coordination_claim` also authorizes `coordination_write` on the same wing, so a
+  claim-only token can create tasks and file messages, artifacts and results. It does
+  not run the other way, and `coordination_read` is unaffected.
+  See [Federation → 1.5 Authorization scopes](Federation.md#15-authorization-scopes)
   for the full model, including which routes reject a wing mismatch outright
   (403) versus mask it as a 404 or filter it out of an aggregate response.
 - The server speaks **plain HTTP**. On any untrusted network, run it behind a

@@ -29,6 +29,11 @@ tracing.workspace = true
 tempfile = "3.23.0"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+# Only for seeding a legacy pre-wings coordination row directly (issue #102
+# Stage 8 test), the same way mempalace-storage's own upgrade tests do —
+# `CoordinationStore::create_task` refuses `wing_unscoped` outright, so a row
+# on it can only be produced by writing straight to the same sqlite file.
+rusqlite = { version = "0.39.0", features = ["bundled"] }
 
 [lints]
 workspace = true

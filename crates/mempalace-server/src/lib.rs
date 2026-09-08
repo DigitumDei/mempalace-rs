@@ -65,7 +65,7 @@ use mempalace_storage::{
     MaintenanceOutcome, MaintenanceRunSummary, MaintenanceSettings, MaintenanceSkipReason,
     Message as CoordinationMessage, NewArtifact, NewMessage, NewTask, NewTaskResult,
     RevisionedWrite, StorageEngine, Task as CoordinationTask,
-    TaskResult as CoordinationTaskResult, TaskState,
+    TaskResult as CoordinationTaskResult, TaskState, UNSCOPED_WING,
 };
 use serde_json::{Value, json};
 use subtle::ConstantTimeEq;
@@ -127,6 +127,13 @@ pub enum ServerError {
     /// Attempt to write a diary drawer via the federation API.
     #[error("diary drawers are not federated")]
     DiaryNotFederated,
+    /// Attempt to write, claim, or replay a coordination record still parked
+    /// on the reserved `wing_unscoped` backfill wing (issue #102 Stage 8).
+    /// Mirrors `DiaryNotFederated`'s shape: a hard refusal, not a wing-scope
+    /// check, because there is no real wing to authorize federation against
+    /// until the record is re-homed.
+    #[error("coordination records on wing_unscoped are not federated")]
+    UnscopedNotFederated,
     /// Attempted to add a drawer that is a near-duplicate of an existing one.
     #[error("duplicate detected")]
     Duplicate(Value),
@@ -225,6 +232,13 @@ impl IntoResponse for ServerError {
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "diary_not_federated",
                 "diary drawers cannot be read or written via the federation API".to_owned(),
+            ),
+            Self::UnscopedNotFederated => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "unscoped_not_federated",
+                "this coordination record is still on wing_unscoped; re-home it to a real wing \
+                 before federating it"
+                    .to_owned(),
             ),
             Self::Duplicate(_) => (
                 StatusCode::CONFLICT,
@@ -718,7 +732,7 @@ impl AuthIdentity {
     fn allows_operation(&self, op: Operation) -> bool {
         match &self.1 {
             None => true,
-            Some(scopes) => scopes.iter().any(|s| s.operations.contains(&op)),
+            Some(scopes) => scopes.iter().any(|s| scope_grants(s, op)),
         }
     }
 
@@ -726,9 +740,9 @@ impl AuthIdentity {
     fn allows_wing(&self, op: Operation, wing: &str) -> bool {
         match &self.1 {
             None => true,
-            Some(scopes) => scopes.iter().any(|s| {
-                s.operations.contains(&op) && s.wings.iter().any(|w| w == "*" || w == wing)
-            }),
+            Some(scopes) => scopes
+                .iter()
+                .any(|s| scope_grants(s, op) && s.wings.iter().any(|w| w == "*" || w == wing)),
         }
     }
 
@@ -740,7 +754,7 @@ impl AuthIdentity {
             Some(scopes) => {
                 let mut wings = std::collections::BTreeSet::new();
                 for scope in scopes {
-                    if !scope.operations.contains(&op) {
+                    if !scope_grants(scope, op) {
                         continue;
                     }
                     if scope.wings.iter().any(|w| w == "*") {
@@ -752,6 +766,24 @@ impl AuthIdentity {
             }
         }
     }
+}
+
+/// True when `entry` grants `op`, either directly or via the one-way
+/// implication that a `coordination_claim` grant also authorizes
+/// `coordination_write`. Claiming a coordination task inherently requires
+/// creating/mutating it, so a token scoped to claim tasks would otherwise be
+/// unable to perform the writes claiming itself entails. The implication
+/// runs claim → write only: a `coordination_write` grant does NOT imply
+/// `coordination_claim`, and `coordination_read` is unaffected.
+///
+/// This is an authorization-time rule, deliberately not expanded when the
+/// token file is parsed (`RawTokenScope`/`normalize_scope_wing`) — the
+/// closed set of operations an operator wrote in their token file stays
+/// exactly as written; only the check applied to it is widened.
+fn scope_grants(entry: &TokenScopeEntry, op: Operation) -> bool {
+    entry.operations.contains(&op)
+        || (op == Operation::CoordinationWrite
+            && entry.operations.contains(&Operation::CoordinationClaim))
 }
 
 // ─── Server state ─────────────────────────────────────────────────────────────
@@ -2615,6 +2647,15 @@ fn resolve_owning_task(
     if is_diary_wing_or_room(&task.wing, "") {
         return Err(if op == Operation::CoordinationRead { mask() } else { ServerError::DiaryNotFederated });
     }
+    // Diary stays first; it is the stricter rule (no federation at all, ever).
+    // `wing_unscoped` is the SQL backfill default for coordination rows that
+    // predate wings — it has no real wing to authorize federation against
+    // until the record is re-homed. Same read/write asymmetry as the diary
+    // check above: a read is masked as 404 so it can't be used as an
+    // existence oracle, a write or claim gets the explicit 422.
+    if task.wing == UNSCOPED_WING {
+        return Err(if op == Operation::CoordinationRead { mask() } else { ServerError::UnscopedNotFederated });
+    }
     if !auth.allows_wing(op, &task.wing) {
         return Err(mask());
     }
@@ -2657,6 +2698,17 @@ fn coordination_replay_conflict() -> ServerError {
 /// the module-level "Wing authorization" note for why reads and writes are
 /// coded differently.
 fn authorize_replay_wing(auth: &AuthIdentity, wing: &str) -> Result<(), ServerError> {
+    // `wing_unscoped` gets its own check here (rather than relying on
+    // `resolve_owning_task`) because this function takes a bare wing string,
+    // not a task: a replayed idempotent write whose stored record turns out
+    // to be `wing_unscoped` never goes through `resolve_owning_task` at all.
+    // Unlike an unauthorized wing which returns 409 conflict to avoid disclosing
+    // the stored record's wing, `wing_unscoped` returns the typed 422
+    // `UnscopedNotFederated` refusal so callers know the legacy task must be
+    // re-homed.
+    if wing == UNSCOPED_WING {
+        return Err(ServerError::UnscopedNotFederated);
+    }
     if is_diary_wing_or_room(wing, "") || !auth.allows_wing(Operation::CoordinationWrite, wing) {
         return Err(coordination_replay_conflict());
     }
@@ -2986,6 +3038,15 @@ where
     // local unconditionally, regardless of what the token is scoped to.
     if is_diary_wing_or_room(wing.as_str(), "") {
         return Err(ServerError::DiaryNotFederated);
+    }
+    // Same content rule as the diary check above, for the other reserved
+    // wing: `wing_unscoped` is the SQL backfill default for coordination rows
+    // that predate wings, and `CoordinationStore::create_task` already
+    // refuses to create new tasks there (`StorageError::Invariant`). Catching
+    // it here, before the call reaches storage, gives callers the typed 422
+    // instead of letting storage's untyped invariant surface as a 500.
+    if wing.as_str() == UNSCOPED_WING {
+        return Err(ServerError::UnscopedNotFederated);
     }
     if !auth.0.allows_wing(Operation::CoordinationWrite, wing.as_str()) {
         return Err(ServerError::Forbidden);
@@ -3911,6 +3972,11 @@ mod tests {
     /// `coordination_claim`) — proves a writer can create a task but not
     /// claim it.
     const COORD_WRITE_ONLY_TOKEN: &str = "coord-write-only-secret-token";
+    /// Scoped to `wing_alpha` only, `coordination_claim` alone (no
+    /// `coordination_write`) — proves the one-way implication (issue #102
+    /// Stage 7): a claim grant reaches every write route, but a token with
+    /// only `coordination_read` alongside it still gets nowhere near a write.
+    const COORD_CLAIM_ONLY_TOKEN: &str = "coord-claim-only-secret-token";
     /// Scoped to `"*"` (every wing) with all three coordination operations —
     /// used only by the idempotency-replay-narrowing test, which rewrites
     /// this token's scope on disk mid-test (mirroring
@@ -4032,6 +4098,10 @@ mod tests {
             {
                 "token": COORD_WRITE_ONLY_TOKEN, "name": "coord_write_only", "enabled": true,
                 "scopes": [{"wings": ["wing_alpha"], "operations": ["coordination_write"]}],
+            },
+            {
+                "token": COORD_CLAIM_ONLY_TOKEN, "name": "coord_claim_only", "enabled": true,
+                "scopes": [{"wings": ["wing_alpha"], "operations": ["coordination_claim"]}],
             },
             {
                 "token": COORD_WIDE_TOKEN, "name": "coord_wide", "enabled": true,
@@ -7675,6 +7745,125 @@ mod tests {
         assert_eq!(claim_resp.status(), StatusCode::FORBIDDEN);
     }
 
+    #[tokio::test]
+    async fn coordination_claim_scope_implies_write_on_every_write_route() {
+        // issue #102 Stage 7: a token scoped to `coordination_claim` alone
+        // (no `coordination_write`) must reach every write route, because
+        // claiming a task inherently requires the writes claiming itself
+        // entails. `COORD_CLAIM_ONLY_TOKEN` carries no `coordination_read`
+        // either, so this also proves the implication runs claim -> write
+        // only, not claim -> read.
+        let harness = make_harness().await;
+
+        let create_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/coordination/tasks",
+                COORD_CLAIM_ONLY_TOKEN,
+                json!({
+                    "title": "t", "description": "d", "wing": "wing_alpha",
+                    "idempotency_key": "claim-only-create-1",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(create_resp.status(), StatusCode::OK, "claim-only token should create a task");
+        let task_id = body_json(create_resp).await["task_id"].as_str().unwrap().to_owned();
+
+        let message_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/coordination/messages",
+                COORD_CLAIM_ONLY_TOKEN,
+                json!({
+                    "task_id": task_id, "recipient": "someone", "kind": "status",
+                    "payload": {}, "idempotency_key": "claim-only-message-1",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(message_resp.status(), StatusCode::OK, "claim-only token should send a message");
+        let message_id = body_json(message_resp).await["message_id"].as_str().unwrap().to_owned();
+
+        let ack_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                &format!("/v1/coordination/messages/{message_id}/ack"),
+                COORD_CLAIM_ONLY_TOKEN,
+                json!({"actor": "someone"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(ack_resp.status(), StatusCode::OK, "claim-only token should ack a message");
+
+        let artifact_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/coordination/artifacts",
+                COORD_CLAIM_ONLY_TOKEN,
+                json!({
+                    "task_id": task_id, "role": "output", "media_type": "text/plain",
+                    "content": "claim-only artifact", "idempotency_key": "claim-only-artifact-1",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            artifact_resp.status(),
+            StatusCode::OK,
+            "claim-only token should put an artifact"
+        );
+
+        let result_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/coordination/results",
+                COORD_CLAIM_ONLY_TOKEN,
+                json!({
+                    "task_id": task_id, "payload": {},
+                    "idempotency_key": "claim-only-result-1",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(result_resp.status(), StatusCode::OK, "claim-only token should put a result");
+
+        // The implication does not extend to reads: no `coordination_read`
+        // grant means the coarse operation gate rejects before the
+        // handler's wing check ever runs.
+        let get_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_get(
+                &format!("/v1/coordination/tasks/{task_id}"),
+                COORD_CLAIM_ONLY_TOKEN,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(get_resp.status(), StatusCode::FORBIDDEN);
+
+        let inbox_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_get(
+                "/v1/coordination/inbox?recipient=someone",
+                COORD_CLAIM_ONLY_TOKEN,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(inbox_resp.status(), StatusCode::FORBIDDEN);
+    }
+
     // ─── Coordination review-finding regressions (2026-08-20) ───────────────
 
     #[tokio::test]
@@ -7696,6 +7885,116 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(body_json(resp).await["code"], "diary_not_federated");
+    }
+
+    /// Mirrors `coordination_task_create_in_wing_agents_is_rejected_with_422` for the other
+    /// reserved wing (issue #102 Stage 8): `wing_unscoped` is refused outright too, with its own
+    /// typed code rather than storage's untyped invariant surfacing as a 500.
+    #[tokio::test]
+    async fn coordination_task_create_in_wing_unscoped_is_rejected_with_422() {
+        let harness = make_harness().await;
+        let resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/coordination/tasks",
+                ALICE_TOKEN,
+                json!({
+                    "title": "t", "description": "d", "wing": "wing_unscoped",
+                    "idempotency_key": "unscoped-create-1",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body_json(resp).await["code"], "unscoped_not_federated");
+    }
+
+    /// Mirrors `coordination_wing_agents_task_is_masked_from_every_route`'s claim assertion for
+    /// `wing_unscoped` (issue #102 Stage 8): a claim (write-shaped) against a task already
+    /// parked there is rejected with the explicit 422, not masked as 404 — a write is not an
+    /// existence-oracle risk the way a read is.
+    ///
+    /// Unlike `wing_agents` (which storage happily creates tasks in — only the server refuses to
+    /// federate them), `CoordinationStore::create_task` itself refuses `wing_unscoped`
+    /// outright, so there is no in-process way to produce this row; it seeds one directly via
+    /// SQL against the same sqlite file the harness's `CoordinationStore` opens, exactly the way
+    /// `wing_unscoped` rows exist in the wild: pre-dating wings entirely (see
+    /// `ensure_schema_upgrades_a_pre_phase3_palace_and_preserves_existing_tasks` in
+    /// `mempalace-storage`, which does the same thing for the storage-level tests).
+    #[tokio::test]
+    async fn coordination_task_claim_in_wing_unscoped_is_rejected_with_422() {
+        let harness = make_harness().await;
+        let db_path = harness.state.config.palace_path.join("storage.sqlite3");
+        {
+            let conn = rusqlite::Connection::open(&db_path).expect("open storage db");
+            conn.execute(
+                "INSERT INTO coordination_tasks(task_id,title,description,state,revision,created_by,dependencies_json,idempotency_key,created_at,updated_at,wing) \
+                 VALUES ('task_unscoped_seed','legacy','d','pending',0,'alice','[]','unscoped-seed-1','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','wing_unscoped')",
+                [],
+            )
+            .expect("seed legacy wing_unscoped task row");
+        }
+
+        let claim_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/coordination/tasks/task_unscoped_seed/claim",
+                ALICE_TOKEN,
+                json!({"expected_revision": 0, "lease_seconds": 300}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(claim_resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body_json(claim_resp).await["code"], "unscoped_not_federated");
+
+        let get_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_get("/v1/coordination/tasks/task_unscoped_seed", ALICE_TOKEN))
+            .await
+            .unwrap();
+        assert_eq!(get_resp.status(), StatusCode::NOT_FOUND, "a read stays masked as 404");
+    }
+
+    /// Replaying a task-create idempotency key whose stored legacy task is on `wing_unscoped`
+    /// must return 422 `unscoped_not_federated`, not 409 `idempotency_key_conflict`
+    /// (issue #102 Stage 8).
+    #[tokio::test]
+    async fn coordination_task_create_replay_in_wing_unscoped_is_rejected_with_422() {
+        let harness = make_harness().await;
+        let db_path = harness.state.config.palace_path.join("storage.sqlite3");
+        {
+            let conn = rusqlite::Connection::open(&db_path).expect("open storage db");
+            conn.execute(
+                "INSERT INTO coordination_tasks(task_id,title,description,state,revision,created_by,dependencies_json,idempotency_key,created_at,updated_at,wing) \
+                 VALUES ('task_unscoped_replay_seed','legacy','d','pending',0,'alice','[]','unscoped-replay-key-1','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','wing_unscoped')",
+                [],
+            )
+            .expect("seed legacy wing_unscoped task row");
+        }
+
+        let replay_resp = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/coordination/tasks",
+                ALICE_TOKEN,
+                json!({
+                    "title": "replayed task",
+                    "description": "d",
+                    "wing": "wing_alpha",
+                    "idempotency_key": "unscoped-replay-key-1",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(replay_resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body_json(replay_resp).await["code"], "unscoped_not_federated");
     }
 
     /// Seeds a task directly in `wing_agents` via the coordination store

@@ -11,6 +11,7 @@ mod search;
 
 pub use diary::{
     DIARY_HALL, DIARY_ROOM, DIARY_SUMMARY_MAX_CHARS, DIARY_TOPIC_PREFIX, SHARED_AGENT_DIARY_WING,
+    UNSCOPED_WING,
 };
 pub use error::{MempalaceError, Result};
 pub use hash::{hash_bytes, hash_text, mined_drawer_id};

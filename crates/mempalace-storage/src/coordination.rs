@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use mempalace_core::{SHARED_AGENT_DIARY_WING, WingId};
+pub use mempalace_core::UNSCOPED_WING;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -14,10 +15,6 @@ use crate::{Result, StorageError};
 
 const MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
 const MAX_TASK_TEXT_BYTES: usize = 1024 * 1024;
-
-/// Reserved wing name for coordination rows that existed before wings were introduced. Every
-/// task and event created before this stage upgraded its schema reads back with this wing.
-pub const UNSCOPED_WING: &str = "wing_unscoped";
 
 // ─── Conflict-error message fragments ──────────────────────────────────────────
 //
@@ -316,7 +313,11 @@ pub enum CoordinationVisibility<'a> {
     Trusted,
     /// Every federation HTTP route, scoped or not. The shared diary wing is always excluded
     /// here, matching the existing hard override in `is_diary_wing_or_room` — no token, however
-    /// unrestricted, may see it through this feed.
+    /// unrestricted, may see it through this feed. [`UNSCOPED_WING`] is excluded the same way
+    /// (issue #102 Stage 8): it is the SQL backfill default for coordination rows that predate
+    /// wings, `create_task` already refuses to create new tasks there, and a row stuck there has
+    /// no real wing to authorize federation against, so it never appears in a federated feed or
+    /// inbox page — deployments carrying pre-wings legacy rows stop seeing them here.
     ///
     /// - `None`: every other wing is visible (an unrestricted federation token).
     /// - `Some(wings)`: only the wings named in `wings` (already normalised) are visible, on top
@@ -745,6 +746,8 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
             CoordinationVisibility::Federated(restrict) => {
                 bindings.push(Box::new(SHARED_AGENT_DIARY_WING.to_owned()));
                 predicates.push(format!("t.wing<>?{}", bindings.len()));
+                bindings.push(Box::new(UNSCOPED_WING.to_owned()));
+                predicates.push(format!("t.wing<>?{}", bindings.len()));
                 if let Some(wings) = restrict {
                     let placeholders = wings
                         .iter()
@@ -931,6 +934,8 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
             CoordinationVisibility::Trusted => {}
             CoordinationVisibility::Federated(restrict) => {
                 bindings.push(Box::new(SHARED_AGENT_DIARY_WING.to_owned()));
+                predicates.push(format!("wing<>?{}", bindings.len()));
+                bindings.push(Box::new(UNSCOPED_WING.to_owned()));
                 predicates.push(format!("wing<>?{}", bindings.len()));
                 if let Some(wings) = restrict {
                     let placeholders = wings
@@ -2199,5 +2204,55 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
             .expect("inbox");
         assert!(inbox.messages.is_empty());
         assert_eq!(inbox.next_cursor, None);
+    }
+
+    /// `wing_unscoped` — the reserved backfill wing for coordination rows that predate wings —
+    /// must never appear in a federated feed or inbox page (issue #102 Stage 8). `create_task`
+    /// already refuses to create new tasks there, so the only way such a row exists is a legacy
+    /// one carried over from before wings, which this seeds directly via SQL (mirroring
+    /// `ensure_schema_upgrades_a_pre_phase3_palace_and_preserves_existing_tasks`) rather than
+    /// through the public API.
+    #[test]
+    fn federated_visibility_excludes_wing_unscoped() {
+        let (_d, s) = store();
+        let conn = s.connection().expect("connection");
+        conn.execute(
+            "INSERT INTO coordination_tasks(task_id,title,description,state,revision,created_by,dependencies_json,idempotency_key,created_at,updated_at,wing) \
+             VALUES ('task_unscoped','old title','old description','pending',0,'manager','[]','legacy-unscoped-key','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z',?1)",
+            [UNSCOPED_WING],
+        )
+        .expect("legacy unscoped task row");
+        conn.execute(
+            "INSERT INTO coordination_events(event_id,entity_type,entity_id,task_id,event_type,actor,occurred_at,wing) \
+             VALUES ('event_unscoped','task','task_unscoped','task_unscoped','task_created','manager','2026-01-01T00:00:00Z',?1)",
+            [UNSCOPED_WING],
+        )
+        .expect("legacy unscoped event");
+        conn.execute(
+            "INSERT INTO coordination_messages(message_id,task_id,sender,recipient,kind,payload_json,envelope_version,idempotency_key,created_at) \
+             VALUES ('message_unscoped','task_unscoped','manager','worker','handoff','{}',1,'legacy-unscoped-msg','2026-01-01T00:00:00Z')",
+            [],
+        )
+        .expect("legacy unscoped message row");
+
+        // Trusted (local MCP) visibility still sees it — the exclusion is a federation-only rule.
+        let trusted_events = s
+            .events(None, None, None, 100, CoordinationVisibility::Trusted)
+            .expect("trusted events");
+        assert!(trusted_events.events.iter().any(|e| e.entity_id == "task_unscoped"));
+        let trusted_inbox = s
+            .inbox("worker", None, None, 100, false, CoordinationVisibility::Trusted)
+            .expect("trusted inbox");
+        assert!(trusted_inbox.messages.iter().any(|m| m.task_id == "task_unscoped"));
+
+        // Federated (HTTP) visibility, unrestricted (`None`) or wing-scoped, never sees it.
+        let federated_events = s
+            .events(None, None, None, 100, CoordinationVisibility::Federated(None))
+            .expect("federated events");
+        assert!(!federated_events.events.iter().any(|e| e.entity_id == "task_unscoped"));
+        let federated_inbox = s
+            .inbox("worker", None, None, 100, false, CoordinationVisibility::Federated(None))
+            .expect("federated inbox");
+        assert!(!federated_inbox.messages.iter().any(|m| m.task_id == "task_unscoped"));
     }
 }

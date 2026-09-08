@@ -4,7 +4,7 @@ Get MemPalace running and connected to your AI in a few minutes.
 
 ## 1. Install
 
-The installer downloads the latest stable binaries for your platform, verifies the signed release manifest and the artifact digests, installs them to `~/.mempalace/bin`, adds that directory to your PATH, and runs `mempalace-cli setup` to register the MCP server with detected AI tools.
+The installer downloads the latest stable binaries for your platform, verifies the signed release manifest and the artifact digests, installs them to `~/.mempalace/bin`, adds that directory to your PATH, and runs `mempalace-cli setup` to register the MCP server with detected AI tools and warm the embedding model.
 
 **macOS (Apple Silicon) / Linux (x86_64, glibc 2.38+):**
 
@@ -22,7 +22,7 @@ Options:
 
 | sh flag | ps1 parameter | Effect |
 |---|---|---|
-| `--no-setup` | `-NoSetup` (or `$env:MEMPALACE_NO_SETUP='1'`) | skip MCP registration |
+| `--no-setup` | `-NoSetup` (or `$env:MEMPALACE_NO_SETUP='1'`) | skip MCP registration and model warm-up |
 | `--no-path` | `-NoPath` (or `$env:MEMPALACE_NO_PATH='1'`) | don't touch your PATH |
 | `--install-dir <dir>` | `-InstallDir <dir>` (or `$env:MEMPALACE_INSTALL_DIR`) | install elsewhere |
 | `--channel nightly --version v<version>-nightly.<full-commit-sha>` | `-Channel nightly -Version v<version>-nightly.<full-commit-sha>` | explicitly install an immutable test candidate |
@@ -109,13 +109,16 @@ A working `status` shows wings and rooms with drawer counts. `search` returns ma
 
 ## 5. Connect your AI (MCP)
 
-If you used the installer, this already happened: it ran `mempalace-cli setup`, which detects installed AI tools (Claude Code, Codex, Gemini, opencode, Copilot, Antigravity) and registers the `mempalace` MCP server with each. Re-run it any time — it's idempotent:
+If you used the installer, this already happened: it ran `mempalace-cli setup`, which detects installed AI tools (Claude Code, Codex, Gemini, opencode, Copilot, Antigravity) and registers the `mempalace` MCP server with each. It also warms the embedding model — downloading the assets on a fresh machine, then checking the model starts offline exactly as the MCP server will — so the very first MCP launch doesn't abort with `OfflineStartup`. Re-run it any time — it's idempotent:
 
 ```bash
-mempalace-cli setup                     # register with every detected tool
-mempalace-cli setup --dry-run           # preview without writing anything
+mempalace-cli setup                     # register with every detected tool and warm the model
+mempalace-cli setup --dry-run           # preview without writing anything or warming the model
 mempalace-cli setup --tools claude      # restrict to a comma-separated subset
+mempalace-cli setup --no-model-warmup   # skip the model warm-up (air-gapped, staged cache)
 ```
+
+If the warm-up's offline check fails (no network on a fresh machine), `setup` exits non-zero and prints the remediation — re-run it with network access, or stage the cache yourself and use `--no-model-warmup`. When the installer runs it, that failure is a warning: the binaries are already installed, so the installer finishes and tells you exactly what to run later to complete the warm-up.
 
 For tools `setup` doesn't cover, point them at `~/.mempalace/bin/mempalace-mcp` manually:
 
@@ -141,14 +144,14 @@ claude mcp add mempalace -- ~/.mempalace/bin/mempalace-mcp
 
 ### Cline / Cursor / Any MCP host
 
-Point your MCP client at the `mempalace-mcp` binary. No arguments needed — the server speaks stdio MCP and exposes all 43 tools on `initialize`.
+Point your MCP client at the `mempalace-mcp` binary. No arguments are needed: the server speaks stdio MCP and exposes all 58 tools during `initialize`/`tools/list`.
 
 To give different MCP clients distinct persistent selves, set `MEMPALACE_LINEAGE_ID` in each
 server registration. Lineage selection is then fixed by the host and cannot be overridden by a
 model tool call. If the selected lineage does not exist yet, wake-up uses the palace default and
 explains how to create the requested lineage with `mempalace_lineage_set`. See [Self-continuity](Self-Continuity.md#binding-a-lineage-to-an-mcp-client) for Codex and OpenCode examples.
 
-Your AI now has access to `mempalace_search`, `mempalace_add_drawer`, `mempalace_kg_query`, and 40 more tools. Ask it anything about your project — it can search your palace on demand. The full list is in [Release Scope](Release-Scope.md#mcp-tool-surface-43-tools).
+Your AI now has access to `mempalace_search`, `mempalace_add_drawer`, `mempalace_kg_query`, and 55 more tools. Ask it about your project and it can search your palace on demand. The complete list, including coordination, skill-registry, delegation-telemetry, and self-continuity tools, is in [Release Scope](Release-Scope.md#mcp-tool-surface-58-tools).
 
 ## Next steps
 

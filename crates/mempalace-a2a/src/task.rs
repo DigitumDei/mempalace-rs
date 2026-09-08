@@ -24,51 +24,37 @@
 //! actual authenticated identity and routing/config context — is the only party that can supply
 //! them correctly. See deviation entry 27 in `docs/Coordination-Phase-3-Design.md`.
 //!
-//! # `NewTask` has no `state` field: a new task is always `Pending`
+//! # `NewTask` has no `state` field; the caller chooses the creation state
 //!
-//! `mempalace_storage::coordination::CoordinationStore::create_task` always creates a task in
-//! [`TaskState::Pending`], regardless of what [`NewTask`] contains — there is no way to create a
-//! task directly into any other state. So an inbound A2A `Task` whose `status.state` is not
-//! `TASK_STATE_SUBMITTED` (the state that maps to `Pending`, see [`crate::state`]) cannot be
-//! reflected at creation time. [`a2a_task_to_new_task`] still runs the A2A status through
-//! [`crate::state::map_inbound_task_state`] and returns the result alongside the `NewTask`, so
-//! the caller can see what the *target* state should be — and whether reaching it required a
-//! coercion. This mirrors the crate-wide rule that a state mapping's [`crate::state::Coercion`]
-//! is never silently dropped, even when the value it travels with (here, a whole [`NewTask`])
-//! has no slot to carry the *state* itself.
+//! [`NewTask`] carries no state, so [`a2a_task_to_new_task`] cannot express the inbound A2A
+//! status in it. Instead it runs the status through [`crate::state::map_inbound_task_state`] and
+//! returns the result as `target_state` alongside the `NewTask`, so the caller sees both the
+//! target state and whether reaching it required a [`crate::state::Coercion`]. This mirrors the
+//! crate-wide rule that a coercion is never silently dropped, even when the value it travels
+//! with (here, a whole `NewTask`) has no slot for the state itself.
 //!
-//! # Reaching `target_state` is not always one call
+//! # How the caller should apply `target_state`
 //!
-//! A freshly created task is always [`TaskState::Pending`]. `CoordinationStore::transition_task`
-//! only permits the transitions in `allowed_transition`
-//! (`crates/mempalace-storage/src/coordination.rs`):
+//! Use `CoordinationStore::import_task(&new_task, target_state.value)`, which creates the task
+//! *directly* in that state. Do **not** try to reach it through the transition machine.
+//! `allowed_transition` (`crates/mempalace-storage/src/coordination.rs`) permits only
 //! `Pending -> Cancelled | Expired`, `Running -> InputRequired | Completed | Cancelled | Failed |
 //! Expired`, and `InputRequired -> Pending | Running | Cancelled | Failed | Expired`.
-//! `Pending -> Running` is not in that table at all — the only way to move a task out of
-//! `Pending` into `Running` is `CoordinationStore::claim_task`, which additionally requires a
-//! `worker` identity and a lease `ttl: Duration` and returns a `RevisionedWrite<Task>` rather
-//! than the plain `Task` `transition_task` returns. So what the caller must do after creation
-//! depends on `target_state.value`:
+//! `Pending -> Running` is not in that table: the only route into `Running` is `claim_task`,
+//! which requires a worker identity and a lease. So creating with `create_task` and then
+//! transitioning would mean **fabricating a claim by a worker that never existed** in order to
+//! land an inbound `completed` or `failed` task — audit history asserting something that did not
+//! happen.
 //!
-//! - [`TaskState::Pending`] — nothing; this is the state `create_task` already produced.
-//! - [`TaskState::Cancelled`]/[`TaskState::Expired`] — a single `transition_task` call, as
-//!   `Pending -> Cancelled`/`Pending -> Expired` are both directly allowed.
-//! - [`TaskState::Running`] — `claim_task`, not `transition_task`. The caller must supply a
-//!   worker and lease TTL that the inbound A2A `Task` carries no equivalent of, and must decide
-//!   what lease TTL to use for a task the A2A side may believe is already `TASK_STATE_WORKING`.
-//! - [`TaskState::InputRequired`]/[`TaskState::Completed`]/[`TaskState::Failed`] — `claim_task`
-//!   first (to reach `Running`), then `transition_task` from `Running` to the target. Two calls,
-//!   two round trips, and the same worker/lease-TTL requirement as the `Running` case in
-//!   between, purely as an artifact of the storage state machine, not anything A2A asked for.
+//! `import_task` exists precisely to avoid that: an import is a *creation*, not a lifecycle
+//! event, so it bypasses the transition machine, records the imported state on the
+//! `task_created` event with an `imported` marker, and rejects [`TaskState::Expired`] as an
+//! initial state (the palace produces that itself; an importer never asserts it). A task
+//! imported as `Running` has no owner or lease, and none is invented — it stays claimable.
 //!
-//! This crate does not provide a helper that performs the multi-step sequence: doing so
-//! correctly needs a live `CoordinationStore` (to make the `claim_task` and `transition_task`
-//! calls) plus a worker identity and lease TTL policy this crate has no way to supply, and this
-//! crate is a pure translation library that must not depend on a live `CoordinationStore` (see
-//! the crate-level docs). A helper that papered over the sequence without those inputs would
-//! either invent a worker identity/TTL or silently fail on every non-`Pending` inbound state —
-//! either is worse than the caller doing the two calls itself with real values. See deviation
-//! entry 30 in `docs/Coordination-Phase-3-Design.md`.
+//! This crate still provides no helper that performs the storage call: it is a pure translation
+//! library and must not depend on a live `CoordinationStore` (see the crate-level docs). See
+//! deviation entry 30 in `docs/Coordination-Phase-3-Design.md`.
 //!
 //! # Fields with no home in `NewTask`
 //!
@@ -136,6 +122,35 @@ pub struct A2aTask {
     pub metadata: Option<Value>,
 }
 
+impl A2aTask {
+    /// Recursively validates the task's nested artifacts and messages.
+    ///
+    /// Fails with [`A2aError::EmptyArtifactParts`] if any artifact has an empty parts list,
+    /// or [`A2aError::InvalidPart`] if any part in an artifact, history message, or status message
+    /// violates the `Part.content` `oneof` invariant.
+    pub fn validate(&self) -> Result<(), A2aError> {
+        if let Some(msg) = &self.status.message {
+            for part in &msg.parts {
+                part.validate()?;
+            }
+        }
+        for artifact in &self.artifacts {
+            if artifact.parts.is_empty() {
+                return Err(A2aError::EmptyArtifactParts);
+            }
+            for part in &artifact.parts {
+                part.validate()?;
+            }
+        }
+        for message in &self.history {
+            for part in &message.parts {
+                part.validate()?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Caller-supplied fields [`NewTask`] requires that the A2A `Task` message has no source for.
 ///
 /// See the module docs' "The hard part" section for why these cannot be defaulted.
@@ -182,6 +197,8 @@ pub struct NewTaskConversion {
 ///
 /// Fails with [`A2aError::UnspecifiedTaskState`] if `a2a.status.state` is
 /// `TASK_STATE_UNSPECIFIED` — see [`crate::state::map_inbound_task_state`].
+/// Fails with [`A2aError::EmptyArtifactParts`] or [`A2aError::InvalidPart`] if any nested
+/// artifact or message is malformed (see [`A2aTask::validate`]).
 ///
 /// `NewTask::parent_id`, `dependencies`, `budget`, and `expires_at` are set to their empty/absent
 /// value: A2A carries no analogue for any of them (see the module docs).
@@ -189,6 +206,7 @@ pub fn a2a_task_to_new_task(
     a2a: &A2aTask,
     inputs: NewTaskInputs<'_>,
 ) -> Result<NewTaskConversion, A2aError> {
+    a2a.validate()?;
     let target_state = map_inbound_task_state(a2a.status.state)?;
     let new_task = NewTask {
         title: inputs.title.to_owned(),
@@ -404,5 +422,37 @@ mod tests {
         assert_eq!(decoded.id, a2a.id);
         assert_eq!(decoded.status.state, a2a.status.state);
         assert_eq!(decoded.metadata, a2a.metadata);
+    }
+
+    #[test]
+    fn a2a_task_validate_rejects_empty_artifact_parts() {
+        let mut a2a = sample_a2a_task(A2aTaskState::Working);
+        a2a.artifacts.push(A2aArtifact {
+            artifact_id: "art_empty".to_owned(),
+            name: None,
+            description: None,
+            parts: Vec::new(),
+            metadata: None,
+            extensions: Vec::new(),
+        });
+        let err = a2a_task_to_new_task(&a2a, sample_inputs()).unwrap_err();
+        assert!(matches!(err, A2aError::EmptyArtifactParts));
+    }
+
+    #[test]
+    fn a2a_task_validate_rejects_invalid_part_in_nested_message() {
+        let mut a2a = sample_a2a_task(A2aTaskState::Working);
+        a2a.history.push(A2aMessage {
+            message_id: "msg_bad".to_owned(),
+            context_id: None,
+            task_id: Some("task_1".to_owned()),
+            role: A2aRole::User,
+            parts: vec![A2aPart::default()], // 0 fields set -> invalid
+            metadata: None,
+            extensions: Vec::new(),
+            reference_task_ids: Vec::new(),
+        });
+        let err = a2a_task_to_new_task(&a2a, sample_inputs()).unwrap_err();
+        assert!(matches!(err, A2aError::InvalidPart { .. }));
     }
 }

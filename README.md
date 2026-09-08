@@ -14,7 +14,7 @@ It provides:
 
 - Semantic search via local embeddings (no external API calls)
 - A knowledge graph for structured facts, relationships, and timelines
-- An MCP server (`mempalace-mcp`) for agent integration (58 tools)
+- An MCP server (`mempalace-mcp`) for agent integration (67 tools)
 - Durable task coordination for agent workflows: tasks, messages, artifacts, results, leases, and audit events, available locally and optionally through the federation API
 - Provider-neutral agent lineages and reviewed identity packets that preserve a coherent self
   across model and harness changes
@@ -146,7 +146,7 @@ Full index: [docs/README.md](docs/README.md).
 - [Operator guide](docs/Operator-Standard.md) — deployment, maintenance, troubleshooting, storage recovery
 - [CLI surface](docs/CLI-Surface.md) — all commands and flags
 - [Config schema](docs/Config-Schema.md) — `~/.mempalace/config.json`
-- [Release scope](docs/Release-Scope.md) — what ships, what's deferred, the 58 MCP tools
+- [Release scope](docs/Release-Scope.md) — what ships, what's deferred, the 67 MCP tools
 - [Self-continuity](docs/Self-Continuity.md) — lineages, reviewed self-observations, identity
   packets, and model/harness migrations
 - [Low-CPU mode](docs/Operator-Low-CPU.md) — constrained environments

@@ -6,11 +6,13 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+mempalace-a2a = { path = "../mempalace-a2a" }
 mempalace-config = { path = "../mempalace-config" }
 mempalace-core = { path = "../mempalace-core" }
 mempalace-embeddings = { path = "../mempalace-embeddings" }
 mempalace-federation = { path = "../mempalace-federation" }
 mempalace-graph = { path = "../mempalace-graph" }
+mempalace-mcp-tasks = { path = "../mempalace-mcp-tasks" }
 mempalace-remote = { path = "../mempalace-remote" }
 mempalace-search = { path = "../mempalace-search" }
 mempalace-storage = { path = "../mempalace-storage" }

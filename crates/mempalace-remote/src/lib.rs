@@ -355,6 +355,18 @@ pub trait RemoteApi: Send + Sync {
         Err(coordination_unsupported("coordination_result_get"))
     }
 
+    /// Discover tasks using the additive coordination_task_list capability.
+    async fn coordination_tasks(
+        &self,
+        query: mempalace_federation::CoordinationTasksQuery,
+    ) -> Result<mempalace_federation::CoordinationTasksResponse> {
+        let _ = query;
+        Err(RemoteError::CapabilityMissing {
+            remote: "remote".into(),
+            capability: "coordination_task_list".into(),
+        })
+    }
+
     /// Read the coordination audit-event feed, cursor-paginated
     /// (`GET /v1/coordination/events`).
     async fn coordination_events(

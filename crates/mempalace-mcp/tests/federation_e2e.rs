@@ -3972,6 +3972,63 @@ async fn coordination_events_fanout_with_one_remote_down_still_returns_the_healt
 /// `next_cursor` taken out of page 1 is fed back as `remote_cursors.hub` and must yield a
 /// disjoint page 2, not a repeat of page 1.
 #[tokio::test]
+async fn task_list_remote_discovery_continuation_and_claim() {
+    let local_dir = TempDir::new().unwrap();
+    let hub_dir = TempDir::new().unwrap();
+    let addr = spawn_server(&hub_dir).await;
+    let hub_url = format!("http://{addr}");
+    let client = hub_client(&hub_url);
+    let mut ids = Vec::new();
+    for i in 0..3 {
+        let task = client
+            .coordination_task_create(mempalace_federation::NewTaskRequest {
+                title: format!("Remote task {i}"),
+                description: "Execute these instructions".into(),
+                wing: "wing_task_pages".into(),
+                idempotency_key: format!("task-page-{i}"),
+                created_by: None,
+                parent_id: None,
+                dependencies: vec![],
+                budget: None,
+                expires_at: None,
+            })
+            .await
+            .unwrap();
+        ids.push(task.task_id);
+    }
+    let rules = BTreeMap::from([(
+        "wing_task_pages".into(),
+        ResolvedRouteRule {
+            mode: RouteMode::Remote,
+            remote: Some("hub".into()),
+            write: WriteTarget::Remote,
+        },
+    )]);
+    let server = mcp_server_with_hub_coordination(
+        &local_dir,
+        &hub_url,
+        BTreeMap::new(),
+        rules,
+        RouteMode::Local,
+    )
+    .await;
+    let page =
+        call_tool(&server, 1, "mempalace_task_list", json!({"wing":"task_pages","limit":2})).await;
+    assert_eq!(page["tasks"], json!([]));
+    let remote = &page["remote_tasks"]["hub"];
+    assert_eq!(remote["tasks"][0]["task_id"], ids[0]);
+    assert_eq!(remote["tasks"][1]["task_id"], ids[1]);
+    assert!(remote["tasks"][0].get("description").is_none());
+    let next = call_tool(&server,2,"mempalace_task_list",json!({"wing":"task_pages","limit":2,"include_local":false,"remotes":["hub"],"remote_cursors":{"hub":remote["next_cursor"]}})).await;
+    assert_eq!(next["remote_tasks"]["hub"]["tasks"][0]["task_id"], ids[2]);
+    assert!(next["remote_tasks"]["hub"]["next_cursor"].is_null());
+    let row = &remote["tasks"][0];
+    let claimed = call_tool(&server,3,"mempalace_task_claim",json!({"task_id":row["task_id"],"expected_revision":row["revision"],"worker":"worker","lease_seconds":60})).await;
+    assert_eq!(claimed["success"], true);
+    assert_eq!(claimed["task"]["description"], "Execute these instructions");
+}
+
+#[tokio::test]
 async fn coordination_events_remote_cursors_round_trip_paginates_without_repeats() {
     let local_dir = TempDir::new().unwrap();
     let hub_dir = TempDir::new().unwrap();

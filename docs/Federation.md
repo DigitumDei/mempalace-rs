@@ -978,7 +978,15 @@ coordination MCP tools (`mempalace_task_create` and friends) documented in
 configured remote's coordination state the same way it already reaches remote drawers and KG
 facts.
 
-**The capability gate.** Every coordination method on `RemoteClient` checks the cached
+**Task discovery.** `GET /v1/coordination/tasks` and `RemoteApi::coordination_tasks`
+use the additive `coordination_task_list` capability. Unfiltered lists are allowed
+under the same SQL visibility rules as events. The MCP `mempalace_task_list`
+returns separate `remote_tasks` pages with independent cursors, and allocates
+encoded byte budgets before requesting each page. See
+[Task discovery](Coordination.md#task-discovery) for the projection, limits,
+oversized-record policy, and independent-origin continuation arguments.
+
+**The capability gate.** The original coordination methods on `RemoteClient` check the cached
 `GET /v1/info` `capabilities` list for `"coordination"` before sending any request. A remote
 that does not advertise it (an older, pre-Stage-3 server) fails with
 `RemoteError::CapabilityMissing { remote, capability }` — a clear, non-degradable error naming

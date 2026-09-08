@@ -2,8 +2,8 @@
 
 use std::path::{Path, PathBuf};
 
-use mempalace_core::{SHARED_AGENT_DIARY_WING, WingId};
 pub use mempalace_core::UNSCOPED_WING;
+use mempalace_core::{SHARED_AGENT_DIARY_WING, WingId};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -125,7 +125,8 @@ impl TaskState {
             Self::Expired => "expired",
         }
     }
-    fn parse(value: &str) -> Result<Self> {
+    /// Parse the canonical snake-case lifecycle state.
+    pub fn parse(value: &str) -> Result<Self> {
         match value {
             "pending" => Ok(Self::Pending),
             "running" => Ok(Self::Running),
@@ -271,6 +272,68 @@ pub struct TaskResult {
 /// Opaque local ordering cursor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CoordinationCursor(pub i64);
+
+/// Maximum UTF-8 bytes in a discovery title.
+pub const TASK_LIST_TITLE_BYTES: usize = 1024;
+/// Maximum encoded JSON bytes in a local or REST discovery page.
+pub const TASK_LIST_PAGE_BYTES: usize = 256 * 1024;
+/// Maximum discovery rows per origin and page.
+pub const TASK_LIST_MAX_LIMIT: usize = 200;
+
+/// Discovery metadata. Dependency count is not a readiness predicate.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskListItem {
+    /// Immutable task identity.
+    pub task_id: String,
+    /// Owning wing, or an optional wing filter.
+    pub wing: String,
+    /// Task lifecycle state.
+    pub state: TaskState,
+    /// Current revision for optimistic claim concurrency.
+    pub revision: i64,
+    /// UTF-8 title prefix, at most 1024 bytes.
+    pub title: String,
+    /// Whether the title is a prefix of the stored title.
+    pub title_truncated: bool,
+    /// Exact lease owner identity, when present.
+    pub owner: Option<String>,
+    /// Lease deadline in RFC3339; the owning server decides expiry.
+    pub lease_expires_at: Option<String>,
+    /// Parent task identity, when present.
+    pub parent_id: Option<String>,
+    /// Number of declared dependencies, not unresolved dependencies.
+    pub dependency_count: usize,
+    /// Exact task creator identity.
+    pub created_by: String,
+    /// Creation timestamp in RFC3339.
+    pub created_at: String,
+    /// Task deadline in RFC3339, when set.
+    pub expires_at: Option<String>,
+}
+
+/// Optional exact-match filters applied before the visibility/pagination boundary.
+#[derive(Debug, Clone, Default)]
+pub struct TaskListFilter {
+    /// Owning wing, or an optional wing filter.
+    pub wing: Option<String>,
+    /// Task lifecycle state.
+    pub state: Option<TaskState>,
+    /// Exact lease owner identity, when present.
+    pub owner: Option<String>,
+    /// Exact task creator identity.
+    pub created_by: Option<String>,
+    /// Parent task identity, when present.
+    pub parent_id: Option<String>,
+}
+
+/// Wire-sized page; cursors use the existing opaque coordination encoding.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskListPage {
+    /// Discovery items in immutable sequence order.
+    pub tasks: Vec<TaskListItem>,
+    /// Opaque cursor after the last emitted item; null when exhausted.
+    pub next_cursor: Option<String>,
+}
 /// Append-only audit event.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CoordinationEvent {
@@ -359,8 +422,8 @@ impl CoordinationStore {
     /// `coordination_events` tables without a `wing` column. `CREATE TABLE IF NOT EXISTS` is a
     /// no-op against those existing tables, so after it runs this checks
     /// `PRAGMA table_info` and adds the column with `ALTER TABLE ... ADD COLUMN` when it is
-    /// missing. Both the fresh and the upgraded path leave `wing` as the last physical column,
-    /// so the two schemas end up identical. Safe to call on every startup: adding an already-
+    /// missing. Task discovery then appends `sequence` on both paths, so fresh and upgraded
+    /// schemas end up identical. Safe to call on every startup: adding an already-
     /// present column is skipped, not repeated.
     ///
     /// The wing index on `coordination_events` is created *after* the column backfill, not in
@@ -412,8 +475,57 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
         // lock differently), since `add_column_if_missing` is meant to be idempotent by
         // contract, not just serialized by this transaction.
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        add_column_if_missing(&tx, "coordination_tasks", "wing", "TEXT NOT NULL DEFAULT 'wing_unscoped'")?;
-        add_column_if_missing(&tx, "coordination_events", "wing", "TEXT NOT NULL DEFAULT 'wing_unscoped'")?;
+        add_column_if_missing(
+            &tx,
+            "coordination_tasks",
+            "wing",
+            "TEXT NOT NULL DEFAULT 'wing_unscoped'",
+        )?;
+        add_column_if_missing(
+            &tx,
+            "coordination_events",
+            "wing",
+            "TEXT NOT NULL DEFAULT 'wing_unscoped'",
+        )?;
+        add_column_if_missing(&tx, "coordination_tasks", "sequence", "INTEGER")?;
+        // A separate AUTOINCREMENT allocator prevents sequence reuse after deletions/VACUUM.
+        // Backfill and trigger installation share the schema upgrade's write lock.
+        tx.execute_batch(
+            r#"
+CREATE TABLE IF NOT EXISTS coordination_task_sequences (
+ sequence INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL UNIQUE);
+"#,
+        )?;
+        // Parse timestamps rather than sorting RFC3339 strings: variable fractional precision
+        // and offsets are not lexicographically chronological. Exact task ID breaks ties.
+        let mut legacy = {
+            let mut statement = tx.prepare("SELECT task_id,created_at FROM coordination_tasks t WHERE NOT EXISTS (SELECT 1 FROM coordination_task_sequences s WHERE s.task_id=t.task_id)")?;
+            let rows = statement
+                .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+            let mut values = Vec::new();
+            for row in rows {
+                let (id, created) = row?;
+                let created = OffsetDateTime::parse(&created, &Rfc3339).map_err(|e| {
+                    StorageError::Invariant(format!("invalid task creation timestamp: {e}"))
+                })?;
+                values.push((created, id));
+            }
+            values
+        };
+        legacy.sort();
+        for (_, id) in legacy {
+            tx.execute("INSERT INTO coordination_task_sequences(task_id) VALUES (?1)", [id])?;
+        }
+        tx.execute_batch(r#"
+UPDATE coordination_tasks SET sequence=(SELECT sequence FROM coordination_task_sequences s WHERE s.task_id=coordination_tasks.task_id) WHERE sequence IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_coordination_tasks_sequence ON coordination_tasks(sequence);
+CREATE INDEX IF NOT EXISTS idx_coordination_tasks_wing_sequence ON coordination_tasks(wing,sequence);
+CREATE TRIGGER IF NOT EXISTS coordination_tasks_assign_sequence AFTER INSERT ON coordination_tasks
+BEGIN
+ INSERT INTO coordination_task_sequences(task_id) VALUES (NEW.task_id);
+ UPDATE coordination_tasks SET sequence=(SELECT sequence FROM coordination_task_sequences WHERE task_id=NEW.task_id) WHERE task_id=NEW.task_id;
+END;
+"#)?;
         // Wing-filtered `events()` calls are a continuously polled feed, so a full scan is a
         // real cost, not a theoretical one. The column is guaranteed to exist by this point on
         // both the fresh and the upgraded path.
@@ -468,11 +580,7 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
     /// expiry is a lifecycle outcome this palace produces itself (see `claim_task`'s lazy expiry
     /// check), never something an importer may assert about a task it has not yet even placed
     /// under this palace's lease/expiry rules.
-    pub fn import_task(
-        &self,
-        input: &NewTask,
-        initial_state: TaskState,
-    ) -> Result<ImportedTask> {
+    pub fn import_task(&self, input: &NewTask, initial_state: TaskState) -> Result<ImportedTask> {
         if initial_state == TaskState::Expired {
             return Err(StorageError::Invariant(
                 "TaskState::Expired is a lifecycle outcome this palace produces itself; an imported task cannot assert it as an initial state".into(),
@@ -985,7 +1093,20 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
             "INSERT INTO coordination_results(result_id,task_id,created_by,payload_json,idempotency_key,created_at) VALUES(?1,?2,?3,?4,?5,?6)",
             params![id, input.task_id, input.created_by, serde_json::to_string(&input.payload)?, input.idempotency_key, format_time(now)?],
         )?;
-        append_event(&tx, "result", &id, Some(&input.task_id), &task.wing, "result_created", &input.created_by, None, None, None, None, now)?;
+        append_event(
+            &tx,
+            "result",
+            &id,
+            Some(&input.task_id),
+            &task.wing,
+            "result_created",
+            &input.created_by,
+            None,
+            None,
+            None,
+            None,
+            now,
+        )?;
         let value = get_result_tx(&tx, &id)?
             .ok_or_else(|| StorageError::Invariant("created result disappeared".into()))?;
         tx.commit()?;
@@ -1064,6 +1185,123 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
         };
         Ok(CoordinationEventPage { events: values, next_cursor })
     }
+    /// List authorized rows before applying either row or encoded-byte pagination.
+    pub fn tasks(
+        &self,
+        cursor: Option<CoordinationCursor>,
+        filter: &TaskListFilter,
+        limit: usize,
+        byte_budget: usize,
+        visibility: CoordinationVisibility<'_>,
+    ) -> Result<TaskListPage> {
+        let budget = byte_budget.min(TASK_LIST_PAGE_BYTES);
+        let mut page = TaskListPage { tasks: Vec::new(), next_cursor: None };
+        if budget < 128 {
+            return Err(StorageError::Invariant(
+                "task list byte budget must be at least 128".into(),
+            ));
+        }
+        if matches!(visibility, CoordinationVisibility::Federated(Some(w)) if w.is_empty()) {
+            return Ok(page);
+        }
+        let mut predicates = vec!["sequence > ?1".to_owned()];
+        let mut bindings: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(cursor.map_or(0, |c| c.0))];
+        let wing =
+            filter.wing.as_deref().map(WingId::normalized).transpose()?.map(|w| w.to_string());
+        for (column, value) in [
+            ("wing", wing.as_deref()),
+            ("state", filter.state.map(TaskState::as_str)),
+            ("owner", filter.owner.as_deref()),
+            ("created_by", filter.created_by.as_deref()),
+            ("parent_id", filter.parent_id.as_deref()),
+        ] {
+            if let Some(value) = value {
+                bindings.push(Box::new(value.to_owned()));
+                predicates.push(format!("{column}=?{}", bindings.len()));
+            }
+        }
+        if let CoordinationVisibility::Federated(wings) = visibility {
+            for excluded in [SHARED_AGENT_DIARY_WING, UNSCOPED_WING] {
+                bindings.push(Box::new(excluded.to_owned()));
+                predicates.push(format!("wing<>?{}", bindings.len()));
+            }
+            if let Some(wings) = wings {
+                let mut placeholders = Vec::new();
+                for wing in wings {
+                    bindings.push(Box::new(wing.clone()));
+                    placeholders.push(format!("?{}", bindings.len()));
+                }
+                predicates.push(format!("wing IN ({})", placeholders.join(",")));
+            }
+        }
+        let limit = limit.clamp(1, TASK_LIST_MAX_LIMIT);
+        bindings.push(Box::new((limit + 1) as i64));
+        let sql = format!(
+            "SELECT sequence,task_id,wing,state,revision,substr(CAST(title AS BLOB),1,{TASK_LIST_TITLE_BYTES}),length(CAST(title AS BLOB)),owner,lease_expires_at,parent_id,json_array_length(dependencies_json),created_by,created_at,expires_at FROM coordination_tasks WHERE {} ORDER BY sequence LIMIT ?{}",
+            predicates.join(" AND "),
+            bindings.len()
+        );
+        let conn = self.connection()?;
+        let mut statement = conn.prepare(&sql)?;
+        let parameters = bindings.iter().map(AsRef::as_ref).collect::<Vec<&dyn rusqlite::ToSql>>();
+        let mut rows = statement.query(parameters.as_slice())?;
+        let mut last = None;
+        while let Some(row) = rows.next()? {
+            if page.tasks.len() == limit {
+                page.next_cursor = last;
+                break;
+            }
+            let sequence: i64 = row.get(0)?;
+            // Byte slicing preserves embedded NULs and avoids fetching megabyte titles.
+            let prefix: Vec<u8> = row.get(5)?;
+            let end = match std::str::from_utf8(&prefix) {
+                Ok(_) => prefix.len(),
+                Err(error) if error.error_len().is_none() => error.valid_up_to(),
+                Err(_) => {
+                    return Err(StorageError::Invariant("task title is not valid UTF-8".into()));
+                }
+            };
+            let title = std::str::from_utf8(&prefix[..end])
+                .map_err(|e| StorageError::Invariant(format!("invalid title prefix: {e}")))?
+                .to_owned();
+            let item = TaskListItem {
+                task_id: row.get(1)?,
+                wing: row.get(2)?,
+                state: TaskState::parse(&row.get::<_, String>(3)?)?,
+                revision: row.get(4)?,
+                title_truncated: row.get::<_, i64>(6)? > title.len() as i64,
+                title,
+                owner: row.get(7)?,
+                lease_expires_at: row.get(8)?,
+                parent_id: row.get(9)?,
+                dependency_count: row.get::<_, u32>(10)? as usize,
+                created_by: row.get(11)?,
+                created_at: row.get(12)?,
+                expires_at: row.get(13)?,
+            };
+            page.tasks.push(item);
+            // Reserve the longest possible cursor even on the final page.
+            page.next_cursor = Some(i64::MAX.to_string());
+            if serde_json::to_vec(&page)?.len() > budget {
+                let oversized = page
+                    .tasks
+                    .pop()
+                    .ok_or_else(|| StorageError::Invariant("missing list item".into()))?;
+                if page.tasks.is_empty() {
+                    return Err(StorageError::Invariant(format!(
+                        "task list item {} exceeds byte budget {budget}; identities are not truncated; use task_get or increase the budget",
+                        oversized.task_id
+                    )));
+                }
+                page.next_cursor = last;
+                return Ok(page);
+            }
+            last = Some(sequence.to_string());
+            page.next_cursor = None;
+        }
+        Ok(page)
+    }
+
     /// Retrieve an audit event by exact ID.
     pub fn get_event(&self, id: &str) -> Result<Option<CoordinationEvent>> {
         let conn = self.connection()?;
@@ -1089,7 +1327,12 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
 /// error code for it (it comes back as a generic `SQLITE_ERROR` with a message), so this matches
 /// on the message text, which is a stable, documented SQLite error string for this exact
 /// condition, not a moving target we control.
-pub(crate) fn add_column_if_missing(conn: &Connection, table: &str, column: &str, ddl: &str) -> Result<()> {
+pub(crate) fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    ddl: &str,
+) -> Result<()> {
     let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
     let exists = statement
         .query_map([], |row| row.get::<_, String>(1))?
@@ -1337,11 +1580,7 @@ fn get_result_conn(conn: &Connection, id: &str) -> Result<Option<TaskResult>> {
 fn get_result_tx(tx: &Transaction<'_>, id: &str) -> Result<Option<TaskResult>> {
     get_result_conn(tx, id)
 }
-fn find_result_by_key(
-    tx: &Transaction<'_>,
-    actor: &str,
-    key: &str,
-) -> Result<Option<TaskResult>> {
+fn find_result_by_key(tx: &Transaction<'_>, actor: &str, key: &str) -> Result<Option<TaskResult>> {
     let id: Option<String> = tx
         .query_row(
             "SELECT result_id FROM coordination_results WHERE created_by=?1 AND idempotency_key=?2",
@@ -1425,6 +1664,308 @@ mod tests {
             expires_at: None,
         })
         .expect("task")
+    }
+
+    #[test]
+    fn task_list_filters_visibility_pages_and_claims() {
+        let (_d, s) = store();
+        let a = task_with_wing(&s, "alpha", "a");
+        task_with_wing(&s, "beta", "hidden");
+        task_with_wing(&s, "agents", "diary");
+        let b = task_with_wing(&s, "alpha", "b");
+        let visible = vec!["wing_alpha".to_owned()];
+        let filter = TaskListFilter::default();
+        let first = s
+            .tasks(
+                None,
+                &filter,
+                1,
+                TASK_LIST_PAGE_BYTES,
+                CoordinationVisibility::Federated(Some(&visible)),
+            )
+            .expect("page");
+        assert_eq!(first.tasks[0].task_id, a.task_id);
+        let cursor = CoordinationCursor(first.next_cursor.expect("more").parse().expect("cursor"));
+        let second = s
+            .tasks(
+                Some(cursor),
+                &filter,
+                1,
+                TASK_LIST_PAGE_BYTES,
+                CoordinationVisibility::Federated(Some(&visible)),
+            )
+            .expect("page");
+        assert_eq!(second.tasks[0].task_id, b.task_id);
+        assert_eq!(second.next_cursor, None);
+        for wing in ["beta", "agents", "unscoped"] {
+            let filter = TaskListFilter { wing: Some(wing.into()), ..Default::default() };
+            let page = s
+                .tasks(
+                    None,
+                    &filter,
+                    50,
+                    TASK_LIST_PAGE_BYTES,
+                    CoordinationVisibility::Federated(Some(&visible)),
+                )
+                .expect("hidden page");
+            assert!(page.tasks.is_empty());
+            assert!(page.next_cursor.is_none());
+        }
+        assert!(
+            s.tasks(
+                None,
+                &filter,
+                50,
+                TASK_LIST_PAGE_BYTES,
+                CoordinationVisibility::Federated(Some(&[]))
+            )
+            .expect("empty scope")
+            .tasks
+            .is_empty()
+        );
+        let row = &second.tasks[0];
+        let claimed = s
+            .claim_task(&row.task_id, "worker", row.revision, Duration::minutes(1))
+            .expect("claim");
+        let RevisionedWrite::Applied(full) = claimed else { panic!("claim conflict") };
+        assert_eq!(full.description, b.description);
+        assert!(matches!(
+            s.claim_task(&row.task_id, "racer", row.revision, Duration::minutes(1)).expect("CAS"),
+            RevisionedWrite::Conflict { .. }
+        ));
+        let filter = TaskListFilter {
+            state: Some(TaskState::Running),
+            owner: Some("worker".into()),
+            created_by: Some("manager".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            s.tasks(None, &filter, 50, TASK_LIST_PAGE_BYTES, CoordinationVisibility::Trusted)
+                .expect("filters")
+                .tasks[0]
+                .task_id,
+            b.task_id
+        );
+    }
+
+    #[test]
+    fn task_list_bounds_titles_encoded_pages_and_oversized_identities() {
+        let (_d, s) = store();
+        let parent = task(&s);
+        for (i, title) in [
+            "a".repeat(1024),
+            format!("{}é", "a".repeat(1023)),
+            "\u{0001}".repeat(1024),
+            "x".repeat(MAX_TASK_TEXT_BYTES),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            s.create_task(&NewTask {
+                title,
+                description: "d".repeat(MAX_TASK_TEXT_BYTES),
+                created_by: "manager".into(),
+                wing: "alpha".into(),
+                idempotency_key: format!("large-{i}"),
+                parent_id: Some(parent.task_id.clone()),
+                dependencies: vec![parent.task_id.clone()],
+                budget: None,
+                expires_at: None,
+            })
+            .expect("large task");
+        }
+        let filter =
+            TaskListFilter { parent_id: Some(parent.task_id.clone()), ..Default::default() };
+        let all = s
+            .tasks(None, &filter, 5000, TASK_LIST_PAGE_BYTES, CoordinationVisibility::Trusted)
+            .expect("list");
+        assert_eq!(all.tasks.len(), 4);
+        assert!(!all.tasks[0].title_truncated);
+        assert_eq!(all.tasks[1].title.len(), 1023);
+        assert!(all.tasks[1].title_truncated);
+        assert_eq!(all.tasks[3].title.len(), 1024);
+        assert!(all.tasks.iter().all(|t| t.dependency_count == 1));
+        let mut cursor = None;
+        let mut ids = Vec::new();
+        loop {
+            let page = s
+                .tasks(cursor, &filter, 200, 7000, CoordinationVisibility::Trusted)
+                .expect("byte page");
+            assert!(serde_json::to_vec(&page).expect("json").len() <= 7000);
+            ids.extend(page.tasks.iter().map(|t| t.task_id.clone()));
+            cursor = page.next_cursor.map(|s| CoordinationCursor(s.parse().expect("cursor")));
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(ids, all.tasks.iter().map(|t| t.task_id.clone()).collect::<Vec<_>>());
+        let conn = s.connection().expect("connection");
+        conn.execute(
+            "UPDATE coordination_tasks SET created_by=?1,owner=?1 WHERE task_id=?2",
+            params!["x".repeat(TASK_LIST_PAGE_BYTES), parent.task_id],
+        )
+        .expect("legacy huge actors");
+        let error = s
+            .tasks(
+                None,
+                &TaskListFilter::default(),
+                50,
+                TASK_LIST_PAGE_BYTES,
+                CoordinationVisibility::Trusted,
+            )
+            .expect_err("oversized identity");
+        assert!(error.to_string().contains("identities are not truncated"));
+    }
+
+    #[test]
+    fn task_list_sequence_survives_upgrade_and_vacuum() {
+        let d = TempDir::new().expect("temp");
+        let path = d.path().join("legacy.sqlite3");
+        let conn = Connection::open(&path).expect("open");
+        conn.execute_batch(LEGACY_SCHEMA_SQL).expect("legacy");
+        for id in ["b", "a"] {
+            conn.execute("INSERT INTO coordination_tasks(task_id,title,description,state,revision,created_by,dependencies_json,idempotency_key,created_at,updated_at) VALUES (?1,'title','description','pending',0,'manager','[]',?1,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')", [id]).expect("seed");
+        }
+        let s = CoordinationStore::new(&path);
+        s.ensure_schema().expect("upgrade");
+        s.ensure_schema().expect("repeat");
+        let first = s
+            .tasks(
+                None,
+                &TaskListFilter::default(),
+                1,
+                TASK_LIST_PAGE_BYTES,
+                CoordinationVisibility::Trusted,
+            )
+            .expect("page");
+        assert_eq!(first.tasks[0].task_id, "a");
+        conn.execute("DELETE FROM coordination_tasks WHERE task_id='b'", []).expect("delete");
+        conn.execute_batch("VACUUM").expect("vacuum");
+        let newer = task(&s);
+        let after = s
+            .tasks(
+                Some(CoordinationCursor(2)),
+                &TaskListFilter::default(),
+                50,
+                TASK_LIST_PAGE_BYTES,
+                CoordinationVisibility::Trusted,
+            )
+            .expect("resume");
+        assert_eq!(after.tasks[0].task_id, newer.task_id);
+    }
+
+    #[test]
+    fn task_list_upgrade_orders_instants_not_timestamp_strings() {
+        let d = TempDir::new().expect("temp");
+        let path = d.path().join("legacy.sqlite3");
+        let conn = Connection::open(&path).expect("open");
+        conn.execute_batch(LEGACY_SCHEMA_SQL).expect("schema");
+        for (id, created) in
+            [("later", "2026-01-01T00:00:00.000000001Z"), ("earlier", "2026-01-01T00:00:00Z")]
+        {
+            conn.execute("INSERT INTO coordination_tasks(task_id,title,description,state,revision,created_by,dependencies_json,idempotency_key,created_at,updated_at) VALUES (?1,'t','d','pending',0,'manager','[]',?1,?2,?2)",params![id,created]).expect("seed");
+        }
+        let s = CoordinationStore::new(path);
+        s.ensure_schema().expect("upgrade");
+        let page = s
+            .tasks(
+                None,
+                &TaskListFilter::default(),
+                50,
+                TASK_LIST_PAGE_BYTES,
+                CoordinationVisibility::Trusted,
+            )
+            .expect("list");
+        assert_eq!(
+            page.tasks.iter().map(|t| t.task_id.as_str()).collect::<Vec<_>>(),
+            vec!["earlier", "later"]
+        );
+    }
+
+    #[test]
+    fn task_list_preserves_embedded_nul_and_utf8_boundaries() {
+        let (_d, s) = store();
+        for (i, title) in [
+            "before\0after".to_owned(),
+            format!("{}🦀", "a".repeat(1020)),
+            format!("{}🦀", "a".repeat(1021)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let task = s
+                .create_task(&NewTask {
+                    title: title.clone(),
+                    description: "d".into(),
+                    created_by: "manager".into(),
+                    wing: format!("case_{i}"),
+                    idempotency_key: format!("nul-{i}"),
+                    parent_id: None,
+                    dependencies: vec![],
+                    budget: None,
+                    expires_at: None,
+                })
+                .expect("task");
+            let filter = TaskListFilter { wing: Some(task.wing), ..Default::default() };
+            let page = s
+                .tasks(None, &filter, 50, TASK_LIST_PAGE_BYTES, CoordinationVisibility::Trusted)
+                .expect("list");
+            if i < 2 {
+                assert_eq!(page.tasks[0].title, title);
+                assert!(!page.tasks[0].title_truncated);
+            } else {
+                assert_eq!(page.tasks[0].title, "a".repeat(1021));
+                assert!(page.tasks[0].title_truncated);
+            }
+        }
+    }
+
+    #[test]
+    fn task_list_enforces_row_limit_and_dependency_count_is_metadata() {
+        let (_d, s) = store();
+        let parent = task(&s);
+        let child = s
+            .create_task(&NewTask {
+                title: "child".into(),
+                description: "details".into(),
+                created_by: "manager".into(),
+                wing: "test".into(),
+                idempotency_key: "child".into(),
+                parent_id: Some(parent.task_id.clone()),
+                dependencies: vec![parent.task_id.clone()],
+                budget: None,
+                expires_at: None,
+            })
+            .expect("child");
+        let filter =
+            TaskListFilter { parent_id: Some(parent.task_id.clone()), ..Default::default() };
+        let page = s
+            .tasks(None, &filter, 50, TASK_LIST_PAGE_BYTES, CoordinationVisibility::Trusted)
+            .expect("list");
+        assert_eq!(page.tasks[0].dependency_count, 1);
+        assert!(matches!(
+            s.claim_task(&child.task_id, "worker", page.tasks[0].revision, Duration::minutes(1))
+                .expect("claim with pending dependency"),
+            RevisionedWrite::Applied(_)
+        ));
+        let conn = s.connection().expect("connection");
+        conn.execute_batch("WITH RECURSIVE numbers(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM numbers WHERE n<205) INSERT INTO coordination_tasks(task_id,title,description,state,revision,created_by,dependencies_json,idempotency_key,created_at,updated_at,wing) SELECT 'bulk_'||n,'t','d','pending',0,'manager','[]','bulk_'||n,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','wing_bulk' FROM numbers").expect("bulk seed");
+        let filter = TaskListFilter { wing: Some("bulk".into()), ..Default::default() };
+        let page = s
+            .tasks(None, &filter, usize::MAX, TASK_LIST_PAGE_BYTES, CoordinationVisibility::Trusted)
+            .expect("limited");
+        assert_eq!(page.tasks.len(), TASK_LIST_MAX_LIMIT);
+        let next = s
+            .tasks(
+                Some(CoordinationCursor(page.next_cursor.expect("more").parse().expect("cursor"))),
+                &filter,
+                200,
+                TASK_LIST_PAGE_BYTES,
+                CoordinationVisibility::Trusted,
+            )
+            .expect("remainder");
+        assert_eq!(next.tasks.len(), 5);
+        assert!(next.next_cursor.is_none());
     }
     fn task_with_wing(s: &CoordinationStore, wing: &str, key: &str) -> Task {
         s.create_task(&NewTask {
@@ -1664,8 +2205,13 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
 
         // Any worker can claim it -- there is no existing owner to conflict with.
         let claimed = applied_task(
-            s.claim_task(&imported.task.task_id, "worker-a", imported.task.revision, Duration::minutes(5))
-                .expect("an ownerless Running task must remain claimable"),
+            s.claim_task(
+                &imported.task.task_id,
+                "worker-a",
+                imported.task.revision,
+                Duration::minutes(5),
+            )
+            .expect("an ownerless Running task must remain claimable"),
         );
         assert_eq!(claimed.owner.as_deref(), Some("worker-a"));
         assert_eq!(claimed.state, TaskState::Running);
@@ -1679,8 +2225,9 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
     fn claim_is_cas_and_expired_lease_is_reclaimable() {
         let (_d, s) = store();
         let t = task(&s);
-        let claimed =
-            applied_task(s.claim_task(&t.task_id, "a", 0, Duration::milliseconds(1)).expect("claim"));
+        let claimed = applied_task(
+            s.claim_task(&t.task_id, "a", 0, Duration::milliseconds(1)).expect("claim"),
+        );
         // "b" reuses the pre-claim revision `0`, which the claim above already advanced past —
         // a stale revision, reported as a typed conflict rather than an `Err`.
         assert!(matches!(
@@ -1805,7 +2352,13 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
         // invalid transition: Pending -> Completed is not an allowed edge.
         let pending = task_with_wing(&s, "wing_test", "pin-invalid-transition-1");
         let err = s
-            .transition_task(&pending.task_id, "manager", pending.revision, TaskState::Completed, None)
+            .transition_task(
+                &pending.task_id,
+                "manager",
+                pending.revision,
+                TaskState::Completed,
+                None,
+            )
             .expect_err("pending -> completed is not an allowed transition");
         assert!(expect_invariant(&err).starts_with(INVALID_TRANSITION_PREFIX));
 
@@ -1817,7 +2370,13 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
                 .expect("claim"),
         );
         let err = s
-            .transition_task(&owned.task_id, "worker-b", claimed_owned.revision, TaskState::Completed, None)
+            .transition_task(
+                &owned.task_id,
+                "worker-b",
+                claimed_owned.revision,
+                TaskState::Completed,
+                None,
+            )
             .expect_err("a non-owner, non-cancel transition must fail");
         assert!(expect_invariant(&err).starts_with(ONLY_OWNER_MAY_TRANSITION));
 
@@ -1828,7 +2387,12 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
                 .expect("claim"),
         );
         let err = s
-            .renew_lease(&renewed.task_id, "worker-b", claimed_renewed.revision, Duration::minutes(5))
+            .renew_lease(
+                &renewed.task_id,
+                "worker-b",
+                claimed_renewed.revision,
+                Duration::minutes(5),
+            )
             .expect_err("a non-owner renew must fail");
         assert!(expect_invariant(&err).starts_with(ONLY_LEASE_OWNER_MAY_RENEW));
 
@@ -1845,7 +2409,12 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
         );
         std::thread::sleep(std::time::Duration::from_millis(5));
         let err = s
-            .renew_lease(&lease_expiry.task_id, "worker-a", claimed_lease_expiry.revision, Duration::minutes(5))
+            .renew_lease(
+                &lease_expiry.task_id,
+                "worker-a",
+                claimed_lease_expiry.revision,
+                Duration::minutes(5),
+            )
             .expect_err("renewing an already-expired lease must fail");
         assert!(expect_invariant(&err).starts_with(LEASE_HAS_EXPIRED));
 
@@ -1977,8 +2546,14 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
         assert_eq!(child.dependencies, vec![parent.task_id]);
         assert_eq!(child.budget, Some(serde_json::json!({"tokens": 50})));
         let cancelled = applied_task(
-            s.transition_task(&child.task_id, "manager", child.revision, TaskState::Cancelled, None)
-                .expect("cancel"),
+            s.transition_task(
+                &child.task_id,
+                "manager",
+                child.revision,
+                TaskState::Cancelled,
+                None,
+            )
+            .expect("cancel"),
         );
         assert_eq!(cancelled.state, TaskState::Cancelled);
         assert!(
@@ -2029,8 +2604,14 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
             s.claim_task(&t.task_id, "worker", 0, Duration::minutes(1)).expect("claim"),
         );
         let waiting = applied_task(
-            s.transition_task(&t.task_id, "worker", running.revision, TaskState::InputRequired, None)
-                .expect("input required"),
+            s.transition_task(
+                &t.task_id,
+                "worker",
+                running.revision,
+                TaskState::InputRequired,
+                None,
+            )
+            .expect("input required"),
         );
         assert_eq!(waiting.state, TaskState::InputRequired);
         assert_eq!(waiting.owner.as_deref(), Some("worker"));

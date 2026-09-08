@@ -277,6 +277,7 @@ enum ToolName {
     IdentityRead,
     IdentityUpdate,
     TaskCreate,
+    TaskList,
     TaskGet,
     TaskClaim,
     TaskRenew,
@@ -323,7 +324,7 @@ enum ToolName {
 }
 
 impl ToolName {
-    fn all() -> [Self; 67] {
+    fn all() -> [Self; 68] {
         [
             Self::WakeUp,
             Self::Status,
@@ -349,6 +350,7 @@ impl ToolName {
             Self::IdentityRead,
             Self::IdentityUpdate,
             Self::TaskCreate,
+            Self::TaskList,
             Self::TaskGet,
             Self::TaskClaim,
             Self::TaskRenew,
@@ -421,6 +423,7 @@ impl ToolName {
             Self::IdentityRead => "mempalace_identity_read",
             Self::IdentityUpdate => "mempalace_identity_update",
             Self::TaskCreate => "mempalace_task_create",
+            Self::TaskList => "mempalace_task_list",
             Self::TaskGet => "mempalace_task_get",
             Self::TaskClaim => "mempalace_task_claim",
             Self::TaskRenew => "mempalace_task_renew",
@@ -725,6 +728,12 @@ impl ToolName {
                 "Create a durable task idempotently in the given wing. Replaying the same created_by and idempotency_key returns the committed task. wing is normalised on write (myproject and wing_myproject are the same wing) and is inherited by every message, artifact, result, and audit event this task produces.",
                 json!({"title":{"type":"string"},"description":{"type":"string"},"created_by":{"type":"string"},"wing":{"type":"string","description":"Owning wing, e.g. wing_myproject. Normalised on write."},"idempotency_key":{"type":"string"},"parent_id":{"type":"string"},"dependencies":{"type":"array","items":{"type":"string"}},"budget":{},"expires_at":{"type":"string"}}),
                 &["title", "description", "created_by", "wing", "idempotency_key"],
+            ),
+            Self::TaskList => coordination_definition(
+                self,
+                "Discover tasks in creation order with compact metadata and per-origin opaque cursors. Use revision to claim; a successful claim returns the full task. dependency_count is metadata, not readiness. Local reads are trusted; remotes enforce visibility. Pages cap at 200 rows/256 KiB and the aggregate payload at 1 MiB. Oversized items fail explicitly without advancing their origin. Use include_local:false and remotes:[name] to continue a remote independently or give it more budget.",
+                json!({"wing":{"type":"string"},"state":{"type":"string","enum":["pending","running","input_required","completed","cancelled","failed","expired"]},"owner":{"type":"string"},"created_by":{"type":"string"},"parent_id":{"type":"string"},"cursor":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":200},"remote_cursors":{"type":"object","additionalProperties":{"type":"string"}},"include_local":{"type":"boolean"},"remotes":{"type":"array","items":{"type":"string"}}}),
+                &[],
             ),
             Self::TaskGet => coordination_definition(
                 self,
@@ -1047,7 +1056,14 @@ impl ToolName {
                 self,
                 "Translate and persist an inbound MCP Tasks CreateTaskResult (the handle a third-party MCP server returns when it processes a request as an async task): creates the MemPalace task directly in the mapped target_state (e.g. completed -> completed) — bypassing the claim/transition state machine entirely, since an import is a creation event, not a lifecycle transition, and forcing it through mempalace_task_claim/mempalace_task_transition would fabricate a worker/lease/transition history that never happened — and stores the exact wire JSON verbatim as an immutable protocol_envelope artifact for audit. `create_task_result` must be the raw JSON text exactly as received on the wire, not a re-serialized object. A task imported directly into Running has no owner or lease (none is fabricated); it remains claimable by any worker via mempalace_task_claim. `ttlMs` is a retention hint, never MemPalace lifecycle — it is surfaced only under `provenance.retention_deadline`, never written to the task's expiry. Returns the created task, target_state (with any coercion), the envelope artifact id, and `provenance` — the source taskId/createdAt/lastUpdatedAt/retention_deadline this crate has no storage column for. The caller MUST persist `provenance` itself (e.g. as a knowledge-graph fact) if it needs to resolve the wire task id or round-trip the original timestamps after a restart; this tool does not do so on your behalf. Local-only: translate-and-persist is a two-write sequence with no remote transaction to make it atomic.",
                 json!({"create_task_result":{"type":"string","description":"The raw MCP Tasks CreateTaskResult JSON exactly as received on the wire, byte-for-byte"},"wing":{"type":"string","description":"Owning wing, e.g. wing_myproject. Normalised on write."},"created_by":{"type":"string","description":"Actor recorded as having created the task"},"idempotency_key":{"type":"string"},"title":{"type":"string","description":"Human-readable task title — MCP Tasks has no equivalent field"},"description":{"type":"string","description":"Task description — MCP Tasks has no equivalent field"}}),
-                &["create_task_result", "wing", "created_by", "idempotency_key", "title", "description"],
+                &[
+                    "create_task_result",
+                    "wing",
+                    "created_by",
+                    "idempotency_key",
+                    "title",
+                    "description",
+                ],
             ),
         }
     }
@@ -1100,6 +1116,7 @@ impl ToolName {
             | Self::McpTasksCancel
             | Self::McpTasksImport => ToolRoutingCategory::LocalOnly,
             Self::TaskCreate
+            | Self::TaskList
             | Self::TaskGet
             | Self::TaskClaim
             | Self::TaskRenew
@@ -1442,6 +1459,7 @@ where
             },
             ToolRoutingCategory::RoutableCoordination => match tool {
                 ToolName::TaskCreate => runtime.tool_task_create(&call.arguments).await,
+                ToolName::TaskList => runtime.tool_task_list(&call.arguments).await,
                 ToolName::TaskGet => runtime.tool_task_get(&call.arguments).await,
                 ToolName::TaskClaim => runtime.tool_task_claim(&call.arguments).await,
                 ToolName::TaskRenew => runtime.tool_task_renew(&call.arguments).await,
@@ -4725,6 +4743,108 @@ where
                 .map_tool_internal()?,
         )
     }
+    /// Discover tasks with independent, byte-bounded local and remote pages.
+    async fn tool_task_list(&mut self, arguments: &Value) -> ToolResult<Value> {
+        let wing = optional_non_blank_string(arguments, "wing")?;
+        let state = optional_string(arguments, "state")?;
+        let filter = mempalace_storage::TaskListFilter {
+            wing: wing.clone(),
+            state: state.as_deref().map(TaskState::parse).transpose().map_tool()?,
+            owner: optional_string(arguments, "owner")?,
+            created_by: optional_string(arguments, "created_by")?,
+            parent_id: optional_string(arguments, "parent_id")?,
+        };
+        let cursor = optional_string(arguments, "cursor")?;
+        let local_cursor = cursor
+            .as_deref()
+            .map(|v| {
+                v.parse::<i64>()
+                    .ok()
+                    .filter(|v| *v >= 0)
+                    .map(CoordinationCursor)
+                    .ok_or_else(|| ToolError::InvalidParams("invalid task cursor".into()))
+            })
+            .transpose()?;
+        let limit = optional_usize(arguments, "limit")?.unwrap_or(50);
+        let include_local = arguments
+            .get("include_local")
+            .map(|v| {
+                v.as_bool()
+                    .ok_or_else(|| ToolError::InvalidParams("include_local must be boolean".into()))
+            })
+            .transpose()?
+            .unwrap_or(true);
+        let selected: Option<Vec<String>> = arguments
+            .get("remotes")
+            .map(|v| {
+                serde_json::from_value(v.clone()).map_err(|_| {
+                    ToolError::InvalidParams("remotes must be an array of names".into())
+                })
+            })
+            .transpose()?;
+        let mut payload = if include_local {
+            json!(
+                self.coordination
+                    .tasks(
+                        local_cursor,
+                        &filter,
+                        limit,
+                        mempalace_storage::TASK_LIST_PAGE_BYTES,
+                        CoordinationVisibility::Trusted
+                    )
+                    .map_tool()?
+            )
+        } else {
+            json!({"tasks":[], "next_cursor":cursor})
+        };
+        if let Some(router) = self.federation.as_ref().filter(|r| r.has_remotes()) {
+            let cursors = parse_cursors_arg(arguments, "remote_cursors")?;
+            let query = mempalace_federation::CoordinationTasksQuery {
+                cursor: None,
+                wing,
+                state,
+                owner: filter.owner,
+                created_by: filter.created_by,
+                parent_id: filter.parent_id,
+                limit: Some(limit),
+                byte_budget: None,
+            };
+            let used = serde_json::to_vec(&payload)
+                .map_err(|e| ToolError::Internal(McpError::Json(e)))?
+                .len();
+            payload["remote_tasks"] = json!(
+                router
+                    .coordination_tasks_fanout(
+                        query,
+                        &cursors,
+                        selected.as_deref(),
+                        (1024 * 1024usize).saturating_sub(used + 32)
+                    )
+                    .await?
+            );
+        }
+        // The MCP envelope JSON-escapes a pretty-printed payload. Bound that representation
+        // too; rejecting a whole response never hands out cursors for undisplayed tasks.
+        if serde_json::to_vec(&payload).map_err(|e| ToolError::Internal(McpError::Json(e)))?.len()
+            > 1024 * 1024
+        {
+            return Err(ToolError::InvalidParams(
+                "task list aggregate exceeds 1 MiB; select fewer origins".into(),
+            ));
+        }
+        let text = serde_json::to_string_pretty(&payload)
+            .map_err(|e| ToolError::Internal(McpError::Json(e)))?;
+        let result = json!({"content":[{"type":"text","text":text}]});
+        if serde_json::to_vec(&result).map_err(|e| ToolError::Internal(McpError::Json(e)))?.len()
+            > 4 * 1024 * 1024
+        {
+            return Err(ToolError::InvalidParams(
+                "task list MCP result exceeds 4 MiB; select fewer origins".into(),
+            ));
+        }
+        Ok(payload)
+    }
+
     /// Read the coordination audit-event feed. Aggregate and cursor-paginated, like
     /// `mempalace_inbox_read` — always reads local and fans out to every configured remote
     /// concurrently with a per-remote cursor, reported under `remote_events`.
@@ -4770,6 +4890,7 @@ where
                 "taxonomy".to_owned(),
                 "ingest".to_owned(),
                 "coordination".to_owned(),
+                "coordination_task_list".to_owned(),
             ],
             maintenance_enabled: self.config.maintenance.enabled,
             maintenance_background_enabled: self.config.maintenance.background_enabled,
@@ -4995,9 +5116,14 @@ where
         let recipient = required_non_blank_string(arguments, "recipient")?;
         let idempotency_key = required_non_blank_string(arguments, "idempotency_key")?;
 
-        let new_message =
-            a2a_message_to_new_message(&a2a_message, &task_id, &sender, &recipient, idempotency_key)
-                .map_err(map_a2a_tool_error)?;
+        let new_message = a2a_message_to_new_message(
+            &a2a_message,
+            &task_id,
+            &sender,
+            &recipient,
+            idempotency_key,
+        )
+        .map_err(map_a2a_tool_error)?;
         let message = self.coordination.send_message(&new_message).map_tool_internal()?;
         Ok(json!(message))
     }
@@ -5059,7 +5185,9 @@ where
             None | Some(Value::Null) => None,
             Some(Value::Object(map)) => Some(map.clone()),
             Some(_) => {
-                return Err(ToolError::InvalidParams("field `result` must be a JSON object".to_owned()));
+                return Err(ToolError::InvalidParams(
+                    "field `result` must be a JSON object".to_owned(),
+                ));
             }
         };
         let error: Option<mempalace_mcp_tasks::JsonRpcErrorObject> = match arguments.get("error") {
@@ -5121,10 +5249,7 @@ where
         // same-status update conflicts rather than silently succeeding.
         if current.state == target.value {
             if current.revision != expected_revision {
-                return Ok(revision_conflict_payload(
-                    expected_revision,
-                    Some(current.revision),
-                ));
+                return Ok(revision_conflict_payload(expected_revision, Some(current.revision)));
             }
             // The no-op path must still enforce the ownership rule it is bypassing.
             // `transition_task` rejects a non-owner unless the target is `Cancelled`, but that
@@ -5233,10 +5358,7 @@ where
             .ok_or_else(|| ToolError::InvalidParams(format!("task `{task_id}` not found")))?;
         if current.state == target.value {
             if current.revision != expected_revision {
-                return Ok(revision_conflict_payload(
-                    expected_revision,
-                    Some(current.revision),
-                ));
+                return Ok(revision_conflict_payload(expected_revision, Some(current.revision)));
             }
             return Ok(json!({
                 "success": true,
@@ -5872,10 +5994,7 @@ fn exact_result<T: Serialize>(value: Option<T>) -> ToolResult<Value> {
 /// reported the *second* payload's `target_state` — and would file a second protocol envelope
 /// under that task disagreeing with the first about its state. The stored task is authoritative;
 /// this is a caller mistake (a reused key), so it is `InvalidParams`, not an internal error.
-fn reject_replay_state_mismatch(
-    imported: &ImportedTask,
-    requested: TaskState,
-) -> ToolResult<()> {
+fn reject_replay_state_mismatch(imported: &ImportedTask, requested: TaskState) -> ToolResult<()> {
     if imported.replayed && imported.task.state != requested {
         return Err(ToolError::InvalidParams(format!(
             "idempotency_key already imported task `{}` in state `{:?}`; this payload maps to `{:?}`. Use a distinct idempotency_key for a different task state.",
@@ -7511,6 +7630,54 @@ mod tests {
             }
             other => panic!("expected StorageError::Invariant, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn task_list_mcp_discovery_to_claim_and_independent_local_cursor() {
+        let harness = test_harness().await;
+        for i in 0..3 {
+            let response = harness.server.handle_request(tool_call(910+i,"mempalace_task_create",
+                json!({"title":format!("Task {i}"),"description":"execution details","created_by":"manager","wing":"alpha","idempotency_key":format!("list-{i}")}))).await;
+            assert!(decode_tool_payload(&response).unwrap().get("task_id").is_some());
+        }
+        let response = harness
+            .server
+            .handle_request(tool_call(
+                920,
+                "mempalace_task_list",
+                json!({"wing":"alpha","limit":1}),
+            ))
+            .await;
+        let page = decode_tool_payload(&response).unwrap();
+        assert_eq!(page["tasks"].as_array().unwrap().len(), 1);
+        assert!(page["tasks"][0].get("description").is_none());
+        let cursor = page["next_cursor"].clone();
+        let skipped = harness
+            .server
+            .handle_request(tool_call(
+                921,
+                "mempalace_task_list",
+                json!({"include_local":false,"cursor":cursor}),
+            ))
+            .await;
+        let skipped = decode_tool_payload(&skipped).unwrap();
+        assert_eq!(skipped["tasks"], json!([]));
+        assert_eq!(skipped["next_cursor"], cursor);
+        let response = harness
+            .server
+            .handle_request(tool_call(
+                922,
+                "mempalace_task_list",
+                json!({"wing":"alpha","limit":1,"cursor":cursor}),
+            ))
+            .await;
+        let second = decode_tool_payload(&response).unwrap();
+        assert_ne!(second["tasks"][0]["task_id"], page["tasks"][0]["task_id"]);
+        let row = &second["tasks"][0];
+        let claimed = harness.server.handle_request(tool_call(923,"mempalace_task_claim",json!({"task_id":row["task_id"],"expected_revision":row["revision"],"worker":"worker","lease_seconds":60}))).await;
+        let claimed = decode_tool_payload(&claimed).unwrap();
+        assert_eq!(claimed["task"]["description"], "execution details");
+        assert_eq!(ToolName::TaskList.routing(), ToolRoutingCategory::RoutableCoordination);
     }
 
     #[tokio::test]
@@ -10858,11 +11025,7 @@ mod tests {
         // Verify no task was created
         let tasks_check = harness
             .server
-            .handle_request(tool_call(
-                9079,
-                "mempalace_task_get",
-                json!({"task_id": "large"}),
-            ))
+            .handle_request(tool_call(9079, "mempalace_task_get", json!({"task_id": "large"})))
             .await;
         assert_eq!(decode_tool_payload(&tasks_check).unwrap()["found"], false);
     }
@@ -10946,11 +11109,7 @@ mod tests {
         // Freshly created (Pending) coerces outbound to `working`.
         let pending_get = harness
             .server
-            .handle_request(tool_call(
-                9101,
-                "mempalace_mcp_tasks_get",
-                json!({"task_id": task_id}),
-            ))
+            .handle_request(tool_call(9101, "mempalace_mcp_tasks_get", json!({"task_id": task_id})))
             .await;
         let pending_payload = decode_tool_payload(&pending_get).expect("get payload");
         assert_eq!(pending_payload["task"]["status"], "working");
@@ -11351,11 +11510,7 @@ mod tests {
         // The task is Pending, and mcp_tasks_get shows it as `working`.
         let shown = harness
             .server
-            .handle_request(tool_call(
-                9151,
-                "mempalace_mcp_tasks_get",
-                json!({"task_id": task_id}),
-            ))
+            .handle_request(tool_call(9151, "mempalace_mcp_tasks_get", json!({"task_id": task_id})))
             .await;
         let shown = decode_tool_payload(&shown).expect("get payload");
         assert_eq!(shown["task"]["status"], "working");
@@ -11497,7 +11652,15 @@ mod tests {
             .await;
         let card = decode_tool_payload(&card).expect("agent card payload");
         let tags = serde_json::to_string(&card).expect("card json");
-        for capability in ["drawers", "kg", "changes", "taxonomy", "ingest", "coordination"] {
+        for capability in [
+            "drawers",
+            "kg",
+            "changes",
+            "taxonomy",
+            "ingest",
+            "coordination",
+            "coordination_task_list",
+        ] {
             assert!(tags.contains(capability), "agent card omits `{capability}`: {tags}");
         }
     }
@@ -11790,11 +11953,7 @@ mod tests {
         // Verify no task was created
         let tasks_check = harness
             .server
-            .handle_request(tool_call(
-                9151,
-                "mempalace_task_get",
-                json!({"task_id": "src-large"}),
-            ))
+            .handle_request(tool_call(9151, "mempalace_task_get", json!({"task_id": "src-large"})))
             .await;
         assert_eq!(decode_tool_payload(&tasks_check).unwrap()["found"], false);
     }

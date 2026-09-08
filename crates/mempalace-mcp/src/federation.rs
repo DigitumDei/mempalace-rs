@@ -2150,11 +2150,28 @@ impl FederationRouter {
         if per_origin < 128 {
             return Ok(results);
         }
+
+        // All origin reads are independent after the budget has been allocated. Start them
+        // together so one slow or unreachable remote cannot add its timeout to every healthy
+        // origin's latency. The result map remains deterministic because it is a BTreeMap.
+        let mut set: JoinSet<(
+            String,
+            mempalace_remote::Result<mempalace_federation::CoordinationTasksResponse>,
+        )> = JoinSet::new();
         for (name, api) in candidates {
+            let name = name.clone();
+            let api = Arc::clone(api);
             let mut request = query.clone();
-            request.cursor = cursors.get(name).cloned();
+            request.cursor = cursors.get(&name).cloned();
             request.byte_budget = Some(per_origin);
-            let value = match api.coordination_tasks(request).await {
+            set.spawn(async move { (name, api.coordination_tasks(request).await) });
+        }
+        while let Some(joined) = set.join_next().await {
+            let Ok((name, result)) = joined else {
+                tracing::warn!("coordination task-list fan-out task panicked");
+                continue;
+            };
+            let value = match result {
                 Ok(page) => {
                     let value = serde_json::to_value(page)
                         .map_err(|e| ToolError::Internal(McpError::Json(e)))?;
@@ -2163,7 +2180,7 @@ impl FederationRouter {
                         .len()
                         > per_origin
                     {
-                        json!({"unreachable":true,"error":"Remote exceeded requested task page budget","next_cursor":cursors.get(name)})
+                        json!({"unreachable":true,"error":"Remote exceeded requested task page budget","next_cursor":cursors.get(&name)})
                     } else {
                         value
                     }
@@ -2182,7 +2199,7 @@ impl FederationRouter {
                         }
                         failure["error"] = json!(&message[..end]);
                     }
-                    failure["next_cursor"] = json!(cursors.get(name));
+                    failure["next_cursor"] = json!(cursors.get(&name));
                     failure
                 }
             };
@@ -2418,8 +2435,7 @@ fn wing_blocks_coordination_fanout(wing: Option<&str>) -> bool {
         None => false,
         Some(raw) => match WingId::normalized(raw) {
             Ok(canonical) => {
-                canonical.as_str() == SHARED_AGENT_DIARY_WING
-                    || canonical.as_str() == UNSCOPED_WING
+                canonical.as_str() == SHARED_AGENT_DIARY_WING || canonical.as_str() == UNSCOPED_WING
             }
             Err(_) => true,
         },
@@ -3463,6 +3479,7 @@ mod tests {
     struct MockRemote {
         task_list_queries: Arc<std::sync::Mutex<Vec<mempalace_federation::CoordinationTasksQuery>>>,
         task_list_oversize: bool,
+        task_list_delay_ms: u64,
         info_response: Value,
         search_results: Vec<Value>,
         add_drawer_success: bool,
@@ -3524,6 +3541,7 @@ mod tests {
             Self {
                 task_list_queries: Arc::new(std::sync::Mutex::new(Vec::new())),
                 task_list_oversize: false,
+                task_list_delay_ms: 0,
                 info_response: json!({
                     "server_version": "1.0.0-test",
                     "federation_api_version": 1,
@@ -3678,6 +3696,9 @@ mod tests {
             query: mempalace_federation::CoordinationTasksQuery,
         ) -> mempalace_remote::Result<mempalace_federation::CoordinationTasksResponse> {
             self.task_list_queries.lock().unwrap().push(query.clone());
+            if self.task_list_delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(self.task_list_delay_ms)).await;
+            }
             if self.fail_on.as_deref() == Some("tasks") {
                 return Err(RemoteError::Unreachable {
                     remote: "mock".into(),
@@ -4094,6 +4115,35 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn task_list_fanout_reads_origins_concurrently() {
+        let delay_ms = 150;
+        let mut remotes: BTreeMap<String, Arc<dyn RemoteApi>> = BTreeMap::new();
+        for name in ["a", "b", "c"] {
+            remotes.insert(
+                name.to_owned(),
+                Arc::new(MockRemote { task_list_delay_ms: delay_ms, ..Default::default() }),
+            );
+        }
+        let mut router = make_router(remotes);
+        for name in ["a", "b", "c"] {
+            router.rules.coordination.insert(name.to_owned(), make_combined_route(name));
+        }
+
+        let started = std::time::Instant::now();
+        let results = router
+            .coordination_tasks_fanout(Default::default(), &BTreeMap::new(), None, 64 * 1024)
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(results.len(), 3);
+        assert!(
+            elapsed < std::time::Duration::from_millis(delay_ms * 2),
+            "task-list remotes were awaited sequentially: elapsed {elapsed:?}"
         );
     }
 

@@ -123,6 +123,20 @@ impl RemoteClient {
         })
     }
 
+    /// Build a URL for a drawer resource while keeping the id in one encoded
+    /// path segment. Starting from the collection path without a trailing
+    /// slash avoids introducing an empty segment before the id.
+    fn drawer_url(&self, drawer_id: &str) -> Result<reqwest::Url> {
+        let mut url = self.url("v1/drawers")?;
+        url.path_segments_mut()
+            .map_err(|_| RemoteError::InvalidConfig {
+                remote: self.name.clone(),
+                message: "cannot append drawer id to a non-hierarchical URL".to_owned(),
+            })?
+            .push(drawer_id);
+        Ok(url)
+    }
+
     /// Perform the `GET /v1/info` handshake and return the response.
     ///
     /// This method does **not** call [`Self::ensure_handshake`]; it is the
@@ -437,8 +451,7 @@ impl RemoteApi for RemoteClient {
     /// Retrieve a single drawer by its stable identifier (`GET /v1/drawers/{id}`).
     async fn get_drawer(&self, drawer_id: &str) -> Result<serde_json::Value> {
         self.ensure_handshake().await?;
-        let path = format!("v1/drawers/{drawer_id}");
-        let url = self.url(&path)?;
+        let url = self.drawer_url(drawer_id)?;
         let rb = self.http.get(url);
         self.execute(rb, CallKind::Read).await
     }
@@ -463,13 +476,11 @@ impl RemoteApi for RemoteClient {
         // Build the final path segment through `Url` rather than interpolating it into a
         // string. Drawer ids may legitimately contain `/` (for example `wing/room/hash`),
         // which must be percent-encoded as one segment for the server's `{id}` route.
-        let mut url = self.url("v1/drawers/")?;
-        url.path_segments_mut()
-            .map_err(|_| RemoteError::InvalidConfig {
-                remote: self.name.clone(),
-                message: "cannot append drawer id to a non-hierarchical URL".to_owned(),
-            })?
-            .push(drawer_id);
+        // Start from the collection path without a trailing slash. `Url` keeps
+        // a trailing slash as an empty path segment, so pushing onto
+        // `v1/drawers/` would produce `v1/drawers//{id}` and miss the server
+        // route.
+        let url = self.drawer_url(drawer_id)?;
         let rb = self.http.delete(url);
         let rb = match operation_id {
             Some(op) => rb.query(&[("operation_id", op)]),
@@ -873,6 +884,15 @@ mod tests {
 
         let search_url = client.url("v1/drawers/search").unwrap();
         assert_eq!(search_url.as_str(), "https://x.example/palace/v1/drawers/search");
+    }
+
+    #[test]
+    fn drawer_url_uses_one_path_separator_and_encodes_the_id() {
+        let client = RemoteClient::new(endpoint("https://x.example/palace")).unwrap();
+
+        let url = client.drawer_url("wing/room/hash").unwrap();
+        assert_eq!(url.as_str(), "https://x.example/palace/v1/drawers/wing%2Froom%2Fhash");
+        assert!(!url.path().contains("//"));
     }
 
     #[test]

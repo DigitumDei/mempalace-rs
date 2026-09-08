@@ -1,6 +1,7 @@
 # Coordination Phase 3 — design proposal
 
-**Status: proposed.** This document is the design record for
+**Status: shipped.** Stages 1-10 are merged (PRs #116, #117, #118, #120, #128, #129, #134,
+#135); all three open questions below are answered. This document is the design record for
 [issue #102](https://github.com/DigitumDei/mempalace-rs/issues/102), in the same role
 [Coordination-Phase-2-Design.md](Coordination-Phase-2-Design.md) plays for issue #101.
 
@@ -1110,6 +1111,105 @@ decode. Same isolation rule and same envelope-as-artifact mechanism as Stage 5, 
 independent translation libraries with no shared runtime dependency, each defining its own
 `Mapped`/`Coercion` types).
 
+## Stage 7 — `coordination_claim` implies `coordination_write`
+
+Answers open question 2. Shipped in PR #134.
+
+A token that can claim a task but cannot write the messages, artifacts and results that
+claiming it entails is not a useful worker token. The implication is **one-way**: a
+`coordination_write` grant does not imply `coordination_claim`, and `coordination_read` is
+unaffected.
+
+Expressed as a single `scope_grants` helper used by all three matchers in `mempalace-server` -
+`allows_operation`, `allows_wing`, and `visible_wings`. They must change together, or the
+coarse `operation_gate` and the per-wing check disagree. `authorize_replay_wing` inherits it
+through `allows_wing`.
+
+Deliberately **not** expanded at token-parse time: `RawTokenScope` and `normalize_scope_wing`
+are untouched, so the closed set of operations an operator wrote in their token file stays
+exactly as written. Only the check applied to it widens.
+
+## Stage 8 — `wing_unscoped` is refused until re-homed
+
+Answers open question 1. Shipped in PR #134.
+
+`UNSCOPED_WING` is the SQL backfill default for coordination rows that predate wings, so such a
+row is owned by no wing and must not leave the machine. The refusal mirrors the `wing_agents`
+diary hard-override, including its read/write asymmetry: a write or claim gets a typed 422
+`unscoped_not_federated`, a read is masked as 404 so the route cannot be used as an existence
+oracle. `CoordinationVisibility::Federated` excludes it too, so legacy rows also stop appearing
+in federated events and inbox pages - a visible behaviour change for any deployment holding
+pre-wings rows.
+
+`UNSCOPED_WING` moved to `mempalace-core`, next to `SHARED_AGENT_DIARY_WING`, so
+`mempalace-config` and `mempalace-storage` share one definition rather than two string literals
+that must stay identical in crates that never see each other.
+
+## Stages 9 and 10 — the adapters reach the MCP tool surface
+
+Answer open question 3. Both shipped in PR #135.
+
+Stages 5 and 6 left `mempalace-a2a` and `mempalace-mcp-tasks` as orphan crates: correct
+translation libraries that nothing in the workspace depended on, so no caller could reach
+either. Neither adapter gets an HTTP surface; the existing MCP tool surface is the only entry
+point, taking it from 58 to **67 tools**.
+
+- **Stage 9, A2A (5 tools):** `a2a_agent_card`, `a2a_task_import`, `a2a_task_export`,
+  `a2a_message_import`, `a2a_artifact_import`.
+- **Stage 10, MCP Tasks (4 tools):** `mcp_tasks_get`, `mcp_tasks_update`, `mcp_tasks_cancel`,
+  `mcp_tasks_import`.
+
+The import tools translate *and* persist - they create the coordination record and store the
+raw wire JSON verbatim as a `protocol_envelope` artifact - because the envelope-as-artifact
+audit trail only exists if something writes it. The envelope's idempotency key is a BLAKE3 hash
+of the exact bytes, so the caller's raw string is passed through untouched: parsing it for
+conversion and re-serializing to write the envelope would change key order and whitespace, and
+therefore the key.
+
+Idempotency matches on `(created_by, idempotency_key)` alone, so a replay returns the task the
+*first* payload created. Both import tools report `replayed`, and refuse a replay whose stored
+state disagrees with the state the current payload maps to - reporting the new payload's state
+as though it had been applied, or filing a second envelope contradicting the first, would
+misrepresent the stored task.
+
+See "Deviations from this design" entries 34-37 below for what changed relative to Stages 5 and
+6 as written.
+
+## Deviations from this design (Stages 7–10)
+
+34. **`CoordinationStore::import_task` exists.** Stage 5's section above instructs the caller to
+    reach `target_state` by claiming and then transitioning. That instruction was wrong to ship:
+    `allowed_transition` has no `Pending -> Running` edge, and the only route into `Running` is
+    `claim_task`, so landing an inbound `completed` or `failed` task that way means fabricating a
+    claim by a worker that never existed - audit history asserting something that did not happen.
+    An import is a *creation*, not a lifecycle event, so `import_task` creates directly in the
+    mapped state, records it on the `task_created` event with an `imported` marker, and rejects
+    `TaskState::Expired` as an initial state. `NewTask` gains no field: it deserializes straight
+    from tool arguments, so a new field would silently widen the public `mempalace_task_create`
+    wire schema. The module docs in `mempalace-a2a::task` and `mempalace-mcp-tasks::detailed_task`
+    were rewritten to match; the claim-then-transition text there is gone.
+
+35. **All nine adapter tools are `LocalOnly`.** Translate-and-persist is a two-write sequence
+    (the record, then the envelope artifact) with no remote transaction to make it atomic, so no
+    remote path is offered rather than one that can half-apply. `mempalace_coordination_event_get`
+    is the existing precedent for a coordination tool that stays local.
+
+36. **The Stage 8 refusal is not skippable in the ID-keyed fallbacks.** Those fallbacks have no
+    wing available before sending, so they get no pre-flight check and rely on the server-side
+    422. That status is deliberately not in the skippable set (only 404, `CapabilityMissing`, and
+    `Unreachable` for reads), so it surfaces as a hard error rather than silently trying the next
+    remote.
+
+37. **MCP Tasks needs two edges the storage state machine does not have.** `mempalace_mcp_tasks_get`
+    shows a `Pending` task as `working`, so an MCP-only client must be able to advance it:
+    `mempalace_mcp_tasks_update` bridges `Pending -> Running` by claiming first and reports
+    `bridged_from_pending`. And since there is no self-transition edge, re-sending the status a
+    task already holds is treated as a no-op (`no_op: true`) rather than an error - but that path
+    still checks `expected_revision` and still enforces ownership, because `transition_task`'s
+    owner check runs *after* `allowed_transition` and would otherwise be skipped entirely.
+    `mempalace_mcp_tasks_cancel` needs no such ownership check: `transition_task` exempts
+    `Cancelled` from the owner rule.
+
 ## Documentation
 
 Per [CLAUDE.md](../CLAUDE.md), docs ship in the same PR as the behaviour, not after:
@@ -1134,16 +1234,27 @@ route precedence with the diary override applied last, when the code short-circu
 first; and it omits that plain `http://` is rejected for non-loopback hosts, which is a hard
 config-load failure.
 
-## Open questions
+## Open questions — all answered
 
-1. Should `wing_unscoped` tasks be federatable at all, or refused until re-homed to a real wing?
-2. Should `coordination_claim` imply `coordination_write`, or must a worker token carry both?
-3. Does the A2A adapter need its own HTTP surface, or is it a translation layer over the
-   existing `/v1/coordination/*` routes?
+Decided with Dion on 2026-09-02, after Stages 1-6 had merged.
 
-   A proposed answer is written up in [A2A-Broker-Design.html](A2A-Broker-Design.html):
-   MemPalace is a broker rather than an A2A peer, so the palace is the single addressable
-   endpoint and each registered agent is an `AgentInterface.tenant` behind it. That resolves
-   deviation 25 without an endpoint per agent, and splits "the A2A adapter" into an inbound
-   broker surface and an outbound HTTP client that need separate work. **Proposal only —
-   agreed in conversation, not implemented, and not yet ratified into this design.**
+1. **Should `wing_unscoped` tasks be federatable at all, or refused until re-homed to a real
+   wing?** *Refused*, including exclusion from the aggregate feeds. See Stage 8 above; shipped
+   in PR #134.
+
+2. **Should `coordination_claim` imply `coordination_write`, or must a worker token carry
+   both?** *It implies it*, one-way only. See Stage 7 above; shipped in PR #134.
+
+3. **Does the A2A adapter need its own HTTP surface, or is it a translation layer over the
+   existing `/v1/coordination/*` routes?** *Neither, for now.* No broker and no new endpoint —
+   both adapters are reached through the existing MCP tool surface. See Stages 9-10 above;
+   shipped in PR #135.
+
+   The broker proposal in [A2A-Broker-Design.html](A2A-Broker-Design.html) — MemPalace as a
+   broker rather than an A2A peer, with each registered agent an `AgentInterface.tenant` behind
+   one palace endpoint — was **considered and not adopted**. It remains a coherent answer to
+   deviation 25, and the reasoning there still holds if a live A2A transport is ever wanted; it
+   was not adopted because the MCP tool surface already gives every caller MemPalace serves a
+   way to reach the adapters, without standing up an inbound broker surface and an outbound HTTP
+   client. Deviation 25 therefore stands: the Agent Card is not spec-compliant for a live A2A
+   transport, and `interfaces` must be caller-supplied.

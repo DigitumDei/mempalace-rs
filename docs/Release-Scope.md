@@ -166,7 +166,7 @@ Added after the initial v1 freeze; now part of the shipped surface.
 - REST surface under `/v1`: `info`, `drawers` (search, check_duplicate, add, list,
   get, delete), `kg` (query, facts, facts/invalidate, timeline, stats), `taxonomy`,
   `wings`, `rooms`, `changes`, `ingest/batch` (bulk mined-chunk ingest), and — added in
-  issue #102 Stage 3 — `coordination` (tasks: create/get/claim/renew/transition; messages:
+  issue #102 Stage 3 — `coordination` (tasks: create/list/get/claim/renew/transition; messages:
   send/get/ack, inbox; artifacts: put/get; results: put/get; events: the cursor-paginated
   audit feed). See [Federation §1.4](Federation.md#14-rest-surface).
 - Client routing (`federation` config section): per-wing and KG `local` / `remote`

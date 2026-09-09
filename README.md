@@ -71,7 +71,7 @@ The [Quickstart guide](docs/Quickstart.md) covers source builds, conversation im
 | `mempalace-dialect` | AAAK dialect encoding/decoding |
 | `mempalace-import` | Migration from Python palace state |
 | `mempalace-federation` | Shared wire DTOs for the federation REST API |
-| `mempalace-server` | Axum federation REST server (`mempalace serve`) |
+| `mempalace-server` | Axum federation REST server (`mempalace-cli serve`) |
 | `mempalace-remote` | Federation HTTP client (RemoteApi trait + RemoteClient) |
 | `mempalace-a2a` | A2A protocol adapter: translation library between A2A and coordination storage |
 | `mempalace-mcp-tasks` | MCP Tasks extension adapter: translation library between `io.modelcontextprotocol/tasks` and coordination storage |

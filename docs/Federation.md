@@ -173,6 +173,7 @@ requires `Authorization: Bearer <token>`.
 | `GET /v1/changes` | Change-event feed (cursor-paginated) |
 | `POST /v1/ingest/batch` | Bulk mined-chunk ingest (16 MiB body limit) |
 | `POST /v1/coordination/tasks` | Create a task |
+| `GET /v1/coordination/tasks` | Discover/list tasks (cursor-paginated) |
 | `GET /v1/coordination/tasks/{id}` | Get one task |
 | `POST /v1/coordination/tasks/{id}/claim` | Claim a task (or reclaim an expired lease) |
 | `POST /v1/coordination/tasks/{id}/renew` | Renew a live lease |
@@ -191,7 +192,9 @@ requires `Authorization: Bearer <token>`.
 a client checks before attempting federated mining, and the `"coordination"`
 capability (added in issue #102 Stage 3) is what a client would check before
 calling any `/v1/coordination/*` route — see
-[Part 7](#part-7--federated-coordination). The `"idempotent_mutations"`
+[Part 7](#part-7--federated-coordination). The `"coordination_task_list"`
+capability (added in issue #141) indicates support for cursor-paginated
+`GET /v1/coordination/tasks` task discovery. The `"idempotent_mutations"`
 capability (added in issue #127) is what the durable replication worker checks
 before delivering an outbox operation: a remote that does not advertise it can
 only be reached by non-replicated legacy writes, because there would be no way

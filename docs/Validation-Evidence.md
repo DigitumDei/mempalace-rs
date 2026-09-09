@@ -198,8 +198,8 @@ Recorded here so the dated evidence above is not mistaken for current state:
 | Finding 1 — `rust-version = "1.85"` is stale | Resolved. The workspace declares `rust-version = "1.88"`. |
 | Finding 4 — `mempalace-rs-storage.yml` did not run | Obsolete. That workflow no longer exists; [`ci.yml`](../.github/workflows/ci.yml) runs on every PR with no `paths:` filter. |
 | `build-and-package` job | Renamed and split. Package tests fan out per crate into `release-gate`, which gates the `release-host` build matrix. |
-| 19 MCP tools | 43 tools at the time of that historical run. The current surface is 58 tools; see [Release Scope](Release-Scope.md#mcp-tool-surface-58-tools). |
-| 6 crates under test | 14 crates. See the package list in [CLAUDE.md](../CLAUDE.md#test). |
+| 19 MCP tools | 43 tools at the time of that historical run. The current surface is 69 tools; see [Release Scope](Release-Scope.md#mcp-tool-surface-69-tools). |
+| 6 crates under test | 16 crates. See the package list in [CLAUDE.md](../CLAUDE.md#test). |
 | CLI surface (`init`/`mine`/`search`/`status`/`wake-up`) | Also `project`, `prune`, `setup`, `maintain`, and `serve`. See [CLI Surface](CLI-Surface.md). |
 
 Finding 3 (offline-by-default embeddings with an explicit

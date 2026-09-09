@@ -315,7 +315,7 @@ routing:
 ## Server Config
 
 The optional `server` section of `~/.mempalace/config.json` configures the
-federation HTTP server started by `mempalace serve`.
+federation HTTP server started by `mempalace-cli serve`.
 
 ### Shape
 

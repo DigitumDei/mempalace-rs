@@ -1020,6 +1020,12 @@ regardless of any `federation.coordination` entry.
 }
 ```
 
+When `mempalace_task_create` omits `wing`, it uses the configured coordination default. If no
+default is configured, it uses `wing_local_tasks`, whose coordination write route is pinned to
+the local palace even when `federation.default_mode` is `remote` or `combined`. Explicit
+`wing_local_tasks` is pinned locally by the same rule; other explicit wings continue through the
+normal coordination routing rules unchanged.
+
 **The routed wing is normalised before either the diary check or the table lookup runs.**
 `mempalace_task_create` calls `WingId::normalized` on the caller-supplied wing once, up front,
 and uses that canonical value for the route decision *and* for the outgoing request (local or
@@ -1184,6 +1190,13 @@ returned by the same four discovery tools whenever federation has remotes config
   "coordination_availability": { "wing_code": "remote:work", "wing_myproject": "local", "wing_tasks": "local" }
 }
 ```
+
+The dedicated `mempalace_coordination_wings` tool supplements this partial discovery. It reports
+locally known coordination wings from local task/event records and configured routes, always
+including the effective default, with each wing's effective write destination, default marker,
+and provenance. Legacy `wing_unscoped` rows are excluded because that reserved wing is not a
+usable named coordination wing. This is a local read and does not exhaustively scan remote
+palaces.
 
 - `mempalace_status`, `mempalace_list_wings`, `mempalace_list_rooms`, and `mempalace_get_taxonomy`
   all emit it, exactly like `wing_availability`.

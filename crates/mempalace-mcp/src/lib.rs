@@ -16,7 +16,10 @@ use mempalace_a2a::{
     artifact_to_a2a_artifact, build_agent_card, envelope_artifact as a2a_envelope_artifact,
     task_to_a2a_task,
 };
-use mempalace_config::{ConfigLoader, MempalaceConfig, ReplicationStatus, RouteMode, WriteTarget};
+use mempalace_config::{
+    ConfigLoader, DEFAULT_COORDINATION_WING, MempalaceConfig, ReplicationStatus, RouteMode,
+    WriteTarget,
+};
 use mempalace_core::{
     DIARY_HALL, DIARY_ROOM, DIARY_SUMMARY_MAX_CHARS, DIARY_TOPIC_PREFIX, DrawerId, DrawerRecord,
     EmbeddingProfile, RoomId, SHARED_AGENT_DIARY_WING, SearchQuery, WingId,
@@ -256,6 +259,7 @@ enum ToolName {
     WakeUp,
     Status,
     ListWings,
+    CoordinationWings,
     ListRooms,
     GetTaxonomy,
     GetAaaKSpec,
@@ -324,11 +328,12 @@ enum ToolName {
 }
 
 impl ToolName {
-    fn all() -> [Self; 68] {
+    fn all() -> [Self; 69] {
         [
             Self::WakeUp,
             Self::Status,
             Self::ListWings,
+            Self::CoordinationWings,
             Self::ListRooms,
             Self::GetTaxonomy,
             Self::GetAaaKSpec,
@@ -402,6 +407,7 @@ impl ToolName {
             Self::WakeUp => "mempalace_wake_up",
             Self::Status => "mempalace_status",
             Self::ListWings => "mempalace_list_wings",
+            Self::CoordinationWings => "mempalace_coordination_wings",
             Self::ListRooms => "mempalace_list_rooms",
             Self::GetTaxonomy => "mempalace_get_taxonomy",
             Self::GetAaaKSpec => "mempalace_get_aaak_spec",
@@ -504,6 +510,12 @@ impl ToolName {
                 description: "List all wings with drawer counts. When federation is active, includes `wing_availability` (drawer routing) and `coordination_availability` (task placement: local or remote) per wing.",
                 input_schema: json!({"type":"object","properties":{}}),
             },
+            Self::CoordinationWings => coordination_definition(
+                self,
+                "Discover coordination task wings known locally from coordination tasks and audit events, plus configured coordination routes and the effective default. Each entry reports the destination where a newly created task would be written (`local` or `remote:<name>`), whether it is the default, and provenance (`configured`, `in_use`, and/or `built_in`). The legacy `wing_unscoped` wing is excluded because it is not a coordination task wing. This is local discovery; it does not query a remote wing catalog.",
+                json!({}),
+                &[],
+            ),
             Self::ListRooms => ToolDefinition {
                 name: self.as_str(),
                 description: "List rooms within a wing (or all rooms if no wing given). When federation is active, includes `wing_availability` (drawer routing) and `coordination_availability` (task placement: local or remote) per wing.",
@@ -725,9 +737,9 @@ impl ToolName {
             },
             Self::TaskCreate => coordination_definition(
                 self,
-                "Create a durable task idempotently in the given wing. Replaying the same created_by and idempotency_key returns the committed task. wing is normalised on write (myproject and wing_myproject are the same wing) and is inherited by every message, artifact, result, and audit event this task produces.",
-                json!({"title":{"type":"string"},"description":{"type":"string"},"created_by":{"type":"string"},"wing":{"type":"string","description":"Owning wing, e.g. wing_myproject. Normalised on write."},"idempotency_key":{"type":"string"},"parent_id":{"type":"string"},"dependencies":{"type":"array","items":{"type":"string"}},"budget":{},"expires_at":{"type":"string"}}),
-                &["title", "description", "created_by", "wing", "idempotency_key"],
+                "Create a durable task idempotently in the given wing. Replaying the same created_by and idempotency_key returns the committed task. wing is normalised on write (myproject and wing_myproject are the same wing) and is inherited by every message, artifact, result, and audit event this task produces. If wing is omitted, the configured coordination.default_wing is used, falling back to the built-in wing_local_tasks.",
+                json!({"title":{"type":"string"},"description":{"type":"string"},"created_by":{"type":"string"},"wing":{"type":"string","description":"Owning wing, e.g. wing_myproject. Normalised on write. Omit to use coordination.default_wing or wing_local_tasks."},"idempotency_key":{"type":"string"},"parent_id":{"type":"string"},"dependencies":{"type":"array","items":{"type":"string"}},"budget":{},"expires_at":{"type":"string"}}),
+                &["title", "description", "created_by", "idempotency_key"],
             ),
             Self::TaskList => coordination_definition(
                 self,
@@ -1101,6 +1113,7 @@ impl ToolName {
             | Self::DelegationCheckpointAppend
             | Self::DelegationCheckpointGet
             | Self::DelegationTrace
+            | Self::CoordinationWings
             // No wire counterpart to route to — see `ToolRoutingCategory::RoutableCoordination`.
             | Self::CoordinationEventGet
             // Protocol-adapter tools (issue #102 Stages 9-10): translate-and-persist is a
@@ -1385,6 +1398,7 @@ where
                 ToolName::CoordinationEventGet => {
                     runtime.tool_coordination_event_get(&call.arguments).await
                 }
+                ToolName::CoordinationWings => runtime.tool_coordination_wings().await,
                 ToolName::SkillPropose => runtime.tool_skill_propose(&call.arguments).await,
                 ToolName::SkillGet => runtime.tool_skill_get(&call.arguments).await,
                 ToolName::SkillVersions => runtime.tool_skill_versions(&call.arguments).await,
@@ -2711,6 +2725,53 @@ where
             }
         }
         Ok(payload)
+    }
+
+    /// Discover coordination wings from local records and configured routes.
+    async fn tool_coordination_wings(&mut self) -> ToolResult<Value> {
+        let in_use = self.coordination.list_wings().map_tool_internal()?;
+        let default_wing = self
+            .config
+            .federation
+            .coordination_default_wing
+            .as_deref()
+            .unwrap_or(DEFAULT_COORDINATION_WING);
+        let mut provenance = BTreeMap::<String, BTreeSet<String>>::new();
+        for wing in in_use {
+            provenance.entry(wing).or_default().insert("in_use".to_owned());
+        }
+        for wing in self.config.federation.coordination.keys() {
+            provenance.entry(wing.clone()).or_default().insert("configured".to_owned());
+        }
+        provenance.entry(default_wing.to_owned()).or_default();
+        for (wing, sources) in &mut provenance {
+            if wing == default_wing && self.config.federation.coordination_default_wing.is_some() {
+                sources.insert("configured".to_owned());
+            }
+            if wing == DEFAULT_COORDINATION_WING {
+                sources.insert("built_in".to_owned());
+            }
+        }
+        let wings = provenance
+            .into_iter()
+            .map(|(wing, sources)| {
+                let destination = self
+                    .federation
+                    .as_ref()
+                    .map_or_else(|| "local".to_owned(), |router| router.coordination_destination(&wing));
+                let sources = ["configured", "in_use", "built_in"]
+                    .into_iter()
+                    .filter(|source| sources.contains(*source))
+                    .collect::<Vec<_>>();
+                json!({
+                    "wing": wing,
+                    "destination": destination,
+                    "is_default": wing == default_wing,
+                    "provenance": sources,
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(json!({"wings": wings}))
     }
 
     async fn tool_list_rooms(&mut self, arguments: &Value) -> ToolResult<Value> {
@@ -4427,7 +4488,22 @@ where
     /// comment in `federation.rs` for why. `write` can only ever resolve to `Local` or
     /// `Remote` here, never `Both` (rejected at config load).
     async fn tool_task_create(&mut self, arguments: &Value) -> ToolResult<Value> {
-        let mut input: NewTask = parse_coordination_input(arguments)?;
+        let mut task_arguments = arguments.clone();
+        if let Some(object) = task_arguments.as_object_mut() {
+            if !object.contains_key("wing") {
+                object.insert(
+                    "wing".to_owned(),
+                    json!(
+                        self.config
+                            .federation
+                            .coordination_default_wing
+                            .as_deref()
+                            .unwrap_or(DEFAULT_COORDINATION_WING)
+                    ),
+                );
+            }
+        }
+        let mut input: NewTask = parse_coordination_input(&task_arguments)?;
         // Normalise the wing once, up front, and use that canonical value for BOTH the routing
         // decision and the outgoing request (local or remote). `resolve_coordination_route` is
         // keyed on the raw string it is given; routing on the un-normalised caller input would
@@ -4442,7 +4518,7 @@ where
             let route = router.resolve_coordination_route(input.wing.as_str());
             if router.resolve_write_target(&route) == WriteTarget::Remote {
                 let remote_name = route.remote.clone().unwrap_or_else(|| "remote".to_owned());
-                let mut req: WireNewTaskRequest = serde_json::from_value(arguments.clone())
+                let mut req: WireNewTaskRequest = serde_json::from_value(task_arguments.clone())
                     .map_err(|e| ToolError::InvalidParams(e.to_string()))?;
                 req.wing = input.wing.clone();
                 return router.coordination_task_create_remote(&remote_name, req).await;
@@ -6994,7 +7070,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn task_create_requires_a_wing() {
+    async fn task_create_omits_wing_and_uses_builtin_default() {
         let harness = test_harness().await;
         let response = harness
             .server
@@ -7007,15 +7083,110 @@ mod tests {
                 }),
             ))
             .await;
-        // A bare `error.is_some()` would also pass for an unrelated failure, so check the
-        // message actually names the missing field rather than just that *something* failed.
-        let message = response["error"]["message"]
-            .as_str()
-            .unwrap_or_else(|| panic!("expected a tool error naming `wing`, got: {response}"));
-        assert!(
-            message.contains("wing"),
-            "error message must name the missing `wing` field, got: {message}"
-        );
+        let task = decode_tool_payload(&response).expect("defaulted task payload");
+        assert_eq!(task["wing"], "wing_local_tasks");
+    }
+
+    #[tokio::test]
+    async fn task_create_rejects_non_object_arguments_without_panicking() {
+        let harness = test_harness().await;
+        let response = harness
+            .server
+            .handle_request(tool_call(910, "mempalace_task_create", json!([])))
+            .await;
+        assert_eq!(response["error"]["code"], -32602);
+        assert!(response["error"]["message"].is_string());
+    }
+
+    #[tokio::test]
+    async fn task_create_rejects_blank_and_null_wings() {
+        let harness = test_harness().await;
+        for (id, wing) in [(911, json!("   ")), (912, Value::Null)] {
+            let response = harness
+                .server
+                .handle_request(tool_call(
+                    id,
+                    "mempalace_task_create",
+                    json!({
+                        "title":"Research", "description":"Produce a result", "created_by":"manager",
+                        "wing":wing, "idempotency_key":format!("malformed-wing-{id}")
+                    }),
+                ))
+                .await;
+            assert_eq!(response["error"]["code"], -32602, "response: {response}");
+            assert!(response["error"]["message"].is_string());
+        }
+    }
+
+    #[tokio::test]
+    async fn coordination_wings_empty_palace_reports_builtin_local_default() {
+        let tempdir = TempDir::new().unwrap();
+        let palace_path = tempdir.path().join("palace");
+        let config = make_base_config(&palace_path, &tempdir);
+        let server = McpServer::from_parts(
+            config,
+            DeterministicStubProvider::new(EmbeddingProfile::Balanced),
+        )
+        .await
+        .unwrap();
+        let response = server
+            .handle_request(tool_call(913, "mempalace_coordination_wings", json!({})))
+            .await;
+        let payload = decode_tool_payload(&response).expect("discovery payload");
+        let wings = payload["wings"].as_array().expect("wings array");
+        assert_eq!(wings.len(), 1, "empty palace discovery: {payload}");
+        assert_eq!(wings[0]["wing"], DEFAULT_COORDINATION_WING);
+        assert_eq!(wings[0]["destination"], "local");
+        assert_eq!(wings[0]["is_default"], true);
+        assert_eq!(wings[0]["provenance"], json!(["built_in"]));
+    }
+
+    #[tokio::test]
+    async fn coordination_wings_marks_configured_default_without_route() {
+        let mut federation = FederationRuntimeConfig::default();
+        federation.coordination_default_wing = Some("wing_custom_default".to_owned());
+        let harness = test_harness_with_federation(federation).await;
+        let response = harness
+            .server
+            .handle_request(tool_call(914, "mempalace_coordination_wings", json!({})))
+            .await;
+        let payload = decode_tool_payload(&response).expect("discovery payload");
+        let entry = payload["wings"]
+            .as_array()
+            .and_then(|wings| wings.iter().find(|wing| wing["wing"] == "wing_custom_default"))
+            .expect("configured default must be discoverable");
+        assert_eq!(entry["destination"], "local");
+        assert_eq!(entry["is_default"], true);
+        assert_eq!(entry["provenance"], json!(["configured"]));
+    }
+
+    #[tokio::test]
+    async fn coordination_wings_discovers_task_only_wing_as_in_use() {
+        let harness = test_harness().await;
+        let created = harness
+            .server
+            .handle_request(tool_call(
+                915,
+                "mempalace_task_create",
+                json!({
+                    "title":"Task-only wing", "description":"discover me", "created_by":"manager",
+                    "wing":"task_only", "idempotency_key":"task-only-wing-1"
+                }),
+            ))
+            .await;
+        assert_eq!(decode_tool_payload(&created).expect("created task")["wing"], "wing_task_only");
+        let response = harness
+            .server
+            .handle_request(tool_call(916, "mempalace_coordination_wings", json!({})))
+            .await;
+        let payload = decode_tool_payload(&response).expect("discovery payload");
+        let entry = payload["wings"]
+            .as_array()
+            .and_then(|wings| wings.iter().find(|wing| wing["wing"] == "wing_task_only"))
+            .expect("task wing must be discoverable");
+        assert_eq!(entry["destination"], "local");
+        assert_eq!(entry["is_default"], false);
+        assert_eq!(entry["provenance"], json!(["in_use"]));
     }
 
     #[tokio::test]
@@ -7024,7 +7195,7 @@ mod tests {
         let created = harness
             .server
             .handle_request(tool_call(
-                910,
+                917,
                 "mempalace_task_create",
                 json!({
                     "title":"Research", "description":"Produce a result", "created_by":"manager",
@@ -7077,6 +7248,7 @@ mod tests {
                 wings: BTreeMap::new(),
                 kg: None,
                 coordination: BTreeMap::new(),
+                coordination_default_wing: None,
             };
             let router = FederationRouter::with_remotes(rules, remotes);
             let harness = test_harness_with_mock_router(router).await;
@@ -7144,6 +7316,7 @@ mod tests {
             wings: BTreeMap::new(),
             kg: None,
             coordination,
+            coordination_default_wing: None,
         };
         let router = FederationRouter::with_remotes(rules, remotes);
         let harness = test_harness_with_mock_router(router).await;
@@ -7202,6 +7375,7 @@ mod tests {
             wings: BTreeMap::new(),
             kg: None,
             coordination,
+            coordination_default_wing: None,
         };
         (FederationRouter::with_remotes(rules, remotes), calls)
     }
@@ -7414,6 +7588,7 @@ mod tests {
             wings: BTreeMap::new(),
             kg: None,
             coordination,
+            coordination_default_wing: None,
         };
         (FederationRouter::with_remotes(rules, remotes), hub_calls, other_calls)
     }
@@ -12609,6 +12784,7 @@ mod tests {
                 write: WriteTarget::Remote,
             }),
             coordination: BTreeMap::new(),
+            coordination_default_wing: None,
         };
         FederationRouter::with_remotes(rules, remotes)
     }
@@ -13110,6 +13286,7 @@ mod tests {
             .into(),
             kg: None,
             coordination: BTreeMap::new(),
+            coordination_default_wing: None,
         }
     }
 
@@ -14034,6 +14211,7 @@ mod tests {
                 write: WriteTarget::Both,
             }),
             coordination: BTreeMap::new(),
+            coordination_default_wing: None,
         };
 
         let harness = test_harness_with_federation(federation).await;
@@ -14153,6 +14331,7 @@ mod tests {
                 write: WriteTarget::Both,
             }),
             coordination: BTreeMap::new(),
+            coordination_default_wing: None,
         };
 
         let harness = test_harness_with_federation(federation).await;
@@ -14253,6 +14432,7 @@ mod tests {
                 write: WriteTarget::Both,
             }),
             coordination: BTreeMap::new(),
+            coordination_default_wing: None,
         };
         let harness = test_harness_with_federation(federation).await;
 

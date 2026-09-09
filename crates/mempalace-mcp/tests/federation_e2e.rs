@@ -22,7 +22,7 @@ use mempalace_config::{
 use mempalace_core::EmbeddingProfile;
 use mempalace_federation::{DrawerSearchRequest, KgQueryRequest};
 use mempalace_mcp::{DeterministicStubProvider, JsonRpcRequest, McpServer, decode_tool_payload};
-use mempalace_remote::{RemoteApi, RemoteClient, RemoteEndpoint};
+use mempalace_remote::{RemoteApi, RemoteClient, RemoteEndpoint, RemoteError};
 use mempalace_server::{TokenRegistry, build_router};
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -138,6 +138,7 @@ async fn mcp_server_with_hub(
         wings: wing_rules,
         kg: kg_rule,
         coordination: BTreeMap::new(),
+        coordination_default_wing: None,
     };
 
     let config = MempalaceConfig {
@@ -192,6 +193,28 @@ async fn mcp_server_with_hub_multi(
     coordination_rules: BTreeMap<String, ResolvedRouteRule>,
     default_mode: RouteMode,
 ) -> McpServer<DeterministicStubProvider> {
+    mcp_server_with_hub_multi_default(
+        local_dir,
+        remotes,
+        wing_rules,
+        coordination_rules,
+        default_mode,
+        None,
+    )
+    .await
+}
+
+/// General federation helper with an optional configured coordination default wing.
+/// Keeping the option here lets existing scenarios retain the built-in default while tests
+/// exercising config provenance can opt into the same runtime shape produced by the loader.
+async fn mcp_server_with_hub_multi_default(
+    local_dir: &TempDir,
+    remotes: &[(&str, &str)],
+    wing_rules: BTreeMap<String, ResolvedRouteRule>,
+    coordination_rules: BTreeMap<String, ResolvedRouteRule>,
+    default_mode: RouteMode,
+    coordination_default_wing: Option<&str>,
+) -> McpServer<DeterministicStubProvider> {
     let mut resolved_remotes = BTreeMap::new();
     for (name, url) in remotes {
         resolved_remotes.insert(
@@ -216,6 +239,7 @@ async fn mcp_server_with_hub_multi(
         wings: wing_rules,
         kg: None,
         coordination: coordination_rules,
+        coordination_default_wing: coordination_default_wing.map(str::to_owned),
     };
 
     let config = MempalaceConfig {
@@ -770,6 +794,7 @@ async fn different_embedding_profiles_per_side() {
         wings: wing_rules,
         kg: None,
         coordination: BTreeMap::new(),
+        coordination_default_wing: None,
     };
 
     let local_config = MempalaceConfig {
@@ -913,6 +938,7 @@ async fn remote_down_degrades_reads() {
         wings: wing_rules,
         kg: kg_rule,
         coordination: BTreeMap::new(),
+        coordination_default_wing: None,
     };
 
     let config = MempalaceConfig {
@@ -1359,6 +1385,7 @@ async fn wake_up_with_down_remote_marks_unreachable_and_succeeds() {
         wings: BTreeMap::new(),
         kg: None,
         coordination: BTreeMap::new(),
+        coordination_default_wing: None,
     };
 
     let config = MempalaceConfig {
@@ -1918,6 +1945,7 @@ async fn add_drawer_both_replication_fails_with_remote_rejection() {
         wings: wing_rules,
         kg: None,
         coordination: BTreeMap::new(),
+        coordination_default_wing: None,
     };
 
     let config = MempalaceConfig {
@@ -2145,6 +2173,7 @@ async fn add_drawer_both_near_duplicate_same_wing_room_rejected() {
         wings: wing_rules,
         kg: None,
         coordination: BTreeMap::new(),
+        coordination_default_wing: None,
     };
 
     let config = MempalaceConfig {
@@ -2274,6 +2303,7 @@ async fn add_drawer_both_retry_reuses_local_drawer_and_replicates() {
         wings: wing_rules_a,
         kg: None,
         coordination: BTreeMap::new(),
+        coordination_default_wing: None,
     };
     let config_a = MempalaceConfig {
         schema_version: 1,
@@ -2369,6 +2399,7 @@ async fn add_drawer_both_retry_reuses_local_drawer_and_replicates() {
         wings: wing_rules_b,
         kg: None,
         coordination: BTreeMap::new(),
+        coordination_default_wing: None,
     };
     let config_b = MempalaceConfig {
         schema_version: 1,
@@ -2531,6 +2562,7 @@ async fn delete_both_retry_after_local_delete_replays_same_operation() {
         wings: wing_rules,
         kg: None,
         coordination: BTreeMap::new(),
+        coordination_default_wing: None,
     };
     let config = MempalaceConfig {
         schema_version: 1,
@@ -2647,6 +2679,7 @@ async fn delete_both_retry_after_restart_replays_same_operation() {
         wings: BTreeMap::from([(wing.to_owned(), combined_wing_rule_both_write())]),
         kg: None,
         coordination: BTreeMap::new(),
+        coordination_default_wing: None,
     };
     let make_config = || MempalaceConfig {
         schema_version: 1,
@@ -2774,6 +2807,7 @@ async fn add_drawer_both_replication_fails_with_down_remote() {
         wings: wing_rules,
         kg: None,
         coordination: BTreeMap::new(),
+        coordination_default_wing: None,
     };
 
     let config = MempalaceConfig {
@@ -2937,6 +2971,7 @@ async fn kg_add_both_replication_fails_with_down_remote() {
         wings: BTreeMap::new(),
         kg: Some(combined_kg_rule_both_write()),
         coordination: BTreeMap::new(),
+        coordination_default_wing: None,
     };
 
     let config = MempalaceConfig {
@@ -3150,6 +3185,7 @@ async fn kg_invalidate_both_replication_fails_with_down_remote() {
         wings: BTreeMap::new(),
         kg: Some(combined_kg_rule_both_write()),
         coordination: BTreeMap::new(),
+        coordination_default_wing: None,
     };
 
     let config = MempalaceConfig {
@@ -3446,6 +3482,7 @@ async fn kg_add_both_replication_fails_with_remote_rejection() {
         wings: BTreeMap::new(),
         kg: Some(combined_kg_rule_both_write()),
         coordination: BTreeMap::new(),
+        coordination_default_wing: None,
     };
 
     let config = MempalaceConfig {
@@ -3567,6 +3604,7 @@ async fn kg_invalidate_both_replication_fails_with_remote_rejection() {
         wings: BTreeMap::new(),
         kg: Some(combined_kg_rule_both_write()),
         coordination: BTreeMap::new(),
+        coordination_default_wing: None,
     };
 
     let config = MempalaceConfig {
@@ -3707,6 +3745,141 @@ async fn coordination_task_create_routes_to_remote_when_wing_configured_remote()
         local_get["value"]["origin"], "remote:hub",
         "and must be reported as coming from the hub, not local: {local_get}"
     );
+}
+
+/// An omitted wing must use the configured default at the MCP boundary, and the canonical wing
+/// must be the one sent over the federation wire. Checking the hub's stored DTO proves both the
+/// placement and the wire value independently of the local response annotation.
+#[tokio::test]
+async fn coordination_task_create_omitted_wing_uses_configured_remote_default() {
+    let local_dir = TempDir::new().unwrap();
+    let hub_dir = TempDir::new().unwrap();
+    let hub_addr = spawn_server(&hub_dir).await;
+    let hub_url = format!("http://{hub_addr}");
+
+    let mut coordination_rules = BTreeMap::new();
+    coordination_rules.insert("wing_remote_default".to_owned(), remote_wing_rule());
+    let server = mcp_server_with_hub_multi_default(
+        &local_dir,
+        &[("hub", hub_url.as_str())],
+        BTreeMap::new(),
+        coordination_rules,
+        RouteMode::Local,
+        Some("wing_remote_default"),
+    )
+    .await;
+
+    let response = call_tool(
+        &server,
+        1,
+        "mempalace_task_create",
+        json!({
+            "title": "default remote task",
+            "description": "created without a wing",
+            "idempotency_key": "e2e-configured-default-1",
+            "created_by": "alice",
+        }),
+    )
+    .await;
+    assert_eq!(response["applied_to"], "remote:hub", "configured default must route remotely: {response}");
+    let task_id = response["task_id"].as_str().expect("remote response must include task_id");
+
+    let stored = hub_client(&hub_url).coordination_task_get(task_id).await.unwrap();
+    assert_eq!(stored.wing, "wing_remote_default");
+    assert_eq!(stored.title, "default remote task");
+    let observed = call_tool(&server, 2, "mempalace_task_get", json!({"task_id": task_id})).await;
+    assert_eq!(observed["found"], true);
+    assert_eq!(observed["value"]["origin"], "remote:hub");
+}
+
+/// The built-in owning wing is deliberately local, even when the federation's global default is
+/// remote. This guards the safety boundary for callers that omit `wing` without configuration.
+#[tokio::test]
+async fn coordination_task_create_omitted_wing_builtin_fallback_stays_local() {
+    let local_dir = TempDir::new().unwrap();
+    let hub_dir = TempDir::new().unwrap();
+    let hub_addr = spawn_server(&hub_dir).await;
+    let hub_url = format!("http://{hub_addr}");
+    let server = mcp_server_with_hub_multi(
+        &local_dir,
+        &[("hub", hub_url.as_str())],
+        BTreeMap::new(),
+        BTreeMap::new(),
+        RouteMode::Remote,
+    )
+    .await;
+
+    let response = call_tool(
+        &server,
+        1,
+        "mempalace_task_create",
+        json!({
+            "title": "built-in local task",
+            "description": "created without a configured wing",
+            "idempotency_key": "e2e-builtin-default-1",
+            "created_by": "alice",
+        }),
+    )
+    .await;
+    assert_eq!(response["wing"], "wing_local_tasks");
+    let task_id = response["task_id"].as_str().expect("local response must include task_id");
+    let local = call_tool(&server, 2, "mempalace_task_get", json!({"task_id": task_id})).await;
+    assert_eq!(local["found"], true);
+    assert_eq!(local["value"]["wing"], "wing_local_tasks");
+    assert!(local["value"].get("origin").is_none(), "local task must have no remote origin: {local}");
+    let remote_result = hub_client(&hub_url).coordination_task_get(task_id).await;
+    assert!(
+        matches!(remote_result, Err(RemoteError::RemoteRejected { status: 404, .. })),
+        "built-in local task must not be created on the globally-default remote; got {remote_result:?}"
+    );
+}
+
+/// Discovery must expose configured but currently empty wings with the same destination that
+/// task creation uses. The explicit create then checks that the advertised destination is real.
+#[tokio::test]
+async fn coordination_wings_discovery_matches_empty_configured_wing_placement() {
+    let local_dir = TempDir::new().unwrap();
+    let hub_dir = TempDir::new().unwrap();
+    let hub_addr = spawn_server(&hub_dir).await;
+    let hub_url = format!("http://{hub_addr}");
+
+    let mut coordination_rules = BTreeMap::new();
+    coordination_rules.insert("wing_empty_remote".to_owned(), remote_wing_rule());
+    let server = mcp_server_with_hub_coordination(
+        &local_dir,
+        &hub_url,
+        BTreeMap::new(),
+        coordination_rules,
+        RouteMode::Local,
+    )
+    .await;
+
+    let discovery = call_tool(&server, 1, "mempalace_coordination_wings", json!({})).await;
+    let entry = discovery["wings"]
+        .as_array()
+        .and_then(|wings| wings.iter().find(|wing| wing["wing"] == "wing_empty_remote"))
+        .expect("configured empty wing must be discoverable");
+    assert_eq!(entry["destination"], "remote:hub");
+    assert_eq!(entry["is_default"], false);
+    assert!(entry["provenance"].as_array().unwrap().iter().any(|v| v == "configured"));
+
+    let response = call_tool(
+        &server,
+        2,
+        "mempalace_task_create",
+        json!({
+            "title": "empty configured wing task",
+            "description": "placement cross-check",
+            "wing": "empty_remote",
+            "idempotency_key": "e2e-empty-configured-1",
+            "created_by": "alice",
+        }),
+    )
+    .await;
+    assert_eq!(response["applied_to"], "remote:hub");
+    let task_id = response["task_id"].as_str().expect("remote response must include task_id");
+    let stored = hub_client(&hub_url).coordination_task_get(task_id).await.unwrap();
+    assert_eq!(stored.wing, "wing_empty_remote");
 }
 
 /// A combined-mode exact-ID read: a task created directly on the hub (bypassing the local MCP

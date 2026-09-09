@@ -422,6 +422,14 @@
       "type": "object"
     }
   },
+  "mempalace_coordination_wings": {
+    "description": "Discover coordination task wings known locally from coordination tasks and audit events, plus configured coordination routes and the effective default. Each entry reports the destination where a newly created task would be written (`local` or `remote:<name>`), whether it is the default, and provenance (`configured`, `in_use`, and/or `built_in`). The legacy `wing_unscoped` wing is excluded because it is not a coordination task wing. This is local discovery; it does not query a remote wing catalog.",
+    "input_schema": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    }
+  },
   "mempalace_list_rooms": {
     "description": "List rooms within a wing (or all rooms if no wing given). When federation is active, includes `wing_availability` (drawer routing) and `coordination_availability` (task placement: local or remote) per wing.",
     "input_schema": {

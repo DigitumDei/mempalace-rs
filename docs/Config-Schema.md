@@ -37,6 +37,9 @@ Frozen JSON shape:
     "version_retention_hours": 24,
     "tail_threshold_rows": 1024,
     "small_fragment_threshold": 10
+  },
+  "coordination": {
+    "default_wing": "wing_local_tasks"
   }
 }
 ```
@@ -116,6 +119,18 @@ Validation:
 Validation:
 
 - `idle_secs`, `version_retention_hours`, `tail_threshold_rows`, and `small_fragment_threshold` must be greater than `0` when set in the config file. Zero-valued env overrides are also rejected.
+
+### `coordination`
+
+- Type: object
+- Optional
+- `default_wing`: optional string naming the wing used by `mempalace_task_create` when its
+  `wing` argument is omitted. The value is canonicalised to `wing_*` form and defaults to
+  `wing_local_tasks` when the section or field is absent.
+- A blank, invalid, or reserved `wing_unscoped` value is rejected during config load.
+- The built-in `wing_local_tasks` fallback is pinned to the local palace for task writes,
+  including when `federation.default_mode` is `remote` or `combined`. An explicitly configured
+  default wing follows its normal `federation.coordination` route.
 
 ## Profile Defaults
 

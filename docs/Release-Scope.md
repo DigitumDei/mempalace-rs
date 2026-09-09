@@ -47,11 +47,12 @@ Full flag reference: [CLI Surface](CLI-Surface.md).
 - `balanced`
 - `low_cpu`
 
-### MCP tool surface (68 tools)
+### MCP tool surface (69 tools)
 
 - `mempalace_wake_up`
 - `mempalace_status`
 - `mempalace_list_wings`
+- `mempalace_coordination_wings`
 - `mempalace_list_rooms`
 - `mempalace_get_taxonomy`
 - `mempalace_get_aaak_spec`
@@ -131,8 +132,9 @@ palace-default lineage into an identity packet; model-facing calls cannot select
 See [Self-Continuity Across Models](Self-Continuity.md).
 
 The eight skill-registry tools and the seven delegation-telemetry tools are local-only and
-are not federated. The sixteen coordination tools, by contrast, are federation-aware as of
-issue #102 Stage 4, opt-in per wing via `federation.coordination`: `mempalace_task_create` routes
+are not federated. The coordination task, message, artifact, result, and event tools are
+federation-aware as of issue #102 Stage 4, opt-in per wing via `federation.coordination`:
+`mempalace_task_create` routes
 by the task's wing; every other ID-keyed tool (get/claim/renew/transition, message send/get/ack,
 artifact/result put/get) tries local storage first and falls back to each configured remote in
 name order on a local miss; and the two aggregate feeds (`mempalace_inbox_read`,
@@ -143,6 +145,15 @@ filtered to `wing_agents` never fans out, on either feed. `mempalace-server` exp
 the same scoped-token authorization as every other route. See
 [Native Coordination](Coordination.md), [Federation](Federation.md#part-7--federated-coordination),
 [Skill Registry](Skill-Registry.md), and [Delegation Telemetry](Delegation-Telemetry.md).
+
+`mempalace_coordination_wings` is a local discovery read. It lists the union of wings observed
+in local coordination tasks and events, wings named by configured coordination routes, and the
+effective default wing (even when the local palace has no coordination rows). Each entry reports
+the effective write destination (`local` or `remote:<name>`), an `is_default` marker, and
+provenance markers (`configured`, `in_use`, and `built_in`) identifying configured routes or a
+configured default, local records, and the built-in fallback. The list describes locally known
+scope; legacy `wing_unscoped` rows are excluded as a reserved pre-wing marker; it does not perform
+an exhaustive scan of remote palaces.
 
 ### Federation
 

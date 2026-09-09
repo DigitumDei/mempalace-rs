@@ -194,33 +194,26 @@ impl FederationRouter {
             .collect();
 
         for wing_name in all_wing_names {
-            let rule = self.resolve_coordination_route(wing_name);
-            let write_target = self.resolve_write_target(&rule);
-            let status = match write_target {
-                WriteTarget::Local => "local".to_owned(),
-                WriteTarget::Remote => {
-                    if let Some(name) = &rule.remote {
-                        format_remote_origin(name)
-                    } else {
-                        "remote".to_owned()
-                    }
-                }
-                // Structurally unreachable: `resolve_coordination_route` never returns
-                // `write: both` — `resolve_federation_config` rejects any
-                // `federation.coordination` entry that would resolve to it, at config load
-                // (see `resolve_coordination_route`'s doc comment). Panicking here rather than
-                // silently folding this into `"local"` or `"remote"` is deliberate: either
-                // fallback would misreport where a task actually lands, and a value this
-                // diagnostic exists to make trustworthy must not lie quietly if the load-time
-                // invariant is ever broken.
-                WriteTarget::Both => unreachable!(
-                    "coordination route resolved to WriteTarget::Both for wing `{wing_name}`; \
-                     resolve_federation_config should reject this at config load"
-                ),
-            };
-            avail.insert(wing_name.to_owned(), json!(status));
+            avail.insert(wing_name.to_owned(), json!(self.coordination_destination(wing_name)));
         }
         Value::Object(avail)
+    }
+
+    /// Return the effective destination for a newly created coordination task in `wing`.
+    /// This uses the same route resolver and write-target mapping as task creation.
+    pub fn coordination_destination(&self, wing: &str) -> String {
+        let rule = self.resolve_coordination_route(wing);
+        match self.resolve_write_target(&rule) {
+            WriteTarget::Local => "local".to_owned(),
+            WriteTarget::Remote => rule
+                .remote
+                .as_deref()
+                .map_or_else(|| "remote".to_owned(), format_remote_origin),
+            WriteTarget::Both => unreachable!(
+                "coordination route resolved to WriteTarget::Both for wing `{wing}`; \
+                 resolve_federation_config should reject this at config load"
+            ),
+        }
     }
 
     /// Resolve the route for a drawer operation. Accepts room and source_file so
@@ -3161,6 +3154,7 @@ mod tests {
             wings: BTreeMap::new(),
             kg: None,
             coordination: BTreeMap::new(),
+            coordination_default_wing: None,
         };
         let router_obj = FederationRouter::new(rules);
         let mut wings = BTreeMap::new();
@@ -3194,6 +3188,7 @@ mod tests {
             wings: BTreeMap::new(),
             kg: None,
             coordination,
+            coordination_default_wing: None,
         };
         let router = FederationRouter::new(rules);
 
@@ -3243,6 +3238,7 @@ mod tests {
             wings,
             kg: None,
             coordination,
+            coordination_default_wing: None,
         };
         let router = FederationRouter::new(rules);
         let local_wings: BTreeMap<String, usize> = BTreeMap::new();
@@ -3277,6 +3273,7 @@ mod tests {
             wings: BTreeMap::new(),
             kg: None,
             coordination,
+            coordination_default_wing: None,
         };
         let router = FederationRouter::new(rules);
         let mut local_wings = BTreeMap::new();
@@ -3311,6 +3308,7 @@ mod tests {
             wings: BTreeMap::new(),
             kg: None,
             coordination,
+            coordination_default_wing: None,
         };
         let router = FederationRouter::new(rules);
         let mut local_wings = BTreeMap::new();
@@ -3346,6 +3344,7 @@ mod tests {
             wings: BTreeMap::new(),
             kg: None,
             coordination: BTreeMap::new(),
+            coordination_default_wing: None,
         };
         let router = FederationRouter::new(rules);
         let mut local_wings = BTreeMap::new();
@@ -3377,6 +3376,7 @@ mod tests {
             wings: BTreeMap::new(),
             kg: None,
             coordination,
+            coordination_default_wing: None,
         };
         let router = FederationRouter::new(rules);
         let local_wings: BTreeMap<String, usize> = BTreeMap::new();
@@ -3407,6 +3407,7 @@ mod tests {
             wings: BTreeMap::new(),
             kg: None,
             coordination,
+            coordination_default_wing: None,
         };
         let router = FederationRouter::new(rules);
         let local_wings: BTreeMap<String, usize> = BTreeMap::new();
@@ -3437,6 +3438,7 @@ mod tests {
             wings: BTreeMap::new(),
             kg: None,
             coordination,
+            coordination_default_wing: None,
         };
         let router = FederationRouter::new(rules);
         let local_wings: BTreeMap<String, usize> = BTreeMap::new();
@@ -3463,6 +3465,7 @@ mod tests {
             wings: BTreeMap::new(),
             kg: None,
             coordination: BTreeMap::new(),
+            coordination_default_wing: None,
         };
         let router = FederationRouter::new(rules);
         let mut local_wings = BTreeMap::new();
@@ -4027,6 +4030,7 @@ mod tests {
                 write: WriteTarget::Remote,
             }),
             coordination: BTreeMap::new(),
+            coordination_default_wing: None,
         };
         FederationRouter::with_remotes(rules, remotes)
     }
@@ -4197,6 +4201,7 @@ mod tests {
             wings: BTreeMap::new(),
             kg: None,
             coordination: BTreeMap::new(),
+            coordination_default_wing: None,
         };
         assert!(
             rules.coordination.is_empty() && rules.default_mode == RouteMode::Local,
@@ -4253,6 +4258,7 @@ mod tests {
             wings: BTreeMap::new(),
             kg: None,
             coordination: BTreeMap::new(),
+            coordination_default_wing: None,
         };
         FederationRouter::with_remotes(rules, remotes)
     }
@@ -4410,6 +4416,7 @@ mod tests {
             wings,
             kg: None,
             coordination,
+            coordination_default_wing: None,
         };
         let router = FederationRouter::with_remotes(rules, remotes);
 
@@ -4575,6 +4582,7 @@ mod tests {
             wings: BTreeMap::new(),
             kg: None,
             coordination,
+            coordination_default_wing: None,
         };
         let router = FederationRouter::with_remotes(rules, remotes);
 
@@ -6228,6 +6236,7 @@ mod tests {
             wings: wings_config,
             kg: None,
             coordination: BTreeMap::new(),
+            coordination_default_wing: None,
         };
         let router = FederationRouter::with_remotes(rules, remotes);
 
@@ -6305,6 +6314,7 @@ mod tests {
             wings,
             kg: None,
             coordination: BTreeMap::new(),
+            coordination_default_wing: None,
         };
         FederationRouter::with_remotes(rules, remotes)
     }
@@ -6584,6 +6594,7 @@ mod tests {
             wings: BTreeMap::new(),
             kg: None,
             coordination: BTreeMap::new(),
+            coordination_default_wing: None,
         };
         let router = FederationRouter::with_remotes(rules, remotes);
 

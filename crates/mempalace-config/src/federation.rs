@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 
 /// Default connection timeout for remote connections in milliseconds.
 pub const DEFAULT_REMOTE_TIMEOUT_MS: u64 = 5_000;
+/// Built-in owning wing for coordination tasks when no default is configured.
+pub const DEFAULT_COORDINATION_WING: &str = "wing_local_tasks";
 
 // ─── File-format (serde) types ────────────────────────────────────────────────
 
@@ -157,6 +159,9 @@ pub struct FederationRuntimeConfig {
     /// this is a separate table from [`Self::wings`]. Every entry here is guaranteed at load
     /// time to never carry [`WriteTarget::Both`] — see [`resolve_coordination_route`].
     pub coordination: BTreeMap<String, ResolvedRouteRule>,
+    /// Configured default owning wing used by the MCP task-create boundary. `None` means the
+    /// built-in [`DEFAULT_COORDINATION_WING`] is effective.
+    pub coordination_default_wing: Option<String>,
 }
 
 impl Default for FederationRuntimeConfig {
@@ -168,6 +173,7 @@ impl Default for FederationRuntimeConfig {
             wings: BTreeMap::new(),
             kg: None,
             coordination: BTreeMap::new(),
+            coordination_default_wing: None,
         }
     }
 }
@@ -383,7 +389,15 @@ pub(crate) fn resolve_federation_config(
         }
     };
 
-    Ok(FederationRuntimeConfig { remotes, default_mode, default_remote, wings, kg, coordination })
+    Ok(FederationRuntimeConfig {
+        remotes,
+        default_mode,
+        default_remote,
+        wings,
+        kg,
+        coordination,
+        coordination_default_wing: None,
+    })
 }
 
 /// Resolve a single [`RouteRuleV1`] into a [`ResolvedRouteRule`], validating
@@ -579,6 +593,8 @@ pub fn resolve_kg_route(federation: &FederationRuntimeConfig) -> ResolvedRouteRu
 ///   central authorization key for the whole feature (see `docs/Federation.md`'s "Wing is the
 ///   authorization key"), so `wing_agents` coordination must stay local unconditionally, the
 ///   same way the diary is protected everywhere else in the palace.
+/// - **`wing_local_tasks` is always local**: it is the built-in fallback for MCP task creation,
+///   so a global remote default must not move omitted-wing tasks off this palace.
 /// - **`wing_unscoped` gets the same hard override** (issue #102 Stage 8): it is the reserved
 ///   backfill wing for coordination rows that predate wings, has no real wing to authorize
 ///   federation against until re-homed, and the server refuses to federate it outright (see
@@ -599,7 +615,7 @@ pub fn resolve_coordination_route(federation: &FederationRuntimeConfig, wing: &s
         return local_rule();
     };
     let wing = canonical.as_str();
-    if wing == SHARED_AGENT_DIARY_WING || wing == UNSCOPED_WING {
+    if wing == SHARED_AGENT_DIARY_WING || wing == UNSCOPED_WING || wing == DEFAULT_COORDINATION_WING {
         return local_rule();
     }
     if let Some(rule) = federation.coordination.get(wing) {
@@ -1163,6 +1179,7 @@ mod tests {
             wings: BTreeMap::new(),
             kg: None,
             coordination: BTreeMap::new(),
+            coordination_default_wing: None,
         }
     }
 
@@ -1532,6 +1549,7 @@ mod tests {
                     write: WriteTarget::Local,
                 }),
                 coordination: BTreeMap::new(),
+                coordination_default_wing: None,
                 ..base
             }
         };
@@ -1710,6 +1728,7 @@ mod tests {
                     write: WriteTarget::Both,
                 }),
                 coordination: BTreeMap::new(),
+                coordination_default_wing: None,
             }
         };
         let result = resolve_kg_route(&fed);
@@ -1887,6 +1906,18 @@ mod tests {
         let result = resolve_coordination_route(&fed, "wing_unlisted");
         assert_eq!(result.mode, RouteMode::Remote);
         assert_eq!(result.remote.as_deref(), Some("work"));
+    }
+
+    #[test]
+    fn resolve_coordination_route_builtin_task_wing_stays_local_under_remote_default() {
+        let fed = FederationRuntimeConfig {
+            default_mode: RouteMode::Remote,
+            default_remote: Some("work".to_owned()),
+            ..work_remote_federation()
+        };
+        let result = resolve_coordination_route(&fed, DEFAULT_COORDINATION_WING);
+        assert_eq!(result.mode, RouteMode::Local);
+        assert_eq!(result.write, WriteTarget::Local);
     }
 
     /// No coordination rule and no `default_mode` → Local, the same hard default every other

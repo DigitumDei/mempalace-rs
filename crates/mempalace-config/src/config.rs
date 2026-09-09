@@ -91,6 +91,15 @@ pub struct ServerRuntimeConfig {
     pub checkouts: BTreeMap<String, PathBuf>,
 }
 
+/// File-level coordination defaults. This section is intentionally separate from
+/// `federation.coordination`, which controls where each named wing is routed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct CoordinationConfigV1 {
+    /// Owning wing used when MCP task creation omits `wing`.
+    #[serde(default)]
+    pub default_wing: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LowCpuConfigFileV1 {
     #[serde(default)]
@@ -356,6 +365,9 @@ pub struct ConfigFileV1 {
     /// Optional federation routing section.
     #[serde(default)]
     pub federation: Option<FederationConfigV1>,
+    /// Optional coordination defaults, separate from federation routing rules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coordination: Option<CoordinationConfigV1>,
     /// Optional maintenance subsystem configuration.
     #[serde(default)]
     pub maintenance: Option<MaintenanceConfigFileV1>,
@@ -371,6 +383,7 @@ impl Default for ConfigFileV1 {
             low_cpu: None,
             server: None,
             federation: None,
+            coordination: None,
             maintenance: None,
         }
     }
@@ -520,6 +533,11 @@ impl ConfigLoader {
         let federation = resolve_federation_config(file.federation, &paths.config_file, |name| {
             env::var(name).ok()
         })?;
+        let mut federation = federation;
+        federation.coordination_default_wing = resolve_coordination_default_wing(
+            file.coordination,
+            &paths.config_file,
+        )?;
         let maintenance = resolve_maintenance_config(
             file.maintenance,
             &paths.config_file,
@@ -787,6 +805,34 @@ impl ConfigLoader {
         }
         Ok((paths.project_registry_file, removed))
     }
+}
+
+fn resolve_coordination_default_wing(
+    section: Option<CoordinationConfigV1>,
+    config_path: &Path,
+) -> Result<Option<String>> {
+    let Some(section) = section else {
+        return Ok(None);
+    };
+    let Some(raw) = section.default_wing else {
+        return Ok(None);
+    };
+    let wing = mempalace_core::WingId::normalized(&raw).map_err(|error| {
+        MempalaceError::ConfigParse {
+            path: config_path.to_path_buf(),
+            message: format!("coordination.default_wing is not a valid wing name: {error}"),
+        }
+    })?;
+    if wing.as_str() == mempalace_core::UNSCOPED_WING {
+        return Err(MempalaceError::ConfigParse {
+            path: config_path.to_path_buf(),
+            message: format!(
+                "coordination.default_wing may not be `{}`; choose a real coordination wing",
+                mempalace_core::UNSCOPED_WING
+            ),
+        });
+    }
+    Ok(Some(wing.to_string()))
 }
 
 /// Resolve the base directory and every path derived from it, reading
@@ -1256,15 +1302,45 @@ mod tests {
     use mempalace_core::EmbeddingProfile;
 
     use super::{
-        ConfigLoader, DEFAULT_BASE_DIR, DEFAULT_COLLECTION_NAME, DEFAULT_LOW_CPU_INGEST_BATCH_SIZE,
-        LowCpuConfigFileV1, LowCpuRuntimeConfig, MaintenanceConfigFileV1, MaintenanceRuntimeConfig,
-        ProjectConfig, ProjectRegistryEntryV1, ProjectRoomConfig, expand_path,
-        resolve_paths_with_env,
+        ConfigLoader, CoordinationConfigV1, DEFAULT_BASE_DIR, DEFAULT_COLLECTION_NAME,
+        DEFAULT_LOW_CPU_INGEST_BATCH_SIZE, LowCpuConfigFileV1, LowCpuRuntimeConfig,
+        MaintenanceConfigFileV1, MaintenanceRuntimeConfig, ProjectConfig, ProjectRegistryEntryV1,
+        ProjectRoomConfig, expand_path, resolve_coordination_default_wing, resolve_paths_with_env,
     };
 
     fn temp_dir() -> PathBuf {
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         std::env::temp_dir().join(format!("mempalace-rs-config-{nanos}"))
+    }
+
+    #[test]
+    fn coordination_default_wing_is_optional_and_normalised() {
+        assert_eq!(
+            resolve_coordination_default_wing(None, Path::new("config.json")).unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve_coordination_default_wing(
+                Some(CoordinationConfigV1 { default_wing: Some("local_tasks".to_owned()) }),
+                Path::new("config.json"),
+            )
+            .unwrap()
+            .as_deref(),
+            Some("wing_local_tasks")
+        );
+    }
+
+    #[test]
+    fn coordination_default_wing_rejects_blank_invalid_and_unscoped() {
+        for value in ["", "   ", "wing_unscoped"] {
+            let error = resolve_coordination_default_wing(
+                Some(CoordinationConfigV1 { default_wing: Some(value.to_owned()) }),
+                Path::new("config.json"),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("coordination.default_wing"), "{error}");
+        }
     }
 
     #[test]

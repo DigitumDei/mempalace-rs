@@ -2,6 +2,9 @@
 
 MemPalace stores durable coordination state in the palace's local `storage.sqlite3`. It provides persistence and concurrency control; the host agent runtime still owns worker spawning, scheduling, tool execution, and live budget enforcement. Federation is opt-in and, as of issue #102 Stage 4, extends all the way to the MCP tool surface on this page: `mempalace-server` exposes tasks, messages, artifacts, results, and audit events over `/v1/coordination/*` to a caller holding the right scoped token, under the same wing-scoped authorization as the rest of the federation REST surface, and `mempalace-mcp`'s `RemoteApi`/`FederationRouter` route the MCP tools below to a configured remote when a wing's `federation.coordination` rule (or, for the ID-keyed tools, the mere presence of a configured remote) calls for it. The CLI is unaffected — it has never read or written coordination state. See [Federation → Part 7, Federated coordination](Federation.md#part-7--federated-coordination) for the full routing and wire behaviour.
 
+The discovery tool described below is local-only: it reports this palace's known coordination
+scope and configured destinations without querying remote records.
+
 ## Data and guarantees
 
 - Tasks have immutable IDs, parent and dependency references, optional budget metadata and expiry, a lifecycle state, an owner, a lease expiry, and a monotonically increasing revision.
@@ -30,7 +33,7 @@ Task titles, descriptions, JSON payloads and budgets, and artifact content are l
 
 The native local tool surface is:
 
-- `mempalace_task_create` (requires `wing`), `mempalace_task_list`, `mempalace_task_get`, `mempalace_task_claim`, `mempalace_task_renew`, `mempalace_task_transition`
+- `mempalace_coordination_wings`, `mempalace_task_create` (optional `wing`), `mempalace_task_list`, `mempalace_task_get`, `mempalace_task_claim`, `mempalace_task_renew`, `mempalace_task_transition`
 - `mempalace_message_send`, `mempalace_message_get`, `mempalace_message_acknowledge`, `mempalace_inbox_read` (takes an optional `wing` filter)
 - `mempalace_artifact_put`, `mempalace_artifact_get`
 - `mempalace_result_put`, `mempalace_result_get`
@@ -41,6 +44,19 @@ Treat returned cursors as opaque and persist them with worker state. After resta
 As of issue #102 Stage 4, this tool surface is federation-aware: `mempalace_task_create` routes by its wing's `federation.coordination` rule, and the other ID-keyed tools above fall back across configured remotes by ID after a local miss (mirroring `mempalace_delete_drawer`'s existing local-first pattern) — a task's `wing` is never supplied to those calls, so there is nothing else to route by. `mempalace_inbox_read`/`mempalace_coordination_events` always read local and additionally fan out to every configured remote, reporting `remote_messages`/`remote_events` alongside the local result — `mempalace_coordination_event_get` is the one exception, staying local-only because Stage 3 never exposed a single-event GET route on the wire. Both fan-out tools also accept a `remote_cursors` object argument (`{"<remote_name>": "<opaque_cursor>"}`) to continue a specific remote's page independently of the local `cursor`; a page's own `remote_messages`/`remote_events` entries carry the `next_cursor` to feed back for that remote. See [Federation → Part 7, Federated coordination](Federation.md#part-7--federated-coordination) for the full routing rules, the server-side REST surface used by a remote peer, and the conflict/capability-gate error shapes.
 
 ## Task discovery
+
+`mempalace_coordination_wings` discovers locally known coordination scope without contacting
+remote palaces. It combines wings present in local task or event rows, wings named in configured
+coordination routes, and the effective default wing, including the default when the palace has no
+coordination rows. Each entry reports `wing`, the effective write `destination` (`local` or
+`remote:<name>`), `is_default`, and `provenance`. Provenance is an array whose markers are
+`configured`, `in_use`, and `built_in`: configured routes or a configured default wing, locally
+observed task/event usage, and the synthesized fallback respectively. The fallback is
+`wing_local_tasks`, which is always pinned locally for coordination writes, including when it is
+selected explicitly, even when the general federation default is remote. An omitted `wing` in
+`mempalace_task_create` selects the configured default when present, otherwise this fallback;
+other explicit wing arguments retain their routing. Legacy `wing_unscoped` rows are excluded from
+discovery because that reserved wing represents pre-wing records rather than a usable named wing.
 
 `mempalace_task_list` is a `RoutableCoordination` read. It returns a local
 `{tasks, next_cursor}` page and, when coordination federation is enabled,

@@ -14,17 +14,17 @@ It provides:
 
 - Semantic search via local embeddings (no external API calls)
 - A knowledge graph for structured facts, relationships, and timelines
-- An MCP server (`mempalace-mcp`) for agent integration (69 tools)
+- An MCP server (`mempalace serve --stdio`) for agent integration (69 tools)
 - Durable task coordination for agent workflows: tasks, messages, artifacts, results, leases, and audit events, available locally and optionally through the federation API
 - Provider-neutral agent lineages and reviewed identity packets that preserve a coherent self
   across model and harness changes
-- A CLI (`mempalace-cli`) for direct palace management
+- A CLI (`mempalace`) for direct palace management
 - Locator-based mined storage: project file chunks store byte/line ranges instead of duplicated text; snippets are resolved lazily from the checkout at read time with stale detection
 - Repository views: `mine` detects the checkout automatically — a full canonical snapshot on the default branch, a branch delta everywhere else — and `search --view <branch>` composes that delta over the canonical snapshot, tombstones included. Force either side with `--full` / `--branch`
 - Scoped pruning (`mine`'s inverse): `prune` previews and then deletes mined project data by project, wing, ingest kind, branch view, or path prefix, local palace only
-- Background maintenance: fragment compaction, version retention, and vector-index optimization, run automatically by the hub and on demand via `mempalace-cli maintain`
+- Background maintenance: fragment compaction, version retention, and vector-index optimization, run automatically by the hub and on demand via `mempalace maintain`
 - Federated project mining: when a wing's route targets a remote palace, `mine` prepares chunks locally and pushes them to the remote server via `POST /v1/ingest/batch`; the server embeds and stores them, so teams can share a single mined index without distributing embedding workload to every client
-- Federation: an HTTP server (`mempalace-cli serve`) shares a palace with other clients; per-wing `local`/`remote`/`combined` routing merges remote and local results, with bearer-token auth and `write: both` local-first dual-write support — see the [Federation guide](docs/Federation.md)
+- Federation: an HTTP server (`mempalace serve`) shares a palace with other clients; per-wing `local`/`remote`/`combined` routing merges remote and local results, with bearer-token auth and `write: both` local-first dual-write support — see the [Federation guide](docs/Federation.md)
 
 ## Quick start
 
@@ -45,22 +45,33 @@ irm https://raw.githubusercontent.com/DigitumDei/mempalace-rs/main/install.ps1 |
 Then initialize and mine a project:
 
 ```bash
-mempalace-cli init /path/to/project
-mempalace-cli mine /path/to/project
-mempalace-cli status
-mempalace-cli search "your query"
+mempalace init /path/to/project
+mempalace mine /path/to/project
+mempalace status
+mempalace search "your query"
 ```
 
 Stable releases are the default and are immutable. To install an immutable test candidate, pass `--channel nightly --version v<version>-nightly.<full-commit-sha>` explicitly. Intel macOS, ARM Linux, musl, and other unsupported prebuilt targets require a [source build](docs/Quickstart.md#1b-build-from-source-alternative).
 
 The [Quickstart guide](docs/Quickstart.md) covers source builds, conversation imports, repository views, MCP setup, and lineage configuration. Release operators should follow the [signed release runbook](docs/Release-Operations.md).
 
+The install contains one executable with ONNX Runtime statically linked into it:
+
+```text
+mempalace.exe
+ONNXRuntime-NOTICES.txt
+```
+
+Use `mempalace serve` for HTTP MCP at `/mcp` and federation REST on the same port.
+Use `mempalace serve --stdio` for local MCP clients. Regular commands such as `mine`
+and `search` use the same executable. See [HTTP MCP setup](docs/Federation.md#http-mcp-endpoint).
+
 ## Crates
 
 | Crate | Purpose |
 |---|---|
 | `mempalace-cli` | Command-line interface (`init`, `mine`, `project`, `prune`, `search`, `status`, `wake-up`, `setup`, `maintain`, `serve`) |
-| `mempalace-mcp` | MCP server for agent tool integration |
+| `mempalace-mcp` | MCP dispatcher library, linked into the single `mempalace` executable |
 | `mempalace-core` | Core types and traits |
 | `mempalace-storage` | Palace persistence layer |
 | `mempalace-ingest` | Content ingestion and chunking |
@@ -83,11 +94,11 @@ These apply only when building from source — the prebuilt stable or nightly in
 - Rust 1.88+
 - `protobuf-compiler` (for storage layer)
 
-(ONNX Runtime is downloaded automatically by the build — see the note below if you build behind an SSL-inspecting proxy.)
+ONNX Runtime is downloaded by the build and statically linked into the executable.
 
 ## Building behind corporate SSL inspection (Netskope, Zscaler, etc.)
 
-Corporate network proxies that perform SSL inspection (Netskope, Zscaler, and similar) intercept TLS connections and re-sign them with a custom root CA. Several build-time dependencies download binaries using their own TLS stacks, which won't trust that CA by default. The embeddings crate is configured to download over the OS **native TLS** stack so it trusts your proxy's CA automatically (see section 3); the only thing you normally need to configure is Cargo itself.
+Corporate network proxies that perform SSL inspection (Netskope, Zscaler, and similar) intercept TLS connections and re-sign them with a custom root CA. Cargo, model downloads, and deployment downloads must trust that CA. The embeddings crate is configured to download over the OS **native TLS** stack so it trusts your proxy's CA automatically (see section 3); the only thing you normally need to configure is Cargo itself.
 
 The commands and paths below are written for Windows (where native TLS means Schannel and the system certificate store), but the same concepts apply on macOS (Keychain / Security framework) and Linux (OpenSSL reading the system trust store, e.g. `/etc/ssl/certs`) — substitute your platform's CA bundle path and trust store accordingly.
 
@@ -113,21 +124,12 @@ The `ort-sys` build script downloads a prebuilt ONNX Runtime binary from `cdn.py
 
 If your firewall filters by domain rather than inspecting TLS, allow `cdn.pyke.io` — the build cannot complete without it.
 
-**Offline / air-gapped fallback.** If the build can't reach `cdn.pyke.io` at all (rather than a TLS-trust problem), download a matching ONNX Runtime release once and point the build at it. Using PowerShell:
-
-```powershell
-Invoke-WebRequest -Uri "https://github.com/microsoft/onnxruntime/releases/download/v1.23.2/onnxruntime-win-x64-1.23.2.zip" -OutFile "$env:TEMP\onnxruntime.zip"
-Expand-Archive -Path "$env:TEMP\onnxruntime.zip" -DestinationPath "C:\onnxruntime" -Force
-```
-
-Then add this to `~/.cargo/config.toml` so every build finds it (this overrides the auto-download):
-
-```toml
-[env]
-ORT_LIB_LOCATION = "C:/onnxruntime/onnxruntime-win-x64-1.23.2/lib"
-```
-
-Copy `onnxruntime.dll` and `onnxruntime_providers_shared.dll` from that `lib` directory alongside your built binaries when deploying to another machine.
+**Offline / air-gapped builds.** Populate the hash-verified `ort-sys` download cache
+on a connected build machine first, then carry that cache into the offline build
+environment. Alternatively, point `ORT_LIB_LOCATION` at a compatible **static**
+ONNX Runtime build with its required static dependencies. The standard build links
+the runtime into `mempalace`; no ONNX Runtime DLL needs to be deployed. Model weights
+remain separate cached files.
 
 ### 3. HuggingFace model downloads (embedding models at runtime)
 

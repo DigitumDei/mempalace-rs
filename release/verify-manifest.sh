@@ -27,12 +27,12 @@ required_metadata=(
     release-manifest.sig
 )
 expected_assets=(
-    mempalace-cli-linux-x86_64
-    mempalace-mcp-linux-x86_64
-    mempalace-cli-macos-arm64
-    mempalace-mcp-macos-arm64
-    mempalace-cli-windows-x86_64.exe
-    mempalace-mcp-windows-x86_64.exe
+    mempalace-linux-x86_64
+    mempalace-macos-arm64
+    mempalace-windows-x86_64.exe
+    mempalace-notices-linux-x86_64.txt
+    mempalace-notices-macos-arm64.txt
+    mempalace-notices-windows-x86_64.txt
 )
 
 for file in "${required_metadata[@]}" "${expected_assets[@]}"; do
@@ -74,7 +74,7 @@ jq -e \
       and ((.assets | map(.name) | sort) == ($expected_names | sort))
       and (all(.assets[];
           (.name | type == "string")
-          and (.component == "cli" or .component == "mcp")
+          and (.component == "cli" or .component == "notices")
           and (.target | type == "string")
           and (.sha256 | type == "string" and test("^[0-9a-f]{64}$"))
           and (.size | type == "number" and . > 0)))
@@ -119,10 +119,13 @@ expected_checksum_names="$(printf '%s\n' "${expected_assets[@]}" | LC_ALL=C sort
 (cd "$asset_dir" && sha256sum --strict --check SHA256SUMS >/dev/null)
 
 for asset in "${expected_assets[@]}"; do
-    expected_component="${asset#mempalace-}"
-    expected_component="${expected_component%%-*}"
-    expected_target="${asset#mempalace-cli-}"
-    expected_target="${expected_target#mempalace-mcp-}"
+    expected_component=cli
+    expected_target="${asset#mempalace-}"
+    if [[ "$asset" == mempalace-notices-* ]]; then
+        expected_component=notices
+        expected_target="${asset#mempalace-notices-}"
+    fi
+    expected_target="${expected_target%.txt}"
     expected_target="${expected_target%.exe}"
     actual_sha256="$(sha256sum "$asset_dir/$asset" | cut -d' ' -f1)"
     actual_size="$(wc -c < "$asset_dir/$asset" | tr -d '[:space:]')"

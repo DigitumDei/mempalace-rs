@@ -4,30 +4,26 @@ This document captures the practical release path for the current Rust workspace
 
 ## Release Artifacts
 
-Each release builds `mempalace-cli` and `mempalace-mcp` for every supported platform.
-Per-tool asset names:
+Each release ships one `mempalace` executable with ONNX Runtime statically linked
+into it, plus its license notices, per supported platform:
 
-- `*-linux-x86_64` — glibc, built on `ubuntu-latest`
-- `*-macos-arm64` — Apple Silicon
-- `*-windows-x86_64.exe`
+| Platform | Executable asset |
+|---|---|
+| Linux x86_64 | `mempalace-linux-x86_64` |
+| macOS arm64 | `mempalace-macos-arm64` |
+| Windows x86_64 | `mempalace-windows-x86_64.exe` |
 
-The supported set is bounded by the prebuilt ONNX Runtime binaries that `ort`
-ships (see `ort-sys`'s `dist.txt`). Targets `ort` does **not** provide a prebuilt
-for are therefore not built:
-
-- **musl** — no prebuilt (the original blocker; see the musl attempt in PR #12).
-- **Intel macOS (`x86_64-apple-darwin`)** — `ort` 2.0.0-rc.11 ships no Intel-macOS
-  binary at all.
-- **Older glibc / "any container" (e.g. manylinux_2_28)** — `ort`'s Linux prebuilt
-  requires **glibc 2.38+**, so the `linux-x86_64` binary's glibc floor is set by
-  `ort`, not by the build host. Building on an older glibc baseline cannot lower it
-  and fails to link (`undefined symbol: __isoc23_strtoull`). Broadening this would
-  require compiling ONNX Runtime from source or switching to `ort-tract`.
+The build downloads the prebuilt runtime via `ort-sys`; no runtime DLL, shared
+library, or runtime-path environment setting is required after deployment.
+Executable and notices assets are covered by the signed release manifest and checksums.
+Model weights remain separate cached assets. Linux uses glibc and is built on
+`ubuntu-latest`; older Linux distributions, musl, and Intel macOS are outside the
+current tested release matrix.
 
 Reference build command (host platforms):
 
 ```bash
-cargo build --release --locked -p mempalace-cli -p mempalace-mcp --target <triple>
+cargo build --release --locked -p mempalace-cli --target <triple>
 ```
 
 Reference packaging job:
@@ -76,9 +72,9 @@ Host:
 Required outcomes:
 
 - Install or unpack the exact `release-<asset>` artifact(s) built by Row 1 for the target platform.
-- `mempalace-cli --help` succeeds.
+- `mempalace --help` succeeds.
 - `init`, `mine`, `search`, `status`, and `wake-up` succeed against an isolated palace root.
-- `mempalace-mcp` starts and responds successfully to MCP `initialize` plus `tools/list`.
+- `mempalace serve --stdio` starts and responds successfully to MCP `initialize` plus `tools/list`.
 - Low-CPU runtime expectations are recorded from this host, including degraded-behavior observations and any resource ceilings used for release signoff.
 
 ## Install Validation
@@ -86,13 +82,13 @@ Required outcomes:
 Minimum install validation for a candidate release:
 
 1. Download or copy the `release-<asset>` artifact for the target platform from the successful `release-host` run.
-2. Run `mempalace-cli --help`.
-3. Run `mempalace-cli init <fixture-dir>`.
-4. Run `mempalace-cli mine <fixture-dir>`.
-5. Run `mempalace-cli search <query>`.
-6. Run `mempalace-cli status`.
-7. Run `mempalace-cli wake-up`.
-8. Start `mempalace-mcp` and confirm MCP `initialize` plus `tools/list`.
+2. Run `mempalace --help`.
+3. Run `mempalace init <fixture-dir>`.
+4. Run `mempalace mine <fixture-dir>`.
+5. Run `mempalace search <query>`.
+6. Run `mempalace status`.
+7. Run `mempalace wake-up`.
+8. Start `mempalace serve --stdio` and confirm MCP `initialize` plus `tools/list`.
 
 ## Validation Matrix
 
@@ -101,7 +97,7 @@ Minimum install validation for a candidate release:
 - workspace build
 - per-crate unit and integration test jobs
 - embedding baseline capture
-- release build for `mempalace-cli` and `mempalace-mcp` across all platform legs
+- release build for `mempalace` with statically linked ONNX Runtime across all platform legs
 - per-platform packaged artifact publication
 
 ### Expected on the supported small VM
@@ -155,3 +151,9 @@ and store the base64-encoded private key matching `release/public-key.pem` in
 the `MEMPALACE_RELEASE_SIGNING_KEY` environment secret. Candidate signing uses
 the same protected environment so the private key is never exposed without
 release approval.
+
+Each platform also ships a signed `mempalace-notices-<platform>.txt` asset containing
+the upstream ONNX Runtime license and third-party notices, installed as `ONNXRuntime-NOTICES.txt`.
+
+`release/ONNXRuntime-NOTICES.txt` contains the upstream ONNX Runtime 1.23.2 license
+and third-party notices. Refresh it when upgrading the bundled runtime.

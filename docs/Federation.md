@@ -7,7 +7,7 @@
 Federation lets several MemPalace clients share one or more **remote palaces** over
 an HTTP REST API. An agent talking to its local MCP server sees a single seamless
 palace: reads for selected wings are transparently merged across local and remote,
-and writes are routed per the wing's rule. (The `mempalace-cli` is federation-aware
+and writes are routed per the wing's rule. (The `mempalace` is federation-aware
 for mining/writes; its `search`/`status`/`wake-up` read the local palace only —
 see [Part 5](#part-5--federated-reads-wake-up-and-changes).)
 
@@ -73,7 +73,7 @@ it all locally for dev testing.
 
 ## Part 1 — Running a server (the hub)
 
-The server is the same `mempalace-cli` binary, started with `serve`. It exposes
+The server is the same `mempalace` binary, started with `serve`. It exposes
 the local palace at `<palace_path>` over HTTP.
 
 ### 1.1 Create a token file
@@ -135,9 +135,9 @@ field reference.
 ### 1.3 Start the server
 
 ```bash
-mempalace-cli serve
+mempalace serve
 # or override config:
-mempalace-cli serve --bind 0.0.0.0:8765 --token-file /etc/mempalace/tokens.json
+mempalace serve --bind 0.0.0.0:8765 --token-file /etc/mempalace/tokens.json
 ```
 
 On start it prints the palace path, bind address, and token file, then logs
@@ -173,6 +173,7 @@ requires `Authorization: Bearer <token>`.
 | `GET /v1/changes` | Change-event feed (cursor-paginated) |
 | `POST /v1/ingest/batch` | Bulk mined-chunk ingest (16 MiB body limit) |
 | `POST /v1/coordination/tasks` | Create a task |
+| `GET /v1/coordination/tasks` | Discover/list tasks (cursor-paginated) |
 | `GET /v1/coordination/tasks/{id}` | Get one task |
 | `POST /v1/coordination/tasks/{id}/claim` | Claim a task (or reclaim an expired lease) |
 | `POST /v1/coordination/tasks/{id}/renew` | Renew a live lease |
@@ -191,7 +192,9 @@ requires `Authorization: Bearer <token>`.
 a client checks before attempting federated mining, and the `"coordination"`
 capability (added in issue #102 Stage 3) is what a client would check before
 calling any `/v1/coordination/*` route — see
-[Part 7](#part-7--federated-coordination). The `"idempotent_mutations"`
+[Part 7](#part-7--federated-coordination). The `"coordination_task_list"`
+capability (added in issue #141) indicates support for cursor-paginated
+`GET /v1/coordination/tasks` task discovery. The `"idempotent_mutations"`
 capability (added in issue #127) is what the durable replication worker checks
 before delivering an outbox operation: a remote that does not advertise it can
 only be reached by non-replicated legacy writes, because there would be no way
@@ -544,10 +547,10 @@ with `write: remote`) pushes the work to the hub instead of writing locally.
 
 ```bash
 # wing routes to a remote → this pushes to the hub
-mempalace-cli mine /path/to/project
+mempalace mine /path/to/project
 
 # preview what would be sent, no network calls
-mempalace-cli mine /path/to/project --dry-run
+mempalace mine /path/to/project --dry-run
 ```
 
 ### Machine-independent identity
@@ -577,7 +580,7 @@ a purely local concept — see [Part 4](#part-4--branch-aware-mining).
 > **Batch-ingest replication is synchronous, not durable (known gap — issue #127).
 > ** The MCP tool paths (`mempalace_add_drawer`, `mempalace_delete_drawer`,
 > `mempalace_kg_add`, `mempalace_kg_invalidate`) route `write: both` through the
-> durable replication outbox described in Part 2. **`mempalace-cli mine` does not.**
+> durable replication outbox described in Part 2. **`mempalace mine` does not.**
 > Its `write: both` leg still pushes prepared files to `/v1/ingest/batch` inline and
 > best-effort, with no outbox intent and no replay identity: a crash mid-push can
 > leave the local mine committed and part of the remote batch unapplied, and a retry
@@ -589,7 +592,7 @@ a purely local concept — see [Part 4](#part-4--branch-aware-mining).
 > carries the durable, resumable batch-ingest work split from issue #127:
 >
 > - **Title:** `Durable resumable batch-ingest replication for write: both (issue #127 follow-up)`
-> - **Body:** `mempalace-cli mine` currently replicates `write: both` batches to
+> - **Body:** `mempalace mine` currently replicates `write: both` batches to
 >   `POST /v1/ingest/batch` inline and best-effort. Make it durable and resumable on
 >   the same outbox as the MCP tool paths: stage a batch-ingest intent (with a stable
 >   batch id and per-file manifest) before local commit, deliver via the background
@@ -609,9 +612,9 @@ repo. On a non-canonical checkout this is now the **automatic** behaviour — th
 flag only forces it:
 
 ```bash
-mempalace-cli mine /path/to/project            # auto: canonical on main, branch delta elsewhere
-mempalace-cli mine /path/to/project --branch   # force a branch delta
-mempalace-cli mine /path/to/project --full     # force a full canonical mine
+mempalace mine /path/to/project            # auto: canonical on main, branch delta elsewhere
+mempalace mine /path/to/project --branch   # force a branch delta
+mempalace mine /path/to/project --full     # force a full canonical mine
 ```
 
 - **Delta** = files changed vs the merge-base with the default branch
@@ -647,7 +650,7 @@ detection rules, source-key layout, tombstones, and search-time overlay composit
 
 `view` is a first-class search parameter in three places — the MCP `mempalace_search`
 tool, the federation wire (`SearchRequest.view`, forwarded to remotes), and the CLI
-(`mempalace-cli search --view`). All three take the same values:
+(`mempalace search --view`). All three take the same values:
 
 - omitted or `"canonical"` — canonical snapshots only
 - `"<branch>"` — that branch composed over the canonical snapshot
@@ -663,7 +666,7 @@ to a view.
 > **Only `mempalace_search` composes a view across a combined wing.** The CLI's
 > `search --view` opens the local `StorageEngine` and never performs federation routing
 > (see [Part 5](#part-5--federated-reads-wake-up-and-changes)). On the combined-wing setup
-> below — canonical on the hub, branch delta local — `mempalace-cli search --view <branch>`
+> below — canonical on the hub, branch delta local — `mempalace search --view <branch>`
 > returns only the local branch rows, because the canonical rows it would overlay live on
 > the remote and the CLI never fetches them. Use the MCP tool for that query.
 
@@ -691,10 +694,10 @@ propagate to the shared palace when the remote is reachable.
 ## Part 5 — Federated reads, wake-up, and changes
 
 > **Federated reads are an MCP-server capability.** The fan-out and merge below
-> happen inside `mempalace-mcp` (the tools your agent calls). The `mempalace-cli`
+> happen inside `mempalace serve --stdio` (the tools your agent calls). The `mempalace`
 > `search`, `status`, and `wake-up` commands always operate on the **local**
 > palace only — the CLI is federation-aware for **mining (writes)**, not for
-> reads. To exercise federated reads, point an MCP client at `mempalace-mcp` with
+> reads. To exercise federated reads, point an MCP client at `mempalace serve --stdio` with
 > the federation config, or call the hub's REST endpoints directly.
 
 Through the MCP server, federated wings fan out across reads:
@@ -729,7 +732,7 @@ mkdir -p /tmp/hub
 echo '[{"token":"dev-token","name":"dev","enabled":true}]' > /tmp/hub/tokens.json
 
 # 2. Start the hub against the hub palace (stub embeddings for a fast offline run)
-MEMPALACE_STUB_EMBEDDINGS=1 mempalace-cli --palace /tmp/hub/palace serve \
+MEMPALACE_STUB_EMBEDDINGS=1 mempalace --palace /tmp/hub/palace serve \
   --bind 127.0.0.1:8765 --token-file /tmp/hub/tokens.json &
 
 # 3. Give the client its own config directory instead of touching
@@ -750,7 +753,7 @@ export MEMPALACE_CONFIG_DIR=/tmp/client
 # 4. Mine a project whose mempalace.yaml declares wing: wing_demo → pushes to the hub.
 #    The client does NOT embed here; the hub does. MEMPALACE_CONFIG_DIR must be
 #    set in this shell (or exported) so the CLI picks up /tmp/client/config.json.
-mempalace-cli mine /path/to/demo-project
+mempalace mine /path/to/demo-project
 
 # 5. Verify the hub received it. The CLI's own `search` only reads the LOCAL
 #    palace, so query the hub directly over REST instead:
@@ -760,16 +763,16 @@ curl -s -X POST http://127.0.0.1:8765/v1/drawers/search \
 ```
 
 To exercise federated **reads** (combined search, wake-up fan-out), point an MCP
-client at `mempalace-mcp` launched with `MEMPALACE_CONFIG_DIR=/tmp/client` in its
+client at `mempalace serve --stdio` launched with `MEMPALACE_CONFIG_DIR=/tmp/client` in its
 environment (an MCP client typically sets this in its server-launch config, since
-`mempalace-mcp` itself takes no CLI arguments) — the fan-out lives in the MCP
+`mempalace serve --stdio` itself takes no CLI arguments) — the fan-out lives in the MCP
 server, not the CLI.
 
 For non-stale snippet resolution on the hub, add the project path to
 `server.checkouts.wing_demo` in the hub's config and restart `serve`.
 
 Notes:
-- `MEMPALACE_STUB_EMBEDDINGS` is honored by the `mempalace-mcp` binary and the CLI
+- `MEMPALACE_STUB_EMBEDDINGS` is honored by the `mempalace serve --stdio` binary and the CLI
   `serve` command. The CLI `mine`/`search` commands always use the real embedding
   provider — but a *remote-routed* `mine` does no client-side embedding at all, so
   the stub setting only matters on the hub. For a fully stubbed read path, run the
@@ -1335,7 +1338,7 @@ replay against it is refused outright (issue #102 Stage 8), mirroring the way
 against a `wing_unscoped` record is masked as 404 instead, so the 422 never
 becomes an existence oracle. It is also never returned by a fan-out fallback
 (`coordination_write_fallback`/`coordination_task_revisioned_fallback` in
-`mempalace-mcp`) as a soft miss — it surfaces as a hard tool error there,
+`mempalace serve --stdio`) as a soft miss — it surfaces as a hard tool error there,
 deliberately, because the record is confirmed to exist on that remote. The
 remedy is to move the task to a real wing (there is currently no in-place
 re-home operation; recreate it under the wing you want it federated from) —
@@ -1378,3 +1381,22 @@ A `created_by`/`sender`/`worker`/`actor` claim containing `:` is rejected — th
 character is reserved for the `identity:claimed` encoding the server builds when
 a claim disagrees with the authenticated token identity. See [Part 7 → Actor
 identity is derived, not claimed](#actor-identity-is-derived-not-claimed).
+
+## HTTP MCP endpoint
+
+`mempalace serve` also exposes `POST /mcp` using stateless Streamable HTTP
+(protocol `2025-03-26`). It calls the same tool dispatcher as
+`mempalace serve --stdio`, including lineage binding and configured federation routing.
+Requests require `Authorization: Bearer <token>`, `Content-Type: application/json`,
+and `Accept: application/json, text/event-stream`. Only unrestricted tokens (no
+`scopes` field) can access this full local tool surface; scoped tokens retain their
+REST permissions and receive 403 on `/mcp`. HTTP MCP represents trusted local-operator
+access, including local files and host assertions; do not issue these tokens to
+clients that should have only REST access. All requests with an Origin header are
+rejected, so this endpoint supports native MCP clients rather than browser clients.
+
+The endpoint returns JSON for requests and 202 for notifications. GET returns 405:
+there are no unsolicited SSE events, session IDs, or resumable streams. If provided,
+`MCP-Protocol-Version` must be `2025-03-26`. Stdio retains its existing `2024-11-05`
+protocol and needs no token file. HTTP and stdio are alternative modes of the same
+executable; start separate processes if both transports are needed concurrently.

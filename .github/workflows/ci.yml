@@ -72,16 +72,11 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      # `key` scopes this job's cache. `ort-sys` (via fastembed) downloads a prebuilt
-      # ONNX Runtime in its build script and records an absolute link-search path; when a
-      # restored cache carries that recorded path but not the downloaded library, the crate
-      # fails to link with "could not find native static library `onnxruntime`" and no
-      # rebuild is attempted. Because CACHE_ON_FAILURE is false, a poisoned cache is never
-      # replaced and every retry fails identically. Bump this value to evict it.
+      # Keep the prebuilt static ONNX Runtime cache separate from dynamic builds.
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
         with:
-          key: ort-1
+          key: ort-static-2
 
       - name: Build mempalace-embeddings tests
         run: cargo test -p mempalace-embeddings --locked --no-run
@@ -417,30 +412,26 @@ jobs:
           key: ${{ matrix.asset }}
 
       - name: Build release artifacts
-        run: cargo build --release --locked -p mempalace-cli -p mempalace-mcp --target ${{ matrix.target }}
+        run: cargo build --release --locked -p mempalace-cli --target ${{ matrix.target }}
 
-      - name: Stage binaries
+      - name: Stage executable and license notices
         shell: bash
         run: |
           ext=""
           [ "${{ runner.os }}" = "Windows" ] && ext=".exe"
           mkdir -p dist
-          cp "target/${{ matrix.target }}/release/mempalace-cli${ext}" "dist/mempalace-cli-${{ matrix.asset }}${ext}"
-          cp "target/${{ matrix.target }}/release/mempalace-mcp${ext}" "dist/mempalace-mcp-${{ matrix.asset }}${ext}"
+          cp "target/${{ matrix.target }}/release/mempalace${ext}" "dist/mempalace-${{ matrix.asset }}${ext}"
+          cp release/ONNXRuntime-NOTICES.txt "dist/mempalace-notices-${{ matrix.asset }}.txt"
 
-      - name: Smoke packaged binaries
+      - name: Smoke packaged executable
         shell: bash
         run: |
           ext=""
           [ "${{ runner.os }}" = "Windows" ] && ext=".exe"
-          "dist/mempalace-cli-${{ matrix.asset }}${ext}" --help
-          "dist/mempalace-mcp-${{ matrix.asset }}${ext}" --help
-          cli_version="$("dist/mempalace-cli-${{ matrix.asset }}${ext}" --version)"
-          mcp_version="$("dist/mempalace-mcp-${{ matrix.asset }}${ext}" --version)"
-          [ "$cli_version" = "mempalace-cli $MEMPALACE_BUILD_VERSION" ] \
-            || { echo "CLI binary does not report the calculated release version" >&2; exit 1; }
-          [ "$mcp_version" = "mempalace-mcp $MEMPALACE_BUILD_VERSION" ] \
-            || { echo "MCP binary does not report the calculated release version" >&2; exit 1; }
+          "dist/mempalace-${{ matrix.asset }}${ext}" --help
+          "dist/mempalace-${{ matrix.asset }}${ext}" serve --help
+          version="$("dist/mempalace-${{ matrix.asset }}${ext}" --version)"
+          [ "$version" = "mempalace $MEMPALACE_BUILD_VERSION" ]
 
       - name: Upload release artifacts
         uses: actions/upload-artifact@v7
@@ -554,13 +545,13 @@ jobs:
             - Commit: [\`${GITHUB_SHA}\`](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA})
             - CI run: [${GITHUB_RUN_ID}](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})
 
-            Binaries (each as `mempalace-cli-*` and `mempalace-mcp-*`):
-            - `linux-x86_64` — glibc (requires glibc 2.38+, set by the bundled ONNX Runtime)
+            Assets: one `mempalace-*` executable with built-in ONNX Runtime per platform:
+            - `linux-x86_64` — glibc, built on ubuntu-latest
             - `macos-arm64` (Apple Silicon)
             - `windows-x86_64.exe`
 
-            Intel macOS, musl, and older-glibc targets are not shipped: `ort` provides
-            no prebuilt ONNX Runtime for them.
+            Intel macOS, musl, and older-glibc targets are outside the tested release matrix.
+            Each platform includes signed ONNX Runtime license and third-party notices.
 
             `release-manifest.json` and `SHA256SUMS` are signed by the project
             release key. This is not a stable release.

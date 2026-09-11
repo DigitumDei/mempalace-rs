@@ -42,12 +42,12 @@ case "$channel" in
 esac
 
 expected_assets=(
-    mempalace-cli-linux-x86_64
-    mempalace-mcp-linux-x86_64
-    mempalace-cli-macos-arm64
-    mempalace-mcp-macos-arm64
-    mempalace-cli-windows-x86_64.exe
-    mempalace-mcp-windows-x86_64.exe
+    mempalace-linux-x86_64
+    mempalace-macos-arm64
+    mempalace-windows-x86_64.exe
+    mempalace-notices-linux-x86_64.txt
+    mempalace-notices-macos-arm64.txt
+    mempalace-notices-windows-x86_64.txt
 )
 
 for asset in "${expected_assets[@]}"; do
@@ -71,10 +71,13 @@ checksums_sha256="$(sha256sum "$asset_dir/SHA256SUMS" | cut -d' ' -f1)"
 
 assets_json="$(
     for asset in "${expected_assets[@]}"; do
-        component="${asset#mempalace-}"
-        component="${component%%-*}"
-        target="${asset#mempalace-cli-}"
-        target="${target#mempalace-mcp-}"
+        component=cli
+        target="${asset#mempalace-}"
+        if [[ "$asset" == mempalace-notices-* ]]; then
+            component=notices
+            target="${asset#mempalace-notices-}"
+        fi
+        target="${target%.txt}"
         target="${target%.exe}"
         sha256="$(sha256sum "$asset_dir/$asset" | cut -d' ' -f1)"
         size="$(wc -c < "$asset_dir/$asset" | tr -d '[:space:]')"

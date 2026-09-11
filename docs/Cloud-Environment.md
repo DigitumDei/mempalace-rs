@@ -118,13 +118,13 @@ Add them only if you intend to run the embedding benchmarks.
 stub's vectors are not comparable with model output.
 
 **It is not a blanket offline switch for the CLI.** The tests that need it set it on the
-processes they spawn, and at runtime only `mempalace-mcp` and `mempalace-cli serve` consult
-it. `mempalace-cli init`, `mine`, and `search` always construct the real provider, so on a
+processes they spawn, and at runtime only `mempalace serve --stdio` and `mempalace serve` consult
+it. `mempalace init`, `mine`, and `search` always construct the real provider, so on a
 box with no model cache they fail with missing assets no matter what this variable says.
 That is expected here: the workspace's tests do not exercise those commands against a real
 model.
 
-**Do not set `MEMPALACE_EMBED_ALLOW_DOWNLOADS`.** Both binaries default to offline and refuse to
+**Do not set `MEMPALACE_EMBED_ALLOW_DOWNLOADS`.** All transports default to offline and refuse to
 fetch model assets without it, and the test suite is green in that state — CI's
 `embeddings-tests` job never sets it, and only the separate `embedding-baselines` job does.
 Leaving it unset is what allows the HuggingFace domains to stay off the allowlist. If you need

@@ -110,7 +110,7 @@ workspace package version.
 
 ## Candidate publication
 
-Every successful push to `main` builds and attests six binaries. After the
+Every successful push to `main` builds and attests three executables with statically linked ONNX Runtime and three license-notice assets. After the
 `stable-release` approval, CI:
 
 1. calculates and embeds the deterministic release version;
@@ -191,3 +191,6 @@ Key rotation is a coordinated release change:
 
 Old installers continue to trust only the old key, so retain old stable
 releases and plan compatibility explicitly.
+
+Each platform also ships a signed `mempalace-notices-<platform>.txt` asset containing
+the upstream ONNX Runtime license and third-party notices, installed as `ONNXRuntime-NOTICES.txt`.

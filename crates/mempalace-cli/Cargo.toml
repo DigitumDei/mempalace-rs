@@ -5,12 +5,17 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[[bin]]
+name = "mempalace"
+path = "src/main.rs"
+
 [dependencies]
 axum = { version = "0.8", default-features = true }
 clap = { version = "4.5.50", features = ["derive"] }
 dirs.workspace = true
 mempalace-config = { path = "../mempalace-config" }
 mempalace-core = { path = "../mempalace-core" }
+mempalace-mcp = { path = "../mempalace-mcp" }
 mempalace-ingest = { path = "../mempalace-ingest" }
 mempalace-embeddings = { path = "../mempalace-embeddings" }
 mempalace-federation = { path = "../mempalace-federation" }
@@ -25,6 +30,7 @@ tempfile = "3.23.0"
 time.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+toml_edit = "0.25.11"
 
 [dev-dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

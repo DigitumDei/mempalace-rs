@@ -47,7 +47,7 @@ if ($Channel -eq 'stable') {
     $nightlySha = $Matches[2]
     $releaseUrl = "https://github.com/$repo/releases/download/$Version"
 }
-$assets = @('mempalace-cli-windows-x86_64.exe', 'mempalace-mcp-windows-x86_64.exe')
+$assets = @('mempalace-notices-windows-x86_64.txt', 'mempalace-windows-x86_64.exe')
 $publicKeyPem = @'
 -----BEGIN PUBLIC KEY-----
 MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAqDpP5+PmejB/5RA2bO/K
@@ -167,7 +167,7 @@ try {
             throw "Release manifest is missing a unique entry for $asset"
         }
         $manifestAsset = $manifestAssets[0]
-        $expectedComponent = if ($asset.StartsWith('mempalace-cli-')) { 'cli' } else { 'mcp' }
+        $expectedComponent = if ($asset.StartsWith('mempalace-notices-')) { 'notices' } else { 'cli' }
         if ($manifestAsset.component -ne $expectedComponent -or
             $manifestAsset.target -ne 'windows-x86_64' -or
             $manifestAsset.sha256 -ne $actual -or
@@ -176,32 +176,49 @@ try {
         }
     }
 
-    $updated = Test-Path (Join-Path $InstallDir 'mempalace-cli.exe')
+    $updated = (Test-Path (Join-Path $InstallDir 'mempalace.exe')) -or
+        (Test-Path (Join-Path $InstallDir 'mempalace-cli.exe')) -or
+        (Test-Path (Join-Path $InstallDir 'mempalace-mcp.exe'))
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
 
     # Clean up .old files left behind by a previous locked-file update.
-    Get-ChildItem -Path $InstallDir -Filter '*.exe.old' -ErrorAction SilentlyContinue | ForEach-Object {
-        try { Remove-Item $_.FullName -Force -Confirm:$false -ErrorAction Stop } catch {}
+    Get-ChildItem -LiteralPath $InstallDir -Filter 'mempalace*.old' -File -ErrorAction SilentlyContinue | ForEach-Object {
+        try { Remove-Item -LiteralPath $_.FullName -Force -Confirm:$false -ErrorAction Stop } catch {}
     }
 
     foreach ($asset in $assets) {
-        # mempalace-cli-windows-x86_64.exe -> mempalace-cli.exe
-        $target = Join-Path $InstallDir ($asset -replace '-windows-x86_64\.exe$', '.exe')
+        # mempalace-windows-x86_64.exe -> mempalace.exe
+        $target = Join-Path $InstallDir $(if ($asset.StartsWith('mempalace-notices-')) { 'ONNXRuntime-NOTICES.txt' } else { 'mempalace.exe' })
         $source = Join-Path $tmpDir $asset
         try {
             Move-Item -Path $source -Destination $target -Force -ErrorAction Stop
         } catch {
             # A running MCP server locks its exe; Windows still allows renaming
             # a running exe, so move the old one aside and retry.
-            Move-Item -Path $target -Destination "$target.old" -Force
+            $oldTarget = "$target.$([guid]::NewGuid().ToString('N')).old"
+            Move-Item -LiteralPath $target -Destination $oldTarget
             Move-Item -Path $source -Destination $target -Force
+        }
+    }
+
+    # Retire legacy entry points after installing the replacement. A running
+    # legacy server may lock its executable; rename it out of PATH for now.
+    foreach ($legacyName in @('mempalace-cli.exe', 'mempalace-mcp.exe')) {
+        $legacyPath = Join-Path $InstallDir $legacyName
+        if (Test-Path -LiteralPath $legacyPath -PathType Leaf) {
+            try {
+                Remove-Item -LiteralPath $legacyPath -Force -ErrorAction Stop
+            } catch {
+                $retiredPath = "$legacyPath.$([guid]::NewGuid().ToString('N')).old"
+                Move-Item -LiteralPath $legacyPath -Destination $retiredPath -ErrorAction Stop
+            }
         }
     }
 
     if ($updated) {
         Write-Host "Updated existing install in $InstallDir"
     } else {
-        Write-Host "Installed mempalace-cli.exe and mempalace-mcp.exe to $InstallDir"
+        Write-Host "Installed mempalace.exe (with built-in ONNX Runtime) to $InstallDir"
     }
 
     if (-not $NoPath) {
@@ -218,30 +235,30 @@ try {
     }
 
     if (-not $NoSetup) {
-        & (Join-Path $InstallDir 'mempalace-cli.exe') setup
+        & (Join-Path $InstallDir 'mempalace.exe') setup
         if ($LASTEXITCODE -ne 0) {
             # setup exits non-zero only when the embedding model could not be
             # made usable offline (see the "check:" line above). The install
             # itself succeeded, so warn with remediation rather than aborting.
             Write-Warning @"
 The embedding-model warm-up in setup failed.
-mempalace-cli and mempalace-mcp are installed and usable, but the MCP server
+mempalace (with built-in ONNX Runtime) is installed and usable, but the MCP server
 will abort with OfflineStartup until the model cache is complete.
 Fix: re-run setup with network access to download the model:
-  $(Join-Path $InstallDir 'mempalace-cli.exe') setup
+  $(Join-Path $InstallDir 'mempalace.exe') setup
 or stage the model cache yourself and re-run with the warm-up skipped:
-  $(Join-Path $InstallDir 'mempalace-cli.exe') setup --no-model-warmup
+  $(Join-Path $InstallDir 'mempalace.exe') setup --no-model-warmup
 "@
         }
     } else {
         Write-Host 'Skipped MCP registration and model warm-up. Run them later with:'
-        Write-Host "  $(Join-Path $InstallDir 'mempalace-cli.exe') setup"
+        Write-Host "  $(Join-Path $InstallDir 'mempalace.exe') setup"
     }
 
     Write-Host ''
     Write-Host 'MemPalace is installed. Next steps:'
-    Write-Host '  mempalace-cli init C:\path\to\your\project    # create a palace for a project'
-    Write-Host '  mempalace-cli mine C:\path\to\your\project    # ingest its files'
+    Write-Host '  mempalace init C:\path\to\your\project    # create a palace for a project'
+    Write-Host '  mempalace mine C:\path\to\your\project    # ingest its files'
     Write-Host ''
     Write-Host "Full walkthrough: https://github.com/$repo/blob/main/docs/Quickstart.md"
 } finally {

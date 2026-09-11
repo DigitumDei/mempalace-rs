@@ -3940,6 +3940,7 @@ dependencies = [
  "mempalace-embeddings",
  "mempalace-federation",
  "mempalace-ingest",
+ "mempalace-mcp",
  "mempalace-remote",
  "mempalace-search",
  "mempalace-server",
@@ -3950,6 +3951,7 @@ dependencies = [
  "tempfile",
  "time",
  "tokio",
+ "toml_edit",
  "tracing",
  "tracing-subscriber",
 ]
@@ -6540,6 +6542,7 @@ dependencies = [
  "indexmap 2.14.0",
  "toml_datetime 1.1.1+spec-1.1.0",
  "toml_parser",
+ "toml_writer",
  "winnow 1.0.1",
 ]
 

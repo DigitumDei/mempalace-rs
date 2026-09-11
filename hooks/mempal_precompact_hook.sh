@@ -41,8 +41,8 @@
 # to save everything. After the AI saves, compaction proceeds normally.
 #
 # === MEMPALACE CLI ===
-# This repo uses: mempalace-cli mine <dir>
-# or:            mempalace-cli mine <dir> --mode convos
+# This repo uses: mempalace mine <dir>
+# or:            mempalace mine <dir> --mode convos
 # Set MEMPAL_DIR below if you want the hook to auto-ingest before compaction.
 # Leave blank to rely on the AI's own save instructions.
 
@@ -58,16 +58,16 @@ MEMPAL_DIR=""
 # (the usual MEMPAL_DIR contents), `projects` for source files.
 MEMPAL_MINE_MODE="convos"
 
-# Locate the mempalace-cli binary. Hooks run in a non-interactive shell that may
+# Locate the mempalace binary. Hooks run in a non-interactive shell that may
 # not have the installer's PATH additions, so fall back to the default install
 # location before giving up.
 resolve_mempalace_cli() {
-    if command -v mempalace-cli >/dev/null 2>&1; then
-        command -v mempalace-cli
+    if command -v mempalace >/dev/null 2>&1; then
+        command -v mempalace
         return 0
     fi
-    for candidate in "$HOME/.mempalace/bin/mempalace-cli" \
-                     "$HOME/.mempalace/bin/mempalace-cli.exe"; do
+    for candidate in "$HOME/.mempalace/bin/mempalace" \
+                     "$HOME/.mempalace/bin/mempalace.exe"; do
         if [ -x "$candidate" ]; then
             printf '%s\n' "$candidate"
             return 0
@@ -89,7 +89,7 @@ if [ -n "$MEMPAL_DIR" ] && [ -d "$MEMPAL_DIR" ]; then
         "$MEMPALACE_CLI" mine "$MEMPAL_DIR" --mode "$MEMPAL_MINE_MODE" \
             >> "$STATE_DIR/hook.log" 2>&1
     else
-        echo "[$(date '+%H:%M:%S')] mempalace-cli not found on PATH or in ~/.mempalace/bin; skipping auto-ingest" \
+        echo "[$(date '+%H:%M:%S')] mempalace not found on PATH or in ~/.mempalace/bin; skipping auto-ingest" \
             >> "$STATE_DIR/hook.log"
     fi
 fi

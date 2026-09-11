@@ -4,7 +4,7 @@ Get MemPalace running and connected to your AI in a few minutes.
 
 ## 1. Install
 
-The installer downloads the latest stable binaries for your platform, verifies the signed release manifest and the artifact digests, installs them to `~/.mempalace/bin`, adds that directory to your PATH, and runs `mempalace-cli setup` to register the MCP server with detected AI tools and warm the embedding model.
+The installer downloads the latest stable binaries for your platform, verifies the signed release manifest and the artifact digests, installs them to `~/.mempalace/bin`, adds that directory to your PATH, and runs `mempalace setup` to register the MCP server with detected AI tools and warm the embedding model.
 
 **macOS (Apple Silicon) / Linux (x86_64, glibc 2.38+):**
 
@@ -39,16 +39,17 @@ Supported platforms: Linux x86_64 (glibc 2.38+), macOS Apple Silicon, Windows x8
 ### 1b. Build from source (alternative)
 
 ```bash
-cargo build --release -p mempalace-cli -p mempalace-mcp
+cargo build --release -p mempalace-cli
 ```
 
 Requires Rust 1.88+ and `protobuf-compiler` (see [README](../README.md)).
 
 Expected binaries:
-- `target/release/mempalace-cli`
-- `target/release/mempalace-mcp`
+- `target/release/mempalace`
 
-The rest of this guide assumes `mempalace-cli` is on your PATH (the installer does this); for a source build, substitute `./target/release/mempalace-cli`.
+ONNX Runtime is statically linked into the executable. Model weights are cached separately.
+
+The rest of this guide assumes `mempalace` is on your PATH (the installer does this); for a source build, substitute `./target/release/mempalace`.
 
 ## 2. Initialize a palace
 
@@ -57,7 +58,7 @@ and room configuration in the local registry (`~/.mempalace/projects.json` by
 default), so no repository file is required:
 
 ```bash
-mempalace-cli init /path/to/your/project
+mempalace init /path/to/your/project
 ```
 
 Use `--repo-config` when you explicitly want a portable repository-local
@@ -67,7 +68,7 @@ For a repository without a Git `origin`, provide a durable identity explicitly
 so another checkout can resolve the same declaration:
 
 ```bash
-mempalace-cli init /path/to/your/project --project-id local/my-project
+mempalace init /path/to/your/project --project-id local/my-project
 ```
 
 On first run, you'll see a startup validation status. If it's not `ready`, set `MEMPALACE_EMBED_ALLOW_DOWNLOADS=1` to download embedding assets, then re-run `init`.
@@ -76,10 +77,10 @@ On first run, you'll see a startup validation status. If it's not `ready`, set `
 
 ```bash
 # Mine project files (code, docs, notes)
-mempalace-cli mine /path/to/your/project
+mempalace mine /path/to/your/project
 
 # Mine conversation exports
-mempalace-cli mine /path/to/chats/ --mode convos --wing project_name
+mempalace mine /path/to/chats/ --mode convos --wing project_name
 ```
 
 `mine` reads the checkout it is pointed at. On the repository's default branch it takes a
@@ -99,28 +100,28 @@ So mine the default branch first, then just re-run `mine` as you work on a featu
 ## 4. Verify it works
 
 ```bash
-mempalace-cli status
-mempalace-cli search "your query"
-mempalace-cli search "your query" --view my-feature-branch
-mempalace-cli wake-up
+mempalace status
+mempalace search "your query"
+mempalace search "your query" --view my-feature-branch
+mempalace wake-up
 ```
 
 A working `status` shows wings and rooms with drawer counts. `search` returns matching results with similarity scores — canonical rows by default, or a branch view composed over them with `--view`. `wake-up` renders your L0 + L1 context.
 
 ## 5. Connect your AI (MCP)
 
-If you used the installer, this already happened: it ran `mempalace-cli setup`, which detects installed AI tools (Claude Code, Codex, Gemini, opencode, Copilot, Antigravity) and registers the `mempalace` MCP server with each. It also warms the embedding model — downloading the assets on a fresh machine, then checking the model starts offline exactly as the MCP server will — so the very first MCP launch doesn't abort with `OfflineStartup`. Re-run it any time — it's idempotent:
+If you used the installer, this already happened: it ran `mempalace setup`, which detects installed AI tools (Claude Code, Codex, Gemini, opencode, Copilot, Antigravity) and registers the `mempalace` MCP server with each. It also warms the embedding model — downloading the assets on a fresh machine, then checking the model starts offline exactly as the MCP server will — so the very first MCP launch doesn't abort with `OfflineStartup`. Re-run it any time — it's idempotent:
 
 ```bash
-mempalace-cli setup                     # register with every detected tool and warm the model
-mempalace-cli setup --dry-run           # preview without writing anything or warming the model
-mempalace-cli setup --tools claude      # restrict to a comma-separated subset
-mempalace-cli setup --no-model-warmup   # skip the model warm-up (air-gapped, staged cache)
+mempalace setup                     # register with every detected tool and warm the model
+mempalace setup --dry-run           # preview without writing anything or warming the model
+mempalace setup --tools claude      # restrict to a comma-separated subset
+mempalace setup --no-model-warmup   # skip the model warm-up (air-gapped, staged cache)
 ```
 
 If the warm-up's offline check fails (no network on a fresh machine), `setup` exits non-zero and prints the remediation — re-run it with network access, or stage the cache yourself and use `--no-model-warmup`. When the installer runs it, that failure is a warning: the binaries are already installed, so the installer finishes and tells you exactly what to run later to complete the warm-up.
 
-For tools `setup` doesn't cover, point them at `~/.mempalace/bin/mempalace-mcp` manually:
+For tools `setup` doesn't cover, point them at `~/.mempalace/bin/mempalace` with arguments `serve --stdio` manually:
 
 ### Claude Desktop
 
@@ -130,7 +131,8 @@ Add to `claude_desktop_config.json`:
 {
   "mcpServers": {
     "mempalace": {
-      "command": "/absolute/path/to/.mempalace/bin/mempalace-mcp"
+      "command": "/absolute/path/to/.mempalace/bin/mempalace",
+      "args": ["serve", "--stdio"]
     }
   }
 }
@@ -139,19 +141,19 @@ Add to `claude_desktop_config.json`:
 ### Claude Code
 
 ```bash
-claude mcp add mempalace -- ~/.mempalace/bin/mempalace-mcp
+claude mcp add mempalace -- ~/.mempalace/bin/mempalace serve --stdio
 ```
 
 ### Cline / Cursor / Any MCP host
 
-Point your MCP client at the `mempalace-mcp` binary. No arguments are needed: the server speaks stdio MCP and exposes all 58 tools during `initialize`/`tools/list`.
+Point your MCP client at `mempalace` with arguments `serve --stdio`: the server speaks stdio MCP and exposes all 69 tools during `initialize`/`tools/list`.
 
 To give different MCP clients distinct persistent selves, set `MEMPALACE_LINEAGE_ID` in each
 server registration. Lineage selection is then fixed by the host and cannot be overridden by a
 model tool call. If the selected lineage does not exist yet, wake-up uses the palace default and
 explains how to create the requested lineage with `mempalace_lineage_set`. See [Self-continuity](Self-Continuity.md#binding-a-lineage-to-an-mcp-client) for Codex and OpenCode examples.
 
-Your AI now has access to `mempalace_search`, `mempalace_add_drawer`, `mempalace_kg_query`, and 55 more tools. Ask it about your project and it can search your palace on demand. The complete list, including coordination, skill-registry, delegation-telemetry, and self-continuity tools, is in [Release Scope](Release-Scope.md#mcp-tool-surface-58-tools).
+Your AI now has access to `mempalace_search`, `mempalace_add_drawer`, `mempalace_kg_query`, and 66 more tools. Ask it about your project and it can search your palace on demand. The complete list, including coordination, skill-registry, delegation-telemetry, and self-continuity tools, is in [Release Scope](Release-Scope.md#mcp-tool-surface-69-tools).
 
 ## Next steps
 

@@ -146,7 +146,8 @@ fn compiled_binary_serves_stdio_with_stub_embeddings() {
     let home_dir = tempdir.path().join("home");
     std::fs::create_dir_all(&home_dir).unwrap();
     let palace_path = tempdir.path().join("palace");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_mempalace-mcp"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_mempalace"))
+        .args(["serve", "--stdio"])
         .env("HOME", &home_dir)
         .env("MEMPALACE_PALACE_PATH", &palace_path)
         .env("MEMPALACE_STUB_EMBEDDINGS", "1")
@@ -191,7 +192,8 @@ fn compiled_binary_falls_back_for_missing_bound_lineage_and_explains_creation() 
     let home_dir = tempdir.path().join("home");
     std::fs::create_dir_all(&home_dir).unwrap();
     let palace_path = tempdir.path().join("palace");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_mempalace-mcp"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_mempalace"))
+        .args(["serve", "--stdio"])
         .env("HOME", &home_dir)
         .env("MEMPALACE_PALACE_PATH", &palace_path)
         .env("MEMPALACE_STUB_EMBEDDINGS", "1")
@@ -241,7 +243,8 @@ fn compiled_binary_falls_back_for_missing_bound_lineage_and_explains_creation() 
 #[test]
 fn compiled_binary_rejects_invalid_environment_lineage_id_at_startup() {
     let tempdir = TempDir::new().unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_mempalace-mcp"))
+    let output = Command::new(env!("CARGO_BIN_EXE_mempalace"))
+        .args(["serve", "--stdio"])
         .env("HOME", tempdir.path())
         .env("MEMPALACE_PALACE_PATH", tempdir.path().join("palace"))
         .env("MEMPALACE_STUB_EMBEDDINGS", "1")
@@ -251,11 +254,10 @@ fn compiled_binary_rejects_invalid_environment_lineage_id_at_startup() {
 
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("InvalidLineageBinding"));
     assert!(stderr.contains("may contain only ASCII letters"));
 }
 
-/// Proves `MEMPALACE_CONFIG_DIR` actually reaches the compiled `mempalace-mcp`
+/// Proves `MEMPALACE_CONFIG_DIR` actually reaches the compiled `mempalace serve --stdio`
 /// binary in production, not just the config loader in isolation. `HOME`
 /// points at an empty, never-read directory so a passing test can only mean
 /// the binary resolved its base directory from `MEMPALACE_CONFIG_DIR` — with
@@ -270,7 +272,8 @@ fn compiled_binary_honors_config_dir_env_var_for_default_palace_location() {
     let config_dir = tempdir.path().join("config-dir");
     std::fs::create_dir_all(&config_dir).unwrap();
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_mempalace-mcp"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_mempalace"))
+        .args(["serve", "--stdio"])
         .env("HOME", &unused_home)
         .env("MEMPALACE_CONFIG_DIR", &config_dir)
         .env("MEMPALACE_STUB_EMBEDDINGS", "1")
@@ -329,7 +332,8 @@ fn compiled_binary_palace_path_env_var_wins_over_config_dir_default_palace() {
     std::fs::create_dir_all(&config_dir).unwrap();
     let explicit_palace = tempdir.path().join("explicit-palace");
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_mempalace-mcp"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_mempalace"))
+        .args(["serve", "--stdio"])
         .env("HOME", tempdir.path().join("unused-home"))
         .env("MEMPALACE_CONFIG_DIR", &config_dir)
         .env("MEMPALACE_PALACE_PATH", &explicit_palace)

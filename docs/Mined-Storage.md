@@ -143,7 +143,7 @@ Run `mine --reindex <dir>` to re-mine a directory and replace content rows with
 locator rows:
 
 ```bash
-mempalace-cli mine /path/to/project --reindex
+mempalace mine /path/to/project --reindex
 ```
 
 `--reindex` bypasses the unchanged-content skip that would normally leave
@@ -379,7 +379,7 @@ When a **canonical** mine's wing routes to `mode: remote` (or `mode: combined`
 with `write: remote`), running `mine <dir>` routes to the remote palace instead
 of writing locally. When the route resolves to `mode: combined` with
 `write: both`, the mine runs locally first, then a best-effort remote push is
-attempted (see [Federation guide](Federation.md#write-both--local-first-dual-write-semantics)).
+attempted (see [Federation guide](Federation.md#write-both--durable-local-first-dual-write-semantics)).
 
 A mine that resolves to a **branch view** — via `--branch`, `--view <name>`, or
 automatic detection on a non-canonical checkout — never routes remote. It always

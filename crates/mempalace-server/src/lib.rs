@@ -727,6 +727,11 @@ pub struct AuthIdentity(
 );
 
 impl AuthIdentity {
+    /// Whether this token grants the full local MCP surface.
+    pub fn is_unrestricted(&self) -> bool {
+        self.1.is_none()
+    }
+
     /// The authenticated identity name.
     pub fn name(&self) -> &str {
         &self.0
@@ -3238,7 +3243,11 @@ fn resolve_owning_task(
     // check above: a read is masked as 404 so it can't be used as an
     // existence oracle, a write or claim gets the explicit 422.
     if task.wing == UNSCOPED_WING {
-        return Err(if op == Operation::CoordinationRead { mask() } else { ServerError::UnscopedNotFederated });
+        return Err(if op == Operation::CoordinationRead {
+            mask()
+        } else {
+            ServerError::UnscopedNotFederated
+        });
     }
     if !auth.allows_wing(op, &task.wing) {
         return Err(mask());

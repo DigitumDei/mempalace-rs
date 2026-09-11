@@ -36,6 +36,7 @@ use serde_yaml::Mapping;
 use tracing_subscriber::{EnvFilter, fmt};
 
 mod setup;
+mod transport;
 
 const DEFERRED_COMMAND_DOC: &str = "docs/rust-phase-plans/Phase09-Deferred-Commands.md";
 
@@ -150,12 +151,13 @@ fn init_tracing(default_filter: &str) {
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
 
-    let _ = fmt().with_env_filter(filter).with_target(false).try_init();
+    let _ =
+        fmt().with_env_filter(filter).with_target(false).with_writer(std::io::stderr).try_init();
 }
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "mempalace-cli",
+    name = "mempalace",
     about = "MemPalace — Give your AI a memory. No API key required.",
     version = mempalace_core::BUILD_VERSION
 )]
@@ -314,7 +316,7 @@ enum Commands {
         dry_run: bool,
         #[arg(
             long = "mcp-path",
-            help = "Path to the mempalace-mcp binary (default: ~/.mempalace/bin/mempalace-mcp[.exe])"
+            help = "Path to the mempalace executable (default: this executable)"
         )]
         mcp_path: Option<PathBuf>,
         #[arg(
@@ -350,8 +352,10 @@ enum Commands {
     },
     /// Run a single maintenance pass (compact, prune, optimize) using configured settings.
     Maintain,
-    /// Run the federation HTTP server over this palace.
+    /// Serve MCP and federation over HTTP, or MCP over stdio.
     Serve {
+        #[arg(long, conflicts_with_all = ["bind", "token_file"])]
+        stdio: bool,
         #[arg(long, help = "Bind address, e.g. 127.0.0.1:8765 (default: from config)")]
         bind: Option<SocketAddr>,
         #[arg(
@@ -480,7 +484,7 @@ where
     Q: EmbeddingProvider,
     H: Fn(EmbeddingProfile, PathBuf) -> Result<P, Box<dyn std::error::Error>>,
 {
-    let argv = std::iter::once(std::ffi::OsString::from("mempalace-cli"))
+    let argv = std::iter::once(std::ffi::OsString::from("mempalace"))
         .chain(args.into_iter().map(Into::into))
         .collect::<Vec<_>>();
     let cli = match Cli::try_parse_from(argv) {
@@ -498,20 +502,14 @@ where
         return Ok(CliOutput::success(render_help()));
     }
 
-    execute(
-        cli,
-        context,
-        provider_factory,
-        validation_provider_factory,
-        warmup_provider_factory,
-    )
+    execute(cli, context, provider_factory, validation_provider_factory, warmup_provider_factory)
 }
 
 fn render_help() -> String {
     let mut command = Cli::command();
     let mut buffer = Vec::new();
     if command.write_long_help(&mut buffer).is_err() {
-        return "mempalace-cli\n".to_owned();
+        return "mempalace\n".to_owned();
     }
     String::from_utf8_lossy(&buffer).into_owned()
 }
@@ -626,8 +624,16 @@ where
         Commands::Split { .. } => Ok(deferred_command("split")),
         Commands::Compress { .. } => Ok(deferred_command("compress")),
         Commands::Maintain => execute_maintain(cli.palace.as_deref(), context),
-        Commands::Serve { bind, token_file } => {
-            execute_serve(bind, token_file, cli.palace.as_deref(), context, provider_factory)
+        Commands::Serve { bind, token_file, stdio } => {
+            if stdio {
+                let config =
+                    load_runtime_config(cli.palace.as_deref(), context).map_err(config_error)?;
+                let runtime = build_runtime(&config).map_err(runtime_error)?;
+                runtime.block_on(transport::stdio(config)).map_err(provider_error)?;
+                Ok(CliOutput::success(""))
+            } else {
+                execute_serve(bind, token_file, cli.palace.as_deref(), context, provider_factory)
+            }
         }
     }
 }
@@ -662,7 +668,7 @@ where
         return Ok(CliOutput::failure(
             1,
             format!(
-                "{} already exists; re-run `mempalace-cli init {}` with `--yes` to overwrite it\n",
+                "{} already exists; re-run `mempalace init {}` with `--yes` to overwrite it\n",
                 config_path.display(),
                 project_dir.display()
             ),
@@ -767,7 +773,7 @@ where
         format!("  Startup validation: {}", validation.status),
         format!("  Global config: {}", runtime_paths.config_file.display()),
         "  Next step:".to_owned(),
-        format!("    mempalace-cli mine {}", project_dir.display()),
+        format!("    mempalace mine {}", project_dir.display()),
         format!("\n{}\n", "=".repeat(INIT_HEADER_WIDTH)),
     ]);
 
@@ -2310,7 +2316,7 @@ where
         return Ok(CliOutput::failure(
             1,
             format!(
-                "{}\n\n## L1 — No palace found. Run: mempalace-cli init <dir> then mempalace-cli mine <dir>\n",
+                "{}\n\n## L1 — No palace found. Run: mempalace init <dir> then mempalace mine <dir>\n",
                 default_identity_banner()
             ),
         ));
@@ -2416,7 +2422,16 @@ async fn run_serve<P>(
 where
     P: EmbeddingProvider + Send + Sync + 'static,
 {
-    let (router, _state) = build_router(config, provider, tokens).await?;
+    let mcp_config = config.clone();
+    let provider = transport::SharedProvider::new(provider);
+    let (router, state) = build_router(config, provider.clone(), tokens).await?;
+    let mcp = transport::http_router(mcp_config, provider, state.tokens.clone()).await.map_err(
+        |err| mempalace_server::ServerError::Io {
+            path: PathBuf::from("MCP startup"),
+            source: std::io::Error::other(err.to_string()),
+        },
+    )?;
+    let router = router.merge(mcp);
     let listener = tokio::net::TcpListener::bind(bind).await.map_err(|source| {
         mempalace_server::ServerError::Io { path: PathBuf::from(bind.to_string()), source }
     })?;
@@ -2525,7 +2540,7 @@ fn no_palace_error(palace_path: &Path) -> CliOutput {
 
 fn no_palace_message(palace_path: &Path) -> String {
     format!(
-        "\n  No palace found at {}\n  Run: mempalace-cli init <dir> then mempalace-cli mine <dir>\n",
+        "\n  No palace found at {}\n  Run: mempalace init <dir> then mempalace mine <dir>\n",
         palace_path.display()
     )
 }
@@ -2690,7 +2705,7 @@ fn write_project_config(
         return Err(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
             format!(
-                "{} already exists; re-run `mempalace-cli init {}` with `--yes` to overwrite it",
+                "{} already exists; re-run `mempalace init {}` with `--yes` to overwrite it",
                 config_path.display(),
                 project_dir.display()
             ),
@@ -2784,7 +2799,7 @@ fn fastembed_provider_config(cache_root: PathBuf) -> FastembedProviderConfig {
 }
 
 /// Provider factory for the `setup` warm-up phase. Unlike
-/// [`fastembed_provider`] it always permits downloads: `mempalace-cli setup` is
+/// [`fastembed_provider`] it always permits downloads: `mempalace setup` is
 /// the one step every install path runs, so it is the deliberate place to
 /// bootstrap missing embedding assets. Air-gapped operators who stage the cache
 /// themselves pass `--no-model-warmup` to skip it.
@@ -2811,7 +2826,7 @@ struct ModelWarmup {
 ///
 /// Phase 1 initialises a download-enabled provider so a fresh machine fetches
 /// the missing model assets (a no-op on a warm cache). Phase 2 re-initialises
-/// with the regular provider factory — exactly how `mempalace-mcp` starts by
+/// with the regular provider factory — exactly how `mempalace serve --stdio` starts by
 /// default — proving the cache is complete before the MCP server is ever
 /// launched. A warm cache adds no more than the model init time.
 fn run_setup_model_warmup<F, H, P>(
@@ -2835,10 +2850,7 @@ where
 
     let (offline, offline_ok) = match offline_factory(profile, cache_dir) {
         Ok(provider) => match provider.startup_validation() {
-            Ok(validation) => (
-                format!("ok — {}", validation.detail),
-                validation.is_ready(),
-            ),
+            Ok(validation) => (format!("ok — {}", validation.detail), validation.is_ready()),
             Err(error) => (format!("failed — {}", one_line_error(&error)), false),
         },
         Err(error) => (format!("failed — {}", one_line_error(error.as_ref())), false),
@@ -2861,19 +2873,22 @@ where
         lines.push("    OfflineStartup until the model cache is complete.".to_owned());
         lines.push(String::new());
         lines.push(
-            "  ! fix: re-run `mempalace-cli setup` with network access to download the model,".to_owned(),
+            "  ! fix: re-run `mempalace setup` with network access to download the model,"
+                .to_owned(),
         );
-        lines.push("    or stage the cache yourself and re-run with `--no-model-warmup`.".to_owned());
+        lines.push(
+            "    or stage the cache yourself and re-run with `--no-model-warmup`.".to_owned(),
+        );
     }
     lines.push(String::new());
 
     ModelWarmup { text: lines.join("\n"), offline_ok }
 }
 
-/// Resolves the embedding profile `setup` warms, mirroring how `mempalace-mcp`
+/// Resolves the embedding profile `setup` warms, mirroring how `mempalace serve --stdio`
 /// resolves its own profile at startup. `config_base_dir` is the test-isolation
 /// base dir threaded from [`CliContext`] (see [`ConfigLoader::load_with_env`]);
-/// `None` resolves the real environment config, like `mempalace-mcp` does.
+/// `None` resolves the real environment config, like `mempalace serve --stdio` does.
 /// Falls back to the default profile when no config can be loaded (e.g. a
 /// machine with no palace yet) rather than failing the install path on an
 /// unreadable config.
@@ -3029,7 +3044,7 @@ mod tests {
 
     fn temp_config_root(prefix: &str) -> PathBuf {
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH).expect("system clock").as_nanos();
-        std::env::temp_dir().join(format!("mempalace-cli-{prefix}-{nanos}"))
+        std::env::temp_dir().join(format!("mempalace-{prefix}-{nanos}"))
     }
 
     fn remove_dir_all_if_exists(path: &Path) {
@@ -3116,7 +3131,8 @@ mod tests {
 
     #[test]
     fn setup_help_lists_no_model_warmup_flag() {
-        let output = run_cli(["setup", "--help"], &CliContext::production(), stub_provider).unwrap();
+        let output =
+            run_cli(["setup", "--help"], &CliContext::production(), stub_provider).unwrap();
         assert_eq!(output.exit_code, 0);
         assert!(output.stdout.contains("--no-model-warmup"));
     }
@@ -3149,12 +3165,9 @@ mod tests {
 
     #[test]
     fn setup_warmup_succeeds_with_stub_provider() {
-        let output = run_cli(
-            ["setup", "--tools", "jules"],
-            &CliContext::production(),
-            stub_provider,
-        )
-        .unwrap();
+        let output =
+            run_cli(["setup", "--tools", "jules"], &CliContext::production(), stub_provider)
+                .unwrap();
         assert_eq!(output.exit_code, 0);
         assert!(output.stdout.contains("Embedding model warm-up"));
         assert!(output.stdout.contains("check : ok"));
@@ -3170,7 +3183,7 @@ mod tests {
         .unwrap();
         assert_eq!(output.exit_code, 1);
         assert!(output.stdout.contains("embedding model is not usable offline"));
-        assert!(output.stdout.contains("re-run `mempalace-cli setup` with network access"));
+        assert!(output.stdout.contains("re-run `mempalace setup` with network access"));
     }
 
     #[test]

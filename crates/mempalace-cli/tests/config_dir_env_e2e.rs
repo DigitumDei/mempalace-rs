@@ -1,7 +1,7 @@
-//! Proves `MEMPALACE_CONFIG_DIR` reaches the compiled `mempalace-cli` binary
+//! Proves `MEMPALACE_CONFIG_DIR` reaches the compiled `mempalace` binary
 //! in production.
 //!
-//! `mempalace-cli`'s `CliContext::production()` always passes `None` for the
+//! `mempalace`'s `CliContext::production()` always passes `None` for the
 //! config base-dir override, so the only way the override reaches the
 //! binary is through `mempalace_config::resolve_paths` reading the env var
 //! itself. These tests spawn the real binary (not the in-process `run_cli`
@@ -29,7 +29,7 @@ fn compiled_binary_status_resolves_default_palace_under_config_dir_override() {
     let config_dir = tempdir.path().join("config-dir");
     std::fs::create_dir_all(&config_dir).unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_mempalace-cli"))
+    let output = Command::new(env!("CARGO_BIN_EXE_mempalace"))
         .arg("status")
         .env("HOME", &unused_home)
         .env("MEMPALACE_CONFIG_DIR", &config_dir)
@@ -66,7 +66,7 @@ fn compiled_binary_palace_path_env_var_wins_over_config_dir_default_palace() {
     std::fs::create_dir_all(&config_dir).unwrap();
     let explicit_palace = tempdir.path().join("explicit-palace");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_mempalace-cli"))
+    let output = Command::new(env!("CARGO_BIN_EXE_mempalace"))
         .arg("status")
         .env("HOME", &unused_home)
         .env("MEMPALACE_CONFIG_DIR", &config_dir)

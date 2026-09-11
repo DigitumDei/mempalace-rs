@@ -6,7 +6,7 @@
 #   curl -fsSL https://raw.githubusercontent.com/DigitumDei/mempalace-rs/main/install.sh | sh
 #
 # Options (pass via `sh -s -- <flags>` when piping):
-#   --no-setup           skip `mempalace-cli setup` (MCP registration + embedding-model warm-up)
+#   --no-setup           skip `mempalace setup` (MCP registration + embedding-model warm-up)
 #   --no-path            skip adding the install dir to your shell PATH
 #   --install-dir <dir>  install somewhere other than ~/.mempalace/bin
 #   --channel <channel>  stable (default) or explicit nightly candidate
@@ -47,7 +47,7 @@ its signed manifest and checksums, installs to ~/.mempalace/bin, registers the M
 server with detected AI tools, and warms the embedding model.
 
 Options (pass via `sh -s -- <flags>` when piping):
-  --no-setup           skip `mempalace-cli setup` (MCP registration + embedding-model warm-up)
+  --no-setup           skip `mempalace setup` (MCP registration + embedding-model warm-up)
   --no-path            skip adding the install dir to your shell PATH
   --install-dir <dir>  install somewhere other than ~/.mempalace/bin
   --channel <channel>  stable (default) or explicit nightly candidate
@@ -101,8 +101,8 @@ if [ "${PLATFORM}" = "linux-x86_64" ] && command -v ldd >/dev/null 2>&1; then
     fi
 fi
 
-CLI_ASSET="mempalace-cli-${PLATFORM}"
-MCP_ASSET="mempalace-mcp-${PLATFORM}"
+CLI_ASSET="mempalace-${PLATFORM}"
+NOTICES_ASSET="mempalace-notices-${PLATFORM}.txt"
 
 # --- Downloader -------------------------------------------------------------
 if command -v curl >/dev/null 2>&1; then
@@ -153,7 +153,7 @@ download_release_asset() {
     fi
 }
 download_release_asset "${CLI_ASSET}"
-download_release_asset "${MCP_ASSET}"
+download_release_asset "${NOTICES_ASSET}"
 download_release_asset "SHA256SUMS"
 download_release_asset "SHA256SUMS.sig"
 download_release_asset "release-manifest.json"
@@ -216,7 +216,7 @@ ACTUAL_CHECKSUMS_SHA256="$(file_sha256 "${TMP_DIR}/SHA256SUMS")"
     || err "signed release manifest does not match SHA256SUMS"
 
 echo "Verifying signed manifest and checksums..."
-grep -E "^[0-9a-fA-F]{64} [ *](${CLI_ASSET}|${MCP_ASSET})\$" "${TMP_DIR}/SHA256SUMS" \
+grep -E "^[0-9a-fA-F]{64} [ *](${CLI_ASSET}|${NOTICES_ASSET})\$" "${TMP_DIR}/SHA256SUMS" \
     > "${TMP_DIR}/SHA256SUMS.filtered" || true
 [ "$(wc -l < "${TMP_DIR}/SHA256SUMS.filtered")" -eq 2 ] \
     || err "SHA256SUMS is missing entries for ${PLATFORM} assets"
@@ -230,17 +230,20 @@ fi
 
 # --- Install ----------------------------------------------------------------
 UPDATED=0
-[ -f "${INSTALL_DIR}/mempalace-cli" ] && UPDATED=1
+if [ -f "${INSTALL_DIR}/mempalace" ] || [ -f "${INSTALL_DIR}/mempalace-cli" ] || [ -f "${INSTALL_DIR}/mempalace-mcp" ]; then
+    UPDATED=1
+fi
 mkdir -p "${INSTALL_DIR}"
-mv "${TMP_DIR}/${CLI_ASSET}" "${INSTALL_DIR}/mempalace-cli"
-mv "${TMP_DIR}/${MCP_ASSET}" "${INSTALL_DIR}/mempalace-mcp"
-chmod +x "${INSTALL_DIR}/mempalace-cli" "${INSTALL_DIR}/mempalace-mcp"
-ln -sf "${INSTALL_DIR}/mempalace-cli" "${INSTALL_DIR}/mempalace"
+mv "${TMP_DIR}/${NOTICES_ASSET}" "${INSTALL_DIR}/ONNXRuntime-NOTICES.txt"
+mv "${TMP_DIR}/${CLI_ASSET}" "${INSTALL_DIR}/mempalace"
+chmod +x "${INSTALL_DIR}/mempalace"
+# Retire the old entry points only after the unified executable is installed.
+rm -f "${INSTALL_DIR}/mempalace-cli" "${INSTALL_DIR}/mempalace-mcp"
 
 if [ "${UPDATED}" -eq 1 ]; then
     echo "Updated existing install in ${INSTALL_DIR}"
 else
-    echo "Installed mempalace-cli and mempalace-mcp to ${INSTALL_DIR}"
+    echo "Installed mempalace (with built-in ONNX Runtime) to ${INSTALL_DIR}"
 fi
 
 # --- PATH -------------------------------------------------------------------
@@ -269,31 +272,31 @@ fi
 
 # --- MCP setup + model warm-up ----------------------------------------------
 if [ "${RUN_SETUP}" -eq 1 ]; then
-    if ! "${INSTALL_DIR}/mempalace-cli" setup; then
+    if ! "${INSTALL_DIR}/mempalace" setup; then
         # setup exits non-zero only when the embedding model could not be made
         # usable offline (see the "check :" line above). The install itself
         # succeeded, so warn with remediation rather than aborting the script.
         cat >&2 <<EOF
 
 warning: the embedding-model warm-up in \`setup\` failed.
-  mempalace-cli and mempalace-mcp are installed and usable, but the MCP server
+  mempalace (with built-in ONNX Runtime) is installed and usable, but the MCP server
   will abort with OfflineStartup until the model cache is complete.
   Fix: re-run \`setup\` with network access to download the model:
-    ${INSTALL_DIR}/mempalace-cli setup
+    ${INSTALL_DIR}/mempalace setup
   or stage the model cache yourself and re-run with the warm-up skipped:
-    ${INSTALL_DIR}/mempalace-cli setup --no-model-warmup
+    ${INSTALL_DIR}/mempalace setup --no-model-warmup
 EOF
     fi
 else
     echo "Skipped MCP registration and model warm-up. Run them later with:"
-    echo "  ${INSTALL_DIR}/mempalace-cli setup"
+    echo "  ${INSTALL_DIR}/mempalace setup"
 fi
 
 cat <<EOF
 
 MemPalace is installed. Next steps:
-  mempalace-cli init /path/to/your/project    # create a palace for a project
-  mempalace-cli mine /path/to/your/project    # ingest its files
+  mempalace init /path/to/your/project    # create a palace for a project
+  mempalace mine /path/to/your/project    # ingest its files
 
 Full walkthrough: https://github.com/${REPO}/blob/main/docs/Quickstart.md
 EOF

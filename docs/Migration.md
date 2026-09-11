@@ -98,8 +98,12 @@ with the new instructions reference and required tool names as needed.
 ## Recovery and rollback
 
 If both data homes already exist, migration refuses to merge them. Inspect them
-and choose a destination explicitly. It also refuses symlinks in the copied tree
-and refuses to overwrite a previous source backup. Custom external storage can
+and choose a destination explicitly. File symlinks whose resolved targets are
+regular files inside the same source tree (including Hugging Face snapshot links
+to cached blobs) are copied as ordinary files, so they remain usable after the
+original directory is retired. Directory links, links outside the source tree,
+broken links, and link cycles are rejected. Migration also refuses to overwrite
+a previous source backup. Custom external storage can
 remain outside the home, referenced by its configured path.
 
 A marker in the new home permits a repeated run to finish retiring the original

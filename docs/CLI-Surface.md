@@ -15,7 +15,9 @@ Offline MemPalace upgrade, also invoked by both installers. Requires
 `--mcp-path <final-executable-path>`. Optional `--from <old-home>` and
 `--to <new-home>` default to `~/.mempalace` and `~/.agentpalace`; `--dry-run`
 previews without writing. The applying command refuses running servers, stages
-and backs up data, and migrates supported MCP registrations. Failures exit 1.
+and backs up data, and migrates supported MCP registrations. Internal file
+symlinks are materialized; directory, external, broken, and cyclic links are
+rejected. Failures exit 1.
 See [Migration](Migration.md) for conflicts, custom paths, and rollback.
 
 ### `init <dir>`

@@ -1,6 +1,7 @@
 #![allow(missing_docs)]
 
 mod federation;
+mod maintenance;
 mod metrics;
 mod replication;
 
@@ -1178,8 +1179,41 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
 pub async fn serve_transport<P, R, W>(
     server: &McpServer<P>,
     reader: R,
-    mut writer: W,
+    writer: W,
 ) -> std::result::Result<(), Box<dyn std::error::Error>>
+where
+    P: EmbeddingProvider + Send + 'static,
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let (storage, config) = {
+        let runtime = server.runtime.lock().await;
+        (runtime.storage.clone(), runtime.config.maintenance.clone())
+    };
+    if !config.enabled || !config.background_enabled {
+        return serve_lines(server, reader, writer)
+            .await
+            .map_err(|error| error as Box<dyn std::error::Error>);
+    }
+
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    // Keep maintenance scoped to this transport. On EOF or an I/O error, stop
+    // scheduling and let the current pass finish (and release its lease).
+    let transport = async {
+        let result = serve_lines(server, reader, writer).await;
+        storage.signal_activity();
+        let _ = stop.send(());
+        result
+    };
+    let (result, ()) = tokio::join!(transport, maintenance::run(&storage, &config, stopped));
+    result.map_err(|error| error as Box<dyn std::error::Error>)
+}
+
+async fn serve_lines<P, R, W>(
+    server: &McpServer<P>,
+    reader: R,
+    mut writer: W,
+) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     P: EmbeddingProvider + Send + 'static,
     R: AsyncBufRead + Unpin,
@@ -10143,6 +10177,200 @@ mod tests {
         let status: Value = serde_json::from_str(lines[1]).unwrap();
         assert_eq!(initialize["result"]["protocolVersion"], PROTOCOL_VERSION);
         assert_eq!(decode_tool_payload(&status).unwrap()["total_drawers"], 2);
+    }
+
+    // Observe completed real storage passes without adding a production test hook.
+    fn maintenance_probe(storage: &StorageEngine) -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open(&storage.layout().sqlite_path).unwrap();
+        conn.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE maintenance_probe (completed INTEGER NOT NULL);
+             INSERT INTO maintenance_probe VALUES (0);
+             CREATE TRIGGER maintenance_probe_release AFTER UPDATE ON maintenance_leases
+             WHEN OLD.holder != '' AND NEW.holder = ''
+             BEGIN UPDATE maintenance_probe SET completed = completed + 1; END;",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn completed_maintenance(conn: &rusqlite::Connection) -> i64 {
+        conn.query_row("SELECT completed FROM maintenance_probe", [], |row| row.get(0)).unwrap()
+    }
+
+    async fn fragment_for_maintenance(storage: &StorageEngine, prefix: &str) {
+        for i in 0..12 {
+            let id = format!("{prefix}-{i}");
+            let drawer = test_diary_drawer(&id, &id, OffsetDateTime::now_utc());
+            storage.signal_activity();
+            storage.drawer_store().put_drawers(&[drawer], DuplicateStrategy::Error).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn stdio_maintenance_compacts_recurs_and_stops_on_eof() {
+        use mempalace_storage::{
+            MaintenanceOutcome, MaintenanceSettings, MaintenanceSkipReason, MaintenanceTier,
+        };
+        let harness = test_harness().await;
+        let storage = {
+            let mut runtime = harness.server.runtime.lock().await;
+            runtime.config.maintenance.idle_secs = 1;
+            runtime.config.maintenance.small_fragment_threshold = 1;
+            runtime.storage.clone()
+        };
+        fragment_for_maintenance(&storage, "first").await;
+        let probe = maintenance_probe(&storage);
+        let server = harness.server.clone();
+        let (client, stream) = tokio::io::duplex(8192);
+        let (read, write) = tokio::io::split(stream);
+        let task = tokio::spawn(async move {
+            serve_transport(&server, BufReader::new(read), write).await.unwrap();
+        });
+        let (read, mut write) = tokio::io::split(client);
+        let mut responses = BufReader::new(read).lines();
+
+        for round in 0..2 {
+            if round == 1 {
+                fragment_for_maintenance(&storage, "second").await;
+            }
+            let baseline = completed_maintenance(&probe);
+            // Continuing read-only MCP traffic must not starve maintenance.
+            tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                while completed_maintenance(&probe) == baseline {
+                    write
+                        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\n")
+                        .await
+                        .unwrap();
+                    let response: Value =
+                        serde_json::from_str(&responses.next_line().await.unwrap().unwrap())
+                            .unwrap();
+                    assert!(response["result"]["tools"].is_array());
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        write.shutdown().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), task).await.unwrap().unwrap();
+        let completed = completed_maintenance(&probe);
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        assert_eq!(completed_maintenance(&probe), completed, "scheduler survived EOF");
+
+        // The background pass really compacted the table: a manual pass now
+        // has no fragment work left, and all original records are preserved.
+        storage.take_activity_signal();
+        let summary = storage
+            .run_maintenance(&MaintenanceSettings {
+                idle_secs: 0,
+                small_fragment_threshold: 1,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let compaction = summary
+            .tier_results
+            .iter()
+            .find(|tier| tier.tier == MaintenanceTier::FragmentCompaction)
+            .unwrap();
+        assert_eq!(
+            compaction.outcome,
+            MaintenanceOutcome::Skipped { reason: MaintenanceSkipReason::NothingToDo }
+        );
+        assert_eq!(
+            storage.drawer_store().list_drawers(&DrawerFilter::default()).await.unwrap().len(),
+            26
+        );
+    }
+
+    #[tokio::test]
+    async fn stdio_maintenance_respects_disabled_and_manual_modes() {
+        for (enabled, background_enabled) in [(false, true), (true, false)] {
+            let harness = test_harness().await;
+            let storage = {
+                let mut runtime = harness.server.runtime.lock().await;
+                runtime.config.maintenance.enabled = enabled;
+                runtime.config.maintenance.background_enabled = background_enabled;
+                runtime.config.maintenance.idle_secs = 1;
+                runtime.storage.clone()
+            };
+            let probe = maintenance_probe(&storage);
+            let server = harness.server.clone();
+            let (mut client, stream) = tokio::io::duplex(1024);
+            let (read, write) = tokio::io::split(stream);
+            let task = tokio::spawn(async move {
+                serve_transport(&server, BufReader::new(read), write).await.unwrap();
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(1300)).await;
+            assert_eq!(completed_maintenance(&probe), 0);
+            client.shutdown().await.unwrap();
+            task.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn stdio_maintenance_stops_on_transport_error() {
+        let harness = test_harness().await;
+        let storage = {
+            let mut runtime = harness.server.runtime.lock().await;
+            runtime.config.maintenance.idle_secs = 1;
+            runtime.storage.clone()
+        };
+        let probe = maintenance_probe(&storage);
+        let (writer, disconnected_reader) = tokio::io::duplex(1);
+        drop(disconnected_reader);
+        let input = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}\n";
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            serve_transport(&harness.server, BufReader::new(&input[..]), writer),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_err());
+        tokio::time::sleep(std::time::Duration::from_millis(1300)).await;
+        assert_eq!(completed_maintenance(&probe), 0);
+    }
+
+    #[tokio::test]
+    async fn stdio_maintenance_respects_writes_and_competing_lease() {
+        use mempalace_storage::MaintenanceLeaseStore;
+        let harness = test_harness().await;
+        let storage = harness.server.runtime.lock().await.storage.clone();
+        let probe = maintenance_probe(&storage);
+        let config =
+            MaintenanceRuntimeConfig { idle_secs: 1, ..MaintenanceRuntimeConfig::defaults() };
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let worker_storage = storage.clone();
+        let task =
+            tokio::spawn(async move { maintenance::run(&worker_storage, &config, stopped).await });
+        // More than one scheduling interval elapses, but writes keep it busy.
+        for _ in 0..6 {
+            storage.signal_activity();
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+        assert_eq!(completed_maintenance(&probe), 0);
+        assert!(
+            storage
+                .operational_store()
+                .try_claim_lease("other-process", Duration::minutes(1))
+                .unwrap()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(2300)).await;
+        assert_eq!(completed_maintenance(&probe), 0);
+        assert_eq!(storage.operational_store().lease_status().unwrap().unwrap().0, "other-process");
+        storage.operational_store().release_lease("other-process").unwrap();
+        let baseline = completed_maintenance(&probe);
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while completed_maintenance(&probe) == baseline {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .unwrap();
+        stop.send(()).unwrap();
+        task.await.unwrap();
+        assert_eq!(storage.operational_store().lease_status().unwrap(), None);
     }
 
     #[test]

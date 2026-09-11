@@ -171,8 +171,9 @@ Full setup, client configuration, and the team mining workflow are in the
 
 The maintenance subsystem keeps the palace storage healthy by compacting
 fragments, pruning old version data, and optimising vector indices. It is
-**enabled by default** and the long-lived HTTP hub (`mempalace serve`)
-schedules it automatically by default. Set `background_enabled: false` to
+**enabled by default** and both the HTTP hub (`mempalace serve`) and stdio
+MCP (`mempalace mcp`, or the no-argument MCP entrypoint) schedule it
+automatically by default. Set `background_enabled: false` to
 use manual-only maintenance; the one-shot CLI command (`mempalace maintain`)
 remains available while `enabled` is `true`.
 
@@ -194,7 +195,7 @@ Each run executes up to three tiers in order:
 | Field | Default | Description |
 |---|---|---|
 | `enabled` | `true` | Master switch for all maintenance, including `mempalace maintain`. |
-| `background_enabled` | `true` | Whether the HTTP hub schedules maintenance automatically. |
+| `background_enabled` | `true` | Whether HTTP and stdio MCP schedule maintenance automatically. |
 | `idle_secs` | `300` | Minimum wall-clock seconds since the last write before a run starts. |
 | `version_retention_hours` | `24` | Maximum age in hours for retained version rows. |
 | `tail_threshold_rows` | `1024` | Row count that triggers incremental vector-index optimization. |
@@ -217,29 +218,39 @@ variables, which take precedence over `config.json`:
 - `MEMPALACE_MAINTENANCE_SMALL_FRAGMENT_THRESHOLD` — positive integer;
   zero is rejected.
 
-### Idle-Only Hub Scheduling
+### Idle-Only Automatic Scheduling
 
-When `background_enabled` is `true`, the HTTP hub (`mempalace serve`) runs
-maintenance in a background tokio task. The scheduling rules are:
+When `enabled` and `background_enabled` are both `true`, HTTP and stdio MCP
+run maintenance alongside request handling. The scheduling rules are:
 
-- **Startup eligibility check**: on hub startup, one maintenance
+- **Startup eligibility check**: on transport startup, one maintenance
   eligibility check runs immediately.  The storage engine initialises its
   activity timestamp at open time, so the first actual run occurs only
   after the configured `idle_secs` interval has elapsed without write
   activity (subject to the lease gate — see below).
 - **Loop**: after each run, the task sleeps for `idle_secs` plus a
   randomised jitter of up to 10% of `idle_secs` to desynchronise
-  concurrent hubs.
-- **Idle reset**: every incoming HTTP request signals activity via the
-  `activity_middleware`.  The middleware calls `signal_activity()` on the
-  storage engine and notifies the background task, which cancels any
-  pending sleep and restarts the idle timer.
+  concurrent processes.
+- **Idle reset**: storage write paths call `signal_activity()`. Read-only
+  requests do not reset this timer, so regular searches and status checks
+  do not prevent maintenance.
 - **Not idle**: if the background task wakes from sleep and detects
   recent activity (elapsed time < `idle_secs`), it skips the run and
   goes back to sleep.
-- **Write-path safety**: write operations (add, delete, mine, ingest)
-  also call `signal_activity()`, so maintenance never runs concurrently
-  with active writes from the same process.
+- **Write-path safety**: the engine checks activity before and between
+  maintenance tiers. New write activity causes remaining tiers to be
+  skipped; an already-running tier may finish alongside a write.
+- **Stdio lifecycle**: EOF or a transport I/O error stops scheduling and
+  signals activity. Any active pass finishes through the engine's normal
+  cleanup path, releasing its lease before the transport returns. No
+  maintenance worker survives a completed stdio connection. HTTP MCP uses
+  the hub's existing scheduler rather than starting a second one.
+
+The default idle interval remains 300 seconds. Connections shorter than
+that interval, or continuous writes with no idle window, may still need
+a planned `mempalace maintain` run. For agents with shorter pauses between
+writes, lower `maintenance.idle_secs` to match the available idle window;
+automatic scheduling never bypasses the configured idle gate.
 
 The one-shot CLI command (`mempalace maintain`) bypasses the
 process-local idle gate entirely (sets `idle_secs` to `0`) so the pass

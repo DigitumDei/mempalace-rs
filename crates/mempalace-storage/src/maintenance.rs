@@ -1,6 +1,16 @@
 use serde::{Deserialize, Serialize};
 use time::{Duration, OffsetDateTime};
 
+pub(crate) fn check_delay(idle_secs: u64) -> std::time::Duration {
+    let fraction = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos() as f64
+        / 1_000_000_000.0;
+    let base = std::time::Duration::from_secs(idle_secs.max(1));
+    base + std::time::Duration::from_secs_f64(base.as_secs_f64() * fraction * 0.1)
+}
+
 /// Identifies a single maintenance tier operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -135,6 +145,16 @@ impl Default for MaintenanceSettings {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_check_delay_has_a_floor_and_bounded_jitter() {
+        for idle_secs in [0, 1, 300] {
+            let delay = check_delay(idle_secs);
+            let base = std::time::Duration::from_secs(idle_secs.max(1));
+            assert!(delay >= base);
+            assert!(delay <= base.mul_f64(1.1));
+        }
+    }
 
     #[test]
     fn maintenance_tier_serde_snake_case() {

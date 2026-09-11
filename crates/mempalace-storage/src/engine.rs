@@ -122,6 +122,32 @@ impl StorageEngine {
         Instant::now() - *guard
     }
 
+    /// Check eligibility for automatic maintenance, clearing only activity
+    /// preceding a complete idle window. Rechecks the timestamp after clearing
+    /// the flag so a racing write still postpones the run. The maintenance
+    /// engine independently rechecks activity and claims its lease before work.
+    pub fn maintenance_window_open(&self, idle_secs: u64) -> bool {
+        let idle = std::time::Duration::from_secs(idle_secs);
+        if self.elapsed_since_last_activity() < idle {
+            return false;
+        }
+        self.take_activity_signal();
+        self.elapsed_since_last_activity() >= idle
+    }
+
+    /// Wait for the next automatic maintenance window, checking after each
+    /// idle interval plus up to 10% jitter. Even a zero interval waits at least
+    /// one second. Callers own enable/disable policy and may cancel this wait;
+    /// it acquires no maintenance lease and performs no storage maintenance.
+    pub async fn wait_for_maintenance_window(&self, idle_secs: u64) {
+        loop {
+            tokio::time::sleep(crate::maintenance::check_delay(idle_secs)).await;
+            if self.maintenance_window_open(idle_secs) {
+                return;
+            }
+        }
+    }
+
     pub async fn commit_ingest(&self, request: IngestCommitRequest) -> Result<i64> {
         let now = OffsetDateTime::now_utc();
         let manifests = request

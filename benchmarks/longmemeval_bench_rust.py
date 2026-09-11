@@ -15,7 +15,7 @@ Usage:
     python benchmarks/longmemeval_bench_rust.py data.json --limit 20
     python benchmarks/longmemeval_bench_rust.py data.json --rust-only
     python benchmarks/longmemeval_bench_rust.py data.json --python-only
-    python benchmarks/longmemeval_bench_rust.py data.json --rust-binary /path/to/mempalace-cli
+    python benchmarks/longmemeval_bench_rust.py data.json --rust-binary /path/to/agentpalace-cli
 
 Data:
     curl -fsSL -o /tmp/longmemeval_s_cleaned.json \\
@@ -128,7 +128,7 @@ def python_query(entry, n_results=10):
 
 
 # =============================================================================
-# RUST RETRIEVER (mempalace-cli subprocess)
+# RUST RETRIEVER (agentpalace-cli subprocess)
 # =============================================================================
 
 
@@ -149,13 +149,13 @@ def rust_query(entry, rust_binary: str, n_results=10):
     if not corpus:
         return [], corpus_ids, 0.0, 0.0
 
-    with tempfile.TemporaryDirectory(prefix="mempalace_bench_") as tmpdir:
+    with tempfile.TemporaryDirectory(prefix="agentpalace_bench_") as tmpdir:
         sessions_dir = Path(tmpdir) / "sessions"
         palace_dir = Path(tmpdir) / "palace"
         sessions_dir.mkdir()
 
         # Minimal project config so the CLI doesn't require `init` first
-        (sessions_dir / "mempalace.yaml").write_text(
+        (sessions_dir / "agentpalace.yaml").write_text(
             "wing: bench\nrooms:\n  - name: general\n    description: Sessions\n    keywords: []\n",
             encoding="utf-8",
         )
@@ -167,7 +167,7 @@ def rust_query(entry, rust_binary: str, n_results=10):
             (sessions_dir / fname).write_text(text, encoding="utf-8")
             filename_to_id[fname] = sess_id
 
-        env = {**os.environ, "MEMPALACE_EMBED_ALLOW_DOWNLOADS": "1"}
+        env = {**os.environ, "AGENTPALACE_EMBED_ALLOW_DOWNLOADS": "1"}
 
         # Ingest
         t0 = time.perf_counter()
@@ -345,7 +345,7 @@ def run_benchmark(data_path: str, args):
         print()
 
     if not args.python_only:
-        print("  Rust (mempalace-cli):")
+        print("  Rust (agentpalace-cli):")
         print(f"    Recall@5:       {rs_r5 / n:.3f}  ({rs_r5:.0f}/{n})")
         print(f"    Recall@10:      {rs_r10 / n:.3f}  ({rs_r10:.0f}/{n})")
         print(f"    NDCG@10:        {rs_ndcg / n:.3f}")
@@ -382,7 +382,7 @@ def run_benchmark(data_path: str, args):
 # =============================================================================
 
 _DEFAULT_BINARY = str(
-    Path(__file__).parent.parent / "mempalace-rs" / "target" / "release" / "mempalace-cli"
+    Path(__file__).parent.parent / "agentpalace-rs" / "target" / "release" / "agentpalace-cli"
 )
 
 
@@ -391,7 +391,7 @@ def main():
     parser.add_argument("data", help="Path to longmemeval_s_cleaned.json")
     parser.add_argument("--limit", type=int, default=0, help="Number of questions to run (0 = all)")
     parser.add_argument(
-        "--rust-binary", default=_DEFAULT_BINARY, help="Path to mempalace-cli binary"
+        "--rust-binary", default=_DEFAULT_BINARY, help="Path to agentpalace-cli binary"
     )
     parser.add_argument("--rust-only", action="store_true", help="Skip Python baseline")
     parser.add_argument("--python-only", action="store_true", help="Skip Rust benchmark")
@@ -404,8 +404,8 @@ def main():
         if not Path(args.rust_binary).exists():
             sys.exit(
                 f"Rust binary not found: {args.rust_binary}\n"
-                f"Build it with: cargo build --release -p mempalace-cli\n"
-                f"Or pass --rust-binary /path/to/mempalace-cli"
+                f"Build it with: cargo build --release -p agentpalace-cli\n"
+                f"Or pass --rust-binary /path/to/agentpalace-cli"
             )
         print(
             f"Rust binary: {args.rust_binary} ({Path(args.rust_binary).stat().st_size // 1_000_000}MB)"

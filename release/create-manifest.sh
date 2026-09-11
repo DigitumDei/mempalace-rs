@@ -42,12 +42,12 @@ case "$channel" in
 esac
 
 expected_assets=(
-    mempalace-linux-x86_64
-    mempalace-macos-arm64
-    mempalace-windows-x86_64.exe
-    mempalace-notices-linux-x86_64.txt
-    mempalace-notices-macos-arm64.txt
-    mempalace-notices-windows-x86_64.txt
+    agentpalace-linux-x86_64
+    agentpalace-macos-arm64
+    agentpalace-windows-x86_64.exe
+    agentpalace-notices-linux-x86_64.txt
+    agentpalace-notices-macos-arm64.txt
+    agentpalace-notices-windows-x86_64.txt
 )
 
 for asset in "${expected_assets[@]}"; do
@@ -55,13 +55,13 @@ for asset in "${expected_assets[@]}"; do
 done
 
 actual_assets="$(
-    for path in "$asset_dir"/mempalace-*; do
+    for path in "$asset_dir"/agentpalace-*; do
         [ -f "$path" ] && basename "$path"
     done | LC_ALL=C sort
 )"
 expected_asset_list="$(printf '%s\n' "${expected_assets[@]}" | LC_ALL=C sort)"
 [ "$actual_assets" = "$expected_asset_list" ] \
-    || { echo "release asset set contains missing or unexpected mempalace files" >&2; exit 1; }
+    || { echo "release asset set contains missing or unexpected agentpalace files" >&2; exit 1; }
 
 (
     cd "$asset_dir"
@@ -72,10 +72,10 @@ checksums_sha256="$(sha256sum "$asset_dir/SHA256SUMS" | cut -d' ' -f1)"
 assets_json="$(
     for asset in "${expected_assets[@]}"; do
         component=cli
-        target="${asset#mempalace-}"
-        if [[ "$asset" == mempalace-notices-* ]]; then
+        target="${asset#agentpalace-}"
+        if [[ "$asset" == agentpalace-notices-* ]]; then
             component=notices
-            target="${asset#mempalace-notices-}"
+            target="${asset#agentpalace-notices-}"
         fi
         target="${target%.txt}"
         target="${target%.exe}"

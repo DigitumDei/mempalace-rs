@@ -2,25 +2,25 @@
 
 Native coordination state is stored in `storage.sqlite3` and follows the same backup and restore boundary as other operational SQLite data. Preserve this file to retain task revisions, leases, inbox acknowledgements, results, artifacts, idempotency records, and event cursors. See [Native local coordination](Coordination.md#recovery-and-maintenance).
 
-This guide covers the normal Rust deployment path for the single `mempalace` executable.
+This guide covers the normal Rust deployment path for the single `agentpalace` executable.
 
 ## Prerequisites
 
 - Rust toolchain compatible with workspace `rust-version = 1.88`
-- Writable home directory for `~/.mempalace`
+- Writable home directory for `~/.agentpalace`
 - Writable cache directory for embedding assets
 
 ## Build
 
-From the `mempalace-rs` directory:
+From the `agentpalace` directory:
 
 ```bash
-cargo build --release -p mempalace-cli
+cargo build --release -p agentpalace-cli
 ```
 
 Expected executable:
 
-- `target/release/mempalace`
+- `target/release/agentpalace`
 
 ONNX Runtime is statically linked into this executable; no separate runtime library is required.
 
@@ -29,7 +29,7 @@ ONNX Runtime is statically linked into this executable; no separate runtime libr
 1. Initialize project-local room config.
 
 ```bash
-target/release/mempalace init /path/to/project
+target/release/agentpalace init /path/to/project
 ```
 
 2. Confirm the reported startup validation status.
@@ -44,30 +44,30 @@ Expected statuses:
 3. Ingest data.
 
 ```bash
-target/release/mempalace mine /path/to/project
+target/release/agentpalace mine /path/to/project
 ```
 
 4. Validate retrieval.
 
 ```bash
-target/release/mempalace search "auth migration"
-target/release/mempalace status
-target/release/mempalace wake-up
+target/release/agentpalace search "auth migration"
+target/release/agentpalace status
+target/release/agentpalace wake-up
 ```
 
 ## Paths And State
 
 Default state roots:
 
-- global config: `~/.mempalace/config.json`
-- palace root: `~/.mempalace/palace`
-- default embeddings cache root: platform cache dir under `mempalace/embeddings`
+- global config: `~/.agentpalace/config.json`
+- palace root: `~/.agentpalace/palace`
+- default embeddings cache root: platform cache dir under `agentpalace/embeddings`
 
-Set `MEMPALACE_CONFIG_DIR` to move the `~/.mempalace` base directory itself
+Set `AGENTPALACE_CONFIG_DIR` to move the `~/.agentpalace` base directory itself
 (`config.json`, `projects.json`, `people_map.json`, and the default
 `server_tokens.json` location all move with it) — see
 [Config-Schema.md](Config-Schema.md#other-environment-variables). This is
-orthogonal to `MEMPALACE_PALACE_PATH`/`--palace`, which move only the palace
+orthogonal to `AGENTPALACE_PALACE_PATH`/`--palace`, which move only the palace
 root and take precedence over it for that one path.
 
 Presence checks used by the CLI:
@@ -83,15 +83,15 @@ Operational rule:
 
 - Do not treat `init` as proof that assets are already present.
 - Treat the startup validation status as the source of truth.
-- By default both `mempalace` and `mempalace serve --stdio` stay offline and will not download embedding assets. The one deliberate exception is `mempalace setup`, which runs a model warm-up phase (download-enabled) precisely because it is the step every install path executes; pass `--no-model-warmup` to skip it when you stage the cache yourself.
-- Set `MEMPALACE_EMBED_ALLOW_DOWNLOADS` to an explicit truthy value (`1`, `true`, or `yes`) on first run when you want either binary to bootstrap missing model assets into the local cache.
+- By default both `agentpalace` and `agentpalace serve --stdio` stay offline and will not download embedding assets. The one deliberate exception is `agentpalace setup`, which runs a model warm-up phase (download-enabled) precisely because it is the step every install path executes; pass `--no-model-warmup` to skip it when you stage the cache yourself.
+- Set `AGENTPALACE_EMBED_ALLOW_DOWNLOADS` to an explicit truthy value (`1`, `true`, or `yes`) on first run when you want either binary to bootstrap missing model assets into the local cache.
 
 Recommended sequence:
 
 1. Run `init`.
 2. If validation is not `ready`, either:
-   set `MEMPALACE_EMBED_ALLOW_DOWNLOADS=1` and re-run the command to let the binary fetch missing assets, or
-   run `mempalace setup` to warm the embedding model (installer users get this for free), or
+   set `AGENTPALACE_EMBED_ALLOW_DOWNLOADS=1` and re-run the command to let the binary fetch missing assets, or
+   run `agentpalace setup` to warm the embedding model (installer users get this for free), or
    pre-stage/repair the embedding cache out of band before relying on offline operation.
 3. Run a small `mine` or `search` flow to warm the chosen profile on the target host.
 4. Re-run `search` once to confirm warm-path behavior before calling the host production-ready.
@@ -99,7 +99,7 @@ Recommended sequence:
 Example first-run bootstrap:
 
 ```bash
-MEMPALACE_EMBED_ALLOW_DOWNLOADS=1 target/release/mempalace mine /path/to/project
+AGENTPALACE_EMBED_ALLOW_DOWNLOADS=1 target/release/agentpalace mine /path/to/project
 ```
 
 ## MCP Deployment
@@ -107,21 +107,21 @@ MEMPALACE_EMBED_ALLOW_DOWNLOADS=1 target/release/mempalace mine /path/to/project
 The MCP binary is the Rust server entrypoint:
 
 ```bash
-target/release/mempalace serve --stdio
+target/release/agentpalace serve --stdio
 ```
 
 The server exposes the frozen v1 tool set listed in [Release Scope](Release-Scope.md).
 
-Set `MEMPALACE_LINEAGE_ID` in an MCP host's server environment to bind wake-up and identity
-packets to one lineage. The binding is validated by `mempalace serve --stdio` and cannot be overridden by
+Set `AGENTPALACE_LINEAGE_ID` in an MCP host's server environment to bind wake-up and identity
+packets to one lineage. The binding is validated by `agentpalace serve --stdio` and cannot be overridden by
 model-facing tool arguments. If its target does not exist, the response uses the palace default and
-includes instructions for creating the requested lineage with `mempalace_lineage_set`. Leave it
+includes instructions for creating the requested lineage with `agentpalace_lineage_set`. Leave it
 unset to use the palace default. See [Self-continuity](Self-Continuity.md#binding-a-lineage-to-an-mcp-client).
 
 If the MCP host needs to bootstrap a cold cache on first start, launch it with:
 
 ```bash
-MEMPALACE_EMBED_ALLOW_DOWNLOADS=1 target/release/mempalace serve --stdio
+AGENTPALACE_EMBED_ALLOW_DOWNLOADS=1 target/release/agentpalace serve --stdio
 ```
 
 ## Federation Server Deployment
@@ -129,8 +129,8 @@ MEMPALACE_EMBED_ALLOW_DOWNLOADS=1 target/release/mempalace serve --stdio
 To share a palace with other clients, run the federation HTTP server:
 
 ```bash
-target/release/mempalace serve --bind 127.0.0.1:8765 \
-  --token-file ~/.mempalace/server_tokens.json
+target/release/agentpalace serve --bind 127.0.0.1:8765 \
+  --token-file ~/.agentpalace/server_tokens.json
 ```
 
 Operational notes:
@@ -169,8 +169,8 @@ Operational notes:
   Without Git or readable Git metadata, commit diagnostics are unavailable but
   file-hash validation still runs. A committed write whose receipt was interrupted
   can finish recovery even if the checkout changes before retry.
-- Cold cache bootstrap uses the same `MEMPALACE_EMBED_ALLOW_DOWNLOADS` rule as the
-  other binaries; `MEMPALACE_STUB_EMBEDDINGS` runs the server with deterministic
+- Cold cache bootstrap uses the same `AGENTPALACE_EMBED_ALLOW_DOWNLOADS` rule as the
+  other binaries; `AGENTPALACE_STUB_EMBEDDINGS` runs the server with deterministic
   stub vectors for offline testing.
 
 Full setup, client configuration, and the team mining workflow are in the
@@ -180,10 +180,10 @@ Full setup, client configuration, and the team mining workflow are in the
 
 The maintenance subsystem keeps the palace storage healthy by compacting
 fragments, pruning old version data, and optimising vector indices. It is
-**enabled by default** and both the HTTP hub (`mempalace serve`) and stdio
-MCP (`mempalace mcp`, or the no-argument MCP entrypoint) schedule it
+**enabled by default** and both the HTTP hub (`agentpalace serve`) and stdio
+MCP (`agentpalace mcp`, or the no-argument MCP entrypoint) schedule it
 automatically by default. Set `background_enabled: false` to
-use manual-only maintenance; the one-shot CLI command (`mempalace maintain`)
+use manual-only maintenance; the one-shot CLI command (`agentpalace maintain`)
 remains available while `enabled` is `true`.
 
 ### Maintenance Tiers
@@ -203,7 +203,7 @@ Each run executes up to three tiers in order:
 
 | Field | Default | Description |
 |---|---|---|
-| `enabled` | `true` | Master switch for all maintenance, including `mempalace maintain`. |
+| `enabled` | `true` | Master switch for all maintenance, including `agentpalace maintain`. |
 | `background_enabled` | `true` | Whether HTTP and stdio MCP schedule maintenance automatically. |
 | `idle_secs` | `300` | Minimum wall-clock seconds since the last write before a run starts. |
 | `version_retention_hours` | `24` | Maximum age in hours for retained version rows. |
@@ -215,16 +215,16 @@ Each run executes up to three tiers in order:
 All six fields can be overridden at process start via environment
 variables, which take precedence over `config.json`:
 
-- `MEMPALACE_MAINTENANCE_ENABLED` — true values: `1`, `true`, `TRUE`, `yes`,
+- `AGENTPALACE_MAINTENANCE_ENABLED` — true values: `1`, `true`, `TRUE`, `yes`,
   `YES`; false values: `0`, `false`, `FALSE`, `no`, `NO`. Other values are rejected.
-- `MEMPALACE_MAINTENANCE_BACKGROUND_ENABLED` — same boolean values; set it to
-  `false` for manual-only maintenance while retaining `mempalace maintain`.
-- `MEMPALACE_MAINTENANCE_IDLE_SECS` — positive integer; zero is rejected.
-- `MEMPALACE_MAINTENANCE_VERSION_RETENTION_HOURS` — positive integer;
+- `AGENTPALACE_MAINTENANCE_BACKGROUND_ENABLED` — same boolean values; set it to
+  `false` for manual-only maintenance while retaining `agentpalace maintain`.
+- `AGENTPALACE_MAINTENANCE_IDLE_SECS` — positive integer; zero is rejected.
+- `AGENTPALACE_MAINTENANCE_VERSION_RETENTION_HOURS` — positive integer;
   zero is rejected.
-- `MEMPALACE_MAINTENANCE_TAIL_THRESHOLD_ROWS` — positive integer; zero
+- `AGENTPALACE_MAINTENANCE_TAIL_THRESHOLD_ROWS` — positive integer; zero
   is rejected.
-- `MEMPALACE_MAINTENANCE_SMALL_FRAGMENT_THRESHOLD` — positive integer;
+- `AGENTPALACE_MAINTENANCE_SMALL_FRAGMENT_THRESHOLD` — positive integer;
   zero is rejected.
 
 ### Idle-Only Automatic Scheduling
@@ -257,11 +257,11 @@ run maintenance alongside request handling. The scheduling rules are:
 
 The default idle interval remains 300 seconds. Connections shorter than
 that interval, or continuous writes with no idle window, may still need
-a planned `mempalace maintain` run. For agents with shorter pauses between
+a planned `agentpalace maintain` run. For agents with shorter pauses between
 writes, lower `maintenance.idle_secs` to match the available idle window;
 automatic scheduling never bypasses the configured idle gate.
 
-The one-shot CLI command (`mempalace maintain`) bypasses the
+The one-shot CLI command (`agentpalace maintain`) bypasses the
 process-local idle gate entirely (sets `idle_secs` to `0`) so the pass
 runs immediately.  It still respects the cross-process lease.
 
@@ -325,7 +325,7 @@ from an older AgentPalace release), the recommended procedure is:
    together) before running maintenance, in case of unexpected issues.
 2. **Run the one-shot CLI command**:
    ```bash
-   mempalace maintain --palace /path/to/palace
+   agentpalace maintain --palace /path/to/palace
    ```
 3. **Inspect the output** for per-tier outcomes.  Tiers report
    `completed`, `skipped {reason}`, `aborted {reason}`, or `failed`.
@@ -336,7 +336,7 @@ from an older AgentPalace release), the recommended procedure is:
 5. **After the initial one-shot pass**, the hub's background maintenance
    will handle incremental compaction and pruning automatically during
    idle periods when `background_enabled` is `true`. When it is `false`,
-   schedule further `mempalace maintain` runs yourself.
+   schedule further `agentpalace maintain` runs yourself.
 
 The `maintain` command respects the same `enabled`, `version_retention_hours`,
 `tail_threshold_rows`, and `small_fragment_threshold` settings from
@@ -346,18 +346,18 @@ starts immediately.
 
 ## Reclaiming Space From Mined Data
 
-`mempalace prune` deletes mined project data from the **local** palace by scope. It
+`agentpalace prune` deletes mined project data from the **local** palace by scope. It
 previews by default and only deletes with `--yes`:
 
 ```bash
 # preview everything mined for one project
-mempalace prune --project-id github.com/acme/repo
+agentpalace prune --project-id github.com/acme/repo
 
 # drop a single stale branch view
-mempalace prune --project-id github.com/acme/repo --view old-feature --yes
+agentpalace prune --project-id github.com/acme/repo --view old-feature --yes
 
 # drop one subtree of a branch view
-mempalace prune --project-id github.com/acme/repo --view old-feature \
+agentpalace prune --project-id github.com/acme/repo --view old-feature \
   --source-prefix crates/legacy/ --yes
 ```
 
@@ -402,7 +402,7 @@ worktree's rows. Scope it instead by what actually distinguishes the worktree's 
 
 ```bash
 # a worktree mined on its own branch is a branch view — prune that view
-mempalace prune --project-id github.com/acme/repo --view worktree-branch --yes
+agentpalace prune --project-id github.com/acme/repo --view worktree-branch --yes
 ```
 
 If you need worktrees to be independently prunable, give them a distinct identity **at mine
@@ -440,8 +440,8 @@ recovery guidance above applies to it unchanged.
 
 Canonical `mine` with `write: both` uses this worker too (issue #131). Each file's
 exact remote payload and local recovery snapshot are staged before local replacement.
-The foreground mine makes no remote calls. Start `mempalace serve` or
-`mempalace serve --stdio` with the same palace and federation configuration to deliver it. Restarting
+The foreground mine makes no remote calls. Start `agentpalace serve` or
+`agentpalace serve --stdio` with the same palace and federation configuration to deliver it. Restarting
 finishes staged local effects from durable snapshots, then resumes unacknowledged remote
 records. Files not yet staged when a process crashes require another mine. Keep SQLite,
 LanceDB, the outbox and receipts in the same consistent palace backup. Recovery snapshots
@@ -449,8 +449,8 @@ retain prepared content and embeddings while staged; activation atomically disca
 snapshots and old drawer IDs, retaining a fingerprint and source metadata. Remote request content
 remains in the outbox. Do not delete `ingest-locks/` files while processes run.
 
-Observe the replication pipeline through `mempalace_status` (and the status
-embedded in `mempalace_wake_up`):
+Observe the replication pipeline through `agentpalace_status` (and the status
+embedded in `agentpalace_wake_up`):
 
 - `replication.backlog` — pending/leased/retryable counts, the age of the oldest
   pending operation, the attempt count and last error of the oldest retryable
@@ -469,7 +469,7 @@ embedded in `mempalace_wake_up`):
   (`duplicate_search`, `embedding`, `commit`, `outbox_wait`,
   `delivery_attempt`, `remote_acknowledge`) with count/last/total/max/avg
   millisecond statistics. These are process-local and reset on restart; they
-  are also emitted as `tracing` events under target `mempalace_metrics`.
+  are also emitted as `tracing` events under target `agentpalace_metrics`.
 
 Operational rules:
 

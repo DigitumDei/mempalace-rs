@@ -29,7 +29,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           CANDIDATE_TAG: ${{ inputs.candidate_tag }}
-          IMMUTABLE_RELEASES_ENABLED: ${{ vars.MEMPALACE_IMMUTABLE_RELEASES_ENABLED }}
+          IMMUTABLE_RELEASES_ENABLED: ${{ vars.AGENTPALACE_IMMUTABLE_RELEASES_ENABLED || vars.MEMPALACE_IMMUTABLE_RELEASES_ENABLED }}
         run: |
           [[ "$CANDIDATE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-nightly\.[0-9a-f]{40}$ ]] \
             || { echo "candidate tag must be v<version>-nightly.<full-commit-sha>" >&2; exit 1; }
@@ -85,7 +85,7 @@ jobs:
             exit 1
           fi
 
-          for asset in candidate-assets/mempalace-*; do
+          for asset in candidate-assets/agentpalace-*; do
             gh attestation verify "$asset" \
               --repo "$GITHUB_REPOSITORY" \
               --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/ci.yml" \
@@ -96,7 +96,7 @@ jobs:
 
       - name: Create and verify signed stable manifest
         env:
-          RELEASE_SIGNING_KEY: ${{ secrets.MEMPALACE_RELEASE_SIGNING_KEY }}
+          RELEASE_SIGNING_KEY: ${{ secrets.AGENTPALACE_RELEASE_SIGNING_KEY || secrets.MEMPALACE_RELEASE_SIGNING_KEY }}
         run: |
           bash release/promote-manifest.sh candidate-assets "$RELEASE_VERSION"
           bash release/sign-manifest.sh candidate-assets release/public-key.pem

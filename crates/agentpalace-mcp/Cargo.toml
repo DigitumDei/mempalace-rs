@@ -1,0 +1,37 @@
+[package]
+name = "agentpalace-mcp"
+autobins = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+agentpalace-a2a = { path = "../agentpalace-a2a" }
+agentpalace-config = { path = "../agentpalace-config" }
+agentpalace-core = { path = "../agentpalace-core" }
+agentpalace-embeddings = { path = "../agentpalace-embeddings" }
+agentpalace-federation = { path = "../agentpalace-federation" }
+agentpalace-graph = { path = "../agentpalace-graph" }
+agentpalace-mcp-tasks = { path = "../agentpalace-mcp-tasks" }
+agentpalace-remote = { path = "../agentpalace-remote" }
+agentpalace-search = { path = "../agentpalace-search" }
+agentpalace-storage = { path = "../agentpalace-storage" }
+blake3.workspace = true
+dirs.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio = { version = "1.48.0", features = ["io-std", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
+tracing.workspace = true
+
+[dev-dependencies]
+async-trait = "0.1.89"
+axum = { version = "0.8", default-features = true }
+agentpalace-server = { path = "../agentpalace-server" }
+rusqlite = "0.39.0"
+tempfile = "3.23.0"
+
+[lints]
+workspace = true

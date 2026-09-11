@@ -1,6 +1,6 @@
 # Rust CLI Surface Freeze
 
-This is the frozen command surface for `mempalace` v1.
+This is the frozen command surface for `agentpalace` v1.
 
 ## Global Flag
 
@@ -8,6 +8,15 @@ This is the frozen command surface for `mempalace` v1.
   Overrides the palace path for the current invocation. During `init`, this also updates the global `config.json` palace path.
 
 ## Commands
+
+### `migrate`
+
+Offline MemPalace upgrade, also invoked by both installers. Requires
+`--mcp-path <final-executable-path>`. Optional `--from <old-home>` and
+`--to <new-home>` default to `~/.mempalace` and `~/.agentpalace`; `--dry-run`
+previews without writing. The applying command refuses running servers, stages
+and backs up data, and migrates supported MCP registrations. Failures exit 1.
+See [Migration](Migration.md) for conflicts, custom paths, and rollback.
 
 ### `init <dir>`
 
@@ -22,7 +31,7 @@ Flags:
   Permit replacing an existing repository-local config when `--repo-config` is
   also supplied.
 - `--repo-config`
-  Also write a portable repository-local `mempalace.yaml`. Without this flag,
+  Also write a portable repository-local `agentpalace.yaml`. Without this flag,
   `init` does not modify repository files.
 - `--project-id <STRING>`
   Use an explicit durable identity when the repository has no usable Git
@@ -42,7 +51,7 @@ Notes:
   raw directory traversal, so ignored/untracked/secret-shaped files are not
   counted.
 - The central registry is stored at `<base-dir>/projects.json` (normally
-  `~/.mempalace/projects.json`) and uses normalized Git origin identity when
+  `~/.agentpalace/projects.json`) and uses normalized Git origin identity when
   available, with checkout paths as discovery aliases.
 
 ### `mine <dir>`
@@ -56,7 +65,7 @@ Flags:
 - `--project-id <STRING>`
   Select a centralized declaration explicitly. This takes precedence over a
   repository-local compatibility file.
-- `--agent <STRING>` default: `mempalace`
+- `--agent <STRING>` default: `agentpalace`
 - `--limit <N>` default: `0`, meaning no explicit limit
 - `--dry-run`
 - `--extract <exchange|general>` default: `exchange`
@@ -108,7 +117,7 @@ Behavior:
 - `projects` uses the project ingest path.
 - `convos` uses the conversation ingest path.
 - In `convos` mode, discovery walks the conversation directory honouring only
-  the worktree ignore files (nested `.gitignore`/`.mempalaceignore` and the
+  the worktree ignore files (nested `.gitignore`/`.agentpalaceignore` and the
   built-in skip directories), then applies the `.txt`/`.md`/`.json`/`.jsonl`
   extension filter. It deliberately does **not** load the repository-level
   exclude sources (`$GIT_DIR/info/exclude`, `core.excludesFile`) and does not
@@ -118,7 +127,7 @@ Behavior:
 - In `projects` mode, source discovery honours git: a Git-backed root mines the
   tracked index only (`git ls-files`), so ignored and untracked working-tree
   files (e.g. `.env`, `*.local.json`, build output) are never ingested. A
-  `.gitignore` never suppresses a tracked file; `.mempalaceignore` is the
+  `.gitignore` never suppresses a tracked file; `.agentpalaceignore` is the
   explicit additional exclusion and is deny-only — it outranks a nested
   `.gitignore` `!` negation in filesystem and branch walks. Symlinks are
   rejected outright before
@@ -134,7 +143,7 @@ Behavior:
   any skipped candidate and shown in the mine summary as `Secrets withheld: N`
   with one `<path> — secret-shaped path (<reason>)` line per withheld file
   (never the file content). Non-Git directories fall back to a filesystem
-  walk that honours `.gitignore` and `.mempalaceignore` at every level with
+  walk that honours `.gitignore` and `.agentpalaceignore` at every level with
   git-compatible semantics (nesting, `!` negation, anchoring, and globs) plus
   the `core.excludesFile` global excludes file. Branch-delta mines
   (`--branch` / `--view <name>`) union the tracked-index set with the
@@ -157,11 +166,11 @@ Behavior:
   exception: their filesystem walk also picks up untracked, non-ignored files.
 - Project resolution checks explicit CLI values, optional repository-local
   config, the central project registry, and then derived defaults. A project
-  can therefore be mined without `mempalace.yaml`.
+  can therefore be mined without `agentpalace.yaml`.
 - In low-CPU mode, ingest batching is clamped by the resolved low-CPU runtime config. An explicit `--batch-size` overrides that clamp (it takes precedence over the low-CPU default).
 - `--reindex` bypasses the unchanged-content skip in both `projects` and `convos` modes.
 - When the wing's federation route targets a remote palace (mode `remote`, or mode `combined` with `write: remote`) and `--branch` is not set, the CLI prepares chunks locally and pushes them to `POST /v1/ingest/batch` on the remote server. The remote must advertise the `"ingest"` capability in `GET /v1/info`; older servers that lack this endpoint return a 404, which surfaces as a `RemoteRejected` error with a prompt to upgrade.
-- Canonical `combined` / `write: both` mines stage each exact prepared file and local recovery snapshot before replacing the local source. They print `Remote replication: durably queued` and a batch ID without waiting on the network. Run `mempalace serve` (HTTP or `--stdio`) against the same palace to deliver and recover unfinished records. Check `mempalace_status` → `replication.ingestion` for progress. Branch views remain local; see [Federation guide](Federation.md#durable-canonical-mining-write-both).
+- Canonical `combined` / `write: both` mines stage each exact prepared file and local recovery snapshot before replacing the local source. They print `Remote replication: durably queued` and a batch ID without waiting on the network. Run `agentpalace serve` (HTTP or `--stdio`) against the same palace to deliver and recover unfinished records. Check `agentpalace_status` → `replication.ingestion` for progress. Branch views remain local; see [Federation guide](Federation.md#durable-canonical-mining-write-both).
 - Remote-only mining preflights each locator-backed batch when the server advertises `ingest_preflight`, sending paths and hashes before chunk text. Missing or mismatched remote checkouts produce one actionable error and a nonzero exit. Earlier completed batches remain applied. Durable `write: both` records validate on the receiver; checkout rejection appears in status/wake-up as a terminal failure. See [checkout preflight](Federation.md#checkout-preflight-issue-91-phase-1).
 - Branch-delta mining is always local. Any resolved branch view — whether from `--branch`, `--view <name>`, or automatic detection — overrides a remote route for the wing. Only canonical mines are eligible for federated batch ingest.
 
@@ -182,7 +191,7 @@ Commands:
   centralized declaration as a portable repository-local override.
 
 `project register --repo-config` additionally emits a portable repository-local
-`mempalace.yaml`.
+`agentpalace.yaml`.
 
 `project register` derives rooms from the same safe source set `init` and a
 canonical mine use (tracked index for Git-backed roots, the ignore-aware
@@ -297,14 +306,14 @@ Behavior:
 ### `setup`
 
 Purpose:
-- Detect which supported AI coding tools are installed and register the mempalace MCP server (`mempalace serve --stdio`) with each, idempotently.
-- Warm and verify the embedding model so the very next `mempalace serve --stdio` start succeeds even with no `MEMPALACE_EMBED_ALLOW_DOWNLOADS` set.
+- Detect which supported AI coding tools are installed and register the agentpalace MCP server (`agentpalace serve --stdio`) with each, idempotently.
+- Warm and verify the embedding model so the very next `agentpalace serve --stdio` start succeeds even with no `AGENTPALACE_EMBED_ALLOW_DOWNLOADS` set.
 
 Flags:
 - `--dry-run`
   Preview what would change — print the command that would run / file that would be written for each detected tool — without running anything or writing any file. The embedding model warm-up is skipped.
 - `--mcp-path <PATH>` default: the currently running executable
-  Absolute path to the `mempalace` executable that tools are pointed at. A warning is printed if the binary is not present there yet (tools are still configured to launch it once installed).
+  Absolute path to the `agentpalace` executable that tools are pointed at. A warning is printed if the binary is not present there yet (tools are still configured to launch it once installed).
 - `--tools <LIST>` default: all
   Comma-separated subset of tool keys to limit setup to: `claude,codex,gemini,opencode,copilot,antigravity,jules`.
 - `--no-model-warmup`
@@ -312,16 +321,16 @@ Flags:
 
 Behavior:
 - Per-tool mechanism (verified against each tool's official docs):
-  - **claude / codex / gemini** — registered via the tool's own CLI (`claude mcp add --scope user`, `codex mcp add`, `gemini mcp add -s user`), at user/global scope. Requires the tool's binary on `PATH`. Idempotent: an existing `mempalace` server is detected and left as-is. The binary is invoked by its resolved path (including the npm `.cmd` shim on Windows), so arguments — including the MCP path — are passed as real argv entries rather than re-parsed by `cmd.exe`.
-  - **opencode** — merges a `mcp.mempalace` entry (`type: "local"`, command as a single-element array) into `~/.config/opencode/opencode.json` (XDG path, the same on Windows).
-  - **copilot** — merges a `mcpServers.mempalace` entry into `~/.copilot/mcp-config.json`.
-  - **antigravity** — merges a `mcpServers.mempalace` entry into both `~/.gemini/config/mcp_config.json` and `~/.gemini/antigravity-cli/mcp_config.json` (the config location differs across Antigravity versions; writing both is harmless). Detection keys off the antigravity-owned `~/.gemini/antigravity-cli/` directory (not the bare `~/.gemini/config/`, which is shared with the Gemini CLI).
+  - **claude / codex / gemini** — registered via the tool's own CLI (`claude mcp add --scope user`, `codex mcp add`, `gemini mcp add -s user`), at user/global scope. Requires the tool's binary on `PATH`. Idempotent: an existing `agentpalace` server is detected and left as-is. The binary is invoked by its resolved path (including the npm `.cmd` shim on Windows), so arguments — including the MCP path — are passed as real argv entries rather than re-parsed by `cmd.exe`.
+  - **opencode** — merges a `mcp.agentpalace` entry (`type: "local"`, command as a single-element array) into `~/.config/opencode/opencode.json` (XDG path, the same on Windows).
+  - **copilot** — merges a `mcpServers.agentpalace` entry into `~/.copilot/mcp-config.json`.
+  - **antigravity** — merges a `mcpServers.agentpalace` entry into both `~/.gemini/config/mcp_config.json` and `~/.gemini/antigravity-cli/mcp_config.json` (the config location differs across Antigravity versions; writing both is harmless). Detection keys off the antigravity-owned `~/.gemini/antigravity-cli/` directory (not the bare `~/.gemini/config/`, which is shared with the Gemini CLI).
   - **jules** — reported as unsupported and skipped: it is a cloud agent that only allows a curated set of remote MCP integrations configured in its web UI, so it cannot run a local stdio server.
 - JSON merges preserve all other keys and are idempotent (re-running reports "already configured"). If an existing config file is not valid JSON, setup refuses to clobber it and reports a failure for that tool.
 - Tools that are not installed are skipped with a note. Tool registration is best-effort across tools; per-tool status is shown in the summary.
 - Embedding-model warm-up (unless `--dry-run` or `--no-model-warmup`):
-  1. Initialises a download-enabled provider so missing model assets are fetched on a fresh machine (a no-op on a warm cache). The profile and cache are resolved the same way `mempalace serve --stdio` resolves them at startup.
-  2. Re-initialises with downloads disabled — exactly how `mempalace serve --stdio` starts by default — proving the cache is complete before the MCP server is ever launched.
+  1. Initialises a download-enabled provider so missing model assets are fetched on a fresh machine (a no-op on a warm cache). The profile and cache are resolved the same way `agentpalace serve --stdio` resolves them at startup.
+  2. Re-initialises with downloads disabled — exactly how `agentpalace serve --stdio` starts by default — proving the cache is complete before the MCP server is ever launched.
   3. Prints a summary (model, cache path, warm and offline-check status). If the offline check fails, the command prints the remediation explicitly and exits non-zero. The installers (`install.sh`/`install.ps1`) treat that as a warning — the install itself has already succeeded — and print their own remediation, so a no-network fresh install still completes.
 - Exit codes:
   - `0` — tools registered/checked; when a warm-up ran, the model is usable offline.
@@ -378,7 +387,7 @@ Flags:
   `config.json`, falling back to `127.0.0.1:8765`.
 - `--token-file <PATH>`
   Path to the bearer-token JSON file. Default: `server.token_file` from
-  `config.json`, falling back to `~/.mempalace/server_tokens.json`.
+  `config.json`, falling back to `~/.agentpalace/server_tokens.json`.
 
 Behavior:
 - The token file is a JSON array of objects, each with `token`, `name`, and
@@ -388,7 +397,7 @@ Behavior:
   `Authorization: Bearer <token>`.
 - The server speaks plain HTTP and prints a warning to that effect — front it with
   TLS termination on untrusted networks.
-- Honors `MEMPALACE_STUB_EMBEDDINGS` (deterministic stub provider) for offline dev
+- Honors `AGENTPALACE_STUB_EMBEDDINGS` (deterministic stub provider) for offline dev
   testing.
 - Runs until interrupted; shuts down gracefully on Ctrl-C.
 
@@ -411,10 +420,10 @@ the current boundary of the deferred commands.
 
 ## Upgrading from separate executables
 
-The only executable is now `mempalace` (`mempalace.exe` on Windows). Run
-`mempalace setup` after upgrading. Standard legacy Claude, Codex, and Gemini
+The only executable is now `agentpalace` (`agentpalace.exe` on Windows). Run
+`agentpalace setup` after upgrading. Standard legacy Claude, Codex, and Gemini
 registrations are migrated while preserving their environment and other settings;
 JSON-based integrations are merged idempotently. Custom client launchers must use
-`mempalace` with arguments `["serve", "--stdio"]`. Existing running MCP processes
+`agentpalace` with arguments `["serve", "--stdio"]`. Existing running MCP processes
 continue until the client restarts. `--mcp-path` overrides the executable path;
 setup always adds `serve --stdio`.

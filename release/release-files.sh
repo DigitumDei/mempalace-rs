@@ -5,12 +5,12 @@ set -euo pipefail
 asset_dir="$1"
 
 files=(
-    "$asset_dir/mempalace-linux-x86_64"
-    "$asset_dir/mempalace-macos-arm64"
-    "$asset_dir/mempalace-windows-x86_64.exe"
-    "$asset_dir/mempalace-notices-linux-x86_64.txt"
-    "$asset_dir/mempalace-notices-macos-arm64.txt"
-    "$asset_dir/mempalace-notices-windows-x86_64.txt"
+    "$asset_dir/agentpalace-linux-x86_64"
+    "$asset_dir/agentpalace-macos-arm64"
+    "$asset_dir/agentpalace-windows-x86_64.exe"
+    "$asset_dir/agentpalace-notices-linux-x86_64.txt"
+    "$asset_dir/agentpalace-notices-macos-arm64.txt"
+    "$asset_dir/agentpalace-notices-windows-x86_64.txt"
     "$asset_dir/SHA256SUMS"
     "$asset_dir/SHA256SUMS.sig"
     "$asset_dir/release-manifest.json"

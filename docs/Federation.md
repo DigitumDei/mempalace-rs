@@ -7,7 +7,7 @@
 Federation lets several AgentPalace clients share one or more **remote palaces** over
 an HTTP REST API. An agent talking to its local MCP server sees a single seamless
 palace: reads for selected wings are transparently merged across local and remote,
-and writes are routed per the wing's rule. (The `mempalace` is federation-aware
+and writes are routed per the wing's rule. (The `agentpalace` is federation-aware
 for mining/writes; its `search`/`status`/`wake-up` read the local palace only —
 see [Part 5](#part-5--federated-reads-wake-up-and-changes).)
 
@@ -73,7 +73,7 @@ it all locally for dev testing.
 
 ## Part 1 — Running a server (the hub)
 
-The server is the same `mempalace` binary, started with `serve`. It exposes
+The server is the same `agentpalace` binary, started with `serve`. It exposes
 the local palace at `<palace_path>` over HTTP.
 
 ### 1.1 Create a token file
@@ -99,17 +99,17 @@ Authentication is bearer-token based. The token file is a JSON array of entries:
 Tokens are hashed in memory; the raw secret is not retained after load. The file
 is hot-reloaded — editing it (e.g. flipping `enabled`, or narrowing `scopes`) takes
 effect on the next request without restarting the server. The default path is
-`~/.mempalace/server_tokens.json`.
+`~/.agentpalace/server_tokens.json`.
 
 ### 1.2 Configure the server section (optional but recommended)
 
-In `~/.mempalace/config.json`:
+In `~/.agentpalace/config.json`:
 
 ```jsonc
 {
   "server": {
     "bind": "127.0.0.1:8765",
-    "token_file": "~/.mempalace/server_tokens.json",
+    "token_file": "~/.agentpalace/server_tokens.json",
     "checkouts": {
       "wing_myproject": "/srv/repos/myproject",
       "wing_teamdocs":  "/srv/repos/teamdocs"
@@ -135,9 +135,9 @@ field reference.
 ### 1.3 Start the server
 
 ```bash
-mempalace serve
+agentpalace serve
 # or override config:
-mempalace serve --bind 0.0.0.0:8765 --token-file /etc/mempalace/tokens.json
+agentpalace serve --bind 0.0.0.0:8765 --token-file /etc/agentpalace/tokens.json
 ```
 
 On start it prints the palace path, bind address, and token file, then logs
@@ -207,7 +207,7 @@ capability (added in issue #127) is what the durable replication worker checks
 before delivering an outbox operation: a remote that does not advertise it can
 only be reached by non-replicated legacy writes, because there would be no way
 to apply a replayed mutation exactly once. The wire DTOs live in the
-`mempalace-federation` crate and are shared verbatim by server and client.
+`agentpalace-federation` crate and are shared verbatim by server and client.
 Federated mutation routes (`POST /v1/drawers`, `DELETE /v1/drawers/{id}`,
 `POST /v1/kg/facts`, `POST /v1/kg/facts/invalidate`) accept an optional
 `operation_id`; when present, the server pins the mutation's target identity in
@@ -251,7 +251,7 @@ is one-way — a `coordination_write` grant does **not** imply
 token file still lists exactly the operations the operator wrote; nothing is
 expanded when the file is loaded. The widening happens only in the
 authorization check itself (`scope_grants` in
-`crates/mempalace-server/src/lib.rs`), applied consistently to the coarse
+`crates/agentpalace-server/src/lib.rs`), applied consistently to the coarse
 per-route gate, the per-wing check, and the aggregate wing-visibility
 computation.
 
@@ -267,7 +267,7 @@ four groups, and each group is authorized differently:
   `DELETE /v1/drawers/{id}` resolve the drawer, then authorize. A caller without
   access gets a **404**, not a 403 — the same masking the diary guard already
   applies to `GET /v1/drawers/{id}` (see `route_drawers_get` in
-  `crates/mempalace-server/src/lib.rs`), so the response never becomes an
+  `crates/agentpalace-server/src/lib.rs`), so the response never becomes an
   existence oracle for wings the caller cannot see.
 - **Aggregate routes filter instead of rejecting.** `GET /v1/taxonomy`,
   `GET /v1/wings`, `GET /v1/rooms`, `GET /v1/changes`, and
@@ -276,7 +276,7 @@ four groups, and each group is authorized differently:
   wing's slice, not a 403. A wing-absent `POST /v1/drawers/search` does the
   same, filtering ranked candidates after an over-fetch (it has no
   continuation promise, so a short page is an acceptable trade-off there — see
-  `route_drawers_search` in `crates/mempalace-server/src/lib.rs`). A
+  `route_drawers_search` in `crates/agentpalace-server/src/lib.rs`). A
   wing-absent `GET /v1/drawers` cannot use that approach: its `limit`/
   `next_cursor` shape implies a caller can page through everything it can see,
   and the store has no cursor-based pagination, so filtering visibility out of
@@ -313,7 +313,7 @@ four groups, and each group is authorized differently:
 - **No wing concept — operation only.** `POST /v1/kg/query`, `GET /v1/kg/timeline`,
   `GET /v1/kg/stats`, `POST /v1/kg/facts`, and `POST /v1/kg/facts/invalidate`
   check only the operation. KG facts are entity-scoped, not wing-scoped — this is
-  the same rule `resolve_kg_route` in `mempalace-config` already applies by
+  the same rule `resolve_kg_route` in `agentpalace-config` already applies by
   skipping the wing lookup for KG routing. `GET /v1/info` requires any
   authenticated token and no specific operation; `GET /v1/health` stays
   unauthenticated.
@@ -363,7 +363,7 @@ A request is authorized if it matches any alias a raw entry produces.
 ## Part 2 — Configuring a client
 
 Clients (the CLI and the MCP server) read `federation` from
-`~/.mempalace/config.json`:
+`~/.agentpalace/config.json`:
 
 ```jsonc
 {
@@ -372,7 +372,7 @@ Clients (the CLI and the MCP server) read `federation` from
       {
         "name": "work",
         "url": "https://palace.intra.example",
-        "token_env": "MEMPALACE_WORK_TOKEN",
+        "token_env": "AGENTPALACE_WORK_TOKEN",
         "timeout_ms": 5000
       }
     ],
@@ -401,7 +401,7 @@ First match wins:
 
 1. Explicit per-wing rule in `federation.wings`
 2. The `routing` block in the resolved project declaration (central registry
-   first, with repository-local `mempalace.yaml` as the compatibility override)
+   first, with repository-local `agentpalace.yaml` as the compatibility override)
 3. `federation.default_mode`
 4. `local` (hard default when no federation config exists)
 
@@ -414,7 +414,7 @@ branch facts local" pattern.
 ### Per-project routing
 
 A repo can declare its own route without editing the global config, via the
-central project registry or the optional repository-local `mempalace.yaml`:
+central project registry or the optional repository-local `agentpalace.yaml`:
 
 ```yaml
 wing: wing_myproject
@@ -466,7 +466,7 @@ When `write: both` is configured, every federatable write operation follows a
      `(destination_remote, ordering_key)`.
 5. **Outcomes are observable, not inline.** Delivery progress — pending,
    leased, retryable counts, the backlog, the most recent terminal failures —
-   is surfaced by `mempalace_status` (and `mempalace_wake_up`'s embedded
+   is surfaced by `agentpalace_status` (and `agentpalace_wake_up`'s embedded
    status) under `replication.backlog` and `replication.recent_terminal_failures`.
    An operator can therefore answer "did my queued write actually replicate?"
    by reading the outbox state rather than by resubmitting the write.
@@ -488,17 +488,17 @@ When `write: both` is configured, every federatable write operation follows a
    field. No config can federate diary content.
 
 This applies to all federated write paths that go through the MCP tools:
-- **Drawer writes** (`mempalace_add_drawer`) — durable intent, local commit,
+- **Drawer writes** (`agentpalace_add_drawer`) — durable intent, local commit,
   queued remote delivery.
-- **Drawer deletes** (`mempalace_delete_drawer` on a locally-known drawer) — same
+- **Drawer deletes** (`agentpalace_delete_drawer` on a locally-known drawer) — same
   protocol: durable intent, local delete, queued remote delivery.
-- **KG fact adds** (`mempalace_kg_add`) — durable intent, local commit, queued
+- **KG fact adds** (`agentpalace_kg_add`) — durable intent, local commit, queued
   remote delivery.
-- **KG fact invalidations** (`mempalace_kg_invalidate`) — durable intent, local
+- **KG fact invalidations** (`agentpalace_kg_invalidate`) — durable intent, local
   invalidation, queued remote delivery.
 
 > **DeleteDrawer's remote fallback is unchanged.** Unknown drawer IDs are not
-> `write: both`-routed: `mempalace_delete_drawer` first deletes a *known* local
+> `write: both`-routed: `agentpalace_delete_drawer` first deletes a *known* local
 > drawer (applying the resolved `write` target, which is what produces durable
 > replication for `both` routes). If the ID is not found locally it falls back by
 > attempting deletion on ALL configured remotes (in deterministic name order), as
@@ -555,10 +555,10 @@ with `write: remote`) pushes the work to the hub instead of writing locally.
 
 ```bash
 # wing routes to a remote → this pushes to the hub
-mempalace mine /path/to/project
+agentpalace mine /path/to/project
 
 # preview what would be sent, no network calls
-mempalace mine /path/to/project --dry-run
+agentpalace mine /path/to/project --dry-run
 ```
 
 ### Machine-independent identity
@@ -641,7 +641,7 @@ An unchanged re-mine retains the existing record and its retry state instead of 
 another copy. If nothing new is staged, the CLI reports `no new records; existing queue retained`
 without claiming a new durable batch.
 
-Keep `mempalace serve` (HTTP or `--stdio`) running against the same palace and federation
+Keep `agentpalace serve` (HTTP or `--stdio`) running against the same palace and federation
 configuration for delivery. Startup and periodic reconciliation finish staged local file
 effects from their saved snapshots, without reading a changed or missing checkout. Recovery
 and foreground ingestion use process-safe source locks. The receiver locks each source
@@ -676,7 +676,7 @@ Unsupported capabilities and permanent HTTP rejection become inspectable termina
 After correcting a terminal problem, run a fresh mine to create new record identities.
 Successful old records need no manual replay. Never delete the outbox or receipts to retry.
 
-`mempalace_status` and wake-up expose `replication.ingestion`: distinct pending, retryable,
+`agentpalace_status` and wake-up expose `replication.ingestion`: distinct pending, retryable,
 failed and total batch counts, per-file state counts, oldest pending timestamp and age in
 seconds. Pending includes staged, leased and retrying work; a batch with both unfinished
 and rejected files counts as both pending and failed. Recent terminal failures include
@@ -699,9 +699,9 @@ repo. On a non-canonical checkout this is now the **automatic** behaviour — th
 flag only forces it:
 
 ```bash
-mempalace mine /path/to/project            # auto: canonical on main, branch delta elsewhere
-mempalace mine /path/to/project --branch   # force a branch delta
-mempalace mine /path/to/project --full     # force a full canonical mine
+agentpalace mine /path/to/project            # auto: canonical on main, branch delta elsewhere
+agentpalace mine /path/to/project --branch   # force a branch delta
+agentpalace mine /path/to/project --full     # force a full canonical mine
 ```
 
 - **Delta** = files changed vs the merge-base with the default branch
@@ -735,9 +735,9 @@ detection rules, source-key layout, tombstones, and search-time overlay composit
 
 ### Searching a view
 
-`view` is a first-class search parameter in three places — the MCP `mempalace_search`
+`view` is a first-class search parameter in three places — the MCP `agentpalace_search`
 tool, the federation wire (`SearchRequest.view`, forwarded to remotes), and the CLI
-(`mempalace search --view`). All three take the same values:
+(`agentpalace search --view`). All three take the same values:
 
 - omitted or `"canonical"` — canonical snapshots only
 - `"<branch>"` — that branch composed over the canonical snapshot
@@ -747,13 +747,13 @@ In the MCP and REST responses each result carries its own `view` field, absent f
 rows. **The CLI does not print it** — `render_search_results` shows wing, room, source,
 score, and content only. That matters most for `search --view full`, where rows from
 different views can share a source path and the terminal output gives you no way to tell
-them apart; use `mempalace_search` or the REST endpoint when you need to attribute a result
+them apart; use `agentpalace_search` or the REST endpoint when you need to attribute a result
 to a view.
 
-> **Only `mempalace_search` composes a view across a combined wing.** The CLI's
+> **Only `agentpalace_search` composes a view across a combined wing.** The CLI's
 > `search --view` opens the local `StorageEngine` and never performs federation routing
 > (see [Part 5](#part-5--federated-reads-wake-up-and-changes)). On the combined-wing setup
-> below — canonical on the hub, branch delta local — `mempalace search --view <branch>`
+> below — canonical on the hub, branch delta local — `agentpalace search --view <branch>`
 > returns only the local branch rows, because the canonical rows it would overlay live on
 > the remote and the CLI never fetches them. Use the MCP tool for that query.
 
@@ -781,10 +781,10 @@ propagate to the shared palace when the remote is reachable.
 ## Part 5 — Federated reads, wake-up, and changes
 
 > **Federated reads are an MCP-server capability.** The fan-out and merge below
-> happen inside `mempalace serve --stdio` (the tools your agent calls). The `mempalace`
+> happen inside `agentpalace serve --stdio` (the tools your agent calls). The `agentpalace`
 > `search`, `status`, and `wake-up` commands always operate on the **local**
 > palace only — the CLI is federation-aware for **mining (writes)**, not for
-> reads. To exercise federated reads, point an MCP client at `mempalace serve --stdio` with
+> reads. To exercise federated reads, point an MCP client at `agentpalace serve --stdio` with
 > the federation config, or call the hub's REST endpoints directly.
 
 Through the MCP server, federated wings fan out across reads:
@@ -792,11 +792,11 @@ Through the MCP server, federated wings fan out across reads:
 - **Search / taxonomy / wings / rooms / status** — combined wings merge local and
   remote; results and wings are annotated with origin/availability; a down remote
   becomes a warning, not a failure.
-- **`mempalace_wake_up`** — when federation is active, the response gains
+- **`agentpalace_wake_up`** — when federation is active, the response gains
   `remote_changes`: a per-remote map of the last 24 h of change events (each event
   carries `origin: "remote:<name>"`), with unreachable remotes shown as
   `{ "unreachable": true, "error": "..." }` and a `next_cursor` per remote.
-- **`mempalace_get_changes_since`** — merges local and remote change feeds,
+- **`agentpalace_get_changes_since`** — merges local and remote change feeds,
   annotates origin, and accepts per-remote `cursors` for continuation.
 
 > **Clock-skew caveat:** persist and pass back the per-origin cursors rather than
@@ -806,11 +806,11 @@ Through the MCP server, federated wings fan out across reads:
 ## Part 6 — Dev testing locally
 
 You can exercise the whole feature on one machine with two palaces — a hub and a
-client — each with its own `config.json`. Use `MEMPALACE_CONFIG_DIR` to give the
-client its own `~/.mempalace`-shaped directory instead of editing your real one;
+client — each with its own `config.json`. Use `AGENTPALACE_CONFIG_DIR` to give the
+client its own `~/.agentpalace`-shaped directory instead of editing your real one;
 the hub is pointed at directly with `--palace`/`--token-file` and needs no config
 directory of its own. The hub does the embedding, so set
-`MEMPALACE_STUB_EMBEDDINGS` (deterministic vectors, no model download) on the
+`AGENTPALACE_STUB_EMBEDDINGS` (deterministic vectors, no model download) on the
 **hub** process — the client never embeds during a remote mine.
 
 ```bash
@@ -819,11 +819,11 @@ mkdir -p /tmp/hub
 echo '[{"token":"dev-token","name":"dev","enabled":true}]' > /tmp/hub/tokens.json
 
 # 2. Start the hub against the hub palace (stub embeddings for a fast offline run)
-MEMPALACE_STUB_EMBEDDINGS=1 mempalace --palace /tmp/hub/palace serve \
+AGENTPALACE_STUB_EMBEDDINGS=1 agentpalace --palace /tmp/hub/palace serve \
   --bind 127.0.0.1:8765 --token-file /tmp/hub/tokens.json &
 
 # 3. Give the client its own config directory instead of touching
-#    ~/.mempalace/config.json — MEMPALACE_CONFIG_DIR redirects config.json,
+#    ~/.agentpalace/config.json — AGENTPALACE_CONFIG_DIR redirects config.json,
 #    projects.json, and (by default) the client's own palace under it.
 mkdir -p /tmp/client
 cat > /tmp/client/config.json <<'JSON'
@@ -835,12 +835,12 @@ cat > /tmp/client/config.json <<'JSON'
   }
 }
 JSON
-export MEMPALACE_CONFIG_DIR=/tmp/client
+export AGENTPALACE_CONFIG_DIR=/tmp/client
 
-# 4. Mine a project whose mempalace.yaml declares wing: wing_demo → pushes to the hub.
-#    The client does NOT embed here; the hub does. MEMPALACE_CONFIG_DIR must be
+# 4. Mine a project whose agentpalace.yaml declares wing: wing_demo → pushes to the hub.
+#    The client does NOT embed here; the hub does. AGENTPALACE_CONFIG_DIR must be
 #    set in this shell (or exported) so the CLI picks up /tmp/client/config.json.
-mempalace mine /path/to/demo-project
+agentpalace mine /path/to/demo-project
 
 # 5. Verify the hub received it. The CLI's own `search` only reads the LOCAL
 #    palace, so query the hub directly over REST instead:
@@ -850,16 +850,16 @@ curl -s -X POST http://127.0.0.1:8765/v1/drawers/search \
 ```
 
 To exercise federated **reads** (combined search, wake-up fan-out), point an MCP
-client at `mempalace serve --stdio` launched with `MEMPALACE_CONFIG_DIR=/tmp/client` in its
+client at `agentpalace serve --stdio` launched with `AGENTPALACE_CONFIG_DIR=/tmp/client` in its
 environment (an MCP client typically sets this in its server-launch config, since
-`mempalace serve --stdio` itself takes no CLI arguments) — the fan-out lives in the MCP
+`agentpalace serve --stdio` itself takes no CLI arguments) — the fan-out lives in the MCP
 server, not the CLI.
 
 For non-stale snippet resolution on the hub, add the project path to
 `server.checkouts.wing_demo` in the hub's config and restart `serve`.
 
 Notes:
-- `MEMPALACE_STUB_EMBEDDINGS` is honored by the `mempalace serve --stdio` binary and the CLI
+- `AGENTPALACE_STUB_EMBEDDINGS` is honored by the `agentpalace serve --stdio` binary and the CLI
   `serve` command. The CLI `mine`/`search` commands always use the real embedding
   provider — but a *remote-routed* `mine` does no client-side embedding at all, so
   the stub setting only matters on the hub. For a fully stubbed read path, run the
@@ -875,7 +875,7 @@ messages, immutable artifacts and results, and the audit-event feed — over the
 else in this guide.
 
 As of issue #102 Stage 4, the client side is wired up too: `RemoteApi`, `FederationRouter`,
-and the coordination MCP tools (`mempalace_task_create` and friends) route to a configured
+and the coordination MCP tools (`agentpalace_task_create` and friends) route to a configured
 remote — see [Client-side coordination routing](#client-side-coordination-routing) below.
 
 ### Wing is the authorization key
@@ -1006,7 +1006,7 @@ parameter and therefore needs time ordering, while the coordination feeds have n
 relying on synchronized clocks" more directly than reusing a timestamp-bearing
 format would. Cursors are per-origin: a cursor from one palace means nothing to
 another, so a client combining several remotes keeps one cursor per remote (as
-`mempalace_get_changes_since` already does for the generic feed) rather than
+`agentpalace_get_changes_since` already does for the generic feed) rather than
 comparing or merge-sorting them.
 
 ### Lease and expiry clocks belong to the palace that owns the task
@@ -1063,14 +1063,14 @@ curl -s -X POST http://127.0.0.1:8765/v1/coordination/tasks/task_.../claim \
 ### Client-side coordination routing
 
 Issue #102 Stage 4 wires the routes above into `RemoteApi`, `FederationRouter`, and the
-coordination MCP tools (`mempalace_task_create` and friends) documented in
+coordination MCP tools (`agentpalace_task_create` and friends) documented in
 [Coordination.md](Coordination.md), so an agent talking to its local MCP server can reach a
 configured remote's coordination state the same way it already reaches remote drawers and KG
 facts.
 
 **Task discovery.** `GET /v1/coordination/tasks` and `RemoteApi::coordination_tasks`
 use the additive `coordination_task_list` capability. Unfiltered lists are allowed
-under the same SQL visibility rules as events. The MCP `mempalace_task_list`
+under the same SQL visibility rules as events. The MCP `agentpalace_task_list`
 returns separate `remote_tasks` pages with independent cursors, and allocates
 encoded byte budgets before requesting each page. See
 [Task discovery](Coordination.md#task-discovery) for the projection, limits,
@@ -1110,14 +1110,14 @@ regardless of any `federation.coordination` entry.
 }
 ```
 
-When `mempalace_task_create` omits `wing`, it uses the configured coordination default. If no
+When `agentpalace_task_create` omits `wing`, it uses the configured coordination default. If no
 default is configured, it uses `wing_local_tasks`, whose coordination write route is pinned to
 the local palace even when `federation.default_mode` is `remote` or `combined`. Explicit
 `wing_local_tasks` is pinned locally by the same rule; other explicit wings continue through the
 normal coordination routing rules unchanged.
 
 **The routed wing is normalised before either the diary check or the table lookup runs.**
-`mempalace_task_create` calls `WingId::normalized` on the caller-supplied wing once, up front,
+`agentpalace_task_create` calls `WingId::normalized` on the caller-supplied wing once, up front,
 and uses that canonical value for the route decision *and* for the outgoing request (local or
 remote) alike — a short or mixed-case spelling (`"agents"`, `"Wing_Agents"`, `"myproject"`) is
 routed exactly as its canonical form (`wing_agents`, `wing_myproject`) would be. This matters
@@ -1131,14 +1131,14 @@ given wing cannot be normalised at all, it resolves local rather than falling th
 `default_mode`, since a routing decision that gates data egress must fail closed, not open, on
 an input it cannot canonicalize.
 
-**`mempalace_task_create` is the one wing-routed write.** It is also the only coordination
-request that carries a wing at all — every other coordination tool (`mempalace_task_get`,
-`mempalace_task_claim`, `mempalace_message_send`, and so on) acts on an existing task,
+**`agentpalace_task_create` is the one wing-routed write.** It is also the only coordination
+request that carries a wing at all — every other coordination tool (`agentpalace_task_get`,
+`agentpalace_task_claim`, `agentpalace_message_send`, and so on) acts on an existing task,
 message, artifact, or result ID, and none of them take a `wing` argument, so there is nothing
 for `resolve_coordination_route` to resolve against. Those ID-keyed tools instead use a
 **local-first, ID-discovery fallback**: local storage is tried first; on a miss, if coordination
 federation is configured at all, the router tries each **candidate** remote in name order and
-uses whichever one actually owns the record — mirroring `mempalace_delete_drawer`'s existing "no
+uses whichever one actually owns the record — mirroring `agentpalace_delete_drawer`'s existing "no
 cross-palace ID mapping" reasoning exactly. The candidate set is every remote named by a
 `federation.coordination[wing]` rule (across every wing — there is no wing to key a single
 lookup by, so it is the union) plus `default_remote` when `default_mode` is non-`local`; a
@@ -1160,8 +1160,8 @@ record" and "I don't implement coordination at all", respectively, the latter re
 the candidate's own `/v1/info`, independent of how `federation.coordination` describes it, so a
 candidate remote can still turn out not to run coordination at all. Neither is a sign the
 configured remote is broken, so both fallbacks skip past them to the next candidate. For a
-**read** (`mempalace_task_get`, `mempalace_message_get`, `mempalace_artifact_get`,
-`mempalace_result_get`), a genuinely-degradable `Unreachable` remote is *also* skipped — the
+**read** (`agentpalace_task_get`, `agentpalace_message_get`, `agentpalace_artifact_get`,
+`agentpalace_result_get`), a genuinely-degradable `Unreachable` remote is *also* skipped — the
 federation-wide "reads degrade" rule, so one down remote never blocks discovery through the
 others — but every remaining error from a candidate — wrong credentials or an incompatible API
 version — means that *configured* remote is broken in a way that cannot be read as "absent",
@@ -1169,8 +1169,8 @@ and is raised as a tool error instead of being folded into `{"found": false}`; a
 able to tell "this record genuinely does not exist anywhere" apart from "your token is wrong"
 or "this remote is on an incompatible protocol version" — cases where the record might still
 exist and reporting absence would be a lie. For a **write**
-(`mempalace_task_claim`/`_renew`/`_transition`, `mempalace_message_send`,
-`mempalace_message_acknowledge`, `mempalace_artifact_put`, `mempalace_result_put`), every error
+(`agentpalace_task_claim`/`_renew`/`_transition`, `agentpalace_message_send`,
+`agentpalace_message_acknowledge`, `agentpalace_artifact_put`, `agentpalace_result_put`), every error
 other than `404`/`CapabilityMissing`, including an unreachable remote, is terminal: unlike a
 read, a write cannot afford to guess past a candidate it could not get a definitive answer from,
 since guessing wrong could create a second, divergent record for the same task on the wrong
@@ -1179,14 +1179,14 @@ terminal set instead of its skippable one, contradicting the write side and hard
 coordination read against a remote that simply predates coordination support; see deviation 21
 in [Coordination-Phase-3-Design.md](Coordination-Phase-3-Design.md).) A read that finds the
 record on a remote annotates the response with `origin: "remote:<name>"`; a write that lands on
-a remote reports `applied_to: "remote:<name>"`. `mempalace_task_claim`/`_renew`/`_transition`'s
+a remote reports `applied_to: "remote:<name>"`. `agentpalace_task_claim`/`_renew`/`_transition`'s
 successful remote response nests the task under `"task"`, exactly like the local shape
 documented below — `{"success": true, "task": {...}, "applied_to": "remote:<name>"}` — so a
 caller never has to special-case which palace served the write.
 
 **The ID-discovery read fallback probes candidates sequentially, one at a time, stopping at the
 first success — this is deliberate, not an oversight left over from before the fan-outs went
-concurrent.** `mempalace_inbox_read`/`mempalace_coordination_events` fan out concurrently because
+concurrent.** `agentpalace_inbox_read`/`agentpalace_coordination_events` fan out concurrently because
 they are aggregate reads: every candidate's answer is wanted, so nothing is lost by asking them
 all at once. `coordination_read_fallback` is a discovery lookup for one record: the moment a
 candidate answers, the search stops, so a candidate after the winner is never contacted in the
@@ -1198,8 +1198,8 @@ id to remotes with no answer to it is a real data-minimisation regression, bough
 latency on a path that already runs after a local miss — exactly the case local-first ordering
 exists to keep off the network. Sequential order is load-bearing here, not incidental.
 
-`mempalace_inbox_read` and `mempalace_coordination_events` are the exception to the exception:
-being aggregate, cursor-paginated feeds (like `mempalace_get_changes_since`), they always read
+`agentpalace_inbox_read` and `agentpalace_coordination_events` are the exception to the exception:
+being aggregate, cursor-paginated feeds (like `agentpalace_get_changes_since`), they always read
 local and fan out concurrently, with a per-remote cursor, to every remote in
 `FederationRouter::coordination_candidates()` — **not** every configured remote; a remote wired
 up only for drawer or KG federation, never named by any `federation.coordination` rule, is
@@ -1212,7 +1212,7 @@ from its own `/v1/info`, so a remote named by a coordination rule can still turn
 coordination at all — is reported as `{"capability_missing": true, "capability": "coordination",
 "error": "..."}` instead: it declined correctly, it is not down, and conflating the two shapes
 would send an operator investigating a healthy remote for an outage that never happened.
-`mempalace_coordination_event_get` — a single audit event by exact ID — has no remote
+`agentpalace_coordination_event_get` — a single audit event by exact ID — has no remote
 counterpart at all: Stage 3 never exposed `GET /v1/coordination/events/{id}`, only the paginated
 feed, so it stays local-only.
 
@@ -1228,7 +1228,7 @@ built on the shared `coordination_candidates()` iterator every candidate-narrowe
   `coordination_federation_enabled()` — an explicit `federation.coordination` entry, or
   `default_mode` itself non-`local`. A palace that federates drawers only, with an empty
   `federation.coordination` table and `default_mode: local`, never sends a recipient name or
-  wing filter to any remote on `mempalace_inbox_read` or `mempalace_coordination_events` — a
+  wing filter to any remote on `agentpalace_inbox_read` or `agentpalace_coordination_events` — a
   configured remote alone is not enough, exactly as for the ID-keyed fallbacks above.
 - **Only coordination candidates are contacted at all**, per the candidate-set narrowing
   described above — a remote configured for drawers/KG only never receives a coordination fan-out
@@ -1244,11 +1244,11 @@ built on the shared `coordination_candidates()` iterator every candidate-narrowe
   aggregate read.
 
 **Continuing a federated page uses `remote_cursors`, not `cursor`.** The local `cursor`
-argument on `mempalace_inbox_read`/`mempalace_coordination_events` only advances the local
+argument on `agentpalace_inbox_read`/`agentpalace_coordination_events` only advances the local
 page. Each remote's own page is continued independently by echoing back its
 `remote_messages.<name>.next_cursor` / `remote_events.<name>.next_cursor` from the previous
 response inside a `remote_cursors: {"<name>": "<cursor>"}` object argument — the same
-per-remote-map shape `mempalace_get_changes_since`'s `cursors` argument already uses. Treat
+per-remote-map shape `agentpalace_get_changes_since`'s `cursors` argument already uses. Treat
 each value as opaque; do not parse it or reuse it against a different remote. `remote_messages`/
 `remote_events` is an empty object whenever coordination federation is not configured for the
 requested wing (including the diary wing) or no remotes are configured at all — an empty map
@@ -1268,8 +1268,8 @@ federated.
 
 Every routing decision documented above except one can be inspected without side effects:
 drawer routing shows up in `wing_availability`, configured remotes show up in
-`mempalace_status`, and `/v1/info` lists capabilities. Coordination routing was the exception —
-the only way to learn where `mempalace_task_create` would put a task in a given wing was to
+`agentpalace_status`, and `/v1/info` lists capabilities. Coordination routing was the exception —
+the only way to learn where `agentpalace_task_create` would put a task in a given wing was to
 create one, and coordination has no delete. Issue #125 closes that gap with a
 `coordination_availability` map, a sibling to `wing_availability` rather than a change to it,
 returned by the same four discovery tools whenever federation has remotes configured:
@@ -1281,14 +1281,14 @@ returned by the same four discovery tools whenever federation has remotes config
 }
 ```
 
-The dedicated `mempalace_coordination_wings` tool supplements this partial discovery. It reports
+The dedicated `agentpalace_coordination_wings` tool supplements this partial discovery. It reports
 locally known coordination wings from local task/event records and configured routes, always
 including the effective default, with each wing's effective write destination, default marker,
 and provenance. Legacy `wing_unscoped` rows are excluded because that reserved wing is not a
 usable named coordination wing. This is a local read and does not exhaustively scan remote
 palaces.
 
-- `mempalace_status`, `mempalace_list_wings`, `mempalace_list_rooms`, and `mempalace_get_taxonomy`
+- `agentpalace_status`, `agentpalace_list_wings`, `agentpalace_list_rooms`, and `agentpalace_get_taxonomy`
   all emit it, exactly like `wing_availability`.
 - **`coordination_availability` reports the effective *write target* — `"local"` or
   `"remote:<name>"` — not the routing *mode*.** This is the one place it deliberately diverges
@@ -1302,10 +1302,10 @@ palaces.
   `"combined"` for a wing whose tasks always land locally — answering the one question this map
   exists to answer (where will my task go?) incorrectly for exactly that case. `wing_tasks`
   above illustrates it: with no explicit `federation.coordination` entry, it falls through to
-  `default_mode: combined` and is reported as `"local"`, matching where `mempalace_task_create`
+  `default_mode: combined` and is reported as `"local"`, matching where `agentpalace_task_create`
   actually places its tasks.
 - Each entry is resolved by calling `resolve_coordination_route` followed by the same
-  `resolve_write_target` helper `mempalace_task_create` uses to turn a resolved route into an
+  `resolve_write_target` helper `agentpalace_task_create` uses to turn a resolved route into an
   actual write destination — never a second implementation of either. That precedence has
   already produced three separate bugs in this file when re-derived on a parallel code path
   (the coordination opt-in gate, the diary override, and the candidate-set narrowing each landed
@@ -1314,7 +1314,7 @@ palaces.
   reuses both wrappers instead of re-deriving the chain.
 - The key set is the union of the local wing names, `federation.wings`, and
   `federation.coordination`. Drawer and coordination routing are deliberately separate tables
-  (see [`FederationConfigV1::coordination`](../crates/mempalace-config/src/federation.rs) for
+  (see [`FederationConfigV1::coordination`](../crates/agentpalace-config/src/federation.rs) for
   why), so the same wing can legitimately answer differently in each map — `wing_code` above is
   `combined` for drawers but `remote:work` for coordination. Including `federation.wings` in the
   key set (not just `federation.coordination`) means a wing configured only for drawers still
@@ -1428,7 +1428,7 @@ replay against it is refused outright (issue #102 Stage 8), mirroring the way
 against a `wing_unscoped` record is masked as 404 instead, so the 422 never
 becomes an existence oracle. It is also never returned by a fan-out fallback
 (`coordination_write_fallback`/`coordination_task_revisioned_fallback` in
-`mempalace serve --stdio`) as a soft miss — it surfaces as a hard tool error there,
+`agentpalace serve --stdio`) as a soft miss — it surfaces as a hard tool error there,
 deliberately, because the record is confirmed to exist on that remote. The
 remedy is to move the task to a real wing (there is currently no in-place
 re-home operation; recreate it under the wing you want it federated from) —
@@ -1443,7 +1443,7 @@ for records in wings the caller is not allowed to see, and `wing_unscoped` is
 refused to *every* caller regardless of scope — so there is no authorization
 state to disclose, and the only thing the 422 reveals is the actionable fact
 that the stored task needs re-homing. See `authorize_replay_wing` in
-`crates/mempalace-server/src/lib.rs`.
+`crates/agentpalace-server/src/lib.rs`.
 
 ### A coordination write returns 409 with code `idempotency_key_conflict`
 You replayed an `idempotency_key` your token has used before, but the record
@@ -1474,9 +1474,9 @@ identity is derived, not claimed](#actor-identity-is-derived-not-claimed).
 
 ## HTTP MCP endpoint
 
-`mempalace serve` also exposes `POST /mcp` using stateless Streamable HTTP
+`agentpalace serve` also exposes `POST /mcp` using stateless Streamable HTTP
 (protocol `2025-03-26`). It calls the same tool dispatcher as
-`mempalace serve --stdio`, including lineage binding and configured federation routing.
+`agentpalace serve --stdio`, including lineage binding and configured federation routing.
 Requests require `Authorization: Bearer <token>`, `Content-Type: application/json`,
 and `Accept: application/json, text/event-stream`. Only unrestricted tokens (no
 `scopes` field) can access this full local tool surface; scoped tokens retain their

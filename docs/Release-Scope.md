@@ -1,12 +1,12 @@
 # Rust v1 Release Scope
 
-This document defines the first Rust release surface for `mempalace-rs`.
+This document defines the first Rust release surface for `agentpalace`.
 
 ## In Scope
 
 ### Executable and runtime
 
-- `mempalace` (`mempalace.exe` on Windows): CLI, HTTP, and stdio MCP
+- `agentpalace` (`agentpalace.exe` on Windows): CLI, HTTP, and stdio MCP
 - Statically linked ONNX Runtime 1.23.2 and upstream license notices
 
 ### CLI commands frozen for v1
@@ -38,7 +38,7 @@ Full flag reference: [CLI Surface](CLI-Surface.md).
 ### Maintenance
 
 - Enabled by default; runs in the background of the HTTP hub (`serve`) and on demand via
-  `mempalace maintain`. Three tiers — vector-index optimization, fragment compaction,
+  `agentpalace maintain`. Three tiers — vector-index optimization, fragment compaction,
   version retention — coordinated by a cross-process SQLite advisory lease. See
   [Operator guide](Operator-Standard.md#maintenance).
 
@@ -49,77 +49,77 @@ Full flag reference: [CLI Surface](CLI-Surface.md).
 
 ### MCP tool surface (69 tools)
 
-- `mempalace_wake_up`
-- `mempalace_status`
-- `mempalace_list_wings`
-- `mempalace_coordination_wings`
-- `mempalace_list_rooms`
-- `mempalace_get_taxonomy`
-- `mempalace_get_aaak_spec`
-- `mempalace_kg_query`
-- `mempalace_kg_add`
-- `mempalace_kg_invalidate`
-- `mempalace_kg_timeline`
-- `mempalace_kg_stats`
-- `mempalace_traverse`
-- `mempalace_find_tunnels`
-- `mempalace_graph_stats`
-- `mempalace_search`
-- `mempalace_check_duplicate`
-- `mempalace_add_drawer`
-- `mempalace_delete_drawer`
-- `mempalace_diary_write`
-- `mempalace_diary_read`
-- `mempalace_get_changes_since`
-- `mempalace_identity_read`
-- `mempalace_identity_update`
-- `mempalace_task_create`
-- `mempalace_task_list`
-- `mempalace_task_get`
-- `mempalace_task_claim`
-- `mempalace_task_renew`
-- `mempalace_task_transition`
-- `mempalace_message_send`
-- `mempalace_message_get`
-- `mempalace_message_acknowledge`
-- `mempalace_inbox_read`
-- `mempalace_artifact_put`
-- `mempalace_artifact_get`
-- `mempalace_result_put`
-- `mempalace_result_get`
-- `mempalace_coordination_event_get`
-- `mempalace_coordination_events`
-- `mempalace_skill_propose`
-- `mempalace_skill_get`
-- `mempalace_skill_versions`
-- `mempalace_skill_list`
-- `mempalace_skill_record_outcome`
-- `mempalace_skill_promote`
-- `mempalace_skill_retire`
-- `mempalace_skill_reviews`
-- `mempalace_delegation_span_start`
-- `mempalace_delegation_span_get`
-- `mempalace_delegation_span_close`
-- `mempalace_delegation_spans_for_task`
-- `mempalace_delegation_checkpoint_append`
-- `mempalace_delegation_checkpoint_get`
-- `mempalace_delegation_trace`
-- `mempalace_lineage_set`
-- `mempalace_self_observation_propose`
-- `mempalace_self_observation_review`
-- `mempalace_identity_packet`
-- `mempalace_migration_record`
-- `mempalace_a2a_agent_card`
-- `mempalace_a2a_task_import`
-- `mempalace_a2a_task_export`
-- `mempalace_a2a_message_import`
-- `mempalace_a2a_artifact_import`
-- `mempalace_mcp_tasks_get`
-- `mempalace_mcp_tasks_update`
-- `mempalace_mcp_tasks_cancel`
-- `mempalace_mcp_tasks_import`
+- `agentpalace_wake_up`
+- `agentpalace_status`
+- `agentpalace_list_wings`
+- `agentpalace_coordination_wings`
+- `agentpalace_list_rooms`
+- `agentpalace_get_taxonomy`
+- `agentpalace_get_aaak_spec`
+- `agentpalace_kg_query`
+- `agentpalace_kg_add`
+- `agentpalace_kg_invalidate`
+- `agentpalace_kg_timeline`
+- `agentpalace_kg_stats`
+- `agentpalace_traverse`
+- `agentpalace_find_tunnels`
+- `agentpalace_graph_stats`
+- `agentpalace_search`
+- `agentpalace_check_duplicate`
+- `agentpalace_add_drawer`
+- `agentpalace_delete_drawer`
+- `agentpalace_diary_write`
+- `agentpalace_diary_read`
+- `agentpalace_get_changes_since`
+- `agentpalace_identity_read`
+- `agentpalace_identity_update`
+- `agentpalace_task_create`
+- `agentpalace_task_list`
+- `agentpalace_task_get`
+- `agentpalace_task_claim`
+- `agentpalace_task_renew`
+- `agentpalace_task_transition`
+- `agentpalace_message_send`
+- `agentpalace_message_get`
+- `agentpalace_message_acknowledge`
+- `agentpalace_inbox_read`
+- `agentpalace_artifact_put`
+- `agentpalace_artifact_get`
+- `agentpalace_result_put`
+- `agentpalace_result_get`
+- `agentpalace_coordination_event_get`
+- `agentpalace_coordination_events`
+- `agentpalace_skill_propose`
+- `agentpalace_skill_get`
+- `agentpalace_skill_versions`
+- `agentpalace_skill_list`
+- `agentpalace_skill_record_outcome`
+- `agentpalace_skill_promote`
+- `agentpalace_skill_retire`
+- `agentpalace_skill_reviews`
+- `agentpalace_delegation_span_start`
+- `agentpalace_delegation_span_get`
+- `agentpalace_delegation_span_close`
+- `agentpalace_delegation_spans_for_task`
+- `agentpalace_delegation_checkpoint_append`
+- `agentpalace_delegation_checkpoint_get`
+- `agentpalace_delegation_trace`
+- `agentpalace_lineage_set`
+- `agentpalace_self_observation_propose`
+- `agentpalace_self_observation_review`
+- `agentpalace_identity_packet`
+- `agentpalace_migration_record`
+- `agentpalace_a2a_agent_card`
+- `agentpalace_a2a_task_import`
+- `agentpalace_a2a_task_export`
+- `agentpalace_a2a_message_import`
+- `agentpalace_a2a_artifact_import`
+- `agentpalace_mcp_tasks_get`
+- `agentpalace_mcp_tasks_update`
+- `agentpalace_mcp_tasks_cancel`
+- `agentpalace_mcp_tasks_import`
 
-The nine protocol-adapter tools (`mempalace_a2a_*`, `mempalace_mcp_tasks_*`) translate between
+The nine protocol-adapter tools (`agentpalace_a2a_*`, `agentpalace_mcp_tasks_*`) translate between
 AgentPalace coordination records and the A2A and `io.modelcontextprotocol/tasks` wire models
 (issue #102 Stages 9-10). They are all local-only: the import tools translate *and* persist,
 which is a two-write sequence (the record, then the raw wire envelope stored as a
@@ -127,26 +127,26 @@ which is a two-write sequence (the record, then the raw wire envelope stored as 
 remote path is offered rather than one that can half-apply. Neither adapter has an HTTP surface
 of its own; this tool surface is the only entry point.
 
-The five self-continuity tools are local-only. `mempalace_wake_up` compiles the MCP-bound or
+The five self-continuity tools are local-only. `agentpalace_wake_up` compiles the MCP-bound or
 palace-default lineage into an identity packet; model-facing calls cannot select or override it.
 See [Self-Continuity Across Models](Self-Continuity.md).
 
 The eight skill-registry tools and the seven delegation-telemetry tools are local-only and
 are not federated. The coordination task, message, artifact, result, and event tools are
 federation-aware as of issue #102 Stage 4, opt-in per wing via `federation.coordination`:
-`mempalace_task_create` routes
+`agentpalace_task_create` routes
 by the task's wing; every other ID-keyed tool (get/claim/renew/transition, message send/get/ack,
 artifact/result put/get) tries local storage first and falls back to each configured remote in
-name order on a local miss; and the two aggregate feeds (`mempalace_inbox_read`,
-`mempalace_coordination_events`) always read local and, when coordination federation is
+name order on a local miss; and the two aggregate feeds (`agentpalace_inbox_read`,
+`agentpalace_coordination_events`) always read local and, when coordination federation is
 configured at all, fan out concurrently to the remotes a `federation.coordination` rule names
 (plus the default remote when `default_mode` is not `local`), each with its own cursor. A read
-filtered to `wing_agents` never fans out, on either feed. `mempalace-server` exposes the same records over `/v1/coordination/*` under
+filtered to `wing_agents` never fans out, on either feed. `agentpalace-server` exposes the same records over `/v1/coordination/*` under
 the same scoped-token authorization as every other route. See
 [Native Coordination](Coordination.md), [Federation](Federation.md#part-7--federated-coordination),
 [Skill Registry](Skill-Registry.md), and [Delegation Telemetry](Delegation-Telemetry.md).
 
-`mempalace_coordination_wings` is a local discovery read. It lists the union of wings observed
+`agentpalace_coordination_wings` is a local discovery read. It lists the union of wings observed
 in local coordination tasks and events, wings named by configured coordination routes, and the
 effective default wing (even when the local palace has no coordination rows). Each entry reports
 the effective write destination (`local` or `remote:<name>`), an `is_default` marker, and
@@ -159,10 +159,10 @@ an exhaustive scan of remote palaces.
 
 Added after the initial v1 freeze; now part of the shipped surface.
 
-- `mempalace-server` — Axum REST server exposing a palace, started via
-  `mempalace serve`. Bearer-token auth; `GET /v1/health` is public.
-- `mempalace-remote` — HTTP client (`RemoteApi` trait + `RemoteClient`).
-- `mempalace-federation` — shared wire DTOs.
+- `agentpalace-server` — Axum REST server exposing a palace, started via
+  `agentpalace serve`. Bearer-token auth; `GET /v1/health` is public.
+- `agentpalace-remote` — HTTP client (`RemoteApi` trait + `RemoteClient`).
+- `agentpalace-federation` — shared wire DTOs.
 - REST surface under `/v1`: `info`, `drawers` (search, check_duplicate, add, list,
   get, delete), `kg` (query, facts, facts/invalidate, timeline, stats), `taxonomy`,
   `wings`, `rooms`, `changes`, `ingest/batch` (bulk mined-chunk ingest), and — added in
@@ -174,7 +174,7 @@ Added after the initial v1 freeze; now part of the shipped surface.
   durable local-first dual-write with **asynchronous, queued replication** in
   `both` mode (issue #127): the tool commits locally and returns
   `replication.status: "queued"` with a stable `operation_id`, a background
-  worker delivers idempotently, and outcomes surface via `mempalace_status`
+  worker delivers idempotently, and outcomes surface via `agentpalace_status`
   (`replication.backlog` / `replication.recent_terminal_failures`) and
   `replication.phase_metrics`; federated mining and `mine --branch` branch-delta
   mining.
@@ -187,10 +187,10 @@ Added after the initial v1 freeze; now part of the shipped surface.
   legacy string `warnings` and as a machine-actionable `degradations` array
   (`code`, `remote`, `kind`, `error`, `classification`).
 - MCP read fan-out: combined search/taxonomy/status, plus `remote_changes` in
-  `mempalace_wake_up`, remote merge in `mempalace_get_changes_since`, and (issue #102 Stage 4)
-  `remote_messages`/`remote_events` in `mempalace_inbox_read`/`mempalace_coordination_events`.
-- Routing discovery (issue #125): when federation has remotes configured, `mempalace_status`,
-  `mempalace_list_wings`, `mempalace_list_rooms`, and `mempalace_get_taxonomy` each include a
+  `agentpalace_wake_up`, remote merge in `agentpalace_get_changes_since`, and (issue #102 Stage 4)
+  `remote_messages`/`remote_events` in `agentpalace_inbox_read`/`agentpalace_coordination_events`.
+- Routing discovery (issue #125): when federation has remotes configured, `agentpalace_status`,
+  `agentpalace_list_wings`, `agentpalace_list_rooms`, and `agentpalace_get_taxonomy` each include a
   `wing_availability` map (drawer routing *mode*, `federation.wings`, values `"local"` /
   `"remote:<name>"` / `"combined"`) and a sibling `coordination_availability` map (the effective
   task *write target*, `federation.coordination`, values `"local"` / `"remote:<name>"` only —
@@ -210,7 +210,7 @@ previous shape must be updated; nothing here is additive.
 
 ### v0.1.26 — coordination task-write responses (issue #102 Stage 4)
 
-`mempalace_task_claim`, `mempalace_task_renew` and `mempalace_task_transition` changed shape
+`agentpalace_task_claim`, `agentpalace_task_renew` and `agentpalace_task_transition` changed shape
 twice in one release, in the same direction: a revision conflict is now **data**, not an error,
 and the task is **nested** rather than spread across the top level.
 
@@ -227,7 +227,7 @@ failed". And the federated path had drifted: a remote claim returned the task fl
 whenever the same call fell back to a remote. Both paths now emit one envelope, pinned by a
 test that drives the same assertion over each.
 
-This matches `mempalace_skill_promote` and `mempalace_delegation_span_close`, which have used
+This matches `agentpalace_skill_promote` and `agentpalace_delegation_span_close`, which have used
 the `{"success", ...}` envelope since Phase 2.
 
 **Migrating:** read `response.task` instead of the response body, and branch on

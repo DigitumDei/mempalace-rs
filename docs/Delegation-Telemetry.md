@@ -19,7 +19,7 @@ This is the second half of the Phase 2 work described in
 - Spans nest through `parent_span_id`, forming the delegation tree. **A child span's `task_id`
   must match its parent's**, and a terminal (closed) parent cannot gain new children — otherwise
   a task-A trace could pick up a task-B descendant, disagreeing with
-  `mempalace_delegation_spans_for_task`'s strict per-task filter about what belongs to which run.
+  `agentpalace_delegation_spans_for_task`'s strict per-task filter about what belongs to which run.
 - **`depth` and `fan_out_index` are derived, not caller-supplied.** `depth` is the parent's depth
   plus one; `fan_out_index` is the number of siblings that already existed. A host comparing
   recorded depth against its declared `max_depth` is comparing against something the caller could
@@ -60,7 +60,7 @@ explicit `stop_reason`:
 A run that ran out of budget is therefore distinguishable from one that merely never finished
 being written down.
 
-**Repeated delegation** is visible the same way: `mempalace_delegation_spans_for_task` returns
+**Repeated delegation** is visible the same way: `agentpalace_delegation_spans_for_task` returns
 every span for a task, so a second root span against already-delegated work shows up as data
 rather than being silently absorbed.
 
@@ -81,7 +81,7 @@ AgentPalace cannot detect them.
 
 ## Reconstructing a run
 
-`mempalace_delegation_trace` returns the root span, every descendant span, and each of their
+`agentpalace_delegation_trace` returns the root span, every descendant span, and each of their
 checkpoints in sequence order. The node list is **flat**, with each node carrying
 `parent_span_id`, so a consumer rebuilds the tree itself and the response imposes no recursion
 depth. This is the export path for trace visualization; AgentPalace does not ship a viewer.
@@ -92,12 +92,12 @@ context is required.
 
 ## MCP tools
 
-- `mempalace_delegation_span_start`, `mempalace_delegation_span_get`,
-  `mempalace_delegation_span_close`, `mempalace_delegation_spans_for_task`
-- `mempalace_delegation_checkpoint_append`, `mempalace_delegation_checkpoint_get`
-- `mempalace_delegation_trace`
+- `agentpalace_delegation_span_start`, `agentpalace_delegation_span_get`,
+  `agentpalace_delegation_span_close`, `agentpalace_delegation_spans_for_task`
+- `agentpalace_delegation_checkpoint_append`, `agentpalace_delegation_checkpoint_get`
+- `agentpalace_delegation_trace`
 
-`mempalace_delegation_span_close` returns `{"success": false, "conflict": {...}}` on a revision
+`agentpalace_delegation_span_close` returns `{"success": false, "conflict": {...}}` on a revision
 mismatch, matching the skill-registry, lineage, and self-observation tools.
 
 ## Recovery and maintenance

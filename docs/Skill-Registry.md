@@ -84,7 +84,7 @@ Idempotency keys are limited to 256 bytes. Confidence must be within `0.0..=1.0`
 ## Instruction references
 
 `instructions_ref` is an opaque reference to where the procedure actually lives — a repository
-path such as `skills/coordinate-with-mempalace/SKILL.md`, or a drawer ID. The registry stores
+path such as `skills/coordinate-with-agentpalace/SKILL.md`, or a drawer ID. The registry stores
 the reference and its provenance rather than copying instruction bodies, so a skill record stays
 small and the source of truth stays where it is authored.
 
@@ -92,18 +92,18 @@ small and the source of truth stays where it is authored.
 
 The local skill-registry tool surface is:
 
-- `mempalace_skill_propose` (takes `wing` for project scope), `mempalace_skill_get`,
-  `mempalace_skill_versions`, `mempalace_skill_list` (takes `wing` to scope discovery)
-- `mempalace_skill_record_outcome`
-- `mempalace_skill_promote`, `mempalace_skill_retire`
-- `mempalace_skill_reviews`
+- `agentpalace_skill_propose` (takes `wing` for project scope), `agentpalace_skill_get`,
+  `agentpalace_skill_versions`, `agentpalace_skill_list` (takes `wing` to scope discovery)
+- `agentpalace_skill_record_outcome`
+- `agentpalace_skill_promote`, `agentpalace_skill_retire`
+- `agentpalace_skill_reviews`
 
-`mempalace_skill_list` is discovery only, and its `limit` is clamped to `1..=500`. Resolve a
-specific version with `mempalace_skill_get` before treating a skill as authoritative, for the
+`agentpalace_skill_list` is discovery only, and its `limit` is clamped to `1..=500`. Resolve a
+specific version with `agentpalace_skill_get` before treating a skill as authoritative, for the
 same reason semantic search is not authoritative delivery in
 [Native Coordination](Coordination.md).
 
-`mempalace_skill_promote` and `mempalace_skill_retire` return
+`agentpalace_skill_promote` and `agentpalace_skill_retire` return
 `{"success": false, "conflict": {...}}` on a revision mismatch, matching the conflict shape used
 by the lineage and self-observation tools.
 

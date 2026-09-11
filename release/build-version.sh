@@ -3,9 +3,9 @@ set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 default_repo_root="$(cd "$script_dir/.." && pwd)"
-repo_root="${MEMPALACE_VERSION_REPO:-$default_repo_root}"
-version_file="${MEMPALACE_VERSION_FILE:-release/version.toml}"
-commit="${MEMPALACE_VERSION_COMMIT:-HEAD}"
+repo_root="${AGENTPALACE_VERSION_REPO:-$default_repo_root}"
+version_file="${AGENTPALACE_VERSION_FILE:-release/version.toml}"
+commit="${AGENTPALACE_VERSION_COMMIT:-HEAD}"
 
 die() {
     echo "error: $*" >&2

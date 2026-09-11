@@ -27,12 +27,12 @@ required_metadata=(
     release-manifest.sig
 )
 expected_assets=(
-    mempalace-linux-x86_64
-    mempalace-macos-arm64
-    mempalace-windows-x86_64.exe
-    mempalace-notices-linux-x86_64.txt
-    mempalace-notices-macos-arm64.txt
-    mempalace-notices-windows-x86_64.txt
+    agentpalace-linux-x86_64
+    agentpalace-macos-arm64
+    agentpalace-windows-x86_64.exe
+    agentpalace-notices-linux-x86_64.txt
+    agentpalace-notices-macos-arm64.txt
+    agentpalace-notices-windows-x86_64.txt
 )
 
 for file in "${required_metadata[@]}" "${expected_assets[@]}"; do
@@ -120,10 +120,10 @@ expected_checksum_names="$(printf '%s\n' "${expected_assets[@]}" | LC_ALL=C sort
 
 for asset in "${expected_assets[@]}"; do
     expected_component=cli
-    expected_target="${asset#mempalace-}"
-    if [[ "$asset" == mempalace-notices-* ]]; then
+    expected_target="${asset#agentpalace-}"
+    if [[ "$asset" == agentpalace-notices-* ]]; then
         expected_component=notices
-        expected_target="${asset#mempalace-notices-}"
+        expected_target="${asset#agentpalace-notices-}"
     fi
     expected_target="${expected_target%.txt}"
     expected_target="${expected_target%.exe}"

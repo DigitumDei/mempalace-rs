@@ -1,12 +1,17 @@
 # Rust Config Schema Freeze
 
-This document freezes the config and runtime override surface used by `mempalace-rs` v1.
+This document freezes the config and runtime override surface used by `agentpalace` v1.
+
+For an existing MemPalace installation, run the [migration](Migration.md) before
+using the new default home. `MEMPALACE_*` settings are accepted as upgrade aliases;
+the corresponding `AGENTPALACE_*` value takes precedence when set. Old project
+config filenames remain readable, with `agentpalace.yaml` taking precedence.
 
 ## Global Config File
 
 Path:
 
-- default: `~/.mempalace/config.json`
+- default: `~/.agentpalace/config.json`
 
 Schema version:
 
@@ -17,8 +22,8 @@ Frozen JSON shape:
 ```json
 {
   "version": 1,
-  "palace_path": "~/.mempalace/palace",
-  "collection_name": "mempalace_drawers",
+  "palace_path": "~/.agentpalace/palace",
+  "collection_name": "agentpalace_drawers",
   "embedding_profile": "balanced",
   "low_cpu": {
     "worker_threads": 1,
@@ -62,13 +67,13 @@ Notes:
 ### `palace_path`
 
 - Type: string
-- Optional in file, resolved to `~/.mempalace/palace` by default
+- Optional in file, resolved to `~/.agentpalace/palace` by default
 - `~/...` expansion is supported
 
 ### `collection_name`
 
 - Type: string
-- Default: `mempalace_drawers`
+- Default: `agentpalace_drawers`
 
 ### `embedding_profile`
 
@@ -109,8 +114,8 @@ Validation:
   - `tail_threshold_rows: 1024`
   - `small_fragment_threshold: 10`
 - Fields:
-  - `enabled`: boolean — master switch for all maintenance. When `false`, both the HTTP scheduler and `mempalace maintain` are disabled. Default: `true`.
-  - `background_enabled`: boolean — whether the HTTP server and stdio MCP schedule maintenance automatically. Default: `true`. Set to `false` for low-I/O operation; `mempalace maintain` remains available for a planned maintenance window when `enabled` remains `true`. Stdio scheduling lasts for the connection and respects the same idle interval and maintenance lease as the HTTP server.
+  - `enabled`: boolean — master switch for all maintenance. When `false`, both the HTTP scheduler and `agentpalace maintain` are disabled. Default: `true`.
+  - `background_enabled`: boolean — whether the HTTP server and stdio MCP schedule maintenance automatically. Default: `true`. Set to `false` for low-I/O operation; `agentpalace maintain` remains available for a planned maintenance window when `enabled` remains `true`. Stdio scheduling lasts for the connection and respects the same idle interval and maintenance lease as the HTTP server.
   - `idle_secs`: positive integer — minimum idle seconds since the last write before maintenance runs. Default: `300`.
   - `version_retention_hours`: positive integer — maximum age in hours for retained version data. Default: `24`.
   - `tail_threshold_rows`: positive integer — row count threshold that triggers incremental vector-index optimization. Default: `1024`.
@@ -124,7 +129,7 @@ Validation:
 
 - Type: object
 - Optional
-- `default_wing`: optional string naming the wing used by `mempalace_task_create` when its
+- `default_wing`: optional string naming the wing used by `agentpalace_task_create` when its
   `wing` argument is omitted. The value is canonicalised to `wing_*` form and defaults to
   `wing_local_tasks` when the section or field is absent.
 - A blank, invalid, or reserved `wing_unscoped` value is rejected during config load.
@@ -166,21 +171,21 @@ If `degraded_mode = false`, the configured non-degraded values apply directly.
 
 Supported environment variables:
 
-- `MEMPALACE_PALACE_PATH`
+- `AGENTPALACE_PALACE_PATH`
 - `MEMPAL_PALACE_PATH`
   Legacy alias retained for Python-era compatibility.
-- `MEMPALACE_EMBEDDING_PROFILE`
-- `MEMPALACE_MAINTENANCE_ENABLED`
+- `AGENTPALACE_EMBEDDING_PROFILE`
+- `AGENTPALACE_MAINTENANCE_ENABLED`
   Overrides `maintenance.enabled`. Accepted true values: `1`, `true`, `TRUE`, `yes`, `YES`. Accepted false values: `0`, `false`, `FALSE`, `no`, `NO`. Other values are rejected.
-- `MEMPALACE_MAINTENANCE_BACKGROUND_ENABLED`
-  Overrides `maintenance.background_enabled`. It accepts the same true and false values as `MEMPALACE_MAINTENANCE_ENABLED`.
-- `MEMPALACE_MAINTENANCE_IDLE_SECS`
+- `AGENTPALACE_MAINTENANCE_BACKGROUND_ENABLED`
+  Overrides `maintenance.background_enabled`. It accepts the same true and false values as `AGENTPALACE_MAINTENANCE_ENABLED`.
+- `AGENTPALACE_MAINTENANCE_IDLE_SECS`
   Overrides `maintenance.idle_secs`. Must be a positive integer. Zero is rejected.
-- `MEMPALACE_MAINTENANCE_VERSION_RETENTION_HOURS`
+- `AGENTPALACE_MAINTENANCE_VERSION_RETENTION_HOURS`
   Overrides `maintenance.version_retention_hours`. Must be a positive integer. Zero is rejected.
-- `MEMPALACE_MAINTENANCE_TAIL_THRESHOLD_ROWS`
+- `AGENTPALACE_MAINTENANCE_TAIL_THRESHOLD_ROWS`
   Overrides `maintenance.tail_threshold_rows`. Must be a positive integer. Zero is rejected.
-- `MEMPALACE_MAINTENANCE_SMALL_FRAGMENT_THRESHOLD`
+- `AGENTPALACE_MAINTENANCE_SMALL_FRAGMENT_THRESHOLD`
   Overrides `maintenance.small_fragment_threshold`. Must be a positive integer. Zero is rejected.
 
 Override order:
@@ -197,25 +202,25 @@ counterpart, so they are not part of the override chain above:
 
 | Variable | Read by | Effect |
 |---|---|---|
-| `MEMPALACE_CONFIG_DIR` | `mempalace`, `mempalace serve --stdio` | Overrides the `~/.mempalace` base directory used to resolve `config.json`, `projects.json`, `people_map.json`, and (unless `server.token_file` is set) `server_tokens.json`. Unset or blank preserves today's `~/.mempalace` default. A directory that does not exist is not an error: it resolves the same way a fresh install would, with every file inside it treated as absent until something creates it there. It is independent of `MEMPALACE_PALACE_PATH`/`MEMPAL_PALACE_PATH` above: that variable always wins for the palace path specifically, even when `MEMPALACE_CONFIG_DIR` is also set — but if neither the env var nor `config.json`'s `palace_path` sets the palace explicitly, the default palace path is derived as `<MEMPALACE_CONFIG_DIR>/palace`, so setting only `MEMPALACE_CONFIG_DIR` relocates the palace too. See [Federation.md Part 6](Federation.md#part-6--dev-testing-locally) for the two-palace workflow this unblocks. The value is read with `env::var_os`, not `env::var`, specifically so a value that is a valid OS path but not valid Unicode (only reachable on Unix, where env values are arbitrary bytes) is never silently discarded as unset — that would defeat the isolation this variable exists to provide. When the value is valid UTF-8 it is trimmed and `~`-expanded as described above; a non-UTF-8 value is instead taken as a literal path with no trimming or `~` expansion (neither is defined without assuming a text encoding). |
-| `MEMPALACE_EMBED_ALLOW_DOWNLOADS` | `mempalace`, `mempalace serve --stdio`, `mempalace serve` | Permits downloading missing embedding assets. Offline is the default. |
-| `MEMPALACE_STUB_EMBEDDINGS` | `mempalace serve --stdio`, `mempalace serve` — **only** | Selects a deterministic stub embedding provider for offline dev and testing. |
-| `MEMPALACE_LINEAGE_ID` | `mempalace serve --stdio` — **only** | Binds wake-up and identity packets to a lineage. Model-facing tools cannot override it; a missing bound lineage falls back to the palace default and includes creation guidance in the response. |
-| `MEMPALACE_BUILD_VERSION` | build script | Embeds the calculated release version in both binaries and in `GET /v1/info`. Unset falls back to the workspace package version. See [Release Operations](Release-Operations.md#release-versions). |
-| `MEMPALACE_EMBED_CACHE` | `embedding_bench` / `lme_bench` examples | Overrides the embedding cache root for benchmark runs only. |
-| `MEMPALACE_EMBED_PROFILE`, `MEMPALACE_EMBED_ITERATIONS` | `embedding_bench` example | Benchmark profile selection and iteration count. |
+| `AGENTPALACE_CONFIG_DIR` | `agentpalace`, `agentpalace serve --stdio` | Overrides the `~/.agentpalace` base directory used to resolve `config.json`, `projects.json`, `people_map.json`, and (unless `server.token_file` is set) `server_tokens.json`. Unset or blank preserves today's `~/.agentpalace` default. A directory that does not exist is not an error: it resolves the same way a fresh install would, with every file inside it treated as absent until something creates it there. It is independent of `AGENTPALACE_PALACE_PATH`/`MEMPAL_PALACE_PATH` above: that variable always wins for the palace path specifically, even when `AGENTPALACE_CONFIG_DIR` is also set — but if neither the env var nor `config.json`'s `palace_path` sets the palace explicitly, the default palace path is derived as `<AGENTPALACE_CONFIG_DIR>/palace`, so setting only `AGENTPALACE_CONFIG_DIR` relocates the palace too. See [Federation.md Part 6](Federation.md#part-6--dev-testing-locally) for the two-palace workflow this unblocks. The value is read with `env::var_os`, not `env::var`, specifically so a value that is a valid OS path but not valid Unicode (only reachable on Unix, where env values are arbitrary bytes) is never silently discarded as unset — that would defeat the isolation this variable exists to provide. When the value is valid UTF-8 it is trimmed and `~`-expanded as described above; a non-UTF-8 value is instead taken as a literal path with no trimming or `~` expansion (neither is defined without assuming a text encoding). |
+| `AGENTPALACE_EMBED_ALLOW_DOWNLOADS` | `agentpalace`, `agentpalace serve --stdio`, `agentpalace serve` | Permits downloading missing embedding assets. Offline is the default. |
+| `AGENTPALACE_STUB_EMBEDDINGS` | `agentpalace serve --stdio`, `agentpalace serve` — **only** | Selects a deterministic stub embedding provider for offline dev and testing. |
+| `AGENTPALACE_LINEAGE_ID` | `agentpalace serve --stdio` — **only** | Binds wake-up and identity packets to a lineage. Model-facing tools cannot override it; a missing bound lineage falls back to the palace default and includes creation guidance in the response. |
+| `AGENTPALACE_BUILD_VERSION` | build script | Embeds the calculated release version in both binaries and in `GET /v1/info`. Unset falls back to the workspace package version. See [Release Operations](Release-Operations.md#release-versions). |
+| `AGENTPALACE_EMBED_CACHE` | `embedding_bench` / `lme_bench` examples | Overrides the embedding cache root for benchmark runs only. |
+| `AGENTPALACE_EMBED_PROFILE`, `AGENTPALACE_EMBED_ITERATIONS` | `embedding_bench` example | Benchmark profile selection and iteration count. |
 
 The two embedding flags are parsed by the same helper (`env_flag`) and accept only an
 explicit truthy value — `1`, `true`, `TRUE`, `yes`, `YES`. Every other value is false,
-including `0`, `false`, and the empty string, so `MEMPALACE_STUB_EMBEDDINGS=0` disables stub
+including `0`, `false`, and the empty string, so `AGENTPALACE_STUB_EMBEDDINGS=0` disables stub
 vectors rather than enabling them.
 
-> **`MEMPALACE_STUB_EMBEDDINGS` reaches only the two long-running servers.** The CLI consults
+> **`AGENTPALACE_STUB_EMBEDDINGS` reaches only the two long-running servers.** The CLI consults
 > it inside `serve` alone; `init`, `mine`, and `search` always construct the real
 > `FastembedProvider`, so on a host with no model cache they still fail with missing assets
 > however the variable is set.
 
-> **Don't leave `MEMPALACE_STUB_EMBEDDINGS` set in an environment that expects real
+> **Don't leave `AGENTPALACE_STUB_EMBEDDINGS` set in an environment that expects real
 > embeddings.** Stub vectors are deterministic placeholders and are not comparable with
 > model output, so a palace written while it is enabled returns misleading search results.
 
@@ -223,7 +228,7 @@ vectors rather than enabling them.
 
 Repository-local compatibility path:
 
-- `<project>/mempalace.yaml`
+- `<project>/agentpalace.yaml`
 
 Legacy fallback path accepted by the loader:
 
@@ -231,7 +236,7 @@ Legacy fallback path accepted by the loader:
 
 Repository-local files are optional. The default CLI workflow stores project
 declarations centrally at `<base-dir>/projects.json` (normally
-`~/.mempalace/projects.json`) so clones and worktrees can share one mapping.
+`~/.agentpalace/projects.json`) so clones and worktrees can share one mapping.
 
 The registry is keyed by a normalized Git origin when available and stores the
 wing, room rules, optional federation route, and checkout-path aliases. A
@@ -242,9 +247,9 @@ registry entry has the same project fields as the YAML shape below, plus
 {
   "version": 1,
   "projects": {
-    "github.com/digitumdei/mempalace-rs": {
-      "wing": "wing_mempalace_rs",
-      "checkouts": ["D:/SourceCode/mempalace-rs"],
+    "github.com/digitumdei/agentpalace": {
+      "wing": "wing_agentpalace_rs",
+      "checkouts": ["D:/SourceCode/agentpalace"],
       "rooms": [
         {"name": "crates", "description": "Rust crates", "keywords": ["rust"]}
       ],
@@ -291,7 +296,7 @@ Fields:
 
 ### Project-level routing block
 
-An optional `routing` block in `mempalace.yaml` sets a default route for the wing declared in that file:
+An optional `routing` block in `agentpalace.yaml` sets a default route for the wing declared in that file:
 
 ```yaml
 wing: wing_myproject
@@ -302,7 +307,7 @@ routing:
 ```
 
 - `mode`: `local`, `remote`, or `combined`
-- `remote`: name of a remote defined in `~/.mempalace/config.json` federation.remotes. May be omitted when exactly one remote is configured.
+- `remote`: name of a remote defined in `~/.agentpalace/config.json` federation.remotes. May be omitted when exactly one remote is configured.
 - `write`: `local`, `remote`, or `both`. Only meaningful for `combined` mode. Default: `local`.
   - `both` performs a durable local-first dual-write (issue #127): the local
     write must complete successfully, then replication is **queued** durably in
@@ -314,8 +319,8 @@ routing:
 
 ## Server Config
 
-The optional `server` section of `~/.mempalace/config.json` configures the
-federation HTTP server started by `mempalace serve`.
+The optional `server` section of `~/.agentpalace/config.json` configures the
+federation HTTP server started by `agentpalace serve`.
 
 ### Shape
 
@@ -323,7 +328,7 @@ federation HTTP server started by `mempalace serve`.
 {
   "server": {
     "bind": "127.0.0.1:8765",
-    "token_file": "~/.mempalace/server_tokens.json",
+    "token_file": "~/.agentpalace/server_tokens.json",
     "checkouts": {
       "wing_myproject": "/home/user/repos/myproject",
       "wing_teamdocs":  "/home/user/repos/teamdocs"
@@ -355,7 +360,7 @@ token entries, not a field of `config.json`. Its shape (`token`/`name`/
 #### `server.token_file`
 
 - Type: string (path, `~/`-prefixed strings are expanded)
-- Optional. Default: `~/.mempalace/server_tokens.json`
+- Optional. Default: `~/.agentpalace/server_tokens.json`
 - Each element of the array is a token entry:
   - `token` — string, the bearer secret a client must present.
   - `name` — string, the identity recorded as `added_by` / `ChangeEvent.actor`
@@ -418,11 +423,11 @@ token entries, not a field of `config.json`. Its shape (`token`/`name`/
       `coordination_claim`), `coordination_read` is unaffected, and the file
       itself is never rewritten — the widening happens only in the
       authorization check (`scope_grants` in
-      `crates/mempalace-server/src/lib.rs`), not at load time.
+      `crates/agentpalace-server/src/lib.rs`), not at load time.
     - Validation: an `operations` string outside that enum, or a malformed
       `wings` entry, fails the token file load — same fail-closed behaviour
       as any other malformed reload (see `TokenRegistry` in
-      `crates/mempalace-server/src/lib.rs`). **Unknown keys are also
+      `crates/agentpalace-server/src/lib.rs`). **Unknown keys are also
       rejected** at every level of a token entry (top level and each
       `scopes` grant): since an absent `scopes` field means unrestricted
       access, a typo'd key (`"scope"`, `"scopees"`, a trailing space) would
@@ -450,7 +455,7 @@ token entries, not a field of `config.json`. Its shape (`token`/`name`/
 
 ## Federation Config
 
-The optional `federation` section of `~/.mempalace/config.json` controls routing of wing reads and writes to remote palace servers.
+The optional `federation` section of `~/.agentpalace/config.json` controls routing of wing reads and writes to remote palace servers.
 
 ### Shape
 
@@ -461,7 +466,7 @@ The optional `federation` section of `~/.mempalace/config.json` controls routing
       {
         "name": "work",
         "url": "https://palace.intra.example",
-        "token_env": "MEMPALACE_WORK_TOKEN",
+        "token_env": "AGENTPALACE_WORK_TOKEN",
         "timeout_ms": 5000
       }
     ],
@@ -542,7 +547,7 @@ Validation:
 - `write: both` is a hard config-load error on this table specifically (see Validation Errors
   below) — legal on the corresponding `federation.wings` entry for the same wing, since drawers
   have no multi-master restriction.
-- Used only by `mempalace_task_create`, which is the one coordination write that carries a wing
+- Used only by `agentpalace_task_create`, which is the one coordination write that carries a wing
   in its request. Every other coordination MCP tool acts on an existing record ID with no wing
   in the request and does not consult this table at all — see [Federation → Client-side
   coordination routing](Federation.md#client-side-coordination-routing) for the local-first,
@@ -580,7 +585,7 @@ override layered on top of the other four steps:
    (a read is masked as 404 instead) — see [Federation →
    Troubleshooting](Federation.md#a-coordination-write-returns-422-with-code-unscoped_not_federated).
 2. Explicit per-wing rule in `federation.wings`
-3. Project `mempalace.yaml` `routing` block for the wing declared in that file
+3. Project `agentpalace.yaml` `routing` block for the wing declared in that file
 4. `federation.default_mode`
 5. `local` (hard default when no federation config is present)
 
@@ -591,7 +596,7 @@ The diary hard-override still applies unconditionally at step 1, exactly as abov
 `resolve_route`, `resolve_kg_route`(§`federation.kg`) skips that step entirely, because KG facts
 are entity-scoped and have no wing-shaped diary content to protect in the first place.
 
-The wing `mempalace_task_create` routes on is normalised (via `WingId::normalized`) before either
+The wing `agentpalace_task_create` routes on is normalised (via `WingId::normalized`) before either
 the diary check or the `federation.coordination` lookup runs, so a short or mixed-case spelling
 (`"agents"`, `"Wing_Agents"`, `"myproject"`) is routed exactly as its canonical form
 (`wing_agents`, `wing_myproject`) would be — it cannot slip past the `wing_agents` hard override
@@ -641,7 +646,7 @@ worker delivers asynchronously in the background:
 | `skipped` | No replication was attempted: route is not `write: both`, or the target is diary-local. |
 
 The terminal outcomes of the queued operation are not reported inline; they are
-observed via `mempalace_status` under `replication.backlog` (pending/leased/
+observed via `agentpalace_status` under `replication.backlog` (pending/leased/
 retryable) and `replication.recent_terminal_failures` (authoritative permanent
 rejections such as HTTP 401 or a semantic/content duplicate 409 with a
 different remote `drawer_id`). See

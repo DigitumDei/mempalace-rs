@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Bootstrap a cloud sandbox (Claude Code on the web, or any fresh Ubuntu box)
-# for building and testing the mempalace-rs workspace.
+# for building and testing the agentpalace workspace.
 #
 # Idempotent: safe to re-run, and safe to use as a snapshot/setup script.
 # See docs/Cloud-Environment.md for the firewall allowlist and env vars this
@@ -16,7 +16,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 # 1. System packages.
-#    protobuf-compiler: required by mempalace-storage via lancedb/lance.
+#    protobuf-compiler: required by agentpalace-storage via lancedb/lance.
 #    build-essential:   rusqlite uses the `bundled` feature, so SQLite is
 #                       compiled from source.
 #    libssl-dev:        openssl-sys is not vendored (no openssl-src in

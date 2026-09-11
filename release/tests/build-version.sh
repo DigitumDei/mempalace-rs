@@ -43,7 +43,7 @@ empty_commit() {
 
 build_version() {
     local directory="$1"
-    MEMPALACE_VERSION_REPO="$directory" bash "$version_script"
+    AGENTPALACE_VERSION_REPO="$directory" bash "$version_script"
 }
 
 expect_version() {
@@ -75,8 +75,8 @@ empty_commit "$linear_repo" "first build"
 first_build_commit="$(git -C "$linear_repo" rev-parse HEAD)"
 expect_version "$linear_repo" 1.4.1
 [ "$(
-    MEMPALACE_VERSION_REPO="$linear_repo" \
-        MEMPALACE_VERSION_COMMIT="$first_build_commit" \
+    AGENTPALACE_VERSION_REPO="$linear_repo" \
+        AGENTPALACE_VERSION_COMMIT="$first_build_commit" \
         bash "$version_script"
 )" = 1.4.1 ] || {
     echo "rerunning the same commit changed its version" >&2

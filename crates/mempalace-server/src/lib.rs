@@ -2640,12 +2640,24 @@ async fn validate_ingest_checkout(
     request: &mempalace_federation::IngestPreflightRequest,
 ) -> Result<mempalace_federation::IngestPreflightResponse, ServerError> {
     use mempalace_federation::IngestPreflightResponse;
+    if request.files.len() > MAX_INGEST_FILES {
+        return Err(ServerError::InvalidParams(format!(
+            "files must contain at most {MAX_INGEST_FILES} entries"
+        )));
+    }
     if request.files.is_empty() {
         return Ok(IngestPreflightResponse { checkout_commit: None });
     }
+    let mut paths = std::collections::BTreeSet::new();
     for file in &request.files {
         if let Some(error) = invalid_ingest_relative_path(&file.relative_path) {
             return Err(ServerError::InvalidParams(error));
+        }
+        if !paths.insert(&file.relative_path) {
+            return Err(ServerError::InvalidParams(format!(
+                "duplicate relative_path '{}' in checkout preflight",
+                file.relative_path
+            )));
         }
     }
     let remedy = format!(
@@ -2798,6 +2810,7 @@ where
     // Hold a resumable file's lock through receipt completion. Unrelated sources can
     // progress independently; legacy batches lock one file at a time.
     let _ingest_guard;
+    let mut recovering_committed_ingest = false;
     if let Some(replication) = &body.replication {
         if body.files.len() != 1
             || replication.batch_id.trim().is_empty()
@@ -2837,7 +2850,23 @@ where
                     "ingest record identity was reused with a different request".to_owned(),
                 ));
             }
-            ReceiptOutcome::Fresh(_) | ReceiptOutcome::Recover(_) => {}
+            ReceiptOutcome::Recover(receipt) => {
+                // Resolve the crash-after-commit window while holding the source
+                // lock, before touching checkout bytes. Details establish that a
+                // prior attempt reached application; matching metadata identifies
+                // its committed effect. Fresh/unapplied records still validate.
+                recovering_committed_ingest = receipt.details.is_some()
+                    && !replication.remove
+                    && state
+                        .storage
+                        .operational_store()
+                        .get_ingested_file(&format!(
+                            "projects:{wing_str}:{repo_id_hash}:{}",
+                            body.files[0].relative_path
+                        ))?
+                        .is_some_and(|record| record.content_hash == body.files[0].content_hash);
+            }
+            ReceiptOutcome::Fresh(_) => {}
         }
     }
 
@@ -2860,7 +2889,9 @@ where
             })
             .collect(),
     };
-    validate_ingest_checkout(resolve_root_path.as_deref(), &preflight).await?;
+    if !recovering_committed_ingest {
+        validate_ingest_checkout(resolve_root_path.as_deref(), &preflight).await?;
+    }
     let resolve_root =
         resolve_root_path.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
 
@@ -2945,13 +2976,7 @@ where
                     &replication.record_id,
                     &json!({"previous_ids": previous, "source_key": source_key}),
                 )?;
-            } else if !replication.remove
-                && state
-                    .storage
-                    .operational_store()
-                    .get_ingested_file(&source_key)?
-                    .is_some_and(|record| record.content_hash == file.content_hash)
-            {
+            } else if recovering_committed_ingest {
                 // A prior attempt committed before its receipt. Finish cleanup without
                 // revalidating a checkout that may have changed since that successful write.
                 file_results.push(IngestFileResult {
@@ -8506,6 +8531,152 @@ mod tests {
     }
 
     // ─── 9. Ingest batch ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn checkout_preflight_bounds_entries_before_checkout_io() {
+        let harness = make_harness().await;
+        for (count, repeated, expected) in [
+            (MAX_INGEST_FILES + 1, false, StatusCode::BAD_REQUEST),
+            (2, true, StatusCode::BAD_REQUEST),
+            (MAX_INGEST_FILES, false, StatusCode::CONFLICT),
+        ] {
+            let files: Vec<_> = (0..count)
+                .map(|index| {
+                    json!({
+                        "relative_path":format!("file{}.rs", if repeated {0} else {index}),
+                        "file_hash":"hash"
+                    })
+                })
+                .collect();
+            let response = harness
+                .router
+                .clone()
+                .oneshot(authed_json_request(
+                    Method::POST,
+                    "/v1/ingest/preflight",
+                    ALICE_TOKEN,
+                    json!({"wing":"wing_unmapped", "files":files}),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "count={count}, repeated={repeated}");
+        }
+    }
+
+    #[tokio::test]
+    async fn checkout_recovery_finishes_committed_effect_after_drift() {
+        for (applied, missing) in [(true, false), (true, true), (false, false), (false, true)] {
+            let checkout = TempDir::new().unwrap();
+            let path = checkout.path().join("a.rs");
+            std::fs::write(&path, "original").unwrap();
+            let harness = make_harness_with_checkouts(std::collections::BTreeMap::from([(
+                "wing_checkout".to_owned(),
+                checkout.path().to_path_buf(),
+            )]))
+            .await;
+            let request: IngestBatchRequest = serde_json::from_value(json!({
+                "wing":"wing_checkout", "repo_id":"repo",
+                "replication":{"batch_id":"batch", "record_id":"crash-record"},
+                "files":[{"relative_path":"a.rs", "content_hash":"v1", "file_hash":hash_bytes(b"original"),
+                    "chunks":[{"chunk_index":0,"room":"general","text":"original",
+                        "byte_start":0,"byte_end":8,"line_start":1,"line_end":1}]}]
+            })).unwrap();
+            let source_key = format!("projects:wing_checkout:{}:a.rs", hash_text("repo"));
+            let stale_id = DrawerId::new("stale-recovery-drawer").unwrap();
+            if applied {
+                let mut legacy = request.clone();
+                legacy.replication = None;
+                let response = harness
+                    .router
+                    .clone()
+                    .oneshot(authed_json_request(
+                        Method::POST,
+                        "/v1/ingest/batch",
+                        ALICE_TOKEN,
+                        json!(legacy),
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                // Recreate the crash window: current metadata committed, but an
+                // obsolete drawer remains until receipt completion runs cleanup.
+                let current = harness
+                    .state
+                    .storage
+                    .operational_store()
+                    .committed_drawer_ids_for_source_key(&source_key)
+                    .unwrap();
+                let mut stale = harness
+                    .state
+                    .storage
+                    .drawer_store()
+                    .get_drawer(&current[0])
+                    .await
+                    .unwrap()
+                    .unwrap();
+                stale.id = stale_id.clone();
+                harness
+                    .state
+                    .storage
+                    .drawer_store()
+                    .put_drawers(&[stale], DuplicateStrategy::Error)
+                    .await
+                    .unwrap();
+            }
+            let receipts = harness.state.storage.receipt_store();
+            receipts
+                .begin_receipt(&NewReceipt {
+                    operation_id: "crash-record".to_owned(),
+                    operation_kind: "ingest_file".to_owned(),
+                    request_hash: mutation_request_hash(&[
+                        ("request", json!(&request)),
+                        ("identity", json!("alice")),
+                    ]),
+                    target_id: hash_text("wing_checkout:repo:a.rs"),
+                })
+                .unwrap();
+            receipts.set_receipt_details("crash-record", &json!({
+                "source_key":source_key, "previous_ids":if applied {vec![stale_id.clone()]} else {vec![]}
+            })).unwrap();
+            if missing {
+                std::fs::remove_file(&path).unwrap();
+            } else {
+                std::fs::write(&path, "changed").unwrap();
+            }
+            let response = harness
+                .router
+                .clone()
+                .oneshot(authed_json_request(
+                    Method::POST,
+                    "/v1/ingest/batch",
+                    ALICE_TOKEN,
+                    json!(request),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                if applied { StatusCode::OK } else { StatusCode::CONFLICT }
+            );
+            if applied {
+                assert_eq!(body_json(response).await["files"][0]["status"], "skipped_unchanged");
+                assert!(
+                    harness
+                        .state
+                        .storage
+                        .drawer_store()
+                        .get_drawer(&stale_id)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            assert_eq!(
+                receipts.get_receipt("crash-record").unwrap().unwrap().response.is_some(),
+                applied
+            );
+        }
+    }
 
     #[tokio::test]
     async fn checkout_preflight_detects_commit_drift_and_dirty_bytes() {

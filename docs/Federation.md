@@ -601,6 +601,8 @@ locator-backed batch, `RemoteClient` sends `POST /v1/ingest/preflight` with:
 ```
 
 The endpoint requires the same ingest operation and wing scope as batch ingestion.
+It accepts at most 128 files and rejects duplicate relative paths with HTTP 400
+before checkout I/O; direct batch locator validation uses the same checks.
 It sends no source text and returns `{"checkout_commit":"<HEAD or null>"}` on
 success. When both commits are known they must match; every listed file must also
 match its hash, including on dirty working trees. Git HEAD lookup has a five-second
@@ -612,8 +614,11 @@ the same containment checks as ingestion.
 Older servers without this capability retain their existing client protocol.
 Current servers also validate batches directly, so skipping preflight cannot
 bypass the checkout requirement. Durable records skip client preflight to allow
-receipt replay after checkout drift; the server validates records that still
-need application. Content-only batches and removals need no checkout. Preflight
+receipt replay after checkout drift. Recovery of a write committed before its
+receipt also uses stored receipt details and matching source metadata to finish
+stale-drawer cleanup and receipt completion without reading the changed checkout.
+Records that still need application must validate. Content-only batches and
+removals need no checkout. Preflight
 does not reserve or freeze a directory: later edits can still make locators stale.
 
 Checkouts remain operator-managed in this phase. Automatic fetch and remote-side

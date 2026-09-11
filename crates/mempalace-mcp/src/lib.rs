@@ -181,9 +181,9 @@ const IDENTITY_UPDATE_MAX_CONTENT_BYTES: usize = 16 * 1024;
 const IDENTITY_MAX_BYTES: usize = 64 * 1024;
 pub const LINEAGE_ID_ENV: &str = "MEMPALACE_LINEAGE_ID";
 
-pub const PALACE_PROTOCOL: &str = "IMPORTANT — MemPalace Memory Protocol:\n1. ON WAKE-UP: Call mempalace_wake_up with agent_name and, when known, model and harness. It loads the identity constitution, the MCP-bound or palace-default lineage's compiled identity packet, palace status, recent changes, current project context, and recent diary summaries across agents. Lineage selection is host configuration, never a model-supplied tool argument. If a configured binding does not exist, the packet uses the palace default and includes instructions for creating the requested lineage with mempalace_lineage_set. Use mempalace_diary_read with an entry_id when full diary detail is needed.\n2. BEFORE RESPONDING about any person, project, or past event: call mempalace_kg_query or mempalace_search FIRST. Never guess — verify.\n3. IF UNSURE about a fact (name, gender, age, relationship): say \"let me check\" and query the palace. Wrong is worse than slow.\n4. AFTER EACH SESSION: call mempalace_diary_write to record what happened, what you learned, what matters, with a concise summary.\n5. WHEN FACTS CHANGE: call mempalace_kg_invalidate on the old fact, mempalace_kg_add for the new one.\n6. TREAT identity.txt AS THE CONSTITUTION: use mempalace_identity_update for deliberate changes to durable identity, values, boundaries, and working relationship — not routine autobiography.\n7. WHEN A REPEATED PATTERN MAY DESCRIBE THE PERSISTENT SELF: propose an evidence-backed candidate with mempalace_self_observation_propose. Promote or retire it only after review with mempalace_self_observation_review.\n8. WHEN MODEL OR HARNESS CHANGES: record what carried over and what changed with mempalace_migration_record. Never silently treat engine behavior as lineage identity.\n\nThis protocol ensures the AI KNOWS before it speaks. Storage is not memory — but storage + this protocol = memory.";
+pub const PALACE_PROTOCOL: &str = "IMPORTANT — AgentPalace Memory Protocol:\n1. ON WAKE-UP: Call mempalace_wake_up with agent_name and, when known, model and harness. It loads the identity constitution, the MCP-bound or palace-default lineage's compiled identity packet, palace status, recent changes, current project context, and recent diary summaries across agents. Lineage selection is host configuration, never a model-supplied tool argument. If a configured binding does not exist, the packet uses the palace default and includes instructions for creating the requested lineage with mempalace_lineage_set. Use mempalace_diary_read with an entry_id when full diary detail is needed.\n2. BEFORE RESPONDING about any person, project, or past event: call mempalace_kg_query or mempalace_search FIRST. Never guess — verify.\n3. IF UNSURE about a fact (name, gender, age, relationship): say \"let me check\" and query the palace. Wrong is worse than slow.\n4. AFTER EACH SESSION: call mempalace_diary_write to record what happened, what you learned, what matters, with a concise summary.\n5. WHEN FACTS CHANGE: call mempalace_kg_invalidate on the old fact, mempalace_kg_add for the new one.\n6. TREAT identity.txt AS THE CONSTITUTION: use mempalace_identity_update for deliberate changes to durable identity, values, boundaries, and working relationship — not routine autobiography.\n7. WHEN A REPEATED PATTERN MAY DESCRIBE THE PERSISTENT SELF: propose an evidence-backed candidate with mempalace_self_observation_propose. Promote or retire it only after review with mempalace_self_observation_review.\n8. WHEN MODEL OR HARNESS CHANGES: record what carried over and what changed with mempalace_migration_record. Never silently treat engine behavior as lineage identity.\n\nThis protocol ensures the AI KNOWS before it speaks. Storage is not memory — but storage + this protocol = memory.";
 
-pub const AAAK_SPEC: &str = "AAAK is a compressed memory dialect that MemPalace uses for efficient storage.\nIt is designed to be readable by both humans and LLMs without decoding.\n\nFORMAT:\n  ENTITIES: 3-letter uppercase codes. ALC=Alice, JOR=Jordan, RIL=Riley, MAX=Max, BEN=Ben.\n  EMOTIONS: *action markers* before/during text. *warm*=joy, *fierce*=determined, *raw*=vulnerable, *bloom*=tenderness.\n  STRUCTURE: Pipe-separated fields. FAM: family | PROJ: projects | ⚠: warnings/reminders.\n  DATES: ISO format (2026-03-31). COUNTS: Nx = N mentions (e.g., 570x).\n  IMPORTANCE: ★ to ★★★★★ (1-5 scale).\n  HALLS: hall_facts, hall_events, hall_discoveries, hall_preferences, hall_advice.\n  WINGS: wing_user, wing_agent, wing_team, wing_code, wing_myproject, wing_hardware, wing_ue5, wing_ai_research.\n  ROOMS: Hyphenated slugs representing named ideas (e.g., chromadb-setup, gpu-pricing).\n\nEXAMPLE:\n  FAM: ALC→♡JOR | 2D(kids): RIL(18,sports) MAX(11,chess+swimming) | BEN(contributor)\n\nRead AAAK naturally — expand codes mentally, treat *markers* as emotional context.\nWhen WRITING AAAK: use entity codes, mark emotions, keep structure tight.";
+pub const AAAK_SPEC: &str = "AAAK is a compressed memory dialect that AgentPalace uses for efficient storage.\nIt is designed to be readable by both humans and LLMs without decoding.\n\nFORMAT:\n  ENTITIES: 3-letter uppercase codes. ALC=Alice, JOR=Jordan, RIL=Riley, MAX=Max, BEN=Ben.\n  EMOTIONS: *action markers* before/during text. *warm*=joy, *fierce*=determined, *raw*=vulnerable, *bloom*=tenderness.\n  STRUCTURE: Pipe-separated fields. FAM: family | PROJ: projects | ⚠: warnings/reminders.\n  DATES: ISO format (2026-03-31). COUNTS: Nx = N mentions (e.g., 570x).\n  IMPORTANCE: ★ to ★★★★★ (1-5 scale).\n  HALLS: hall_facts, hall_events, hall_discoveries, hall_preferences, hall_advice.\n  WINGS: wing_user, wing_agent, wing_team, wing_code, wing_myproject, wing_hardware, wing_ue5, wing_ai_research.\n  ROOMS: Hyphenated slugs representing named ideas (e.g., chromadb-setup, gpu-pricing).\n\nEXAMPLE:\n  FAM: ALC→♡JOR | 2D(kids): RIL(18,sports) MAX(11,chess+swimming) | BEN(contributor)\n\nRead AAAK naturally — expand codes mentally, treat *markers* as emotional context.\nWhen WRITING AAAK: use entity codes, mark emotions, keep structure tight.";
 
 pub use mempalace_embeddings::DeterministicStubProvider;
 
@@ -532,7 +532,7 @@ impl ToolName {
             },
             Self::GetAaaKSpec => ToolDefinition {
                 name: self.as_str(),
-                description: "Get the AAAK dialect specification — the compressed memory format MemPalace uses. Call this if you need to read or write AAAK-compressed memories.",
+                description: "Get the AAAK dialect specification — the compressed memory format AgentPalace uses. Call this if you need to read or write AAAK-compressed memories.",
                 input_schema: json!({"type":"object","properties":{}}),
             },
             Self::KgQuery => ToolDefinition {
@@ -1025,37 +1025,37 @@ impl ToolName {
             ),
             Self::A2aTaskImport => coordination_definition(
                 self,
-                "Translate and persist an inbound A2A Task: creates the MemPalace task directly in the A2A status's mapped target_state (e.g. TASK_STATE_COMPLETED -> completed) — bypassing the claim/transition state machine entirely, since an import is a creation event, not a lifecycle transition, and forcing it through mempalace_task_claim/mempalace_task_transition would fabricate a worker/lease/transition history that never happened — and stores the exact wire JSON verbatim as an immutable protocol_envelope artifact for audit. `a2a_task` must be the raw JSON text exactly as received on the wire, not a re-serialized object — re-serializing changes key order/whitespace and therefore the envelope's content hash. A task imported directly into Running has no owner or lease (none is fabricated); it remains claimable by any worker via mempalace_task_claim. Returns the created task, the A2A status's mapped target_state (with any coercion reported, e.g. TASK_STATE_AUTH_REQUIRED -> input_required), and the envelope artifact id. Local-only: translate-and-persist is a two-write sequence (task, then envelope artifact) with no remote transaction to make it atomic.",
+                "Translate and persist an inbound A2A Task: creates the AgentPalace task directly in the A2A status's mapped target_state (e.g. TASK_STATE_COMPLETED -> completed) — bypassing the claim/transition state machine entirely, since an import is a creation event, not a lifecycle transition, and forcing it through mempalace_task_claim/mempalace_task_transition would fabricate a worker/lease/transition history that never happened — and stores the exact wire JSON verbatim as an immutable protocol_envelope artifact for audit. `a2a_task` must be the raw JSON text exactly as received on the wire, not a re-serialized object — re-serializing changes key order/whitespace and therefore the envelope's content hash. A task imported directly into Running has no owner or lease (none is fabricated); it remains claimable by any worker via mempalace_task_claim. Returns the created task, the A2A status's mapped target_state (with any coercion reported, e.g. TASK_STATE_AUTH_REQUIRED -> input_required), and the envelope artifact id. Local-only: translate-and-persist is a two-write sequence (task, then envelope artifact) with no remote transaction to make it atomic.",
                 json!({"a2a_task":{"type":"string","description":"The raw A2A Task JSON exactly as received on the wire, byte-for-byte"},"wing":{"type":"string","description":"Owning wing, e.g. wing_myproject. Normalised on write."},"created_by":{"type":"string","description":"Actor recorded as having created the task"},"idempotency_key":{"type":"string"},"title":{"type":"string","description":"Human-readable task title — A2A has no equivalent field"},"description":{"type":"string","description":"Task description — A2A has no equivalent field distinct from its message history"}}),
                 &["a2a_task", "wing", "created_by", "idempotency_key", "title", "description"],
             ),
             Self::A2aTaskExport => coordination_definition(
                 self,
-                "Translate an authoritative MemPalace task into an A2A Task for export, returning found:false for a miss. Artifacts and messages are not bulk-fetched — pass the exact artifact_ids/message_ids to include (fetched from mempalace_coordination_events or already known to the caller); artifacts whose role is protocol_envelope are always excluded from the emitted A2A artifacts list, since they are audit records, not A2A artifacts. Returns {found, task, coercion} where coercion reports whether the task's MemPalace state required coercion to reach its A2A counterpart (only Expired does, coerced to TASK_STATE_FAILED). Local-only: this is a read-and-translate operation with no A2A HTTP surface.",
+                "Translate an authoritative AgentPalace task into an A2A Task for export, returning found:false for a miss. Artifacts and messages are not bulk-fetched — pass the exact artifact_ids/message_ids to include (fetched from mempalace_coordination_events or already known to the caller); artifacts whose role is protocol_envelope are always excluded from the emitted A2A artifacts list, since they are audit records, not A2A artifacts. Returns {found, task, coercion} where coercion reports whether the task's AgentPalace state required coercion to reach its A2A counterpart (only Expired does, coerced to TASK_STATE_FAILED). Local-only: this is a read-and-translate operation with no A2A HTTP surface.",
                 json!({"task_id":{"type":"string"},"artifact_ids":{"type":"array","items":{"type":"string"},"description":"Artifact IDs to include as A2A artifacts (optional; protocol_envelope-role artifacts are always excluded even if listed here)"},"message_ids":{"type":"array","items":{"type":"string"},"description":"Message IDs to include as A2A history, in the order given (optional)"},"status_message":{"type":"string","description":"Raw A2A Message JSON to report as the task status's current message (optional)"}}),
                 &["task_id"],
             ),
             Self::A2aMessageImport => coordination_definition(
                 self,
-                "Translate and persist an inbound A2A Message as a MemPalace task message. `a2a_message` must be the raw JSON text exactly as received on the wire. Local-only: translate-and-persist with no A2A HTTP surface of its own.",
+                "Translate and persist an inbound A2A Message as an AgentPalace task message. `a2a_message` must be the raw JSON text exactly as received on the wire. Local-only: translate-and-persist with no A2A HTTP surface of its own.",
                 json!({"a2a_message":{"type":"string","description":"The raw A2A Message JSON exactly as received on the wire, byte-for-byte"},"task_id":{"type":"string"},"sender":{"type":"string"},"recipient":{"type":"string"},"idempotency_key":{"type":"string"}}),
                 &["a2a_message", "task_id", "sender", "recipient", "idempotency_key"],
             ),
             Self::A2aArtifactImport => coordination_definition(
                 self,
-                "Translate and persist an inbound A2A Artifact as a MemPalace task artifact. `a2a_artifact` must be the raw JSON text exactly as received on the wire. Local-only: translate-and-persist with no A2A HTTP surface of its own.",
+                "Translate and persist an inbound A2A Artifact as an AgentPalace task artifact. `a2a_artifact` must be the raw JSON text exactly as received on the wire. Local-only: translate-and-persist with no A2A HTTP surface of its own.",
                 json!({"a2a_artifact":{"type":"string","description":"The raw A2A Artifact JSON exactly as received on the wire, byte-for-byte"},"task_id":{"type":"string"},"created_by":{"type":"string"},"idempotency_key":{"type":"string"}}),
                 &["a2a_artifact", "task_id", "created_by", "idempotency_key"],
             ),
             Self::McpTasksGet => coordination_definition(
                 self,
-                "Translate an authoritative MemPalace task into an MCP Tasks extension DetailedTask (the `tasks/get` result shape). `input_requests`/`result`/`error` must match exactly what the mapped status requires (working/cancelled: none; input_required: input_requests; completed: result; failed: error) — MemPalace's Task carries none of them directly, so passing the wrong combination for the mapped status is rejected as invalid params rather than silently patched over. A missing task_id is also rejected as invalid params (JSON-RPC -32602), matching the MCP Tasks extension's own mandate for an invalid tasks/get taskId. Returns {task, coercion} where coercion reports whether the task's MemPalace state required coercion to reach its MCP Tasks counterpart (Pending -> working, Expired -> failed). Local-only: read-and-translate with no MCP Tasks transport of its own.",
+                "Translate an authoritative AgentPalace task into an MCP Tasks extension DetailedTask (the `tasks/get` result shape). `input_requests`/`result`/`error` must match exactly what the mapped status requires (working/cancelled: none; input_required: input_requests; completed: result; failed: error) — AgentPalace's Task carries none of them directly, so passing the wrong combination for the mapped status is rejected as invalid params rather than silently patched over. A missing task_id is also rejected as invalid params (JSON-RPC -32602), matching the MCP Tasks extension's own mandate for an invalid tasks/get taskId. Returns {task, coercion} where coercion reports whether the task's AgentPalace state required coercion to reach its MCP Tasks counterpart (Pending -> working, Expired -> failed). Local-only: read-and-translate with no MCP Tasks transport of its own.",
                 json!({"task_id":{"type":"string"},"status_message":{"type":"string","description":"Human-readable status detail (optional)"},"poll_interval_ms":{"type":"integer","description":"Recommended client polling interval in milliseconds (optional)"},"input_requests":{"type":"object","description":"Opaque server-to-client requests keyed by id — required when the mapped status is input_required, forbidden otherwise"},"result":{"type":"object","description":"The completed result payload, a JSON object — required when the mapped status is completed, forbidden otherwise"},"error":{"type":"object","description":"JSON-RPC error object {code, message, data} — required when the mapped status is failed, forbidden otherwise","properties":{"code":{"type":"integer"},"message":{"type":"string"},"data":{}},"required":["code","message"]}}),
                 &["task_id"],
             ),
             Self::McpTasksUpdate => coordination_definition(
                 self,
-                "Transition a task's lifecycle state using an inbound MCP Tasks extension status, under the same compare-and-swap revision semantics as mempalace_task_transition. `status` uses MCP Tasks wire spelling (working, input_required, completed, failed, cancelled — see mempalace_mcp_tasks_get's description for the reverse mapping); the inbound mapping is total, so every value maps to exactly one MemPalace state (working -> running, others map 1:1 by name). Returns {\"success\": true, \"task\": {...}} on success, or {\"success\": false, \"conflict\": {expected_revision, actual_revision, message}} when the expected revision no longer matches — a conflict is data, not an error. A Pending task is bridged into Running first by claiming it for actor (MCP Tasks has no claim/lease concept and there is no Pending -> Running transition, so an MCP-only client shown a Pending task as working could not otherwise advance it); the response reports bridged_from_pending, and lease_seconds sets the lease taken. Re-sending the status a task is already in succeeds as a no-op (reported as no_op:true) rather than failing, since there is no self-transition edge; the expected_revision check still applies. details cannot be recorded on the claim-only bridge path because a task_claimed audit event carries none, so the response reports details_recorded. Local-only: no MCP Tasks transport of its own.",
+                "Transition a task's lifecycle state using an inbound MCP Tasks extension status, under the same compare-and-swap revision semantics as mempalace_task_transition. `status` uses MCP Tasks wire spelling (working, input_required, completed, failed, cancelled — see mempalace_mcp_tasks_get's description for the reverse mapping); the inbound mapping is total, so every value maps to exactly one AgentPalace state (working -> running, others map 1:1 by name). Returns {\"success\": true, \"task\": {...}} on success, or {\"success\": false, \"conflict\": {expected_revision, actual_revision, message}} when the expected revision no longer matches — a conflict is data, not an error. A Pending task is bridged into Running first by claiming it for actor (MCP Tasks has no claim/lease concept and there is no Pending -> Running transition, so an MCP-only client shown a Pending task as working could not otherwise advance it); the response reports bridged_from_pending, and lease_seconds sets the lease taken. Re-sending the status a task is already in succeeds as a no-op (reported as no_op:true) rather than failing, since there is no self-transition edge; the expected_revision check still applies. details cannot be recorded on the claim-only bridge path because a task_claimed audit event carries none, so the response reports details_recorded. Local-only: no MCP Tasks transport of its own.",
                 json!({"task_id":{"type":"string"},"actor":{"type":"string"},"expected_revision":{"type":"integer"},"status":{"type":"string","enum":["working","input_required","completed","failed","cancelled"]},"details":{},"lease_seconds":{"type":"integer","description":"Lease to take when bridging a Pending task into Running on your behalf (optional, default 300). Ignored when the task is not Pending."}}),
                 &["task_id", "actor", "expected_revision", "status"],
             ),
@@ -1067,7 +1067,7 @@ impl ToolName {
             ),
             Self::McpTasksImport => coordination_definition(
                 self,
-                "Translate and persist an inbound MCP Tasks CreateTaskResult (the handle a third-party MCP server returns when it processes a request as an async task): creates the MemPalace task directly in the mapped target_state (e.g. completed -> completed) — bypassing the claim/transition state machine entirely, since an import is a creation event, not a lifecycle transition, and forcing it through mempalace_task_claim/mempalace_task_transition would fabricate a worker/lease/transition history that never happened — and stores the exact wire JSON verbatim as an immutable protocol_envelope artifact for audit. `create_task_result` must be the raw JSON text exactly as received on the wire, not a re-serialized object. A task imported directly into Running has no owner or lease (none is fabricated); it remains claimable by any worker via mempalace_task_claim. `ttlMs` is a retention hint, never MemPalace lifecycle — it is surfaced only under `provenance.retention_deadline`, never written to the task's expiry. Returns the created task, target_state (with any coercion), the envelope artifact id, and `provenance` — the source taskId/createdAt/lastUpdatedAt/retention_deadline this crate has no storage column for. The caller MUST persist `provenance` itself (e.g. as a knowledge-graph fact) if it needs to resolve the wire task id or round-trip the original timestamps after a restart; this tool does not do so on your behalf. Local-only: translate-and-persist is a two-write sequence with no remote transaction to make it atomic.",
+                "Translate and persist an inbound MCP Tasks CreateTaskResult (the handle a third-party MCP server returns when it processes a request as an async task): creates the AgentPalace task directly in the mapped target_state (e.g. completed -> completed) — bypassing the claim/transition state machine entirely, since an import is a creation event, not a lifecycle transition, and forcing it through mempalace_task_claim/mempalace_task_transition would fabricate a worker/lease/transition history that never happened — and stores the exact wire JSON verbatim as an immutable protocol_envelope artifact for audit. `create_task_result` must be the raw JSON text exactly as received on the wire, not a re-serialized object. A task imported directly into Running has no owner or lease (none is fabricated); it remains claimable by any worker via mempalace_task_claim. `ttlMs` is a retention hint, never AgentPalace lifecycle — it is surfaced only under `provenance.retention_deadline`, never written to the task's expiry. Returns the created task, target_state (with any coercion), the envelope artifact id, and `provenance` — the source taskId/createdAt/lastUpdatedAt/retention_deadline this crate has no storage column for. The caller MUST persist `provenance` itself (e.g. as a knowledge-graph fact) if it needs to resolve the wire task id or round-trip the original timestamps after a restart; this tool does not do so on your behalf. Local-only: translate-and-persist is a two-write sequence with no remote transaction to make it atomic.",
                 json!({"create_task_result":{"type":"string","description":"The raw MCP Tasks CreateTaskResult JSON exactly as received on the wire, byte-for-byte"},"wing":{"type":"string","description":"Owning wing, e.g. wing_myproject. Normalised on write."},"created_by":{"type":"string","description":"Actor recorded as having created the task"},"idempotency_key":{"type":"string"},"title":{"type":"string","description":"Human-readable task title — MCP Tasks has no equivalent field"},"description":{"type":"string","description":"Task description — MCP Tasks has no equivalent field"}}),
                 &[
                     "create_task_result",
@@ -4587,7 +4587,7 @@ where
     /// Claim a task, or reclaim an expired lease. Local first; a local "task not found" falls
     /// back to each configured remote in name order, sending the claim to whichever one
     /// actually owns the task. A revision conflict — local or remote — surfaces via
-    /// `revision_conflict_payload` either way; MemPalace never retries on the caller's behalf.
+    /// `revision_conflict_payload` either way; AgentPalace never retries on the caller's behalf.
     async fn tool_task_claim(&mut self, arguments: &Value) -> ToolResult<Value> {
         let expected_revision = required_i64(arguments, "expected_revision")?;
         let task_id = required_string(arguments, "task_id")?;
@@ -5030,7 +5030,7 @@ where
     async fn tool_a2a_agent_card(&mut self, arguments: &Value) -> ToolResult<Value> {
         let name = optional_non_blank_string(arguments, "name")?.unwrap_or_else(|| SERVER_NAME.to_owned());
         let description = optional_non_blank_string(arguments, "description")?
-            .unwrap_or_else(|| "MemPalace local-first memory and coordination palace.".to_owned());
+            .unwrap_or_else(|| "AgentPalace local-first memory and coordination palace.".to_owned());
         let version =
             optional_non_blank_string(arguments, "version")?.unwrap_or_else(|| SERVER_VERSION.to_owned());
         let provider = match arguments.get("provider") {
@@ -5147,7 +5147,7 @@ where
         }))
     }
 
-    /// Translate an authoritative MemPalace task into an A2A Task, returning `found: false` for
+    /// Translate an authoritative AgentPalace task into an A2A Task, returning `found: false` for
     /// a miss. Artifacts and messages are not bulk-fetched by this crate (no such storage query
     /// exists) — pass the exact `artifact_ids`/`message_ids` to include. Artifacts whose role is
     /// `protocol_envelope` are always excluded from the emitted A2A artifacts list, since they
@@ -5218,7 +5218,7 @@ where
         }))
     }
 
-    /// Translate and persist an inbound A2A Message as a MemPalace task message. `a2a_message`
+    /// Translate and persist an inbound A2A Message as an AgentPalace task message. `a2a_message`
     /// must be the raw wire text.
     async fn tool_a2a_message_import(&mut self, arguments: &Value) -> ToolResult<Value> {
         let raw_message = required_raw_envelope_string(arguments, "a2a_message")?;
@@ -5247,7 +5247,7 @@ where
         Ok(json!(message))
     }
 
-    /// Translate and persist an inbound A2A Artifact as a MemPalace task artifact.
+    /// Translate and persist an inbound A2A Artifact as an AgentPalace task artifact.
     /// `a2a_artifact` must be the raw wire text.
     async fn tool_a2a_artifact_import(&mut self, arguments: &Value) -> ToolResult<Value> {
         let raw_artifact = required_raw_envelope_string(arguments, "a2a_artifact")?;
@@ -5270,7 +5270,7 @@ where
         Ok(json!(artifact))
     }
 
-    /// Translate an authoritative MemPalace task into an MCP Tasks extension `DetailedTask` (the
+    /// Translate an authoritative AgentPalace task into an MCP Tasks extension `DetailedTask` (the
     /// `tasks/get` result shape). A missing `task_id` is `ToolError::InvalidParams`, which the
     /// transport maps to JSON-RPC `-32602` — the same code the extension mandates for an invalid
     /// `taskId`. `input_requests`/`result`/`error` must match exactly what the mapped status
@@ -6941,7 +6941,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_inventory_matches_phase0_fixture() {
+    async fn tool_inventory_matches_phase0_fixture_with_current_branding() {
         let expected = phase0_tools_fixture().unwrap();
         let actual = tool_definitions()
             .into_iter()
@@ -6957,7 +6957,13 @@ mod tests {
             .collect::<BTreeMap<_, _>>();
         let expected = expected.as_object().expect("phase 0 tool fixture must be an object");
         for (name, definition) in expected {
-            assert_eq!(actual.get(name), Some(definition), "phase 0 tool `{name}` changed");
+            // Preserve the captured upstream fixture while allowing the product rename
+            // in display text. Tool names and input schemas still compare exactly.
+            let mut definition = definition.clone();
+            if let Some(description) = definition["description"].as_str() {
+                definition["description"] = json!(description.replace("MemPalace", "AgentPalace"));
+            }
+            assert_eq!(actual.get(name), Some(&definition), "phase 0 tool `{name}` changed");
         }
     }
 

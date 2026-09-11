@@ -1,14 +1,14 @@
-# Driving external coding agents through MemPalace tasks
+# Driving external coding agents through AgentPalace tasks
 
-MemPalace coordination is a durable control plane, not a process scheduler. A task can describe,
+AgentPalace coordination is a durable control plane, not a process scheduler. A task can describe,
 lease, audit, and preserve delegated work across restarts, but creating or assigning a task does
 not start OpenCode (or any other coding harness). A supervisor or human must still launch the
 worker. One practical bridge is to invoke OpenCode's CLI in the intended worktree and tell it to
-claim one exact MemPalace task:
+claim one exact AgentPalace task:
 
 ```powershell
 opencode run --agent build --format json `
-  "Use the MemPalace task system. Read task <task-id> and assignment message <message-id>. `
+  "Use the AgentPalace task system. Read task <task-id> and assignment message <message-id>. `
   Claim it as agent opencode, implement only its bounded ownership, run its checks, publish a `
   result, and transition it to input_required for senior review. Do not commit or push."
 ```
@@ -41,7 +41,7 @@ in parallel, but the supervisor still owns integration and full-workspace verifi
 - **Assignment does not wake a worker.** A pending task and addressed message remain passive until
   a human, scheduler, or supervising agent launches the target harness.
 - **Terminal state is durable; terminal sessions are not.** A Codex/OpenCode restart loses the
-  local process handle and streamed output, while the MemPalace task, messages, result, and diary
+  local process handle and streamed output, while the AgentPalace task, messages, result, and diary
   survive. Resume by rereading task state, not by assuming the old terminal still represents it.
 - **The desktop UI may hide a live child process.** A CLI process launched from a tool call may
   continue running even when no background-process indicator is visible. In one observed run, the
@@ -77,7 +77,7 @@ in parallel, but the supervisor still owns integration and full-workspace verifi
   can receive a very large historical inbox; CLI JSON output may be truncated and distract from
   the current assignment. Prefer exact message retrieval plus a task-scoped or recent inbox read.
 - **Streaming JSON is useful but too verbose as the system of record.** Tool traces can overwhelm
-  terminal output limits. Treat them as progress telemetry; the concise MemPalace result and task
+  terminal output limits. Treat them as progress telemetry; the concise AgentPalace result and task
   transition are the durable completion report.
 - **Leases need an execution policy.** A long run must renew its task lease before expiry. The
   task store records the lease, but the CLI bridge currently relies on prompting the worker to
@@ -110,7 +110,7 @@ threshold; never use implicit `--continue` when concurrent sessions or worktrees
 
 The more robust bridge is a persistent `opencode serve` process per worker/project. Health-check
 it, subscribe to its event stream before prompting, use session status/messages as the OpenCode
-completion signal, and use its abort endpoint for cancellation. MemPalace result/task state remains
+completion signal, and use its abort endpoint for cancellation. AgentPalace result/task state remains
 the workflow completion signal. On Windows, preflight the OpenCode data/log directory, redirect
 long-lived child stdout/stderr, retain the wrapper PID, and avoid relying on inherited terminal
 pipes or the desktop background-process indicator.

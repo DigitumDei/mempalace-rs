@@ -1,6 +1,6 @@
 [package]
 name = "mempalace-remote"
-description = "HTTP client for the MemPalace federation REST API."
+description = "HTTP client for the AgentPalace federation REST API."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

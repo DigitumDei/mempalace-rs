@@ -1,6 +1,7 @@
 # Documentation
 
-This directory documents the Rust release surface that exists in `mempalace-rs/` today.
+This directory documents the current AgentPalace release surface. Existing `mempalace`
+commands and configuration names remain supported; see the [rename compatibility note](../README.md#existing-installations).
 
 ### Getting started
 

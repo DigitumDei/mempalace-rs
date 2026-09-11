@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Federation HTTP server exposing a MemPalace palace over REST with bearer-token auth."
+description = "Federation HTTP server exposing an AgentPalace palace over REST with bearer-token auth."
 
 [dependencies]
 mempalace-config = { path = "../mempalace-config" }

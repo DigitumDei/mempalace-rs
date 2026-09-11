@@ -319,7 +319,7 @@ visible in the hub's stderr output and can be ingested by any
 
 For a palace that has accumulated significant fragmentation or version
 data before the maintenance subsystem was introduced (e.g. upgrading
-from an older MemPalace release), the recommended procedure is:
+from an older AgentPalace release), the recommended procedure is:
 
 1. **Back up** the palace root (`storage.sqlite3` and `lancedb/`
    together) before running maintenance, in case of unexpected issues.

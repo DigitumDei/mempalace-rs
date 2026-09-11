@@ -1,6 +1,6 @@
 # Quickstart
 
-Get MemPalace running and connected to your AI in a few minutes.
+Get AgentPalace running and connected to your AI in a few minutes.
 
 ## 1. Install
 
@@ -9,13 +9,13 @@ The installer downloads the latest stable binaries for your platform, verifies t
 **macOS (Apple Silicon) / Linux (x86_64, glibc 2.38+):**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/DigitumDei/mempalace-rs/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/DigitumDei/agentpalace/main/install.sh | sh
 ```
 
 **Windows (x86_64, PowerShell 7.1+):**
 
 ```powershell
-irm https://raw.githubusercontent.com/DigitumDei/mempalace-rs/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/DigitumDei/agentpalace/main/install.ps1 | iex
 ```
 
 Options:

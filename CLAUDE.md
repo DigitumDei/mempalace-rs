@@ -1,7 +1,8 @@
-# mempalace-rs — instructions for Claude
+# AgentPalace — instructions for Claude
 
-A Rust workspace of 16 crates implementing MemPalace, a local-first memory store for LLM
-agents.
+A Rust workspace of 16 crates implementing AgentPalace, local-first memory, continuity,
+and coordination for AI agents. Existing `mempalace` commands, crate names, MCP tool
+names, environment variables, and storage paths are compatibility contracts.
 
 **The invariant to protect:** memory never leaves the user's control by default. Embeddings,
 search, and the knowledge graph run locally — no third-party model or inference APIs, no

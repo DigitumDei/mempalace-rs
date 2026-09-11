@@ -1,6 +1,6 @@
 # Self-Continuity Across Models
 
-MemPalace can preserve a coherent agent self while the model or harness changes. It does this
+AgentPalace can preserve a coherent agent self while the model or harness changes. It does this
 without pretending that every engine behaves identically and without letting a single session
 silently rewrite identity.
 

@@ -1,6 +1,6 @@
 [CmdletBinding(SupportsShouldProcess)]
 param(
-    [string]$Repository = 'DigitumDei/mempalace-rs',
+    [string]$Repository = 'DigitumDei/agentpalace',
     [Parameter(Mandatory)]
     [string]$Reviewer,
     [Parameter(Mandatory)]

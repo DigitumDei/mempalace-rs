@@ -120,7 +120,7 @@ Full flag reference: [CLI Surface](CLI-Surface.md).
 - `mempalace_mcp_tasks_import`
 
 The nine protocol-adapter tools (`mempalace_a2a_*`, `mempalace_mcp_tasks_*`) translate between
-MemPalace coordination records and the A2A and `io.modelcontextprotocol/tasks` wire models
+AgentPalace coordination records and the A2A and `io.modelcontextprotocol/tasks` wire models
 (issue #102 Stages 9-10). They are all local-only: the import tools translate *and* persist,
 which is a two-write sequence (the record, then the raw wire envelope stored as a
 `protocol_envelope` artifact) with no remote transaction available to make it atomic, so no

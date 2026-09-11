@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# MemPalace installer — downloads the stable build for this platform, verifies
+# AgentPalace installer — downloads the stable build for this platform, verifies
 # its signed manifest and checksums, installs to ~/.mempalace/bin, registers the MCP
 # server with detected AI tools, and warms the embedding model.
 #
-#   curl -fsSL https://raw.githubusercontent.com/DigitumDei/mempalace-rs/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/DigitumDei/agentpalace/main/install.sh | sh
 #
 # Options (pass via `sh -s -- <flags>` when piping):
 #   --no-setup           skip `mempalace setup` (MCP registration + embedding-model warm-up)
@@ -14,7 +14,7 @@
 
 set -eu
 
-REPO="DigitumDei/mempalace-rs"
+REPO="DigitumDei/agentpalace"
 INSTALL_DIR="${HOME}/.mempalace/bin"
 RUN_SETUP=1
 UPDATE_PATH=1
@@ -42,7 +42,7 @@ while [ $# -gt 0 ]; do
             ;;
         -h|--help)
             cat <<'EOF'
-MemPalace installer — downloads the stable build for this platform, verifies
+AgentPalace installer — downloads the stable build for this platform, verifies
 its signed manifest and checksums, installs to ~/.mempalace/bin, registers the MCP
 server with detected AI tools, and warms the embedding model.
 
@@ -142,7 +142,7 @@ dJDS7qZOD9CIIsZX+6HOd48CAwEAAQ==
 -----END PUBLIC KEY-----
 EOF
 
-echo "Downloading MemPalace ${CHANNEL} (${PLATFORM})..."
+echo "Downloading AgentPalace ${CHANNEL} (${PLATFORM})..."
 download_release_asset() {
     asset="$1"
     if ! fetch "${RELEASE_URL}/${asset}" "${TMP_DIR}/${asset}"; then
@@ -264,7 +264,7 @@ if [ "${UPDATE_PATH}" -eq 1 ]; then
         if [ -f "${RC_FILE}" ] && grep -q '\.mempalace/bin' "${RC_FILE}"; then
             : # already on PATH via rc file
         else
-            printf '\n# Added by the MemPalace installer\nexport PATH="%s:$PATH"\n' "${INSTALL_DIR}" >> "${RC_FILE}"
+            printf '\n# Added by the AgentPalace installer\nexport PATH="%s:$PATH"\n' "${INSTALL_DIR}" >> "${RC_FILE}"
             echo "Added ${INSTALL_DIR} to PATH in ${RC_FILE} — restart your shell to pick it up."
         fi
     fi
@@ -294,7 +294,7 @@ fi
 
 cat <<EOF
 
-MemPalace is installed. Next steps:
+AgentPalace is installed. Next steps:
   mempalace init /path/to/your/project    # create a palace for a project
   mempalace mine /path/to/your/project    # ingest its files
 

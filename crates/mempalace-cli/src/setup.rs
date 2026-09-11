@@ -99,7 +99,7 @@ impl SetupReport {
         let width = 55;
         let mut lines = vec![
             format!("\n{}", "=".repeat(width)),
-            "  MemPalace setup".to_owned(),
+            "  AgentPalace setup".to_owned(),
             "=".repeat(width),
             format!("  MCP server: {}", self.mcp_path.display()),
         ];
@@ -945,7 +945,7 @@ mod tests {
             ],
         };
         let text = report.render();
-        assert!(text.contains("MemPalace setup"));
+        assert!(text.contains("AgentPalace setup"));
         assert!(text.contains("binary not found"));
         assert!(text.contains("claude"));
         assert!(text.contains("dry run"));

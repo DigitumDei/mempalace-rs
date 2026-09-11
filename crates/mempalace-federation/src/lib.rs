@@ -414,6 +414,9 @@ pub struct ChangeEventDto {
 /// converge on identical drawer ids.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct IngestBatchRequest {
+    /// Durable single-record identity. Absent for legacy synchronous batches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replication: Option<IngestReplicationIdentity>,
     /// Target wing name (will be normalized server-side).
     pub wing: String,
     /// Machine-independent repository identity (normalized remote-URL or fallback).
@@ -426,6 +429,18 @@ pub struct IngestBatchRequest {
     pub commit_hash: Option<String>,
     /// Files included in this batch.
     pub files: Vec<IngestFileDto>,
+}
+
+/// Stable identities for resumable canonical mining.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IngestReplicationIdentity {
+    /// Mine invocation shared by all its file records.
+    pub batch_id: String,
+    /// Stable idempotency key for this record, unchanged by retries.
+    pub record_id: String,
+    /// Explicit removal of this source, with an empty chunk list.
+    #[serde(default)]
+    pub remove: bool,
 }
 
 /// A single file's chunks within an [`IngestBatchRequest`].
@@ -488,7 +503,8 @@ pub struct IngestBatchResponse {
 pub struct IngestFileResult {
     /// Repository-root-relative path, echoed from the request.
     pub relative_path: String,
-    /// `"ingested"` | `"skipped_unchanged"` | `"failed"`.
+    /// `"ingested"` | `"skipped_unchanged"` | `"failed"`; resumable records also use
+    /// `"removed"` and `"retryable"`.
     pub status: String,
     /// Number of drawers written (0 for skipped or failed files).
     #[serde(default)]
@@ -1306,6 +1322,7 @@ mod tests {
     #[test]
     fn ingest_batch_request_round_trips() {
         let original = IngestBatchRequest {
+            replication: None,
             wing: "wing_myproject".to_owned(),
             repo_id: "github.com/acme/myrepo".to_owned(),
             agent: Some("claude".to_owned()),

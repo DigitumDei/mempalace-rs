@@ -8,6 +8,7 @@ mod lance;
 mod maintenance;
 mod outbox;
 mod receipt;
+mod replicated_ingest;
 mod skills;
 mod sqlite;
 mod types;
@@ -45,6 +46,7 @@ pub use receipt::{
     RECEIPT_KIND_DRAWER_DELETE, RECEIPT_KIND_KG_ADD, RECEIPT_KIND_KG_INVALIDATE, ReceiptOutcome,
     ReceiptState,
 };
+pub use replicated_ingest::ReplicatedSource;
 pub use skills::{
     NewSkill, NewSkillOutcome, Skill, SkillOutcome, SkillOutcomeResult, SkillReview, SkillScope,
     SkillStatus, SkillStore,

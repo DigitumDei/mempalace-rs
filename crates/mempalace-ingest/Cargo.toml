@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+uuid = { version = "1.18.1", features = ["v4"] }
 mempalace-core = { path = "../mempalace-core" }
 mempalace-config = { path = "../mempalace-config" }
 mempalace-embeddings = { path = "../mempalace-embeddings" }

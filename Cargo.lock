@@ -4051,6 +4051,7 @@ dependencies = [
  "thiserror 2.0.18",
  "time",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -4164,6 +4165,7 @@ dependencies = [
  "arrow-schema",
  "async-trait",
  "blake3",
+ "fs4",
  "futures",
  "lancedb",
  "mempalace-core",

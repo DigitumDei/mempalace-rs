@@ -418,6 +418,15 @@ worker delivers it to the remote with a stable `operation_id`. Because the
 outbox lives in the same SQLite file as the palace schema, operator backup and
 recovery guidance above applies to it unchanged.
 
+Canonical `mine` with `write: both` uses this worker too (issue #131). Each file's
+exact remote payload and local recovery snapshot are staged before local replacement.
+The foreground mine makes no remote calls. Start `mempalace serve` or
+`mempalace serve --stdio` with the same palace and federation configuration to deliver it. Restarting
+finishes staged local effects from durable snapshots, then resumes unacknowledged remote
+records. Files not yet staged when a process crashes require another mine. Keep SQLite,
+LanceDB, the outbox and receipts in the same consistent palace backup; snapshots retain
+prepared content and embeddings. Do not delete `ingest-locks/` files while processes run.
+
 Observe the replication pipeline through `mempalace_status` (and the status
 embedded in `mempalace_wake_up`):
 
@@ -429,6 +438,11 @@ embedded in `mempalace_wake_up`):
   authoritative permanent error (e.g. HTTP 401, or a semantic/content duplicate
   with a different remote `drawer_id`). Each entry carries the `operation_id`,
   remote, mutation kind, attempt count, and `last_error`.
+- `replication.ingestion` — pending/retryable/failed/total batch counts, per-file state
+  counts, oldest pending timestamp and `oldest_pending_age_seconds`. A partially failed
+  batch can also be pending. Terminal entries additionally identify the batch, record
+  and source path. Fix terminal rejection, then run a fresh mine; for outages, simply
+  restore the remote and leave the worker running. Do not clear receipts or the outbox.
 - `replication.phase_metrics` — per-phase latency aggregates
   (`duplicate_search`, `embedding`, `commit`, `outbox_wait`,
   `delivery_attempt`, `remote_acknowledge`) with count/last/total/max/avg
@@ -445,7 +459,7 @@ Operational rules:
   identity conflict the receiver would repeat on every retry). Resubmitting the
   tool call unchanged will reproduce the same terminal result. Investigate the
   `last_error` instead.
-- On restart, startup reconciliation settles intents whose local mutation never
+- For MCP drawer/KG intents, startup reconciliation settles intents whose local mutation never
   committed: committed mutations are activated and delivered, uncommitted
   intents are cancelled. Uncommitted intents younger than a five-minute
   ownership grace period (measured against each row's durable `created_at`) are

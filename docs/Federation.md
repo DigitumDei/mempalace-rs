@@ -34,7 +34,7 @@ it all locally for dev testing.
   - `local` — writes go to the local palace only (default).
   - `remote` — writes go to the remote palace only.
   - `both` — **local-first dual-write**: the local write must complete
-    successfully before a best-effort remote replication is attempted. Remote
+    successfully with a durable replication intent for asynchronous delivery. Remote
     failure does not roll back the local write or change the success result;
     the outcome of the remote leg is reported as a `replication` field on the
     response.
@@ -571,38 +571,70 @@ a purely local concept — see [Part 4](#part-4--branch-aware-mining).
 - Remote unreachable (and mode is `remote` or `combined` with `write: remote`)
   → explicit error, no local fallback.
 - Remote unreachable during `write: both` replication → local mine succeeds;
-   the mine output appends `Remote replication: failed — <reason>` as a text
-   line (not JSON) without rolling back the local mine.
+   the mine output reports a durable queue entry. The worker retries after recovery.
 - A bad single file → reported `failed` in the 200 response body; the rest of the
    batch still commits.
 - Diary-shaped wing/room → rejected with HTTP 422.
 
-> **Batch-ingest replication is synchronous, not durable (known gap — issue #127).
-> ** The MCP tool paths (`mempalace_add_drawer`, `mempalace_delete_drawer`,
-> `mempalace_kg_add`, `mempalace_kg_invalidate`) route `write: both` through the
-> durable replication outbox described in Part 2. **`mempalace mine` does not.**
-> Its `write: both` leg still pushes prepared files to `/v1/ingest/batch` inline and
-> best-effort, with no outbox intent and no replay identity: a crash mid-push can
-> leave the local mine committed and part of the remote batch unapplied, and a retry
-> is not resumable. Because issue #127's acceptance required either durable/resumable
-> batch semantics *or* a clearly identified linked follow-up, this gap is intentionally
-> tracked as its own issue rather than silently absorbed into the MCP-only outbox work.
->
-> **Tracked follow-up:** [issue #131](https://github.com/DigitumDei/mempalace-rs/issues/131)
-> carries the durable, resumable batch-ingest work split from issue #127:
->
-> - **Title:** `Durable resumable batch-ingest replication for write: both (issue #127 follow-up)`
-> - **Body:** `mempalace mine` currently replicates `write: both` batches to
->   `POST /v1/ingest/batch` inline and best-effort. Make it durable and resumable on
->   the same outbox as the MCP tool paths: stage a batch-ingest intent (with a stable
->   batch id and per-file manifest) before local commit, deliver via the background
->   worker with bounded backoff, record terminal per-file failures in the outbox, and
->   make a retried mine resume the partially-applied batch instead of resending whole
->   files. Acceptance: a crash mid-push is reconciled at next start; a retry never
->   double-applies an already-replicated file; status exposes the pending/retryable/
->   failed batch count.`
-> Creating and linking issue #131 satisfies issue #127's explicit split-follow-up
-> requirement; implementation of the batch-specific guarantees remains scoped to #131.
+### Durable canonical mining (`write: both`)
+
+Each mine invocation gets a stable batch ID. Each prepared file gets a stable record ID,
+stored with its exact chunk payload and local recovery snapshot in `replication_outbox`
+before the local source replacement starts. After local commit and stale-drawer cleanup,
+the record becomes pending. The CLI reports `Remote replication: durably queued` and the
+batch ID; it makes no network requests on this path. A local staging/storage error fails
+the command; previously staged files remain recoverable. A crash before a file is staged
+requires another mine to discover that file. A mine is not one atomic repository snapshot.
+
+An unchanged re-mine retains the existing record and its retry state instead of staging
+another copy. If nothing new is staged, the CLI reports `no new records; existing queue retained`
+without claiming a new durable batch.
+
+Keep `mempalace serve` (HTTP or `--stdio`) running against the same palace and federation
+configuration for delivery. Startup and periodic reconciliation finish staged local file
+effects from their saved snapshots, without reading a changed or missing checkout. Recovery
+and foreground ingestion use process-safe source locks. Lock files under `ingest-locks/`
+are retained; their existence does not mean a process holds a lock.
+
+The existing replication worker sends one file record per request. Individual durable
+acknowledgements mean a partially delivered batch resumes only its unfinished records.
+Retries use bounded exponential backoff and jitter, indefinitely for transport and transient
+failures. Pending updates and removals for the same destination/repository/wing/path remain
+in insertion order within the originating palace. Independent clients do not share a global
+ordering clock.
+
+The receiver advertises `resumable_ingest` and accepts optional request metadata:
+
+```json
+"replication": {"batch_id": "batch_...", "record_id": "ingest_...", "remove": false}
+```
+
+When present, `files` must contain exactly one record. IDs must be nonempty and at most
+256 bytes. `remove: true` requires empty chunks and removes the source's drawers and
+manifest. An empty replacement with `remove: false` retains an empty source manifest.
+Receipts bind the record ID to the full request and authenticated identity: identical replay
+returns the saved response, even after newer updates; changed payload/identity yields 409.
+Pending receipts preserve old drawer IDs so interrupted cleanup also resumes. Legacy
+requests without this metadata retain synchronous bulk behavior and require nonempty chunks.
+
+Per-file outcomes include `ingested`, `skipped_unchanged`, `removed`, `failed`, and
+`retryable`. Validation rejection is terminal; storage/embedding failures are retryable.
+Unsupported capabilities and permanent HTTP rejection become inspectable terminal state.
+After correcting a terminal problem, run a fresh mine to create new record identities.
+Successful old records need no manual replay. Never delete the outbox or receipts to retry.
+
+`mempalace_status` and wake-up expose `replication.ingestion`: distinct pending, retryable,
+failed and total batch counts, per-file state counts, oldest pending timestamp and age in
+seconds. Pending includes staged, leased and retrying work; a batch with both unfinished
+and rejected files counts as both pending and failed. Recent terminal failures include
+batch ID, record ID and source path. Existing delivery phase metrics include these records.
+
+Unlimited, complete canonical discovery also journals removals of previously mined local
+sources that are no longer eligible. Limited or incomplete discovery does not sweep. This
+does not delete remote-only historical files absent from the local manifest. Branch-view
+and conversation mining remain local. `--batch-size` still controls local embedding batches;
+durable delivery always acknowledges one file at a time. Recovery snapshots include prepared
+content and embeddings and increase SQLite backup size; retain the full palace backup.
 
 ## Part 4 — Branch-aware mining
 
@@ -683,7 +715,7 @@ This is the intended end state of federation + locator storage + branch mining:
    not double-counted. Pass `view: "<branch>"` to compose the local branch delta
    over the canonical index; without it, search returns canonical rows only.
 4. With `write: both`, any additional writes (e.g. authored drawers or
-   knowledge-graph facts) land in the local palace and are best-effort
+   knowledge-graph facts) land in the local palace and are durably
    replicated to the shared remote, keeping both sides in sync without blocking
    the local workflow.
 

@@ -1614,6 +1614,7 @@ where
     /// [`STAGED_INTENT_RECONCILIATION_GRACE`], so a second process starting mid-write cannot
     /// cancel work the originating process is still applying.
     async fn reconcile_staged_replication(&mut self) -> Result<()> {
+        self.storage.recover_replicated_ingestion().await?;
         loop {
             let staged = self.outbox.list_staged(10_000)?;
             if staged.is_empty() {
@@ -1621,6 +1622,9 @@ where
             }
             let mut settled = 0usize;
             for operation in staged {
+                if operation.mutation_kind == "ingest_file" {
+                    continue; // Recovered under its process-safe source lock above.
+                }
                 // Clone the storage handles before awaiting the local-state probe.  This keeps
                 // the reconciliation future independent of the embedding provider held by the
                 // runtime, so it remains `Send` without requiring providers to be `Sync`.
@@ -1698,6 +1702,7 @@ where
                 ))
             })?;
         match mutation {
+            ReplicationMutation::IngestFile { .. } => Ok(false),
             ReplicationMutation::DrawerAdd { request } => {
                 let drawer_id = request.drawer_id.ok_or_else(|| {
                     McpError::Replication(format!(
@@ -2154,6 +2159,9 @@ where
                     "attempt_count": operation.attempt_count,
                     "last_error": operation.last_error,
                     "failed_at": operation.updated_at,
+                    "batch_id": operation.payload.pointer("/request/replication/batch_id"),
+                    "record_id": operation.payload.pointer("/request/replication/record_id"),
+                    "source_file": operation.payload.pointer("/local/source_file"),
                 })
             })
             .collect::<Vec<_>>();
@@ -2174,6 +2182,7 @@ where
             .collect::<BTreeMap<_, _>>();
         payload["replication"] = json!({
             "backlog": backlog,
+            "ingestion": self.outbox.ingestion_backlog().map_tool()?,
             "recent_terminal_failures": failures,
             "phase_metrics": phase_metrics,
         });

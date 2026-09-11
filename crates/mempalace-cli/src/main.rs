@@ -21,7 +21,7 @@ use mempalace_federation::{IngestBatchRequest, IngestBatchResponse};
 use mempalace_ingest::{
     ConversationExtractMode, ConversationIngestRequest, IngestError, IngestSummary,
     PROJECTS_BRANCH_INGEST_KIND, PROJECTS_INGEST_KIND, ProjectIngestRequest, ProjectSourceSkip,
-    derive_project_id, ingest_conversations, ingest_project_with_config,
+    derive_project_id, ingest_conversations, ingest_project_with_replication,
     prepare_project_batch_with_config, project_branch_source_prefix,
     project_canonical_source_prefix, project_root_relative, wing_kind_source_prefix,
 };
@@ -1431,7 +1431,7 @@ where
         }
 
         if use_both {
-            let local_output = execute_local_project_mine(
+            return execute_local_project_mine(
                 &source_dir,
                 wing.clone(),
                 agent.clone(),
@@ -1446,23 +1446,8 @@ where
                 &provider_factory,
                 &project_config,
                 Some(&project_id),
-            )?;
-            let remote_output = execute_remote_mine(
-                &source_dir,
-                wing,
-                &agent,
-                limit,
-                dry_run,
-                batch_size,
-                effective_view.clone(),
-                &config,
-                &runtime,
-                &rule,
-                &project_config,
-                Some(&project_id),
-                true,
-            )?;
-            return Ok(combine_dual_write_outputs(local_output, remote_output));
+                rule.remote.as_deref(),
+            );
         }
 
         // ── Local mine path continues below with the resolved declaration. ──
@@ -1481,6 +1466,7 @@ where
             provider_factory,
             &project_config,
             Some(&project_id),
+            None,
         );
     } else {
         // Convos mode: --branch is not supported; remote routing is not supported.
@@ -1583,6 +1569,7 @@ fn execute_local_project_mine<F, P>(
     provider_factory: F,
     project_config: &ProjectConfig,
     project_id: Option<&str>,
+    replication_remote: Option<&str>,
 ) -> Result<CliOutput, clap::Error>
 where
     F: Fn(EmbeddingProfile, PathBuf) -> Result<P, Box<dyn std::error::Error>>,
@@ -1602,8 +1589,10 @@ where
         .filter(|&n| n > 0)
         .or_else(|| config.low_cpu.enabled.then(|| config.low_cpu.effective_ingest_batch_size()));
 
+    let replication = replication_remote
+        .map(|remote| mempalace_ingest::ProjectReplication::new(remote.to_owned()));
     let summary = runtime
-        .block_on(ingest_project_with_config(
+        .block_on(ingest_project_with_replication(
             &engine,
             &mut provider,
             &ProjectIngestRequest {
@@ -1619,16 +1608,34 @@ where
             },
             project_config,
             project_id,
+            replication.as_ref(),
         ))
         .map_err(|e| branch_delta_error(e, ingest_error))?;
 
-    Ok(CliOutput::success(render_mine_summary(
-        CliMode::Projects,
-        source_dir,
-        &config.palace_path,
-        dry_run,
-        &summary,
-    )))
+    let mut output =
+        render_mine_summary(CliMode::Projects, source_dir, &config.palace_path, dry_run, &summary);
+    if let Some(replication) = replication {
+        if dry_run {
+            output.push_str(&format!(
+                "\n  Remote replication: would queue durable records for {}\n",
+                replication.remote
+            ));
+        } else {
+            let outbox = mempalace_storage::OutboxStore::new(&engine.layout().sqlite_path);
+            let records = outbox
+                .ingestion_batch_record_count(&replication.batch_id)
+                .map_err(storage_error)?;
+            if records > 0 {
+                output.push_str(&format!("\n  Remote replication: durably queued {records} records for {} (batch {})\n  Delivery runs asynchronously while mempalace serve is running.\n", replication.remote, replication.batch_id));
+            } else {
+                output.push_str(&format!(
+                    "\n  Remote replication: no new records; existing queue retained for {}\n",
+                    replication.remote
+                ));
+            }
+        }
+    }
+    Ok(CliOutput::success(output))
 }
 
 /// Map an [`IngestError`] to a clap error, giving a friendly message for
@@ -1867,6 +1874,7 @@ fn execute_remote_mine(
 
     for batch_files in batches {
         let req = IngestBatchRequest {
+            replication: None,
             wing: wing.clone(),
             repo_id: repo_id.clone(),
             agent: Some(agent_owned.clone()),
@@ -5211,6 +5219,43 @@ mod tests {
         remove_dir_all_if_exists(&config_root);
     }
 
+    fn drain_mine_replication(config: MempalaceConfig, expected_failed: i64) {
+        let outbox =
+            mempalace_storage::OutboxStore::new(config.palace_path.join("storage.sqlite3"));
+        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            let _server = mempalace_mcp::McpServer::from_parts(
+                config,
+                mempalace_embeddings::DeterministicStubProvider::new(EmbeddingProfile::Balanced),
+            )
+            .await
+            .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(40);
+            loop {
+                let status = outbox.backlog(None).unwrap();
+                if status.pending_count
+                    + status.staged_count
+                    + status.leased_count
+                    + status.retryable_count
+                    == 0
+                {
+                    assert_eq!(
+                        status.failed_count,
+                        expected_failed,
+                        "{:?}",
+                        outbox.list_failed(10).unwrap()
+                    );
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "replication did not converge: {status:?}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        });
+    }
+
     #[test]
     fn mine_combined_both_unreachable_returns_local_success() {
         let workspace = tempdir().unwrap();
@@ -5247,19 +5292,22 @@ mod tests {
             run_cli(["mine", project_dir.to_str().unwrap()], &context, stub_provider).unwrap();
 
         // Must succeed locally despite remote being unreachable.
-        assert_eq!(output.exit_code, 0, "combined mine failed: stderr={:?}", output.stderr);
-        assert!(
-            output.stdout.contains("Files ingested:"),
-            "local ingestion must appear: {}",
-            output.stdout
-        );
-        assert!(
-            output.stdout.contains("replication: failed")
-                || output.stdout.contains("replication: skipped"),
-            "remote replication failure must be reported: {}",
-            output.stdout
-        );
+        assert_eq!(output.exit_code, 0, "{output:?}");
+        assert!(output.stdout.contains("durably queued"), "{}", output.stdout);
+        let outbox = mempalace_storage::OutboxStore::new(palace_dir.join("storage.sqlite3"));
+        let backlog = outbox.backlog(None).unwrap();
+        assert!(backlog.pending_count > 0);
+        assert_eq!(backlog.retryable_count, 0, "foreground mine never attempts delivery");
 
+        // Recover the destination after the CLI process has already returned.
+        let addr = spawn_test_server(
+            workspace.path().join("recovered-palace"),
+            "combined-unreachable-tok",
+        );
+        let mut config = load_runtime_config(None, &context).unwrap();
+        config.federation.remotes.get_mut(remote_name).unwrap().url = format!("http://{addr}");
+        drain_mine_replication(config, 0);
+        assert_eq!(outbox.ingestion_backlog().unwrap()["pending_batches"], 0);
         remove_dir_all_if_exists(&config_root);
     }
 
@@ -5309,18 +5357,15 @@ mod tests {
         let output =
             run_cli(["mine", project_dir.to_str().unwrap()], &context, stub_provider).unwrap();
 
-        assert_eq!(output.exit_code, 0, "combined mine failed: stderr={:?}", output.stderr);
-        assert!(
-            output.stdout.contains("Files ingested:"),
-            "must show local ingestion results: {}",
-            output.stdout
-        );
-        assert!(
-            output.stdout.contains("replication: succeeded"),
-            "remote replication must report success: {}",
-            output.stdout
-        );
+        assert_eq!(output.exit_code, 0, "{output:?}");
+        assert!(output.stdout.contains("durably queued"), "{}", output.stdout);
+        let outbox = mempalace_storage::OutboxStore::new(palace_dir.join("storage.sqlite3"));
+        let backlog = outbox.backlog(None).unwrap();
+        assert!(backlog.pending_count > 0);
+        assert_eq!(backlog.retryable_count, 0, "foreground mine never attempts delivery");
 
+        drain_mine_replication(load_runtime_config(None, &context).unwrap(), 0);
+        assert_eq!(outbox.backlog(None).unwrap().pending_count, 0);
         remove_dir_all_if_exists(&config_root);
     }
 
@@ -5510,33 +5555,16 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(output.exit_code, 0, "combined mine must exit 0: stderr={:?}", output.stderr);
-        assert!(
-            output.stdout.contains("Files ingested:"),
-            "local ingestion must appear: {}",
-            output.stdout
-        );
-        assert!(
-            output.stdout.contains("replication: partial"),
-            "must report partial replication: {}",
-            output.stdout
-        );
-        assert!(
-            output.stdout.contains("transport interrupted"),
-            "must mention transport interruption: {}",
-            output.stdout
-        );
-        assert!(
-            !output.stdout.contains("replication: succeeded"),
-            "must NOT claim full replication success: {}",
-            output.stdout
-        );
-        assert!(
-            !output.stdout.contains("some files had errors"),
-            "must NOT claim file-level errors when the only issue was transport: {}",
-            output.stdout
-        );
+        assert_eq!(output.exit_code, 0, "{output:?}");
+        assert!(output.stdout.contains("durably queued"), "{}", output.stdout);
+        let outbox = mempalace_storage::OutboxStore::new(palace_dir.join("storage.sqlite3"));
+        let backlog = outbox.backlog(None).unwrap();
+        assert!(backlog.pending_count > 0);
+        assert_eq!(backlog.retryable_count, 0, "foreground mine never attempts delivery");
 
+        // The worker retries a delayed request, with other file acknowledgements retained.
+        drain_mine_replication(load_runtime_config(None, &context).unwrap(), 0);
+        assert_eq!(outbox.ingestion_backlog().unwrap()["pending_batches"], 0);
         remove_dir_all_if_exists(&config_root);
     }
 
@@ -5592,78 +5620,47 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            first_output.exit_code, 0,
-            "first mine must exit 0: stderr={:?}",
-            first_output.stderr
-        );
-        assert!(
-            first_output.stdout.contains("Files ingested: 3"),
-            "local mine must ingest 3: {}",
-            first_output.stdout
-        );
-        assert!(
-            first_output.stdout.contains("replication: partial"),
-            "first mine must report partial replication: {}",
-            first_output.stdout
-        );
-        assert!(
-            first_output.stdout.contains("transport interrupted"),
-            "first mine must mention transport interruption: {}",
-            first_output.stdout
-        );
-
-        // ── Second mine (retry — server is now past the slow delay) ───────────
-        let second_output = run_cli(
-            ["mine", project_dir.to_str().unwrap(), "--batch-size", "1"],
-            &context,
-            stub_provider,
-        )
-        .unwrap();
-
-        assert_eq!(
-            second_output.exit_code, 0,
-            "second mine must exit 0: stderr={:?}",
-            second_output.stderr
-        );
-
-        // Local mine re-ingests nothing because files are unchanged.
-        assert!(
-            second_output.stdout.contains("Files skipped unchanged: 3"),
-            "retry must skip all locally-unchanged files: {}",
-            second_output.stdout
-        );
-        assert!(
-            second_output.stdout.contains("Files ingested: 0"),
-            "retry must not re-ingest unchanged files: {}",
-            second_output.stdout
-        );
-
-        // Remote should report the previously-replicated file as skipped_unchanged
-        // and the remaining two as ingested.
-        assert!(
-            second_output.stdout.contains("replication: succeeded"),
-            "second mine must report full replication success: {}",
-            second_output.stdout
-        );
-        assert!(
-            second_output.stdout.contains("Files ingested: 2"),
-            "remote mine must ingest the two files that were not previously replicated: {}",
-            second_output.stdout
-        );
-
-        // ── Verify no duplicates: local drawer count is unchanged after retry ──
+        assert_eq!(first_output.exit_code, 0, "{first_output:?}");
+        assert!(first_output.stdout.contains("durably queued"));
+        drain_mine_replication(load_runtime_config(None, &context).unwrap(), 0);
+        let second =
+            run_cli(["mine", project_dir.to_str().unwrap()], &context, stub_provider).unwrap();
+        assert_eq!(second.exit_code, 0, "{second:?}");
+        assert!(second.stdout.contains("Files skipped unchanged: 3"), "{}", second.stdout);
+        drain_mine_replication(load_runtime_config(None, &context).unwrap(), 0);
         let status = run_cli(["status"], &context, stub_provider).unwrap();
-        assert_eq!(status.exit_code, 0, "status failed: stderr={:?}", status.stderr);
-        // The fixture has 3 files → 3 drawers after the first mine.
-        // After retry there should still be 3 (no duplicates, nothing added).
-        let drawer_count_line = status.stdout.lines().find(|l| l.contains("drawers")).unwrap_or("");
+        assert!(status.stdout.contains("3 drawers"), "{}", status.stdout);
+        let outbox = mempalace_storage::OutboxStore::new(palace_dir.join("storage.sqlite3"));
+        assert_eq!(outbox.ingestion_backlog().unwrap()["total_batches"], 1);
+        fs::remove_file(project_dir.join("file0.rs")).unwrap();
+        let removal =
+            run_cli(["mine", project_dir.to_str().unwrap()], &context, stub_provider).unwrap();
+        assert_eq!(removal.exit_code, 0, "{removal:?}");
+        let operation =
+            outbox.claim_next("hub", "test", time::Duration::minutes(1)).unwrap().unwrap();
+        assert_eq!(operation.payload["request"]["replication"]["remove"], true);
+        outbox
+            .fail(
+                &operation.operation_id,
+                "test",
+                operation.revision,
+                "temporary configuration mistake",
+            )
+            .unwrap();
+        // The local manifest is already gone. A fresh mine must still find this failed removal.
+        let retry =
+            run_cli(["mine", project_dir.to_str().unwrap()], &context, stub_provider).unwrap();
+        assert_eq!(retry.exit_code, 0, "{retry:?}");
+        assert!(retry.stdout.contains("durably queued 1 records"), "{}", retry.stdout);
+        drain_mine_replication(load_runtime_config(None, &context).unwrap(), 1);
+        let remote_store =
+            mempalace_storage::SqliteOperationalStore::new(server_palace.join("storage.sqlite3"));
+        let keys =
+            remote_store.ingested_source_keys_with_prefix("projects:wing_retryproject:").unwrap();
         assert!(
-            drawer_count_line.contains("3 drawers"),
-            "must have exactly 3 drawers after retry, not more (no duplicates): {}",
-            status.stdout
+            !keys.iter().any(|key| key.ends_with(":file0.rs")),
+            "removal must reach the remote after its terminal error is corrected"
         );
-
         remove_dir_all_if_exists(&config_root);
     }
 
@@ -5945,33 +5942,15 @@ mod tests {
             run_cli(["mine", project_dir.to_str().unwrap()], &context, stub_provider).unwrap();
 
         // Exit code 0 — local success even though remote is unsupported.
-        assert_eq!(output.exit_code, 0, "combined mine failed: stderr={:?}", output.stderr);
-        assert!(
-            output.stdout.contains("Files ingested:"),
-            "local ingestion must appear: {}",
-            output.stdout
-        );
-        assert!(
-            output.stdout.contains("replication: skipped"),
-            "must report replication as skipped: {}",
-            output.stdout
-        );
-        assert!(
-            output.stdout.contains("does not support the ingest capability"),
-            "must identify unsupported ingest capability: {}",
-            output.stdout
-        );
-        assert!(
-            output.stdout.contains("Server capabilities: drawers, kg, changes, taxonomy"),
-            "must list server capabilities: {}",
-            output.stdout
-        );
-        assert!(
-            output.stdout.contains("local mine completed successfully"),
-            "must note local mine success: {}",
-            output.stdout
-        );
+        assert_eq!(output.exit_code, 0, "{output:?}");
+        assert!(output.stdout.contains("durably queued"), "{}", output.stdout);
+        let outbox = mempalace_storage::OutboxStore::new(palace_dir.join("storage.sqlite3"));
+        let backlog = outbox.backlog(None).unwrap();
+        assert!(backlog.pending_count > 0);
+        assert_eq!(backlog.retryable_count, 0, "foreground mine never attempts delivery");
 
+        drain_mine_replication(load_runtime_config(None, &context).unwrap(), backlog.pending_count);
+        assert_eq!(outbox.backlog(None).unwrap().failed_count, backlog.pending_count);
         remove_dir_all_if_exists(&config_root);
     }
 

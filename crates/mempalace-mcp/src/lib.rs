@@ -2151,25 +2151,25 @@ where
     }
 
     async fn status_payload(&mut self, include_rooms: bool) -> ToolResult<Value> {
-        let drawers = self.list_all_drawers().await?;
+        let counts = self
+            .storage
+            .drawer_store()
+            .count_by_wing_room(&DrawerFilter::default(), false)
+            .await
+            .map_tool()?;
         let mut wings = BTreeMap::<String, usize>::new();
         let mut rooms = include_rooms.then(BTreeMap::<String, usize>::new);
-        for drawer in &drawers {
-            if let Some(count) = wings.get_mut(drawer.wing.as_str()) {
-                *count += 1;
-            } else {
-                wings.insert(drawer.wing.as_str().to_owned(), 1);
-            }
+        for (wing, wing_rooms) in counts {
+            wings.insert(wing, wing_rooms.values().sum());
             if let Some(rooms) = &mut rooms {
-                if let Some(count) = rooms.get_mut(drawer.room.as_str()) {
-                    *count += 1;
-                } else {
-                    rooms.insert(drawer.room.as_str().to_owned(), 1);
+                for (room, count) in wing_rooms {
+                    *rooms.entry(room).or_default() += count;
                 }
             }
         }
+        let total_drawers: usize = wings.values().sum();
         let mut payload = json!({
-            "total_drawers": drawers.len(),
+            "total_drawers": total_drawers,
             "wings": wings,
             "palace_path": self.config.palace_path,
             "protocol": PALACE_PROTOCOL,
@@ -2798,10 +2798,10 @@ where
         let wings = provenance
             .into_iter()
             .map(|(wing, sources)| {
-                let destination = self
-                    .federation
-                    .as_ref()
-                    .map_or_else(|| "local".to_owned(), |router| router.coordination_destination(&wing));
+                let destination = self.federation.as_ref().map_or_else(
+                    || "local".to_owned(),
+                    |router| router.coordination_destination(&wing),
+                );
                 let sources = ["configured", "in_use", "built_in"]
                     .into_iter()
                     .filter(|source| sources.contains(*source))

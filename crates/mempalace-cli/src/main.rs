@@ -2167,18 +2167,9 @@ fn execute_status(
     let engine = runtime
         .block_on(StorageEngine::open(&config.palace_path, config.embedding_profile))
         .map_err(storage_error)?;
-    let drawers = runtime
-        .block_on(engine.drawer_store().list_drawers(&DrawerFilter::default()))
+    let wing_rooms = runtime
+        .block_on(engine.drawer_store().count_by_wing_room(&DrawerFilter::default(), false))
         .map_err(storage_error)?;
-
-    let mut wing_rooms = BTreeMap::<String, BTreeMap<String, usize>>::new();
-    for drawer in drawers {
-        *wing_rooms
-            .entry(drawer.wing.to_string())
-            .or_default()
-            .entry(drawer.room.to_string())
-            .or_default() += 1;
-    }
 
     let mut lines = vec![
         format!("\n{}", "=".repeat(STATUS_HEADER_WIDTH)),

@@ -422,7 +422,9 @@ where
                 Ok(format!("{identity}\n\n{story}"))
             }
             WakeUpFormat::AaaK => {
-                let drawers = list_layer_drawers(store, request.wing.clone()).await?;
+                let drawers =
+                    list_layer_drawers(store, request.wing.clone(), request.layer1.max_drawers)
+                        .await?;
                 Ok(self.dialect.render_wake_up_aaak(
                     &identity,
                     &drawers,
@@ -531,7 +533,7 @@ pub async fn generate_layer1<S>(
 where
     S: DrawerStore,
 {
-    let mut drawers = list_layer_drawers(store, wing).await?;
+    let mut drawers = list_layer_drawers(store, wing, config.max_drawers).await?;
 
     if drawers.is_empty() {
         return Ok("## L1 — No memories yet.".to_owned());
@@ -593,13 +595,20 @@ where
 async fn list_layer_drawers<S>(
     store: &S,
     wing: Option<mempalace_core::WingId>,
+    limit: usize,
 ) -> Result<Vec<DrawerRecord>>
 where
     S: DrawerStore,
 {
-    let mut drawers = store.list_drawers(&DrawerFilter { wing, ..DrawerFilter::default() }).await?;
-    // Resolve locator-backed records so wake_up/AAaK rendering sees real text.
-    resolve_records(&mut drawers);
+    // Keep the historical distinction between an empty palace and a zero-sized
+    // story. One candidate establishes existence when the configured limit is zero.
+    let mut drawers = store
+        .list_layer_drawers(&DrawerFilter { wing, ..DrawerFilter::default() }, limit.max(1))
+        .await?;
+    // Resolve only the selected records; a zero-sized story reads no source files.
+    if limit > 0 {
+        resolve_records(&mut drawers);
+    }
     Ok(drawers)
 }
 
@@ -677,27 +686,7 @@ fn compare_distance(left: Option<f32>, right: Option<f32>) -> Ordering {
 }
 
 fn order_layer_drawers(drawers: &mut [DrawerRecord]) {
-    drawers.sort_by(|left, right| {
-        right
-            .layer_weight()
-            .partial_cmp(&left.layer_weight())
-            .unwrap_or(Ordering::Equal)
-            .then_with(|| left.room.as_str().cmp(right.room.as_str()))
-            .then_with(|| compare_option_dates(right.date, left.date))
-            .then_with(|| right.filed_at.cmp(&left.filed_at))
-            .then_with(|| source_label(&left.source_file).cmp(&source_label(&right.source_file)))
-            .then_with(|| left.chunk_index.cmp(&right.chunk_index))
-            .then_with(|| left.id.as_str().cmp(right.id.as_str()))
-    });
-}
-
-fn compare_option_dates(left: Option<time::Date>, right: Option<time::Date>) -> Ordering {
-    match (left, right) {
-        (Some(left), Some(right)) => left.cmp(&right),
-        (Some(_), None) => Ordering::Greater,
-        (None, Some(_)) => Ordering::Less,
-        (None, None) => Ordering::Equal,
-    }
+    drawers.sort_by(mempalace_core::compare_layer_drawers);
 }
 
 fn normalize_score(distance: Option<f32>) -> f32 {
@@ -749,16 +738,6 @@ fn char_count(value: &str) -> usize {
 
 fn source_label(source_file: &str) -> &str {
     Path::new(source_file).file_name().and_then(|value| value.to_str()).unwrap_or(source_file)
-}
-
-trait LayerWeight {
-    fn layer_weight(&self) -> f32;
-}
-
-impl LayerWeight for DrawerRecord {
-    fn layer_weight(&self) -> f32 {
-        self.importance.or(self.emotional_weight).or(self.weight).unwrap_or(3.0)
-    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2329,6 +2308,128 @@ mod tests {
         let rendered = generate_layer1(&store, None, Layer1Config::default()).await.unwrap();
 
         assert_eq!(rendered, "## L1 — No memories yet.");
+    }
+
+    #[tokio::test]
+    async fn bounded_wakeup_preserves_locator_output_for_both_formats() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = mempalace_storage::LanceDrawerStore::new(
+            temp.path().join("lance"),
+            EmbeddingProfile::Balanced,
+        );
+        store.ensure_schema().await.unwrap();
+        let mut drawers = sample_store().drawers;
+        for (index, drawer) in drawers.iter_mut().enumerate() {
+            let text = format!("resolved source {index}");
+            drawer.source_file = format!("source-{index}.txt");
+            std::fs::write(temp.path().join(&drawer.source_file), &text).unwrap();
+            drawer.locator = Some(mempalace_core::SourceLocator {
+                byte_start: 0,
+                byte_end: text.len() as u64,
+                line_start: 1,
+                line_end: 1,
+                file_hash: if index % 2 == 0 {
+                    mempalace_core::hash_bytes(text.as_bytes())
+                } else {
+                    "old-hash".to_owned()
+                },
+                resolve_root: temp.path().to_string_lossy().into_owned(),
+                commit_hash: None,
+            });
+        }
+        store.put_drawers(&drawers, DuplicateStrategy::Error).await.unwrap();
+        // Reference behavior resolved every source before selecting the story.
+        mempalace_core::resolve_records(&mut drawers);
+        let reference = StubStore { drawers };
+        let runtime = SearchRuntime::new(StubProvider { response: vec![embedding(0.0)] });
+        for format in [WakeUpFormat::PlainText, WakeUpFormat::AaaK] {
+            for max_drawers in [0, 1, 3, 15] {
+                let request = WakeUpRequest {
+                    wing: None,
+                    identity: IdentitySource::Inline("Identity".to_owned()),
+                    layer1: Layer1Config { max_drawers, max_chars: 3200 },
+                    format,
+                };
+                assert_eq!(
+                    runtime.wake_up(&store, &request).await.unwrap(),
+                    runtime.wake_up(&reference, &request).await.unwrap()
+                );
+            }
+        }
+        assert_eq!(
+            generate_layer1(&store, None, Layer1Config { max_drawers: 0, max_chars: 3200 })
+                .await
+                .unwrap(),
+            "## L1 — ESSENTIAL STORY"
+        );
+    }
+
+    /// Manual acceptance probe for #136; fixture creation is outside the timing.
+    #[tokio::test]
+    #[ignore = "creates a 150k-drawer palace and 10k source files"]
+    async fn large_palace_wakeup_metadata_benchmark() {
+        let temp = tempfile::tempdir().unwrap();
+        let engine =
+            mempalace_storage::StorageEngine::open(temp.path(), EmbeddingProfile::Balanced)
+                .await
+                .unwrap();
+        let store = engine.drawer_store();
+        let text = "source content ".repeat(80);
+        let hash = mempalace_core::hash_bytes(text.as_bytes());
+        for index in 0..10_000 {
+            std::fs::write(temp.path().join(format!("source-{index}.txt")), &text).unwrap();
+        }
+        let template = sample_store().drawers.remove(0);
+        let drawers = (0..150_000)
+            .map(|index| {
+                let mut drawer = template.clone();
+                drawer.id = DrawerId::new(format!("drawer-{index:06}")).unwrap();
+                drawer.source_file = format!("source-{}.txt", index % 10_000);
+                drawer.importance = Some((index % 5) as f32);
+                drawer.content = "locator-backed".to_owned();
+                drawer.locator = Some(mempalace_core::SourceLocator {
+                    byte_start: 0,
+                    byte_end: text.len() as u64,
+                    line_start: 1,
+                    line_end: 1,
+                    file_hash: hash.clone(),
+                    resolve_root: temp.path().to_string_lossy().into_owned(),
+                    commit_hash: None,
+                });
+                drawer
+            })
+            .collect::<Vec<_>>();
+        // Keep fixture ingestion's duplicate-ID predicates reasonably sized.
+        for (index, batch) in drawers.chunks(1000).enumerate() {
+            store.put_drawers(batch, DuplicateStrategy::Error).await.unwrap();
+            if (index + 1) % 25 == 0 {
+                eprintln!("fixture: {} drawers", (index + 1) * 1000);
+            }
+        }
+        drop(drawers);
+        let maintenance = engine
+            .run_maintenance(&mempalace_storage::MaintenanceSettings {
+                idle_secs: 0,
+                tail_threshold_rows: u64::MAX,
+                small_fragment_threshold: 0,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(maintenance.tier_results.iter().any(|tier| tier.tier
+            == mempalace_storage::MaintenanceTier::FragmentCompaction
+            && matches!(tier.outcome, mempalace_storage::MaintenanceOutcome::Completed { .. })));
+        eprintln!("fixture compacted");
+        for run in 1..=2 {
+            let started = std::time::Instant::now();
+            let rendered = generate_layer1(store, None, Layer1Config::default()).await.unwrap();
+            eprintln!("150k drawers / 10k files: L1 run {run}: {:?}", started.elapsed());
+            assert!(rendered.contains("source content"));
+            let started = std::time::Instant::now();
+            let counts = store.count_by_wing_room(&DrawerFilter::default(), false).await.unwrap();
+            eprintln!("150k drawers: counts run {run}: {:?}", started.elapsed());
+            assert_eq!(counts.values().flat_map(|rooms| rooms.values()).sum::<usize>(), 150_000);
+        }
     }
 
     #[tokio::test]

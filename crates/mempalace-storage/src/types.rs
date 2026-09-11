@@ -371,4 +371,49 @@ pub trait DrawerStore: Send + Sync {
     async fn delete_drawers(&self, ids: &[DrawerId]) -> Result<usize>;
     async fn search_drawers(&self, request: &SearchRequest) -> Result<Vec<DrawerMatch>>;
     async fn list_drawers(&self, filter: &DrawerFilter) -> Result<Vec<DrawerRecord>>;
+
+    /// Exact counts by wing and room, ignoring `filter.limit`. Implementations
+    /// should stream projected metadata rather than materialize drawer bodies.
+    async fn count_by_wing_room(
+        &self,
+        filter: &DrawerFilter,
+        exclude_diary: bool,
+    ) -> Result<std::collections::BTreeMap<String, std::collections::BTreeMap<String, usize>>> {
+        let mut filter = filter.clone();
+        filter.limit = None;
+        let mut counts =
+            std::collections::BTreeMap::<String, std::collections::BTreeMap<String, usize>>::new();
+        for drawer in self.list_drawers(&filter).await? {
+            if exclude_diary
+                && (drawer.wing.as_str() == mempalace_core::SHARED_AGENT_DIARY_WING
+                    || drawer.room.as_str() == mempalace_core::DIARY_ROOM)
+            {
+                continue;
+            }
+            *counts
+                .entry(drawer.wing.to_string())
+                .or_default()
+                .entry(drawer.room.to_string())
+                .or_default() += 1;
+        }
+        Ok(counts)
+    }
+
+    /// Select at most `limit` drawers in the established layer rendering order.
+    /// Storage implementations should select metadata before fetching bodies.
+    async fn list_layer_drawers(
+        &self,
+        filter: &DrawerFilter,
+        limit: usize,
+    ) -> Result<Vec<DrawerRecord>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut filter = filter.clone();
+        filter.limit = None;
+        let mut drawers = self.list_drawers(&filter).await?;
+        drawers.sort_by(mempalace_core::compare_layer_drawers);
+        drawers.truncate(limit);
+        Ok(drawers)
+    }
 }

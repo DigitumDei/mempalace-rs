@@ -275,6 +275,7 @@ Known limitations:
 
 Purpose:
 - Show wing and room drawer counts from the current palace.
+- Counts stream only wing and room metadata; drawer bodies, embeddings, and mined source files are not loaded.
 
 Behavior:
 - Returns a non-zero result with guidance if no palace exists.
@@ -289,6 +290,7 @@ Flags:
 
 Behavior:
 - Default L1 assembly uses the search crate default and is then clamped by low-CPU limits when enabled.
+- L1 selection streams ranking metadata and retains only the configured number of candidates before loading bodies and resolving source locators. The existing weight, room, date, filing time, source basename, chunk, and ID ordering applies to both plain-text and AAAK stories. Ranking metadata still requires a scan; memory use no longer grows with the total size of drawer bodies or embeddings.
 - If no palace exists, the command returns a non-zero result with the expected bootstrap guidance.
 
 ### `setup`

@@ -24,7 +24,7 @@
 
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::{Arc, PoisonError, RwLock};
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
@@ -937,31 +937,7 @@ where
             }
 
             loop {
-                let base = Duration::from_secs(settings.idle_secs);
-                let jitter_frac = (SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .subsec_nanos() as f64)
-                    / 1_000_000_000.0;
-                let jitter = Duration::from_secs_f64(jitter_frac * base.as_secs_f64() * 0.1);
-                let sleep_dur = base + jitter;
-
-                tokio::time::sleep(sleep_dur).await;
-                if task_state.storage.elapsed_since_last_activity()
-                    < Duration::from_secs(settings.idle_secs)
-                {
-                    continue;
-                }
-
-                // Clear only activity that predates the completed idle window.
-                // Re-check elapsed time after taking the flag so a write racing
-                // this transition still postpones the run.
-                if task_state.storage.take_activity_signal()
-                    && task_state.storage.elapsed_since_last_activity()
-                        < Duration::from_secs(settings.idle_secs)
-                {
-                    continue;
-                }
+                task_state.storage.wait_for_maintenance_window(settings.idle_secs).await;
                 info!("background maintenance check");
                 *task_state.maintenance_status.lock().unwrap_or_else(PoisonError::into_inner) =
                     MaintenanceStatus::Running;

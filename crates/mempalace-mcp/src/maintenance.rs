@@ -1,7 +1,5 @@
 //! Connection-scoped maintenance for stdio; HTTP scheduling belongs to the hub.
 
-use std::time::{Duration, SystemTime};
-
 use mempalace_config::MaintenanceRuntimeConfig;
 use mempalace_storage::{MaintenanceSettings, StorageEngine};
 use tokio::sync::oneshot;
@@ -27,35 +25,20 @@ pub(crate) async fn run(
         if !matches!(stopped.try_recv(), Err(oneshot::error::TryRecvError::Empty)) {
             return;
         }
-        if storage.elapsed_since_last_activity() >= Duration::from_secs(settings.idle_secs) {
-            // Clear activity only after a complete idle window, then recheck to
-            // preserve a write racing the transition. The engine checks again
-            // before and between tiers and uses the same cross-process lease
-            // as `serve` and `maintain`.
-            storage.take_activity_signal();
-            if storage.elapsed_since_last_activity() >= Duration::from_secs(settings.idle_secs) {
-                tracing::info!("stdio MCP maintenance check");
-                match storage.run_maintenance(&settings).await {
-                    Ok(summary) => tracing::info!(
-                        run_id = summary.run_id,
-                        status = ?summary.status,
-                        "stdio MCP maintenance finished"
-                    ),
-                    Err(error) => tracing::warn!(%error, "stdio MCP maintenance failed"),
-                }
+        if storage.maintenance_window_open(settings.idle_secs) {
+            tracing::info!("stdio MCP maintenance check");
+            match storage.run_maintenance(&settings).await {
+                Ok(summary) => tracing::info!(
+                    run_id = summary.run_id,
+                    status = ?summary.status,
+                    "stdio MCP maintenance finished"
+                ),
+                Err(error) => tracing::warn!(%error, "stdio MCP maintenance failed"),
             }
         }
-        // A positive floor also protects programmatically constructed configs.
-        let base = Duration::from_secs(settings.idle_secs.max(1));
-        let fraction = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .subsec_nanos() as f64
-            / 1_000_000_000.0;
-        let jitter = Duration::from_secs_f64(base.as_secs_f64() * fraction * 0.1);
         tokio::select! {
             _ = &mut stopped => return,
-            _ = tokio::time::sleep(base + jitter) => {}
+            _ = storage.wait_for_maintenance_window(settings.idle_secs) => {}
         }
     }
 }

@@ -4,18 +4,18 @@ This document records the local-first experiment from issue #99. It evaluates wh
 
 ## Reproduce
 
-Install the repository skill by copying `skills/coordinate-with-mempalace` into a supported client's skill directory, or invoke it directly from the checkout. Validate the package and its envelopes:
+Install the repository skill by copying `skills/coordinate-with-agentpalace` into a supported client's skill directory, or invoke it directly from the checkout. Validate the package and its envelopes:
 
 ```bash
-python3 skills/coordinate-with-mempalace/scripts/validate_envelope.py \
-  skills/coordinate-with-mempalace/assets/*.json
+python3 skills/coordinate-with-agentpalace/scripts/validate_envelope.py \
+  skills/coordinate-with-agentpalace/assets/*.json
 ```
 
-The package also passes the standard Codex skill validator. It contains runnable, tool-level procedures for manager-as-tools and explicit-handoff workflows and uses only `mempalace_add_drawer`, `mempalace_get_changes_since`, and `mempalace_search`.
+The package also passes the standard Codex skill validator. It contains runnable, tool-level procedures for manager-as-tools and explicit-handoff workflows and uses only `agentpalace_add_drawer`, `agentpalace_get_changes_since`, and `agentpalace_search`.
 
 ## Recorded runs — 2026-08-17
 
-Both runs targeted `wing_mempalace_rs/workflows`. Routing placed the drawers on configured origin `actuarius`.
+Both runs targeted `wing_agentpalace_rs/workflows`. Routing placed the drawers on configured origin `actuarius`.
 
 | Measure | Manager as tools | Explicit handoff |
 |---|---:|---:|
@@ -32,17 +32,17 @@ Both runs targeted `wing_mempalace_rs/workflows`. Routing placed the drawers on 
 
 Manager-as-tools references:
 
-- task: `drawer_wing_mempalace_rs_workflows_2e9c0b3e78c3d2ea`
-- artifact: `drawer_wing_mempalace_rs_workflows_cdc1fa754720c364`
-- result: `drawer_wing_mempalace_rs_workflows_ce55519c7b0d8352`
+- task: `drawer_wing_agentpalace_rs_workflows_2e9c0b3e78c3d2ea`
+- artifact: `drawer_wing_agentpalace_rs_workflows_cdc1fa754720c364`
+- result: `drawer_wing_agentpalace_rs_workflows_ce55519c7b0d8352`
 
 Explicit-handoff references:
 
-- task: `drawer_wing_mempalace_rs_workflows_ef5611209f835e5c`
-- handoff: `drawer_wing_mempalace_rs_workflows_cf7fe18553b40196`
-- acknowledgement: `drawer_wing_mempalace_rs_workflows_838dbf13c0c95e98`
-- artifact: `drawer_wing_mempalace_rs_workflows_02ba6c6cb212b709`
-- result: `drawer_wing_mempalace_rs_workflows_278f40252031eaba`
+- task: `drawer_wing_agentpalace_rs_workflows_ef5611209f835e5c`
+- handoff: `drawer_wing_agentpalace_rs_workflows_cf7fe18553b40196`
+- acknowledgement: `drawer_wing_agentpalace_rs_workflows_838dbf13c0c95e98`
+- artifact: `drawer_wing_agentpalace_rs_workflows_02ba6c6cb212b709`
+- result: `drawer_wing_agentpalace_rs_workflows_278f40252031eaba`
 
 Cursor pagination was exercised twice. The manager run used limit 2 and origin `actuarius` returned opaque cursor `2026-08-17T10:31:18.309442004Z|224`; supplying it returned the remaining result event. The handoff run used limit 3 and returned `2026-08-17T10:32:22.108719845Z|228`; supplying it returned the artifact and result. Cursors are recorded as opaque values, not parsed or synthesized by the workflow.
 
@@ -53,8 +53,8 @@ The manager artifact contains 238 bytes and was replaced in downstream communica
 The experiment is race-prone and is not a reliable queue:
 
 - No atomic claim, compare-and-set, lease, acknowledgement state, or ordered mailbox prevents duplicate work or lost ownership updates.
-- `mempalace_get_changes_since` provides useful discovery and opaque per-origin continuation, but observing an event does not acknowledge delivery.
-- The MCP surface has no get-drawer-by-ID operation. `mempalace_search` recovered the restart artifact content, but its result omitted the drawer ID. A consumer therefore cannot prove that content came from the stable reference it received.
+- `agentpalace_get_changes_since` provides useful discovery and opaque per-origin continuation, but observing an event does not acknowledge delivery.
+- The MCP surface has no get-drawer-by-ID operation. `agentpalace_search` recovered the restart artifact content, but its result omitted the drawer ID. A consumer therefore cannot prove that content came from the stable reference it received.
 - Semantic search ranking is not authoritative delivery. A relevant envelope can fall outside the result limit or be displaced by unrelated content.
 - Duplicate detection is semantic and rejected the first explicit-handoff result as a duplicate of its acknowledgement at similarity 0.9117. Rewording the result allowed the write, demonstrating content-dependent delivery failure.
 - Cross-origin timestamps are not an ordering mechanism. Clients must preserve each origin's opaque cursor.

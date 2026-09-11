@@ -9,6 +9,272 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
+name = "agentpalace-a2a"
+version = "0.1.0"
+dependencies = [
+ "agentpalace-federation",
+ "agentpalace-storage",
+ "blake3",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "time",
+]
+
+[[package]]
+name = "agentpalace-cli"
+version = "0.1.0"
+dependencies = [
+ "agentpalace-config",
+ "agentpalace-core",
+ "agentpalace-embeddings",
+ "agentpalace-federation",
+ "agentpalace-ingest",
+ "agentpalace-mcp",
+ "agentpalace-remote",
+ "agentpalace-search",
+ "agentpalace-server",
+ "agentpalace-storage",
+ "axum",
+ "clap",
+ "dirs",
+ "reqwest",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "time",
+ "tokio",
+ "toml",
+ "toml_edit",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "agentpalace-config"
+version = "0.1.0"
+dependencies = [
+ "agentpalace-core",
+ "dirs",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "time",
+ "tokio",
+ "toml",
+ "tracing",
+]
+
+[[package]]
+name = "agentpalace-core"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "time",
+]
+
+[[package]]
+name = "agentpalace-dialect"
+version = "0.1.0"
+dependencies = [
+ "agentpalace-core",
+ "serde_json",
+ "thiserror 2.0.18",
+ "time",
+]
+
+[[package]]
+name = "agentpalace-embeddings"
+version = "0.1.0"
+dependencies = [
+ "agentpalace-core",
+ "fastembed",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tracing",
+ "ureq 2.12.1",
+]
+
+[[package]]
+name = "agentpalace-federation"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "agentpalace-graph"
+version = "0.1.0"
+dependencies = [
+ "agentpalace-core",
+ "agentpalace-storage",
+ "aho-corasick",
+ "async-trait",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "time",
+ "tokio",
+]
+
+[[package]]
+name = "agentpalace-import"
+version = "0.1.0"
+dependencies = [
+ "agentpalace-core",
+]
+
+[[package]]
+name = "agentpalace-ingest"
+version = "0.1.0"
+dependencies = [
+ "agentpalace-config",
+ "agentpalace-core",
+ "agentpalace-embeddings",
+ "agentpalace-federation",
+ "agentpalace-storage",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "time",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "agentpalace-mcp"
+version = "0.1.0"
+dependencies = [
+ "agentpalace-a2a",
+ "agentpalace-config",
+ "agentpalace-core",
+ "agentpalace-embeddings",
+ "agentpalace-federation",
+ "agentpalace-graph",
+ "agentpalace-mcp-tasks",
+ "agentpalace-remote",
+ "agentpalace-search",
+ "agentpalace-server",
+ "agentpalace-storage",
+ "async-trait",
+ "axum",
+ "blake3",
+ "dirs",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "time",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "agentpalace-mcp-tasks"
+version = "0.1.0"
+dependencies = [
+ "agentpalace-storage",
+ "blake3",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "time",
+]
+
+[[package]]
+name = "agentpalace-remote"
+version = "0.1.0"
+dependencies = [
+ "agentpalace-config",
+ "agentpalace-core",
+ "agentpalace-embeddings",
+ "agentpalace-federation",
+ "agentpalace-server",
+ "async-trait",
+ "axum",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "agentpalace-search"
+version = "0.1.0"
+dependencies = [
+ "agentpalace-core",
+ "agentpalace-dialect",
+ "agentpalace-embeddings",
+ "agentpalace-storage",
+ "async-trait",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "time",
+ "tokio",
+]
+
+[[package]]
+name = "agentpalace-server"
+version = "0.1.0"
+dependencies = [
+ "agentpalace-config",
+ "agentpalace-core",
+ "agentpalace-embeddings",
+ "agentpalace-federation",
+ "agentpalace-graph",
+ "agentpalace-search",
+ "agentpalace-storage",
+ "axum",
+ "blake3",
+ "http-body-util",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "subtle",
+ "tempfile",
+ "thiserror 2.0.18",
+ "time",
+ "tokio",
+ "tower",
+ "tracing",
+]
+
+[[package]]
+name = "agentpalace-storage"
+version = "0.1.0"
+dependencies = [
+ "agentpalace-core",
+ "arrow-array",
+ "arrow-schema",
+ "async-trait",
+ "blake3",
+ "fs4",
+ "futures",
+ "lancedb",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "time",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3913,271 +4179,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "714098028fe011992e1c3962653c96b2d578c4b4bce9036e15ff220319b1e0e3"
 dependencies = [
  "libc",
-]
-
-[[package]]
-name = "mempalace-a2a"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "mempalace-federation",
- "mempalace-storage",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "time",
-]
-
-[[package]]
-name = "mempalace-cli"
-version = "0.1.0"
-dependencies = [
- "axum",
- "clap",
- "dirs",
- "mempalace-config",
- "mempalace-core",
- "mempalace-embeddings",
- "mempalace-federation",
- "mempalace-ingest",
- "mempalace-mcp",
- "mempalace-remote",
- "mempalace-search",
- "mempalace-server",
- "mempalace-storage",
- "reqwest",
- "serde_json",
- "serde_yaml",
- "tempfile",
- "time",
- "tokio",
- "toml_edit",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "mempalace-config"
-version = "0.1.0"
-dependencies = [
- "dirs",
- "mempalace-core",
- "serde",
- "serde_json",
- "serde_yaml",
- "time",
- "tokio",
- "toml",
- "tracing",
-]
-
-[[package]]
-name = "mempalace-core"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "time",
-]
-
-[[package]]
-name = "mempalace-dialect"
-version = "0.1.0"
-dependencies = [
- "mempalace-core",
- "serde_json",
- "thiserror 2.0.18",
- "time",
-]
-
-[[package]]
-name = "mempalace-embeddings"
-version = "0.1.0"
-dependencies = [
- "fastembed",
- "mempalace-core",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tracing",
- "ureq 2.12.1",
-]
-
-[[package]]
-name = "mempalace-federation"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "mempalace-graph"
-version = "0.1.0"
-dependencies = [
- "aho-corasick",
- "async-trait",
- "mempalace-core",
- "mempalace-storage",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "time",
- "tokio",
-]
-
-[[package]]
-name = "mempalace-import"
-version = "0.1.0"
-dependencies = [
- "mempalace-core",
-]
-
-[[package]]
-name = "mempalace-ingest"
-version = "0.1.0"
-dependencies = [
- "mempalace-config",
- "mempalace-core",
- "mempalace-embeddings",
- "mempalace-federation",
- "mempalace-storage",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "time",
- "tokio",
- "uuid",
-]
-
-[[package]]
-name = "mempalace-mcp"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "axum",
- "blake3",
- "dirs",
- "mempalace-a2a",
- "mempalace-config",
- "mempalace-core",
- "mempalace-embeddings",
- "mempalace-federation",
- "mempalace-graph",
- "mempalace-mcp-tasks",
- "mempalace-remote",
- "mempalace-search",
- "mempalace-server",
- "mempalace-storage",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "time",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "mempalace-mcp-tasks"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "mempalace-storage",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "time",
-]
-
-[[package]]
-name = "mempalace-remote"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "axum",
- "mempalace-config",
- "mempalace-core",
- "mempalace-embeddings",
- "mempalace-federation",
- "mempalace-server",
- "reqwest",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "mempalace-search"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "mempalace-core",
- "mempalace-dialect",
- "mempalace-embeddings",
- "mempalace-storage",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "time",
- "tokio",
-]
-
-[[package]]
-name = "mempalace-server"
-version = "0.1.0"
-dependencies = [
- "axum",
- "blake3",
- "http-body-util",
- "mempalace-config",
- "mempalace-core",
- "mempalace-embeddings",
- "mempalace-federation",
- "mempalace-graph",
- "mempalace-search",
- "mempalace-storage",
- "rusqlite",
- "serde",
- "serde_json",
- "subtle",
- "tempfile",
- "thiserror 2.0.18",
- "time",
- "tokio",
- "tower",
- "tracing",
-]
-
-[[package]]
-name = "mempalace-storage"
-version = "0.1.0"
-dependencies = [
- "arrow-array",
- "arrow-schema",
- "async-trait",
- "blake3",
- "fs4",
- "futures",
- "lancedb",
- "mempalace-core",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "time",
- "tokio",
- "tracing",
- "uuid",
 ]
 
 [[package]]

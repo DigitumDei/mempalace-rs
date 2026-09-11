@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Broker, Not Peer — MemPalace A2A design</title>
-<meta name="description" content="Not adopted: a design proposal for MemPalace as an A2A broker rather than a peer. Open question 3 of issue #102 was settled the other way - the adapters are reached through the MCP tool surface instead.">
+<title>Broker, Not Peer — AgentPalace A2A design</title>
+<meta name="description" content="Not adopted: a design proposal for AgentPalace as an A2A broker rather than a peer. Open question 3 of issue #102 was settled the other way - the adapters are reached through the MCP tool surface instead.">
 <!--
   Self-contained by design: no webfonts, no scripts, no external requests of any
   kind. Open it straight from the filesystem. See docs/Coordination-Phase-3-Design.md
@@ -321,20 +321,20 @@
     </div>
     <h1>Broker, Not Peer</h1>
     <p class="verdict"><strong>Considered and not adopted.</strong> Open question 3 was settled
-    the other way: both protocol adapters are reached through MemPalace's existing MCP tool
+    the other way: both protocol adapters are reached through AgentPalace's existing MCP tool
     surface, and no A2A HTTP endpoint was built. The reasoning below still holds if a live A2A
     transport is ever wanted &mdash; it was not adopted because the MCP tool surface already
-    gives every caller MemPalace serves a way to reach the adapters, without standing up an
+    gives every caller AgentPalace serves a way to reach the adapters, without standing up an
     inbound broker surface and an outbound HTTP client. Deviation 25 therefore stands: the Agent
     Card is not spec-compliant for a live A2A transport, and <code>interfaces</code> must be
     caller-supplied. See <a href="Coordination-Phase-3-Design.md">Coordination-Phase-3-Design.md</a>.</p>
-    <p class="standfirst">A2A assumes every agent is a server with a URL. MemPalace is a mailbox. Reconciling those is not a compromise &mdash; the A2A spec already has first-class vocabulary for it, and using that vocabulary is what lets an agent on a laptop participate without ever opening a port.</p>
+    <p class="standfirst">A2A assumes every agent is a server with a URL. AgentPalace is a mailbox. Reconciling those is not a compromise &mdash; the A2A spec already has first-class vocabulary for it, and using that vocabulary is what lets an agent on a laptop participate without ever opening a port.</p>
   </header>
 
   <section>
     <p class="eyebrow">The question this answers</p>
     <h2>Why the Agent Card was a shell</h2>
-    <p>Stage 5 shipped the <code>mempalace-a2a</code> mapping crate, but left one thing unbuildable. The A2A <code>AgentCard</code> requires <code>supported_interfaces</code>: a non-empty, ordered list where every entry carries a resolvable absolute HTTPS URL. We had no endpoint, so there was nothing truthful to put in it. The card was recorded as not spec-compliant for a live transport &mdash; deviation 25.</p>
+    <p>Stage 5 shipped the <code>agentpalace-a2a</code> mapping crate, but left one thing unbuildable. The A2A <code>AgentCard</code> requires <code>supported_interfaces</code>: a non-empty, ordered list where every entry carries a resolvable absolute HTTPS URL. We had no endpoint, so there was nothing truthful to put in it. The card was recorded as not spec-compliant for a live transport &mdash; deviation 25.</p>
     <p>The instinct was to treat that as a missing feature: give the adapter an HTTP surface and fill the field in. That instinct is wrong, and the reason is worth stating precisely, because it changes what gets built.</p>
   </section>
 
@@ -342,7 +342,7 @@
     <p class="eyebrow">The reframing</p>
     <h2>The disagreement is about who holds the socket</h2>
     <p>A2A's default topology is peer-to-peer. Each agent is a server, has an address, and gets dialled. Discovery means fetching a card, reading a URL, and posting to it.</p>
-    <p>MemPalace is a broker. There are tasks, an inbox, and opaque cursors, and agents <em>pull</em> the work addressed to them. An agent behind a mailbox needs no inbound port, no TLS certificate, and no public address &mdash; which is exactly what makes an agent running on a laptop a first-class participant rather than a second-class one.</p>
+    <p>AgentPalace is a broker. There are tasks, an inbox, and opaque cursors, and agents <em>pull</em> the work addressed to them. An agent behind a mailbox needs no inbound port, no TLS certificate, and no public address &mdash; which is exactly what makes an agent running on a laptop a first-class participant rather than a second-class one.</p>
 
     <figure>
       <svg viewBox="0 0 640 232" role="img" aria-labelledby="topo-title">
@@ -391,7 +391,7 @@
 
           <line x1="310" y1="26" x2="310" y2="214" stroke="var(--rule)" stroke-width="1" stroke-dasharray="3 4"/>
 
-          <text x="352" y="14" font-size="10.5" font-weight="600" letter-spacing="1.3" fill="var(--accent)">MEMPALACE &#8212; BROKER</text>
+          <text x="352" y="14" font-size="10.5" font-weight="600" letter-spacing="1.3" fill="var(--accent)">AGENTPALACE &#8212; BROKER</text>
 
           <rect x="356" y="92" width="104" height="48" rx="3" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.5"/>
           <text x="408" y="112" font-size="11.5" font-weight="700" fill="var(--accent)" text-anchor="middle">PALACE</text>
@@ -486,7 +486,7 @@
           <tr>
             <td class="who">Outbound<br><span class="sub">palace agent &rarr; external agent</span></td>
             <td class="who">They do</td>
-            <td>An HTTP client, structurally like <code>mempalace-remote</code>. Here the remote genuinely has a URL and we dial it.</td>
+            <td>An HTTP client, structurally like <code>agentpalace-remote</code>. Here the remote genuinely has a URL and we dial it.</td>
           </tr>
         </tbody>
       </table>
@@ -508,7 +508,7 @@
 
     <div class="note warn">
       <h3>This wing inverts the default posture</h3>
-      <p>Everywhere else in MemPalace, memory stays local unless deliberately routed out. <code>wing_registry</code> federates <em>by definition</em> &mdash; that is its entire purpose. It therefore needs an explicit, stated rule about what may be filed there.</p>
+      <p>Everywhere else in AgentPalace, memory stays local unless deliberately routed out. <code>wing_registry</code> federates <em>by definition</em> &mdash; that is its entire purpose. It therefore needs an explicit, stated rule about what may be filed there.</p>
       <p>The failure mode is mundane and likely: someone reasons &ldquo;agent things go in the agents wing&rdquo;, picks the wrong one, and has it replicate silently. The name <code>wing_registry</code> was chosen over <code>wing_agent_public</code> for exactly this reason &mdash; two wings with opposite egress semantics should not differ by six characters.</p>
     </div>
   </section>

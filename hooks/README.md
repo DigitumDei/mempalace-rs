@@ -14,7 +14,7 @@ The AI does the actual filing — it knows the conversation context, so it class
 
 ## Init Hook — Session Orientation
 
-The init hook fires on the **first user message of each session** and injects context instructing the AI to call `mempalace_wake_up` before it responds. This means Claude arrives in every session already oriented — it knows its identity, palace status, recent changes, what was decided last time, and what still needs doing.
+The init hook fires on the **first user message of each session** and injects context instructing the AI to call `agentpalace_wake_up` before it responds. This means Claude arrives in every session already oriented — it knows its identity, palace status, recent changes, what was decided last time, and what still needs doing.
 
 It uses a `/tmp/claude-mp-<session_id>` marker file to fire exactly once per session. The marker files are small and are cleared automatically on reboot.
 
@@ -35,7 +35,7 @@ The init hook goes in **`~/.claude/settings.json`** (user-level, applies to all 
     "UserPromptSubmit": [{
       "hooks": [{
         "type": "command",
-        "command": "/Users/YOU/.claude/mempalace-init-hook.sh"
+        "command": "/Users/YOU/.claude/agentpalace-init-hook.sh"
       }]
     }]
   }
@@ -49,7 +49,7 @@ The init hook goes in **`~/.claude/settings.json`** (user-level, applies to all 
     "UserPromptSubmit": [{
       "hooks": [{
         "type": "command",
-        "command": "bash /c/Users/YOU/.claude/mempalace-init-hook.sh"
+        "command": "bash /c/Users/YOU/.claude/agentpalace-init-hook.sh"
       }]
     }]
   }
@@ -58,8 +58,8 @@ The init hook goes in **`~/.claude/settings.json`** (user-level, applies to all 
 
 Copy the script to your Claude config directory first:
 ```bash
-cp hooks/mempalace-init-hook.sh ~/.claude/mempalace-init-hook.sh
-chmod +x ~/.claude/mempalace-init-hook.sh
+cp hooks/agentpalace-init-hook.sh ~/.claude/agentpalace-init-hook.sh
+chmod +x ~/.claude/agentpalace-init-hook.sh
 ```
 
 ### Project settings — Save and PreCompact Hooks
@@ -73,14 +73,14 @@ The save and precompact hooks go in **`.claude/settings.local.json`** in the pro
       "matcher": "*",
       "hooks": [{
         "type": "command",
-        "command": "/absolute/path/to/hooks/mempal_save_hook.sh",
+        "command": "/absolute/path/to/hooks/agentpalace-save-hook.sh",
         "timeout": 30
       }]
     }],
     "PreCompact": [{
       "hooks": [{
         "type": "command",
-        "command": "/absolute/path/to/hooks/mempal_precompact_hook.sh",
+        "command": "/absolute/path/to/hooks/agentpalace-precompact-hook.sh",
         "timeout": 30
       }]
     }]
@@ -90,7 +90,7 @@ The save and precompact hooks go in **`.claude/settings.local.json`** in the pro
 
 Make them executable:
 ```bash
-chmod +x hooks/mempal_save_hook.sh hooks/mempal_precompact_hook.sh
+chmod +x hooks/agentpalace-save-hook.sh hooks/agentpalace-precompact-hook.sh
 ```
 
 ## Install — Codex CLI (OpenAI)
@@ -101,12 +101,12 @@ Add to `.codex/hooks.json`:
 {
   "Stop": [{
     "type": "command",
-    "command": "/absolute/path/to/hooks/mempal_save_hook.sh",
+    "command": "/absolute/path/to/hooks/agentpalace-save-hook.sh",
     "timeout": 30
   }],
   "PreCompact": [{
     "type": "command",
-    "command": "/absolute/path/to/hooks/mempal_precompact_hook.sh",
+    "command": "/absolute/path/to/hooks/agentpalace-precompact-hook.sh",
     "timeout": 30
   }]
 }
@@ -114,27 +114,27 @@ Add to `.codex/hooks.json`:
 
 ## Configuration
 
-Edit `mempal_save_hook.sh` to change:
+Edit `agentpalace-save-hook.sh` to change:
 
 - **`SAVE_INTERVAL=15`** — How many human messages between saves. Lower = more frequent saves, higher = less interruption.
-- **`STATE_DIR`** — Where hook state is stored (defaults to `~/.mempalace/hook_state/`)
-- **`MEMPAL_DIR`** — Optional. Set to a conversations directory to auto-run `mempalace mine <dir>` on each save trigger. Leave blank (default) to let the AI handle saving via the block reason message.
-- **`MEMPAL_MINE_MODE`** — Mine mode used for that auto-ingest. Defaults to `convos` (chat transcripts); set to `projects` if `MEMPAL_DIR` holds source files instead.
+- **`STATE_DIR`** — Where hook state is stored (defaults to `~/.agentpalace/hook_state/`)
+- **`AGENTPALACE_DIR`** — Optional. Set to a conversations directory to auto-run `agentpalace mine <dir>` on each save trigger. Leave blank (default) to let the AI handle saving via the block reason message.
+- **`AGENTPALACE_MINE_MODE`** — Mine mode used for that auto-ingest. Defaults to `convos` (chat transcripts); set to `projects` if `AGENTPALACE_DIR` holds source files instead.
 
-The same two settings exist in `mempal_precompact_hook.sh`; the save hook runs the ingest in the background, the precompact hook runs it synchronously so the data lands before compaction.
+The same two settings exist in `agentpalace-precompact-hook.sh`; the save hook runs the ingest in the background, the precompact hook runs it synchronously so the data lands before compaction.
 
-### mempalace CLI
+### agentpalace CLI
 
 The relevant commands are:
 
 ```bash
-mempalace mine <dir>               # Mine all files in a directory
-mempalace mine <dir> --mode convos # Mine conversation transcripts only
+agentpalace mine <dir>               # Mine all files in a directory
+agentpalace mine <dir> --mode convos # Mine conversation transcripts only
 ```
 
-Auto-ingest is off unless you set `MEMPAL_DIR`. When it is set, the hooks locate
-`mempalace` themselves — first on `PATH`, then at the installer's default
-`~/.mempalace/bin/mempalace` (`.exe` on Windows). Hooks run in a non-interactive shell
+Auto-ingest is off unless you set `AGENTPALACE_DIR`. When it is set, the hooks locate
+`agentpalace` themselves — first on `PATH`, then at the installer's default
+`~/.agentpalace/bin/agentpalace` (`.exe` on Windows). Hooks run in a non-interactive shell
 that often doesn't inherit the installer's PATH changes, which is why the fallback exists.
 If neither lookup finds the binary, the hook logs a line to `hook.log` and skips the
 ingest — it never blocks your session over a missing binary.
@@ -156,7 +156,7 @@ User sends first message of session → Claude Code fires UserPromptSubmit hook
                                                           ↓
                                                    Claude Code injects context into AI turn
                                                           ↓
-                                                   AI calls mempalace_wake_up
+                                                   AI calls agentpalace_wake_up
                                                           ↓
                                                    AI responds, already oriented
 ```
@@ -203,7 +203,7 @@ No counting needed — compaction always warrants a save.
 
 Check the save hook log:
 ```bash
-cat ~/.mempalace/hook_state/hook.log
+cat ~/.agentpalace/hook_state/hook.log
 ```
 
 Example output:

@@ -143,7 +143,7 @@ Run `mine --reindex <dir>` to re-mine a directory and replace content rows with
 locator rows:
 
 ```bash
-mempalace mine /path/to/project --reindex
+agentpalace mine /path/to/project --reindex
 ```
 
 `--reindex` bypasses the unchanged-content skip that would normally leave
@@ -174,10 +174,10 @@ valid UTF-8 always use the legacy stored-content path. Re-mining them with
   overrides like `*.local.json`, and build output) never enters the source set
   because it is simply absent from the index. A `.gitignore` does **not**
   suppress a tracked file: tracked paths remain tracked even after an ignore
-  pattern is added. `.mempalaceignore` is the explicit additional exclusion and
+  pattern is added. `.agentpalaceignore` is the explicit additional exclusion and
   applies to tracked files, including nested files at any depth: it is read from
   the root and from every ancestor directory of each tracked path (in
-  root-to-leaf order), so an intermediate scope such as `a/.mempalaceignore`
+  root-to-leaf order), so an intermediate scope such as `a/.agentpalaceignore`
   applies to `a/b/file.rs` just as `a/b`'s own file does, and deeper scopes take
   precedence over shallower ones. Independently
   of git, the secret-path denylist still applies to tracked index paths: a
@@ -204,7 +204,7 @@ valid UTF-8 always use the legacy stored-content path. Re-mining them with
   filesystem walk is used only for roots that are not Git-backed.
 
 - **Non-Git directories** use a filesystem walk that honors `.gitignore` and
-  `.mempalaceignore` files at every directory level with git-compatible
+  `.agentpalaceignore` files at every directory level with git-compatible
   semantics: nested files are scoped to their own directory, `!` patterns
   re-include previously excluded paths, patterns containing a `/` are anchored
   to the ignore file's directory (unanchored patterns match the basename at any
@@ -227,14 +227,14 @@ The repository-level exclude sources are honored at git's precedence:
 `$GIT_DIR/info/exclude` (Git-backed roots only) and the global excludes file
 (`core.excludesFile`) for every filesystem walk, including non-Git roots. A
 relative `core.excludesFile` is resolved from the Git worktree toplevel (or the
-discovery root for a non-Git walk). As in git, `.mempalaceignore` outranks
+discovery root for a non-Git walk). As in git, `.agentpalaceignore` outranks
 `.gitignore`, which outranks `info/exclude`, which outranks the global excludes
-file. The `.mempalaceignore` exclusion is
+file. The `.agentpalaceignore` exclusion is
 deny-only and takes precedence over a `.gitignore` **across scopes**: a deeper
-`.gitignore` `!` negation can never clear a parent `.mempalaceignore` rule,
+`.gitignore` `!` negation can never clear a parent `.agentpalaceignore` rule,
 which is exactly what the operator explicitly excluded from discovery. Both
 repository-level sources are purely additive and never override the
-`.mempalaceignore` local protection. Their patterns are anchored at the Git
+`.agentpalaceignore` local protection. Their patterns are anchored at the Git
 **toplevel** (as in git, where `info/exclude` and the global file resolve
 leading `/` against the worktree root), so mining a subdirectory of a
 repository matches them against the Git-relative path: a rooted `/secret.md`
@@ -257,7 +257,7 @@ checkouts and its walk does not consult git state or spawn git subprocesses.
 
 `mine --mode convos` walks the conversation directory with the same worktree
 ignore handling as the non-Git project walk: nested `.gitignore`/
-`.mempalaceignore` files (git-compatible semantics) and the built-in skip
+`.agentpalaceignore` files (git-compatible semantics) and the built-in skip
 directories apply, so an export can exclude files explicitly. The scope is
 deliberately narrower than project discovery:
 
@@ -275,7 +275,7 @@ deliberately narrower than project discovery:
 
 The following directory names are always skipped: `.git`, `node_modules`,
 `__pycache__`, `.venv`, `venv`, `env`, `dist`, `build`, `.next`, `coverage`,
-`.mempalace`.
+`.agentpalace`.
 
 Room detection during `init` and `project register` uses the same safe source
 set: rooms are derived from the directories that hold eligible sources, so
@@ -346,7 +346,7 @@ discovered (see [Conversation discovery](#conversation-discovery)).
   - `*.local.json` — local override/config files that commonly hold credentials
 - **Lockfiles**: `package-lock.json`, `Cargo.lock`, `yarn.lock`,
   `pnpm-lock.yaml`, `poetry.lock`, `composer.lock`, `Gemfile.lock`
-- **Palace config**: `mempalace.yaml`, `mempalace.yml`, `mempal.yaml`,
+- **Palace config**: `agentpalace.yaml`, `agentpalace.yml`, `mempal.yaml`,
   `mempal.yml`, `.gitignore`
 
 Every secret-denylist exclusion is counted in the run's discovery metrics (the
@@ -405,7 +405,7 @@ If the remote is unreachable and the route is `remote` or `combined` with
 `write: remote`, the run fails with an explicit error. There is no silent
 fallback to local storage (matching the write semantics of other federated
 operations). For `write: both`, the CLI reports a durable batch ID. Delivery errors and
-progress appear in `mempalace_status` under `replication.ingestion`; see the
+progress appear in `agentpalace_status` under `replication.ingestion`; see the
 [durability and recovery contract](Federation.md#durable-canonical-mining-write-both).
 
 If the current git branch differs from the repository's default branch, `mine`

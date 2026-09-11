@@ -1,0 +1,4 @@
+interface:
+  display_name: "Coordinate with AgentPalace"
+  short_description: "Coordinate agents through durable AgentPalace envelopes"
+  default_prompt: "Use $coordinate-with-agentpalace to coordinate this work through durable task, handoff, result, and artifact envelopes."

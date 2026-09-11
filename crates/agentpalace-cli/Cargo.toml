@@ -1,0 +1,40 @@
+[package]
+name = "agentpalace-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "agentpalace"
+path = "src/main.rs"
+
+[dependencies]
+axum = { version = "0.8", default-features = true }
+clap = { version = "4.5.50", features = ["derive"] }
+dirs.workspace = true
+agentpalace-config = { path = "../agentpalace-config" }
+agentpalace-core = { path = "../agentpalace-core" }
+agentpalace-mcp = { path = "../agentpalace-mcp" }
+agentpalace-ingest = { path = "../agentpalace-ingest" }
+agentpalace-embeddings = { path = "../agentpalace-embeddings" }
+agentpalace-federation = { path = "../agentpalace-federation" }
+agentpalace-remote = { path = "../agentpalace-remote" }
+agentpalace-search = { path = "../agentpalace-search" }
+agentpalace-server = { path = "../agentpalace-server" }
+agentpalace-storage = { path = "../agentpalace-storage" }
+serde_json.workspace = true
+serde_yaml.workspace = true
+tokio = { version = "1.48.0", features = ["rt-multi-thread", "net", "signal"] }
+tempfile = "3.23.0"
+time.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+toml_edit = "0.25.11"
+toml.workspace = true
+
+[dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+[lints]
+workspace = true

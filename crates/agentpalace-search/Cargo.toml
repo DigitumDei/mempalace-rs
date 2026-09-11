@@ -1,0 +1,23 @@
+[package]
+name = "agentpalace-search"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+agentpalace-core = { path = "../agentpalace-core" }
+agentpalace-dialect = { path = "../agentpalace-dialect" }
+agentpalace-embeddings = { path = "../agentpalace-embeddings" }
+agentpalace-storage = { path = "../agentpalace-storage" }
+thiserror.workspace = true
+time.workspace = true
+
+[dev-dependencies]
+async-trait = "0.1.89"
+serde_json = "1"
+tempfile = "3"
+tokio = { version = "1.48.0", features = ["macros", "rt"] }
+
+[lints]
+workspace = true

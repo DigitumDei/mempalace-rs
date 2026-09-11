@@ -1,14 +1,14 @@
 # AgentPalace installer - downloads the Windows x86_64 stable build, verifies its
-# signed manifest and checksums, installs to ~\.mempalace\bin, registers the MCP server with
+# signed manifest and checksums, installs to ~\.agentpalace\bin, registers the MCP server with
 # detected AI tools, and warms the embedding model.
 #
 #   irm https://raw.githubusercontent.com/DigitumDei/agentpalace/main/install.ps1 | iex
 #
 # Piped `iex` cannot pass parameters; either download the script first and run
 # it with parameters, or set the env-var equivalents before the one-liner:
-#   -NoSetup      / $env:MEMPALACE_NO_SETUP = '1'   skip MCP registration + model warm-up
-#   -NoPath       / $env:MEMPALACE_NO_PATH  = '1'   skip PATH update
-#   -InstallDir   / $env:MEMPALACE_INSTALL_DIR      install somewhere else
+#   -NoSetup      / $env:AGENTPALACE_NO_SETUP = '1'   skip MCP registration + model warm-up
+#   -NoPath       / $env:AGENTPALACE_NO_PATH  = '1'   skip PATH update
+#   -InstallDir   / $env:AGENTPALACE_INSTALL_DIR      install somewhere else
 
 [CmdletBinding()]
 param(
@@ -17,7 +17,9 @@ param(
     [string]$InstallDir,
     [ValidateSet('stable', 'nightly')]
     [string]$Channel = 'stable',
-    [string]$Version
+    [string]$Version,
+    [string]$MigrationFrom = (Join-Path $HOME '.mempalace'),
+    [string]$MigrationTo = (Join-Path $HOME '.agentpalace')
 )
 
 $ErrorActionPreference = 'Stop'
@@ -26,14 +28,15 @@ if ($PSVersionTable.PSEdition -ne 'Core' -or $PSVersionTable.PSVersion -lt [vers
     throw 'The signed installer requires PowerShell 7.1 or later. Install it from https://aka.ms/powershell.'
 }
 
-if (-not $NoSetup -and $env:MEMPALACE_NO_SETUP -eq '1') { $NoSetup = $true }
-if (-not $NoPath -and $env:MEMPALACE_NO_PATH -eq '1') { $NoPath = $true }
-if ($Channel -eq 'stable' -and $env:MEMPALACE_CHANNEL) { $Channel = $env:MEMPALACE_CHANNEL }
-if (-not $Version -and $env:MEMPALACE_VERSION) { $Version = $env:MEMPALACE_VERSION }
+if (-not $NoSetup -and $env:AGENTPALACE_NO_SETUP -eq '1') { $NoSetup = $true }
+if (-not $NoPath -and $env:AGENTPALACE_NO_PATH -eq '1') { $NoPath = $true }
+if ($Channel -eq 'stable' -and $env:AGENTPALACE_CHANNEL) { $Channel = $env:AGENTPALACE_CHANNEL }
+if (-not $Version -and $env:AGENTPALACE_VERSION) { $Version = $env:AGENTPALACE_VERSION }
 if (-not $InstallDir) {
-    if ($env:MEMPALACE_INSTALL_DIR) { $InstallDir = $env:MEMPALACE_INSTALL_DIR }
-    else { $InstallDir = Join-Path $HOME '.mempalace\bin' }
+    if ($env:AGENTPALACE_INSTALL_DIR) { $InstallDir = $env:AGENTPALACE_INSTALL_DIR }
+    else { $InstallDir = Join-Path $MigrationTo 'bin' }
 }
+$InstallDir = [IO.Path]::GetFullPath($InstallDir)
 
 $repo = 'DigitumDei/agentpalace'
 if ($Channel -eq 'stable') {
@@ -47,7 +50,7 @@ if ($Channel -eq 'stable') {
     $nightlySha = $Matches[2]
     $releaseUrl = "https://github.com/$repo/releases/download/$Version"
 }
-$assets = @('mempalace-notices-windows-x86_64.txt', 'mempalace-windows-x86_64.exe')
+$assets = @('agentpalace-notices-windows-x86_64.txt', 'agentpalace-windows-x86_64.exe')
 $publicKeyPem = @'
 -----BEGIN PUBLIC KEY-----
 MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAqDpP5+PmejB/5RA2bO/K
@@ -69,7 +72,7 @@ if ($env:PROCESSOR_ARCHITECTURE -ne 'AMD64' -and $env:PROCESSOR_ARCHITEW6432 -ne
     throw "Unsupported architecture: $env:PROCESSOR_ARCHITECTURE. Nightly builds cover Windows x86_64 only. Build from source instead: https://github.com/$repo/blob/main/docs/Quickstart.md"
 }
 
-$tmpDir = Join-Path ([System.IO.Path]::GetTempPath()) ("mempalace-install-" + [System.IO.Path]::GetRandomFileName())
+$tmpDir = Join-Path ([System.IO.Path]::GetTempPath()) ("agentpalace-install-" + [System.IO.Path]::GetRandomFileName())
 New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
 
 try {
@@ -167,7 +170,7 @@ try {
             throw "Release manifest is missing a unique entry for $asset"
         }
         $manifestAsset = $manifestAssets[0]
-        $expectedComponent = if ($asset.StartsWith('mempalace-notices-')) { 'notices' } else { 'cli' }
+        $expectedComponent = if ($asset.StartsWith('agentpalace-notices-')) { 'notices' } else { 'cli' }
         if ($manifestAsset.component -ne $expectedComponent -or
             $manifestAsset.target -ne 'windows-x86_64' -or
             $manifestAsset.sha256 -ne $actual -or
@@ -176,19 +179,25 @@ try {
         }
     }
 
-    $updated = (Test-Path (Join-Path $InstallDir 'mempalace.exe')) -or
-        (Test-Path (Join-Path $InstallDir 'mempalace-cli.exe')) -or
-        (Test-Path (Join-Path $InstallDir 'mempalace-mcp.exe'))
+    # Only the signed, checksum-verified executable may migrate local data.
+    # This runs even with -NoSetup: existing registrations must follow the rename.
+    & (Join-Path $tmpDir 'agentpalace-windows-x86_64.exe') migrate `
+        --from $MigrationFrom --to $MigrationTo --mcp-path (Join-Path $InstallDir 'agentpalace.exe')
+    if ($LASTEXITCODE -ne 0) { throw 'Migration failed. Existing backups are retained; resolve the reported issue and rerun this installer.' }
+
+    $updated = (Test-Path (Join-Path $InstallDir 'agentpalace.exe')) -or
+        (Test-Path (Join-Path $InstallDir 'agentpalace-cli.exe')) -or
+        (Test-Path (Join-Path $InstallDir 'agentpalace-mcp.exe'))
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
 
     # Clean up .old files left behind by a previous locked-file update.
-    Get-ChildItem -LiteralPath $InstallDir -Filter 'mempalace*.old' -File -ErrorAction SilentlyContinue | ForEach-Object {
+    Get-ChildItem -LiteralPath $InstallDir -Filter 'agentpalace*.old' -File -ErrorAction SilentlyContinue | ForEach-Object {
         try { Remove-Item -LiteralPath $_.FullName -Force -Confirm:$false -ErrorAction Stop } catch {}
     }
 
     foreach ($asset in $assets) {
-        # mempalace-windows-x86_64.exe -> mempalace.exe
-        $target = Join-Path $InstallDir $(if ($asset.StartsWith('mempalace-notices-')) { 'ONNXRuntime-NOTICES.txt' } else { 'mempalace.exe' })
+        # agentpalace-windows-x86_64.exe -> agentpalace.exe
+        $target = Join-Path $InstallDir $(if ($asset.StartsWith('agentpalace-notices-')) { 'ONNXRuntime-NOTICES.txt' } else { 'agentpalace.exe' })
         $source = Join-Path $tmpDir $asset
         try {
             Move-Item -Path $source -Destination $target -Force -ErrorAction Stop
@@ -203,62 +212,69 @@ try {
 
     # Retire legacy entry points after installing the replacement. A running
     # legacy server may lock its executable; rename it out of PATH for now.
-    foreach ($legacyName in @('mempalace-cli.exe', 'mempalace-mcp.exe')) {
+    foreach ($legacyName in @('mempalace.exe', 'mempalace-cli.exe', 'mempalace-mcp.exe', 'agentpalace-cli.exe', 'agentpalace-mcp.exe')) {
         $legacyPath = Join-Path $InstallDir $legacyName
         if (Test-Path -LiteralPath $legacyPath -PathType Leaf) {
-            try {
-                Remove-Item -LiteralPath $legacyPath -Force -ErrorAction Stop
-            } catch {
-                $retiredPath = "$legacyPath.$([guid]::NewGuid().ToString('N')).old"
-                Move-Item -LiteralPath $legacyPath -Destination $retiredPath -ErrorAction Stop
-            }
+            $retiredPath = "$legacyPath.pre-agentpalace"
+            if (Test-Path -LiteralPath $retiredPath) { throw "Both $legacyPath and its backup exist; resolve this conflict before retrying." }
+            Move-Item -LiteralPath $legacyPath -Destination $retiredPath -ErrorAction Stop
         }
     }
 
     if ($updated) {
         Write-Host "Updated existing install in $InstallDir"
     } else {
-        Write-Host "Installed mempalace.exe (with built-in ONNX Runtime) to $InstallDir"
+        Write-Host "Installed agentpalace.exe (with built-in ONNX Runtime) to $InstallDir"
     }
 
     if (-not $NoPath) {
         $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+        $legacyBin = Join-Path $MigrationFrom 'bin'
+        $userPath = (($userPath -split ';') | Where-Object { $_ -and $_.TrimEnd('\') -ine $legacyBin.TrimEnd('\') }) -join ';'
         $onPath = ($userPath -split ';') -contains $InstallDir
         if (-not $onPath) {
             $newPath = if ($userPath) { "$userPath;$InstallDir" } else { $InstallDir }
             [Environment]::SetEnvironmentVariable('Path', $newPath, 'User')
             Write-Host "Added $InstallDir to your user PATH - new terminals will pick it up."
         }
+        else { [Environment]::SetEnvironmentVariable('Path', $userPath, 'User') }
+        $env:Path = (($env:Path -split ';') | Where-Object { $_ -and $_.TrimEnd('\') -ine $legacyBin.TrimEnd('\') }) -join ';'
         if (($env:Path -split ';') -notcontains $InstallDir) {
             $env:Path = "$InstallDir;$env:Path"
         }
     }
 
     if (-not $NoSetup) {
-        & (Join-Path $InstallDir 'mempalace.exe') setup
-        if ($LASTEXITCODE -ne 0) {
+        $previousConfigDir = $env:AGENTPALACE_CONFIG_DIR
+        try {
+            # Persist the selected home into newly created MCP registrations.
+            $env:AGENTPALACE_CONFIG_DIR = [IO.Path]::GetFullPath($MigrationTo)
+            & (Join-Path $InstallDir 'agentpalace.exe') setup
+            $setupExitCode = $LASTEXITCODE
+        } finally { $env:AGENTPALACE_CONFIG_DIR = $previousConfigDir }
+        if ($setupExitCode -ne 0) {
             # setup exits non-zero only when the embedding model could not be
             # made usable offline (see the "check:" line above). The install
             # itself succeeded, so warn with remediation rather than aborting.
             Write-Warning @"
 The embedding-model warm-up in setup failed.
-mempalace (with built-in ONNX Runtime) is installed and usable, but the MCP server
+agentpalace (with built-in ONNX Runtime) is installed and usable, but the MCP server
 will abort with OfflineStartup until the model cache is complete.
 Fix: re-run setup with network access to download the model:
-  $(Join-Path $InstallDir 'mempalace.exe') setup
+  $(Join-Path $InstallDir 'agentpalace.exe') setup
 or stage the model cache yourself and re-run with the warm-up skipped:
-  $(Join-Path $InstallDir 'mempalace.exe') setup --no-model-warmup
+  $(Join-Path $InstallDir 'agentpalace.exe') setup --no-model-warmup
 "@
         }
     } else {
         Write-Host 'Skipped MCP registration and model warm-up. Run them later with:'
-        Write-Host "  $(Join-Path $InstallDir 'mempalace.exe') setup"
+        Write-Host "  $(Join-Path $InstallDir 'agentpalace.exe') setup"
     }
 
     Write-Host ''
     Write-Host 'AgentPalace is installed. Next steps:'
-    Write-Host '  mempalace init C:\path\to\your\project    # create a palace for a project'
-    Write-Host '  mempalace mine C:\path\to\your\project    # ingest its files'
+    Write-Host '  agentpalace init C:\path\to\your\project    # create a palace for a project'
+    Write-Host '  agentpalace mine C:\path\to\your\project    # ingest its files'
     Write-Host ''
     Write-Host "Full walkthrough: https://github.com/$repo/blob/main/docs/Quickstart.md"
 } finally {

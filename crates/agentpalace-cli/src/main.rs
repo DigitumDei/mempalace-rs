@@ -1,0 +1,6500 @@
+#![allow(missing_docs)]
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::env;
+use std::fs;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use agentpalace_config::{
+    ConfigFileV1, ConfigLoader, AgentPalaceConfig, ProjectConfig, ProjectRegistryEntryV1,
+    ProjectRoomConfig, ResolvedPaths, RouteMode, RouteQuery, WriteTarget, build_runtime,
+    resolve_route,
+};
+use agentpalace_core::{EmbeddingProfile, RoomId, SearchQuery, WingId};
+use agentpalace_embeddings::{
+    DeterministicStubProvider, EmbeddingProvider, FastembedProvider, FastembedProviderConfig,
+    env_flag, log_startup_validation,
+};
+use agentpalace_federation::{IngestBatchRequest, IngestBatchResponse};
+use agentpalace_ingest::{
+    ConversationExtractMode, ConversationIngestRequest, IngestError, IngestSummary,
+    PROJECTS_BRANCH_INGEST_KIND, PROJECTS_INGEST_KIND, ProjectIngestRequest, ProjectSourceSkip,
+    derive_project_id, ingest_conversations, ingest_project_with_replication,
+    prepare_project_batch_with_config, project_branch_source_prefix,
+    project_canonical_source_prefix, project_root_relative, wing_kind_source_prefix,
+};
+use agentpalace_remote::{RemoteApi, RemoteClient, RemoteEndpoint, RemoteError};
+use agentpalace_search::{Layer1Config, SearchRuntime, SearchRuntimePolicy, WakeUpRequest};
+use agentpalace_server::{TokenRegistry, build_router};
+use agentpalace_storage::{
+    DrawerFilter, DrawerStore, IngestManifestStore, MaintenanceSettings, StorageEngine,
+    StorageLayout,
+};
+use serde_yaml::Mapping;
+use tracing_subscriber::{EnvFilter, fmt};
+
+mod migrate;
+mod setup;
+mod transport;
+
+const DEFERRED_COMMAND_DOC: &str = "docs/rust-phase-plans/Phase09-Deferred-Commands.md";
+
+const INIT_HEADER_WIDTH: usize = 55;
+const STATUS_HEADER_WIDTH: usize = 55;
+const SEARCH_HEADER_WIDTH: usize = 60;
+const WAKE_UP_SEPARATOR_WIDTH: usize = 50;
+
+const FOLDER_ROOM_MAP: &[(&str, &str)] = &[
+    ("frontend", "frontend"),
+    ("front_end", "frontend"),
+    ("client", "frontend"),
+    ("ui", "frontend"),
+    ("views", "frontend"),
+    ("components", "frontend"),
+    ("pages", "frontend"),
+    ("backend", "backend"),
+    ("back_end", "backend"),
+    ("server", "backend"),
+    ("api", "backend"),
+    ("routes", "backend"),
+    ("services", "backend"),
+    ("controllers", "backend"),
+    ("models", "backend"),
+    ("database", "backend"),
+    ("db", "backend"),
+    ("docs", "documentation"),
+    ("doc", "documentation"),
+    ("documentation", "documentation"),
+    ("wiki", "documentation"),
+    ("readme", "documentation"),
+    ("notes", "documentation"),
+    ("design", "design"),
+    ("designs", "design"),
+    ("mockups", "design"),
+    ("wireframes", "design"),
+    ("assets", "design"),
+    ("storyboard", "design"),
+    ("costs", "costs"),
+    ("cost", "costs"),
+    ("budget", "costs"),
+    ("finance", "costs"),
+    ("financial", "costs"),
+    ("pricing", "costs"),
+    ("invoices", "costs"),
+    ("accounting", "costs"),
+    ("meetings", "meetings"),
+    ("meeting", "meetings"),
+    ("calls", "meetings"),
+    ("meeting_notes", "meetings"),
+    ("standup", "meetings"),
+    ("minutes", "meetings"),
+    ("team", "team"),
+    ("staff", "team"),
+    ("hr", "team"),
+    ("hiring", "team"),
+    ("employees", "team"),
+    ("people", "team"),
+    ("research", "research"),
+    ("references", "research"),
+    ("reading", "research"),
+    ("papers", "research"),
+    ("planning", "planning"),
+    ("roadmap", "planning"),
+    ("strategy", "planning"),
+    ("specs", "planning"),
+    ("requirements", "planning"),
+    ("tests", "testing"),
+    ("test", "testing"),
+    ("testing", "testing"),
+    ("qa", "testing"),
+    ("scripts", "scripts"),
+    ("tools", "scripts"),
+    ("utils", "scripts"),
+    ("config", "configuration"),
+    ("configs", "configuration"),
+    ("settings", "configuration"),
+    ("infrastructure", "configuration"),
+    ("infra", "configuration"),
+    ("deploy", "configuration"),
+];
+
+fn main() {
+    init_tracing("info");
+
+    let result = run_cli_with_validation_factory(
+        env::args_os().skip(1),
+        &CliContext::production(),
+        fastembed_provider,
+        fastembed_validation_provider,
+        fastembed_download_provider,
+    );
+
+    match result {
+        Ok(output) => {
+            if !output.stdout.is_empty() {
+                print!("{}", output.stdout);
+            }
+            if !output.stderr.is_empty() {
+                eprint!("{}", output.stderr);
+            }
+            std::process::exit(output.exit_code);
+        }
+        Err(error) => {
+            eprint!("{error}");
+            std::process::exit(2);
+        }
+    }
+}
+
+fn init_tracing(default_filter: &str) {
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
+
+    let _ =
+        fmt().with_env_filter(filter).with_target(false).with_writer(std::io::stderr).try_init();
+}
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "agentpalace",
+    about = "AgentPalace — Local-first memory, continuity, and coordination for AI agents.",
+    version = agentpalace_core::BUILD_VERSION
+)]
+struct Cli {
+    #[arg(
+        long,
+        global = true,
+        value_name = "PATH",
+        help = "Where the palace lives (default: from ~/.agentpalace/config.json or ~/.agentpalace/palace)"
+    )]
+    palace: Option<PathBuf>,
+
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Debug, Subcommand)]
+enum Commands {
+    /// Detect rooms from your project's safe source directories.
+    Init {
+        dir: PathBuf,
+        #[arg(long, help = "Auto-accept detected rooms")]
+        yes: bool,
+        #[arg(
+            long = "repo-config",
+            help = "Also write a portable repository-local agentpalace.yaml"
+        )]
+        repo_config: bool,
+        #[arg(
+            long = "project-id",
+            alias = "project",
+            help = "Explicit stable project ID for repositories without a usable origin"
+        )]
+        project_id: Option<String>,
+    },
+    /// Mine files into the palace.
+    Mine {
+        dir: PathBuf,
+        #[arg(long, value_enum, default_value_t = CliMode::Projects)]
+        mode: CliMode,
+        #[arg(long)]
+        wing: Option<String>,
+        #[arg(long = "project-id", alias = "project", help = "Explicit project registry ID")]
+        project_id: Option<String>,
+        #[arg(long, default_value = "agentpalace")]
+        agent: String,
+        #[arg(long, default_value_t = 0)]
+        limit: usize,
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        #[arg(
+            long = "reindex",
+            help = "Re-process all discovered files even if their content hash is unchanged (migration path from content rows to locator rows)"
+        )]
+        reindex: bool,
+        #[arg(long, value_enum, default_value_t = CliExtractMode::Exchange)]
+        extract: CliExtractMode,
+        #[arg(
+            long,
+            conflicts_with = "full",
+            help = "Mine only files changed vs the merge-base with the default branch (local branch-delta mining). When omitted, the checkout type is detected automatically: canonical checkouts perform a full mine, non-canonical checkouts perform a branch-delta mine."
+        )]
+        branch: bool,
+        #[arg(
+            long = "batch-size",
+            value_name = "N",
+            help = "Largest batch to process at once; lower it to bound peak memory/CPU on low-spec machines. Local mine: chunks embedded per batch (default: a file's chunks together). Remote mine: files per request (default: 64). 0 or omitted keeps the default."
+        )]
+        batch_size: Option<usize>,
+        #[arg(
+            long,
+            help = "Explicit view/ref name for this mine. Overrides automatic detection. Use 'canonical' to force a full canonical mine."
+        )]
+        view: Option<String>,
+        #[arg(
+            long,
+            help = "Force a full canonical mine, ignoring automatic branch detection. Equivalent to --view canonical."
+        )]
+        full: bool,
+    },
+    /// Inspect and manage centralized project declarations.
+    Project {
+        #[command(subcommand)]
+        command: ProjectCommands,
+    },
+    /// Delete mined project/source data by scope. Previews by default; pass
+    /// `--yes` to actually delete. Local palace only.
+    Prune {
+        #[arg(
+            long = "project-id",
+            alias = "project",
+            help = "Project to prune, as identified at mine time (explicit --project-id or derived repo id)"
+        )]
+        project_id: Option<String>,
+        #[arg(
+            long,
+            help = "Wing to scope to. Taken from the project registry when --project-id is registered; required otherwise, or when scoping by --wing + --kind"
+        )]
+        wing: Option<String>,
+        #[arg(
+            long,
+            value_enum,
+            help = "Restrict to one ingest kind (default: both project kinds)"
+        )]
+        kind: Option<CliPruneKind>,
+        #[arg(
+            long,
+            help = "Restrict to a single branch view; implies the projects-branch kind. Requires --project-id"
+        )]
+        view: Option<String>,
+        #[arg(
+            long = "source-prefix",
+            help = "Restrict to source paths under this normalized prefix, matched against paths relative to the mined project root, e.g. crates/legacy/. Without --view this narrows the canonical snapshot only. Requires --project-id"
+        )]
+        source_prefix: Option<String>,
+        #[arg(
+            long = "dry-run",
+            help = "Preview only; never delete (the default when --yes is absent)"
+        )]
+        dry_run: bool,
+        #[arg(
+            long,
+            help = "Actually delete the matched sources; without this, prune only previews"
+        )]
+        yes: bool,
+    },
+    /// Find anything, exact words.
+    Search {
+        query: String,
+        #[arg(long)]
+        wing: Option<String>,
+        #[arg(long)]
+        room: Option<String>,
+        #[arg(long = "results", default_value_t = 5)]
+        results: usize,
+        #[arg(
+            long,
+            help = "Use a branch view composed over canonical data; use 'full' to search every stored repository view"
+        )]
+        view: Option<String>,
+    },
+    /// Show what's been filed.
+    Status,
+    /// Show L0 + L1 wake-up context.
+    #[command(name = "wake-up")]
+    WakeUp {
+        #[arg(long)]
+        wing: Option<String>,
+    },
+    /// Migrate an offline MemPalace installation and existing MCP registrations.
+    Migrate {
+        #[arg(long, help = "Old config/data home (default: ~/.mempalace)")]
+        from: Option<PathBuf>,
+        #[arg(long, help = "New config/data home (default: ~/.agentpalace)")]
+        to: Option<PathBuf>,
+        #[arg(long, help = "Final installed executable path for MCP registrations")]
+        mcp_path: PathBuf,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Wire the agentpalace MCP server into your installed AI coding tools.
+    Setup {
+        #[arg(
+            long = "dry-run",
+            help = "Preview what would change without writing anything or running tool commands"
+        )]
+        dry_run: bool,
+        #[arg(
+            long = "mcp-path",
+            help = "Path to the agentpalace executable (default: this executable)"
+        )]
+        mcp_path: Option<PathBuf>,
+        #[arg(
+            long,
+            value_delimiter = ',',
+            help = "Limit to specific tools (comma-separated): claude,codex,gemini,opencode,copilot,antigravity,jules"
+        )]
+        tools: Option<Vec<String>>,
+        #[arg(
+            long = "no-model-warmup",
+            help = "Skip the embedding-model warm-up and offline startup check (e.g. air-gapped operators who stage the model cache themselves)"
+        )]
+        no_model_warmup: bool,
+    },
+    /// Deferred in Rust Phase 9. See the linked decision record.
+    Split {
+        dir: PathBuf,
+        #[arg(long = "output-dir")]
+        output_dir: Option<PathBuf>,
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        #[arg(long = "min-sessions", default_value_t = 2)]
+        min_sessions: usize,
+    },
+    /// Deferred in Rust Phase 9. See the linked decision record.
+    Compress {
+        #[arg(long)]
+        wing: Option<String>,
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Run a single maintenance pass (compact, prune, optimize) using configured settings.
+    Maintain,
+    /// Serve MCP and federation over HTTP, or MCP over stdio.
+    Serve {
+        #[arg(long, conflicts_with_all = ["bind", "token_file"])]
+        stdio: bool,
+        #[arg(long, help = "Bind address, e.g. 127.0.0.1:8765 (default: from config)")]
+        bind: Option<SocketAddr>,
+        #[arg(
+            long = "token-file",
+            help = "Path to the bearer token JSON file (default: ~/.agentpalace/server_tokens.json)"
+        )]
+        token_file: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+enum CliMode {
+    Projects,
+    Convos,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+enum CliExtractMode {
+    Exchange,
+    General,
+}
+
+/// Ingest kinds that `prune` is allowed to target. Restricting the CLI surface
+/// to these two project kinds keeps prune from ever selecting diary, narrative,
+/// or conversation drawers by scope. Rendered by clap as `projects` /
+/// `projects-branch`, matching the stored `ingest_kind`.
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+enum CliPruneKind {
+    Projects,
+    ProjectsBranch,
+}
+
+impl CliPruneKind {
+    fn ingest_kind(self) -> &'static str {
+        match self {
+            CliPruneKind::Projects => PROJECTS_INGEST_KIND,
+            CliPruneKind::ProjectsBranch => PROJECTS_BRANCH_INGEST_KIND,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CliContext {
+    config_base_dir: Option<PathBuf>,
+}
+
+impl CliContext {
+    fn production() -> Self {
+        Self { config_base_dir: None }
+    }
+
+    #[cfg(test)]
+    fn for_tests(config_base_dir: PathBuf) -> Self {
+        Self { config_base_dir: Some(config_base_dir) }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CliOutput {
+    exit_code: i32,
+    stdout: String,
+    stderr: String,
+}
+
+impl CliOutput {
+    fn success(stdout: impl Into<String>) -> Self {
+        Self { exit_code: 0, stdout: stdout.into(), stderr: String::new() }
+    }
+
+    fn failure(exit_code: i32, stderr: impl Into<String>) -> Self {
+        Self { exit_code, stdout: String::new(), stderr: stderr.into() }
+    }
+}
+
+/// Combine a local success with a best-effort remote replication result.
+///
+/// The local write determines the command's exit status. If a future remote
+/// path returns a failure output instead of encoding its status in stdout, its
+/// stderr still needs to be surfaced to the user without turning the local
+/// success into a command failure.
+fn combine_dual_write_outputs(local: CliOutput, remote: CliOutput) -> CliOutput {
+    let remote_text = if remote.exit_code == 0 || remote.stderr.trim().is_empty() {
+        remote.stdout
+    } else {
+        remote.stderr
+    };
+    CliOutput::success(format!("{}\n{}", local.stdout.trim(), remote_text.trim()))
+}
+
+fn run_cli<I, T, F, P>(
+    args: I,
+    context: &CliContext,
+    provider_factory: F,
+) -> Result<CliOutput, clap::Error>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+    F: Fn(EmbeddingProfile, PathBuf) -> Result<P, Box<dyn std::error::Error>> + Copy,
+    P: EmbeddingProvider + Send + Sync + 'static,
+{
+    // The test harness has no download-capable provider, so the warm-up factory
+    // is the regular stub factory: warm-up and the offline startup check are
+    // trivially satisfied.
+    run_cli_with_validation_factory(
+        args,
+        context,
+        provider_factory,
+        provider_factory,
+        provider_factory,
+    )
+}
+
+fn run_cli_with_validation_factory<I, T, F, P, G, Q, H>(
+    args: I,
+    context: &CliContext,
+    provider_factory: F,
+    validation_provider_factory: G,
+    warmup_provider_factory: H,
+) -> Result<CliOutput, clap::Error>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+    F: Fn(EmbeddingProfile, PathBuf) -> Result<P, Box<dyn std::error::Error>>,
+    P: EmbeddingProvider + Send + Sync + 'static,
+    G: Fn(EmbeddingProfile, PathBuf) -> Result<Q, Box<dyn std::error::Error>>,
+    Q: EmbeddingProvider,
+    H: Fn(EmbeddingProfile, PathBuf) -> Result<P, Box<dyn std::error::Error>>,
+{
+    let argv = std::iter::once(std::ffi::OsString::from("agentpalace"))
+        .chain(args.into_iter().map(Into::into))
+        .collect::<Vec<_>>();
+    let cli = match Cli::try_parse_from(argv) {
+        Ok(cli) => cli,
+        Err(error) if error.kind() == clap::error::ErrorKind::DisplayHelp => {
+            return Ok(CliOutput::success(error.to_string()));
+        }
+        Err(error) if error.kind() == clap::error::ErrorKind::DisplayVersion => {
+            return Ok(CliOutput::success(error.to_string()));
+        }
+        Err(error) => return Err(error),
+    };
+
+    if cli.command.is_none() {
+        return Ok(CliOutput::success(render_help()));
+    }
+
+    execute(cli, context, provider_factory, validation_provider_factory, warmup_provider_factory)
+}
+
+fn render_help() -> String {
+    let mut command = Cli::command();
+    let mut buffer = Vec::new();
+    if command.write_long_help(&mut buffer).is_err() {
+        return "agentpalace\n".to_owned();
+    }
+    String::from_utf8_lossy(&buffer).into_owned()
+}
+
+fn execute<F, P, G, Q, H>(
+    cli: Cli,
+    context: &CliContext,
+    provider_factory: F,
+    validation_provider_factory: G,
+    warmup_provider_factory: H,
+) -> Result<CliOutput, clap::Error>
+where
+    F: Fn(EmbeddingProfile, PathBuf) -> Result<P, Box<dyn std::error::Error>>,
+    P: EmbeddingProvider + Send + Sync + 'static,
+    G: Fn(EmbeddingProfile, PathBuf) -> Result<Q, Box<dyn std::error::Error>>,
+    Q: EmbeddingProvider,
+    H: Fn(EmbeddingProfile, PathBuf) -> Result<P, Box<dyn std::error::Error>>,
+{
+    let Some(command) = cli.command else {
+        return Ok(CliOutput::success(render_help()));
+    };
+    match command {
+        Commands::Init { dir, yes, repo_config, project_id } => execute_init(
+            &dir,
+            yes,
+            repo_config,
+            project_id.as_deref(),
+            cli.palace.as_deref(),
+            context,
+            validation_provider_factory,
+        ),
+        Commands::Mine {
+            dir,
+            mode,
+            wing,
+            project_id,
+            agent,
+            limit,
+            dry_run,
+            reindex,
+            extract,
+            branch,
+            batch_size,
+            view,
+            full,
+        } => execute_mine(
+            &dir,
+            mode,
+            wing,
+            project_id,
+            agent,
+            limit,
+            dry_run,
+            reindex,
+            extract,
+            branch,
+            batch_size,
+            view,
+            full,
+            cli.palace.as_deref(),
+            context,
+            provider_factory,
+        ),
+        Commands::Project { command } => execute_project_command(command, context),
+        Commands::Prune { project_id, wing, kind, view, source_prefix, dry_run, yes } => {
+            execute_prune(
+                project_id,
+                wing,
+                kind,
+                view,
+                source_prefix,
+                dry_run,
+                yes,
+                cli.palace.as_deref(),
+                context,
+            )
+        }
+        Commands::Search { query, wing, room, results, view } => execute_search(
+            &query,
+            wing,
+            room,
+            results,
+            view,
+            cli.palace.as_deref(),
+            context,
+            provider_factory,
+        ),
+        Commands::Status => execute_status(cli.palace.as_deref(), context),
+        Commands::WakeUp { wing } => {
+            execute_wake_up(wing, cli.palace.as_deref(), context, provider_factory)
+        }
+        Commands::Migrate { from, to, mcp_path, dry_run } => {
+            let result = (|| {
+                let home = dirs::home_dir().ok_or_else(|| std::io::Error::other("No home directory"))?;
+                if !dry_run { migrate::check_stopped()?; }
+                migrate::run(&from.unwrap_or_else(|| home.join(".mempalace")),
+                    &to.unwrap_or_else(|| home.join(".agentpalace")), &home, &mcp_path, dry_run)
+            })();
+            Ok(match result {
+                Ok(text) => CliOutput::success(text),
+                Err(err) => CliOutput::failure(1, format!("Migration aborted: {err}\n")),
+            })
+        }
+        Commands::Setup { dry_run, mcp_path, tools, no_model_warmup } => {
+            let report = setup::run_setup(&setup::SetupOptions { mcp_path, dry_run, only: tools });
+            let mut text = report.render();
+            if dry_run || no_model_warmup {
+                let reason = if dry_run { "dry run" } else { "--no-model-warmup" };
+                text.push_str(&format!("  (embedding model warm-up skipped: {reason})\n\n"));
+                return Ok(CliOutput::success(text));
+            }
+            let warmup = run_setup_model_warmup(
+                context.config_base_dir.as_deref(),
+                provider_factory,
+                warmup_provider_factory,
+            );
+            text.push_str(&warmup.text);
+            Ok(CliOutput {
+                exit_code: if warmup.offline_ok { 0 } else { 1 },
+                stdout: text,
+                stderr: String::new(),
+            })
+        }
+        Commands::Split { .. } => Ok(deferred_command("split")),
+        Commands::Compress { .. } => Ok(deferred_command("compress")),
+        Commands::Maintain => execute_maintain(cli.palace.as_deref(), context),
+        Commands::Serve { bind, token_file, stdio } => {
+            if stdio {
+                let config =
+                    load_runtime_config(cli.palace.as_deref(), context).map_err(config_error)?;
+                let runtime = build_runtime(&config).map_err(runtime_error)?;
+                runtime.block_on(transport::stdio(config)).map_err(provider_error)?;
+                Ok(CliOutput::success(""))
+            } else {
+                execute_serve(bind, token_file, cli.palace.as_deref(), context, provider_factory)
+            }
+        }
+    }
+}
+
+fn execute_init<F, P>(
+    dir: &Path,
+    yes: bool,
+    repo_config: bool,
+    explicit_project_id: Option<&str>,
+    palace_override: Option<&Path>,
+    context: &CliContext,
+    provider_factory: F,
+) -> Result<CliOutput, clap::Error>
+where
+    F: Fn(EmbeddingProfile, PathBuf) -> Result<P, Box<dyn std::error::Error>>,
+    P: EmbeddingProvider,
+{
+    let project_dir = dir.canonicalize().map_err(|source| {
+        clap::Error::raw(
+            clap::error::ErrorKind::Io,
+            format!("failed to access project directory `{}`: {source}", dir.display()),
+        )
+    })?;
+
+    let detection = detect_rooms(&project_dir).map_err(ingest_error)?;
+    let file_count = detection.file_count;
+    let config_path = project_dir.join("agentpalace.yaml");
+    let legacy_config_path = project_dir.join("mempal.yaml");
+    let existing_config = config_path.exists() || legacy_config_path.exists();
+
+    if existing_config && repo_config && !yes {
+        return Ok(CliOutput::failure(
+            1,
+            format!(
+                "{} already exists; re-run `agentpalace init {}` with `--yes` to overwrite it\n",
+                config_path.display(),
+                project_dir.display()
+            ),
+        ));
+    }
+
+    let runtime_paths = init_runtime_config(palace_override, context).map_err(config_error)?;
+    let config = load_runtime_config(palace_override, context).map_err(config_error)?;
+    let provider = provider_factory(config.embedding_profile, default_embedding_cache_dir())
+        .map_err(provider_error)?;
+    let validation = provider.startup_validation().map_err(provider_error)?;
+    log_startup_validation(&validation);
+
+    let project_config = if existing_config {
+        ConfigLoader::load_project_config(&project_dir).map_err(config_error)?
+    } else {
+        let derived_wing = wing_name_for_dir(&project_dir);
+        let candidate_project_id =
+            derive_project_id(&project_dir, &derived_wing, explicit_project_id);
+        ConfigLoader::resolve_project_config(
+            &project_dir,
+            context.config_base_dir.as_deref(),
+            Some(&candidate_project_id),
+            &derived_wing,
+            detection.rooms.clone(),
+        )
+        .map_err(config_error)?
+    };
+    let derived_project_id =
+        derive_project_id(&project_dir, &project_config.wing, explicit_project_id);
+    let project_id = if explicit_project_id.filter(|id| !id.trim().is_empty()).is_some() {
+        derived_project_id
+    } else {
+        ConfigLoader::find_project_id(
+            context.config_base_dir.as_deref(),
+            &project_dir,
+            Some(&derived_project_id),
+        )
+        .map_err(config_error)?
+        .unwrap_or(derived_project_id)
+    };
+    if explicit_project_id.filter(|id| !id.trim().is_empty()).is_none()
+        && project_id.starts_with("wing:")
+        && ConfigLoader::load_project_registry(context.config_base_dir.as_deref())
+            .map_err(config_error)?
+            .projects
+            .contains_key(&project_id)
+        && ConfigLoader::find_project_id(context.config_base_dir.as_deref(), &project_dir, None)
+            .map_err(config_error)?
+            .is_none()
+    {
+        return Ok(CliOutput::failure(
+            1,
+            format!(
+                "project `{project_id}` is ambiguous for a checkout without a Git origin; pass --project-id\n"
+            ),
+        ));
+    }
+    let project_root = project_root_relative(&project_dir);
+    let registry_path = ConfigLoader::register_project(
+        context.config_base_dir.as_deref(),
+        &project_id,
+        ProjectRegistryEntryV1 {
+            project_root,
+            ..ProjectRegistryEntryV1::from(project_config.clone())
+        },
+        Some(&project_dir),
+    )
+    .map_err(config_error)?;
+
+    if repo_config {
+        write_project_config(&config_path, &project_dir, &project_config, true)
+            .map_err(io_error)?;
+    }
+
+    let mut lines = vec![
+        format!("\n{}", "=".repeat(INIT_HEADER_WIDTH)),
+        "  AgentPalace Init — Local setup".to_owned(),
+        "=".repeat(INIT_HEADER_WIDTH),
+        String::new(),
+        format!("  WING: {}", project_config.wing),
+        render_source_population_line(file_count, detection.source),
+        String::new(),
+    ];
+
+    for room in &detection.rooms {
+        lines.push(format!("    ROOM: {}", room.name));
+        lines
+            .push(format!("          {}", room.description.as_deref().unwrap_or("No description")));
+    }
+
+    lines.extend([
+        String::new(),
+        format!("{}", "─".repeat(INIT_HEADER_WIDTH)),
+        format!("  Project registry: {}", registry_path.display()),
+        if repo_config {
+            format!("  Repository config: {}", config_path.display())
+        } else {
+            "  Repository config: not written (use --repo-config to opt in)".to_owned()
+        },
+        format!("  Palace path: {}", config.palace_path.display()),
+        format!("  Startup validation: {}", validation.status),
+        format!("  Global config: {}", runtime_paths.config_file.display()),
+        "  Next step:".to_owned(),
+        format!("    agentpalace mine {}", project_dir.display()),
+        format!("\n{}\n", "=".repeat(INIT_HEADER_WIDTH)),
+    ]);
+
+    Ok(CliOutput::success(lines.join("\n")))
+}
+
+fn execute_project_command(
+    command: ProjectCommands,
+    context: &CliContext,
+) -> Result<CliOutput, clap::Error> {
+    match command {
+        ProjectCommands::Register { dir, wing, project_id: explicit_project_id, repo_config } => {
+            let project_dir = dir.canonicalize().map_err(|source| {
+                clap::Error::raw(
+                    clap::error::ErrorKind::Io,
+                    format!("failed to access project directory `{}`: {source}", dir.display()),
+                )
+            })?;
+            let RoomDetection { source, rooms, file_count } =
+                detect_rooms(&project_dir).map_err(ingest_error)?;
+            let mut project_config = if project_dir.join("agentpalace.yaml").exists()
+                || project_dir.join("mempalace.yaml").exists()
+                || project_dir.join("mempal.yaml").exists()
+            {
+                ConfigLoader::load_project_config(&project_dir).map_err(config_error)?
+            } else {
+                let derived_wing = wing.clone().unwrap_or_else(|| wing_name_for_dir(&project_dir));
+                let candidate_project_id =
+                    derive_project_id(&project_dir, &derived_wing, explicit_project_id.as_deref());
+                ConfigLoader::resolve_project_config(
+                    &project_dir,
+                    context.config_base_dir.as_deref(),
+                    Some(&candidate_project_id),
+                    &derived_wing,
+                    rooms,
+                )
+                .map_err(config_error)?
+            };
+            if let Some(wing) = wing {
+                project_config.wing = wing;
+            }
+            let derived_project_id = derive_project_id(
+                &project_dir,
+                &project_config.wing,
+                explicit_project_id.as_deref(),
+            );
+            let project_id =
+                if explicit_project_id.as_deref().filter(|id| !id.trim().is_empty()).is_some() {
+                    derived_project_id
+                } else {
+                    ConfigLoader::find_project_id(
+                        context.config_base_dir.as_deref(),
+                        &project_dir,
+                        Some(&derived_project_id),
+                    )
+                    .map_err(config_error)?
+                    .unwrap_or(derived_project_id)
+                };
+            if explicit_project_id.as_deref().filter(|id| !id.trim().is_empty()).is_none()
+                && project_id.starts_with("wing:")
+                && ConfigLoader::load_project_registry(context.config_base_dir.as_deref())
+                    .map_err(config_error)?
+                    .projects
+                    .contains_key(&project_id)
+                && ConfigLoader::find_project_id(
+                    context.config_base_dir.as_deref(),
+                    &project_dir,
+                    None,
+                )
+                .map_err(config_error)?
+                .is_none()
+            {
+                return Ok(CliOutput::failure(
+                    1,
+                    format!(
+                        "project `{project_id}` is ambiguous for a checkout without a Git origin; pass --project-id\n"
+                    ),
+                ));
+            }
+            let registry_path = ConfigLoader::register_project(
+                context.config_base_dir.as_deref(),
+                &project_id,
+                ProjectRegistryEntryV1 {
+                    project_root: project_root_relative(&project_dir),
+                    ..ProjectRegistryEntryV1::from(project_config.clone())
+                },
+                Some(&project_dir),
+            )
+            .map_err(config_error)?;
+            if repo_config {
+                write_project_config(
+                    &project_dir.join("agentpalace.yaml"),
+                    &project_dir,
+                    &project_config,
+                    true,
+                )
+                .map_err(io_error)?;
+            }
+
+            let mut lines = vec![
+                format!("Project registered: {project_id}"),
+                format!("  Wing: {}", project_config.wing),
+                render_source_population_line(file_count, source),
+                format!("  Registry: {}", registry_path.display()),
+            ];
+            if repo_config {
+                lines.push(format!(
+                    "  Repository config: {}",
+                    project_dir.join("agentpalace.yaml").display()
+                ));
+            }
+            Ok(CliOutput::success(format!("{}\n", lines.join("\n"))))
+        }
+        ProjectCommands::Show { dir } => {
+            let project_dir = dir.canonicalize().map_err(|source| {
+                clap::Error::raw(
+                    clap::error::ErrorKind::Io,
+                    format!("failed to access project directory `{}`: {source}", dir.display()),
+                )
+            })?;
+            let derived_wing = wing_name_for_dir(&project_dir);
+            let project_id = derive_project_id(&project_dir, &derived_wing, None);
+            let project_config = ConfigLoader::resolve_project_config(
+                &project_dir,
+                context.config_base_dir.as_deref(),
+                Some(&project_id),
+                &derived_wing,
+                Vec::new(),
+            )
+            .map_err(config_error)?;
+            let project_id = ConfigLoader::find_project_id(
+                context.config_base_dir.as_deref(),
+                &project_dir,
+                Some(&project_id),
+            )
+            .map_err(config_error)?
+            .unwrap_or(project_id);
+            let mut lines = vec![
+                format!("Project: {project_id}"),
+                format!("  Wing: {}", project_config.wing),
+                "  Rooms:".to_owned(),
+            ];
+            lines.extend(project_config.rooms.iter().map(|room| format!("    - {}", room.name)));
+            if let Some(routing) = project_config.routing {
+                lines.push(format!("  Routing: {:?}", routing.mode));
+            }
+            Ok(CliOutput::success(format!("{}\n", lines.join("\n"))))
+        }
+        ProjectCommands::List => {
+            let registry = ConfigLoader::load_project_registry(context.config_base_dir.as_deref())
+                .map_err(config_error)?;
+            let mut lines = vec![format!("Projects: {}", registry.projects.len())];
+            for (project_id, entry) in registry.projects {
+                lines.push(format!("  {project_id} -> {}", entry.wing));
+            }
+            Ok(CliOutput::success(format!("{}\n", lines.join("\n"))))
+        }
+        ProjectCommands::Remove { project_id } => {
+            let (registry_path, removed) =
+                ConfigLoader::remove_project(context.config_base_dir.as_deref(), &project_id)
+                    .map_err(config_error)?;
+            if !removed {
+                return Ok(CliOutput::failure(
+                    1,
+                    format!("project `{project_id}` is not registered\n"),
+                ));
+            }
+            Ok(CliOutput::success(format!(
+                "Removed project {project_id} from {}\n",
+                registry_path.display()
+            )))
+        }
+        ProjectCommands::Export { project_id, dir, repo_config } => {
+            if !repo_config {
+                return Ok(CliOutput::failure(
+                    1,
+                    "project export requires --repo-config\n".to_owned(),
+                ));
+            }
+            let registry = ConfigLoader::load_project_registry(context.config_base_dir.as_deref())
+                .map_err(config_error)?;
+            let entry = registry.projects.get(&project_id).ok_or_else(|| {
+                clap::Error::raw(
+                    clap::error::ErrorKind::InvalidValue,
+                    format!("project `{project_id}` is not registered"),
+                )
+            })?;
+            let target_dir = match dir {
+                Some(dir) => dir.canonicalize().map_err(|source| {
+                    clap::Error::raw(
+                        clap::error::ErrorKind::Io,
+                        format!("failed to access project directory `{}`: {source}", dir.display()),
+                    )
+                })?,
+                None => entry.checkouts.first().cloned().ok_or_else(|| {
+                    clap::Error::raw(
+                        clap::error::ErrorKind::InvalidValue,
+                        format!("project `{project_id}` has no checkout alias; pass --dir"),
+                    )
+                })?,
+            };
+            let project_config = ProjectConfig {
+                wing: entry.wing.clone(),
+                rooms: entry.rooms.clone(),
+                routing: entry.routing.clone(),
+            };
+            let path = target_dir.join("agentpalace.yaml");
+            write_project_config(&path, &target_dir, &project_config, true).map_err(io_error)?;
+            Ok(CliOutput::success(format!("Exported project {project_id} to {}\n", path.display())))
+        }
+    }
+}
+
+/// Delete mined project/source data selected by a structured scope.
+///
+/// Preview-first: without `--yes` (or with `--dry-run`) it only reports what
+/// would be removed. The scope must be narrow — an identified project, or an
+/// explicit wing paired with a kind — so a bare invocation can never wipe the
+/// whole palace, and only the two project ingest kinds are reachable, so
+/// diary/narrative/conversation drawers are never in scope. Local palace only.
+#[allow(clippy::too_many_arguments)]
+fn execute_prune(
+    project_id: Option<String>,
+    wing: Option<String>,
+    kind: Option<CliPruneKind>,
+    view: Option<String>,
+    source_prefix: Option<String>,
+    dry_run: bool,
+    yes: bool,
+    palace_override: Option<&Path>,
+    context: &CliContext,
+) -> Result<CliOutput, clap::Error> {
+    // Reject a present-but-empty scope value. An empty --source-prefix would
+    // otherwise collapse to "no path filter" and silently widen a subtree prune
+    // to the whole project (e.g. an unset shell variable in a script).
+    for (flag, value) in [
+        ("--project-id", &project_id),
+        ("--wing", &wing),
+        ("--view", &view),
+        ("--source-prefix", &source_prefix),
+    ] {
+        if matches!(value.as_deref(), Some(v) if v.trim().is_empty()) {
+            return Ok(CliOutput::failure(2, format!("{flag} must not be empty\n")));
+        }
+    }
+    let mut notes: Vec<String> = Vec::new();
+
+    // ── Resolve the effective wing ───────────────────────────────────────────
+    let effective_wing = match project_id.as_deref() {
+        Some(id) => {
+            // NOTE: project data mined before the stable project-id migration is
+            // keyed by a checkout-path hash rather than hash("project:<id>"), so
+            // --project-id does not match those legacy rows. They are migrated by
+            // a re-mine, or can be swept with an explicit --wing/--kind after
+            // confirming the preview. Reconstructing the legacy prefix here is
+            // deferred (it depends on fragile canonical-path matching).
+            let registered =
+                ConfigLoader::load_project_by_id(context.config_base_dir.as_deref(), id)
+                    .map_err(config_error)?;
+            match (wing.clone(), registered.map(|config| config.wing)) {
+                (Some(explicit), _) => explicit,
+                (None, Some(registered_wing)) => registered_wing,
+                (None, None) => {
+                    return Ok(CliOutput::failure(
+                        2,
+                        format!(
+                            "project `{id}` is not registered; pass --wing to name the wing it was mined into\n"
+                        ),
+                    ));
+                }
+            }
+        }
+        None => {
+            // No project scope: require an explicit wing AND kind so the scope
+            // cannot widen to every project or every kind. Path/branch narrowing
+            // needs a project (the branch and path segments follow the project
+            // root key in the source key), so reject them here.
+            if view.is_some() {
+                return Ok(CliOutput::failure(2, "--view requires --project-id\n".to_owned()));
+            }
+            if source_prefix.is_some() {
+                return Ok(CliOutput::failure(
+                    2,
+                    "--source-prefix requires --project-id\n".to_owned(),
+                ));
+            }
+            match (wing.clone(), kind) {
+                (Some(wing), Some(_)) => wing,
+                _ => {
+                    return Ok(CliOutput::failure(
+                        2,
+                        "prune needs a narrow scope: pass --project-id, or both --wing and --kind\n"
+                            .to_owned(),
+                    ));
+                }
+            }
+        }
+    };
+
+    // ── Resolve the concrete source-key prefixes to match ────────────────────
+    let kinds: Vec<CliPruneKind> = match kind {
+        Some(k) => vec![k],
+        None => vec![CliPruneKind::Projects, CliPruneKind::ProjectsBranch],
+    };
+
+    let mut prefixes: Vec<String> = Vec::new();
+    for k in &kinds {
+        match (project_id.as_deref(), k) {
+            (Some(id), CliPruneKind::Projects) => {
+                if view.is_some() {
+                    // --view only narrows branch views; it does not apply to the
+                    // canonical snapshot, so leave canonical out when it is set.
+                    continue;
+                }
+                let mut prefix = project_canonical_source_prefix(&effective_wing, id);
+                if let Some(sp) = source_prefix.as_deref() {
+                    prefix.push_str(sp);
+                }
+                prefixes.push(prefix);
+            }
+            (Some(id), CliPruneKind::ProjectsBranch) => {
+                match (view.as_deref(), source_prefix.as_deref()) {
+                    (Some(branch), sp) => {
+                        let mut prefix =
+                            project_branch_source_prefix(&effective_wing, id, Some(branch));
+                        if let Some(sp) = sp {
+                            prefix.push_str(sp);
+                        }
+                        prefixes.push(prefix);
+                    }
+                    (None, Some(_)) => {
+                        // A path can't be anchored inside branch views without
+                        // naming the branch (the branch segment precedes the
+                        // path). Skip branch views rather than over-match.
+                        notes.push(
+                            "skipped branch views: --source-prefix needs --view to target a path inside a branch"
+                                .to_owned(),
+                        );
+                    }
+                    (None, None) => {
+                        prefixes.push(project_branch_source_prefix(&effective_wing, id, None));
+                    }
+                }
+            }
+            (None, k) => {
+                // Wing + kind scope (validated above).
+                prefixes.push(wing_kind_source_prefix(k.ingest_kind(), &effective_wing));
+            }
+        }
+    }
+
+    prefixes.sort();
+    prefixes.dedup();
+    if prefixes.is_empty() {
+        return Ok(CliOutput::failure(
+            2,
+            "the given options selected nothing to prune; widen or correct the scope\n".to_owned(),
+        ));
+    }
+
+    // ── Open the palace ──────────────────────────────────────────────────────
+    let config = load_runtime_config(palace_override, context).map_err(config_error)?;
+    if !palace_exists(&config.palace_path) {
+        return Ok(no_palace_error(&config.palace_path));
+    }
+    let runtime = build_runtime(&config).map_err(runtime_error)?;
+    let engine = runtime
+        .block_on(StorageEngine::open(&config.palace_path, config.embedding_profile))
+        .map_err(storage_error)?;
+
+    // ── Preview: gather matched (source_key, drawer_count) across prefixes ────
+    let mut matched: BTreeMap<String, i64> = BTreeMap::new();
+    for prefix in &prefixes {
+        for (source_key, count) in
+            engine.ingested_sources_with_prefix(prefix).map_err(storage_error)?
+        {
+            matched.insert(source_key, count);
+        }
+    }
+    let total_sources = matched.len();
+    let total_drawers: i64 = matched.values().copied().sum();
+
+    // ── Render the scope + preview ───────────────────────────────────────────
+    let kind_labels = kinds.iter().map(|k| k.ingest_kind()).collect::<Vec<_>>().join(", ");
+    let mut lines = vec![
+        format!("\n{}", "=".repeat(STATUS_HEADER_WIDTH)),
+        "  AgentPalace Prune (local palace only)".to_owned(),
+        "=".repeat(STATUS_HEADER_WIDTH),
+        String::new(),
+        format!("  Wing   : {effective_wing}"),
+        format!("  Kinds  : {kind_labels}"),
+    ];
+    if let Some(id) = project_id.as_deref() {
+        lines.push(format!("  Project: {id}"));
+    }
+    if let Some(branch) = view.as_deref() {
+        lines.push(format!("  View   : {branch}"));
+    }
+    if let Some(sp) = source_prefix.as_deref() {
+        lines.push(format!("  Path   : {sp}*"));
+    }
+    for note in &notes {
+        lines.push(format!("  Note   : {note}"));
+    }
+    lines.push(String::new());
+    lines.push(format!("  Matched: {total_sources} sources, {total_drawers} drawers"));
+
+    const PREVIEW_LIMIT: usize = 20;
+    for (source_key, count) in matched.iter().take(PREVIEW_LIMIT) {
+        lines.push(format!("    {count:>6}  {source_key}"));
+    }
+    if total_sources > PREVIEW_LIMIT {
+        lines.push(format!("    … and {} more", total_sources - PREVIEW_LIMIT));
+    }
+    lines.push(String::new());
+
+    if total_sources == 0 {
+        lines.push("  Nothing matched this scope.".to_owned());
+        lines.push("=".repeat(STATUS_HEADER_WIDTH));
+        lines.push(String::new());
+        return Ok(CliOutput::success(lines.join("\n")));
+    }
+
+    if dry_run || !yes {
+        lines.push("  Preview only — re-run with --yes to delete.".to_owned());
+        lines.push("=".repeat(STATUS_HEADER_WIDTH));
+        lines.push(String::new());
+        return Ok(CliOutput::success(lines.join("\n")));
+    }
+
+    // ── Delete (both-store consistent, batched, idempotent) ──────────────────
+    let mut removed_sources = 0usize;
+    let mut removed_drawers = 0usize;
+    for prefix in &prefixes {
+        let (sources, drawers) =
+            runtime.block_on(engine.remove_source_prefix(prefix)).map_err(storage_error)?;
+        removed_sources += sources;
+        removed_drawers += drawers;
+    }
+
+    lines.push(format!("  Removed: {removed_sources} sources, {removed_drawers} drawers"));
+    lines.push("=".repeat(STATUS_HEADER_WIDTH));
+    lines.push(String::new());
+    Ok(CliOutput::success(lines.join("\n")))
+}
+
+fn execute_mine<F, P>(
+    dir: &Path,
+    mode: CliMode,
+    wing: Option<String>,
+    explicit_project_id: Option<String>,
+    agent: String,
+    limit: usize,
+    dry_run: bool,
+    reindex: bool,
+    extract: CliExtractMode,
+    branch: bool,
+    batch_size: Option<usize>,
+    explicit_view: Option<String>,
+    full: bool,
+    palace_override: Option<&Path>,
+    context: &CliContext,
+    provider_factory: F,
+) -> Result<CliOutput, clap::Error>
+where
+    F: Fn(EmbeddingProfile, PathBuf) -> Result<P, Box<dyn std::error::Error>>,
+    P: EmbeddingProvider,
+{
+    if full && explicit_view.is_some() {
+        return Err(clap::Error::raw(
+            clap::error::ErrorKind::ArgumentConflict,
+            "--full cannot be combined with --view; use one canonical-mode selector",
+        ));
+    }
+    if branch && explicit_view.as_deref() == Some("canonical") {
+        return Err(clap::Error::raw(
+            clap::error::ErrorKind::ArgumentConflict,
+            "--branch cannot be combined with --view canonical",
+        ));
+    }
+    let source_dir = dir.canonicalize().map_err(|source| {
+        clap::Error::raw(
+            clap::error::ErrorKind::Io,
+            format!("failed to access source directory `{}`: {source}", dir.display()),
+        )
+    })?;
+
+    let config = load_runtime_config(palace_override, context).map_err(config_error)?;
+    let runtime = build_runtime(&config).map_err(runtime_error)?;
+
+    // ── Auto-detect checkout view (projects mode only) ─────────────────────
+    let (effective_branch, effective_view, automatically_detected_branch) =
+        if mode == CliMode::Projects {
+            let checkout_view = agentpalace_ingest::detect_checkout_view(&source_dir);
+            let (detected_branch, is_auto) = match &checkout_view {
+                agentpalace_ingest::CheckoutView::Canonical => (false, true),
+                agentpalace_ingest::CheckoutView::Branch { .. } => (true, true),
+                agentpalace_ingest::CheckoutView::NonGit => (false, false),
+            };
+
+            // Override logic:
+            // --full forces canonical mode
+            // --view overrides automatic detection
+            // --branch flag still works as before
+            let final_branch = if full || explicit_view.as_deref() == Some("canonical") {
+                false
+            } else if branch || explicit_view.is_some() {
+                true
+            } else if is_auto {
+                detected_branch
+            } else {
+                branch
+            };
+
+            // Resolve the effective view name for the ingest request
+            let final_view = if full || !final_branch {
+                None
+            } else {
+                explicit_view.clone().or_else(|| {
+                    if is_auto {
+                        match &checkout_view {
+                            agentpalace_ingest::CheckoutView::Branch { view_name, .. } => {
+                                Some(view_name.clone())
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    }
+                })
+            };
+
+            (
+                final_branch,
+                final_view,
+                is_auto && detected_branch && !branch && explicit_view.is_none() && !full,
+            )
+        } else {
+            (branch, None, false)
+        };
+
+    // ── Routing decision (projects mode only) ────────────────────────────────
+    if mode == CliMode::Projects {
+        let derived_wing = wing.clone().unwrap_or_else(|| wing_name_for_dir(&source_dir));
+        let candidate_project_id =
+            derive_project_id(&source_dir, &derived_wing, explicit_project_id.as_deref());
+        let project_config = if let Some(project_id) = explicit_project_id.as_deref() {
+            match ConfigLoader::load_project_by_id(context.config_base_dir.as_deref(), project_id)
+                .map_err(config_error)?
+            {
+                Some(config) => config,
+                None => {
+                    return Ok(CliOutput::failure(
+                        1,
+                        format!("project `{project_id}` is not registered\n"),
+                    ));
+                }
+            }
+        } else {
+            ConfigLoader::resolve_project_config(
+                &source_dir,
+                context.config_base_dir.as_deref(),
+                Some(&candidate_project_id),
+                &derived_wing,
+                Vec::new(),
+            )
+            .map_err(config_error)?
+        };
+        let project_id = if let Some(project_id) = explicit_project_id.as_deref() {
+            project_id.to_owned()
+        } else {
+            ConfigLoader::find_project_id(
+                context.config_base_dir.as_deref(),
+                &source_dir,
+                Some(&candidate_project_id),
+            )
+            .map_err(config_error)?
+            .unwrap_or_else(|| derive_project_id(&source_dir, &project_config.wing, None))
+        };
+        let wing_name = wing.clone().unwrap_or_else(|| project_config.wing.clone());
+
+        let project_routing = if wing
+            .as_deref()
+            .is_some_and(|override_wing| !wing_ids_equal(override_wing, &project_config.wing))
+        {
+            None
+        } else {
+            project_config.routing.as_ref()
+        };
+        let rule = resolve_route(
+            &config.federation,
+            project_routing,
+            RouteQuery { wing: Some(&wing_name), room: None, source_file: None },
+        );
+
+        // Whether a *canonical* mine of this wing would be pushed to a remote rather
+        // than stored locally. `write: both` is excluded: it still runs the full local
+        // mine, so it does leave a local canonical snapshot behind.
+        let canonical_routes_remote = rule.mode == RouteMode::Remote
+            || (rule.mode == RouteMode::Combined && rule.write == WriteTarget::Remote);
+
+        // Federated batch ingestion is canonical-only. Keep branch views local
+        // until the batch protocol can carry their metadata end to end.
+        let use_remote = !effective_branch && canonical_routes_remote;
+        let use_both = !effective_branch
+            && rule.mode == RouteMode::Combined
+            && rule.write == WriteTarget::Both;
+
+        if automatically_detected_branch && !use_remote && !use_both {
+            let engine = runtime
+                .block_on(StorageEngine::open(&config.palace_path, config.embedding_profile))
+                .map_err(storage_error)?;
+            let prefix = agentpalace_ingest::project_canonical_source_prefix(&wing_name, &project_id);
+            if engine
+                .operational_store()
+                .ingested_source_keys_with_prefix(&prefix)
+                .map_err(storage_error)?
+                .is_empty()
+            {
+                // The check is local-only. On a wing whose canonical mines route to a
+                // remote, `--full` would push there too and never satisfy it, so point
+                // those users at the selector that actually bypasses the guard.
+                let recovery = if canonical_routes_remote {
+                    format!(
+                        "wing `{wing_name}` routes canonical mines to a remote, so --full cannot create the local snapshot this check needs; pass --branch or --view <name> to mine the branch delta deliberately"
+                    )
+                } else {
+                    "mine the canonical checkout first or use --full to intentionally replace it"
+                        .to_owned()
+                };
+                return Ok(CliOutput::failure(
+                    1,
+                    format!(
+                        "automatic branch mining requires an existing canonical snapshot; {recovery}\n"
+                    ),
+                ));
+            }
+        }
+
+        if use_remote {
+            return execute_remote_mine(
+                &source_dir,
+                wing,
+                &agent,
+                limit,
+                dry_run,
+                batch_size,
+                effective_view.clone(),
+                &config,
+                &runtime,
+                &rule,
+                &project_config,
+                Some(&project_id),
+                false,
+            );
+        }
+
+        if use_both {
+            return execute_local_project_mine(
+                &source_dir,
+                wing.clone(),
+                agent.clone(),
+                limit,
+                dry_run,
+                reindex,
+                batch_size,
+                effective_branch,
+                effective_view.clone(),
+                &config,
+                &runtime,
+                &provider_factory,
+                &project_config,
+                Some(&project_id),
+                rule.remote.as_deref(),
+            );
+        }
+
+        // ── Local mine path continues below with the resolved declaration. ──
+        return execute_local_project_mine(
+            &source_dir,
+            wing,
+            agent,
+            limit,
+            dry_run,
+            reindex,
+            batch_size,
+            effective_branch,
+            effective_view,
+            &config,
+            &runtime,
+            provider_factory,
+            &project_config,
+            Some(&project_id),
+            None,
+        );
+    } else {
+        // Convos mode: --branch is not supported; remote routing is not supported.
+        if branch {
+            return Ok(CliOutput::failure(
+                1,
+                "--branch requires --mode projects; branch-delta mining is not supported for conversations\n",
+            ));
+        }
+        // Conversation mining is always local: routing rules are wing-based and
+        // convo directories carry no project wing config to resolve against.
+    }
+
+    // ── Conversation mine path ──────────────────────────────────────────────
+    let use_temp_storage = dry_run && !palace_exists(&config.palace_path);
+    let dry_run_storage =
+        if use_temp_storage { Some(tempfile::tempdir().map_err(io_error)?) } else { None };
+    let storage_root =
+        dry_run_storage.as_ref().map(|dir| dir.path()).unwrap_or(config.palace_path.as_path());
+    let engine = runtime
+        .block_on(StorageEngine::open(storage_root, config.embedding_profile))
+        .map_err(storage_error)?;
+    let mut provider = provider_factory(config.embedding_profile, default_embedding_cache_dir())
+        .map_err(provider_error)?;
+
+    let max_embed_batch_size = batch_size
+        .filter(|&n| n > 0)
+        .or_else(|| config.low_cpu.enabled.then(|| config.low_cpu.effective_ingest_batch_size()));
+
+    let summary = runtime
+        .block_on(ingest_conversations(
+            &engine,
+            &mut provider,
+            &ConversationIngestRequest {
+                convo_dir: source_dir.clone(),
+                wing,
+                agent,
+                extract_mode: match extract {
+                    CliExtractMode::Exchange => ConversationExtractMode::Exchange,
+                    CliExtractMode::General => ConversationExtractMode::General,
+                },
+                limit: if limit == 0 { None } else { Some(limit) },
+                dry_run,
+                reindex,
+                max_embed_batch_size,
+            },
+        ))
+        .map_err(ingest_error)?;
+
+    Ok(CliOutput::success(render_mine_summary(
+        mode,
+        &source_dir,
+        &config.palace_path,
+        dry_run,
+        &summary,
+    )))
+}
+
+#[derive(Debug, Subcommand)]
+enum ProjectCommands {
+    /// Register or update a project declaration.
+    Register {
+        dir: PathBuf,
+        #[arg(long)]
+        wing: Option<String>,
+        #[arg(long = "project-id", alias = "project", help = "Explicit project registry ID")]
+        project_id: Option<String>,
+        #[arg(long = "repo-config")]
+        repo_config: bool,
+    },
+    /// Show the declaration resolved for a checkout.
+    Show { dir: PathBuf },
+    /// List all centralized project declarations.
+    List,
+    /// Remove a declaration by its stable project ID.
+    Remove { project_id: String },
+    /// Export a centralized declaration to a repository-local compatibility file.
+    Export {
+        project_id: String,
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        #[arg(long = "repo-config")]
+        repo_config: bool,
+    },
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_local_project_mine<F, P>(
+    source_dir: &Path,
+    wing: Option<String>,
+    agent: String,
+    limit: usize,
+    dry_run: bool,
+    reindex: bool,
+    batch_size: Option<usize>,
+    branch: bool,
+    view: Option<String>,
+    config: &AgentPalaceConfig,
+    runtime: &tokio::runtime::Runtime,
+    provider_factory: F,
+    project_config: &ProjectConfig,
+    project_id: Option<&str>,
+    replication_remote: Option<&str>,
+) -> Result<CliOutput, clap::Error>
+where
+    F: Fn(EmbeddingProfile, PathBuf) -> Result<P, Box<dyn std::error::Error>>,
+    P: EmbeddingProvider,
+{
+    let use_temp_storage = dry_run && !palace_exists(&config.palace_path);
+    let dry_run_storage =
+        if use_temp_storage { Some(tempfile::tempdir().map_err(io_error)?) } else { None };
+    let storage_root =
+        dry_run_storage.as_ref().map(|dir| dir.path()).unwrap_or(config.palace_path.as_path());
+    let engine = runtime
+        .block_on(StorageEngine::open(storage_root, config.embedding_profile))
+        .map_err(storage_error)?;
+    let mut provider = provider_factory(config.embedding_profile, default_embedding_cache_dir())
+        .map_err(provider_error)?;
+    let max_embed_batch_size = batch_size
+        .filter(|&n| n > 0)
+        .or_else(|| config.low_cpu.enabled.then(|| config.low_cpu.effective_ingest_batch_size()));
+
+    let replication = replication_remote
+        .map(|remote| agentpalace_ingest::ProjectReplication::new(remote.to_owned()));
+    let summary = runtime
+        .block_on(ingest_project_with_replication(
+            &engine,
+            &mut provider,
+            &ProjectIngestRequest {
+                project_dir: source_dir.to_path_buf(),
+                wing,
+                agent,
+                limit: if limit == 0 { None } else { Some(limit) },
+                dry_run,
+                reindex,
+                max_embed_batch_size,
+                branch,
+                view,
+            },
+            project_config,
+            project_id,
+            replication.as_ref(),
+        ))
+        .map_err(|e| branch_delta_error(e, ingest_error))?;
+
+    let mut output =
+        render_mine_summary(CliMode::Projects, source_dir, &config.palace_path, dry_run, &summary);
+    if let Some(replication) = replication {
+        if dry_run {
+            output.push_str(&format!(
+                "\n  Remote replication: would queue durable records for {}\n",
+                replication.remote
+            ));
+        } else {
+            let outbox = agentpalace_storage::OutboxStore::new(&engine.layout().sqlite_path);
+            let records = outbox
+                .ingestion_batch_record_count(&replication.batch_id)
+                .map_err(storage_error)?;
+            if records > 0 {
+                output.push_str(&format!("\n  Remote replication: durably queued {records} records for {} (batch {})\n  Delivery runs asynchronously while agentpalace serve is running.\n", replication.remote, replication.batch_id));
+            } else {
+                output.push_str(&format!(
+                    "\n  Remote replication: no new records; existing queue retained for {}\n",
+                    replication.remote
+                ));
+            }
+        }
+    }
+    Ok(CliOutput::success(output))
+}
+
+/// Map an [`IngestError`] to a clap error, giving a friendly message for
+/// [`IngestError::BranchDeltaUnavailable`].
+fn branch_delta_error(
+    error: IngestError,
+    fallback: impl Fn(IngestError) -> clap::Error,
+) -> clap::Error {
+    match error {
+        IngestError::BranchDeltaUnavailable { ref reason } => clap::Error::raw(
+            clap::error::ErrorKind::Io,
+            format!(
+                "--branch mining requires a git repository with a detectable default branch \
+                 (main or master): {reason}\n\
+                 Hint: run `git init` and commit at least once, or omit --branch for a full mine.\n"
+            ),
+        ),
+        other => fallback(other),
+    }
+}
+
+/// Maximum accumulated chunk-text bytes before flushing a remote batch (~4 MiB).
+const REMOTE_BATCH_MAX_BYTES: usize = 4 * 1024 * 1024;
+/// Maximum number of files per remote batch.
+const REMOTE_BATCH_MAX_FILES: usize = 64;
+
+#[allow(clippy::too_many_arguments)]
+fn execute_remote_mine(
+    source_dir: &Path,
+    wing_override: Option<String>,
+    agent: &str,
+    limit: usize,
+    dry_run: bool,
+    batch_size: Option<usize>,
+    view: Option<String>,
+    config: &AgentPalaceConfig,
+    runtime: &tokio::runtime::Runtime,
+    rule: &agentpalace_config::ResolvedRouteRule,
+    project_config: &ProjectConfig,
+    project_id: Option<&str>,
+    dual_write: bool,
+) -> Result<CliOutput, clap::Error> {
+    // `--batch-size N` (N>0) caps files per remote request, letting low-spec
+    // machines bound how much is held/serialized at once. The ~4 MiB byte cap
+    // still applies as an independent guardrail against the server body limit.
+    let max_files_per_batch = batch_size.filter(|&n| n > 0).unwrap_or(REMOTE_BATCH_MAX_FILES);
+    // ── 1. Prepare the batch (no embedding, no storage) ─────────────────────
+    let prepared = match prepare_project_batch_with_config(
+        &ProjectIngestRequest {
+            project_dir: source_dir.to_path_buf(),
+            wing: wing_override.clone(),
+            agent: agent.to_owned(),
+            limit: if limit == 0 { None } else { Some(limit) },
+            dry_run: false,
+            reindex: false,
+            max_embed_batch_size: None,
+            branch: false,
+            view,
+        },
+        project_config,
+        project_id,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            let msg = format!("failed to prepare project batch: {e}\n");
+            return if dual_write {
+                Ok(CliOutput::success(format!("  Remote replication: failed — {msg}")))
+            } else {
+                Ok(CliOutput::failure(1, msg))
+            };
+        }
+    };
+
+    // ── 2. Resolve the remote config entry ──────────────────────────────────
+    let remote_name = rule.remote.as_deref().unwrap_or("remote");
+    let resolved_remote = match config.federation.remotes.get(remote_name) {
+        Some(r) => r,
+        None => {
+            let msg = format!(
+                "federation config error: route for wing '{}' refers to remote '{}', \
+                     but no such remote is defined in config.federation.remotes\n",
+                prepared.wing, remote_name
+            );
+            let output = if dual_write {
+                format!("  Remote replication: failed — {msg}")
+            } else {
+                format!("{msg}")
+            };
+            return if dual_write {
+                Ok(CliOutput::success(output))
+            } else {
+                Ok(CliOutput::failure(1, output))
+            };
+        }
+    };
+    let remote_url = resolved_remote.url.clone();
+
+    // ── 3. Non-default-branch warning text (computed early for dry-run) ─────
+    let branch_warning = match (&prepared.current_branch, &prepared.default_branch) {
+        (Some(cur), Some(def)) if cur != def => Some(format!(
+            "warning: mining branch '{}' into the shared remote wing '{}' \
+             (expected '{}')\n",
+            cur, prepared.wing, def
+        )),
+        _ => None,
+    };
+
+    // Count total chunks for dry-run display.
+    let total_chunks: usize = prepared.files.iter().map(|f| f.chunks.len()).sum();
+
+    // ── 4. Dry-run: print plan and return ────────────────────────────────────
+    if dry_run {
+        let mut lines = vec![
+            format!("\n{}", "=".repeat(SEARCH_HEADER_WIDTH)),
+            "  Mine plan (dry run)".to_owned(),
+            "=".repeat(SEARCH_HEADER_WIDTH),
+            "  Mode: projects (remote)".to_owned(),
+            format!("  Source: {}", source_dir.display()),
+            format!("  Remote: {} ({})", remote_name, remote_url),
+            format!("  Wing: {}", prepared.wing),
+            format!("  Repo ID: {}", prepared.repo_id),
+            format!("  Commit: {}", prepared.commit_hash.as_deref().unwrap_or("<none>")),
+            format!("  Files to send: {}", prepared.files.len()),
+            format!("  Total chunks: {total_chunks}"),
+            format!("  Max files/batch: {max_files_per_batch}"),
+        ];
+        if let Some(view_name) = &prepared.summary.view_name {
+            lines.push(format!("  View: {view_name}"));
+        }
+        lines.extend(render_secret_skip_lines(&prepared.summary.secret_path_skips));
+        if let Some(ref warning) = branch_warning {
+            lines.push(format!("  {}", warning.trim()));
+        }
+        lines.push(format!("{}\n", "=".repeat(SEARCH_HEADER_WIDTH)));
+        return Ok(CliOutput::success(lines.join("\n")));
+    }
+
+    // ── 5. Build the remote client ───────────────────────────────────────────
+    let endpoint = RemoteEndpoint {
+        name: remote_name.to_owned(),
+        base_url: remote_url.clone(),
+        token: resolved_remote.token.clone(),
+        timeout: resolved_remote.timeout,
+    };
+    let client = match RemoteClient::new(endpoint) {
+        Ok(c) => c,
+        Err(e) => {
+            let msg = format!("failed to build remote client for '{}': {e}\n", remote_name);
+            let output = if dual_write {
+                format!("  Remote replication: failed — {msg}")
+            } else {
+                format!("{msg}")
+            };
+            return if dual_write {
+                Ok(CliOutput::success(output))
+            } else {
+                Ok(CliOutput::failure(1, output))
+            };
+        }
+    };
+
+    // ── 6. Capabilities check ────────────────────────────────────────────────
+    // Call through the trait to avoid shadowing by the `info` field on RemoteClient.
+    let api: &dyn RemoteApi = &client;
+    let info_resp = match runtime.block_on(api.info()) {
+        Ok(resp) => resp,
+        Err(e) => {
+            let msg = match e {
+                RemoteError::Unreachable { ref message, .. } => format!(
+                    "remote '{}' is unreachable at {}: {}",
+                    remote_name, remote_url, message
+                ),
+                other => format!("remote '{}' info() failed: {other}", remote_name),
+            };
+            let output = if dual_write {
+                format!(
+                    "  Remote replication: failed — {msg}\n\
+                     Note: the local mine completed successfully; remote replication was skipped.\n"
+                )
+            } else {
+                format!(
+                    "{msg}\n\
+                     Note: writes do not fall back to local.\n"
+                )
+            };
+            return if dual_write {
+                Ok(CliOutput::success(output))
+            } else {
+                Ok(CliOutput::failure(1, output))
+            };
+        }
+    };
+
+    if !info_resp.capabilities.iter().any(|c| c == "ingest") {
+        let msg = if dual_write {
+            format!(
+                "  Remote replication: skipped — remote '{}' does not support the ingest capability.\n\
+                 Server capabilities: {}\n\
+                 Note: the local mine completed successfully.\n",
+                remote_name,
+                info_resp.capabilities.join(", ")
+            )
+        } else {
+            format!(
+                "remote '{}' does not support the ingest capability; \
+                 please upgrade the remote server.\n\
+                 Server capabilities: {}\n",
+                remote_name,
+                info_resp.capabilities.join(", ")
+            )
+        };
+        return if dual_write {
+            Ok(CliOutput::success(msg))
+        } else {
+            Ok(CliOutput::failure(1, msg))
+        };
+    }
+
+    // ── 7. Batch and send ────────────────────────────────────────────────────
+    let wing = prepared.wing.clone();
+    let repo_id = prepared.repo_id.clone();
+    let commit_hash = prepared.commit_hash.clone();
+    let view_name = prepared.summary.view_name.clone();
+    let agent_owned = agent.to_owned();
+
+    // Split files into batches.
+    let batches = build_remote_batches(prepared.files, max_files_per_batch);
+
+    let mut ingested_count: usize = 0;
+    let mut skipped_count: usize = 0;
+    let mut failed_count: usize = 0;
+    let mut total_drawers_written: usize = 0;
+    let mut all_warnings: Vec<String> = Vec::new();
+    let mut failed_files: Vec<(String, String)> = Vec::new();
+    let mut batches_sent: usize = 0;
+
+    for batch_files in batches {
+        let req = IngestBatchRequest {
+            replication: None,
+            wing: wing.clone(),
+            repo_id: repo_id.clone(),
+            agent: Some(agent_owned.clone()),
+            commit_hash: commit_hash.clone(),
+            files: batch_files,
+        };
+
+        let resp: IngestBatchResponse = match runtime.block_on(api.ingest_batch(req)) {
+            Ok(resp) => resp,
+            Err(e) => {
+                let msg = format!(
+                    "remote '{}' ingestion failed after {} batch(es): {e}",
+                    remote_name, batches_sent
+                );
+                if dual_write && batches_sent > 0 {
+                    // Some batches completed — render partial summary showing
+                    // what was achieved before the transport interruption.
+                    let partial = render_remote_mine_summary(
+                        source_dir,
+                        remote_name,
+                        &remote_url,
+                        &wing,
+                        &repo_id,
+                        ingested_count,
+                        skipped_count,
+                        failed_count,
+                        total_drawers_written,
+                        &all_warnings,
+                        &failed_files,
+                        &prepared.summary.secret_path_skips,
+                        branch_warning.as_deref(),
+                        view_name.as_deref(),
+                        true,
+                        true,
+                    );
+                    let with_error = format!(
+                        "{}\n  {}\n  Note: remote replication was incomplete — {msg}.\n",
+                        partial.trim(),
+                        "─".repeat(SEARCH_HEADER_WIDTH),
+                    );
+                    return Ok(CliOutput::success(with_error));
+                }
+                let output = if dual_write {
+                    format!(
+                        "  Remote replication: failed — {msg}\n\
+                             Note: the local mine completed successfully; remote replication was incomplete.\n"
+                    )
+                } else {
+                    format!(
+                        "{msg}\n\
+                             Note: writes do not fall back to local.\n"
+                    )
+                };
+                return if dual_write {
+                    Ok(CliOutput::success(output))
+                } else {
+                    Ok(CliOutput::failure(1, output))
+                };
+            }
+        };
+
+        batches_sent += 1;
+
+        for file_result in resp.files {
+            match file_result.status.as_str() {
+                "ingested" => {
+                    ingested_count += 1;
+                    total_drawers_written += file_result.drawers_written;
+                }
+                "skipped_unchanged" => {
+                    skipped_count += 1;
+                }
+                _ => {
+                    failed_count += 1;
+                    failed_files
+                        .push((file_result.relative_path, file_result.error.unwrap_or_default()));
+                }
+            }
+        }
+
+        // Dedupe warnings.
+        for w in resp.warnings {
+            if !all_warnings.contains(&w) {
+                all_warnings.push(w);
+            }
+        }
+    }
+
+    // ── 8. Render summary ────────────────────────────────────────────────────
+    let output = render_remote_mine_summary(
+        source_dir,
+        remote_name,
+        &remote_url,
+        &wing,
+        &repo_id,
+        ingested_count,
+        skipped_count,
+        failed_count,
+        total_drawers_written,
+        &all_warnings,
+        &failed_files,
+        &prepared.summary.secret_path_skips,
+        branch_warning.as_deref(),
+        view_name.as_deref(),
+        dual_write,
+        false,
+    );
+
+    Ok(CliOutput::success(output))
+}
+
+/// Split a flat list of [`IngestFileDto`] into batches bounded by `max_files`
+/// files (caller-supplied; from `--batch-size`, defaulting to
+/// [`REMOTE_BATCH_MAX_FILES`]) and [`REMOTE_BATCH_MAX_BYTES`] of chunk text.
+fn build_remote_batches(
+    files: Vec<agentpalace_federation::IngestFileDto>,
+    max_files: usize,
+) -> Vec<Vec<agentpalace_federation::IngestFileDto>> {
+    // Guard against a zero slipping through: a 0 cap would never flush on the
+    // file count and silently disable that bound. Treat it as the default.
+    let max_files = if max_files == 0 { REMOTE_BATCH_MAX_FILES } else { max_files };
+    let mut batches: Vec<Vec<agentpalace_federation::IngestFileDto>> = Vec::new();
+    let mut current: Vec<agentpalace_federation::IngestFileDto> = Vec::new();
+    let mut current_bytes: usize = 0;
+
+    for file in files {
+        let file_bytes: usize = file.chunks.iter().map(|c| c.text.len()).sum();
+
+        // An oversized single file goes alone in its own batch.
+        let would_overflow_bytes =
+            current_bytes + file_bytes > REMOTE_BATCH_MAX_BYTES && !current.is_empty();
+        let would_overflow_files = current.len() >= max_files;
+
+        if would_overflow_bytes || would_overflow_files {
+            batches.push(std::mem::take(&mut current));
+            current_bytes = 0;
+        }
+
+        current_bytes += file_bytes;
+        current.push(file);
+    }
+
+    if !current.is_empty() {
+        batches.push(current);
+    }
+
+    batches
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_remote_mine_summary(
+    source_dir: &Path,
+    remote_name: &str,
+    remote_url: &str,
+    wing: &str,
+    repo_id: &str,
+    ingested_count: usize,
+    skipped_count: usize,
+    failed_count: usize,
+    drawers_written: usize,
+    warnings: &[String],
+    failed_files: &[(String, String)],
+    secret_skips: &[ProjectSourceSkip],
+    branch_warning: Option<&str>,
+    view_name: Option<&str>,
+    dual_write: bool,
+    replication_incomplete: bool,
+) -> String {
+    let mode_label = if dual_write { "replication (best-effort)" } else { "projects (remote)" };
+    let mut lines = vec![
+        format!("\n{}", "=".repeat(SEARCH_HEADER_WIDTH)),
+        "  Mine complete".to_owned(),
+        "=".repeat(SEARCH_HEADER_WIDTH),
+        format!("  Mode: {mode_label}"),
+        format!("  Source: {}", source_dir.display()),
+        format!("  Remote: {remote_name} ({remote_url})"),
+        format!("  Wing: {wing}"),
+        format!("  Repo ID: {repo_id}"),
+        format!("  Files ingested: {ingested_count}"),
+        format!("  Files skipped unchanged: {skipped_count}"),
+        format!("  Files failed: {failed_count}"),
+        format!("  Drawers written: {drawers_written}"),
+    ];
+    lines.extend(render_secret_skip_lines(secret_skips));
+
+    if dual_write {
+        if replication_incomplete {
+            lines.insert(1, "  Remote replication: partial — transport interrupted".to_owned());
+            lines.insert(2, String::new());
+        } else if failed_count > 0 {
+            lines.insert(1, "  Remote replication: partial — some files had errors".to_owned());
+            lines.insert(2, String::new());
+        } else {
+            lines.insert(1, "  Remote replication: succeeded".to_owned());
+            lines.insert(2, String::new());
+        }
+    }
+
+    if !warnings.is_empty() {
+        lines.push(String::new());
+        lines.push("  Warnings:".to_owned());
+        for w in warnings {
+            lines.push(format!("    - {w}"));
+        }
+    }
+
+    if let Some(bw) = branch_warning {
+        lines.push(format!("  {}", bw.trim()));
+    }
+
+    if let Some(view_name) = view_name {
+        lines.push(format!("  View: {view_name}"));
+    }
+
+    if !failed_files.is_empty() {
+        lines.push(String::new());
+        lines.push("  Failed files:".to_owned());
+        let cap = failed_files.len().min(10);
+        for (path, err) in failed_files.iter().take(cap) {
+            lines.push(format!("    {path}: {err}"));
+        }
+        if failed_files.len() > 10 {
+            lines.push(format!("    ... and {} more", failed_files.len() - 10));
+        }
+    }
+
+    lines.push(format!("{}\n", "=".repeat(SEARCH_HEADER_WIDTH)));
+    lines.join("\n")
+}
+
+fn execute_search<F, P>(
+    query: &str,
+    wing: Option<String>,
+    room: Option<String>,
+    results: usize,
+    view: Option<String>,
+    palace_override: Option<&Path>,
+    context: &CliContext,
+    provider_factory: F,
+) -> Result<CliOutput, clap::Error>
+where
+    F: Fn(EmbeddingProfile, PathBuf) -> Result<P, Box<dyn std::error::Error>>,
+    P: EmbeddingProvider,
+{
+    let config = load_runtime_config(palace_override, context).map_err(config_error)?;
+    if !palace_exists(&config.palace_path) {
+        return Ok(no_palace_error(&config.palace_path));
+    }
+
+    let runtime = build_runtime(&config).map_err(runtime_error)?;
+    let engine = runtime
+        .block_on(StorageEngine::open(&config.palace_path, config.embedding_profile))
+        .map_err(storage_error)?;
+    let provider = provider_factory(config.embedding_profile, default_embedding_cache_dir())
+        .map_err(provider_error)?;
+    let mut search = SearchRuntime::with_policy(
+        provider,
+        SearchRuntimePolicy { rerank_enabled: config.low_cpu.effective_rerank_enabled() },
+    );
+
+    let wing_id = wing.as_deref().map(WingId::normalized).transpose().map_err(id_error)?;
+    let room_id = room.as_deref().map(RoomId::new).transpose().map_err(id_error)?;
+    let rendered = runtime
+        .block_on(search.search_text(
+            engine.drawer_store(),
+            &SearchQuery {
+                text: query.to_owned(),
+                wing: wing_id,
+                room: room_id,
+                limit: clamp_search_results(results, &config),
+                profile: config.embedding_profile,
+                view,
+            },
+        ))
+        .map_err(search_error)?;
+
+    Ok(CliOutput::success(rendered))
+}
+
+fn execute_status(
+    palace_override: Option<&Path>,
+    context: &CliContext,
+) -> Result<CliOutput, clap::Error> {
+    let config = load_runtime_config(palace_override, context).map_err(config_error)?;
+    if !palace_exists(&config.palace_path) {
+        return Ok(no_palace_error(&config.palace_path));
+    }
+
+    let runtime = build_runtime(&config).map_err(runtime_error)?;
+    let engine = runtime
+        .block_on(StorageEngine::open(&config.palace_path, config.embedding_profile))
+        .map_err(storage_error)?;
+    let wing_rooms = runtime
+        .block_on(engine.drawer_store().count_by_wing_room(&DrawerFilter::default(), false))
+        .map_err(storage_error)?;
+
+    let mut lines = vec![
+        format!("\n{}", "=".repeat(STATUS_HEADER_WIDTH)),
+        format!(
+            "  AgentPalace Status — {} drawers",
+            wing_rooms.values().map(|rooms| rooms.values().sum::<usize>()).sum::<usize>()
+        ),
+        "=".repeat(STATUS_HEADER_WIDTH),
+        String::new(),
+    ];
+
+    for (wing, rooms) in wing_rooms {
+        lines.push(format!("  WING: {wing}"));
+        let mut room_counts = rooms.into_iter().collect::<Vec<_>>();
+        room_counts.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+        for (room, count) in room_counts {
+            lines.push(format!("    ROOM: {room:20} {count:5} drawers"));
+        }
+        lines.push(String::new());
+    }
+
+    lines.push("=".repeat(STATUS_HEADER_WIDTH));
+    lines.push(String::new());
+    Ok(CliOutput::success(lines.join("\n")))
+}
+
+fn execute_maintain(
+    palace_override: Option<&Path>,
+    context: &CliContext,
+) -> Result<CliOutput, clap::Error> {
+    let config = load_runtime_config(palace_override, context).map_err(config_error)?;
+    if !palace_exists(&config.palace_path) {
+        return Ok(no_palace_error(&config.palace_path));
+    }
+
+    let runtime = build_runtime(&config).map_err(runtime_error)?;
+    let engine = runtime
+        .block_on(StorageEngine::open(&config.palace_path, config.embedding_profile))
+        .map_err(storage_error)?;
+
+    // Bypass the process-local idle gate for the one-shot CLI invocation.
+    // StorageEngine::open() initialises last_activity_at to Instant::now(), so
+    // the configured idle_secs (default 300) would always skip.  We set
+    // idle_secs to 0 so the pass runs immediately, while retaining the
+    // configured enablement flag and all other thresholds.
+    let settings = MaintenanceSettings {
+        enabled: config.maintenance.enabled,
+        idle_secs: 0,
+        version_retention_hours: config.maintenance.version_retention_hours as u64,
+        tail_threshold_rows: config.maintenance.tail_threshold_rows as u64,
+        small_fragment_threshold: config.maintenance.small_fragment_threshold as u64,
+    };
+
+    let summary = runtime.block_on(engine.run_maintenance(&settings)).map_err(storage_error)?;
+
+    let status_label = match summary.status {
+        agentpalace_storage::MaintenanceRunStatus::Success => "SUCCESS",
+        agentpalace_storage::MaintenanceRunStatus::Partial => "PARTIAL",
+        agentpalace_storage::MaintenanceRunStatus::Failure => "FAILURE",
+    };
+
+    let exit_code = match summary.status {
+        agentpalace_storage::MaintenanceRunStatus::Failure => 1,
+        _ => 0,
+    };
+
+    let mut lines = vec![
+        format!("\n{}", "=".repeat(STATUS_HEADER_WIDTH)),
+        format!("  Maintenance Run #{:<8}  [{status_label}]", summary.run_id),
+        "=".repeat(STATUS_HEADER_WIDTH),
+        String::new(),
+        format!("  Started : {}", summary.started_at),
+        format!("  Finished: {}", summary.finished_at),
+        format!("  Duration: {} ms", summary.duration.whole_milliseconds()),
+        format!("  CPU     : {} ms", summary.cpu_duration.whole_milliseconds()),
+        String::new(),
+    ];
+
+    // When maintenance is disabled the summary has no tier results.
+    // Show an explicit message rather than a bare [PARTIAL].
+    if summary.tier_results.is_empty() {
+        lines.push("  –  Maintenance is disabled by configuration.".to_owned());
+    }
+
+    for result in &summary.tier_results {
+        let tier_name = match result.tier {
+            agentpalace_storage::MaintenanceTier::VectorIndexOptimization => {
+                "Vector Index Optimization"
+            }
+            agentpalace_storage::MaintenanceTier::FragmentCompaction => "Fragment Compaction",
+            agentpalace_storage::MaintenanceTier::VersionRetention => "Version Retention",
+        };
+        let outcome_line = match &result.outcome {
+            agentpalace_storage::MaintenanceOutcome::Completed { items_affected } => {
+                format!("  ✓  {tier_name:<30} completed  ({items_affected} items)")
+            }
+            agentpalace_storage::MaintenanceOutcome::Skipped { reason } => {
+                let reason_str = match reason {
+                    agentpalace_storage::MaintenanceSkipReason::Disabled => "disabled",
+                    agentpalace_storage::MaintenanceSkipReason::NotIdle => "not idle",
+                    agentpalace_storage::MaintenanceSkipReason::NothingToDo => "nothing to do",
+                };
+                format!("  –  {tier_name:<30} skipped    ({reason_str})")
+            }
+            agentpalace_storage::MaintenanceOutcome::Aborted { reason, items_affected } => {
+                let reason_str = match reason {
+                    agentpalace_storage::MaintenanceAbortReason::ConcurrentRun => "concurrent run",
+                    agentpalace_storage::MaintenanceAbortReason::Shutdown => "shutdown",
+                    agentpalace_storage::MaintenanceAbortReason::Timeout => "timeout",
+                };
+                format!("  ✗  {tier_name:<30} aborted    ({reason_str}, {items_affected} items)")
+            }
+            agentpalace_storage::MaintenanceOutcome::Failed { message } => {
+                format!("  ✗  {tier_name:<30} failed     ({message})")
+            }
+        };
+        lines.push(outcome_line);
+    }
+
+    lines.push(String::new());
+    lines.push("=".repeat(STATUS_HEADER_WIDTH));
+    lines.push(String::new());
+
+    if exit_code == 0 {
+        Ok(CliOutput::success(lines.join("\n")))
+    } else {
+        Ok(CliOutput::failure(1, lines.join("\n")))
+    }
+}
+
+fn execute_wake_up<F, P>(
+    wing: Option<String>,
+    palace_override: Option<&Path>,
+    context: &CliContext,
+    provider_factory: F,
+) -> Result<CliOutput, clap::Error>
+where
+    F: Fn(EmbeddingProfile, PathBuf) -> Result<P, Box<dyn std::error::Error>>,
+    P: EmbeddingProvider,
+{
+    let config = load_runtime_config(palace_override, context).map_err(config_error)?;
+    if !palace_exists(&config.palace_path) {
+        return Ok(CliOutput::failure(
+            1,
+            format!(
+                "{}\n\n## L1 — No palace found. Run: agentpalace init <dir> then agentpalace mine <dir>\n",
+                default_identity_banner()
+            ),
+        ));
+    }
+
+    let runtime = build_runtime(&config).map_err(runtime_error)?;
+    let engine = runtime
+        .block_on(StorageEngine::open(&config.palace_path, config.embedding_profile))
+        .map_err(storage_error)?;
+    let provider = provider_factory(config.embedding_profile, default_embedding_cache_dir())
+        .map_err(provider_error)?;
+    let search = SearchRuntime::with_policy(
+        provider,
+        SearchRuntimePolicy { rerank_enabled: config.low_cpu.effective_rerank_enabled() },
+    );
+    let rendered = runtime
+        .block_on(search.wake_up(
+            engine.drawer_store(),
+            &WakeUpRequest {
+                wing: wing.as_deref().map(WingId::normalized).transpose().map_err(id_error)?,
+                layer1: wake_up_layer1_config(&config),
+                ..WakeUpRequest::default()
+            },
+        ))
+        .map_err(search_error)?;
+
+    let token_estimate = rendered.chars().count() / 4;
+    Ok(CliOutput::success(format!(
+        "Wake-up text (~{token_estimate} tokens):\n{}\n{}\n",
+        "=".repeat(WAKE_UP_SEPARATOR_WIDTH),
+        rendered
+    )))
+}
+
+fn execute_serve<F, P>(
+    bind_override: Option<SocketAddr>,
+    token_file_override: Option<PathBuf>,
+    palace_override: Option<&Path>,
+    context: &CliContext,
+    provider_factory: F,
+) -> Result<CliOutput, clap::Error>
+where
+    F: Fn(EmbeddingProfile, PathBuf) -> Result<P, Box<dyn std::error::Error>>,
+    P: EmbeddingProvider + Send + Sync + 'static,
+{
+    let config = load_runtime_config(palace_override, context).map_err(config_error)?;
+
+    // Resolve bind address: CLI flag > config section > default (already in config)
+    let bind = bind_override.unwrap_or(config.server.bind);
+
+    // Resolve token file: CLI flag > config section > default
+    let token_file = token_file_override.unwrap_or_else(|| config.server.token_file.clone());
+
+    // Load the token registry — friendly error if the file is missing.
+    let tokens = TokenRegistry::load(token_file.clone()).map_err(|err| {
+        clap::Error::raw(
+            clap::error::ErrorKind::Io,
+            format!(
+                "failed to load token file `{}`: {err}\n\n\
+                 Hint: create the file with at least one entry, e.g.:\n\
+                   [\n\
+                     {{\"token\": \"<your-secret-token>\", \"name\": \"you\", \"enabled\": true}}\n\
+                   ]\n",
+                token_file.display()
+            ),
+        )
+    })?;
+
+    eprintln!(
+        "WARNING: The federation server speaks plain HTTP. Bearer tokens must only be used \
+         on trusted networks or behind a TLS-terminating reverse proxy."
+    );
+    eprintln!("Starting AgentPalace federation server");
+    eprintln!("  Palace:     {}", config.palace_path.display());
+    eprintln!("  Bind:       {bind}");
+    eprintln!("  Token file: {}", token_file.display());
+
+    let runtime = build_runtime(&config).map_err(runtime_error)?;
+
+    // Use AGENTPALACE_STUB_EMBEDDINGS if set, mirroring the MCP binary. Parsed for an
+    // explicit truthy value so `=0`/`=false` disable stubs rather than enabling them.
+    let serve_result = if env_flag("AGENTPALACE_STUB_EMBEDDINGS") {
+        let provider = DeterministicStubProvider::new(config.embedding_profile);
+        runtime.block_on(run_serve(config, provider, tokens, bind))
+    } else {
+        let provider = provider_factory(config.embedding_profile, default_embedding_cache_dir())
+            .map_err(provider_error)?;
+        runtime.block_on(run_serve(config, provider, tokens, bind))
+    };
+
+    match serve_result {
+        Ok(()) => Ok(CliOutput::success("")),
+        Err(err) => Ok(CliOutput::failure(1, format!("federation server error: {err}\n"))),
+    }
+}
+
+async fn run_serve<P>(
+    config: AgentPalaceConfig,
+    provider: P,
+    tokens: TokenRegistry,
+    bind: SocketAddr,
+) -> Result<(), agentpalace_server::ServerError>
+where
+    P: EmbeddingProvider + Send + Sync + 'static,
+{
+    let mcp_config = config.clone();
+    let provider = transport::SharedProvider::new(provider);
+    let (router, state) = build_router(config, provider.clone(), tokens).await?;
+    let mcp = transport::http_router(mcp_config, provider, state.tokens.clone()).await.map_err(
+        |err| agentpalace_server::ServerError::Io {
+            path: PathBuf::from("MCP startup"),
+            source: std::io::Error::other(err.to_string()),
+        },
+    )?;
+    let router = router.merge(mcp);
+    let listener = tokio::net::TcpListener::bind(bind).await.map_err(|source| {
+        agentpalace_server::ServerError::Io { path: PathBuf::from(bind.to_string()), source }
+    })?;
+    eprintln!(
+        "Listening on http://{}",
+        listener.local_addr().map_err(|source| agentpalace_server::ServerError::Io {
+            path: PathBuf::from("local_addr"),
+            source,
+        })?
+    );
+    axum::serve(listener, router)
+        .with_graceful_shutdown(async {
+            let _ = tokio::signal::ctrl_c().await;
+            eprintln!("\nShutting down federation server...");
+        })
+        .await
+        .map_err(|source| agentpalace_server::ServerError::Io {
+            path: PathBuf::from("axum::serve"),
+            source,
+        })
+}
+
+fn render_mine_summary(
+    mode: CliMode,
+    source_dir: &Path,
+    palace_path: &Path,
+    dry_run: bool,
+    summary: &IngestSummary,
+) -> String {
+    let mode_name = match mode {
+        CliMode::Projects => "projects",
+        CliMode::Convos => "convos",
+    };
+
+    let mut lines = vec![
+        format!("\n{}", "=".repeat(SEARCH_HEADER_WIDTH)),
+        "  Mine complete".to_owned(),
+        "=".repeat(SEARCH_HEADER_WIDTH),
+        format!("  Mode: {mode_name}"),
+        format!("  Source: {}", source_dir.display()),
+        format!("  Palace: {}", palace_path.display()),
+        format!("  Dry run: {}", if dry_run { "yes" } else { "no" }),
+        format!("  Files discovered: {}", summary.discovered_files),
+        format!("  Files ignored: {}", summary.ignored_files),
+        format!("  Files unreadable: {}", summary.unreadable_files),
+        format!("  Files malformed: {}", summary.malformed_files),
+        format!("  Files skipped unchanged: {}", summary.skipped_unchanged),
+        format!("  Files ingested: {}", summary.ingested_files),
+        format!("  Drawers written: {}", summary.drawers_written),
+        format!("  Files truncated: {}", summary.truncated_files),
+    ];
+
+    // Show view info when available.
+    if let Some(ref view_name) = summary.view_name {
+        lines.push(format!("  View: {view_name}"));
+    }
+
+    // Secret-shaped paths withheld during discovery (issue #95). Only printed
+    // when non-empty to preserve byte-parity with existing test output.
+    lines.extend(render_secret_skip_lines(&summary.secret_path_skips));
+
+    // Only print when non-zero to preserve byte-parity with existing test output.
+    if summary.removed_sources > 0 {
+        lines.push(format!("  Sources removed: {}", summary.removed_sources));
+    }
+
+    lines.push(format!("{}\n", "=".repeat(SEARCH_HEADER_WIDTH)));
+    lines.join("\n")
+}
+
+/// Render the operator-visible secret-denylist skip records (path + reason,
+/// never file content) as summary lines. Empty when there are none.
+fn render_secret_skip_lines(skips: &[ProjectSourceSkip]) -> Vec<String> {
+    if skips.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = Vec::with_capacity(skips.len() + 1);
+    lines.push(format!("  Secrets withheld: {}", skips.len()));
+    lines.extend(
+        skips.iter().map(|skip| {
+            format!("    {} — secret-shaped path ({})", skip.relative_path, skip.reason)
+        }),
+    );
+    lines
+}
+
+/// The "N files found, rooms detected from <source>" summary line shared by
+/// `init` and `project register`, so both report the same effective source
+/// population that a canonical mine ingests.
+fn render_source_population_line(file_count: usize, source: &'static str) -> String {
+    format!("  ({file_count} files found, rooms detected from {source})")
+}
+
+fn deferred_command(command: &str) -> CliOutput {
+    CliOutput::failure(
+        1,
+        format!(
+            "The `{command}` command is deferred in Rust Phase 9.\nSee {DEFERRED_COMMAND_DOC} for the explicit scope decision.\n"
+        ),
+    )
+}
+
+fn no_palace_error(palace_path: &Path) -> CliOutput {
+    CliOutput::failure(1, no_palace_message(palace_path))
+}
+
+fn no_palace_message(palace_path: &Path) -> String {
+    format!(
+        "\n  No palace found at {}\n  Run: agentpalace init <dir> then agentpalace mine <dir>\n",
+        palace_path.display()
+    )
+}
+
+fn palace_exists(palace_path: &Path) -> bool {
+    let layout = StorageLayout::new(palace_path);
+    palace_path.exists() && (layout.sqlite_path.exists() || layout.lancedb_dir.exists())
+}
+
+fn init_runtime_config(
+    palace_override: Option<&Path>,
+    context: &CliContext,
+) -> Result<ResolvedPaths, agentpalace_core::AgentPalaceError> {
+    let paths = ConfigLoader::init_default(context.config_base_dir.as_deref())?;
+    if let Some(palace_path) = palace_override {
+        fs::create_dir_all(palace_path).map_err(|source| {
+            agentpalace_core::AgentPalaceError::ConfigWrite { path: palace_path.to_path_buf(), source }
+        })?;
+        write_global_config_override(&paths, palace_path)?;
+    }
+    Ok(paths)
+}
+
+fn load_runtime_config(
+    palace_override: Option<&Path>,
+    context: &CliContext,
+) -> Result<AgentPalaceConfig, agentpalace_core::AgentPalaceError> {
+    let mut config = ConfigLoader::load_with_env(context.config_base_dir.as_deref())?;
+    if let Some(palace_path) = palace_override {
+        config.palace_path = palace_path.to_path_buf();
+    }
+    Ok(config)
+}
+
+fn write_global_config_override(
+    paths: &ResolvedPaths,
+    palace_path: &Path,
+) -> Result<(), agentpalace_core::AgentPalaceError> {
+    let mut file = read_global_config_file(&paths.config_file)?;
+    file.palace_path = Some(palace_path.display().to_string());
+    let body = serde_json::to_string_pretty(&file).map_err(|source| {
+        agentpalace_core::AgentPalaceError::ConfigParse {
+            path: paths.config_file.clone(),
+            message: source.to_string(),
+        }
+    })?;
+    fs::write(&paths.config_file, body).map_err(|source| {
+        agentpalace_core::AgentPalaceError::ConfigWrite { path: paths.config_file.clone(), source }
+    })
+}
+
+fn read_global_config_file(
+    config_path: &Path,
+) -> Result<ConfigFileV1, agentpalace_core::AgentPalaceError> {
+    if !config_path.exists() {
+        return Ok(ConfigFileV1::default());
+    }
+
+    let body = fs::read_to_string(config_path).map_err(|source| {
+        agentpalace_core::AgentPalaceError::ConfigRead { path: config_path.to_path_buf(), source }
+    })?;
+    serde_json::from_str(&body).map_err(|source| agentpalace_core::AgentPalaceError::ConfigParse {
+        path: config_path.to_path_buf(),
+        message: source.to_string(),
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RoomDetection {
+    source: &'static str,
+    rooms: Vec<ProjectRoomConfig>,
+    /// Number of eligible project sources the rooms were derived from.
+    file_count: usize,
+}
+
+fn detect_rooms(project_dir: &Path) -> agentpalace_ingest::Result<RoomDetection> {
+    // Derive room candidates and the reported file count from the same safe
+    // source set mining uses (agentpalace_ingest::discover_project_sources), so
+    // ignored, untracked, and linked-worktree files never count or produce
+    // rooms. For Git-backed roots this is the tracked index; for non-Git roots
+    // it is the filesystem walk with git-compatible ignore handling.
+    let discovery = agentpalace_ingest::discover_project_sources(project_dir)?;
+    let file_count = discovery.sources.len();
+    let mut discovered = BTreeMap::<String, BTreeSet<String>>::new();
+
+    for source in &discovery.sources {
+        // Room candidates are the top-level and second-level directories that
+        // hold an eligible source (matching the pre-discovery folder scan).
+        let Some((parent, _)) = source.relative_path.rsplit_once('/') else { continue };
+        let mut parts = parent.split('/');
+        if let Some(first) = parts.next() {
+            record_room(&mut discovered, first);
+        }
+        if let Some(second) = parts.next() {
+            record_room(&mut discovered, second);
+        }
+    }
+
+    let (source, rooms) = if discovered.is_empty() {
+        ("fallback", vec![project_room("general", "All project files", &["general"])])
+    } else {
+        (
+            "safe project sources",
+            discovered
+                .into_iter()
+                .map(|(room, originals)| {
+                    let original_dirs = originals.into_iter().collect::<Vec<_>>();
+                    let description = if original_dirs.len() == 1 {
+                        format!("Files from {}/", original_dirs[0])
+                    } else {
+                        format!("Files from {}/", original_dirs.join(", "))
+                    };
+                    let mut keywords = vec![room.clone()];
+                    keywords.extend(original_dirs.iter().cloned());
+                    project_room(
+                        &room,
+                        &description,
+                        &keywords.iter().map(String::as_str).collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )
+    };
+
+    let mut deduped = BTreeMap::<String, ProjectRoomConfig>::new();
+    for room in rooms {
+        deduped.entry(room.name.clone()).or_insert(room);
+    }
+    let mut deduped = deduped.into_values().collect::<Vec<_>>();
+    if !deduped.iter().any(|room| room.name == "general") {
+        deduped.push(project_room("general", "Files that don't fit other rooms", &[]));
+    }
+
+    deduped.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(RoomDetection { source, rooms: deduped, file_count })
+}
+
+fn record_room(discovered: &mut BTreeMap<String, BTreeSet<String>>, raw_name: &str) {
+    let normalized = raw_name.to_lowercase().replace('-', "_").replace(' ', "_");
+    let room_name = FOLDER_ROOM_MAP
+        .iter()
+        .find_map(|(key, room)| (*key == normalized).then_some((*room).to_owned()))
+        .unwrap_or_else(|| normalized);
+    discovered.entry(room_name).or_default().insert(raw_name.to_owned());
+}
+
+fn project_room(name: &str, description: &str, keywords: &[&str]) -> ProjectRoomConfig {
+    ProjectRoomConfig {
+        name: name.to_owned(),
+        description: Some(description.to_owned()),
+        keywords: keywords.iter().map(|value| (*value).to_owned()).collect(),
+    }
+}
+
+fn write_project_config(
+    config_path: &Path,
+    project_dir: &Path,
+    project_config: &ProjectConfig,
+    overwrite: bool,
+) -> std::io::Result<()> {
+    if config_path.exists() && !overwrite {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "{} already exists; re-run `agentpalace init {}` with `--yes` to overwrite it",
+                config_path.display(),
+                project_dir.display()
+            ),
+        ));
+    }
+
+    let mut root = Mapping::new();
+    root.insert(
+        serde_yaml::Value::String("wing".to_owned()),
+        serde_yaml::Value::String(project_config.wing.clone()),
+    );
+    root.insert(
+        serde_yaml::Value::String("rooms".to_owned()),
+        serde_yaml::to_value(&project_config.rooms)
+            .map_err(|error| std::io::Error::other(error.to_string()))?,
+    );
+    if let Some(routing) = &project_config.routing {
+        root.insert(
+            serde_yaml::Value::String("routing".to_owned()),
+            serde_yaml::to_value(routing)
+                .map_err(|error| std::io::Error::other(error.to_string()))?,
+        );
+    }
+
+    fs::write(
+        config_path,
+        serde_yaml::to_string(&root).map_err(|error| std::io::Error::other(error.to_string()))?,
+    )
+}
+
+fn wing_name_for_dir(project_dir: &Path) -> String {
+    let name = project_dir
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("project")
+        .to_lowercase()
+        .replace('-', "_")
+        .replace(' ', "_");
+    if name.starts_with("wing_") { name } else { format!("wing_{name}") }
+}
+
+fn wing_ids_equal(left: &str, right: &str) -> bool {
+    match (WingId::normalized(left), WingId::normalized(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left.eq_ignore_ascii_case(right),
+    }
+}
+
+fn default_embedding_cache_dir() -> PathBuf {
+    dirs::cache_dir()
+        .unwrap_or_else(|| PathBuf::from(".cache"))
+        .join("agentpalace")
+        .join("embeddings")
+}
+
+fn clamp_search_results(results: usize, config: &AgentPalaceConfig) -> usize {
+    results.min(config.low_cpu.effective_search_results_limit())
+}
+
+fn wake_up_layer1_config(config: &AgentPalaceConfig) -> Layer1Config {
+    let mut layer1 = Layer1Config::default();
+    layer1.max_drawers = layer1.max_drawers.min(config.low_cpu.effective_wake_up_drawers_limit());
+    layer1
+}
+
+fn default_identity_banner() -> &'static str {
+    "## L0 — IDENTITY\nNo identity configured. Create ~/.agentpalace/identity.txt"
+}
+
+fn fastembed_provider(
+    profile: EmbeddingProfile,
+    cache_root: PathBuf,
+) -> Result<FastembedProvider, Box<dyn std::error::Error>> {
+    Ok(FastembedProvider::new(profile, fastembed_provider_config(cache_root)).try_initialize()?)
+}
+
+fn fastembed_validation_provider(
+    profile: EmbeddingProfile,
+    cache_root: PathBuf,
+) -> Result<FastembedProvider, Box<dyn std::error::Error>> {
+    Ok(FastembedProvider::new(profile, fastembed_provider_config(cache_root)))
+}
+
+fn fastembed_provider_config(cache_root: PathBuf) -> FastembedProviderConfig {
+    let mut config = FastembedProviderConfig::new(cache_root);
+    if env_flag("AGENTPALACE_EMBED_ALLOW_DOWNLOADS") {
+        config.allow_downloads = true;
+        config.show_download_progress = true;
+    }
+    config
+}
+
+/// Provider factory for the `setup` warm-up phase. Unlike
+/// [`fastembed_provider`] it always permits downloads: `agentpalace setup` is
+/// the one step every install path runs, so it is the deliberate place to
+/// bootstrap missing embedding assets. Air-gapped operators who stage the cache
+/// themselves pass `--no-model-warmup` to skip it.
+fn fastembed_download_provider(
+    profile: EmbeddingProfile,
+    cache_root: PathBuf,
+) -> Result<FastembedProvider, Box<dyn std::error::Error>> {
+    let mut config = FastembedProviderConfig::new(cache_root);
+    config.allow_downloads = true;
+    config.show_download_progress = true;
+    Ok(FastembedProvider::new(profile, config).try_initialize()?)
+}
+
+/// Result of a `setup` embedding-model warm-up phase.
+struct ModelWarmup {
+    /// Human-readable summary appended to the `setup` report.
+    text: String,
+    /// Whether the model cache is usable without network access. `false` makes
+    /// `setup` exit non-zero so install scripts surface the failure.
+    offline_ok: bool,
+}
+
+/// Warm and verify the embedding model as part of `setup`.
+///
+/// Phase 1 initialises a download-enabled provider so a fresh machine fetches
+/// the missing model assets (a no-op on a warm cache). Phase 2 re-initialises
+/// with the regular provider factory — exactly how `agentpalace serve --stdio` starts by
+/// default — proving the cache is complete before the MCP server is ever
+/// launched. A warm cache adds no more than the model init time.
+fn run_setup_model_warmup<F, H, P>(
+    config_base_dir: Option<&Path>,
+    offline_factory: F,
+    download_factory: H,
+) -> ModelWarmup
+where
+    F: Fn(EmbeddingProfile, PathBuf) -> Result<P, Box<dyn std::error::Error>>,
+    H: Fn(EmbeddingProfile, PathBuf) -> Result<P, Box<dyn std::error::Error>>,
+    P: EmbeddingProvider,
+{
+    let profile = setup_embedding_profile(config_base_dir);
+    let cache_dir = default_embedding_cache_dir();
+    let metadata = profile.metadata();
+
+    let warm = match download_factory(profile, cache_dir.clone()) {
+        Ok(_) => "ok".to_owned(),
+        Err(error) => format!("failed — {}", one_line_error(error.as_ref())),
+    };
+
+    let (offline, offline_ok) = match offline_factory(profile, cache_dir) {
+        Ok(provider) => match provider.startup_validation() {
+            Ok(validation) => (format!("ok — {}", validation.detail), validation.is_ready()),
+            Err(error) => (format!("failed — {}", one_line_error(&error)), false),
+        },
+        Err(error) => (format!("failed — {}", one_line_error(error.as_ref())), false),
+    };
+
+    let mut lines = vec![
+        format!("\n{}", "=".repeat(55)),
+        "  Embedding model warm-up".to_owned(),
+        "=".repeat(55),
+        format!("  model : {}", metadata.model_id),
+        format!("  cache : {}", effective_embedding_cache_dir().display()),
+        format!("  warm  : {warm}"),
+        format!("  check : {offline}"),
+    ];
+    if !offline_ok {
+        lines.push(String::new());
+        lines.push(
+            "  ! embedding model is not usable offline; the MCP server will abort with".to_owned(),
+        );
+        lines.push("    OfflineStartup until the model cache is complete.".to_owned());
+        lines.push(String::new());
+        lines.push(
+            "  ! fix: re-run `agentpalace setup` with network access to download the model,"
+                .to_owned(),
+        );
+        lines.push(
+            "    or stage the cache yourself and re-run with `--no-model-warmup`.".to_owned(),
+        );
+    }
+    lines.push(String::new());
+
+    ModelWarmup { text: lines.join("\n"), offline_ok }
+}
+
+/// Resolves the embedding profile `setup` warms, mirroring how `agentpalace serve --stdio`
+/// resolves its own profile at startup. `config_base_dir` is the test-isolation
+/// base dir threaded from [`CliContext`] (see [`ConfigLoader::load_with_env`]);
+/// `None` resolves the real environment config, like `agentpalace serve --stdio` does.
+/// Falls back to the default profile when no config can be loaded (e.g. a
+/// machine with no palace yet) rather than failing the install path on an
+/// unreadable config.
+fn setup_embedding_profile(config_base_dir: Option<&Path>) -> EmbeddingProfile {
+    ConfigLoader::load_with_env(config_base_dir)
+        .map(|config| config.embedding_profile)
+        .unwrap_or_default()
+}
+
+/// Cache directory actually consulted by the embedding provider: an `HF_HOME`
+/// env var overrides the default root (see `agentpalace-embeddings`). Used only
+/// for display in the warm-up summary.
+fn effective_embedding_cache_dir() -> PathBuf {
+    match std::env::var_os("HF_HOME") {
+        Some(hf_home) => PathBuf::from(hf_home),
+        None => default_embedding_cache_dir(),
+    }
+}
+
+/// First non-empty line of an error, for compact one-line summaries.
+fn one_line_error(error: &dyn std::error::Error) -> String {
+    error.to_string().lines().next().map(str::trim).unwrap_or("unknown error").to_owned()
+}
+
+fn config_error(error: agentpalace_core::AgentPalaceError) -> clap::Error {
+    clap::Error::raw(clap::error::ErrorKind::Io, error.to_string())
+}
+
+fn ingest_error(error: agentpalace_ingest::IngestError) -> clap::Error {
+    clap::Error::raw(clap::error::ErrorKind::Io, error.to_string())
+}
+
+fn provider_error<E>(error: E) -> clap::Error
+where
+    E: std::fmt::Display,
+{
+    clap::Error::raw(clap::error::ErrorKind::Io, error.to_string())
+}
+
+fn runtime_error(error: std::io::Error) -> clap::Error {
+    clap::Error::raw(clap::error::ErrorKind::Io, error.to_string())
+}
+
+fn search_error(error: agentpalace_search::SearchError) -> clap::Error {
+    clap::Error::raw(clap::error::ErrorKind::Io, error.to_string())
+}
+
+fn storage_error(error: agentpalace_storage::StorageError) -> clap::Error {
+    clap::Error::raw(clap::error::ErrorKind::Io, error.to_string())
+}
+
+fn io_error(error: std::io::Error) -> clap::Error {
+    clap::Error::raw(clap::error::ErrorKind::Io, error.to_string())
+}
+
+fn id_error(error: agentpalace_core::IdError) -> clap::Error {
+    clap::Error::raw(clap::error::ErrorKind::InvalidValue, error.to_string())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use agentpalace_core::EmbeddingProfileMetadata;
+    use agentpalace_embeddings::{
+        EmbeddingRequest, EmbeddingResponse, StartupValidation, StartupValidationStatus,
+    };
+    use agentpalace_storage::{MaintenanceLeaseStore, StorageLayout};
+    use tempfile::tempdir;
+
+    #[derive(Debug, Clone)]
+    struct StubProvider {
+        profile: EmbeddingProfile,
+    }
+
+    impl StubProvider {
+        fn new(profile: EmbeddingProfile) -> Self {
+            Self { profile }
+        }
+    }
+
+    impl EmbeddingProvider for StubProvider {
+        fn profile(&self) -> &'static EmbeddingProfileMetadata {
+            self.profile.metadata()
+        }
+
+        fn startup_validation(&self) -> agentpalace_embeddings::Result<StartupValidation> {
+            Ok(StartupValidation {
+                status: StartupValidationStatus::Ready,
+                cache_root: PathBuf::from("/tmp/stub-cache"),
+                model_id: self.profile.metadata().model_id,
+                detail: "stub".to_owned(),
+            })
+        }
+
+        fn embed(
+            &mut self,
+            request: &EmbeddingRequest,
+        ) -> agentpalace_embeddings::Result<EmbeddingResponse> {
+            let dimensions = self.profile.metadata().dimensions;
+            let vectors = request
+                .texts()
+                .iter()
+                .map(|text| stub_vector(text, dimensions))
+                .collect::<Vec<_>>();
+            EmbeddingResponse::from_vectors(
+                vectors,
+                dimensions,
+                self.profile,
+                self.profile.metadata().model_id,
+            )
+        }
+    }
+
+    fn stub_provider(
+        profile: EmbeddingProfile,
+        _cache_root: PathBuf,
+    ) -> Result<StubProvider, Box<dyn std::error::Error>> {
+        Ok(StubProvider::new(profile))
+    }
+
+    /// Simulates a provider that cannot initialise because the model cache is
+    /// missing — the cold-machine, no-network shape `setup` must detect.
+    fn offline_only_provider(
+        _profile: EmbeddingProfile,
+        _cache_root: PathBuf,
+    ) -> Result<StubProvider, Box<dyn std::error::Error>> {
+        Err(Box::new(agentpalace_embeddings::EmbeddingError::OfflineStartup {
+            model_id: "stub".to_owned(),
+            detail: "no local cache assets found for test stub".to_owned(),
+        }))
+    }
+
+    fn stub_vector(text: &str, dimensions: usize) -> Vec<f32> {
+        let lowered = text.to_lowercase();
+        let seed = if lowered.contains("auth") || lowered.contains("login") {
+            [1.0, 0.0, 0.0, 0.0]
+        } else if lowered.contains("roadmap") || lowered.contains("plan") {
+            [0.0, 1.0, 0.0, 0.0]
+        } else {
+            [0.0, 0.0, 1.0, 0.0]
+        };
+
+        let mut values = Vec::with_capacity(dimensions);
+        while values.len() < dimensions {
+            values.extend(seed);
+        }
+        values.truncate(dimensions);
+        values
+    }
+
+    fn temp_config_root(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).expect("system clock").as_nanos();
+        std::env::temp_dir().join(format!("agentpalace-{prefix}-{nanos}"))
+    }
+
+    fn remove_dir_all_if_exists(path: &Path) {
+        if path.exists() {
+            fs::remove_dir_all(path).unwrap();
+        }
+    }
+
+    fn write_file(path: &Path, body: &str) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("create parent directories");
+        }
+        fs::write(path, body).expect("write fixture file");
+    }
+
+    fn setup_project_fixture(root: &Path) -> PathBuf {
+        let project = root.join("project-alpha");
+        write_file(
+            &project.join("backend/auth.rs"),
+            "Auth login flow keeps auth checks in the backend service.\n",
+        );
+        write_file(
+            &project.join("docs/roadmap.md"),
+            "Roadmap plan tracks the migration milestones and release plan.\n",
+        );
+        write_file(&project.join("README.md"), "Project overview for auth migration.\n");
+        project
+    }
+
+    fn setup_second_project_fixture(root: &Path) -> PathBuf {
+        let project = root.join("project-beta");
+        write_file(
+            &project.join("planning/roadmap.md"),
+            "Roadmap ownership stays with the beta planning group.\n",
+        );
+        write_file(
+            &project.join("backend/payments.rs"),
+            "Payments ledger reconciliation runs in the beta backend.\n",
+        );
+        project
+    }
+
+    fn setup_convo_fixture(root: &Path) -> PathBuf {
+        let convos = root.join("convos");
+        write_file(
+            &convos.join("session.txt"),
+            "> What changed?\nWe fixed the auth migration.\n\n> Why?\nTo keep search results stable.\n",
+        );
+        convos
+    }
+
+    #[test]
+    fn help_lists_phase9_commands_and_deferred_entries() {
+        let output = run_cli(["--help"], &CliContext::production(), stub_provider).unwrap();
+        assert_eq!(output.exit_code, 0);
+        assert!(output.stdout.contains("init"));
+        assert!(output.stdout.contains("mine"));
+        assert!(output.stdout.contains("search"));
+        assert!(output.stdout.contains("status"));
+        assert!(output.stdout.contains("wake-up"));
+        assert!(output.stdout.contains("split"));
+        assert!(output.stdout.contains("compress"));
+    }
+
+    #[test]
+    fn no_command_prints_help_and_exits_zero() {
+        let output =
+            run_cli(std::iter::empty::<&str>(), &CliContext::production(), stub_provider).unwrap();
+        assert_eq!(output.exit_code, 0);
+        assert!(output.stdout.contains("Usage:"));
+    }
+
+    #[test]
+    fn deferred_commands_fail_with_explicit_record() {
+        let split =
+            run_cli(["split", "fixtures"], &CliContext::production(), stub_provider).unwrap();
+        assert_eq!(split.exit_code, 1);
+        assert!(split.stderr.contains(DEFERRED_COMMAND_DOC));
+
+        let compress = run_cli(["compress"], &CliContext::production(), stub_provider).unwrap();
+        assert_eq!(compress.exit_code, 1);
+        assert!(compress.stderr.contains("deferred"));
+    }
+
+    #[test]
+    fn setup_help_lists_no_model_warmup_flag() {
+        let output =
+            run_cli(["setup", "--help"], &CliContext::production(), stub_provider).unwrap();
+        assert_eq!(output.exit_code, 0);
+        assert!(output.stdout.contains("--no-model-warmup"));
+    }
+
+    #[test]
+    fn setup_dry_run_skips_model_warmup() {
+        let output = run_cli(
+            ["setup", "--tools", "jules", "--dry-run"],
+            &CliContext::production(),
+            stub_provider,
+        )
+        .unwrap();
+        assert_eq!(output.exit_code, 0);
+        assert!(output.stdout.contains("(dry run — nothing was written)"));
+        assert!(output.stdout.contains("warm-up skipped"));
+    }
+
+    #[test]
+    fn setup_no_model_warmup_flag_skips_warmup() {
+        let output = run_cli(
+            ["setup", "--tools", "jules", "--no-model-warmup"],
+            &CliContext::production(),
+            stub_provider,
+        )
+        .unwrap();
+        assert_eq!(output.exit_code, 0);
+        assert!(output.stdout.contains("warm-up skipped"));
+        assert!(output.stdout.contains("--no-model-warmup"));
+    }
+
+    #[test]
+    fn setup_warmup_succeeds_with_stub_provider() {
+        let output =
+            run_cli(["setup", "--tools", "jules"], &CliContext::production(), stub_provider)
+                .unwrap();
+        assert_eq!(output.exit_code, 0);
+        assert!(output.stdout.contains("Embedding model warm-up"));
+        assert!(output.stdout.contains("check : ok"));
+    }
+
+    #[test]
+    fn setup_warmup_failure_exits_nonzero_with_remediation() {
+        let output = run_cli(
+            ["setup", "--tools", "jules"],
+            &CliContext::production(),
+            offline_only_provider,
+        )
+        .unwrap();
+        assert_eq!(output.exit_code, 1);
+        assert!(output.stdout.contains("embedding model is not usable offline"));
+        assert!(output.stdout.contains("re-run `agentpalace setup` with network access"));
+    }
+
+    #[test]
+    fn setup_model_warmup_offline_check_is_authoritative() {
+        // Warm-up download failure alone must not fail setup when the offline
+        // check passes (e.g. a warm cache on a machine whose download phase
+        // hiccups): the offline startup check is what gates the exit code.
+        let warm_fail = run_setup_model_warmup(None, stub_provider, offline_only_provider);
+        assert!(warm_fail.offline_ok);
+        assert!(warm_fail.text.contains("warm  : failed"));
+
+        let cold = run_setup_model_warmup(None, offline_only_provider, offline_only_provider);
+        assert!(!cold.offline_ok);
+        assert!(cold.text.contains("embedding model is not usable offline"));
+    }
+
+    #[test]
+    fn setup_warmup_uses_configured_embedding_profile_from_config_base_dir() {
+        // `setup` must resolve its embedding profile through the same config
+        // source as every other command (CliContext::for_tests base dir), so a
+        // hermetic test can prove a configured low_cpu profile is honoured
+        // rather than silently warming the default.
+        let config_root = temp_config_root("setup-profile");
+        write_file(
+            &config_root.join("config.json"),
+            "{\"embedding_profile\": \"low_cpu\", \"palace_path\": \"palace\"}\n",
+        );
+        let context = CliContext::for_tests(config_root.clone());
+
+        let output = run_cli(["setup", "--tools", "jules"], &context, stub_provider).unwrap();
+
+        assert_eq!(output.exit_code, 0);
+        assert!(output.stdout.contains("Embedding model warm-up"));
+        assert!(
+            output.stdout.contains("Xenova/all-MiniLM-L6-v2"),
+            "warm-up must use the configured low_cpu profile:\n{}",
+            output.stdout
+        );
+        assert!(!output.stdout.contains("sentence-transformers/all-MiniLM-L6-v2"));
+
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn init_registers_project_without_writing_repository_config_by_default() {
+        let workspace = tempdir().unwrap();
+        let project_dir = setup_project_fixture(workspace.path());
+        let config_root = temp_config_root("init");
+        let context = CliContext::for_tests(config_root.clone());
+
+        let output =
+            run_cli(["init", project_dir.to_str().unwrap()], &context, stub_provider).unwrap();
+
+        assert_eq!(output.exit_code, 0);
+        assert!(output.stdout.contains("AgentPalace Init"));
+        assert!(!project_dir.join("agentpalace.yaml").exists());
+        assert!(config_root.join("projects.json").exists());
+        assert!(config_root.join("config.json").exists());
+        assert!(config_root.join("palace").exists());
+        fs::remove_dir_all(config_root).unwrap();
+    }
+
+    #[test]
+    fn init_does_not_reuse_wing_only_id_for_an_unrelated_checkout() {
+        let workspace = tempdir().unwrap();
+        let first = setup_project_fixture(&workspace.path().join("first"));
+        let second = setup_project_fixture(&workspace.path().join("second"));
+        let config_root = temp_config_root("wing-only-id");
+        let context = CliContext::for_tests(config_root.clone());
+
+        let first_init =
+            run_cli(["init", first.to_str().unwrap()], &context, stub_provider).unwrap();
+        assert_eq!(first_init.exit_code, 0);
+        let second_init =
+            run_cli(["init", second.to_str().unwrap()], &context, stub_provider).unwrap();
+        assert_eq!(second_init.exit_code, 1);
+        assert!(second_init.stderr.contains("pass --project-id"));
+
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn init_imports_existing_project_config_without_modifying_repository_file() {
+        let workspace = tempdir().unwrap();
+        let project_dir = setup_project_fixture(workspace.path());
+        let config_root = temp_config_root("init-yes");
+        let context = CliContext::for_tests(config_root.clone());
+        let existing = "wing: preserved\nrooms:\n  - name: archive\n    description: Keep me\n";
+        write_file(&project_dir.join("agentpalace.yaml"), existing);
+
+        let output =
+            run_cli(["init", project_dir.to_str().unwrap()], &context, stub_provider).unwrap();
+        assert_eq!(output.exit_code, 0);
+        assert_eq!(fs::read_to_string(project_dir.join("agentpalace.yaml")).unwrap(), existing);
+        assert!(config_root.join("projects.json").is_file());
+
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn init_repo_config_flag_emits_portable_override() {
+        let workspace = tempdir().unwrap();
+        let project_dir = setup_project_fixture(workspace.path());
+        let config_root = temp_config_root("init-repo-config");
+        let context = CliContext::for_tests(config_root.clone());
+
+        let output = run_cli(
+            ["init", project_dir.to_str().unwrap(), "--repo-config"],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+
+        assert_eq!(output.exit_code, 0);
+        assert!(project_dir.join("agentpalace.yaml").is_file());
+        assert!(config_root.join("projects.json").is_file());
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn init_with_palace_override_preserves_existing_global_config_fields() {
+        let workspace = tempdir().unwrap();
+        let project_dir = setup_project_fixture(workspace.path());
+        let config_root = temp_config_root("init-palace");
+        fs::create_dir_all(&config_root).unwrap();
+        let context = CliContext::for_tests(config_root.clone());
+        write_file(
+            &config_root.join("config.json"),
+            r#"{
+  "version": 1,
+  "palace_path": "/tmp/original-palace",
+  "collection_name": "custom_collection",
+  "embedding_profile": "low_cpu"
+}"#,
+        );
+        let override_palace = workspace.path().join("custom-palace");
+
+        let output = run_cli(
+            [
+                "--palace",
+                override_palace.to_str().unwrap(),
+                "init",
+                project_dir.to_str().unwrap(),
+                "--yes",
+            ],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+
+        assert_eq!(output.exit_code, 0);
+        let config: ConfigFileV1 =
+            serde_json::from_str(&fs::read_to_string(config_root.join("config.json")).unwrap())
+                .unwrap();
+        assert_eq!(config.collection_name, "custom_collection");
+        assert_eq!(config.embedding_profile, Some(EmbeddingProfile::LowCpu));
+        assert_eq!(config.palace_path, Some(override_palace.display().to_string()));
+        assert_eq!(config.low_cpu, None);
+
+        fs::remove_dir_all(config_root).unwrap();
+    }
+
+    #[test]
+    fn low_cpu_search_results_are_clamped_by_runtime_config() {
+        let workspace = tempdir().unwrap();
+        let project_alpha = setup_project_fixture(workspace.path());
+        let project_beta = setup_second_project_fixture(workspace.path());
+        let balanced_root = temp_config_root("balanced-search");
+        let balanced_context = CliContext::for_tests(balanced_root.clone());
+        let config_root = temp_config_root("low-cpu-search");
+        fs::create_dir_all(&balanced_root).unwrap();
+        fs::create_dir_all(&config_root).unwrap();
+        write_file(
+            &config_root.join("config.json"),
+            r#"{
+  "version": 1,
+  "collection_name": "agentpalace_drawers",
+  "embedding_profile": "low_cpu",
+  "low_cpu": {
+    "search_results_limit": 1
+  }
+}"#,
+        );
+        let context = CliContext::for_tests(config_root.clone());
+
+        run_cli(
+            ["init", project_alpha.to_str().unwrap(), "--yes"],
+            &balanced_context,
+            stub_provider,
+        )
+        .unwrap();
+        run_cli(
+            ["init", project_beta.to_str().unwrap(), "--yes"],
+            &balanced_context,
+            stub_provider,
+        )
+        .unwrap();
+        run_cli(["mine", project_alpha.to_str().unwrap()], &balanced_context, stub_provider)
+            .unwrap();
+        run_cli(["mine", project_beta.to_str().unwrap()], &balanced_context, stub_provider)
+            .unwrap();
+        run_cli(["init", project_alpha.to_str().unwrap(), "--yes"], &context, stub_provider)
+            .unwrap();
+        run_cli(["init", project_beta.to_str().unwrap(), "--yes"], &context, stub_provider)
+            .unwrap();
+        run_cli(["mine", project_alpha.to_str().unwrap()], &context, stub_provider).unwrap();
+        run_cli(["mine", project_beta.to_str().unwrap()], &context, stub_provider).unwrap();
+
+        let unclamped =
+            run_cli(["search", "roadmap", "--results", "5"], &balanced_context, stub_provider)
+                .unwrap();
+        let search =
+            run_cli(["search", "roadmap", "--results", "5"], &context, stub_provider).unwrap();
+
+        assert_eq!(unclamped.exit_code, 0);
+        assert!(unclamped.stdout.matches("  [").count() > 1);
+        assert_eq!(search.exit_code, 0);
+        assert_eq!(search.stdout.matches("  [").count(), 1);
+
+        fs::remove_dir_all(balanced_root).unwrap();
+        fs::remove_dir_all(config_root).unwrap();
+    }
+
+    #[test]
+    fn low_cpu_wake_up_drawers_are_clamped_by_runtime_config() {
+        let workspace = tempdir().unwrap();
+        let project_dir = setup_project_fixture(workspace.path());
+        let config_root = temp_config_root("low-cpu-wake-up");
+        fs::create_dir_all(&config_root).unwrap();
+        write_file(
+            &config_root.join("config.json"),
+            r#"{
+  "version": 1,
+  "collection_name": "agentpalace_drawers",
+  "embedding_profile": "low_cpu",
+  "low_cpu": {
+    "degraded_mode": false,
+    "wake_up_drawers_limit": 1
+  }
+}"#,
+        );
+        let context = CliContext::for_tests(config_root.clone());
+
+        run_cli(["init", project_dir.to_str().unwrap(), "--yes"], &context, stub_provider).unwrap();
+        run_cli(["mine", project_dir.to_str().unwrap()], &context, stub_provider).unwrap();
+
+        let wake_up = run_cli(["wake-up"], &context, stub_provider).unwrap();
+
+        assert_eq!(wake_up.exit_code, 0);
+        assert_eq!(wake_up.stdout.matches("  - ").count(), 1);
+
+        fs::remove_dir_all(config_root).unwrap();
+    }
+
+    #[test]
+    fn mine_search_status_and_wakeup_work_end_to_end() {
+        let workspace = tempdir().unwrap();
+        let project_dir = setup_project_fixture(workspace.path());
+        let config_root = temp_config_root("e2e");
+        let context = CliContext::for_tests(config_root.clone());
+
+        run_cli(["init", project_dir.to_str().unwrap(), "--yes"], &context, stub_provider).unwrap();
+
+        let mine =
+            run_cli(["mine", project_dir.to_str().unwrap()], &context, stub_provider).unwrap();
+        assert_eq!(mine.exit_code, 0);
+        assert!(mine.stdout.contains("Files ingested: 3"));
+
+        let search = run_cli(["search", "auth login"], &context, stub_provider).unwrap();
+        assert_eq!(search.exit_code, 0);
+        assert!(search.stdout.contains("Results for: \"auth login\""));
+        assert!(search.stdout.contains("backend"));
+
+        let status = run_cli(["status"], &context, stub_provider).unwrap();
+        assert_eq!(status.exit_code, 0);
+        assert!(status.stdout.contains("AgentPalace Status"));
+        assert!(status.stdout.contains("WING: wing_project_alpha"));
+
+        let wake_up = run_cli(["wake-up"], &context, stub_provider).unwrap();
+        assert_eq!(wake_up.exit_code, 0);
+        assert!(wake_up.stdout.contains("Wake-up text"));
+        assert!(wake_up.stdout.contains("ESSENTIAL STORY"));
+
+        fs::remove_dir_all(config_root).unwrap();
+    }
+
+    /// Register + mine `project-alpha` (3 canonical files) into a fresh palace,
+    /// returning the test context and the config root for cleanup.
+    fn setup_mined_alpha(prefix: &str) -> (tempfile::TempDir, CliContext, PathBuf) {
+        let workspace = tempdir().unwrap();
+        let project_dir = setup_project_fixture(workspace.path());
+        let config_root = temp_config_root(prefix);
+        let context = CliContext::for_tests(config_root.clone());
+        run_cli(["init", project_dir.to_str().unwrap(), "--yes"], &context, stub_provider).unwrap();
+        run_cli(["mine", project_dir.to_str().unwrap()], &context, stub_provider).unwrap();
+        (workspace, context, config_root)
+    }
+
+    /// Read the centrally-registered project id whose wing matches `wing`.
+    fn registered_project_id(context: &CliContext, wing: &str) -> String {
+        let list = run_cli(["project", "list"], context, stub_provider).unwrap();
+        list.stdout
+            .lines()
+            .filter_map(|line| line.trim().split_once(" -> "))
+            .find(|(_, entry_wing)| *entry_wing == wing)
+            .map(|(id, _)| id.to_owned())
+            .expect("project registered")
+    }
+
+    /// Read the id of the sole centrally-registered project (for fixtures whose
+    /// wing string is not known up front, e.g. a repo-local `agentpalace.yaml`).
+    fn sole_registered_project_id(context: &CliContext) -> String {
+        let list = run_cli(["project", "list"], context, stub_provider).unwrap();
+        list.stdout
+            .lines()
+            .filter_map(|line| line.trim().split_once(" -> "))
+            .map(|(id, _)| id.to_owned())
+            .next()
+            .expect("a project is registered")
+    }
+
+    #[test]
+    fn prune_previews_by_default_without_deleting() {
+        let (_workspace, context, config_root) = setup_mined_alpha("prune-preview");
+
+        let preview = run_cli(
+            ["prune", "--wing", "wing_project_alpha", "--kind", "projects"],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+        assert_eq!(preview.exit_code, 0);
+        assert!(preview.stdout.contains("Matched: 3 sources"), "{}", preview.stdout);
+        assert!(preview.stdout.contains("Preview only"));
+
+        // Nothing was deleted.
+        let status = run_cli(["status"], &context, stub_provider).unwrap();
+        assert!(status.stdout.contains("WING: wing_project_alpha"));
+
+        fs::remove_dir_all(config_root).unwrap();
+    }
+
+    #[test]
+    fn prune_yes_deletes_matched_and_is_idempotent() {
+        let (_workspace, context, config_root) = setup_mined_alpha("prune-delete");
+
+        let removed = run_cli(
+            ["prune", "--wing", "wing_project_alpha", "--kind", "projects", "--yes"],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+        assert_eq!(removed.exit_code, 0);
+        assert!(removed.stdout.contains("Removed: 3 sources"), "{}", removed.stdout);
+
+        // Drawers are gone from the palace.
+        let status = run_cli(["status"], &context, stub_provider).unwrap();
+        assert!(!status.stdout.contains("WING: wing_project_alpha"), "{}", status.stdout);
+
+        // Re-running the same prune is a safe no-op.
+        let again = run_cli(
+            ["prune", "--wing", "wing_project_alpha", "--kind", "projects", "--yes"],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+        assert_eq!(again.exit_code, 0);
+        assert!(again.stdout.contains("Nothing matched this scope"), "{}", again.stdout);
+
+        fs::remove_dir_all(config_root).unwrap();
+    }
+
+    #[test]
+    fn prune_rejects_unsafe_scopes() {
+        let config_root = temp_config_root("prune-unsafe");
+        fs::create_dir_all(&config_root).unwrap();
+        let context = CliContext::for_tests(config_root.clone());
+
+        // No scope at all.
+        let none = run_cli(["prune"], &context, stub_provider).unwrap();
+        assert_eq!(none.exit_code, 2);
+        assert!(none.stderr.contains("narrow scope"), "{}", none.stderr);
+
+        // Wing without a kind is too broad.
+        let wing_only = run_cli(["prune", "--wing", "wing_x"], &context, stub_provider).unwrap();
+        assert_eq!(wing_only.exit_code, 2);
+
+        // Path/branch narrowing needs a project.
+        let view = run_cli(
+            ["prune", "--wing", "wing_x", "--kind", "projects", "--view", "feature"],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+        assert_eq!(view.exit_code, 2);
+        assert!(view.stderr.contains("--view requires --project-id"), "{}", view.stderr);
+
+        let sp = run_cli(
+            ["prune", "--wing", "wing_x", "--kind", "projects", "--source-prefix", "backend/"],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+        assert_eq!(sp.exit_code, 2);
+        assert!(sp.stderr.contains("--source-prefix requires --project-id"), "{}", sp.stderr);
+
+        // A present-but-empty scope value is rejected rather than silently
+        // widening the scope (an empty --source-prefix would otherwise prune the
+        // whole project).
+        let empty =
+            run_cli(["prune", "--project-id", "p", "--source-prefix", ""], &context, stub_provider)
+                .unwrap();
+        assert_eq!(empty.exit_code, 2);
+        assert!(empty.stderr.contains("--source-prefix must not be empty"), "{}", empty.stderr);
+
+        fs::remove_dir_all(config_root).unwrap();
+    }
+
+    #[test]
+    fn prune_reports_zero_when_scope_matches_nothing() {
+        let (_workspace, context, config_root) = setup_mined_alpha("prune-nomatch");
+
+        let miss = run_cli(
+            ["prune", "--wing", "wing_does_not_exist", "--kind", "projects"],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+        assert_eq!(miss.exit_code, 0);
+        assert!(miss.stdout.contains("Nothing matched this scope"), "{}", miss.stdout);
+
+        fs::remove_dir_all(config_root).unwrap();
+    }
+
+    #[test]
+    fn prune_project_id_scope_resolves_wing_and_removes_project() {
+        let (_workspace, context, config_root) = setup_mined_alpha("prune-project-id");
+        let project_id = registered_project_id(&context, "wing_project_alpha");
+
+        // No --wing: the wing is resolved from the project registry.
+        let removed =
+            run_cli(["prune", "--project-id", &project_id, "--yes"], &context, stub_provider)
+                .unwrap();
+        assert_eq!(removed.exit_code, 0);
+        assert!(removed.stdout.contains("Removed: 3 sources"), "{}", removed.stdout);
+
+        let status = run_cli(["status"], &context, stub_provider).unwrap();
+        assert!(!status.stdout.contains("WING: wing_project_alpha"), "{}", status.stdout);
+
+        fs::remove_dir_all(config_root).unwrap();
+    }
+
+    #[test]
+    fn prune_source_prefix_scopes_to_subtree() {
+        let (_workspace, context, config_root) = setup_mined_alpha("prune-subtree");
+        let project_id = registered_project_id(&context, "wing_project_alpha");
+
+        // Only backend/auth.rs lives under backend/.
+        let removed = run_cli(
+            ["prune", "--project-id", &project_id, "--source-prefix", "backend/", "--yes"],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+        assert_eq!(removed.exit_code, 0);
+        assert!(removed.stdout.contains("Removed: 1 sources"), "{}", removed.stdout);
+
+        // The other two files survive.
+        let status = run_cli(["status"], &context, stub_provider).unwrap();
+        assert!(status.stdout.contains("WING: wing_project_alpha"), "{}", status.stdout);
+
+        fs::remove_dir_all(config_root).unwrap();
+    }
+
+    #[test]
+    fn prune_removes_branch_view_leaving_canonical() {
+        let workspace = tempdir().unwrap();
+        let repo_dir = workspace.path().join("repo");
+        fs::create_dir_all(&repo_dir).unwrap();
+
+        let base_content = "fn base() -> i32 { 42 }\n".repeat(20);
+        git_init_repo(
+            &repo_dir,
+            &[
+                ("agentpalace.yaml", "wing: branchprune\nrooms:\n  - name: general\n"),
+                ("base.rs", &base_content),
+                ("stable.rs", "fn stable() -> &str { \"hello\" }\n"),
+            ],
+        );
+        let run_git = |args: &[&str]| {
+            std::process::Command::new("git").args(args).current_dir(&repo_dir).status().unwrap();
+        };
+        run_git(&["checkout", "-b", "feature"]);
+        fs::write(repo_dir.join("base.rs"), "fn base() -> i32 { 99 }\n".repeat(20)).unwrap();
+
+        let config_root = temp_config_root("prune-branch");
+        let context = CliContext::for_tests(config_root.clone());
+
+        run_cli(["init", repo_dir.to_str().unwrap(), "--yes"], &context, stub_provider).unwrap();
+        run_cli(["mine", repo_dir.to_str().unwrap(), "--full"], &context, stub_provider).unwrap();
+        let branch_mine =
+            run_cli(["mine", repo_dir.to_str().unwrap(), "--branch"], &context, stub_provider)
+                .unwrap();
+        assert!(branch_mine.stdout.contains("Files ingested: 1"), "{}", branch_mine.stdout);
+
+        let project_id = sole_registered_project_id(&context);
+
+        // Prune only the `feature` branch view; canonical must survive.
+        let removed = run_cli(
+            ["prune", "--project-id", &project_id, "--view", "feature", "--yes"],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+        assert_eq!(removed.exit_code, 0, "{}", removed.stderr);
+        assert!(removed.stdout.contains("Removed: 1 sources"), "{}", removed.stdout);
+
+        // The branch view is gone; the canonical snapshot survives.
+        let branch_after = run_cli(
+            ["prune", "--project-id", &project_id, "--kind", "projects-branch"],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+        assert!(branch_after.stdout.contains("Nothing matched"), "{}", branch_after.stdout);
+
+        let canonical = run_cli(
+            ["prune", "--project-id", &project_id, "--kind", "projects"],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+        assert!(!canonical.stdout.contains("Matched: 0 sources"), "{}", canonical.stdout);
+        assert!(canonical.stdout.contains("Matched:"), "{}", canonical.stdout);
+
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn prune_after_remine_leaves_no_orphaned_drawers() {
+        let workspace = tempdir().unwrap();
+        let project_dir = setup_project_fixture(workspace.path());
+        let config_root = temp_config_root("prune-remine");
+        let context = CliContext::for_tests(config_root.clone());
+        run_cli(["init", project_dir.to_str().unwrap(), "--yes"], &context, stub_provider).unwrap();
+        run_cli(["mine", project_dir.to_str().unwrap()], &context, stub_provider).unwrap();
+
+        // Change one file and re-mine: a second committed run for that source
+        // key (the earlier run's drawers are superseded). Prune must delete the
+        // live latest-run drawers, leaving nothing orphaned in LanceDB.
+        write_file(
+            &project_dir.join("backend/auth.rs"),
+            "Totally different auth content after an edit.\n",
+        );
+        run_cli(["mine", project_dir.to_str().unwrap()], &context, stub_provider).unwrap();
+
+        let removed = run_cli(
+            ["prune", "--wing", "wing_project_alpha", "--kind", "projects", "--yes"],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+        assert_eq!(removed.exit_code, 0);
+
+        // No drawers may remain — a stale-run orphan would still list here.
+        let status = run_cli(["status"], &context, stub_provider).unwrap();
+        assert!(
+            !status.stdout.contains("WING: wing_project_alpha"),
+            "orphaned drawers remain after prune: {}",
+            status.stdout
+        );
+
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn prune_explicit_wing_overrides_registry() {
+        let (_workspace, context, config_root) = setup_mined_alpha("prune-wing-override");
+        let project_id = registered_project_id(&context, "wing_project_alpha");
+
+        // An explicit --wing overrides the registered wing: a wrong wing resolves
+        // to that wing (matching nothing), not a silent fallback to the registry.
+        let wrong = run_cli(
+            ["prune", "--project-id", &project_id, "--wing", "wing_not_it", "--kind", "projects"],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+        assert_eq!(wrong.exit_code, 0);
+        assert!(wrong.stdout.contains("Nothing matched"), "{}", wrong.stdout);
+
+        // Without --wing, the registry wing is used and the project is found.
+        let registry = run_cli(
+            ["prune", "--project-id", &project_id, "--kind", "projects"],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+        assert!(registry.stdout.contains("Matched: 3 sources"), "{}", registry.stdout);
+
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn mine_accepts_batch_size_on_local_path() {
+        let workspace = tempdir().unwrap();
+        let project_dir = setup_project_fixture(workspace.path());
+        let config_root = temp_config_root("batch-size-local");
+        let context = CliContext::for_tests(config_root.clone());
+
+        run_cli(["init", project_dir.to_str().unwrap(), "--yes"], &context, stub_provider).unwrap();
+
+        // --batch-size 1 forces single-chunk embed batches; mining still ingests
+        // every file, proving the flag is accepted and threads through cleanly.
+        let mine = run_cli(
+            ["mine", project_dir.to_str().unwrap(), "--batch-size", "1"],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+        assert_eq!(mine.exit_code, 0, "stderr: {}", mine.stderr);
+        assert!(
+            mine.stdout.contains("Files ingested: 3"),
+            "expected 3 files ingested with --batch-size 1: {}",
+            mine.stdout
+        );
+
+        fs::remove_dir_all(config_root).unwrap();
+    }
+
+    #[test]
+    fn build_remote_batches_respects_max_files() {
+        use agentpalace_federation::{IngestChunkDto, IngestFileDto};
+
+        let make_file = |name: &str| IngestFileDto {
+            relative_path: name.to_owned(),
+            content_hash: "hash".to_owned(),
+            file_hash: None,
+            chunks: vec![IngestChunkDto {
+                chunk_index: 0,
+                room: "general".to_owned(),
+                text: "x".to_owned(),
+                byte_start: None,
+                byte_end: None,
+                line_start: None,
+                line_end: None,
+            }],
+        };
+
+        let files: Vec<_> = (0..5).map(|i| make_file(&format!("f{i}.rs"))).collect();
+
+        // Cap of 2 files/batch over 5 tiny files → 3 batches sized [2, 2, 1].
+        let batches = build_remote_batches(files.clone(), 2);
+        assert_eq!(batches.len(), 3, "expected 3 batches at cap 2");
+        assert!(batches.iter().all(|b| b.len() <= 2), "no batch may exceed the cap");
+        assert_eq!(batches.iter().map(Vec::len).sum::<usize>(), 5, "no file dropped");
+
+        // 0 falls back to the default cap → a single batch for 5 tiny files.
+        let batches = build_remote_batches(files, 0);
+        assert_eq!(batches.len(), 1, "0 must fall back to the default cap");
+        assert_eq!(batches[0].len(), 5);
+    }
+
+    #[test]
+    fn render_remote_mine_summary_labels_partial_on_incomplete() {
+        let src = Path::new("/tmp/src");
+
+        // No per-file failures, but replication_incomplete=true → "partial — transport interrupted".
+        let output = render_remote_mine_summary(
+            src,
+            "hub",
+            "http://example.com",
+            "wing_test",
+            "repo-1",
+            5,
+            0,
+            0,
+            5,
+            &[],
+            &[],
+            &[],
+            None,
+            Some("feature-x"),
+            true,
+            true,
+        );
+        assert!(
+            output.contains("replication: partial"),
+            "incomplete=true must produce 'partial', got: {output}",
+        );
+        assert!(
+            output.contains("transport interrupted"),
+            "incomplete=true without file errors must say 'transport interrupted', got: {output}",
+        );
+        assert!(
+            !output.contains("replication: succeeded"),
+            "incomplete=true must NOT say 'succeeded', got: {output}",
+        );
+
+        // No per-file failures, replication_incomplete=false → "succeeded".
+        let output = render_remote_mine_summary(
+            src,
+            "hub",
+            "http://example.com",
+            "wing_test",
+            "repo-1",
+            5,
+            0,
+            0,
+            5,
+            &[],
+            &[],
+            &[],
+            None,
+            None,
+            true,
+            false,
+        );
+        assert!(
+            output.contains("replication: succeeded"),
+            "incomplete=false + no file failures must say 'succeeded', got: {output}",
+        );
+
+        // Per-file failures, replication_incomplete=false → "partial — some files had errors".
+        let output = render_remote_mine_summary(
+            src,
+            "hub",
+            "http://example.com",
+            "wing_test",
+            "repo-1",
+            3,
+            0,
+            2,
+            3,
+            &[],
+            &[("bad.rs".into(), "err".into())],
+            &[],
+            None,
+            None,
+            true,
+            false,
+        );
+        assert!(
+            output.contains("replication: partial"),
+            "file failures must produce 'partial', got: {output}",
+        );
+        assert!(
+            output.contains("some files had errors"),
+            "file failures must say 'some files had errors', got: {output}",
+        );
+
+        // Both incomplete AND per-file failures → "partial — transport interrupted".
+        let output = render_remote_mine_summary(
+            src,
+            "hub",
+            "http://example.com",
+            "wing_test",
+            "repo-1",
+            3,
+            0,
+            2,
+            3,
+            &[],
+            &[("bad.rs".into(), "err".into())],
+            &[],
+            None,
+            None,
+            true,
+            true,
+        );
+        assert!(
+            output.contains("replication: partial"),
+            "incomplete=true with file failures must produce 'partial', got: {output}",
+        );
+        assert!(
+            output.contains("transport interrupted"),
+            "incomplete=true with file failures must say 'transport interrupted', got: {output}",
+        );
+        assert!(
+            !output.contains("some files had errors"),
+            "incomplete=true must not say 'some files had errors', got: {output}",
+        );
+        assert!(
+            !output.contains("replication: succeeded"),
+            "incomplete=true with file failures must NOT say 'succeeded', got: {output}",
+        );
+
+        // Non dual_write: no replication label at all.
+        let output = render_remote_mine_summary(
+            src,
+            "hub",
+            "http://example.com",
+            "wing_test",
+            "repo-1",
+            5,
+            0,
+            0,
+            5,
+            &[],
+            &[],
+            &[],
+            None,
+            None,
+            false,
+            false,
+        );
+        assert!(
+            !output.contains("replication:"),
+            "non-dual-write must not contain 'replication:', got: {output}",
+        );
+        assert!(
+            render_remote_mine_summary(
+                src,
+                "hub",
+                "http://example.com",
+                "wing_test",
+                "repo-1",
+                5,
+                0,
+                0,
+                5,
+                &[],
+                &[],
+                &[],
+                None,
+                Some("feature-x"),
+                false,
+                false,
+            )
+            .contains("View: feature-x"),
+        );
+    }
+
+    #[test]
+    fn dual_write_surfaces_remote_stderr_without_failing_local_success() {
+        let output = combine_dual_write_outputs(
+            CliOutput::success("local mine complete"),
+            CliOutput::failure(1, "remote replication failed"),
+        );
+
+        assert_eq!(output.exit_code, 0);
+        assert!(output.stdout.contains("local mine complete"));
+        assert!(output.stdout.contains("remote replication failed"));
+        assert!(output.stderr.is_empty());
+    }
+
+    #[test]
+    fn mine_dry_run_reports_work_without_writing_storage_files() {
+        let workspace = tempdir().unwrap();
+        let project_dir = setup_project_fixture(workspace.path());
+        let config_root = temp_config_root("dry-run");
+        let context = CliContext::for_tests(config_root.clone());
+
+        run_cli(["init", project_dir.to_str().unwrap(), "--yes"], &context, stub_provider).unwrap();
+
+        let output = run_cli(
+            ["mine", project_dir.to_str().unwrap(), "--dry-run", "--limit", "1"],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+        assert_eq!(output.exit_code, 0);
+        assert!(output.stdout.contains("Dry run: yes"));
+        assert!(output.stdout.contains("Files ingested: 1"));
+
+        let status = run_cli(["status"], &context, stub_provider).unwrap();
+        assert_eq!(status.exit_code, 1);
+        assert!(status.stderr.contains("No palace found"));
+        let layout = StorageLayout::new(config_root.join("palace"));
+        assert!(!layout.sqlite_path.exists());
+        assert!(!layout.lancedb_dir.exists());
+        fs::remove_dir_all(config_root).unwrap();
+    }
+
+    /// The mine summary surfaces secret-shaped paths withheld by the denylist
+    /// (issue #95): a count plus the path and reason — never the content.
+    #[test]
+    fn mine_summary_reports_secret_paths_withheld() {
+        let workspace = tempdir().unwrap();
+        let project_dir = setup_project_fixture(workspace.path());
+        write_file(&project_dir.join(".env"), "SECRET=hunter2\n");
+        write_file(&project_dir.join("kubeconfig.yaml"), "apiVersion: v1\n");
+        write_file(&project_dir.join("secrets.local.json"), "{\"key\":\"hunter2\"}\n");
+
+        let config_root = temp_config_root("secret-mine");
+        let context = CliContext::for_tests(config_root.clone());
+        run_cli(["init", project_dir.to_str().unwrap(), "--yes"], &context, stub_provider).unwrap();
+        let output =
+            run_cli(["mine", project_dir.to_str().unwrap(), "--dry-run"], &context, stub_provider)
+                .unwrap();
+
+        assert_eq!(output.exit_code, 0, "mine failed: {:?}", output.stderr);
+        assert!(
+            output.stdout.contains("Secrets withheld: 3"),
+            "expected secrets count, got: {}",
+            output.stdout
+        );
+        assert!(output.stdout.contains(".env"), "expected .env in output: {}", output.stdout);
+        assert!(
+            output.stdout.contains("kubeconfig.yaml"),
+            "expected kubeconfig.yaml in output: {}",
+            output.stdout
+        );
+        assert!(
+            output.stdout.contains("secrets.local.json"),
+            "expected secrets.local.json in output: {}",
+            output.stdout
+        );
+        // The paths and reasons are shown, but the file content is not.
+        assert!(
+            !output.stdout.contains("hunter2"),
+            "secret content must never be printed: {}",
+            output.stdout
+        );
+
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn mine_invalid_source_path_fails_before_creating_storage() {
+        let workspace = tempdir().unwrap();
+        let config_root = temp_config_root("invalid-source");
+        let context = CliContext::for_tests(config_root.clone());
+
+        let error = run_cli(
+            ["mine", workspace.path().join("missing-dir").to_str().unwrap()],
+            &context,
+            stub_provider,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::Io);
+        assert!(error.to_string().contains("failed to access source directory"));
+        let layout = StorageLayout::new(config_root.join("palace"));
+        assert!(!layout.sqlite_path.exists());
+        assert!(!layout.lancedb_dir.exists());
+
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn search_without_a_palace_exits_non_zero() {
+        let config_root = temp_config_root("missing");
+        fs::create_dir_all(&config_root).unwrap();
+        let context = CliContext::for_tests(config_root.clone());
+
+        let output = run_cli(["search", "auth"], &context, stub_provider).unwrap();
+        assert_eq!(output.exit_code, 1);
+        assert!(output.stderr.contains("No palace found"));
+        fs::remove_dir_all(config_root).unwrap();
+    }
+
+    #[test]
+    fn status_without_a_palace_exits_non_zero() {
+        let config_root = temp_config_root("missing-status");
+        fs::create_dir_all(&config_root).unwrap();
+        let context = CliContext::for_tests(config_root.clone());
+
+        let output = run_cli(["status"], &context, stub_provider).unwrap();
+        assert_eq!(output.exit_code, 1);
+        assert!(output.stderr.contains("No palace found"));
+        fs::remove_dir_all(config_root).unwrap();
+    }
+
+    #[test]
+    fn wake_up_without_a_palace_exits_non_zero() {
+        let config_root = temp_config_root("missing-wake-up");
+        fs::create_dir_all(&config_root).unwrap();
+        let context = CliContext::for_tests(config_root.clone());
+
+        let output = run_cli(["wake-up"], &context, stub_provider).unwrap();
+        assert_eq!(output.exit_code, 1);
+        assert!(output.stderr.contains("No palace found"));
+
+        fs::remove_dir_all(config_root).unwrap();
+    }
+
+    #[test]
+    fn mine_projects_respects_wing_override() {
+        let workspace = tempdir().unwrap();
+        let project_dir = setup_project_fixture(workspace.path());
+        let config_root = temp_config_root("wing-override");
+        let context = CliContext::for_tests(config_root.clone());
+
+        run_cli(["init", project_dir.to_str().unwrap(), "--yes"], &context, stub_provider).unwrap();
+        let output = run_cli(
+            ["mine", project_dir.to_str().unwrap(), "--wing", "overridewing"],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+        assert_eq!(output.exit_code, 0);
+
+        let status = run_cli(["status"], &context, stub_provider).unwrap();
+        // --wing overridewing is normalized to wing_overridewing so that explicit
+        // CLI overrides match the wing_-prefixed convention used everywhere else.
+        assert!(status.stdout.contains("WING: wing_overridewing"));
+        assert!(!status.stdout.contains("WING: wing_project_alpha"));
+        fs::remove_dir_all(config_root).unwrap();
+    }
+
+    #[test]
+    fn mine_projects_uses_central_registry_without_repository_yaml() {
+        let workspace = tempdir().unwrap();
+        let project_dir = setup_project_fixture(workspace.path());
+        let config_root = temp_config_root("central-registry-mine");
+        let context = CliContext::for_tests(config_root.clone());
+
+        let init =
+            run_cli(["init", project_dir.to_str().unwrap()], &context, stub_provider).unwrap();
+        assert_eq!(init.exit_code, 0);
+        assert!(!project_dir.join("agentpalace.yaml").exists());
+
+        let mine =
+            run_cli(["mine", project_dir.to_str().unwrap(), "--dry-run"], &context, stub_provider)
+                .unwrap();
+        assert_eq!(mine.exit_code, 0);
+        assert!(mine.stdout.contains("Dry run: yes"));
+
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn project_commands_manage_registry_and_export_compatibility_file() {
+        let workspace = tempdir().unwrap();
+        let project_dir = setup_project_fixture(workspace.path());
+        let config_root = temp_config_root("project-commands");
+        let context = CliContext::for_tests(config_root.clone());
+        let project_id = "local/project-alpha";
+
+        let register = run_cli(
+            [
+                "project",
+                "register",
+                project_dir.to_str().unwrap(),
+                "--wing",
+                "wing_registered",
+                "--project-id",
+                project_id,
+            ],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+        assert_eq!(register.exit_code, 0);
+        assert!(register.stdout.contains(project_id));
+
+        let list = run_cli(["project", "list"], &context, stub_provider).unwrap();
+        assert!(list.stdout.contains("Projects: 1"));
+        assert!(list.stdout.contains(project_id));
+
+        let show =
+            run_cli(["project", "show", project_dir.to_str().unwrap()], &context, stub_provider)
+                .unwrap();
+        assert!(show.stdout.contains("wing_registered"));
+
+        let export =
+            run_cli(["project", "export", project_id, "--repo-config"], &context, stub_provider)
+                .unwrap();
+        assert_eq!(export.exit_code, 0);
+        assert!(
+            fs::read_to_string(project_dir.join("agentpalace.yaml"))
+                .unwrap()
+                .contains("wing_registered")
+        );
+
+        let show_after_export =
+            run_cli(["project", "show", project_dir.to_str().unwrap()], &context, stub_provider)
+                .unwrap();
+        assert!(show_after_export.stdout.contains("Project: local/project-alpha"));
+
+        let remove = run_cli(["project", "remove", project_id], &context, stub_provider).unwrap();
+        assert_eq!(remove.exit_code, 0);
+        let list = run_cli(["project", "list"], &context, stub_provider).unwrap();
+        assert!(list.stdout.contains("Projects: 0"));
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn project_export_requires_explicit_repo_config_flag() {
+        let workspace = tempdir().unwrap();
+        let project_dir = setup_project_fixture(workspace.path());
+        let config_root = temp_config_root("project-export-flag");
+        let context = CliContext::for_tests(config_root.clone());
+        let project_id = "local/project-export";
+
+        let register = run_cli(
+            [
+                "project",
+                "register",
+                project_dir.to_str().unwrap(),
+                "--wing",
+                "wing_export",
+                "--project-id",
+                project_id,
+            ],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+        assert_eq!(register.exit_code, 0);
+
+        let export = run_cli(["project", "export", project_id], &context, stub_provider).unwrap();
+        assert_eq!(export.exit_code, 1);
+        assert!(export.stderr.contains("requires --repo-config"));
+        assert!(!project_dir.join("agentpalace.yaml").exists());
+
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn equivalent_wing_ids_preserve_project_routing() {
+        assert!(wing_ids_equal("wing_app", "app"));
+        assert!(wing_ids_equal("APP", "wing_app"));
+        assert!(!wing_ids_equal("wing_app", "wing_other"));
+    }
+
+    #[test]
+    fn mine_convos_mode_supports_real_and_dry_run_paths() {
+        let workspace = tempdir().unwrap();
+        let convo_dir = setup_convo_fixture(workspace.path());
+        let config_root = temp_config_root("convos");
+        let context = CliContext::for_tests(config_root.clone());
+
+        let mine = run_cli(
+            [
+                "--palace",
+                workspace.path().join("convo-palace").to_str().unwrap(),
+                "mine",
+                convo_dir.to_str().unwrap(),
+                "--mode",
+                "convos",
+                "--wing",
+                "talks",
+            ],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+        assert_eq!(mine.exit_code, 0);
+        assert!(mine.stdout.contains("Mode: convos"));
+
+        let dry_run = run_cli(
+            [
+                "--palace",
+                workspace.path().join("dry-convo-palace").to_str().unwrap(),
+                "mine",
+                convo_dir.to_str().unwrap(),
+                "--mode",
+                "convos",
+                "--wing",
+                "talks",
+                "--dry-run",
+            ],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+        assert_eq!(dry_run.exit_code, 0);
+        assert!(dry_run.stdout.contains("Dry run: yes"));
+
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn search_filters_and_wake_up_wing_flag_work_through_cli() {
+        let workspace = tempdir().unwrap();
+        let project_alpha = setup_project_fixture(workspace.path());
+        let project_beta = setup_second_project_fixture(workspace.path());
+        let config_root = temp_config_root("filters");
+        let context = CliContext::for_tests(config_root.clone());
+
+        run_cli(["init", project_alpha.to_str().unwrap(), "--yes"], &context, stub_provider)
+            .unwrap();
+        run_cli(["mine", project_alpha.to_str().unwrap()], &context, stub_provider).unwrap();
+        run_cli(["init", project_beta.to_str().unwrap(), "--yes"], &context, stub_provider)
+            .unwrap();
+        run_cli(["mine", project_beta.to_str().unwrap()], &context, stub_provider).unwrap();
+
+        let wing_search = run_cli(
+            ["search", "reconciliation", "--wing", "wing_project_beta"],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+        assert_eq!(wing_search.exit_code, 0);
+        assert!(wing_search.stdout.contains("wing_project_beta"));
+        assert!(!wing_search.stdout.contains("wing_project_alpha"));
+
+        let room_search =
+            run_cli(["search", "roadmap", "--room", "planning"], &context, stub_provider).unwrap();
+        assert_eq!(room_search.exit_code, 0);
+        assert!(room_search.stdout.contains("planning"));
+
+        let wake_up =
+            run_cli(["wake-up", "--wing", "wing_project_beta"], &context, stub_provider).unwrap();
+        assert_eq!(wake_up.exit_code, 0);
+        assert!(wake_up.stdout.contains("[planning]"));
+        assert!(wake_up.stdout.contains("roadmap.md"));
+        assert!(!wake_up.stdout.contains("auth.rs"));
+
+        fs::remove_dir_all(config_root).unwrap();
+    }
+
+    #[test]
+    fn detect_rooms_keeps_all_directory_aliases_for_same_room() {
+        let workspace = tempdir().unwrap();
+        fs::create_dir_all(workspace.path().join("frontend")).unwrap();
+        fs::create_dir_all(workspace.path().join("client")).unwrap();
+        fs::write(workspace.path().join("frontend").join("index.ts"), "export const x = 1;\n")
+            .unwrap();
+        fs::write(workspace.path().join("client").join("app.ts"), "export const y = 2;\n").unwrap();
+
+        let detection = detect_rooms(workspace.path()).unwrap();
+        let frontend = detection.rooms.iter().find(|room| room.name == "frontend").unwrap();
+        assert!(frontend.description.as_ref().unwrap().contains("frontend"));
+        assert!(frontend.description.as_ref().unwrap().contains("client"));
+        assert!(frontend.keywords.contains(&"frontend".to_owned()));
+        assert!(frontend.keywords.contains(&"client".to_owned()));
+    }
+
+    /// Rooms come from the safe source set, so directories that are ignored or
+    /// untracked in a Git checkout never produce rooms.
+    #[test]
+    fn detect_rooms_ignores_gitignored_and_untracked_directories_in_git_repo() {
+        let workspace = tempdir().unwrap();
+        let repo = workspace.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        git_init_repo(&repo, &[("docs/roadmap.md", "roadmap\n"), ("src/lib.rs", "fn lib() {}\n")]);
+
+        write_file(&repo.join(".gitignore"), "ignored/\n");
+        write_file(&repo.join("ignored/secret.md"), "secret\n");
+        write_file(&repo.join("untracked/scratch.md"), "scratch\n");
+
+        let detection = detect_rooms(&repo).unwrap();
+        let names: Vec<_> = detection.rooms.iter().map(|room| room.name.clone()).collect();
+        assert!(
+            names.iter().any(|name| name == &"documentation"),
+            "documentation room missing: {names:?}"
+        );
+        assert!(names.iter().any(|name| name == &"src"), "src room missing: {names:?}");
+        assert!(
+            !names.iter().any(|name| name == &"ignored"),
+            "ignored room must not be derived: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|name| name == &"untracked"),
+            "untracked room must not be derived: {names:?}"
+        );
+        assert_eq!(detection.file_count, 2, "count must cover only eligible tracked sources");
+    }
+
+    /// A linked Git worktree inside the checkout is a duplicate repository and
+    /// must not contribute rooms.
+    #[test]
+    fn detect_rooms_excludes_linked_worktree_directories() {
+        let workspace = tempdir().unwrap();
+        let repo = workspace.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        git_init_repo(&repo, &[("docs/roadmap.md", "roadmap\n")]);
+
+        let wt = repo.join("linked-wt");
+        let status = std::process::Command::new("git")
+            .args(["worktree", "add", "-b", "wt-branch"])
+            .arg(&wt)
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git worktree add failed");
+        write_file(&wt.join("planning/notes.md"), "planning notes\n");
+
+        let detection = detect_rooms(&repo).unwrap();
+        let names: Vec<_> = detection.rooms.iter().map(|room| room.name.clone()).collect();
+        assert!(
+            names.iter().any(|name| name == &"documentation"),
+            "documentation room missing: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|name| name == &"linked_wt"),
+            "linked worktree room must not be derived: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|name| name == &"planning"),
+            "worktree content room must not be derived: {names:?}"
+        );
+        assert_eq!(detection.file_count, 1, "linked-worktree files must not be counted");
+    }
+
+    /// Non-Git roots keep folder-based detection but honour ignore files.
+    #[test]
+    fn detect_rooms_non_git_root_honors_ignore_files() {
+        let workspace = tempdir().unwrap();
+        let root = workspace.path();
+        write_file(&root.join(".gitignore"), "ignored/\n");
+        write_file(&root.join("ignored/secret.md"), "secret\n");
+        write_file(&root.join("src/lib.rs"), "fn lib() {}\n");
+
+        let detection = detect_rooms(root).unwrap();
+        let names: Vec<_> = detection.rooms.iter().map(|room| room.name.clone()).collect();
+        assert!(names.iter().any(|name| name == &"src"), "src room missing: {names:?}");
+        assert!(
+            !names.iter().any(|name| name == &"ignored"),
+            "ignored room must not be derived: {names:?}"
+        );
+        assert_eq!(detection.file_count, 1, "ignored files must not be counted");
+    }
+
+    /// The `init` summary count reflects the same safe source set that rooms are
+    /// derived from, so ignored/untracked working-tree files are not counted.
+    #[test]
+    fn init_reports_eligible_source_count_not_directory_traversal() {
+        let workspace = tempdir().unwrap();
+        let repo = workspace.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        git_init_repo(&repo, &[("docs/roadmap.md", "roadmap\n")]);
+        write_file(&repo.join(".gitignore"), "ignored/\n");
+        write_file(&repo.join("ignored/secret.md"), "secret\n");
+        write_file(&repo.join("untracked/scratch.md"), "scratch\n");
+
+        let config_root = temp_config_root("init-count");
+        let context = CliContext::for_tests(config_root.clone());
+        let output =
+            run_cli(["init", repo.to_str().unwrap(), "--yes"], &context, stub_provider).unwrap();
+        assert_eq!(output.exit_code, 0, "{}", output.stderr);
+        assert!(
+            output.stdout.contains("(1 files found"),
+            "init must count only the eligible tracked source: {}",
+            output.stdout
+        );
+
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    /// `init`, `project register`, and a canonical mine all report the same
+    /// eligible source population (issues #95/#96): for a Git-backed root that
+    /// is the tracked index, so ignored and untracked working-tree files are
+    /// neither counted nor mined.
+    #[test]
+    fn init_register_and_mine_report_the_same_eligible_source_count() {
+        let workspace = tempdir().unwrap();
+        let repo = workspace.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        git_init_repo(&repo, &[("docs/roadmap.md", "roadmap\n"), ("src/lib.rs", "fn lib() {}\n")]);
+        write_file(&repo.join(".gitignore"), "ignored/\n");
+        write_file(&repo.join("ignored/secret.md"), "secret\n");
+        write_file(&repo.join("untracked/scratch.md"), "scratch\n");
+
+        let config_root = temp_config_root("same-population");
+        let context = CliContext::for_tests(config_root.clone());
+
+        let init =
+            run_cli(["init", repo.to_str().unwrap(), "--yes"], &context, stub_provider).unwrap();
+        assert_eq!(init.exit_code, 0, "{}", init.stderr);
+        assert!(init.stdout.contains("(2 files found"), "init: {}", init.stdout);
+
+        let register =
+            run_cli(["project", "register", repo.to_str().unwrap()], &context, stub_provider)
+                .unwrap();
+        assert_eq!(register.exit_code, 0, "{}", register.stderr);
+        assert!(
+            register.stdout.contains("(2 files found"),
+            "register must report the same eligible source count: {}",
+            register.stdout
+        );
+
+        let mine = run_cli(
+            ["mine", repo.to_str().unwrap(), "--dry-run", "--full"],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+        assert_eq!(mine.exit_code, 0, "{}", mine.stderr);
+        assert!(
+            mine.stdout.contains("Files discovered: 2"),
+            "mine must discover the same eligible sources: {}",
+            mine.stdout
+        );
+
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn fastembed_provider_initializes_or_fails_during_factory_creation() {
+        let cache_root = tempdir().unwrap();
+        let result =
+            fastembed_provider(EmbeddingProfile::Balanced, cache_root.path().to_path_buf());
+        assert!(result.is_err());
+    }
+
+    // ─── --branch tests ──────────────────────────────────────────────────────
+
+    /// Initialize a bare git repo at `dir` with an initial commit on `main`.
+    fn git_init_repo(dir: &Path, files: &[(&str, &str)]) {
+        let run = |args: &[&str]| {
+            let status =
+                std::process::Command::new("git").args(args).current_dir(dir).status().unwrap();
+            assert!(status.success(), "git {args:?} failed in {}", dir.display());
+        };
+        run(&["init", "-b", "main"]);
+        run(&["config", "user.email", "test@test.com"]);
+        run(&["config", "user.name", "Test"]);
+        for (path, content) in files {
+            let full = dir.join(path);
+            if let Some(parent) = full.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(&full, content).unwrap();
+            // Force-add so a developer's global gitignore (e.g. one that excludes
+            // `agentpalace.yaml`) can't silently block staging the fixture file.
+            run(&["add", "-f", path]);
+        }
+        run(&["-c", "user.email=test@test.com", "-c", "user.name=Test", "commit", "-m", "initial"]);
+    }
+
+    #[test]
+    fn mine_branch_e2e_ingests_delta_file() {
+        let workspace = tempdir().unwrap();
+        let repo_dir = workspace.path().join("repo");
+        fs::create_dir_all(&repo_dir).unwrap();
+
+        let base_content = "fn base() -> i32 { 42 }\n".repeat(20);
+        git_init_repo(
+            &repo_dir,
+            &[
+                ("agentpalace.yaml", "wing: branchtest\nrooms:\n  - name: general\n"),
+                ("base.rs", &base_content),
+                ("stable.rs", "fn stable() -> &str { \"hello\" }\n"),
+            ],
+        );
+
+        // Create feature branch, modify one file.
+        let run_git = |args: &[&str]| {
+            std::process::Command::new("git").args(args).current_dir(&repo_dir).status().unwrap();
+        };
+        run_git(&["checkout", "-b", "feature"]);
+        let changed = "fn base() -> i32 { 99 }\n".repeat(20);
+        fs::write(repo_dir.join("base.rs"), &changed).unwrap();
+
+        let config_root = temp_config_root("mine-branch-e2e");
+        let context = CliContext::for_tests(config_root.clone());
+
+        let output =
+            run_cli(["mine", repo_dir.to_str().unwrap(), "--branch"], &context, stub_provider)
+                .unwrap();
+
+        assert_eq!(output.exit_code, 0, "branch mine failed: {:?}", output.stderr);
+        // The modified file (base.rs) must be counted as ingested.
+        assert!(
+            output.stdout.contains("Files ingested: 1"),
+            "expected 1 ingested file: {}",
+            output.stdout
+        );
+
+        // Second run after reverting to original should show Sources removed: 1.
+        fs::write(repo_dir.join("base.rs"), &base_content).unwrap();
+        let second =
+            run_cli(["mine", repo_dir.to_str().unwrap(), "--branch"], &context, stub_provider)
+                .unwrap();
+        assert_eq!(second.exit_code, 0, "second branch mine failed: {:?}", second.stderr);
+        assert!(
+            second.stdout.contains("Sources removed: 1"),
+            "expected 'Sources removed: 1' after revert: {}",
+            second.stdout
+        );
+
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    /// An auto-detected branch mine with no canonical snapshot fails, and on a
+    /// purely local wing the recovery advice is to mine canonically.
+    #[test]
+    fn auto_branch_mine_without_canonical_snapshot_suggests_full() {
+        let workspace = tempdir().unwrap();
+        let repo_dir = workspace.path().join("repo");
+        fs::create_dir_all(&repo_dir).unwrap();
+        git_init_repo(
+            &repo_dir,
+            &[
+                ("agentpalace.yaml", "wing: guardtest\nrooms:\n  - name: general\n"),
+                ("base.rs", &"fn base() -> i32 { 42 }\n".repeat(20)),
+            ],
+        );
+        // Move off the default branch so detection resolves a branch view.
+        std::process::Command::new("git")
+            .args(["checkout", "-b", "feature"])
+            .current_dir(&repo_dir)
+            .status()
+            .unwrap();
+        fs::write(repo_dir.join("base.rs"), "fn base() -> i32 { 99 }\n".repeat(20)).unwrap();
+
+        let config_root = temp_config_root("guard-local");
+        let context = CliContext::for_tests(config_root.clone());
+
+        // No --branch/--view/--full: the branch view is detected automatically.
+        let output =
+            run_cli(["mine", repo_dir.to_str().unwrap()], &context, stub_provider).unwrap();
+
+        assert_eq!(output.exit_code, 1, "expected the guard to fire: {output:?}");
+        assert!(
+            output
+                .stderr
+                .contains("automatic branch mining requires an existing canonical snapshot"),
+            "unexpected stderr: {}",
+            output.stderr
+        );
+        assert!(
+            output.stderr.contains("use --full to intentionally replace it"),
+            "a local wing should still be told to use --full: {}",
+            output.stderr
+        );
+
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    /// On a wing whose canonical mines route to a remote, `--full` cannot satisfy
+    /// the local-only guard, so the error must point at --branch/--view instead.
+    #[test]
+    fn auto_branch_mine_on_remote_wing_suggests_explicit_branch_selector() {
+        let workspace = tempdir().unwrap();
+        let repo_dir = workspace.path().join("repo");
+        fs::create_dir_all(&repo_dir).unwrap();
+        git_init_repo(
+            &repo_dir,
+            &[
+                ("agentpalace.yaml", "wing: guardremote\nrooms:\n  - name: general\n"),
+                ("base.rs", &"fn base() -> i32 { 42 }\n".repeat(20)),
+            ],
+        );
+        std::process::Command::new("git")
+            .args(["checkout", "-b", "feature"])
+            .current_dir(&repo_dir)
+            .status()
+            .unwrap();
+        fs::write(repo_dir.join("base.rs"), "fn base() -> i32 { 99 }\n".repeat(20)).unwrap();
+
+        let config_root = temp_config_root("guard-remote");
+        // The guard runs before any remote call, so this URL is never dialed.
+        write_remote_cli_config(
+            &config_root,
+            "hub",
+            "http://127.0.0.1:1",
+            "unused-token",
+            "wing_guardremote",
+            &repo_dir,
+        );
+        let context = CliContext::for_tests(config_root.clone());
+
+        let output =
+            run_cli(["mine", repo_dir.to_str().unwrap()], &context, stub_provider).unwrap();
+
+        assert_eq!(output.exit_code, 1, "expected the guard to fire: {output:?}");
+        assert!(
+            output.stderr.contains("routes canonical mines to a remote"),
+            "expected federated recovery advice: {}",
+            output.stderr
+        );
+        assert!(
+            output.stderr.contains("pass --branch or --view"),
+            "expected the selector that bypasses the guard: {}",
+            output.stderr
+        );
+        assert!(
+            !output.stderr.contains("use --full to intentionally replace it"),
+            "--full is dead-end advice on a remote-routed wing: {}",
+            output.stderr
+        );
+
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn mine_branch_outside_git_repo_fails_cleanly() {
+        let workspace = tempdir().unwrap();
+        // Non-git directory (no .git).
+        let project_dir = workspace.path().join("plain_project");
+        fs::create_dir_all(&project_dir).unwrap();
+        write_file(
+            &project_dir.join("agentpalace.yaml"),
+            "wing: testproject\nrooms:\n  - name: general\n",
+        );
+        write_file(&project_dir.join("code.rs"), &"fn x() {}\n".repeat(20));
+
+        let config_root = temp_config_root("branch-no-git");
+        let context = CliContext::for_tests(config_root.clone());
+
+        let result =
+            run_cli(["mine", project_dir.to_str().unwrap(), "--branch"], &context, stub_provider);
+
+        // Either a clap Err or an Ok with non-zero exit code — both count as failure.
+        match result {
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("git") || msg.contains("branch"),
+                    "error message should mention git: {msg}"
+                );
+            }
+            Ok(output) => {
+                assert_ne!(output.exit_code, 0, "should fail outside git repo");
+                assert!(
+                    output.stderr.contains("git") || output.stderr.contains("branch"),
+                    "error message should mention git: {}",
+                    output.stderr
+                );
+            }
+        }
+
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn mine_branch_with_convos_mode_fails() {
+        let workspace = tempdir().unwrap();
+        let convo_dir = setup_convo_fixture(workspace.path());
+        let config_root = temp_config_root("branch-convos");
+        let context = CliContext::for_tests(config_root.clone());
+
+        let output = run_cli(
+            [
+                "mine",
+                convo_dir.to_str().unwrap(),
+                "--mode",
+                "convos",
+                "--wing",
+                "talks",
+                "--branch",
+            ],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+
+        assert_ne!(output.exit_code, 0, "--branch + --mode convos should fail");
+        assert!(
+            output.stderr.contains("convos") || output.stderr.contains("projects"),
+            "error should mention mode restriction: {}",
+            output.stderr
+        );
+
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    // ─── Remote mine e2e tests ───────────────────────────────────────────────
+
+    fn restrict_token_file(path: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut permissions = fs::metadata(path).unwrap().permissions();
+            permissions.set_mode(0o600);
+            fs::set_permissions(path, permissions).unwrap();
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+        }
+    }
+
+    /// Write a minimal token file into `dir` and return the path.
+    fn write_test_token_file(dir: &Path, token: &str) -> PathBuf {
+        let path = dir.join("tokens.json");
+        fs::write(
+            &path,
+            serde_json::to_string(&serde_json::json!([
+                {"token": token, "name": "test-user", "enabled": true}
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        restrict_token_file(&path);
+        path
+    }
+
+    /// Build a `AgentPalaceConfig` pointing at the given palace dir with stub embeddings.
+    fn remote_test_config(
+        palace_dir: PathBuf,
+        token_file: PathBuf,
+    ) -> agentpalace_config::AgentPalaceConfig {
+        use agentpalace_config::{
+            FederationRuntimeConfig, LowCpuRuntimeConfig, MaintenanceRuntimeConfig,
+            ServerRuntimeConfig,
+        };
+        agentpalace_config::AgentPalaceConfig {
+            schema_version: 1,
+            collection_name: "agentpalace_drawers".to_owned(),
+            palace_path: palace_dir,
+            embedding_profile: EmbeddingProfile::Balanced,
+            low_cpu: LowCpuRuntimeConfig::defaults_for_profile(EmbeddingProfile::Balanced),
+            server: ServerRuntimeConfig {
+                bind: "127.0.0.1:0".parse().unwrap(),
+                token_file,
+                checkouts: std::collections::BTreeMap::new(),
+            },
+            federation: FederationRuntimeConfig::default(),
+            maintenance: MaintenanceRuntimeConfig::defaults(),
+        }
+    }
+
+    /// Spawn a federation server in-process on an ephemeral port.
+    /// Returns the bound address.
+    fn spawn_test_server(palace_dir: PathBuf, token: &str) -> std::net::SocketAddr {
+        spawn_test_server_with_checkout(palace_dir, token, None)
+    }
+
+    fn spawn_test_server_with_checkout(
+        palace_dir: PathBuf,
+        token: &str,
+        checkout: Option<(&str, PathBuf)>,
+    ) -> std::net::SocketAddr {
+        use agentpalace_embeddings::DeterministicStubProvider;
+        use agentpalace_server::{TokenRegistry, build_router};
+
+        let token_dir = tempfile::tempdir().unwrap();
+        let token_file = write_test_token_file(token_dir.path(), token);
+        let mut config = remote_test_config(palace_dir, token_file.clone());
+        if let Some((wing, root)) = checkout {
+            config.server.checkouts.insert(wing.to_owned(), root);
+        }
+
+        // Build a dedicated tokio runtime to host the server.
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+
+        let tokens = rt.block_on(async { TokenRegistry::load(token_file).unwrap() });
+        let provider = DeterministicStubProvider::new(EmbeddingProfile::Balanced);
+        let (router, _state) = rt.block_on(build_router(config, provider, tokens)).unwrap();
+
+        let listener = rt.block_on(tokio::net::TcpListener::bind("127.0.0.1:0")).unwrap();
+        let addr = rt.block_on(async { listener.local_addr().unwrap() });
+
+        rt.spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        // Keep the runtime alive by leaking it — the test process owns it for its lifetime.
+        std::mem::forget(rt);
+        // Keep token_dir alive too.
+        std::mem::forget(token_dir);
+
+        addr
+    }
+
+    /// Spawn a minimal federation server whose `/v1/info` response does NOT
+    /// advertise the `ingest` capability. Used to test the unsupported-remote
+    /// guard in the dual-write path.
+    fn spawn_no_ingest_server(token: &str) -> std::net::SocketAddr {
+        use axum::{
+            Router,
+            extract::State,
+            http::{StatusCode, header},
+            middleware,
+            response::IntoResponse,
+            routing::get,
+        };
+        use std::sync::Arc;
+
+        let token_dir = tempfile::tempdir().unwrap();
+        let token_file = write_test_token_file(token_dir.path(), token);
+        let tokens = agentpalace_server::TokenRegistry::load(token_file).unwrap();
+        let tokens = Arc::new(tokens);
+
+        #[derive(Clone)]
+        struct NoIngestState {
+            tokens: Arc<agentpalace_server::TokenRegistry>,
+        }
+
+        async fn auth(
+            State(state): State<NoIngestState>,
+            request: axum::http::Request<axum::body::Body>,
+            next: middleware::Next,
+        ) -> impl IntoResponse {
+            let token = request
+                .headers()
+                .get(header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "));
+            match token.and_then(|t| state.tokens.authenticate(t)) {
+                Some(_) => next.run(request).await.into_response(),
+                None => StatusCode::UNAUTHORIZED.into_response(),
+            }
+        }
+
+        async fn info() -> impl axum::response::IntoResponse {
+            axum::Json(agentpalace_federation::InfoResponse {
+                server_version: agentpalace_core::BUILD_VERSION.to_owned(),
+                federation_api_version: agentpalace_federation::FEDERATION_API_VERSION,
+                embedding_profile: "balanced".to_owned(),
+                capabilities: vec![
+                    "drawers".to_owned(),
+                    "kg".to_owned(),
+                    "changes".to_owned(),
+                    "taxonomy".to_owned(),
+                ],
+                maintenance_enabled: false,
+                maintenance_background_enabled: false,
+                maintenance_idle_secs: 0,
+                maintenance_last_run: None,
+                maintenance_status: agentpalace_federation::MaintenanceStatus::Disabled,
+            })
+        }
+
+        let state = NoIngestState { tokens };
+        let router = Router::new()
+            .route("/v1/info", get(info))
+            .layer(middleware::from_fn_with_state(state.clone(), auth))
+            .with_state(state);
+
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        let listener = rt.block_on(tokio::net::TcpListener::bind("127.0.0.1:0")).unwrap();
+        let addr = rt.block_on(async { listener.local_addr().unwrap() });
+        rt.spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        std::mem::forget(rt);
+        std::mem::forget(token_dir);
+
+        addr
+    }
+
+    /// Write a CLI config.json with federation remotes pointing at `server_url`,
+    /// with an inline `token`. Also writes a per-project agentpalace.yaml.
+    fn write_remote_cli_config(
+        config_dir: &Path,
+        remote_name: &str,
+        server_url: &str,
+        inline_token: &str,
+        wing_name: &str,
+        project_dir: &Path,
+    ) {
+        fs::create_dir_all(config_dir).unwrap();
+        // Use inline token (not token_env) to avoid unsafe set_var in Rust 2024.
+        let config_json = serde_json::json!({
+            "version": 1,
+            "federation": {
+                "remotes": [{"name": remote_name, "url": server_url, "token": inline_token}],
+                "wings": {
+                    wing_name: {"mode": "remote", "remote": remote_name}
+                }
+            }
+        });
+        fs::write(
+            config_dir.join("config.json"),
+            serde_json::to_string_pretty(&config_json).unwrap(),
+        )
+        .unwrap();
+
+        // Write the project config.
+        let yaml = format!(
+            "wing: {wing_name}\nrooms:\n  - name: general\n    description: General files\n"
+        );
+        fs::write(project_dir.join("agentpalace.yaml"), yaml).unwrap();
+    }
+
+    /// Write a CLI config for `combined` + `write: both` routing.
+    fn write_combined_cli_config(
+        config_dir: &Path,
+        remote_name: &str,
+        server_url: &str,
+        inline_token: &str,
+        wing_name: &str,
+        palace_dir: &Path,
+        project_dir: &Path,
+    ) {
+        fs::create_dir_all(config_dir).unwrap();
+        let config_json = serde_json::json!({
+            "version": 1,
+            "palace_path": palace_dir.to_str().unwrap(),
+            "federation": {
+                "remotes": [{"name": remote_name, "url": server_url, "token": inline_token}],
+                "wings": {
+                    wing_name: {"mode": "combined", "write": "both", "remote": remote_name}
+                }
+            }
+        });
+        fs::write(
+            config_dir.join("config.json"),
+            serde_json::to_string_pretty(&config_json).unwrap(),
+        )
+        .unwrap();
+
+        let yaml = format!(
+            "wing: {wing_name}\nrooms:\n  - name: general\n    description: General files\n"
+        );
+        fs::write(project_dir.join("agentpalace.yaml"), yaml).unwrap();
+    }
+
+    #[test]
+    fn mine_remote_routed_e2e_ingests_to_server() {
+        const TOKEN: &str = "remote-mine-e2e-tok-001";
+        let workspace = tempdir().unwrap();
+
+        // Server palace dir.
+        let server_palace = workspace.path().join("server-palace");
+        fs::create_dir_all(&server_palace).unwrap();
+
+        let addr = spawn_test_server_with_checkout(
+            server_palace.clone(),
+            TOKEN,
+            Some(("wing_myproject", workspace.path().join("myproject"))),
+        );
+        let server_url = format!("http://{addr}");
+
+        // Project dir.
+        let project_dir = workspace.path().join("myproject");
+        fs::create_dir_all(&project_dir).unwrap();
+        write_file(
+            &project_dir.join("backend/auth.rs"),
+            "Auth login flow keeps auth checks in the backend service.\n".repeat(5).as_str(),
+        );
+        write_file(
+            &project_dir.join("docs/roadmap.md"),
+            "Roadmap plan tracks the migration milestones.\n".repeat(5).as_str(),
+        );
+
+        // CLI config dir.
+        let config_root = temp_config_root("remote-mine-e2e");
+        let wing_name = "wing_myproject";
+        let remote_name = "hub";
+        write_remote_cli_config(
+            &config_root,
+            remote_name,
+            &server_url,
+            TOKEN,
+            wing_name,
+            &project_dir,
+        );
+
+        let context = CliContext::for_tests(config_root.clone());
+        let output =
+            run_cli(["mine", project_dir.to_str().unwrap()], &context, stub_provider).unwrap();
+
+        assert_eq!(output.exit_code, 0, "remote mine failed: stderr={:?}", output.stderr);
+        assert!(
+            output.stdout.contains("Remote:"),
+            "summary must show 'Remote:': {}",
+            output.stdout
+        );
+        assert!(
+            output.stdout.contains("Files ingested:"),
+            "summary must show ingested count: {}",
+            output.stdout
+        );
+        // Files ingested must be > 0.
+        let ingested_line =
+            output.stdout.lines().find(|l| l.contains("Files ingested:")).unwrap_or("");
+        let ingested_n: usize =
+            ingested_line.split(':').last().unwrap_or("0").trim().parse().unwrap_or(0);
+        assert!(ingested_n > 0, "should have ingested at least 1 file: {}", output.stdout);
+
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn mine_remote_dry_run_prints_plan_without_server() {
+        // No server running; dry-run should succeed without network.
+        let workspace = tempdir().unwrap();
+        let project_dir = workspace.path().join("dryrunproject");
+        fs::create_dir_all(&project_dir).unwrap();
+        write_file(
+            &project_dir.join("code.rs"),
+            "fn example() -> bool { true }\n".repeat(10).as_str(),
+        );
+
+        let config_root = temp_config_root("remote-dry-run");
+        let wing_name = "wing_dryrunproject";
+        let remote_name = "hub";
+        // Port 1 is not bindable, so any real connection would fail — but we're dry-run.
+        let server_url = "http://127.0.0.1:1";
+        write_remote_cli_config(
+            &config_root,
+            remote_name,
+            server_url,
+            "dryrun-tok",
+            wing_name,
+            &project_dir,
+        );
+
+        let context = CliContext::for_tests(config_root.clone());
+        let output =
+            run_cli(["mine", project_dir.to_str().unwrap(), "--dry-run"], &context, stub_provider)
+                .unwrap();
+
+        assert_eq!(output.exit_code, 0, "dry-run should succeed without server: {:?}", output);
+        assert!(
+            output.stdout.contains("dry run"),
+            "dry-run output should say 'dry run': {}",
+            output.stdout
+        );
+        assert!(
+            output.stdout.contains("Remote:") || output.stdout.contains("remote"),
+            "dry-run output should mention remote: {}",
+            output.stdout
+        );
+        assert!(
+            output.stdout.contains("Files to send:"),
+            "dry-run output should mention file count: {}",
+            output.stdout
+        );
+
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn mine_remote_unreachable_fails_with_no_fallback_message() {
+        let workspace = tempdir().unwrap();
+        let project_dir = workspace.path().join("unreachableproject");
+        fs::create_dir_all(&project_dir).unwrap();
+        write_file(
+            &project_dir.join("code.rs"),
+            "fn example() -> bool { true }\n".repeat(10).as_str(),
+        );
+
+        let config_root = temp_config_root("remote-unreachable");
+        let wing_name = "wing_unreachableproject";
+        let remote_name = "hub";
+        // Port 1 is not bindable — any connection will fail immediately.
+        let server_url = "http://127.0.0.1:1";
+        write_remote_cli_config(
+            &config_root,
+            remote_name,
+            server_url,
+            "unreachable-tok",
+            wing_name,
+            &project_dir,
+        );
+
+        let context = CliContext::for_tests(config_root.clone());
+        let result = run_cli(["mine", project_dir.to_str().unwrap()], &context, stub_provider);
+
+        // Should fail through legacy CliOutput path with exit code 1.
+        let output = result.expect("remote-only must return Ok(CliOutput), not Err");
+        assert_eq!(output.exit_code, 1, "remote-only must exit code 1: {output:?}");
+        assert!(
+            output.stderr.contains("unreachable") && output.stderr.contains("local"),
+            "error should mention unreachable and no local fallback: {}",
+            output.stderr
+        );
+
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    fn drain_mine_replication(config: AgentPalaceConfig, expected_failed: i64) {
+        let outbox =
+            agentpalace_storage::OutboxStore::new(config.palace_path.join("storage.sqlite3"));
+        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            let _server = agentpalace_mcp::McpServer::from_parts(
+                config,
+                agentpalace_embeddings::DeterministicStubProvider::new(EmbeddingProfile::Balanced),
+            )
+            .await
+            .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(40);
+            loop {
+                let status = outbox.backlog(None).unwrap();
+                if status.pending_count
+                    + status.staged_count
+                    + status.leased_count
+                    + status.retryable_count
+                    == 0
+                {
+                    assert_eq!(
+                        status.failed_count,
+                        expected_failed,
+                        "{:?}",
+                        outbox.list_failed(10).unwrap()
+                    );
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "replication did not converge: {status:?}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        });
+    }
+
+    #[test]
+    fn mine_checkout_rejection_is_visible_and_fresh_mine_recovers_after_repair() {
+        const TOKEN: &str = "checkout-repair-token";
+        let workspace = tempdir().unwrap();
+        let project_dir = workspace.path().join("repair-project");
+        fs::create_dir_all(&project_dir).unwrap();
+        write_file(&project_dir.join("code.rs"), &"fn example() -> bool { true }\n".repeat(10));
+        let config_root = temp_config_root("checkout-repair");
+        let context = CliContext::for_tests(config_root.clone());
+        run_cli(["init", project_dir.to_str().unwrap(), "--yes"], &context, stub_provider).unwrap();
+        let palace_dir = config_root.join("palace");
+        let addr = spawn_test_server(workspace.path().join("unmapped-palace"), TOKEN);
+        write_combined_cli_config(
+            &config_root,
+            "hub",
+            &format!("http://{addr}"),
+            TOKEN,
+            "wing_repair",
+            &palace_dir,
+            &project_dir,
+        );
+        let context = CliContext::for_tests(config_root.clone());
+        let output =
+            run_cli(["mine", project_dir.to_str().unwrap()], &context, stub_provider).unwrap();
+        assert_eq!(output.exit_code, 0, "local mine must succeed: {output:?}");
+        drain_mine_replication(load_runtime_config(None, &context).unwrap(), 1);
+        let outbox = agentpalace_storage::OutboxStore::new(palace_dir.join("storage.sqlite3"));
+        let failures = outbox.list_failed(10).unwrap();
+        assert!(failures[0].last_error.as_deref().unwrap().contains("checkout_unavailable"));
+        assert_eq!(outbox.ingestion_backlog().unwrap()["failed_batches"], 1);
+
+        let addr = spawn_test_server_with_checkout(
+            workspace.path().join("repaired-palace"),
+            TOKEN,
+            Some(("wing_repair", project_dir.clone())),
+        );
+        write_combined_cli_config(
+            &config_root,
+            "hub",
+            &format!("http://{addr}"),
+            TOKEN,
+            "wing_repair",
+            &palace_dir,
+            &project_dir,
+        );
+        let context = CliContext::for_tests(config_root.clone());
+        let output =
+            run_cli(["mine", project_dir.to_str().unwrap()], &context, stub_provider).unwrap();
+        assert_eq!(output.exit_code, 0);
+        assert!(
+            outbox.backlog(None).unwrap().pending_count > 0,
+            "unchanged source must be queued again"
+        );
+        drain_mine_replication(load_runtime_config(None, &context).unwrap(), 1);
+        let status = outbox.ingestion_backlog().unwrap();
+        assert_eq!(status["total_batches"], 2);
+        assert_eq!(status["failed_batches"], 1, "historical failure remains visible");
+        assert_eq!(status["pending_batches"], 0);
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn mine_combined_both_unreachable_returns_local_success() {
+        let workspace = tempdir().unwrap();
+        let project_dir = workspace.path().join("combinedproject");
+        fs::create_dir_all(&project_dir).unwrap();
+        write_file(
+            &project_dir.join("code.rs"),
+            "fn example() -> bool { true }\n".repeat(10).as_str(),
+        );
+
+        let config_root = temp_config_root("combined-unreachable");
+        let context = CliContext::for_tests(config_root.clone());
+        let palace_dir = config_root.join("palace");
+
+        // init creates the local palace and writes default config.json.
+        run_cli(["init", project_dir.to_str().unwrap(), "--yes"], &context, stub_provider).unwrap();
+
+        // Overwrite config.json with combined+both routing pointing at
+        // an unreachable port.
+        let remote_name = "hub";
+        let server_url = "http://127.0.0.1:1";
+        write_combined_cli_config(
+            &config_root,
+            remote_name,
+            server_url,
+            "combined-unreachable-tok",
+            "wing_combinedproject",
+            &palace_dir,
+            &project_dir,
+        );
+
+        let context = CliContext::for_tests(config_root.clone());
+        let output =
+            run_cli(["mine", project_dir.to_str().unwrap()], &context, stub_provider).unwrap();
+
+        // Must succeed locally despite remote being unreachable.
+        assert_eq!(output.exit_code, 0, "{output:?}");
+        assert!(output.stdout.contains("durably queued"), "{}", output.stdout);
+        let outbox = agentpalace_storage::OutboxStore::new(palace_dir.join("storage.sqlite3"));
+        let backlog = outbox.backlog(None).unwrap();
+        assert!(backlog.pending_count > 0);
+        assert_eq!(backlog.retryable_count, 0, "foreground mine never attempts delivery");
+
+        // Recover the destination after the CLI process has already returned.
+        let addr = spawn_test_server_with_checkout(
+            workspace.path().join("recovered-palace"),
+            "combined-unreachable-tok",
+            Some(("wing_combinedproject", project_dir.clone())),
+        );
+        let mut config = load_runtime_config(None, &context).unwrap();
+        config.federation.remotes.get_mut(remote_name).unwrap().url = format!("http://{addr}");
+        drain_mine_replication(config, 0);
+        assert_eq!(outbox.ingestion_backlog().unwrap()["pending_batches"], 0);
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn mine_combined_both_remote_success_reports_with_local() {
+        const TOKEN: &str = "combined-success-tok-002";
+        let workspace = tempdir().unwrap();
+
+        // Server palace dir.
+        let server_palace = workspace.path().join("server-palace");
+        fs::create_dir_all(&server_palace).unwrap();
+        let addr = spawn_test_server_with_checkout(
+            server_palace.clone(),
+            TOKEN,
+            Some(("wing_myproject", workspace.path().join("myproject"))),
+        );
+        let server_url = format!("http://{addr}");
+
+        // Project dir.
+        let project_dir = workspace.path().join("myproject");
+        fs::create_dir_all(&project_dir).unwrap();
+        write_file(
+            &project_dir.join("backend/auth.rs"),
+            "Auth login flow keeps auth checks in the backend service.\n".repeat(5).as_str(),
+        );
+        write_file(
+            &project_dir.join("docs/roadmap.md"),
+            "Roadmap plan tracks the migration milestones.\n".repeat(5).as_str(),
+        );
+
+        // CLI config dir: init local palace, then overwrite with combined+both.
+        let config_root = temp_config_root("combined-e2e");
+        let context = CliContext::for_tests(config_root.clone());
+        let palace_dir = config_root.join("palace");
+
+        run_cli(["init", project_dir.to_str().unwrap(), "--yes"], &context, stub_provider).unwrap();
+
+        let wing_name = "wing_myproject";
+        let remote_name = "hub";
+        write_combined_cli_config(
+            &config_root,
+            remote_name,
+            &server_url,
+            TOKEN,
+            wing_name,
+            &palace_dir,
+            &project_dir,
+        );
+
+        let context = CliContext::for_tests(config_root.clone());
+        let output =
+            run_cli(["mine", project_dir.to_str().unwrap()], &context, stub_provider).unwrap();
+
+        assert_eq!(output.exit_code, 0, "{output:?}");
+        assert!(output.stdout.contains("durably queued"), "{}", output.stdout);
+        let outbox = agentpalace_storage::OutboxStore::new(palace_dir.join("storage.sqlite3"));
+        let backlog = outbox.backlog(None).unwrap();
+        assert!(backlog.pending_count > 0);
+        assert_eq!(backlog.retryable_count, 0, "foreground mine never attempts delivery");
+
+        drain_mine_replication(load_runtime_config(None, &context).unwrap(), 0);
+        assert_eq!(outbox.backlog(None).unwrap().pending_count, 0);
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn mine_remote_only_unreachable_still_fails_legacy() {
+        // Verify that a remote-only (not combined) route still fails through
+        // the legacy error path when the remote is unreachable.
+        let workspace = tempdir().unwrap();
+        let project_dir = workspace.path().join("legacy-remote");
+        fs::create_dir_all(&project_dir).unwrap();
+        write_file(
+            &project_dir.join("code.rs"),
+            "fn example() -> bool { true }\n".repeat(10).as_str(),
+        );
+
+        let config_root = temp_config_root("legacy-remote-unreachable");
+        let wing_name = "wing_legacyremote";
+        let remote_name = "hub";
+        let server_url = "http://127.0.0.1:1";
+        write_remote_cli_config(
+            &config_root,
+            remote_name,
+            server_url,
+            "legacy-unreachable-tok",
+            wing_name,
+            &project_dir,
+        );
+
+        let context = CliContext::for_tests(config_root.clone());
+        let result = run_cli(["mine", project_dir.to_str().unwrap()], &context, stub_provider);
+
+        // Must fail through legacy CliOutput path with exit code 1.
+        let output = result.expect("legacy remote-only must return Ok(CliOutput), not Err");
+        assert_eq!(output.exit_code, 1, "legacy remote-only must exit code 1: {output:?}");
+        assert!(
+            output.stderr.contains("unreachable") && output.stderr.contains("local"),
+            "legacy error should mention unreachable and no fallback: {}",
+            output.stderr
+        );
+
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn mine_reindex_flag_accepted_and_plumbed() {
+        let workspace = tempdir().unwrap();
+        let project_dir = setup_project_fixture(workspace.path());
+        let config_root = temp_config_root("reindex-flag");
+        let context = CliContext::for_tests(config_root.clone());
+
+        run_cli(["init", project_dir.to_str().unwrap(), "--yes"], &context, stub_provider).unwrap();
+
+        // First mine populates the palace.
+        let first =
+            run_cli(["mine", project_dir.to_str().unwrap()], &context, stub_provider).unwrap();
+        assert_eq!(first.exit_code, 0);
+
+        // Second mine without --reindex skips all three unchanged fixture files.
+        let second =
+            run_cli(["mine", project_dir.to_str().unwrap()], &context, stub_provider).unwrap();
+        assert_eq!(second.exit_code, 0);
+        assert!(
+            second.stdout.contains("Files skipped unchanged: 3"),
+            "expected all files skipped: {:?}",
+            second.stdout
+        );
+        assert!(second.stdout.contains("Files ingested: 0"), "second run: {:?}", second.stdout);
+
+        // --reindex forces re-ingestion of all three files despite unchanged hashes.
+        let reindex =
+            run_cli(["mine", project_dir.to_str().unwrap(), "--reindex"], &context, stub_provider)
+                .unwrap();
+        assert_eq!(reindex.exit_code, 0);
+        assert!(
+            reindex.stdout.contains("Files skipped unchanged: 0"),
+            "reindex run must skip nothing: {:?}",
+            reindex.stdout
+        );
+        assert!(
+            reindex.stdout.contains("Files ingested: 3"),
+            "reindex output: {:?}",
+            reindex.stdout
+        );
+
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    /// Spawn a test server that deliberately delays the third request (info +
+    /// first ingest batch are fast; the third is the second ingest batch) to
+    /// exceed the client's 5-second timeout, causing a deterministic transport
+    /// failure. Subsequent requests respond normally, so a retry works.
+    fn spawn_self_destruct_server(
+        palace_dir: PathBuf,
+        token: &str,
+        wing: &str,
+        checkout: PathBuf,
+    ) -> std::net::SocketAddr {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let token_dir = tempfile::tempdir().unwrap();
+        let token_file = write_test_token_file(token_dir.path(), token);
+        let mut config = remote_test_config(palace_dir, token_file.clone());
+        config.server.checkouts.insert(wing.to_owned(), checkout);
+
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+
+        let addr = rt.block_on(async {
+            let tokens = agentpalace_server::TokenRegistry::load(token_file).unwrap();
+            let provider =
+                agentpalace_embeddings::DeterministicStubProvider::new(EmbeddingProfile::Balanced);
+            let (router, _state) =
+                agentpalace_server::build_router(config, provider, tokens).await.unwrap();
+
+            let counter = Arc::new(AtomicUsize::new(0));
+            let app = router.layer(axum::middleware::from_fn({
+                let c = counter.clone();
+                move |req: axum::extract::Request, next: axum::middleware::Next| {
+                    let c = c.clone();
+                    async move {
+                        let prev = c.fetch_add(1, Ordering::SeqCst);
+                        // prev=0: info handshake, prev=1: first ingest batch,
+                        // prev=2: second ingest batch — sleep past client timeout.
+                        if prev == 2 {
+                            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                        }
+                        next.run(req).await
+                    }
+                }
+            }));
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.ok();
+            });
+            addr
+        });
+
+        std::mem::forget(rt);
+        std::mem::forget(token_dir);
+        addr
+    }
+
+    #[test]
+    fn mine_combined_both_partial_on_batch_transport_failure() {
+        // Regression: when the first remote batch succeeds but a later batch
+        // suffers a transport error, the output must say "partial" — never
+        // "replication: succeeded".
+        const TOKEN: &str = "partial-batch-tok-003";
+        let workspace = tempdir().unwrap();
+
+        // Server palace dir.
+        let server_palace = workspace.path().join("server-palace");
+        fs::create_dir_all(&server_palace).unwrap();
+        let proxy_addr = spawn_self_destruct_server(
+            server_palace.clone(),
+            TOKEN,
+            "wing_multibatch",
+            workspace.path().join("multi-batch-project"),
+        );
+        let proxy_url = format!("http://{proxy_addr}");
+
+        // Project dir with enough files for 3 batches at batch-size 1.
+        let project_dir = workspace.path().join("multi-batch-project");
+        fs::create_dir_all(&project_dir).unwrap();
+        for i in 0..3 {
+            write_file(
+                &project_dir.join(format!("file{i}.rs")),
+                &format!("// File {i}\nfn example_{i}() -> bool {{ true }}\n").repeat(5),
+            );
+        }
+
+        // CLI config dir.
+        let config_root = temp_config_root("partial-batch-e2e");
+        let context = CliContext::for_tests(config_root.clone());
+        let palace_dir = config_root.join("palace");
+
+        run_cli(["init", project_dir.to_str().unwrap(), "--yes"], &context, stub_provider).unwrap();
+
+        let wing_name = "wing_multibatch";
+        let remote_name = "hub";
+        write_combined_cli_config(
+            &config_root,
+            remote_name,
+            &proxy_url,
+            TOKEN,
+            wing_name,
+            &palace_dir,
+            &project_dir,
+        );
+
+        let context = CliContext::for_tests(config_root.clone());
+        let output = run_cli(
+            ["mine", project_dir.to_str().unwrap(), "--batch-size", "1"],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+
+        assert_eq!(output.exit_code, 0, "{output:?}");
+        assert!(output.stdout.contains("durably queued"), "{}", output.stdout);
+        let outbox = agentpalace_storage::OutboxStore::new(palace_dir.join("storage.sqlite3"));
+        let backlog = outbox.backlog(None).unwrap();
+        assert!(backlog.pending_count > 0);
+        assert_eq!(backlog.retryable_count, 0, "foreground mine never attempts delivery");
+
+        // The worker retries a delayed request, with other file acknowledgements retained.
+        drain_mine_replication(load_runtime_config(None, &context).unwrap(), 0);
+        assert_eq!(outbox.ingestion_backlog().unwrap()["pending_batches"], 0);
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn mine_combined_both_retry_safe_replication() {
+        // Regression: after a transport interruption mid-way through a combined
+        // write:both mine, retrying the same project must not create duplicate
+        // local drawers, and the remote must report previously-replicated files
+        // as skipped_unchanged.
+        const TOKEN: &str = "retry-safe-tok-004";
+        let workspace = tempdir().unwrap();
+
+        // Server palace dir — single server used for both mines.
+        let server_palace = workspace.path().join("server-palace");
+        fs::create_dir_all(&server_palace).unwrap();
+        let proxy_addr = spawn_self_destruct_server(
+            server_palace.clone(),
+            TOKEN,
+            "wing_retryproject",
+            workspace.path().join("retry-project"),
+        );
+        let proxy_url = format!("http://{proxy_addr}");
+
+        // Project dir with 3 files so batch-size 1 produces 3 batches.
+        let project_dir = workspace.path().join("retry-project");
+        fs::create_dir_all(&project_dir).unwrap();
+        for i in 0..3 {
+            write_file(
+                &project_dir.join(format!("file{i}.rs")),
+                &format!("// File {i}\nfn example_{i}() -> bool {{ true }}\n").repeat(5),
+            );
+        }
+
+        // ── First mine (interrupted) ──────────────────────────────────────────
+        let config_root = temp_config_root("retry-safe-e2e");
+        let context = CliContext::for_tests(config_root.clone());
+        let palace_dir = config_root.join("palace");
+
+        run_cli(["init", project_dir.to_str().unwrap(), "--yes"], &context, stub_provider).unwrap();
+
+        let wing_name = "wing_retryproject";
+        let remote_name = "hub";
+        write_combined_cli_config(
+            &config_root,
+            remote_name,
+            &proxy_url,
+            TOKEN,
+            wing_name,
+            &palace_dir,
+            &project_dir,
+        );
+
+        let context = CliContext::for_tests(config_root.clone());
+        let first_output = run_cli(
+            ["mine", project_dir.to_str().unwrap(), "--batch-size", "1"],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+
+        assert_eq!(first_output.exit_code, 0, "{first_output:?}");
+        assert!(first_output.stdout.contains("durably queued"));
+        drain_mine_replication(load_runtime_config(None, &context).unwrap(), 0);
+        let second =
+            run_cli(["mine", project_dir.to_str().unwrap()], &context, stub_provider).unwrap();
+        assert_eq!(second.exit_code, 0, "{second:?}");
+        assert!(second.stdout.contains("Files skipped unchanged: 3"), "{}", second.stdout);
+        drain_mine_replication(load_runtime_config(None, &context).unwrap(), 0);
+        let status = run_cli(["status"], &context, stub_provider).unwrap();
+        assert!(status.stdout.contains("3 drawers"), "{}", status.stdout);
+        let outbox = agentpalace_storage::OutboxStore::new(palace_dir.join("storage.sqlite3"));
+        assert_eq!(outbox.ingestion_backlog().unwrap()["total_batches"], 1);
+        fs::remove_file(project_dir.join("file0.rs")).unwrap();
+        let removal =
+            run_cli(["mine", project_dir.to_str().unwrap()], &context, stub_provider).unwrap();
+        assert_eq!(removal.exit_code, 0, "{removal:?}");
+        let before = outbox.ingestion_backlog().unwrap();
+        let repeated =
+            run_cli(["mine", project_dir.to_str().unwrap()], &context, stub_provider).unwrap();
+        assert_eq!(repeated.exit_code, 0, "{repeated:?}");
+        assert_eq!(outbox.ingestion_backlog().unwrap()["total_batches"], before["total_batches"]);
+        assert_eq!(outbox.ingestion_backlog().unwrap()["files_by_state"], before["files_by_state"]);
+        let operation =
+            outbox.claim_next("hub", "test", time::Duration::minutes(1)).unwrap().unwrap();
+        assert_eq!(operation.payload["request"]["replication"]["remove"], true);
+        outbox
+            .fail(
+                &operation.operation_id,
+                "test",
+                operation.revision,
+                "temporary configuration mistake",
+            )
+            .unwrap();
+        // The local manifest is already gone. A fresh mine must still find this failed removal.
+        let retry =
+            run_cli(["mine", project_dir.to_str().unwrap()], &context, stub_provider).unwrap();
+        assert_eq!(retry.exit_code, 0, "{retry:?}");
+        assert!(retry.stdout.contains("durably queued 1 records"), "{}", retry.stdout);
+        drain_mine_replication(load_runtime_config(None, &context).unwrap(), 1);
+        let remote_store =
+            agentpalace_storage::SqliteOperationalStore::new(server_palace.join("storage.sqlite3"));
+        let keys =
+            remote_store.ingested_source_keys_with_prefix("projects:wing_retryproject:").unwrap();
+        assert!(
+            !keys.iter().any(|key| key.ends_with(":file0.rs")),
+            "removal must reach the remote after its terminal error is corrected"
+        );
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn mine_combined_both_branch_uses_local_only() {
+        // combined+both config with a healthy remote, but --branch forces
+        // local-only execution. No remote replication must be attempted.
+        const TOKEN: &str = "branch-local-tok-005";
+        let workspace = tempdir().unwrap();
+
+        let server_palace = workspace.path().join("server-palace");
+        fs::create_dir_all(&server_palace).unwrap();
+        let addr = spawn_test_server(server_palace.clone(), TOKEN);
+        let server_url = format!("http://{addr}");
+
+        let repo_dir = workspace.path().join("repo");
+        fs::create_dir_all(&repo_dir).unwrap();
+        let base_content = "fn base() -> i32 { 42 }\n".repeat(20);
+        git_init_repo(
+            &repo_dir,
+            &[
+                ("agentpalace.yaml", "wing: branchtest\nrooms:\n  - name: general\n"),
+                ("base.rs", &base_content),
+                ("stable.rs", "fn stable() -> &str { \"hello\" }\n"),
+            ],
+        );
+
+        // Create feature branch.
+        let run_git = |args: &[&str]| {
+            std::process::Command::new("git").args(args).current_dir(&repo_dir).status().unwrap();
+        };
+        run_git(&["checkout", "-b", "feature"]);
+        let changed = "fn base() -> i32 { 99 }\n".repeat(20);
+        fs::write(repo_dir.join("base.rs"), &changed).unwrap();
+
+        let config_root = temp_config_root("branch-local");
+        let context = CliContext::for_tests(config_root.clone());
+        let palace_dir = config_root.join("palace");
+
+        run_cli(["init", repo_dir.to_str().unwrap(), "--yes"], &context, stub_provider).unwrap();
+
+        let wing_name = "wing_branchtest";
+        let remote_name = "hub";
+        write_combined_cli_config(
+            &config_root,
+            remote_name,
+            &server_url,
+            TOKEN,
+            wing_name,
+            &palace_dir,
+            &repo_dir,
+        );
+
+        let context = CliContext::for_tests(config_root.clone());
+        let output =
+            run_cli(["mine", repo_dir.to_str().unwrap(), "--branch"], &context, stub_provider)
+                .unwrap();
+
+        // Must exit 0 and ingest the changed file locally.
+        assert_eq!(
+            output.exit_code, 0,
+            "branch mine with combined+both config: stderr={:?}",
+            output.stderr
+        );
+        assert!(
+            output.stdout.contains("Files ingested: 1"),
+            "must ingest the changed file: {}",
+            output.stdout
+        );
+
+        // Must NOT contain any replication labels (branch forces local-only).
+        assert!(
+            !output.stdout.contains("replication:"),
+            "branch mode must not attempt replication: {}",
+            output.stdout
+        );
+        assert!(
+            !output.stdout.contains("Remote replication:"),
+            "branch mode must not show Remote replication: {}",
+            output.stdout
+        );
+
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn mine_combined_both_convos_uses_local_only() {
+        // combined+both config with a healthy remote, but --mode convos forces
+        // local-only execution. No remote replication must be attempted.
+        const TOKEN: &str = "convos-local-tok-006";
+        let workspace = tempdir().unwrap();
+
+        let server_palace = workspace.path().join("server-palace");
+        fs::create_dir_all(&server_palace).unwrap();
+        let addr = spawn_test_server(server_palace.clone(), TOKEN);
+        let server_url = format!("http://{addr}");
+
+        let convo_dir = setup_convo_fixture(workspace.path());
+
+        let config_root = temp_config_root("convos-local");
+        let context = CliContext::for_tests(config_root.clone());
+        let palace_dir = config_root.join("palace");
+
+        // Write combined+both config manually (no init for convos).
+        let wing_name = "wing_talks";
+        let remote_name = "hub";
+        write_combined_cli_config(
+            &config_root,
+            remote_name,
+            &server_url,
+            TOKEN,
+            wing_name,
+            &palace_dir,
+            // The project_dir parameter in write_combined_cli_config writes
+            // a agentpalace.yaml. We'll use the convo dir for that.
+            &convo_dir,
+        );
+
+        let context = CliContext::for_tests(config_root.clone());
+        let output = run_cli(
+            [
+                "--palace",
+                workspace.path().join("convo-palace").to_str().unwrap(),
+                "mine",
+                convo_dir.to_str().unwrap(),
+                "--mode",
+                "convos",
+                "--wing",
+                "talks",
+            ],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+
+        // Must exit 0 and ingest conversation files.
+        assert_eq!(
+            output.exit_code, 0,
+            "convos mine with combined+both config: stderr={:?}",
+            output.stderr
+        );
+        assert!(
+            output.stdout.contains("Files ingested:"),
+            "must show local ingestion: {}",
+            output.stdout
+        );
+
+        // Must NOT contain any replication labels (convos mode forces local-only).
+        assert!(
+            !output.stdout.contains("replication:"),
+            "convos mode must not attempt replication: {}",
+            output.stdout
+        );
+        assert!(
+            !output.stdout.contains("Remote replication:"),
+            "convos mode must not show Remote replication: {}",
+            output.stdout
+        );
+
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn mine_local_only_route_with_federation() {
+        // Federation remotes are defined, but the wing is NOT mapped to any
+        // remote — the route resolves to local-only. No remote replication
+        // must be attempted.
+        const TOKEN: &str = "local-route-tok-007";
+        let workspace = tempdir().unwrap();
+
+        // Start a server to prove we *could* replicate if configured.
+        let server_palace = workspace.path().join("server-palace");
+        fs::create_dir_all(&server_palace).unwrap();
+        let addr = spawn_test_server(server_palace.clone(), TOKEN);
+        let server_url = format!("http://{addr}");
+
+        let project_dir = setup_project_fixture(workspace.path());
+
+        let config_root = temp_config_root("local-route");
+        let context = CliContext::for_tests(config_root.clone());
+        let palace_dir = config_root.join("palace");
+
+        // Write config with federation remotes defined but NO wing routing.
+        fs::create_dir_all(&config_root).unwrap();
+        let config_json = serde_json::json!({
+            "version": 1,
+            "palace_path": palace_dir.to_str().unwrap(),
+            "federation": {
+                "remotes": [{"name": "hub", "url": server_url, "token": TOKEN}],
+                "wings": {}
+            }
+        });
+        fs::write(
+            config_root.join("config.json"),
+            serde_json::to_string_pretty(&config_json).unwrap(),
+        )
+        .unwrap();
+
+        // Write project config.
+        let yaml =
+            "wing: wing_project_alpha\nrooms:\n  - name: general\n    description: General files\n";
+        fs::write(project_dir.join("agentpalace.yaml"), yaml).unwrap();
+
+        let context = CliContext::for_tests(config_root.clone());
+
+        // First mine must succeed locally.
+        let mine =
+            run_cli(["mine", project_dir.to_str().unwrap()], &context, stub_provider).unwrap();
+        assert_eq!(mine.exit_code, 0, "local mine must succeed: stderr={:?}", mine.stderr);
+        assert!(
+            mine.stdout.contains("Files ingested: 3"),
+            "must ingest all 3 fixture files: {}",
+            mine.stdout
+        );
+
+        // Must NOT contain any replication or remote labels.
+        assert!(
+            !mine.stdout.contains("replication:"),
+            "local-only route must not attempt replication: {}",
+            mine.stdout
+        );
+        assert!(
+            !mine.stdout.contains("Remote replication:"),
+            "local-only route must not show Remote replication: {}",
+            mine.stdout
+        );
+        assert!(
+            !mine.stdout.contains("Remote:"),
+            "local-only route must not mention Remote: {}",
+            mine.stdout
+        );
+
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn mine_combined_both_unsupported_remote() {
+        // combined + write:both where the remote server does NOT advertise the
+        // "ingest" capability — local mine must succeed, replication must be
+        // reported as skipped, and exit code must be 0.
+        const TOKEN: &str = "unsupported-remote-tok-008";
+        let workspace = tempdir().unwrap();
+
+        // Server without "ingest" capability.
+        let addr = spawn_no_ingest_server(TOKEN);
+        let server_url = format!("http://{addr}");
+
+        let project_dir = workspace.path().join("no-ingest-project");
+        fs::create_dir_all(&project_dir).unwrap();
+        write_file(
+            &project_dir.join("backend/auth.rs"),
+            "Auth login flow keeps auth checks in the backend service.\n".repeat(5).as_str(),
+        );
+        write_file(
+            &project_dir.join("docs/roadmap.md"),
+            "Roadmap plan tracks the migration milestones.\n".repeat(5).as_str(),
+        );
+
+        let config_root = temp_config_root("unsupported-remote");
+        let context = CliContext::for_tests(config_root.clone());
+        let palace_dir = config_root.join("palace");
+
+        run_cli(["init", project_dir.to_str().unwrap(), "--yes"], &context, stub_provider).unwrap();
+
+        let wing_name = "wing_noingestproject";
+        let remote_name = "hub";
+        write_combined_cli_config(
+            &config_root,
+            remote_name,
+            &server_url,
+            TOKEN,
+            wing_name,
+            &palace_dir,
+            &project_dir,
+        );
+
+        let context = CliContext::for_tests(config_root.clone());
+        let output =
+            run_cli(["mine", project_dir.to_str().unwrap()], &context, stub_provider).unwrap();
+
+        // Exit code 0 — local success even though remote is unsupported.
+        assert_eq!(output.exit_code, 0, "{output:?}");
+        assert!(output.stdout.contains("durably queued"), "{}", output.stdout);
+        let outbox = agentpalace_storage::OutboxStore::new(palace_dir.join("storage.sqlite3"));
+        let backlog = outbox.backlog(None).unwrap();
+        assert!(backlog.pending_count > 0);
+        assert_eq!(backlog.retryable_count, 0, "foreground mine never attempts delivery");
+
+        drain_mine_replication(load_runtime_config(None, &context).unwrap(), backlog.pending_count);
+        assert_eq!(outbox.backlog(None).unwrap().failed_count, backlog.pending_count);
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn mine_combined_both_diary_wing_uses_local_only() {
+        // combined+both config with a healthy remote targeting wing_agents,
+        // but the diary hard-override in route resolution forces local-only
+        // execution. No remote replication must be attempted.
+        const TOKEN: &str = "diary-wing-tok-009";
+        let workspace = tempdir().unwrap();
+
+        let server_palace = workspace.path().join("server-palace");
+        fs::create_dir_all(&server_palace).unwrap();
+        let addr = spawn_test_server(server_palace.clone(), TOKEN);
+        let server_url = format!("http://{addr}");
+
+        // Project dir with wing_agents as the wing.
+        let project_dir = workspace.path().join("diary-project");
+        fs::create_dir_all(&project_dir).unwrap();
+        write_file(
+            &project_dir.join("entry.md"),
+            "Today I learned about federation routing.\n".repeat(5).as_str(),
+        );
+
+        let config_root = temp_config_root("diary-wing-local");
+        let context = CliContext::for_tests(config_root.clone());
+        let palace_dir = config_root.join("palace");
+
+        run_cli(["init", project_dir.to_str().unwrap(), "--yes"], &context, stub_provider).unwrap();
+
+        // Overwrite config with combined+both routing for wing_agents targeting
+        // a healthy remote server. The diary hard-override in resolve_route
+        // must force local-only regardless.
+        let wing_name = "wing_agents";
+        let remote_name = "hub";
+        write_combined_cli_config(
+            &config_root,
+            remote_name,
+            &server_url,
+            TOKEN,
+            wing_name,
+            &palace_dir,
+            &project_dir,
+        );
+
+        // Re-read project config to set wing_agents in agentpalace.yaml.
+        let yaml = "wing: wing_agents\nrooms:\n  - name: diary\n    description: Daily entries\n";
+        fs::write(project_dir.join("agentpalace.yaml"), yaml).unwrap();
+
+        let context = CliContext::for_tests(config_root.clone());
+        let output =
+            run_cli(["mine", project_dir.to_str().unwrap()], &context, stub_provider).unwrap();
+
+        // Must exit 0 and ingest locally.
+        assert_eq!(
+            output.exit_code, 0,
+            "diary-wing mine with combined+both config: stderr={:?}",
+            output.stderr
+        );
+        assert!(
+            output.stdout.contains("Files ingested:"),
+            "must show local ingestion: {}",
+            output.stdout
+        );
+
+        // Must NOT contain any replication labels (diary hard-override forces local-only).
+        assert!(
+            !output.stdout.contains("replication:"),
+            "diary wing must not attempt replication: {}",
+            output.stdout
+        );
+        assert!(
+            !output.stdout.contains("Remote replication:"),
+            "diary wing must not show Remote replication: {}",
+            output.stdout
+        );
+        assert!(
+            !output.stdout.contains("Remote:"),
+            "diary wing must not mention Remote: {}",
+            output.stdout
+        );
+
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn maintain_runs_with_enabled_config() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config_root = tempdir.path().to_path_buf();
+        let palace_path = config_root.join("palace");
+
+        // Write config.json with maintenance enabled.
+        write_file(
+            &config_root.join("config.json"),
+            r#"{"maintenance":{"enabled":true,"idle_secs":300}}"#,
+        );
+
+        // Initialise an empty palace so StorageEngine::open does not fail.
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(agentpalace_storage::StorageEngine::open(
+                &palace_path,
+                agentpalace_core::EmbeddingProfile::Balanced,
+            ))
+            .unwrap();
+
+        let context = CliContext::for_tests(config_root);
+        let output = run_cli(
+            ["maintain", "--palace", palace_path.to_str().unwrap()],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+
+        assert_eq!(output.exit_code, 0, "maintain should exit 0: {}", output.stderr);
+        assert!(
+            output.stdout.contains("Maintenance Run #"),
+            "output should contain run header: {}",
+            output.stdout
+        );
+        // With an empty palace all tiers should succeed or skip with nothing to do.
+        assert!(
+            output.stdout.contains("[SUCCESS]") || output.stdout.contains("[PARTIAL]"),
+            "output should show SUCCESS or PARTIAL status: {}",
+            output.stdout
+        );
+    }
+
+    #[test]
+    fn maintain_disabled_shows_explicit_message() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config_root = tempdir.path().to_path_buf();
+        let palace_path = config_root.join("palace");
+
+        // Write config.json with maintenance disabled.
+        write_file(&config_root.join("config.json"), r#"{"maintenance":{"enabled":false}}"#);
+
+        // Initialise an empty palace.
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(agentpalace_storage::StorageEngine::open(
+                &palace_path,
+                agentpalace_core::EmbeddingProfile::Balanced,
+            ))
+            .unwrap();
+
+        let context = CliContext::for_tests(config_root);
+        let output = run_cli(
+            ["maintain", "--palace", palace_path.to_str().unwrap()],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+
+        assert_eq!(output.exit_code, 0);
+        assert!(
+            output.stdout.contains("disabled by configuration"),
+            "disabled output must mention the reason: {}",
+            output.stdout
+        );
+        assert!(
+            output.stdout.contains("[PARTIAL]"),
+            "disabled output must show PARTIAL status: {}",
+            output.stdout
+        );
+    }
+
+    #[test]
+    fn maintain_no_palace_shows_error() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config_root = tempdir.path().to_path_buf();
+
+        let context = CliContext::for_tests(config_root);
+        let output = run_cli(["maintain"], &context, stub_provider).unwrap();
+
+        assert_eq!(output.exit_code, 1);
+        assert!(
+            output.stderr.contains("No palace found"),
+            "no-palace error must mention 'No palace found': {}",
+            output.stderr
+        );
+    }
+
+    #[test]
+    fn maintain_with_data_reports_tier_outcomes() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config_root = tempdir.path().to_path_buf();
+        let palace_path = config_root.join("palace");
+
+        // Write config.json with maintenance enabled and aggressive thresholds
+        // so every tier has work to do.  The validation rejects 0, so use the
+        // minimum positive value (1) for tail_threshold_rows and
+        // small_fragment_threshold; version_retention_hours must also be ≥1
+        // even though newly-created versions may not be old enough to prune.
+        write_file(
+            &config_root.join("config.json"),
+            r#"{"maintenance":{"enabled":true,"idle_secs":300,"tail_threshold_rows":2,"small_fragment_threshold":2,"version_retention_hours":1}}"#,
+        );
+
+        // Initialise a palace and insert drawers in multiple batches to create
+        // multiple LanceDB versions and small fragments, giving every tier
+        // real work.
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let engine = agentpalace_storage::StorageEngine::open(
+                &palace_path,
+                agentpalace_core::EmbeddingProfile::Balanced,
+            )
+            .await
+            .unwrap();
+            let dim = agentpalace_core::EmbeddingProfile::Balanced.metadata().dimensions;
+            for batch in 0..10 {
+                let records: Vec<_> = (0..4)
+                    .map(|i| {
+                        let id =
+                            agentpalace_core::DrawerId::new(&format!("wing/room/b{batch}_{i:04}"))
+                                .unwrap();
+                        let wing = agentpalace_core::WingId::new("wing").unwrap();
+                        let room = agentpalace_core::RoomId::new("room").unwrap();
+                        let mut embedding = vec![0.1_f32; dim];
+                        embedding[0] = (i as f32) * 0.01;
+                        agentpalace_core::DrawerRecord {
+                            id,
+                            wing,
+                            room,
+                            hall: None,
+                            date: None,
+                            source_file: "test.txt".to_owned(),
+                            chunk_index: i,
+                            ingest_mode: "test".to_owned(),
+                            extract_mode: None,
+                            added_by: "tester".to_owned(),
+                            filed_at: time::OffsetDateTime::UNIX_EPOCH,
+                            importance: None,
+                            emotional_weight: None,
+                            weight: None,
+                            content: format!("payload-{batch}-{i}"),
+                            content_hash: format!("hash-{batch}-{i}"),
+                            embedding,
+                            locator: None,
+                            view_metadata: None,
+                        }
+                    })
+                    .collect();
+                engine
+                    .drawer_store()
+                    .put_drawers(&records, agentpalace_storage::DuplicateStrategy::Error)
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let context = CliContext::for_tests(config_root);
+        let output = run_cli(
+            ["maintain", "--palace", palace_path.to_str().unwrap()],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+
+        assert_eq!(output.exit_code, 0, "maintain should exit 0: {}", output.stderr);
+        assert!(
+            output.stdout.contains("Maintenance Run #"),
+            "output should contain run header: {}",
+            output.stdout
+        );
+        // With data present and aggressive thresholds, all three tiers should
+        // appear in the output.  Version retention may be skipped because
+        // versions were created seconds ago (nothing older than 1 hour), but
+        // vector index optimisation and fragment compaction should complete.
+        assert!(
+            output.stdout.contains("[SUCCESS]") || output.stdout.contains("[PARTIAL]"),
+            "output should show SUCCESS or PARTIAL: {}",
+            output.stdout
+        );
+        assert!(
+            output.stdout.contains("Vector Index Optimization"),
+            "vector index tier should appear in output: {}",
+            output.stdout
+        );
+        assert!(
+            output.stdout.contains("Fragment Compaction"),
+            "fragment compaction tier should appear in output: {}",
+            output.stdout
+        );
+        assert!(
+            output.stdout.contains("Version Retention"),
+            "version retention tier should appear in output: {}",
+            output.stdout
+        );
+        // At least one tier must report "completed" with positive items.
+        assert!(
+            output.stdout.contains("completed"),
+            "at least one tier should report completed: {}",
+            output.stdout
+        );
+    }
+
+    #[test]
+    fn maintain_version_retention_shows_in_output() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config_root = tempdir.path().to_path_buf();
+        let palace_path = config_root.join("palace");
+
+        // Use minimum positive thresholds so config validation passes.
+        // version_retention_hours:1 is the minimum; with newly-created
+        // versions the tier will likely be skipped (nothing old enough),
+        // but it should appear in the output with a result.
+        write_file(
+            &config_root.join("config.json"),
+            r#"{"maintenance":{"enabled":true,"idle_secs":300,"version_retention_hours":1,"small_fragment_threshold":2,"tail_threshold_rows":2}}"#,
+        );
+
+        // Create multi-version fixture so pruning has versions to examine.
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let engine = agentpalace_storage::StorageEngine::open(
+                &palace_path,
+                agentpalace_core::EmbeddingProfile::Balanced,
+            )
+            .await
+            .unwrap();
+            let dim = agentpalace_core::EmbeddingProfile::Balanced.metadata().dimensions;
+            for batch in 0..8 {
+                let id =
+                    agentpalace_core::DrawerId::new(&format!("wing/room/v{batch}_0000")).unwrap();
+                let wing = agentpalace_core::WingId::new("wing").unwrap();
+                let room = agentpalace_core::RoomId::new("room").unwrap();
+                let mut embedding = vec![0.1_f32; dim];
+                embedding[0] = (batch as f32) * 0.01;
+                let record = agentpalace_core::DrawerRecord {
+                    id,
+                    wing,
+                    room,
+                    hall: None,
+                    date: None,
+                    source_file: "test.txt".to_owned(),
+                    chunk_index: batch,
+                    ingest_mode: "test".to_owned(),
+                    extract_mode: None,
+                    added_by: "tester".to_owned(),
+                    filed_at: time::OffsetDateTime::UNIX_EPOCH,
+                    importance: None,
+                    emotional_weight: None,
+                    weight: None,
+                    content: format!("payload-{batch}"),
+                    content_hash: format!("hash-{batch}"),
+                    embedding,
+                    locator: None,
+                    view_metadata: None,
+                };
+                engine
+                    .drawer_store()
+                    .put_drawers(&[record], agentpalace_storage::DuplicateStrategy::Error)
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let context = CliContext::for_tests(config_root);
+        let output = run_cli(
+            ["maintain", "--palace", palace_path.to_str().unwrap()],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+
+        assert_eq!(output.exit_code, 0);
+        assert!(
+            output.stdout.contains("Version Retention"),
+            "output must mention Version Retention tier: {}",
+            output.stdout
+        );
+        // The version retention tier should have a concrete result
+        // (completed or skipped with a reason), not a missing line.
+        assert!(
+            output.stdout.contains("completed") || output.stdout.contains("skipped"),
+            "version retention should show completed or skipped result: {}",
+            output.stdout
+        );
+    }
+
+    #[test]
+    fn maintain_exit_code_1_when_lease_contended() {
+        // Arrange: open the engine, claim the lease from a different holder,
+        // then drop the engine.  The CLI's maintain command opens a new
+        // engine with a different holder_id and tries to claim the lease.
+        let tempdir = tempfile::tempdir().unwrap();
+        let config_root = tempdir.path().to_path_buf();
+        let palace_path = config_root.join("palace");
+
+        write_file(
+            &config_root.join("config.json"),
+            r#"{"maintenance":{"enabled":true,"idle_secs":300}}"#,
+        );
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let engine = agentpalace_storage::StorageEngine::open(
+                &palace_path,
+                agentpalace_core::EmbeddingProfile::Balanced,
+            )
+            .await
+            .unwrap();
+            // Claim from a different holder so the CLI's own engine
+            // cannot acquire the lease.
+            engine
+                .operational_store()
+                .try_claim_lease("cli-test-holder", time::Duration::minutes(5))
+                .unwrap();
+            // Engine is dropped here, closing LanceDB/SQLite handles,
+            // but the lease persists in SQLite.
+        });
+
+        let context = CliContext::for_tests(config_root);
+        let output = run_cli(
+            ["maintain", "--palace", palace_path.to_str().unwrap()],
+            &context,
+            stub_provider,
+        )
+        .unwrap();
+
+        assert_eq!(output.exit_code, 1, "should exit 1 when lease is contended");
+        assert!(
+            output.stdout.contains("[FAILURE]") || output.stderr.contains("concurrent"),
+            "output should indicate lease contention: {} {}",
+            output.stdout,
+            output.stderr,
+        );
+    }
+}

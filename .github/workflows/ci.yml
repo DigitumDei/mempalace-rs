@@ -78,11 +78,11 @@ jobs:
         with:
           key: ort-static-2
 
-      - name: Build mempalace-embeddings tests
-        run: cargo test -p mempalace-embeddings --locked --no-run
+      - name: Build agentpalace-embeddings tests
+        run: cargo test -p agentpalace-embeddings --locked --no-run
 
-      - name: Run mempalace-embeddings tests
-        run: cargo test -p mempalace-embeddings --locked -- --nocapture
+      - name: Run agentpalace-embeddings tests
+        run: cargo test -p agentpalace-embeddings --locked -- --nocapture
 
   remaining-package-tests:
     name: ${{ matrix.package }} Tests
@@ -91,16 +91,16 @@ jobs:
       fail-fast: false
       matrix:
         package:
-          - mempalace-a2a
-          - mempalace-config
-          - mempalace-core
-          - mempalace-dialect
-          - mempalace-federation
-          - mempalace-import
-          - mempalace-mcp-tasks
-          - mempalace-remote
-          - mempalace-search
-          - mempalace-server
+          - agentpalace-a2a
+          - agentpalace-config
+          - agentpalace-core
+          - agentpalace-dialect
+          - agentpalace-federation
+          - agentpalace-import
+          - agentpalace-mcp-tasks
+          - agentpalace-remote
+          - agentpalace-search
+          - agentpalace-server
 
     steps:
       - name: Checkout
@@ -129,9 +129,9 @@ jobs:
     needs: embeddings-tests
     timeout-minutes: 30
     env:
-      MEMPALACE_EMBED_CACHE: /home/runner/.cache/mempalace/embeddings
-      MEMPALACE_EMBED_ALLOW_DOWNLOADS: "1"
-      MEMPALACE_EMBED_ITERATIONS: "15"
+      AGENTPALACE_EMBED_CACHE: /home/runner/.cache/agentpalace/embeddings
+      AGENTPALACE_EMBED_ALLOW_DOWNLOADS: "1"
+      AGENTPALACE_EMBED_ITERATIONS: "15"
 
     steps:
       - name: Checkout
@@ -146,18 +146,18 @@ jobs:
       - name: Cache embedding assets
         uses: actions/cache@v6
         with:
-          path: ${{ env.MEMPALACE_EMBED_CACHE }}
+          path: ${{ env.AGENTPALACE_EMBED_CACHE }}
           key: embedding-assets-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
 
       - name: Capture balanced warm baseline
         run: |
-          cargo run -p mempalace-embeddings --example embedding_bench --release --locked \
+          cargo run -p agentpalace-embeddings --example embedding_bench --release --locked \
             | tee balanced-benchmark.txt
 
       - name: Capture low_cpu warm baseline
         run: |
-          MEMPALACE_EMBED_PROFILE=low_cpu \
-            cargo run -p mempalace-embeddings --example embedding_bench --release --locked \
+          AGENTPALACE_EMBED_PROFILE=low_cpu \
+            cargo run -p agentpalace-embeddings --example embedding_bench --release --locked \
             | tee low-cpu-benchmark.txt
 
       - name: Publish embedding benchmark summary
@@ -198,11 +198,11 @@ jobs:
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Build mempalace-storage tests
-        run: cargo test -p mempalace-storage --locked --no-run
+      - name: Build agentpalace-storage tests
+        run: cargo test -p agentpalace-storage --locked --no-run
 
-      - name: Run mempalace-storage tests
-        run: cargo test -p mempalace-storage --locked -- --nocapture
+      - name: Run agentpalace-storage tests
+        run: cargo test -p agentpalace-storage --locked -- --nocapture
 
   ingest-tests:
     name: Ingest Tests
@@ -223,11 +223,11 @@ jobs:
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Build mempalace-ingest tests
-        run: cargo test -p mempalace-ingest --locked --no-run
+      - name: Build agentpalace-ingest tests
+        run: cargo test -p agentpalace-ingest --locked --no-run
 
-      - name: Run mempalace-ingest tests
-        run: cargo test -p mempalace-ingest --locked -- --nocapture
+      - name: Run agentpalace-ingest tests
+        run: cargo test -p agentpalace-ingest --locked -- --nocapture
 
   graph-tests:
     name: Graph Tests
@@ -248,11 +248,11 @@ jobs:
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Build mempalace-graph tests
-        run: cargo test -p mempalace-graph --locked --no-run
+      - name: Build agentpalace-graph tests
+        run: cargo test -p agentpalace-graph --locked --no-run
 
-      - name: Run mempalace-graph tests
-        run: cargo test -p mempalace-graph --locked -- --nocapture
+      - name: Run agentpalace-graph tests
+        run: cargo test -p agentpalace-graph --locked -- --nocapture
 
   mcp-tests:
     name: MCP Tests
@@ -273,11 +273,11 @@ jobs:
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Build mempalace-mcp tests
-        run: cargo test -p mempalace-mcp --locked --no-run
+      - name: Build agentpalace-mcp tests
+        run: cargo test -p agentpalace-mcp --locked --no-run
 
-      - name: Run mempalace-mcp tests
-        run: cargo test -p mempalace-mcp --locked -- --nocapture
+      - name: Run agentpalace-mcp tests
+        run: cargo test -p agentpalace-mcp --locked -- --nocapture
 
   cli-tests:
     name: CLI Tests
@@ -298,11 +298,11 @@ jobs:
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Build mempalace-cli tests
-        run: cargo test -p mempalace-cli --locked --no-run
+      - name: Build agentpalace-cli tests
+        run: cargo test -p agentpalace-cli --locked --no-run
 
-      - name: Run mempalace-cli tests
-        run: cargo test -p mempalace-cli --locked -- --nocapture
+      - name: Run agentpalace-cli tests
+        run: cargo test -p agentpalace-cli --locked -- --nocapture
 
   release-contract-tests:
     name: Release Contract Tests
@@ -331,6 +331,8 @@ jobs:
 
       - name: Exercise signed release contract
         run: bash release/tests/release-contract.sh
+      - name: Installer migration ordering
+        run: bash release/tests/install-rename.sh
 
   release-gate:
     name: Release Gate
@@ -384,7 +386,7 @@ jobs:
         shell: bash
         run: |
           version="$(bash release/build-version.sh)"
-          echo "MEMPALACE_BUILD_VERSION=$version" >> "$GITHUB_ENV"
+          echo "AGENTPALACE_BUILD_VERSION=$version" >> "$GITHUB_ENV"
           echo "Release version: $version"
 
       - name: Install protobuf compiler (Linux)
@@ -412,7 +414,7 @@ jobs:
           key: ${{ matrix.asset }}
 
       - name: Build release artifacts
-        run: cargo build --release --locked -p mempalace-cli --target ${{ matrix.target }}
+        run: cargo build --release --locked -p agentpalace-cli --target ${{ matrix.target }}
 
       - name: Stage executable and license notices
         shell: bash
@@ -420,18 +422,18 @@ jobs:
           ext=""
           [ "${{ runner.os }}" = "Windows" ] && ext=".exe"
           mkdir -p dist
-          cp "target/${{ matrix.target }}/release/mempalace${ext}" "dist/mempalace-${{ matrix.asset }}${ext}"
-          cp release/ONNXRuntime-NOTICES.txt "dist/mempalace-notices-${{ matrix.asset }}.txt"
+          cp "target/${{ matrix.target }}/release/agentpalace${ext}" "dist/agentpalace-${{ matrix.asset }}${ext}"
+          cp release/ONNXRuntime-NOTICES.txt "dist/agentpalace-notices-${{ matrix.asset }}.txt"
 
       - name: Smoke packaged executable
         shell: bash
         run: |
           ext=""
           [ "${{ runner.os }}" = "Windows" ] && ext=".exe"
-          "dist/mempalace-${{ matrix.asset }}${ext}" --help
-          "dist/mempalace-${{ matrix.asset }}${ext}" serve --help
-          version="$("dist/mempalace-${{ matrix.asset }}${ext}" --version)"
-          [ "$version" = "mempalace $MEMPALACE_BUILD_VERSION" ]
+          "dist/agentpalace-${{ matrix.asset }}${ext}" --help
+          "dist/agentpalace-${{ matrix.asset }}${ext}" serve --help
+          version="$("dist/agentpalace-${{ matrix.asset }}${ext}" --version)"
+          [ "$version" = "agentpalace $AGENTPALACE_BUILD_VERSION" ]
 
       - name: Upload release artifacts
         uses: actions/upload-artifact@v7
@@ -471,7 +473,7 @@ jobs:
 
       - name: Require verified immutable-release provisioning
         env:
-          IMMUTABLE_RELEASES_ENABLED: ${{ vars.MEMPALACE_IMMUTABLE_RELEASES_ENABLED }}
+          IMMUTABLE_RELEASES_ENABLED: ${{ vars.AGENTPALACE_IMMUTABLE_RELEASES_ENABLED || vars.MEMPALACE_IMMUTABLE_RELEASES_ENABLED }}
         run: |
           [ "$IMMUTABLE_RELEASES_ENABLED" = true ] \
             || { echo "immutable releases must be verified by release/configure-repository.ps1 before publishing" >&2; exit 1; }
@@ -514,9 +516,9 @@ jobs:
       - name: Create signed candidate manifest
         if: env.CANDIDATE_EXISTS != 'true'
         env:
-          RELEASE_SIGNING_KEY: ${{ secrets.MEMPALACE_RELEASE_SIGNING_KEY }}
+          RELEASE_SIGNING_KEY: ${{ secrets.AGENTPALACE_RELEASE_SIGNING_KEY || secrets.MEMPALACE_RELEASE_SIGNING_KEY }}
         run: |
-          chmod +x candidate/mempalace-* || true
+          chmod +x candidate/agentpalace-* || true
           bash release/create-manifest.sh \
             candidate nightly "$RELEASE_VERSION" "$GITHUB_SHA" "$GITHUB_RUN_ID" "$CANDIDATE_TAG"
           bash release/sign-manifest.sh candidate release/public-key.pem
@@ -545,7 +547,7 @@ jobs:
             - Commit: [\`${GITHUB_SHA}\`](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA})
             - CI run: [${GITHUB_RUN_ID}](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})
 
-            Assets: one `mempalace-*` executable with built-in ONNX Runtime per platform:
+            Assets: one `agentpalace-*` executable with built-in ONNX Runtime per platform:
             - `linux-x86_64` — glibc, built on ubuntu-latest
             - `macos-arm64` (Apple Silicon)
             - `windows-x86_64.exe`

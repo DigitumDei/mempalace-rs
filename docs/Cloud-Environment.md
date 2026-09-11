@@ -44,7 +44,7 @@ build-essential ca-certificates curl git libssl-dev pkg-config protobuf-compiler
 
 Three of these are load-bearing in ways the crate names don't advertise:
 
-- **`protobuf-compiler`** (`protoc`) — required by `mempalace-storage` through
+- **`protobuf-compiler`** (`protoc`) — required by `agentpalace-storage` through
   `lancedb` → `lance`. Without it `cargo check --workspace` fails outright.
 - **`build-essential`** — `rusqlite` uses the `bundled` feature, so SQLite is compiled from
   C source on every fresh machine.
@@ -110,32 +110,32 @@ Add them only if you intend to run the embedding benchmarks.
 | `CARGO_TERM_COLOR` | `always` | Matches CI |
 | `CARGO_NET_RETRY` | `5` | A cold 675-crate fetch is unforgiving of flaky sandbox networking |
 | `RUST_BACKTRACE` | `1` | Useful default when a test fails |
-| `MEMPALACE_EMBED_CACHE` | `$HOME/.cache/mempalace/embeddings` | Matches the CI layout |
-| `MEMPALACE_STUB_EMBEDDINGS` | `1` | Deterministic stub vectors, so the MCP/CLI/server **test suites** run fully offline |
+| `AGENTPALACE_EMBED_CACHE` | `$HOME/.cache/agentpalace/embeddings` | Matches the CI layout |
+| `AGENTPALACE_STUB_EMBEDDINGS` | `1` | Deterministic stub vectors, so the MCP/CLI/server **test suites** run fully offline |
 
-`MEMPALACE_STUB_EMBEDDINGS` takes an explicit truthy value (`1`, `true`, `yes`); `0` and
+`AGENTPALACE_STUB_EMBEDDINGS` takes an explicit truthy value (`1`, `true`, `yes`); `0` and
 `false` disable it. Don't carry it into an environment where you want real embeddings — the
 stub's vectors are not comparable with model output.
 
 **It is not a blanket offline switch for the CLI.** The tests that need it set it on the
-processes they spawn, and at runtime only `mempalace serve --stdio` and `mempalace serve` consult
-it. `mempalace init`, `mine`, and `search` always construct the real provider, so on a
+processes they spawn, and at runtime only `agentpalace serve --stdio` and `agentpalace serve` consult
+it. `agentpalace init`, `mine`, and `search` always construct the real provider, so on a
 box with no model cache they fail with missing assets no matter what this variable says.
 That is expected here: the workspace's tests do not exercise those commands against a real
 model.
 
-**Do not set `MEMPALACE_EMBED_ALLOW_DOWNLOADS`.** All transports default to offline and refuse to
+**Do not set `AGENTPALACE_EMBED_ALLOW_DOWNLOADS`.** All transports default to offline and refuse to
 fetch model assets without it, and the test suite is green in that state — CI's
 `embeddings-tests` job never sets it, and only the separate `embedding-baselines` job does.
 Leaving it unset is what allows the HuggingFace domains to stay off the allowlist. If you need
-real model behaviour (e.g. `cargo run -p mempalace-embeddings --example embedding_bench`), set
+real model behaviour (e.g. `cargo run -p agentpalace-embeddings --example embedding_bench`), set
 it for that command and add the HuggingFace domains for that environment.
 
 ## Secrets
 
 **None are required to build or test.**
 
-- `MEMPALACE_RELEASE_SIGNING_KEY` is CI-only, used for signing release manifests. It must never
+- `AGENTPALACE_RELEASE_SIGNING_KEY` is CI-only, used for signing release manifests. It must never
   be placed in a development or cloud sandbox environment.
 - `GH_TOKEN` is only needed if the session should open pull requests or read CI logs via `gh`.
 
@@ -168,11 +168,11 @@ environment; expect a fresh session to ask for approval on commands until you co
 
 ```bash
 cargo check --workspace --all-targets --locked
-cargo test -p mempalace-embeddings --locked
-cargo test -p mempalace-storage --locked
+cargo test -p agentpalace-embeddings --locked
+cargo test -p agentpalace-storage --locked
 cargo clippy --workspace --all-targets --locked
 ```
 
-Those two packages are the environment-sensitive ones: `mempalace-embeddings` proves the ONNX
-Runtime download and the offline model path both work, and `mempalace-storage` proves `protoc`
+Those two packages are the environment-sensitive ones: `agentpalace-embeddings` proves the ONNX
+Runtime download and the offline model path both work, and `agentpalace-storage` proves `protoc`
 and the bundled SQLite build are present. The clippy run confirms the component was installed.

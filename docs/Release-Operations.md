@@ -1,5 +1,9 @@
 # Release Operations
 
+For the AgentPalace name cutover, publish assets named `agentpalace-*` before
+advertising the updated installer. See [Migration — release operators](Migration.md#release-operators)
+for the existing secret/variable fallback and client upgrade sequence.
+
 This runbook is the operator contract for signed candidate and stable releases.
 The workflow fails closed when any required repository setting, signature,
 artifact, or provenance record is missing.
@@ -11,7 +15,7 @@ artifact, or provenance record is missing.
   produce a GitHub release attestation.
 - `release/public-key.pem` is the installer trust root.
 - The matching private key exists only as the
-  `MEMPALACE_RELEASE_SIGNING_KEY` secret in the protected `stable-release`
+  `AGENTPALACE_RELEASE_SIGNING_KEY` secret in the protected `stable-release`
   environment and in the operator's offline recovery store.
 - The same protected environment gates candidate signing and stable promotion.
   This deliberately requires release approval before the private key is exposed
@@ -44,7 +48,7 @@ Before merging or rerunning a release-producing workflow:
    ```powershell
    ./release/configure-repository.ps1 `
      -Reviewer DigitumDei `
-     -PrivateKeyPath C:\secure\mempalace-release-private.pem
+     -PrivateKeyPath C:\secure\agentpalace-release-private.pem
    ```
 
    Add `-PreventSelfReview` only when a second authorized operator can approve
@@ -58,7 +62,7 @@ The helper:
 - restricts `stable-release` deployments to protected branches and adds the
   required reviewer;
 - stores only the base64-encoded private key in the environment secret;
-- records `MEMPALACE_IMMUTABLE_RELEASES_ENABLED=true` in the protected
+- records `AGENTPALACE_IMMUTABLE_RELEASES_ENABLED=true` in the protected
   environment only after the live admin API confirms that immutability is on.
 
 The workflow's short-lived `GITHUB_TOKEN` cannot read repository Administration
@@ -79,7 +83,7 @@ gh api -H "X-GitHub-Api-Version: 2026-03-10" `
   repos/DigitumDei/agentpalace/immutable-releases
 gh api repos/DigitumDei/agentpalace/environments/stable-release
 gh secret list --repo DigitumDei/agentpalace --env stable-release
-gh variable get MEMPALACE_IMMUTABLE_RELEASES_ENABLED `
+gh variable get AGENTPALACE_IMMUTABLE_RELEASES_ENABLED `
   --repo DigitumDei/agentpalace --env stable-release
 ```
 
@@ -105,7 +109,7 @@ automatic build after stable `v0.1.0` is `0.1.1`.
 
 Release jobs embed the calculated version in the CLI, MCP server, server-info
 response, signed manifest, release title, and stable tag. Ordinary local Cargo
-builds that do not set `MEMPALACE_BUILD_VERSION` continue to report the
+builds that do not set `AGENTPALACE_BUILD_VERSION` continue to report the
 workspace package version.
 
 ## Candidate publication
@@ -192,5 +196,5 @@ Key rotation is a coordinated release change:
 Old installers continue to trust only the old key, so retain old stable
 releases and plan compatibility explicitly.
 
-Each platform also ships a signed `mempalace-notices-<platform>.txt` asset containing
+Each platform also ships a signed `agentpalace-notices-<platform>.txt` asset containing
 the upstream ONNX Runtime license and third-party notices, installed as `ONNXRuntime-NOTICES.txt`.

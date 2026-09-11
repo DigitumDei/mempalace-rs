@@ -1,21 +1,23 @@
 #!/usr/bin/env bash
 # AgentPalace installer — downloads the stable build for this platform, verifies
-# its signed manifest and checksums, installs to ~/.mempalace/bin, registers the MCP
+# its signed manifest and checksums, installs to ~/.agentpalace/bin, registers the MCP
 # server with detected AI tools, and warms the embedding model.
 #
 #   curl -fsSL https://raw.githubusercontent.com/DigitumDei/agentpalace/main/install.sh | sh
 #
 # Options (pass via `sh -s -- <flags>` when piping):
-#   --no-setup           skip `mempalace setup` (MCP registration + embedding-model warm-up)
+#   --no-setup           skip `agentpalace setup` (MCP registration + embedding-model warm-up)
 #   --no-path            skip adding the install dir to your shell PATH
-#   --install-dir <dir>  install somewhere other than ~/.mempalace/bin
+#   --install-dir <dir>  install somewhere other than ~/.agentpalace/bin
 #   --channel <channel>  stable (default) or explicit nightly candidate
 #   --version <tag>      required immutable v<version>-nightly.<full-sha> tag
 
 set -eu
 
 REPO="DigitumDei/agentpalace"
-INSTALL_DIR="${HOME}/.mempalace/bin"
+INSTALL_DIR=""
+MIGRATION_FROM="${HOME}/.mempalace"
+MIGRATION_TO="${HOME}/.agentpalace"
 RUN_SETUP=1
 UPDATE_PATH=1
 CHANNEL="stable"
@@ -30,6 +32,12 @@ while [ $# -gt 0 ]; do
             [ $# -gt 0 ] || { echo "error: --install-dir requires a value" >&2; exit 1; }
             INSTALL_DIR="$1"
             ;;
+        --migrate-from|--migrate-to)
+            option="$1"
+            shift
+            [ $# -gt 0 ] || { echo "error: ${option} requires a value" >&2; exit 1; }
+            if [ "$option" = "--migrate-from" ]; then MIGRATION_FROM="$1"; else MIGRATION_TO="$1"; fi
+            ;;
         --channel)
             shift
             [ $# -gt 0 ] || { echo "error: --channel requires a value" >&2; exit 1; }
@@ -43,13 +51,15 @@ while [ $# -gt 0 ]; do
         -h|--help)
             cat <<'EOF'
 AgentPalace installer — downloads the stable build for this platform, verifies
-its signed manifest and checksums, installs to ~/.mempalace/bin, registers the MCP
+its signed manifest and checksums, installs to ~/.agentpalace/bin, registers the MCP
 server with detected AI tools, and warms the embedding model.
 
 Options (pass via `sh -s -- <flags>` when piping):
-  --no-setup           skip `mempalace setup` (MCP registration + embedding-model warm-up)
+  --no-setup           skip `agentpalace setup` (MCP registration + embedding-model warm-up)
   --no-path            skip adding the install dir to your shell PATH
-  --install-dir <dir>  install somewhere other than ~/.mempalace/bin
+  --install-dir <dir>  install somewhere other than ~/.agentpalace/bin
+  --migrate-from <dir> old data/config home (default: ~/.mempalace)
+  --migrate-to <dir>   new data/config home (default: ~/.agentpalace)
   --channel <channel>  stable (default) or explicit nightly candidate
   --version <tag>      required immutable v<version>-nightly.<full-sha> tag
 EOF
@@ -59,6 +69,11 @@ EOF
     esac
     shift
 done
+case "$MIGRATION_FROM" in /*) ;; *) MIGRATION_FROM="$(pwd)/${MIGRATION_FROM}" ;; esac
+case "$MIGRATION_TO" in /*) ;; *) MIGRATION_TO="$(pwd)/${MIGRATION_TO}" ;; esac
+INSTALL_DIR="${INSTALL_DIR:-${MIGRATION_TO}/bin}"
+# Absolute launcher paths work independently of the MCP host's directory.
+case "$INSTALL_DIR" in /*) ;; *) INSTALL_DIR="$(pwd)/${INSTALL_DIR}" ;; esac
 
 err() { echo "error: $*" >&2; exit 1; }
 
@@ -101,8 +116,8 @@ if [ "${PLATFORM}" = "linux-x86_64" ] && command -v ldd >/dev/null 2>&1; then
     fi
 fi
 
-CLI_ASSET="mempalace-${PLATFORM}"
-NOTICES_ASSET="mempalace-notices-${PLATFORM}.txt"
+CLI_ASSET="agentpalace-${PLATFORM}"
+NOTICES_ASSET="agentpalace-notices-${PLATFORM}.txt"
 
 # --- Downloader -------------------------------------------------------------
 if command -v curl >/dev/null 2>&1; then
@@ -229,21 +244,31 @@ else
 fi
 
 # --- Install ----------------------------------------------------------------
+chmod +x "${TMP_DIR}/${CLI_ASSET}"
+"${TMP_DIR}/${CLI_ASSET}" migrate --from "$MIGRATION_FROM" --to "$MIGRATION_TO" \
+    --mcp-path "${INSTALL_DIR}/agentpalace" \
+    || err "migration failed; resolve the reported issue and rerun this installer (backups are retained)"
 UPDATED=0
-if [ -f "${INSTALL_DIR}/mempalace" ] || [ -f "${INSTALL_DIR}/mempalace-cli" ] || [ -f "${INSTALL_DIR}/mempalace-mcp" ]; then
+if [ -f "${INSTALL_DIR}/agentpalace" ] || [ -f "${INSTALL_DIR}/agentpalace-cli" ] || [ -f "${INSTALL_DIR}/agentpalace-mcp" ]; then
     UPDATED=1
 fi
 mkdir -p "${INSTALL_DIR}"
 mv "${TMP_DIR}/${NOTICES_ASSET}" "${INSTALL_DIR}/ONNXRuntime-NOTICES.txt"
-mv "${TMP_DIR}/${CLI_ASSET}" "${INSTALL_DIR}/mempalace"
-chmod +x "${INSTALL_DIR}/mempalace"
+mv "${TMP_DIR}/${CLI_ASSET}" "${INSTALL_DIR}/agentpalace"
+chmod +x "${INSTALL_DIR}/agentpalace"
 # Retire the old entry points only after the unified executable is installed.
-rm -f "${INSTALL_DIR}/mempalace-cli" "${INSTALL_DIR}/mempalace-mcp"
+for legacy in mempalace mempalace-cli mempalace-mcp agentpalace-cli agentpalace-mcp; do
+    if [ -f "${INSTALL_DIR}/${legacy}" ]; then
+        [ ! -e "${INSTALL_DIR}/${legacy}.pre-agentpalace" ] \
+            || err "both ${legacy} and its backup exist in ${INSTALL_DIR}; resolve this conflict before retrying"
+        mv "${INSTALL_DIR}/${legacy}" "${INSTALL_DIR}/${legacy}.pre-agentpalace"
+    fi
+done
 
 if [ "${UPDATED}" -eq 1 ]; then
     echo "Updated existing install in ${INSTALL_DIR}"
 else
-    echo "Installed mempalace (with built-in ONNX Runtime) to ${INSTALL_DIR}"
+    echo "Installed agentpalace (with built-in ONNX Runtime) to ${INSTALL_DIR}"
 fi
 
 # --- PATH -------------------------------------------------------------------
@@ -261,7 +286,7 @@ if [ "${UPDATE_PATH}" -eq 1 ]; then
         *) RC_FILE="${HOME}/.bashrc" ;;
     esac
     if [ "${SHELL_NAME}" != "fish" ]; then
-        if [ -f "${RC_FILE}" ] && grep -q '\.mempalace/bin' "${RC_FILE}"; then
+        if [ -f "${RC_FILE}" ] && grep -q '\.agentpalace/bin' "${RC_FILE}"; then
             : # already on PATH via rc file
         else
             printf '\n# Added by the AgentPalace installer\nexport PATH="%s:$PATH"\n' "${INSTALL_DIR}" >> "${RC_FILE}"
@@ -272,31 +297,31 @@ fi
 
 # --- MCP setup + model warm-up ----------------------------------------------
 if [ "${RUN_SETUP}" -eq 1 ]; then
-    if ! "${INSTALL_DIR}/mempalace" setup; then
+    if ! AGENTPALACE_CONFIG_DIR="$MIGRATION_TO" "${INSTALL_DIR}/agentpalace" setup; then
         # setup exits non-zero only when the embedding model could not be made
         # usable offline (see the "check :" line above). The install itself
         # succeeded, so warn with remediation rather than aborting the script.
         cat >&2 <<EOF
 
 warning: the embedding-model warm-up in \`setup\` failed.
-  mempalace (with built-in ONNX Runtime) is installed and usable, but the MCP server
+  agentpalace (with built-in ONNX Runtime) is installed and usable, but the MCP server
   will abort with OfflineStartup until the model cache is complete.
   Fix: re-run \`setup\` with network access to download the model:
-    ${INSTALL_DIR}/mempalace setup
+    ${INSTALL_DIR}/agentpalace setup
   or stage the model cache yourself and re-run with the warm-up skipped:
-    ${INSTALL_DIR}/mempalace setup --no-model-warmup
+    ${INSTALL_DIR}/agentpalace setup --no-model-warmup
 EOF
     fi
 else
     echo "Skipped MCP registration and model warm-up. Run them later with:"
-    echo "  ${INSTALL_DIR}/mempalace setup"
+    echo "  ${INSTALL_DIR}/agentpalace setup"
 fi
 
 cat <<EOF
 
 AgentPalace is installed. Next steps:
-  mempalace init /path/to/your/project    # create a palace for a project
-  mempalace mine /path/to/your/project    # ingest its files
+  agentpalace init /path/to/your/project    # create a palace for a project
+  agentpalace mine /path/to/your/project    # ingest its files
 
 Full walkthrough: https://github.com/${REPO}/blob/main/docs/Quickstart.md
 EOF

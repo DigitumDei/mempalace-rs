@@ -1,0 +1,2813 @@
+#![allow(missing_docs)]
+
+use std::cmp::Ordering;
+use std::collections::BTreeMap;
+use std::env;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+pub use agentpalace_core as core;
+pub use agentpalace_dialect as dialect;
+pub use agentpalace_embeddings as embeddings;
+pub use agentpalace_storage as storage;
+
+use agentpalace_core::{DrawerRecord, SearchQuery, SearchResult, WingId, resolve_records};
+use agentpalace_dialect::{Dialect, WakeUpAaaKConfig};
+use agentpalace_embeddings::{EmbeddingProvider, EmbeddingRequest};
+use agentpalace_storage::{DrawerFilter, DrawerMatch, DrawerStore, SearchRequest};
+use thiserror::Error;
+
+const DEFAULT_LAYER1_MAX_DRAWERS: usize = 15;
+const DEFAULT_LAYER1_MAX_CHARS: usize = 3_200;
+const LAYER1_SNIPPET_LIMIT: usize = 200;
+const LAYER2_SNIPPET_LIMIT: usize = 300;
+
+pub type Result<T> = std::result::Result<T, SearchError>;
+
+#[derive(Debug, Error)]
+pub enum SearchError {
+    #[error(transparent)]
+    Core(#[from] agentpalace_core::AgentPalaceError),
+    #[error(transparent)]
+    Embeddings(#[from] agentpalace_embeddings::EmbeddingError),
+    #[error(transparent)]
+    Storage(#[from] agentpalace_storage::StorageError),
+    #[error(
+        "search query requested embedding profile `{query}`, but runtime is configured for `{provider}`"
+    )]
+    ProfileMismatch { query: &'static str, provider: &'static str },
+    #[error("search query text cannot be blank")]
+    BlankQuery,
+    #[error("failed to read identity at {path}: {source}")]
+    IdentityRead {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Layer1Config {
+    pub max_drawers: usize,
+    pub max_chars: usize,
+}
+
+impl Default for Layer1Config {
+    fn default() -> Self {
+        Self { max_drawers: DEFAULT_LAYER1_MAX_DRAWERS, max_chars: DEFAULT_LAYER1_MAX_CHARS }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WakeUpRequest {
+    pub wing: Option<agentpalace_core::WingId>,
+    pub identity: IdentitySource,
+    pub layer1: Layer1Config,
+    pub format: WakeUpFormat,
+}
+
+impl Default for WakeUpRequest {
+    fn default() -> Self {
+        Self {
+            wing: None,
+            identity: default_identity_path()
+                .map(IdentitySource::DefaultPath)
+                .unwrap_or(IdentitySource::MissingDefault),
+            layer1: Layer1Config::default(),
+            format: WakeUpFormat::PlainText,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WakeUpFormat {
+    #[default]
+    PlainText,
+    AaaK,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdentitySource {
+    Inline(String),
+    Path(PathBuf),
+    DefaultPath(PathBuf),
+    MissingDefault,
+}
+
+impl IdentitySource {
+    pub fn render(&self) -> Result<String> {
+        match self {
+            Self::Inline(value) => Ok(value.trim().to_owned()),
+            Self::Path(path) => fs::read_to_string(path)
+                .map(|text| text.trim().to_owned())
+                .map_err(|source| SearchError::IdentityRead { path: path.clone(), source }),
+            Self::DefaultPath(path) => match fs::read_to_string(path) {
+                Ok(text) => Ok(text.trim().to_owned()),
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                    Ok(default_identity_banner())
+                }
+                Err(source) => Err(SearchError::IdentityRead { path: path.clone(), source }),
+            },
+            Self::MissingDefault => Ok(default_identity_banner()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LayerRetrieveRequest {
+    pub wing: Option<agentpalace_core::WingId>,
+    pub room: Option<agentpalace_core::RoomId>,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchRuntime<P> {
+    provider: P,
+    dialect: Dialect,
+    policy: SearchRuntimePolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SearchRuntimePolicy {
+    pub rerank_enabled: bool,
+}
+
+impl<P> SearchRuntime<P>
+where
+    P: EmbeddingProvider,
+{
+    pub fn new(provider: P) -> Self {
+        Self::with_policy(provider, SearchRuntimePolicy::default())
+    }
+
+    pub fn with_policy(provider: P, policy: SearchRuntimePolicy) -> Self {
+        Self::with_dialect_and_policy(provider, Dialect::new(), policy)
+    }
+
+    pub fn with_dialect(provider: P, dialect: Dialect) -> Self {
+        Self::with_dialect_and_policy(provider, dialect, SearchRuntimePolicy::default())
+    }
+
+    pub fn with_dialect_and_policy(
+        provider: P,
+        dialect: Dialect,
+        policy: SearchRuntimePolicy,
+    ) -> Self {
+        Self { provider, dialect, policy }
+    }
+
+    pub fn provider(&self) -> &P {
+        &self.provider
+    }
+
+    pub fn provider_mut(&mut self) -> &mut P {
+        &mut self.provider
+    }
+
+    pub fn dialect(&self) -> &Dialect {
+        &self.dialect
+    }
+
+    pub async fn search<S>(&mut self, store: &S, query: &SearchQuery) -> Result<Vec<SearchResult>>
+    where
+        S: DrawerStore,
+    {
+        self.search_with_rerank(store, query, self.policy.rerank_enabled).await
+    }
+
+    pub async fn search_semantic<S>(
+        &mut self,
+        store: &S,
+        query: &SearchQuery,
+    ) -> Result<Vec<SearchResult>>
+    where
+        S: DrawerStore,
+    {
+        self.search_with_rerank(store, query, false).await
+    }
+
+    async fn search_with_rerank<S>(
+        &mut self,
+        store: &S,
+        query: &SearchQuery,
+        rerank_enabled: bool,
+    ) -> Result<Vec<SearchResult>>
+    where
+        S: DrawerStore,
+    {
+        let provider_profile = self.provider.profile().profile;
+        if provider_profile != query.profile {
+            return Err(SearchError::ProfileMismatch {
+                query: query.profile.as_str(),
+                provider: provider_profile.as_str(),
+            });
+        }
+
+        if query.text.trim().is_empty() {
+            return Err(SearchError::BlankQuery);
+        }
+
+        if query.limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let request = EmbeddingRequest::new(vec![query.text.clone()])?;
+        let response = self.provider.embed(&request)?;
+        let query_embedding = response.vectors().first().cloned().ok_or_else(|| {
+            SearchError::Embeddings(agentpalace_embeddings::EmbeddingError::ProviderContract(
+                "provider returned no vector for a non-empty search query".to_owned(),
+            ))
+        })?;
+        let filter = DrawerFilter {
+            wing: query.wing.clone(),
+            room: query.room.clone(),
+            view: query.view.clone(),
+            ..DrawerFilter::default()
+        };
+        let overlay = query.view.as_deref().filter(|view| *view != "canonical" && *view != "full");
+
+        // Search wider until overlay filtering leaves a complete result window.
+        // A low-scoring branch replacement must shadow its canonical path without
+        // causing unrelated later candidates to disappear from the response.
+        let max_candidate_limit = query.limit.saturating_mul(10).max(query.limit);
+        let mut candidate_limit =
+            if rerank_enabled { query.limit.saturating_mul(2) } else { query.limit }
+                .min(max_candidate_limit);
+        let mut matches;
+        loop {
+            // LanceDB has no offset paging for vector queries, so each bounded
+            // expansion deliberately reissues the search with a wider window.
+            matches = store
+                .search_drawers(&SearchRequest {
+                    embedding: query_embedding.clone(),
+                    limit: candidate_limit,
+                    include_cutoff_ties: true,
+                    filter: filter.clone(),
+                })
+                .await?;
+            let candidate_count = matches.len();
+            if let Some(view) = overlay {
+                // Discover only branch paths represented in this candidate window.
+                // Their branch rows may rank poorly, but must still shadow the
+                // matching canonical candidate without loading the whole branch.
+                let source_files: Vec<String> = matches
+                    .iter()
+                    .map(|entry| entry.record.source_file.clone())
+                    .collect::<std::collections::HashSet<_>>()
+                    .into_iter()
+                    .collect();
+                // An empty source-file filter means no filter at the storage
+                // layer, which would load the entire branch view.
+                if source_files.is_empty() {
+                    break;
+                }
+                let view_hall = format!("view:{view}");
+                let overridden_paths = store
+                    .list_drawers(&DrawerFilter {
+                        view: Some(view.to_owned()),
+                        wing: query.wing.clone(),
+                        // Tombstones live in `general`, but shadow their path in every room.
+                        room: None,
+                        branch_view_only: true,
+                        source_files,
+                        ..DrawerFilter::default()
+                    })
+                    .await?
+                    .into_iter()
+                    .filter_map(|record| {
+                        let is_selected_view = record
+                            .view_metadata
+                            .as_ref()
+                            .and_then(|metadata| metadata.view_name.as_deref())
+                            .is_some_and(|name| name == view)
+                            || record.hall.as_deref() == Some(view_hall.as_str());
+                        // Mixed-version replicas may not share a durable repository ID.
+                        // The wing and project-relative source path are the stable
+                        // compatibility key for overlay composition.
+                        is_selected_view.then(|| (record.wing, record.source_file))
+                    })
+                    .collect::<std::collections::HashSet<_>>();
+                matches.retain(|entry| {
+                    visible_in_view(&entry.record, view, &view_hall, &overridden_paths)
+                });
+            }
+            if matches.len() >= query.limit || candidate_count < candidate_limit {
+                break;
+            }
+            let next_limit = candidate_limit.saturating_mul(2);
+            if next_limit == candidate_limit || candidate_limit == max_candidate_limit {
+                break;
+            }
+            candidate_limit = next_limit.min(max_candidate_limit);
+        }
+
+        // Resolve locator-backed records in place BEFORE ranking so that
+        // rerank's lexical_overlap_score operates on real text.
+        let mut records: Vec<DrawerRecord> = matches.iter().map(|m| m.record.clone()).collect();
+        let stale_flags = resolve_records(&mut records);
+        // Write resolved content back into the matches.
+        for (m, resolved) in matches.iter_mut().zip(records.into_iter()) {
+            m.record.content = resolved.content;
+        }
+
+        let ranked = if rerank_enabled {
+            rerank_matches(&query.text, matches, stale_flags, query.limit)
+        } else {
+            rank_matches(matches, stale_flags, query.limit)
+        };
+
+        Ok(ranked
+            .into_iter()
+            .map(|entry| {
+                // Extract view name from view_metadata (new) or hall field
+                // (legacy convention, stored as "view:<name>").
+                let view = entry
+                    .record
+                    .view_metadata
+                    .as_ref()
+                    .and_then(|vm| vm.view_name.clone())
+                    .or_else(|| {
+                        entry
+                            .record
+                            .hall
+                            .as_ref()
+                            .and_then(|h| h.strip_prefix("view:").map(|v| v.to_owned()))
+                    });
+                SearchResult {
+                    drawer_id: Some(entry.record.id.clone()),
+                    wing: entry.record.wing.clone(),
+                    room: entry.record.room.clone(),
+                    score: entry.score,
+                    content: entry.record.content.clone(),
+                    source_file: source_label(&entry.record.source_file).to_owned(),
+                    stale: entry.stale,
+                    content_hash: Some(entry.record.content_hash.clone()),
+                    view,
+                }
+            })
+            .collect())
+    }
+
+    pub async fn search_text<S>(&mut self, store: &S, query: &SearchQuery) -> Result<String>
+    where
+        S: DrawerStore,
+    {
+        let results = self.search(store, query).await?;
+        Ok(render_search_results(&query.text, &results, query.wing.as_ref(), query.room.as_ref()))
+    }
+
+    pub async fn recall<S>(&self, store: &S, request: &LayerRetrieveRequest) -> Result<String>
+    where
+        S: DrawerStore,
+    {
+        let mut drawers = store
+            .list_drawers(&DrawerFilter {
+                wing: request.wing.clone(),
+                room: request.room.clone(),
+                ..DrawerFilter::default()
+            })
+            .await?;
+
+        // Resolve locator-backed records before rendering so snippets show real text.
+        resolve_records(&mut drawers);
+        order_layer_drawers(&mut drawers);
+
+        if drawers.is_empty() {
+            let mut label = String::new();
+            if let Some(wing) = &request.wing {
+                label.push_str("wing=");
+                label.push_str(wing.as_str());
+            }
+            if let Some(room) = &request.room {
+                if !label.is_empty() {
+                    label.push(' ');
+                }
+                label.push_str("room=");
+                label.push_str(room.as_str());
+            }
+
+            return Ok(if label.is_empty() {
+                "No drawers found.".to_owned()
+            } else {
+                format!("No drawers found for {label}.")
+            });
+        }
+
+        let mut lines =
+            vec![format!("## L2 — ON-DEMAND ({}) drawers", drawers.len().min(request.limit))];
+        for record in drawers.iter().take(request.limit) {
+            let snippet = flatten_and_truncate(&record.content, LAYER2_SNIPPET_LIMIT);
+            let mut entry = format!("  [{}] {}", record.room.as_str(), snippet);
+            let source = source_label(&record.source_file);
+            if !source.is_empty() {
+                entry.push_str("  (");
+                entry.push_str(&source);
+                entry.push(')');
+            }
+            lines.push(entry);
+        }
+
+        Ok(lines.join("\n"))
+    }
+
+    pub async fn wake_up<S>(&self, store: &S, request: &WakeUpRequest) -> Result<String>
+    where
+        S: DrawerStore,
+    {
+        let identity = request.identity.render()?;
+        match request.format {
+            WakeUpFormat::PlainText => {
+                let story =
+                    generate_layer1(store, request.wing.clone(), request.layer1.clone()).await?;
+                Ok(format!("{identity}\n\n{story}"))
+            }
+            WakeUpFormat::AaaK => {
+                let drawers =
+                    list_layer_drawers(store, request.wing.clone(), request.layer1.max_drawers)
+                        .await?;
+                Ok(self.dialect.render_wake_up_aaak(
+                    &identity,
+                    &drawers,
+                    &WakeUpAaaKConfig {
+                        max_drawers: request.layer1.max_drawers,
+                        max_chars: request.layer1.max_chars,
+                    },
+                ))
+            }
+        }
+    }
+}
+
+fn visible_in_view(
+    record: &DrawerRecord,
+    view: &str,
+    view_hall: &str,
+    overridden_paths: &std::collections::HashSet<(WingId, String)>,
+) -> bool {
+    let selected_branch = record
+        .view_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.view_name.as_deref())
+        .is_some_and(|name| name == view)
+        || record.hall.as_deref() == Some(view_hall);
+    if selected_branch
+        && record.view_metadata.as_ref().is_some_and(|metadata| metadata.path_state == "deleted")
+    {
+        return false;
+    }
+    if selected_branch {
+        return true;
+    }
+    if record.ingest_mode != "projects" {
+        return true;
+    }
+    !overridden_paths.contains(&(record.wing.clone(), record.source_file.clone()))
+}
+
+fn default_identity_path() -> Option<PathBuf> {
+    default_identity_path_from_home(env::var_os("HOME").map(PathBuf::from))
+}
+
+fn default_identity_path_from_home(home: Option<PathBuf>) -> Option<PathBuf> {
+    home.map(|home| home.join(".agentpalace").join("identity.txt"))
+}
+
+fn default_identity_banner() -> String {
+    "## L0 — IDENTITY\nNo identity configured. Create ~/.agentpalace/identity.txt".to_owned()
+}
+
+pub fn render_search_results(
+    query: &str,
+    results: &[SearchResult],
+    wing: Option<&agentpalace_core::WingId>,
+    room: Option<&agentpalace_core::RoomId>,
+) -> String {
+    if results.is_empty() {
+        return format!("\n  No results found for: \"{query}\"");
+    }
+
+    let mut lines = vec![
+        String::new(),
+        "============================================================".to_owned(),
+        format!("  Results for: \"{query}\""),
+    ];
+
+    if let Some(wing) = wing {
+        lines.push(format!("  Wing: {}", wing.as_str()));
+    }
+    if let Some(room) = room {
+        lines.push(format!("  Room: {}", room.as_str()));
+    }
+
+    lines.push("============================================================".to_owned());
+    lines.push(String::new());
+
+    for (index, result) in results.iter().enumerate() {
+        lines.push(format!(
+            "  [{}] {} / {}",
+            index + 1,
+            result.wing.as_str(),
+            result.room.as_str()
+        ));
+        lines.push(format!("      Source: {}", result.source_file));
+        lines.push(format!("      Match:  {}", trim_similarity(result.score)));
+        lines.push(String::new());
+
+        for line in result.content.trim().lines() {
+            lines.push(format!("      {line}"));
+        }
+
+        lines.push(String::new());
+        lines.push("  ────────────────────────────────────────────────────────".to_owned());
+    }
+
+    lines.push(String::new());
+    lines.join("\n")
+}
+
+pub async fn generate_layer1<S>(
+    store: &S,
+    wing: Option<agentpalace_core::WingId>,
+    config: Layer1Config,
+) -> Result<String>
+where
+    S: DrawerStore,
+{
+    let mut drawers = list_layer_drawers(store, wing, config.max_drawers).await?;
+
+    if drawers.is_empty() {
+        return Ok("## L1 — No memories yet.".to_owned());
+    }
+
+    order_layer_drawers(&mut drawers);
+    let top = drawers.into_iter().take(config.max_drawers).collect::<Vec<_>>();
+
+    let mut grouped = BTreeMap::<String, Vec<DrawerRecord>>::new();
+    for record in top {
+        grouped.entry(record.room.as_str().to_owned()).or_default().push(record);
+    }
+
+    let mut lines = vec!["## L1 — ESSENTIAL STORY".to_owned()];
+    let mut total_chars = 0;
+
+    for (room, records) in grouped {
+        let room_line = format!("\n[{room}]");
+        let room_chars = char_count(&room_line);
+        let mut room_lines = Vec::new();
+        let mut room_has_entries = false;
+
+        for record in records {
+            let snippet = flatten_and_truncate(&record.content, LAYER1_SNIPPET_LIMIT);
+            let source = source_label(&record.source_file);
+
+            let mut entry = format!("  - {snippet}");
+            if !source.is_empty() {
+                entry.push_str("  (");
+                entry.push_str(&source);
+                entry.push(')');
+            }
+
+            let entry_chars = char_count(&entry);
+            let next_total =
+                total_chars + if room_has_entries { 0 } else { room_chars } + entry_chars;
+            if next_total > config.max_chars {
+                lines.extend(room_lines);
+                lines.push("  ... (more in L3 search)".to_owned());
+                return Ok(lines.join("\n"));
+            }
+
+            if !room_has_entries {
+                lines.push(room_line.clone());
+                total_chars += room_chars;
+                room_has_entries = true;
+            }
+
+            total_chars += entry_chars;
+            room_lines.push(entry);
+        }
+
+        lines.extend(room_lines);
+    }
+
+    Ok(lines.join("\n"))
+}
+
+async fn list_layer_drawers<S>(
+    store: &S,
+    wing: Option<agentpalace_core::WingId>,
+    limit: usize,
+) -> Result<Vec<DrawerRecord>>
+where
+    S: DrawerStore,
+{
+    // Keep the historical distinction between an empty palace and a zero-sized
+    // story. One candidate establishes existence when the configured limit is zero.
+    let mut drawers = store
+        .list_layer_drawers(&DrawerFilter { wing, ..DrawerFilter::default() }, limit.max(1))
+        .await?;
+    // Resolve only the selected records; a zero-sized story reads no source files.
+    if limit > 0 {
+        resolve_records(&mut drawers);
+    }
+    Ok(drawers)
+}
+
+fn rank_matches(
+    matches: Vec<DrawerMatch>,
+    stale_flags: Vec<bool>,
+    limit: usize,
+) -> Vec<RankedMatch> {
+    let mut ranked = matches
+        .into_iter()
+        .zip(stale_flags)
+        .map(|(matched, stale)| RankedMatch {
+            score: normalize_score(matched.distance),
+            distance: matched.distance,
+            record: matched.record,
+            stale,
+        })
+        .collect::<Vec<_>>();
+
+    ranked.sort_by(compare_ranked_matches);
+    ranked.truncate(limit);
+    ranked
+}
+
+fn rerank_matches(
+    query: &str,
+    matches: Vec<DrawerMatch>,
+    stale_flags: Vec<bool>,
+    limit: usize,
+) -> Vec<RankedMatch> {
+    let query_terms = normalized_terms(query);
+    let mut ranked = matches
+        .into_iter()
+        .zip(stale_flags)
+        .map(|(matched, stale)| {
+            let base_score = normalize_score(matched.distance);
+            // lexical overlap uses record.content which has been resolved in place
+            let lexical_score = lexical_overlap_score(&query_terms, &matched.record.content);
+            RankedMatch {
+                score: (base_score * 0.7) + (lexical_score * 0.3),
+                distance: matched.distance,
+                record: matched.record,
+                stale,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    ranked.sort_by(compare_ranked_matches);
+    ranked.truncate(limit);
+    ranked
+}
+
+fn compare_ranked_matches(left: &RankedMatch, right: &RankedMatch) -> Ordering {
+    right
+        .score
+        .partial_cmp(&left.score)
+        .unwrap_or(Ordering::Equal)
+        .then_with(|| compare_distance(left.distance, right.distance))
+        .then_with(|| left.record.wing.as_str().cmp(right.record.wing.as_str()))
+        .then_with(|| left.record.room.as_str().cmp(right.record.room.as_str()))
+        .then_with(|| {
+            source_label(&left.record.source_file).cmp(&source_label(&right.record.source_file))
+        })
+        .then_with(|| left.record.chunk_index.cmp(&right.record.chunk_index))
+        .then_with(|| left.record.id.as_str().cmp(right.record.id.as_str()))
+}
+
+fn compare_distance(left: Option<f32>, right: Option<f32>) -> Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) => left.partial_cmp(&right).unwrap_or(Ordering::Equal),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+fn order_layer_drawers(drawers: &mut [DrawerRecord]) {
+    drawers.sort_by(agentpalace_core::compare_layer_drawers);
+}
+
+fn normalize_score(distance: Option<f32>) -> f32 {
+    distance.map_or(0.0, |value| 1.0 - value)
+}
+
+fn trim_similarity(score: f32) -> String {
+    let rounded = (score * 1_000.0).round() / 1_000.0;
+    let formatted = format!("{rounded:.3}");
+    let trimmed = formatted.trim_end_matches('0').trim_end_matches('.');
+    if trimmed.is_empty() { "0".to_owned() } else { trimmed.to_owned() }
+}
+
+fn flatten_and_truncate(content: &str, limit: usize) -> String {
+    let flattened = content.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    if flattened.chars().count() <= limit {
+        flattened
+    } else {
+        flattened.chars().take(limit.saturating_sub(3)).collect::<String>() + "..."
+    }
+}
+
+fn lexical_overlap_score(query_terms: &[String], content: &str) -> f32 {
+    if query_terms.is_empty() {
+        return 0.0;
+    }
+
+    let content_terms = normalized_terms(content);
+    let matched = query_terms
+        .iter()
+        .filter(|term| content_terms.iter().any(|content_term| content_term == *term))
+        .count();
+
+    matched as f32 / query_terms.len() as f32
+}
+
+fn normalized_terms(value: &str) -> Vec<String> {
+    value
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|term| !term.is_empty())
+        .map(|term| term.chars().flat_map(char::to_lowercase).collect())
+        .collect()
+}
+
+fn char_count(value: &str) -> usize {
+    value.chars().count()
+}
+
+fn source_label(source_file: &str) -> &str {
+    Path::new(source_file).file_name().and_then(|value| value.to_str()).unwrap_or(source_file)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct RankedMatch {
+    score: f32,
+    distance: Option<f32>,
+    record: DrawerRecord,
+    stale: bool,
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::{
+        Dialect, IdentitySource, Layer1Config, LayerRetrieveRequest, SearchError, SearchRuntime,
+        SearchRuntimePolicy, WakeUpFormat, WakeUpRequest, default_identity_path,
+        default_identity_path_from_home, generate_layer1, lexical_overlap_score, normalized_terms,
+        render_search_results, trim_similarity,
+    };
+    use async_trait::async_trait;
+    use agentpalace_core::{
+        DrawerId, DrawerRecord, EmbeddingProfile, RepositoryViewMetadata, RoomId, SearchQuery,
+        WingId,
+    };
+    use agentpalace_embeddings::{
+        EmbeddingProvider, EmbeddingRequest, EmbeddingResponse, StartupValidation,
+        StartupValidationStatus,
+    };
+    use agentpalace_storage::{
+        DrawerFilter, DrawerMatch, DrawerStore, DuplicateStrategy, SearchRequest, StorageError,
+    };
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use time::macros::{date, datetime};
+
+    fn embedding(value: f32) -> Vec<f32> {
+        vec![value; EmbeddingProfile::Balanced.metadata().dimensions]
+    }
+
+    fn record(
+        id: &str,
+        wing: &str,
+        room: &str,
+        source_file: &str,
+        content: &str,
+        score: Option<f32>,
+        filed_at: time::OffsetDateTime,
+    ) -> DrawerRecord {
+        DrawerRecord {
+            id: DrawerId::new(id).unwrap(),
+            wing: WingId::new(wing).unwrap(),
+            room: RoomId::new(room).unwrap(),
+            hall: Some("facts".to_owned()),
+            date: Some(date!(2026 - 04 - 11)),
+            source_file: source_file.to_owned(),
+            chunk_index: 0,
+            ingest_mode: "projects".to_owned(),
+            extract_mode: Some("full".to_owned()),
+            added_by: "tester".to_owned(),
+            filed_at,
+            importance: score,
+            emotional_weight: None,
+            weight: None,
+            content: content.to_owned(),
+            content_hash: format!("hash-{id}"),
+            embedding: embedding(score.unwrap_or(0.0)),
+            locator: None,
+            view_metadata: None,
+        }
+    }
+
+    fn project_record(
+        mut record: DrawerRecord,
+        view: Option<&str>,
+        path_state: &str,
+    ) -> DrawerRecord {
+        record.ingest_mode = if view.is_some() { "projects-branch" } else { "projects" }.to_owned();
+        record.hall = view.map(|view| format!("view:{view}"));
+        record.view_metadata = Some(RepositoryViewMetadata {
+            repo_id: "repo-a".to_owned(),
+            view_name: view.map(str::to_owned),
+            source_path: "/repo".to_owned(),
+            head_commit: None,
+            base_ref: Some("main".to_owned()),
+            merge_base: None,
+            worktree_id: "worktree-a".to_owned(),
+            path_state: path_state.to_owned(),
+        });
+        record
+    }
+
+    #[derive(Debug, Clone)]
+    struct StubProvider {
+        response: Vec<Vec<f32>>,
+    }
+
+    impl EmbeddingProvider for StubProvider {
+        fn profile(&self) -> &'static agentpalace_core::EmbeddingProfileMetadata {
+            EmbeddingProfile::Balanced.metadata()
+        }
+
+        fn startup_validation(&self) -> agentpalace_embeddings::Result<StartupValidation> {
+            Ok(StartupValidation {
+                status: StartupValidationStatus::Ready,
+                cache_root: PathBuf::from("/tmp"),
+                model_id: EmbeddingProfile::Balanced.metadata().model_id,
+                detail: "ok".to_owned(),
+            })
+        }
+
+        fn embed(
+            &mut self,
+            request: &EmbeddingRequest,
+        ) -> agentpalace_embeddings::Result<EmbeddingResponse> {
+            let vectors = self.response.iter().take(request.len()).cloned().collect::<Vec<_>>();
+            EmbeddingResponse::from_vectors(
+                vectors,
+                EmbeddingProfile::Balanced.metadata().dimensions,
+                EmbeddingProfile::Balanced,
+                EmbeddingProfile::Balanced.metadata().model_id,
+            )
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct StubStore {
+        drawers: Vec<DrawerRecord>,
+    }
+
+    #[async_trait]
+    impl DrawerStore for StubStore {
+        async fn ensure_schema(&self) -> Result<(), StorageError> {
+            Ok(())
+        }
+
+        async fn put_drawers(
+            &self,
+            _drawers: &[DrawerRecord],
+            _strategy: DuplicateStrategy,
+        ) -> Result<(), StorageError> {
+            unreachable!("not used in phase 5 tests")
+        }
+
+        async fn get_drawer(&self, _id: &DrawerId) -> Result<Option<DrawerRecord>, StorageError> {
+            unreachable!("not used in phase 5 tests")
+        }
+
+        async fn delete_drawers(&self, _ids: &[DrawerId]) -> Result<usize, StorageError> {
+            unreachable!("not used in phase 5 tests")
+        }
+
+        async fn search_drawers(
+            &self,
+            request: &SearchRequest,
+        ) -> Result<Vec<DrawerMatch>, StorageError> {
+            let mut filtered = self
+                .drawers
+                .iter()
+                .filter(|drawer| filter_matches(drawer, &request.filter))
+                .cloned()
+                .map(|drawer| DrawerMatch {
+                    distance: Some((drawer.embedding[0] - request.embedding[0]).abs()),
+                    record: drawer,
+                })
+                .collect::<Vec<_>>();
+
+            filtered.sort_by(|left, right| {
+                left.distance.partial_cmp(&right.distance).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            if request.limit == 0 {
+                filtered.clear();
+            } else if request.include_cutoff_ties && filtered.len() > request.limit {
+                let cutoff = filtered[request.limit - 1].distance;
+                let cutoff_len = filtered.partition_point(|entry| entry.distance <= cutoff);
+                filtered.truncate(cutoff_len);
+            } else {
+                filtered.truncate(request.limit);
+            }
+            Ok(filtered)
+        }
+
+        async fn list_drawers(
+            &self,
+            filter: &DrawerFilter,
+        ) -> Result<Vec<DrawerRecord>, StorageError> {
+            let mut results: Vec<DrawerRecord> = self
+                .drawers
+                .iter()
+                .filter(|drawer| filter_matches(drawer, filter))
+                .cloned()
+                .collect();
+            if let Some(limit) = filter.limit {
+                results.truncate(limit);
+            }
+            Ok(results)
+        }
+    }
+
+    fn filter_matches(drawer: &DrawerRecord, filter: &DrawerFilter) -> bool {
+        if filter.branch_view_only
+            && !filter.view.as_deref().is_some_and(|view| {
+                drawer.view_metadata.as_ref().and_then(|metadata| metadata.view_name.as_deref())
+                    == Some(view)
+            })
+        {
+            return false;
+        }
+        (filter.ids.is_empty() || filter.ids.iter().any(|id| id == &drawer.id))
+            && filter.wing.as_ref().is_none_or(|wing| wing == &drawer.wing)
+            && filter.room.as_ref().is_none_or(|room| room == &drawer.room)
+            && filter.hall.as_ref().is_none_or(|hall| drawer.hall.as_ref() == Some(hall))
+            && filter.source_file.as_ref().is_none_or(|source| source == &drawer.source_file)
+            && (filter.source_files.is_empty()
+                || filter.source_files.iter().any(|source| source == &drawer.source_file))
+            && if filter.include_all_views || filter.view.as_deref() == Some("full") {
+                true
+            } else {
+                match filter.view.as_deref() {
+                    None | Some("canonical") => drawer.ingest_mode != "projects-branch",
+                    Some(view) => {
+                        let selected = drawer
+                            .view_metadata
+                            .as_ref()
+                            .and_then(|metadata| metadata.view_name.as_deref())
+                            == Some(view);
+                        drawer.ingest_mode != "projects-branch" || selected
+                    }
+                }
+            }
+    }
+
+    fn sample_store() -> StubStore {
+        StubStore {
+            drawers: vec![
+                record(
+                    "wing_team/auth-migration/0001",
+                    "wing_team",
+                    "auth-migration",
+                    "fixtures/team.txt",
+                    "The team decided the auth-migration must preserve CLI and MCP parity.",
+                    Some(0.49),
+                    datetime!(2026-04-11 09:00:00 UTC),
+                ),
+                record(
+                    "wing_code/auth-migration/0001",
+                    "wing_code",
+                    "auth-migration",
+                    "fixtures/code.txt",
+                    "Code notes: auth-migration keeps search filter semantics exact while storage changes underneath.",
+                    Some(0.069),
+                    datetime!(2026-04-11 08:00:00 UTC),
+                ),
+                record(
+                    "project_alpha/backend/0001",
+                    "project_alpha",
+                    "backend",
+                    "project_alpha/backend/auth.py",
+                    "def issue_session(user_id: str) -> str:\n    \"\"\"\n    We switched from opaque session blobs to signed session tokens because the\n    old format made auth debugging painful during the Rust migration work.\n    \"\"\"\n    if not user_id:\n        raise ValueError(\"user_id is required\")\n\n    token = f\"session:{user_id}:signed\"\n    return token\n\n\ndef refresh_token(token: str) -> str:\n    \"\"\"\n    The auth migration plan keeps refresh logic local-first and deterministic.\n    We chose signed tokens over a database-backed session lookup because the\n    CLI and MCP tools need predictable offline behavior.\n    \"\"\"\n    if not token.startswith(\"session:\"):\n        raise ValueError(\"invalid token format\")\n    return token + \":refreshed\"",
+                    Some(-0.267),
+                    datetime!(2026-04-11 07:00:00 UTC),
+                ),
+                record(
+                    "wing_team/phase0-rollout/0001",
+                    "wing_team",
+                    "phase0-rollout",
+                    "fixtures/rollout.txt",
+                    "Phase 0 rollout stays on the team wing so graph traversal captures connected_via semantics.",
+                    Some(-0.848),
+                    datetime!(2026-04-10 07:00:00 UTC),
+                ),
+            ],
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct SearchSpyStore {
+        drawers: Vec<DrawerRecord>,
+        list_calls: Arc<Mutex<usize>>,
+        search_limits: Arc<Mutex<Vec<usize>>>,
+        include_cutoff_ties: Arc<Mutex<Vec<bool>>>,
+    }
+
+    #[async_trait]
+    impl DrawerStore for SearchSpyStore {
+        async fn ensure_schema(&self) -> Result<(), StorageError> {
+            Ok(())
+        }
+
+        async fn put_drawers(
+            &self,
+            _drawers: &[DrawerRecord],
+            _strategy: DuplicateStrategy,
+        ) -> Result<(), StorageError> {
+            unreachable!("not used in phase 5 tests")
+        }
+
+        async fn get_drawer(&self, _id: &DrawerId) -> Result<Option<DrawerRecord>, StorageError> {
+            unreachable!("not used in phase 5 tests")
+        }
+
+        async fn delete_drawers(&self, _ids: &[DrawerId]) -> Result<usize, StorageError> {
+            unreachable!("not used in phase 5 tests")
+        }
+
+        async fn search_drawers(
+            &self,
+            request: &SearchRequest,
+        ) -> Result<Vec<DrawerMatch>, StorageError> {
+            self.search_limits.lock().unwrap().push(request.limit);
+            self.include_cutoff_ties.lock().unwrap().push(request.include_cutoff_ties);
+
+            let mut filtered = self
+                .drawers
+                .iter()
+                .filter(|drawer| filter_matches(drawer, &request.filter))
+                .cloned()
+                .map(|drawer| DrawerMatch {
+                    distance: Some((drawer.embedding[0] - request.embedding[0]).abs()),
+                    record: drawer,
+                })
+                .collect::<Vec<_>>();
+
+            filtered.sort_by(|left, right| {
+                left.distance.partial_cmp(&right.distance).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            if request.limit == 0 {
+                filtered.clear();
+            } else if request.include_cutoff_ties && filtered.len() > request.limit {
+                let cutoff = filtered[request.limit - 1].distance;
+                let cutoff_len = filtered.partition_point(|entry| entry.distance <= cutoff);
+                filtered.truncate(cutoff_len);
+            } else {
+                filtered.truncate(request.limit);
+            }
+            Ok(filtered)
+        }
+
+        async fn list_drawers(
+            &self,
+            _filter: &DrawerFilter,
+        ) -> Result<Vec<DrawerRecord>, StorageError> {
+            *self.list_calls.lock().unwrap() += 1;
+            let mut drawers = self.drawers.clone();
+            if let Some(limit) = _filter.limit {
+                drawers.truncate(limit);
+            }
+            Ok(drawers)
+        }
+    }
+
+    fn temp_test_dir(prefix: &str) -> PathBuf {
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        std::env::temp_dir().join(format!("agentpalace-search-{prefix}-{unique}"))
+    }
+
+    #[tokio::test]
+    async fn search_applies_filters_and_normalizes_similarity() {
+        let mut runtime = SearchRuntime::new(StubProvider { response: vec![embedding(0.0)] });
+        let store = sample_store();
+
+        let query = SearchQuery {
+            text: "auth migration parity".to_owned(),
+            wing: Some(WingId::new("wing_team").unwrap()),
+            room: None,
+            limit: 5,
+            profile: EmbeddingProfile::Balanced,
+            view: None,
+        };
+
+        let results = runtime.search(&store, &query).await.unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].wing.as_str(), "wing_team");
+        assert_eq!(results[0].room.as_str(), "auth-migration");
+        assert!((results[0].score - 0.51).abs() < 1e-6);
+        assert_eq!(
+            results[0].drawer_id.as_ref().map(|value| value.as_str()),
+            Some("wing_team/auth-migration/0001")
+        );
+        assert_eq!(results[0].source_file, "team.txt");
+        assert_eq!(results[1].room.as_str(), "phase0-rollout");
+    }
+
+    #[tokio::test]
+    async fn search_rejects_blank_query() {
+        let mut runtime = SearchRuntime::new(StubProvider { response: vec![embedding(0.0)] });
+        let store = sample_store();
+
+        let err = runtime
+            .search(
+                &store,
+                &SearchQuery {
+                    text: "   \n\t ".to_owned(),
+                    wing: None,
+                    room: None,
+                    limit: 5,
+                    profile: EmbeddingProfile::Balanced,
+                    view: None,
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, SearchError::BlankQuery));
+    }
+
+    #[tokio::test]
+    async fn search_returns_empty_results_when_limit_is_zero() {
+        let mut runtime = SearchRuntime::new(StubProvider { response: vec![embedding(0.0)] });
+        let store = sample_store();
+
+        let results = runtime
+            .search(
+                &store,
+                &SearchQuery {
+                    text: "auth".to_owned(),
+                    wing: None,
+                    room: None,
+                    limit: 0,
+                    profile: EmbeddingProfile::Balanced,
+                    view: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_rejects_profile_mismatch() {
+        let mut runtime = SearchRuntime::new(StubProvider { response: vec![embedding(0.0)] });
+        let store = sample_store();
+        let err = runtime
+            .search(
+                &store,
+                &SearchQuery {
+                    text: "auth".to_owned(),
+                    wing: None,
+                    room: None,
+                    limit: 5,
+                    profile: EmbeddingProfile::LowCpu,
+                    view: None,
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, super::SearchError::ProfileMismatch { .. }));
+    }
+
+    #[tokio::test]
+    async fn search_tie_breaking_is_deterministic() {
+        let store = StubStore {
+            drawers: vec![
+                record(
+                    "wing_b/general/0001",
+                    "wing_b",
+                    "general",
+                    "zeta.txt",
+                    "B",
+                    Some(0.5),
+                    datetime!(2026-04-11 09:00:00 UTC),
+                ),
+                record(
+                    "wing_a/general/0001",
+                    "wing_a",
+                    "general",
+                    "alpha.txt",
+                    "A",
+                    Some(0.5),
+                    datetime!(2026-04-11 09:00:00 UTC),
+                ),
+            ],
+        };
+        let mut runtime = SearchRuntime::new(StubProvider { response: vec![embedding(0.0)] });
+        let query = SearchQuery {
+            text: "tie".to_owned(),
+            wing: None,
+            room: None,
+            limit: 5,
+            profile: EmbeddingProfile::Balanced,
+            view: None,
+        };
+
+        let results = runtime.search(&store, &query).await.unwrap();
+        assert_eq!(
+            results.iter().map(|entry| entry.wing.as_str()).collect::<Vec<_>>(),
+            vec!["wing_a", "wing_b"]
+        );
+    }
+
+    #[tokio::test]
+    async fn search_requests_full_cutoff_tie_group_before_truncating_top_k() {
+        let store = StubStore {
+            drawers: (0..40)
+                .rev()
+                .map(|index| {
+                    record(
+                        &format!("wing_{index:02}/general/0001"),
+                        &format!("wing_{index:02}"),
+                        "general",
+                        &format!("file-{index:02}.txt"),
+                        &format!("payload-{index:02}"),
+                        Some(0.5),
+                        datetime!(2026-04-11 09:00:00 UTC),
+                    )
+                })
+                .collect(),
+        };
+        let mut runtime = SearchRuntime::new(StubProvider { response: vec![embedding(0.0)] });
+        let query = SearchQuery {
+            text: "tie".to_owned(),
+            wing: None,
+            room: None,
+            limit: 3,
+            profile: EmbeddingProfile::Balanced,
+            view: None,
+        };
+
+        let results = runtime.search(&store, &query).await.unwrap();
+        assert_eq!(results.len(), 3);
+        assert_eq!(
+            results.iter().map(|entry| entry.wing.as_str()).collect::<Vec<_>>(),
+            vec!["wing_00", "wing_01", "wing_02"]
+        );
+    }
+
+    #[tokio::test]
+    async fn rerank_policy_requests_extra_candidates_and_prefers_lexical_overlap() {
+        let store = SearchSpyStore {
+            drawers: vec![
+                record(
+                    "project_alpha/backend/0001",
+                    "project_alpha",
+                    "backend",
+                    "backend.md",
+                    "session lease keeps auth tokens valid",
+                    Some(0.02),
+                    datetime!(2026-04-11 09:00:00 UTC),
+                ),
+                record(
+                    "project_alpha/backend/0002",
+                    "project_alpha",
+                    "backend",
+                    "backend-2.md",
+                    "session refresh rotates session refresh auth token keys",
+                    Some(0.04),
+                    datetime!(2026-04-11 08:00:00 UTC),
+                ),
+            ],
+            list_calls: Arc::new(Mutex::new(0)),
+            search_limits: Arc::new(Mutex::new(Vec::new())),
+            include_cutoff_ties: Arc::new(Mutex::new(Vec::new())),
+        };
+        let runtime = &mut SearchRuntime::with_policy(
+            StubProvider { response: vec![embedding(0.0)] },
+            SearchRuntimePolicy { rerank_enabled: true },
+        );
+
+        let results = runtime
+            .search(
+                &store,
+                &SearchQuery {
+                    text: "session refresh auth".to_owned(),
+                    wing: None,
+                    room: None,
+                    limit: 1,
+                    profile: EmbeddingProfile::Balanced,
+                    view: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(store.search_limits.lock().unwrap().as_slice(), &[2]);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].source_file, "backend-2.md");
+    }
+
+    #[tokio::test]
+    async fn search_semantic_ignores_rerank_policy_for_threshold_sensitive_callers() {
+        let store = SearchSpyStore {
+            drawers: vec![
+                record(
+                    "project_alpha/backend/0001",
+                    "project_alpha",
+                    "backend",
+                    "backend.md",
+                    "session lease keeps auth tokens valid",
+                    Some(0.02),
+                    datetime!(2026-04-11 09:00:00 UTC),
+                ),
+                record(
+                    "project_alpha/backend/0002",
+                    "project_alpha",
+                    "backend",
+                    "backend-2.md",
+                    "session refresh rotates session refresh auth token keys",
+                    Some(0.04),
+                    datetime!(2026-04-11 08:00:00 UTC),
+                ),
+            ],
+            list_calls: Arc::new(Mutex::new(0)),
+            search_limits: Arc::new(Mutex::new(Vec::new())),
+            include_cutoff_ties: Arc::new(Mutex::new(Vec::new())),
+        };
+        let runtime = &mut SearchRuntime::with_policy(
+            StubProvider { response: vec![embedding(0.0)] },
+            SearchRuntimePolicy { rerank_enabled: true },
+        );
+        let query = SearchQuery {
+            text: "session refresh auth".to_owned(),
+            wing: None,
+            room: None,
+            limit: 1,
+            profile: EmbeddingProfile::Balanced,
+            view: None,
+        };
+
+        let reranked = runtime.search(&store, &query).await.unwrap();
+        let semantic = runtime.search_semantic(&store, &query).await.unwrap();
+
+        assert_eq!(reranked[0].source_file, "backend-2.md");
+        assert_eq!(semantic[0].source_file, "backend.md");
+    }
+
+    #[tokio::test]
+    async fn search_requests_cutoff_ties_without_listing_drawers() {
+        let list_calls = Arc::new(Mutex::new(0usize));
+        let search_limits = Arc::new(Mutex::new(Vec::new()));
+        let include_cutoff_ties = Arc::new(Mutex::new(Vec::new()));
+        let store = SearchSpyStore {
+            drawers: vec![
+                record(
+                    "wing_b/general/0001",
+                    "wing_b",
+                    "general",
+                    "zeta.txt",
+                    "B",
+                    Some(0.5),
+                    datetime!(2026-04-11 09:00:00 UTC),
+                ),
+                record(
+                    "wing_a/general/0001",
+                    "wing_a",
+                    "general",
+                    "alpha.txt",
+                    "A",
+                    Some(0.5),
+                    datetime!(2026-04-11 09:00:00 UTC),
+                ),
+            ],
+            list_calls: Arc::clone(&list_calls),
+            search_limits: Arc::clone(&search_limits),
+            include_cutoff_ties: Arc::clone(&include_cutoff_ties),
+        };
+        let mut runtime = SearchRuntime::new(StubProvider { response: vec![embedding(0.0)] });
+
+        let results = runtime
+            .search(
+                &store,
+                &SearchQuery {
+                    text: "tie".to_owned(),
+                    wing: None,
+                    room: None,
+                    limit: 1,
+                    profile: EmbeddingProfile::Balanced,
+                    view: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(results[0].wing.as_str(), "wing_a");
+        assert_eq!(*list_calls.lock().unwrap(), 0);
+        assert_eq!(search_limits.lock().unwrap().as_slice(), &[1]);
+        assert_eq!(include_cutoff_ties.lock().unwrap().as_slice(), &[true]);
+    }
+
+    #[tokio::test]
+    async fn search_reports_provider_contract_when_embedding_vector_is_missing() {
+        let mut runtime = SearchRuntime::new(StubProvider { response: Vec::new() });
+        let store = sample_store();
+
+        let err = runtime
+            .search(
+                &store,
+                &SearchQuery {
+                    text: "auth".to_owned(),
+                    wing: None,
+                    room: None,
+                    limit: 5,
+                    profile: EmbeddingProfile::Balanced,
+                    view: None,
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            SearchError::Embeddings(agentpalace_embeddings::EmbeddingError::ProviderContract(
+                ref message
+            )) if message == "provider returned no vectors for a non-empty request"
+        ));
+    }
+
+    #[tokio::test]
+    async fn search_applies_combined_wing_and_room_filters() {
+        let mut runtime = SearchRuntime::new(StubProvider { response: vec![embedding(0.0)] });
+        let store = sample_store();
+
+        let results = runtime
+            .search(
+                &store,
+                &SearchQuery {
+                    text: "auth".to_owned(),
+                    wing: Some(WingId::new("wing_team").unwrap()),
+                    room: Some(RoomId::new("auth-migration").unwrap()),
+                    limit: 5,
+                    profile: EmbeddingProfile::Balanced,
+                    view: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].wing.as_str(), "wing_team");
+        assert_eq!(results[0].room.as_str(), "auth-migration");
+    }
+
+    #[tokio::test]
+    async fn search_applies_room_only_filters() {
+        let mut runtime = SearchRuntime::new(StubProvider { response: vec![embedding(0.0)] });
+        let store = sample_store();
+
+        let results = runtime
+            .search(
+                &store,
+                &SearchQuery {
+                    text: "auth".to_owned(),
+                    wing: None,
+                    room: Some(RoomId::new("auth-migration").unwrap()),
+                    limit: 5,
+                    profile: EmbeddingProfile::Balanced,
+                    view: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|result| result.room.as_str() == "auth-migration"));
+    }
+
+    #[tokio::test]
+    async fn search_filters_by_view_canonical() {
+        let mut runtime = SearchRuntime::new(StubProvider { response: vec![embedding(0.0)] });
+        let store = StubStore {
+            drawers: vec![
+                project_record(
+                    record(
+                        "wing_a/backend/0001",
+                        "wing_a",
+                        "backend",
+                        "main.rs",
+                        "Canonical backend code.",
+                        Some(0.5),
+                        datetime!(2026-04-11 09:00:00 UTC),
+                    ),
+                    None,
+                    "present",
+                ),
+                project_record(
+                    record(
+                        "wing_a/backend/0002",
+                        "wing_a",
+                        "backend",
+                        "main.rs",
+                        "Branch-specific backend code.",
+                        Some(0.5),
+                        datetime!(2026-04-11 09:00:00 UTC),
+                    ),
+                    Some("feature-x"),
+                    "present",
+                ),
+            ],
+        };
+
+        let results = runtime
+            .search(
+                &store,
+                &SearchQuery {
+                    text: "code".to_owned(),
+                    wing: None,
+                    room: None,
+                    limit: 5,
+                    profile: EmbeddingProfile::Balanced,
+                    view: Some("canonical".to_owned()),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].content, "Canonical backend code.");
+    }
+
+    #[tokio::test]
+    async fn search_filters_by_branch_view() {
+        let mut runtime = SearchRuntime::new(StubProvider { response: vec![embedding(0.0)] });
+        let store = StubStore {
+            drawers: vec![
+                project_record(
+                    record(
+                        "wing_a/backend/0001",
+                        "wing_a",
+                        "backend",
+                        "main.rs",
+                        "Canonical backend code.",
+                        Some(0.5),
+                        datetime!(2026-04-11 09:00:00 UTC),
+                    ),
+                    None,
+                    "present",
+                ),
+                project_record(
+                    record(
+                        "wing_a/backend/0002",
+                        "wing_a",
+                        "backend",
+                        "main.rs",
+                        "Branch-specific backend code.",
+                        Some(0.5),
+                        datetime!(2026-04-11 09:00:00 UTC),
+                    ),
+                    Some("feature-x"),
+                    "present",
+                ),
+            ],
+        };
+
+        let results = runtime
+            .search(
+                &store,
+                &SearchQuery {
+                    text: "code".to_owned(),
+                    wing: None,
+                    room: None,
+                    limit: 5,
+                    profile: EmbeddingProfile::Balanced,
+                    view: Some("feature-x".to_owned()),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].content, "Branch-specific backend code.");
+    }
+
+    #[tokio::test]
+    async fn branch_override_replaces_canonical_outside_search_candidates() {
+        let mut runtime = SearchRuntime::new(StubProvider { response: vec![embedding(0.0)] });
+        let store = StubStore {
+            drawers: vec![
+                project_record(
+                    record(
+                        "wing_a/backend/0001",
+                        "wing_a",
+                        "backend",
+                        "main.rs",
+                        "Canonical backend code.",
+                        Some(0.1),
+                        datetime!(2026-04-11 09:00:00 UTC),
+                    ),
+                    None,
+                    "present",
+                ),
+                project_record(
+                    record(
+                        "wing_a/backend/0002",
+                        "wing_a",
+                        "backend",
+                        "main.rs",
+                        "Unrelated branch replacement.",
+                        Some(0.9),
+                        datetime!(2026-04-11 09:00:00 UTC),
+                    ),
+                    Some("feature-x"),
+                    "present",
+                ),
+            ],
+        };
+
+        let results = runtime
+            .search(
+                &store,
+                &SearchQuery {
+                    text: "code".to_owned(),
+                    wing: None,
+                    room: None,
+                    limit: 1,
+                    profile: EmbeddingProfile::Balanced,
+                    view: Some("feature-x".to_owned()),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].content, "Unrelated branch replacement.");
+    }
+
+    #[tokio::test]
+    async fn branch_filtering_expands_past_a_full_shadowed_candidate_window() {
+        let mut runtime = SearchRuntime::new(StubProvider { response: vec![embedding(0.0)] });
+        let store = StubStore {
+            drawers: vec![
+                project_record(
+                    record(
+                        "wing_a/general/0001",
+                        "wing_a",
+                        "general",
+                        "hidden.rs",
+                        "Deleted branch path tombstone",
+                        Some(0.0),
+                        datetime!(2026-04-11 09:00:00 UTC),
+                    ),
+                    Some("feature-x"),
+                    "deleted",
+                ),
+                project_record(
+                    record(
+                        "wing_a/backend/0002",
+                        "wing_a",
+                        "backend",
+                        "hidden.rs",
+                        "Canonical hidden code.",
+                        Some(0.1),
+                        datetime!(2026-04-11 09:00:00 UTC),
+                    ),
+                    None,
+                    "present",
+                ),
+                project_record(
+                    record(
+                        "wing_a/backend/0003",
+                        "wing_a",
+                        "backend",
+                        "visible-one.rs",
+                        "First visible canonical code.",
+                        Some(0.2),
+                        datetime!(2026-04-11 09:00:00 UTC),
+                    ),
+                    None,
+                    "present",
+                ),
+                project_record(
+                    record(
+                        "wing_a/backend/0004",
+                        "wing_a",
+                        "backend",
+                        "visible-two.rs",
+                        "Second visible canonical code.",
+                        Some(0.3),
+                        datetime!(2026-04-11 09:00:00 UTC),
+                    ),
+                    None,
+                    "present",
+                ),
+            ],
+        };
+
+        let results = runtime
+            .search(
+                &store,
+                &SearchQuery {
+                    text: "code".to_owned(),
+                    wing: None,
+                    room: None,
+                    limit: 2,
+                    profile: EmbeddingProfile::Balanced,
+                    view: Some("feature-x".to_owned()),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].source_file, "visible-one.rs");
+        assert_eq!(results[1].source_file, "visible-two.rs");
+    }
+
+    #[tokio::test]
+    async fn branch_tombstone_shadows_canonical_content() {
+        let mut runtime = SearchRuntime::new(StubProvider { response: vec![embedding(0.0)] });
+        let store = StubStore {
+            drawers: vec![
+                project_record(
+                    record(
+                        "wing_a/backend/0001",
+                        "wing_a",
+                        "backend",
+                        "deleted.rs",
+                        "Canonical deleted file.",
+                        Some(0.1),
+                        datetime!(2026-04-11 09:00:00 UTC),
+                    ),
+                    None,
+                    "present",
+                ),
+                project_record(
+                    record(
+                        "wing_a/general/0002",
+                        "wing_a",
+                        "general",
+                        "deleted.rs",
+                        "Deleted branch path tombstone",
+                        Some(0.9),
+                        datetime!(2026-04-11 09:00:00 UTC),
+                    ),
+                    Some("feature-x"),
+                    "deleted",
+                ),
+            ],
+        };
+
+        let results = runtime
+            .search(
+                &store,
+                &SearchQuery {
+                    text: "deleted".to_owned(),
+                    wing: None,
+                    room: Some(RoomId::new("backend").unwrap()),
+                    limit: 1,
+                    profile: EmbeddingProfile::Balanced,
+                    view: Some("feature-x".to_owned()),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn render_search_results_matches_python_shape() {
+        let rendered = render_search_results(
+            "auth migration parity",
+            &[
+                agentpalace_core::SearchResult {
+                    drawer_id: None,
+                    wing: WingId::new("wing_team").unwrap(),
+                    room: RoomId::new("auth-migration").unwrap(),
+                    score: 0.49,
+                    content: "The team decided the auth-migration must preserve CLI and MCP parity."
+                        .to_owned(),
+                    source_file: "team.txt".to_owned(),
+                    stale: false,
+                    content_hash: None,
+                    view: None,
+                },
+                agentpalace_core::SearchResult {
+                    drawer_id: None,
+                    wing: WingId::new("wing_code").unwrap(),
+                    room: RoomId::new("auth-migration").unwrap(),
+                    score: 0.069,
+                    content: "Code notes: auth-migration keeps search filter semantics exact while storage changes underneath."
+                        .to_owned(),
+                    source_file: "code.txt".to_owned(),
+                    stale: false,
+                    content_hash: None,
+                    view: None,
+                },
+            ],
+            None,
+            None,
+        );
+
+        assert!(rendered.contains("Results for: \"auth migration parity\""));
+        assert!(rendered.contains("[1] wing_team / auth-migration"));
+        assert!(rendered.contains("Match:  0.49"));
+        assert!(rendered.contains("Match:  0.069"));
+    }
+
+    #[test]
+    fn trim_similarity_trims_trailing_zeroes_exactly() {
+        assert_eq!(trim_similarity(1.0), "1");
+        assert_eq!(trim_similarity(0.5), "0.5");
+        assert_eq!(trim_similarity(0.49), "0.49");
+        assert_eq!(trim_similarity(0.069), "0.069");
+    }
+
+    #[tokio::test]
+    async fn recall_returns_stable_filtered_layer_output() {
+        let runtime = SearchRuntime::new(StubProvider { response: vec![embedding(0.0)] });
+        let store = sample_store();
+        let rendered = runtime
+            .recall(
+                &store,
+                &LayerRetrieveRequest {
+                    wing: Some(WingId::new("wing_team").unwrap()),
+                    room: None,
+                    limit: 10,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(rendered.starts_with("## L2 — ON-DEMAND (2) drawers"));
+        assert!(rendered.contains("[auth-migration] The team decided"));
+        assert!(rendered.contains("[phase0-rollout] Phase 0 rollout"));
+    }
+
+    #[tokio::test]
+    async fn recall_reports_empty_store() {
+        let runtime = SearchRuntime::new(StubProvider { response: vec![embedding(0.0)] });
+        let store = StubStore { drawers: Vec::new() };
+
+        let rendered = runtime
+            .recall(
+                &store,
+                &LayerRetrieveRequest {
+                    wing: Some(WingId::new("wing_team").unwrap()),
+                    room: Some(RoomId::new("auth-migration").unwrap()),
+                    limit: 10,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(rendered, "No drawers found for wing=wing_team room=auth-migration.");
+    }
+
+    #[tokio::test]
+    async fn recall_limit_zero_returns_zero_drawers() {
+        let runtime = SearchRuntime::new(StubProvider { response: vec![embedding(0.0)] });
+        let store = StubStore {
+            drawers: (0..12)
+                .map(|index| {
+                    record(
+                        &format!("wing_team/general/{index:04}"),
+                        "wing_team",
+                        "general",
+                        &format!("fixtures/{index:04}.txt"),
+                        &format!("entry {index:04}"),
+                        Some(10.0 - index as f32),
+                        datetime!(2026-04-11 09:00:00 UTC),
+                    )
+                })
+                .collect(),
+        };
+
+        let rendered = runtime
+            .recall(
+                &store,
+                &LayerRetrieveRequest {
+                    wing: Some(WingId::new("wing_team").unwrap()),
+                    room: None,
+                    limit: 0,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(rendered, "## L2 — ON-DEMAND (0) drawers");
+    }
+
+    #[tokio::test]
+    async fn wake_up_uses_identity_and_groups_rooms_in_stable_order() {
+        let runtime = SearchRuntime::new(StubProvider { response: vec![embedding(0.0)] });
+        let store = sample_store();
+        let rendered = runtime
+            .wake_up(
+                &store,
+                &WakeUpRequest {
+                    wing: None,
+                    identity: IdentitySource::Inline(
+                        "## L0 — IDENTITY\nI am the AgentPalace phase 0 reference capture."
+                            .to_owned(),
+                    ),
+                    layer1: Layer1Config { max_drawers: 4, max_chars: 3_200 },
+                    format: WakeUpFormat::PlainText,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(rendered.starts_with("## L0 — IDENTITY"));
+        assert!(rendered.contains("## L1 — ESSENTIAL STORY"));
+        let auth_index = rendered.find("[auth-migration]").unwrap();
+        let backend_index = rendered.find("[backend]").unwrap();
+        let rollout_index = rendered.find("[phase0-rollout]").unwrap();
+        assert!(auth_index < backend_index);
+        assert!(backend_index < rollout_index);
+        assert!(rendered.contains("(team.txt)"));
+        assert!(rendered.contains("(auth.py)"));
+    }
+
+    #[tokio::test]
+    async fn wake_up_defaults_to_plain_text_format() {
+        let runtime = SearchRuntime::new(StubProvider { response: vec![embedding(0.0)] });
+        let store = sample_store();
+        let identity = IdentitySource::Inline("## L0 — IDENTITY\nReady.".to_owned());
+
+        let default_rendered = runtime
+            .wake_up(
+                &store,
+                &WakeUpRequest { identity: identity.clone(), ..WakeUpRequest::default() },
+            )
+            .await
+            .unwrap();
+        let explicit_rendered = runtime
+            .wake_up(
+                &store,
+                &WakeUpRequest {
+                    wing: None,
+                    identity,
+                    layer1: Layer1Config::default(),
+                    format: WakeUpFormat::PlainText,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(default_rendered, explicit_rendered);
+        assert!(default_rendered.contains("## L1 — ESSENTIAL STORY"));
+    }
+
+    #[tokio::test]
+    async fn wake_up_applies_wing_filter_end_to_end() {
+        let runtime = SearchRuntime::new(StubProvider { response: vec![embedding(0.0)] });
+        let store = sample_store();
+
+        let rendered = runtime
+            .wake_up(
+                &store,
+                &WakeUpRequest {
+                    wing: Some(WingId::new("wing_code").unwrap()),
+                    identity: IdentitySource::Inline("## L0 — IDENTITY\nReady.".to_owned()),
+                    layer1: Layer1Config::default(),
+                    format: WakeUpFormat::PlainText,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(rendered.contains("## L0 — IDENTITY\nReady."));
+        assert!(rendered.contains("## L1 — ESSENTIAL STORY"));
+        assert!(rendered.contains("[auth-migration]"));
+        assert!(rendered.contains("code.txt"));
+        assert!(!rendered.contains("team.txt"));
+        assert!(!rendered.contains("auth.py"));
+    }
+
+    #[tokio::test]
+    async fn wake_up_supports_aaak_format() {
+        let runtime = SearchRuntime::new(StubProvider { response: vec![embedding(0.0)] });
+        let store = sample_store();
+
+        let rendered = runtime
+            .wake_up(
+                &store,
+                &WakeUpRequest {
+                    wing: Some(WingId::new("wing_code").unwrap()),
+                    identity: IdentitySource::Inline("## L0 — IDENTITY\nReady.".to_owned()),
+                    layer1: Layer1Config::default(),
+                    format: WakeUpFormat::AaaK,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(rendered.contains("## L1 — AAAK STORY"));
+        assert!(rendered.contains("wing_code|auth-migration|2026-04-11|code"));
+        assert!(rendered.contains(":: 0:???|"));
+        assert!(!rendered.contains("wing_team|"));
+    }
+
+    #[tokio::test]
+    async fn wake_up_aaak_uses_configured_runtime_dialect() {
+        let runtime = SearchRuntime::with_dialect(
+            StubProvider { response: vec![embedding(0.0)] },
+            Dialect::with_entities([("alice", "ALC")]),
+        );
+        let store = StubStore {
+            drawers: vec![record(
+                "wing_code/notes/0001",
+                "wing_code",
+                "notes",
+                "fixtures/alice.txt",
+                "alice documented the migration contract.",
+                Some(10.0),
+                datetime!(2026-04-11 09:45:00 UTC),
+            )],
+        };
+
+        let rendered = runtime
+            .wake_up(
+                &store,
+                &WakeUpRequest {
+                    wing: Some(WingId::new("wing_code").unwrap()),
+                    identity: IdentitySource::Inline("## L0 — IDENTITY\nReady.".to_owned()),
+                    layer1: Layer1Config::default(),
+                    format: WakeUpFormat::AaaK,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(rendered.contains(":: 0:ALC|"));
+    }
+
+    #[tokio::test]
+    async fn wake_up_supports_aaak_truncation_without_orphan_room_headers() {
+        let runtime = SearchRuntime::new(StubProvider { response: vec![embedding(0.0)] });
+        let store = StubStore {
+            drawers: vec![
+                record(
+                    "wing_code/alpha/0001",
+                    "wing_code",
+                    "alpha",
+                    "fixtures/alpha.txt",
+                    "Tiny note.",
+                    Some(10.0),
+                    datetime!(2026-04-11 09:45:00 UTC),
+                ),
+                record(
+                    "wing_code/beta/0002",
+                    "wing_code",
+                    "beta",
+                    "fixtures/beta.txt",
+                    "Second room should truncate before its first entry lands in the wake-up output.",
+                    Some(9.0),
+                    datetime!(2026-04-11 09:30:00 UTC),
+                ),
+            ],
+        };
+
+        let expected =
+            "## L0 — IDENTITY\nReady.\n\n## L1 — AAAK STORY\n\n[alpha]\n  ... (more in L3 search)";
+        let rendered = runtime
+            .wake_up(
+                &store,
+                &WakeUpRequest {
+                    wing: Some(WingId::new("wing_code").unwrap()),
+                    identity: IdentitySource::Inline("## L0 — IDENTITY\nReady.".to_owned()),
+                    layer1: Layer1Config { max_drawers: 2, max_chars: super::char_count(expected) },
+                    format: WakeUpFormat::AaaK,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(rendered.contains("[alpha]"));
+        assert!(rendered.contains("... (more in L3 search)"));
+        assert!(!rendered.contains("[beta]"));
+    }
+
+    #[tokio::test]
+    async fn wake_up_aaak_honors_full_output_budget_end_to_end() {
+        let runtime = SearchRuntime::new(StubProvider { response: vec![embedding(0.0)] });
+        let store = sample_store();
+        let expected = "## L0 — IDENTITY\nReady.\n\n## L1 — AAAK STORY\n\n[auth-migration]\n  ... (more in L3 search)";
+
+        let rendered = runtime
+            .wake_up(
+                &store,
+                &WakeUpRequest {
+                    wing: Some(WingId::new("wing_code").unwrap()),
+                    identity: IdentitySource::Inline("## L0 — IDENTITY\nReady.".to_owned()),
+                    layer1: Layer1Config { max_drawers: 3, max_chars: super::char_count(expected) },
+                    format: WakeUpFormat::AaaK,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(super::char_count(&rendered), super::char_count(expected));
+        assert_eq!(rendered, expected);
+    }
+
+    #[tokio::test]
+    async fn wake_up_aaak_is_deterministic_across_repeated_runs() {
+        let runtime = SearchRuntime::new(StubProvider { response: vec![embedding(0.0)] });
+        let store = sample_store();
+        let request = WakeUpRequest {
+            wing: Some(WingId::new("wing_code").unwrap()),
+            identity: IdentitySource::Inline("## L0 — IDENTITY\nReady.".to_owned()),
+            layer1: Layer1Config::default(),
+            format: WakeUpFormat::AaaK,
+        };
+
+        let first = runtime.wake_up(&store, &request).await.unwrap();
+        let second = runtime.wake_up(&store, &request).await.unwrap();
+        let third = runtime.wake_up(&store, &request).await.unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(second, third);
+    }
+
+    #[tokio::test]
+    async fn generate_layer1_honors_wing_filter() {
+        let store = sample_store();
+        let layer1 = generate_layer1(
+            &store,
+            Some(WingId::new("wing_code").unwrap()),
+            Layer1Config::default(),
+        )
+        .await
+        .unwrap();
+
+        assert!(layer1.contains("[auth-migration]"));
+        assert!(layer1.contains("code.txt"));
+        assert!(!layer1.contains("team.txt"));
+    }
+
+    #[tokio::test]
+    async fn generate_layer1_truncates_when_max_chars_is_exceeded() {
+        let store = sample_store();
+        let rendered =
+            generate_layer1(&store, None, Layer1Config { max_drawers: 4, max_chars: 120 })
+                .await
+                .unwrap();
+
+        assert!(rendered.contains("## L1 — ESSENTIAL STORY"));
+        assert!(rendered.contains("... (more in L3 search)"));
+    }
+
+    #[tokio::test]
+    async fn search_text_reports_empty_results() {
+        let mut runtime = SearchRuntime::new(StubProvider { response: vec![embedding(100.0)] });
+        let store = StubStore { drawers: Vec::new() };
+        let rendered = runtime
+            .search_text(
+                &store,
+                &SearchQuery {
+                    text: "missing".to_owned(),
+                    wing: None,
+                    room: None,
+                    limit: 5,
+                    profile: EmbeddingProfile::Balanced,
+                    view: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(rendered, "\n  No results found for: \"missing\"");
+    }
+
+    #[tokio::test]
+    async fn search_text_renders_non_empty_results() {
+        let mut runtime = SearchRuntime::new(StubProvider { response: vec![embedding(0.0)] });
+        let store = sample_store();
+        let rendered = runtime
+            .search_text(
+                &store,
+                &SearchQuery {
+                    text: "auth".to_owned(),
+                    wing: Some(WingId::new("wing_team").unwrap()),
+                    room: None,
+                    limit: 2,
+                    profile: EmbeddingProfile::Balanced,
+                    view: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(rendered.contains("Results for: \"auth\""));
+        assert!(rendered.contains("Wing: wing_team"));
+        assert!(rendered.contains("Source: team.txt"));
+    }
+
+    #[test]
+    fn identity_source_can_load_inline_path_and_missing_default() {
+        assert_eq!(IdentitySource::Inline(" hello \n".to_owned()).render().unwrap(), "hello");
+        let dir = temp_test_dir("identity-inline");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("identity.txt");
+        fs::write(&path, " from file \n").unwrap();
+        assert_eq!(IdentitySource::Path(path.clone()).render().unwrap(), "from file");
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(
+            IdentitySource::MissingDefault.render().unwrap().contains("No identity configured")
+        );
+    }
+
+    #[test]
+    fn identity_source_path_reports_read_errors() {
+        let err = IdentitySource::Path(PathBuf::from("/definitely/missing/identity.txt"))
+            .render()
+            .unwrap_err();
+
+        assert!(matches!(err, SearchError::IdentityRead { .. }));
+    }
+
+    #[test]
+    fn default_identity_path_joins_home_directory() {
+        let dir = temp_test_dir("default-identity");
+        let identity_dir = dir.join(".agentpalace");
+        fs::create_dir_all(&identity_dir).unwrap();
+        assert_eq!(
+            default_identity_path_from_home(Some(dir.clone())),
+            Some(identity_dir.join("identity.txt"))
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn wake_up_request_default_path_reads_identity_file() {
+        let dir = temp_test_dir("default-identity-render");
+        let identity_dir = dir.join(".agentpalace");
+        let identity_path = identity_dir.join("identity.txt");
+        fs::create_dir_all(&identity_dir).unwrap();
+        fs::write(&identity_path, "## L0 — IDENTITY\nConfigured by home directory.\n").unwrap();
+
+        let rendered = IdentitySource::DefaultPath(identity_path).render().unwrap();
+
+        assert_eq!(rendered, "## L0 — IDENTITY\nConfigured by home directory.");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn wake_up_request_default_path_falls_back_when_home_identity_is_missing() {
+        let dir = temp_test_dir("default-missing");
+        let identity_path = dir.join(".agentpalace").join("identity.txt");
+        fs::create_dir_all(&dir).unwrap();
+
+        let rendered = IdentitySource::DefaultPath(identity_path).render().unwrap();
+
+        assert_eq!(
+            rendered,
+            "## L0 — IDENTITY\nNo identity configured. Create ~/.agentpalace/identity.txt"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn default_identity_path_returns_none_without_home() {
+        assert_eq!(default_identity_path_from_home(None), None);
+        assert!(matches!(
+            WakeUpRequest::default().identity,
+            IdentitySource::DefaultPath(_) | IdentitySource::MissingDefault
+        ));
+    }
+
+    #[test]
+    fn wake_up_request_missing_default_uses_literal_tilde_path_when_home_is_unset() {
+        assert_eq!(
+            default_identity_path(),
+            default_identity_path_from_home(std::env::var_os("HOME").map(PathBuf::from))
+        );
+        assert_eq!(
+            IdentitySource::MissingDefault.render().unwrap(),
+            "## L0 — IDENTITY\nNo identity configured. Create ~/.agentpalace/identity.txt"
+        );
+    }
+
+    #[tokio::test]
+    async fn generate_layer1_reports_empty_store_directly() {
+        let store = StubStore { drawers: Vec::new() };
+        let rendered = generate_layer1(&store, None, Layer1Config::default()).await.unwrap();
+
+        assert_eq!(rendered, "## L1 — No memories yet.");
+    }
+
+    #[tokio::test]
+    async fn bounded_wakeup_preserves_locator_output_for_both_formats() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = agentpalace_storage::LanceDrawerStore::new(
+            temp.path().join("lance"),
+            EmbeddingProfile::Balanced,
+        );
+        store.ensure_schema().await.unwrap();
+        let mut drawers = sample_store().drawers;
+        for (index, drawer) in drawers.iter_mut().enumerate() {
+            let text = format!("resolved source {index}");
+            drawer.source_file = format!("source-{index}.txt");
+            std::fs::write(temp.path().join(&drawer.source_file), &text).unwrap();
+            drawer.locator = Some(agentpalace_core::SourceLocator {
+                byte_start: 0,
+                byte_end: text.len() as u64,
+                line_start: 1,
+                line_end: 1,
+                file_hash: if index % 2 == 0 {
+                    agentpalace_core::hash_bytes(text.as_bytes())
+                } else {
+                    "old-hash".to_owned()
+                },
+                resolve_root: temp.path().to_string_lossy().into_owned(),
+                commit_hash: None,
+            });
+        }
+        store.put_drawers(&drawers, DuplicateStrategy::Error).await.unwrap();
+        // Reference behavior resolved every source before selecting the story.
+        agentpalace_core::resolve_records(&mut drawers);
+        let reference = StubStore { drawers };
+        let runtime = SearchRuntime::new(StubProvider { response: vec![embedding(0.0)] });
+        for format in [WakeUpFormat::PlainText, WakeUpFormat::AaaK] {
+            for max_drawers in [0, 1, 3, 15] {
+                let request = WakeUpRequest {
+                    wing: None,
+                    identity: IdentitySource::Inline("Identity".to_owned()),
+                    layer1: Layer1Config { max_drawers, max_chars: 3200 },
+                    format,
+                };
+                assert_eq!(
+                    runtime.wake_up(&store, &request).await.unwrap(),
+                    runtime.wake_up(&reference, &request).await.unwrap()
+                );
+            }
+        }
+        assert_eq!(
+            generate_layer1(&store, None, Layer1Config { max_drawers: 0, max_chars: 3200 })
+                .await
+                .unwrap(),
+            "## L1 — ESSENTIAL STORY"
+        );
+    }
+
+    /// Manual acceptance probe for #136; fixture creation is outside the timing.
+    #[tokio::test]
+    #[ignore = "creates a 150k-drawer palace and 10k source files"]
+    async fn large_palace_wakeup_metadata_benchmark() {
+        let temp = tempfile::tempdir().unwrap();
+        let engine =
+            agentpalace_storage::StorageEngine::open(temp.path(), EmbeddingProfile::Balanced)
+                .await
+                .unwrap();
+        let store = engine.drawer_store();
+        let text = "source content ".repeat(80);
+        let hash = agentpalace_core::hash_bytes(text.as_bytes());
+        for index in 0..10_000 {
+            std::fs::write(temp.path().join(format!("source-{index}.txt")), &text).unwrap();
+        }
+        let template = sample_store().drawers.remove(0);
+        let drawers = (0..150_000)
+            .map(|index| {
+                let mut drawer = template.clone();
+                drawer.id = DrawerId::new(format!("drawer-{index:06}")).unwrap();
+                drawer.source_file = format!("source-{}.txt", index % 10_000);
+                drawer.importance = Some((index % 5) as f32);
+                drawer.content = "locator-backed".to_owned();
+                drawer.locator = Some(agentpalace_core::SourceLocator {
+                    byte_start: 0,
+                    byte_end: text.len() as u64,
+                    line_start: 1,
+                    line_end: 1,
+                    file_hash: hash.clone(),
+                    resolve_root: temp.path().to_string_lossy().into_owned(),
+                    commit_hash: None,
+                });
+                drawer
+            })
+            .collect::<Vec<_>>();
+        // Keep fixture ingestion's duplicate-ID predicates reasonably sized.
+        for (index, batch) in drawers.chunks(1000).enumerate() {
+            store.put_drawers(batch, DuplicateStrategy::Error).await.unwrap();
+            if (index + 1) % 25 == 0 {
+                eprintln!("fixture: {} drawers", (index + 1) * 1000);
+            }
+        }
+        drop(drawers);
+        let maintenance = engine
+            .run_maintenance(&agentpalace_storage::MaintenanceSettings {
+                idle_secs: 0,
+                tail_threshold_rows: u64::MAX,
+                small_fragment_threshold: 0,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(maintenance.tier_results.iter().any(|tier| tier.tier
+            == agentpalace_storage::MaintenanceTier::FragmentCompaction
+            && matches!(tier.outcome, agentpalace_storage::MaintenanceOutcome::Completed { .. })));
+        eprintln!("fixture compacted");
+        for run in 1..=2 {
+            let started = std::time::Instant::now();
+            let rendered = generate_layer1(store, None, Layer1Config::default()).await.unwrap();
+            eprintln!("150k drawers / 10k files: L1 run {run}: {:?}", started.elapsed());
+            assert!(rendered.contains("source content"));
+            let started = std::time::Instant::now();
+            let counts = store.count_by_wing_room(&DrawerFilter::default(), false).await.unwrap();
+            eprintln!("150k drawers: counts run {run}: {:?}", started.elapsed());
+            assert_eq!(counts.values().flat_map(|rooms| rooms.values()).sum::<usize>(), 150_000);
+        }
+    }
+
+    #[tokio::test]
+    async fn wake_up_reports_empty_store_story() {
+        let runtime = SearchRuntime::new(StubProvider { response: vec![embedding(0.0)] });
+        let store = StubStore { drawers: Vec::new() };
+        let rendered = runtime
+            .wake_up(
+                &store,
+                &WakeUpRequest {
+                    wing: None,
+                    identity: IdentitySource::Inline("## L0 — IDENTITY\nReady.".to_owned()),
+                    layer1: Layer1Config::default(),
+                    format: WakeUpFormat::PlainText,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(rendered.contains("## L0 — IDENTITY\nReady."));
+        assert!(rendered.contains("## L1 — No memories yet."));
+    }
+
+    #[tokio::test]
+    async fn generate_layer1_counts_unicode_chars_in_budget() {
+        let store = StubStore {
+            drawers: vec![record(
+                "wing_team/cafe/0001",
+                "wing_team",
+                "cafe",
+                "fixtures/cafe.txt",
+                "éééééééééééééééééééé",
+                Some(0.9),
+                datetime!(2026-04-11 09:00:00 UTC),
+            )],
+        };
+        let entry = "  - éééééééééééééééééééé  (cafe.txt)";
+        let max_chars = super::char_count("\n[cafe]") + super::char_count(entry);
+
+        let rendered = generate_layer1(&store, None, Layer1Config { max_drawers: 1, max_chars })
+            .await
+            .unwrap();
+
+        assert!(rendered.contains(entry));
+        assert!(!rendered.contains("... (more in L3 search)"));
+    }
+
+    #[tokio::test]
+    async fn generate_layer1_does_not_count_header_against_budget() {
+        let store = StubStore {
+            drawers: vec![record(
+                "wing_team/cafe/0001",
+                "wing_team",
+                "cafe",
+                "fixtures/cafe.txt",
+                "header budget parity",
+                Some(0.9),
+                datetime!(2026-04-11 09:00:00 UTC),
+            )],
+        };
+        let entry = "  - header budget parity  (cafe.txt)";
+        let max_chars = super::char_count("\n[cafe]") + super::char_count(entry);
+
+        let rendered = generate_layer1(&store, None, Layer1Config { max_drawers: 1, max_chars })
+            .await
+            .unwrap();
+
+        assert!(rendered.contains("## L1 — ESSENTIAL STORY"));
+        assert!(rendered.contains(entry));
+        assert!(!rendered.contains("... (more in L3 search)"));
+    }
+
+    #[tokio::test]
+    async fn generate_layer1_matches_python_reference_for_header_budget_case() {
+        let store = StubStore {
+            drawers: vec![record(
+                "wing_team/cafe/0001",
+                "wing_team",
+                "cafe",
+                "fixtures/cafe.txt",
+                "header budget parity",
+                Some(0.9),
+                datetime!(2026-04-11 09:00:00 UTC),
+            )],
+        };
+        let expected = "## L1 — ESSENTIAL STORY\n\n[cafe]\n  - header budget parity  (cafe.txt)";
+        let max_chars =
+            "\n[cafe]".chars().count() + "  - header budget parity  (cafe.txt)".chars().count();
+
+        let rendered = generate_layer1(&store, None, Layer1Config { max_drawers: 1, max_chars })
+            .await
+            .unwrap();
+
+        assert_eq!(rendered, expected);
+    }
+
+    #[tokio::test]
+    async fn generate_layer1_does_not_emit_orphan_room_headers_on_truncation() {
+        let store = StubStore {
+            drawers: vec![
+                record(
+                    "wing_team/alpha/0001",
+                    "wing_team",
+                    "alpha",
+                    "fixtures/alpha.txt",
+                    "alpha entry",
+                    Some(0.9),
+                    datetime!(2026-04-11 09:00:00 UTC),
+                ),
+                record(
+                    "wing_team/beta/0001",
+                    "wing_team",
+                    "beta",
+                    "fixtures/beta.txt",
+                    "beta entry that should be truncated",
+                    Some(0.8),
+                    datetime!(2026-04-11 08:00:00 UTC),
+                ),
+            ],
+        };
+        let max_chars = super::char_count("\n[alpha]\n  - alpha entry  (alpha.txt)");
+
+        let rendered = generate_layer1(&store, None, Layer1Config { max_drawers: 2, max_chars })
+            .await
+            .unwrap();
+
+        assert!(rendered.contains("[alpha]"));
+        assert!(!rendered.contains("[beta]"));
+        assert!(rendered.contains("... (more in L3 search)"));
+    }
+
+    #[tokio::test]
+    async fn generate_layer1_keeps_buffered_room_entries_when_truncating_mid_room() {
+        let store = StubStore {
+            drawers: vec![
+                record(
+                    "wing_team/alpha/0001",
+                    "wing_team",
+                    "alpha",
+                    "fixtures/alpha-1.txt",
+                    "first alpha entry",
+                    Some(0.9),
+                    datetime!(2026-04-11 09:00:00 UTC),
+                ),
+                record(
+                    "wing_team/alpha/0002",
+                    "wing_team",
+                    "alpha",
+                    "fixtures/alpha-2.txt",
+                    "second alpha entry that should overflow the layer one budget",
+                    Some(0.8),
+                    datetime!(2026-04-11 08:00:00 UTC),
+                ),
+            ],
+        };
+        let max_chars = super::char_count("\n[alpha]")
+            + super::char_count("  - first alpha entry  (alpha-1.txt)");
+
+        let rendered = generate_layer1(&store, None, Layer1Config { max_drawers: 2, max_chars })
+            .await
+            .unwrap();
+
+        assert!(rendered.contains("[alpha]"));
+        assert!(rendered.contains("first alpha entry  (alpha-1.txt)"));
+        assert!(!rendered.contains("second alpha entry"));
+        assert!(rendered.contains("... (more in L3 search)"));
+    }
+
+    #[test]
+    fn normalized_terms_preserve_unicode_words() {
+        assert_eq!(
+            normalized_terms("CAFÉ 日本語 Привет -- auth"),
+            vec!["café", "日本語", "привет", "auth"]
+        );
+        assert!(
+            (lexical_overlap_score(&normalized_terms("日本語 café"), "日本語 café notes") - 1.0)
+                .abs()
+                < 1e-6
+        );
+    }
+
+    // ─── Locator-backed stale resolution tests ────────────────────────────────
+
+    use agentpalace_core::locator::SourceLocator;
+    use serde_json::json as sjson;
+
+    fn make_locator_record(
+        id: &str,
+        wing: &str,
+        room: &str,
+        source_file: &str,
+        resolve_root: &str,
+        file_hash: &str,
+        byte_start: u64,
+        byte_end: u64,
+        score: Option<f32>,
+    ) -> DrawerRecord {
+        DrawerRecord {
+            id: DrawerId::new(id).unwrap(),
+            wing: WingId::new(wing).unwrap(),
+            room: RoomId::new(room).unwrap(),
+            hall: None,
+            date: None,
+            source_file: source_file.to_owned(),
+            chunk_index: 0,
+            ingest_mode: "projects".to_owned(),
+            extract_mode: None,
+            added_by: "tester".to_owned(),
+            filed_at: datetime!(2026-01-01 00:00:00 UTC),
+            importance: score,
+            emotional_weight: None,
+            weight: None,
+            content: String::new(), // locator rows start with empty content
+            content_hash: "hash".to_owned(),
+            embedding: embedding(score.unwrap_or(0.0)),
+            locator: Some(SourceLocator {
+                byte_start,
+                byte_end,
+                line_start: 1,
+                line_end: 1,
+                file_hash: file_hash.to_owned(),
+                resolve_root: resolve_root.to_owned(),
+                commit_hash: None,
+            }),
+            view_metadata: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn search_resolves_locator_backed_records_non_stale() {
+        use std::io::Write as _;
+        use tempfile::NamedTempFile;
+
+        // Write a real file on disk.
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(b"hello world locator text").unwrap();
+        let path = file.path();
+        let root = path.parent().unwrap().to_str().unwrap().to_owned();
+        let filename = path.file_name().unwrap().to_str().unwrap().to_owned();
+        let file_hash = agentpalace_core::hash_bytes(b"hello world locator text");
+
+        // Locator-backed record + authored record.
+        let locator_record = make_locator_record(
+            "wing_test/code/0001",
+            "wing_test",
+            "code",
+            &filename,
+            &root,
+            &file_hash,
+            0,
+            5, // "hello"
+            Some(0.0),
+        );
+        let authored_record = record(
+            "wing_test/notes/0001",
+            "wing_test",
+            "notes",
+            "notes.txt",
+            "authored note content",
+            Some(0.01),
+            datetime!(2026-04-11 09:00:00 UTC),
+        );
+
+        let store = StubStore { drawers: vec![locator_record, authored_record] };
+        let mut runtime = SearchRuntime::new(StubProvider { response: vec![embedding(0.0)] });
+        let query = SearchQuery {
+            text: "hello".to_owned(),
+            wing: None,
+            room: None,
+            limit: 5,
+            profile: EmbeddingProfile::Balanced,
+            view: None,
+        };
+
+        let results = runtime.search(&store, &query).await.unwrap();
+
+        // Locator-backed result must have resolved text.
+        let locator_result = results.iter().find(|r| r.room.as_str() == "code").unwrap();
+        assert_eq!(locator_result.content, "hello", "locator resolved text should be 'hello'");
+        assert!(!locator_result.stale, "fresh locator row must not be stale");
+
+        // Authored result unchanged.
+        let authored_result = results.iter().find(|r| r.room.as_str() == "notes").unwrap();
+        assert_eq!(authored_result.content, "authored note content");
+        assert!(!authored_result.stale);
+
+        // Stale must be absent from JSON for non-stale result.
+        let authored_json = serde_json::to_value(authored_result).unwrap();
+        assert!(
+            authored_json.as_object().unwrap().get("stale").is_none(),
+            "stale must be absent when false"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_marks_stale_when_source_file_modified() {
+        use std::io::Write as _;
+        use tempfile::NamedTempFile;
+
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(b"original content").unwrap();
+        let path = file.path();
+        let root = path.parent().unwrap().to_str().unwrap().to_owned();
+        let filename = path.file_name().unwrap().to_str().unwrap().to_owned();
+        // Use wrong hash to simulate modified file.
+        let stale_record = make_locator_record(
+            "wing_test/code/0001",
+            "wing_test",
+            "code",
+            &filename,
+            &root,
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+            0,
+            8, // "original"
+            Some(0.0),
+        );
+
+        let store = StubStore { drawers: vec![stale_record] };
+        let mut runtime = SearchRuntime::new(StubProvider { response: vec![embedding(0.0)] });
+        let query = SearchQuery {
+            text: "original".to_owned(),
+            wing: None,
+            room: None,
+            limit: 5,
+            profile: EmbeddingProfile::Balanced,
+            view: None,
+        };
+
+        let results = runtime.search(&store, &query).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].stale, "stale flag must be set when file hash mismatches");
+        // Serialized JSON must contain the stale key.
+        let json = serde_json::to_value(&results[0]).unwrap();
+        assert_eq!(json.as_object().unwrap().get("stale"), Some(&sjson!(true)));
+    }
+
+    #[tokio::test]
+    async fn recall_resolves_locator_backed_records() {
+        use std::io::Write as _;
+        use tempfile::NamedTempFile;
+
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(b"recall file content here").unwrap();
+        let path = file.path();
+        let root = path.parent().unwrap().to_str().unwrap().to_owned();
+        let filename = path.file_name().unwrap().to_str().unwrap().to_owned();
+        let file_hash = agentpalace_core::hash_bytes(b"recall file content here");
+
+        let locator_record = make_locator_record(
+            "wing_test/notes/0001",
+            "wing_test",
+            "notes",
+            &filename,
+            &root,
+            &file_hash,
+            0,
+            6, // "recall"
+            Some(0.9),
+        );
+
+        let store = StubStore { drawers: vec![locator_record] };
+        let runtime = SearchRuntime::new(StubProvider { response: vec![embedding(0.0)] });
+        let rendered = runtime
+            .recall(
+                &store,
+                &LayerRetrieveRequest {
+                    wing: Some(WingId::new("wing_test").unwrap()),
+                    room: None,
+                    limit: 10,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Should show resolved text, not empty string.
+        assert!(
+            rendered.contains("recall"),
+            "recall output must contain resolved text; got: {rendered}"
+        );
+    }
+}

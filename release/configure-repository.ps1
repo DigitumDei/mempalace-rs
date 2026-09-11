@@ -21,7 +21,7 @@ if (-not (Test-Path -LiteralPath $PrivateKeyPath -PathType Leaf)) {
 }
 
 $trustedPublicKey = Join-Path $PSScriptRoot 'public-key.pem'
-$temporaryDirectory = Join-Path ([IO.Path]::GetTempPath()) ("mempalace-release-config-" + [IO.Path]::GetRandomFileName())
+$temporaryDirectory = Join-Path ([IO.Path]::GetTempPath()) ("agentpalace-release-config-" + [IO.Path]::GetRandomFileName())
 New-Item -ItemType Directory -Path $temporaryDirectory -Force | Out-Null
 
 try {
@@ -82,7 +82,7 @@ try {
         $privateKeyBytes = [IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $PrivateKeyPath))
         $encodedPrivateKey = [Convert]::ToBase64String($privateKeyBytes)
         $encodedPrivateKey | & gh secret set `
-            MEMPALACE_RELEASE_SIGNING_KEY `
+            AGENTPALACE_RELEASE_SIGNING_KEY `
             --repo $Repository `
             --env stable-release
         if ($LASTEXITCODE -ne 0) { throw 'Could not configure the release signing secret.' }
@@ -107,12 +107,12 @@ try {
         }
 
         $secretList = & gh secret list --repo $Repository --env stable-release
-        if ($LASTEXITCODE -ne 0 -or $secretList -notmatch '(?m)^MEMPALACE_RELEASE_SIGNING_KEY\s') {
+        if ($LASTEXITCODE -ne 0 -or $secretList -notmatch '(?m)^(AGENTPALACE|MEMPALACE)_RELEASE_SIGNING_KEY\s') {
             throw 'The release signing secret is not visible after configuration.'
         }
 
         & gh variable set `
-            MEMPALACE_IMMUTABLE_RELEASES_ENABLED `
+            AGENTPALACE_IMMUTABLE_RELEASES_ENABLED `
             --body true `
             --repo $Repository `
             --env stable-release
@@ -121,7 +121,7 @@ try {
         }
 
         $immutableMarker = & gh variable get `
-            MEMPALACE_IMMUTABLE_RELEASES_ENABLED `
+            AGENTPALACE_IMMUTABLE_RELEASES_ENABLED `
             --repo $Repository `
             --env stable-release
         if ($LASTEXITCODE -ne 0 -or $immutableMarker -ne 'true') {

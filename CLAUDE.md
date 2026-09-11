@@ -1,15 +1,15 @@
 # AgentPalace — instructions for Claude
 
 A Rust workspace of 16 crates implementing AgentPalace, local-first memory, continuity,
-and coordination for AI agents. Existing `mempalace` commands, crate names, MCP tool
-names, environment variables, and storage paths are compatibility contracts.
+and coordination for AI agents. The technical name is `agentpalace`. MemPalace names
+remain only where required for migration, historical evidence, and persisted identity.
 
 **The invariant to protect:** memory never leaves the user's control by default. Embeddings,
 search, and the knowledge graph run locally — no third-party model or inference APIs, no
 telemetry, no analytics. Don't introduce one.
 
-Federation is the deliberate exception and is a supported product path: `mempalace-remote`
-(`RemoteClient`, reqwest-backed) and `mempalace-server` speak HTTP to a palace endpoint the
+Federation is the deliberate exception and is a supported product path: `agentpalace-remote`
+(`RemoteClient`, reqwest-backed) and `agentpalace-server` speak HTTP to a palace endpoint the
 user configured themselves, opt-in per wing via `local`/`remote`/`combined` routing. Work on
 that path is normal work — see [docs/Federation.md](docs/Federation.md).
 
@@ -19,7 +19,7 @@ that path is normal work — see [docs/Federation.md](docs/Federation.md).
 cargo check --workspace --all-targets --locked
 ```
 
-Requires `protoc` (`protobuf-compiler`) — `mempalace-storage` pulls it in via `lancedb`.
+Requires `protoc` (`protobuf-compiler`) — `agentpalace-storage` pulls it in via `lancedb`.
 `rusqlite` uses the `bundled` feature, so a C toolchain is needed too. On a cold box, run
 `bash scripts/cloud-setup.sh`; see [docs/Cloud-Environment.md](docs/Cloud-Environment.md).
 
@@ -30,22 +30,22 @@ A whole-workspace `cargo test` is heavy, so CI splits it per package.
 at a time:
 
 ```bash
-cargo test -p mempalace-storage --locked
+cargo test -p agentpalace-storage --locked
 ```
 
-Packages: `mempalace-a2a`, `mempalace-cli`, `mempalace-config`, `mempalace-core`,
-`mempalace-dialect`, `mempalace-embeddings`, `mempalace-federation`, `mempalace-graph`,
-`mempalace-import`, `mempalace-ingest`, `mempalace-mcp`, `mempalace-mcp-tasks`,
-`mempalace-remote`, `mempalace-search`, `mempalace-server`, `mempalace-storage`.
+Packages: `agentpalace-a2a`, `agentpalace-cli`, `agentpalace-config`, `agentpalace-core`,
+`agentpalace-dialect`, `agentpalace-embeddings`, `agentpalace-federation`, `agentpalace-graph`,
+`agentpalace-import`, `agentpalace-ingest`, `agentpalace-mcp`, `agentpalace-mcp-tasks`,
+`agentpalace-remote`, `agentpalace-search`, `agentpalace-server`, `agentpalace-storage`.
 
 ## Embeddings are offline by default
 
-Both binaries refuse to download model assets unless `MEMPALACE_EMBED_ALLOW_DOWNLOADS` is set
+Both binaries refuse to download model assets unless `AGENTPALACE_EMBED_ALLOW_DOWNLOADS` is set
 to `1`/`true`/`yes`. The test suite passes without it — don't set it to make a test go green.
 
-- `MEMPALACE_STUB_EMBEDDINGS=1` runs with deterministic stub vectors; use it for MCP, CLI, and
+- `AGENTPALACE_STUB_EMBEDDINGS=1` runs with deterministic stub vectors; use it for MCP, CLI, and
   server tests that only need *an* embedding, not a real one.
-- Set `MEMPALACE_EMBED_ALLOW_DOWNLOADS=1` only when deliberately exercising real model
+- Set `AGENTPALACE_EMBED_ALLOW_DOWNLOADS=1` only when deliberately exercising real model
   behaviour (e.g. `examples/embedding_bench`).
 
 ## Lints

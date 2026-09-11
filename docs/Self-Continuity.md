@@ -22,7 +22,7 @@ honest and revisable.
 
 ## Wake-up behavior
 
-`mempalace_wake_up` now includes an `identity_packet` in addition to the existing identity,
+`agentpalace_wake_up` now includes an `identity_packet` in addition to the existing identity,
 status, change, project, and diary sections. Pass `agent_name` and, when known, the current `model`
 and `harness`.
 
@@ -40,7 +40,7 @@ The packet contains:
 
 Inside the wake-up response, the packet's constitution uses `identity_ref: "$.identity"` to point
 to the existing top-level identity instead of repeating the complete text. A standalone
-`mempalace_identity_packet` response includes the constitution text directly.
+`agentpalace_identity_packet` response includes the constitution text directly.
 
 Candidates are excluded by default. Set `include_candidates: true` only when reviewing or
 developing the self-model. If no default lineage exists, wake-up still succeeds and returns
@@ -54,17 +54,17 @@ Engine-scoped observations are included only when every model or harness constra
 the observation matches the runtime supplied to wake-up. Omitting runtime metadata therefore
 does not accidentally load engine-specific behavior as universal identity.
 
-`mempalace_identity_packet` compiles the same structure on demand without performing the rest of
+`agentpalace_identity_packet` compiles the same structure on demand without performing the rest of
 wake-up.
 
 ## Binding a lineage to an MCP client
 
-Set `MEMPALACE_LINEAGE_ID` in the environment of the local `mempalace serve --stdio` process to bind that
+Set `AGENTPALACE_LINEAGE_ID` in the environment of the local `agentpalace serve --stdio` process to bind that
 MCP connection to one lineage. This is a host-controlled capability boundary: the model cannot
 override the binding in a tool call, even if it knows another valid lineage ID. A configured ID is
 syntax-checked when the server starts. If the ID does not exist in the palace, identity packet and
 wake-up calls use the palace default for that response and include a `lineage_selection.message`
-explaining how to create the requested lineage with `mempalace_lineage_set`.
+explaining how to create the requested lineage with `agentpalace_lineage_set`.
 
 Different MCP clients can share the same palace while binding their separately launched server
 processes to different lineages. For example, Codex can use `codex-dion` while OpenCode uses
@@ -73,18 +73,18 @@ processes to different lineages. For example, Codex can use `codex-dion` while O
 Codex `config.toml`:
 
 ```toml
-[mcp_servers.mempalace]
-command = "/absolute/path/to/mempalace"
+[mcp_servers.agentpalace]
+command = "/absolute/path/to/agentpalace"
 args = ["serve", "--stdio"]
 
-[mcp_servers.mempalace.env]
-MEMPALACE_LINEAGE_ID = "codex-dion"
+[mcp_servers.agentpalace.env]
+AGENTPALACE_LINEAGE_ID = "codex-dion"
 ```
 
 Equivalent Codex CLI registration:
 
 ```bash
-codex mcp add mempalace --env MEMPALACE_LINEAGE_ID=codex-dion -- /absolute/path/to/mempalace serve --stdio
+codex mcp add agentpalace --env AGENTPALACE_LINEAGE_ID=codex-dion -- /absolute/path/to/agentpalace serve --stdio
 ```
 
 OpenCode V2 configuration:
@@ -94,11 +94,11 @@ OpenCode V2 configuration:
   "$schema": "https://opencode.ai/config.json",
   "mcp": {
     "servers": {
-      "mempalace": {
+      "agentpalace": {
         "type": "local",
-        "command": ["/absolute/path/to/mempalace", "serve", "--stdio"],
+        "command": ["/absolute/path/to/agentpalace", "serve", "--stdio"],
         "environment": {
-          "MEMPALACE_LINEAGE_ID": "opencode-dion"
+          "AGENTPALACE_LINEAGE_ID": "opencode-dion"
         }
       }
     }
@@ -107,14 +107,14 @@ OpenCode V2 configuration:
 ```
 
 Changing the binding requires editing the MCP host configuration and restarting that server
-connection. When `MEMPALACE_LINEAGE_ID` is absent, packet tools use only the palace's stored
+connection. When `AGENTPALACE_LINEAGE_ID` is absent, packet tools use only the palace's stored
 default lineage; there is still no per-call override. When a bound lineage is newly created with
-`mempalace_lineage_set`, retry wake-up or identity-packet compilation and the binding will take
+`agentpalace_lineage_set`, retry wake-up or identity-packet compilation and the binding will take
 effect without changing the host configuration.
 
 ## Establishing a lineage
 
-Use `mempalace_lineage_set` with a stable identifier that does not name the current provider or
+Use `agentpalace_lineage_set` with a stable identifier that does not name the current provider or
 model. The first lineage becomes the default automatically; `set_default: true` can move the
 default later.
 
@@ -129,7 +129,7 @@ continuing self.
 
 ## Developing the self-model
 
-Use `mempalace_self_observation_propose` when a repeated pattern may describe the persistent self.
+Use `agentpalace_self_observation_propose` when a repeated pattern may describe the persistent self.
 Each proposal requires:
 
 - a concise, falsifiable statement;
@@ -148,7 +148,7 @@ The scope controls portability:
 | `engine` | Applies only when the packet's runtime matches the observation's recorded model and/or harness. At least one is required. |
 
 New observations start as `candidate`. A candidate does not influence the default identity packet.
-Use `mempalace_self_observation_review` with the current revision to `promote` or `retire` it and
+Use `agentpalace_self_observation_review` with the current revision to `promote` or `retire` it and
 record the reviewer and reason.
 
 When a better observation replaces an older promoted one, propose it with
@@ -165,7 +165,7 @@ candidate -> promoted -> superseded
 
 ## Recording a model or harness change
 
-Use `mempalace_migration_record` after comparing behavior across a model or harness transition.
+Use `agentpalace_migration_record` after comparing behavior across a model or harness transition.
 A migration records:
 
 - the old and new model/harness identifiers;
@@ -181,14 +181,14 @@ change, update `identity.txt` deliberately.
 ## Constitution discipline
 
 Treat `identity.txt` as a constitution, not an autobiography or an append-only session log.
-`mempalace_identity_update` accepts at most 16 KiB of content per call, while the final file may be
+`agentpalace_identity_update` accepts at most 16 KiB of content per call, while the final file may be
 up to 64 KiB. Use diaries for session experience and self-observations for developing patterns so
 the constitution stays compact and legible on every wake-up.
 
 ## Locality and change history
 
 The lineage, observation, review, and migration tools are local-only and are not federated. Their
-mutations appear in `mempalace_get_changes_since` as `lineage_set`,
+mutations appear in `agentpalace_get_changes_since` as `lineage_set`,
 `self_observation_proposed`, `self_observation_reviewed`, and
 `lineage_migration_recorded` events.
 

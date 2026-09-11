@@ -2720,9 +2720,11 @@ where
         _ => identity.clone(),
     };
 
-    // Serialize receipt recovery and source replacement across processes. Legacy requests
-    // participate too, so they cannot enter a receipt's effect-to-completion window.
-    let _ingest_guard = state.storage.lock_ingest_source("federated-ingest").await?;
+    let wing_str = wing.as_str().to_owned();
+    let repo_id_hash = hash_text(&body.repo_id);
+    // Hold a resumable file's lock through receipt completion. Unrelated sources can
+    // progress independently; legacy batches lock one file at a time.
+    let _ingest_guard;
     if let Some(replication) = &body.replication {
         if body.files.len() != 1
             || replication.batch_id.trim().is_empty()
@@ -2734,6 +2736,13 @@ where
             return Err(ServerError::InvalidParams(
                 "replicated ingest requires one file, bounded nonempty identities, and empty removal chunks".to_owned()));
         }
+        _ingest_guard = state
+            .storage
+            .lock_ingest_source(&format!(
+                "projects:{wing_str}:{repo_id_hash}:{}",
+                body.files[0].relative_path
+            ))
+            .await?;
         let request_hash =
             mutation_request_hash(&[("request", json!(&body)), ("identity", json!(&identity))]);
         match state.storage.receipt_store().begin_receipt(&NewReceipt {
@@ -2765,8 +2774,6 @@ where
         resolve_root_path.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
 
     let now = OffsetDateTime::now_utc();
-    let wing_str = wing.as_str().to_owned();
-    let repo_id_hash = hash_text(&body.repo_id);
 
     // Build repository-view metadata for federated batch.
     let view_metadata = mempalace_core::RepositoryViewMetadata {
@@ -2790,6 +2797,11 @@ where
 
     for file in &body.files {
         let source_key = format!("projects:{wing_str}:{repo_id_hash}:{}", file.relative_path);
+        let _legacy_guard = if body.replication.is_none() {
+            Some(state.storage.lock_ingest_source(&source_key).await?)
+        } else {
+            None
+        };
 
         if file.chunks.is_empty() && body.replication.is_none() {
             file_results.push(IngestFileResult {
@@ -8544,6 +8556,69 @@ mod tests {
         let body2 = body_json(resp2).await;
         assert_eq!(body2["files"][0]["status"], "skipped_unchanged");
         assert_eq!(body2["files"][0]["drawers_written"], 0u64);
+    }
+
+    #[tokio::test]
+    async fn resumable_ingest_locks_each_source_without_blocking_other_files() {
+        let harness = make_harness().await;
+        let locked_key = format!("projects:wing_parallel:{}:b.rs", hash_text("repo"));
+        let guard = harness.state.storage.lock_ingest_source(&locked_key).await.unwrap();
+        let file = |path: &str| {
+            json!({"relative_path":path,"content_hash":"v1",
+            "chunks":[{"chunk_index":0,"room":"general","text":"source content"}]})
+        };
+        let send = |request| {
+            harness.router.clone().oneshot(authed_json_request(
+                Method::POST,
+                "/v1/ingest/batch",
+                ALICE_TOKEN,
+                request,
+            ))
+        };
+        let legacy = send(json!({"wing":"wing_parallel","repo_id":"repo",
+            "files":[file("a.rs"),file("b.rs")]}));
+        tokio::pin!(legacy);
+        let first_key = format!("projects:wing_parallel:{}:a.rs", hash_text("repo"));
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                tokio::select! {
+                    response = &mut legacy => panic!("batch passed locked source: {:?}", response),
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(25)) => {
+                        if harness.state.storage.operational_store().get_ingested_file(&first_key).unwrap().is_some() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }).await.unwrap();
+        // The batch waits on b.rs, having released a.rs. A receipt for a.rs must complete.
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            send(json!({
+            "wing":"wing_parallel","repo_id":"repo",
+            "replication":{"batch_id":"parallel","record_id":"free"},
+            "files":[file("a.rs")]})),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let same = send(json!({"wing":"wing_parallel","repo_id":"repo",
+            "replication":{"batch_id":"parallel","record_id":"blocked"},
+            "files":[file("b.rs")]}));
+        tokio::pin!(same);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut same).await.is_err()
+        );
+        assert!(harness.state.storage.receipt_store().get_receipt("blocked").unwrap().is_none());
+        drop(guard);
+        let (legacy, same) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(legacy, same)
+        })
+        .await
+        .unwrap();
+        assert_eq!(legacy.unwrap().status(), StatusCode::OK);
+        assert_eq!(same.unwrap().status(), StatusCode::OK);
     }
 
     #[tokio::test]

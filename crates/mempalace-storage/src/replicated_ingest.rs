@@ -28,6 +28,20 @@ pub struct ReplicatedSource {
     pub previous_ids: Vec<DrawerId>,
 }
 
+// Keep an immutable effect fingerprint for keyed replay, but discard recovery-only data
+// once the local effect commits. Old staged rows need no migration.
+pub(crate) fn compact_ingestion_payload(payload: &mut serde_json::Value) -> Result<()> {
+    if let Some(local) = payload.get_mut("local").and_then(serde_json::Value::as_object_mut) {
+        if local.contains_key("drawers") {
+            local.remove("previous_ids");
+            let fingerprint = blake3::hash(&serde_json::to_vec(&local)?).to_hex().to_string();
+            local.remove("drawers");
+            local.insert("effect_hash".into(), serde_json::Value::String(fingerprint));
+        }
+    }
+    Ok(())
+}
+
 impl StorageEngine {
     /// Acquire a process-safe source lock, automatically released even after a process crash.
     /// Lock files are retained; deleting them could let two processes lock different inodes.
@@ -47,7 +61,9 @@ impl StorageEngine {
         loop {
             match FileExt::try_lock_exclusive(&file) {
                 Ok(()) => return Ok(file),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(error)
+                    if error.raw_os_error() == fs4::lock_contended_error().raw_os_error() =>
+                {
                     tokio::time::sleep(std::time::Duration::from_millis(25)).await;
                 }
                 Err(source) => return Err(StorageError::Io { path, source }),
@@ -69,9 +85,9 @@ impl StorageEngine {
         local.previous_ids = if let Some(existing) =
             outbox.find_by_key(&intent.created_by, &intent.idempotency_key)?
         {
-            let saved: ReplicatedSource =
-                serde_json::from_value(existing.payload["local"].clone())?;
-            saved.previous_ids
+            serde_json::from_value(serde_json::Value::Array(
+                existing.payload["local"]["previous_ids"].as_array().cloned().unwrap_or_default(),
+            ))?
         } else {
             self.operational_store().committed_drawer_ids_for_source_key(&local.source_key)?
         };
@@ -246,10 +262,12 @@ mod tests {
             engine.recover_replicated_ingestion().await.unwrap();
             assert!(engine.drawer_store().get_drawer(&old.id).await.unwrap().is_none());
             assert!(engine.drawer_store().get_drawer(&new.id).await.unwrap().is_some());
-            assert_eq!(
-                outbox.get_operation(&operation.operation_id).unwrap().unwrap().state,
-                OutboxState::Pending
-            );
+            let recovered = outbox.get_operation(&operation.operation_id).unwrap().unwrap();
+            assert_eq!(recovered.state, OutboxState::Pending);
+            assert!(recovered.payload["local"].get("drawers").is_none());
+            assert!(recovered.payload["local"].get("previous_ids").is_none());
+            assert!(recovered.payload["local"]["effect_hash"].is_string());
+            assert_eq!(recovered.payload["request"], operation.payload["request"]);
             let deletion = ReplicatedSource {
                 drawers: vec![],
                 remove: true,
@@ -296,8 +314,19 @@ mod tests {
             .commit_replicated_source(intent("second", &second), second.clone())
             .await
             .unwrap();
-        let replay =
-            engine.commit_replicated_source(intent("second", &second), second).await.unwrap();
+        let replay = engine
+            .commit_replicated_source(intent("second", &second), second.clone())
+            .await
+            .unwrap();
+        assert!(replay.payload["local"].get("drawers").is_none());
+        let mut changed = second.clone();
+        changed.drawers[0].embedding[0] = 0.5;
+        assert!(
+            engine.commit_replicated_source(intent("second", &changed), changed).await.is_err()
+        );
+        let mut changed_request = intent("second", &second);
+        changed_request.payload["request"]["replication"]["batch_id"] = json!("different");
+        assert!(engine.commit_replicated_source(changed_request, second).await.is_err());
         assert_eq!(replay.operation_id, operation.operation_id);
         assert_eq!(
             engine.operational_store().get_ingested_file("source").unwrap().unwrap().content_hash,

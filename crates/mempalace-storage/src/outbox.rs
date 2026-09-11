@@ -324,12 +324,17 @@ CREATE INDEX IF NOT EXISTS idx_replication_outbox_claim
         let mut conn = self.connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some(op) = find_operation_by_key(&tx, &input.created_by, &input.idempotency_key)? {
+            let mut replay_payload = input.payload.clone();
+            if op.mutation_kind == "ingest_file" && op.payload["local"].get("effect_hash").is_some()
+            {
+                crate::replicated_ingest::compact_ingestion_payload(&mut replay_payload)?;
+            }
             if op.mutation_kind != input.mutation_kind
                 || op.entity_id != input.entity_id
                 || op.destination_remote != input.destination_remote
                 || op.ordering_key != input.ordering_key
                 || op.max_attempts != input.max_attempts
-                || op.payload != input.payload
+                || op.payload != replay_payload
             {
                 return Err(StorageError::Invariant(format!(
                     "outbox idempotency key `{}` was reused with a different mutation",
@@ -487,11 +492,15 @@ CREATE INDEX IF NOT EXISTS idx_replication_outbox_claim
         if op.state != OutboxState::Staged {
             return Err(StorageError::Invariant(OUTBOX_ONLY_STAGED_MAY_ACTIVATE.into()));
         }
+        let mut payload = op.payload;
+        if op.mutation_kind == "ingest_file" {
+            crate::replicated_ingest::compact_ingestion_payload(&mut payload)?;
+        }
         let now = OffsetDateTime::now_utc();
         let changed = tx.execute(
-            "UPDATE replication_outbox SET state='pending',revision=revision+1,updated_at=?2 \
+            "UPDATE replication_outbox SET state='pending',revision=revision+1,updated_at=?2,payload_json=?4 \
              WHERE operation_id=?1 AND revision=?3",
-            params![operation_id, format_time(now)?, expected_revision],
+            params![operation_id, format_time(now)?, expected_revision, serde_json::to_string(&payload)?],
         )?;
         if changed != 1 {
             return Ok(RevisionedWrite::Conflict { actual_revision: None });

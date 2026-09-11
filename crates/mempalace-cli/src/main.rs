@@ -5636,6 +5636,12 @@ mod tests {
         let removal =
             run_cli(["mine", project_dir.to_str().unwrap()], &context, stub_provider).unwrap();
         assert_eq!(removal.exit_code, 0, "{removal:?}");
+        let before = outbox.ingestion_backlog().unwrap();
+        let repeated =
+            run_cli(["mine", project_dir.to_str().unwrap()], &context, stub_provider).unwrap();
+        assert_eq!(repeated.exit_code, 0, "{repeated:?}");
+        assert_eq!(outbox.ingestion_backlog().unwrap()["total_batches"], before["total_batches"]);
+        assert_eq!(outbox.ingestion_backlog().unwrap()["files_by_state"], before["files_by_state"]);
         let operation =
             outbox.claim_next("hub", "test", time::Duration::minutes(1)).unwrap().unwrap();
         assert_eq!(operation.payload["request"]["replication"]["remove"], true);

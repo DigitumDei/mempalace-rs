@@ -424,8 +424,10 @@ The foreground mine makes no remote calls. Start `mempalace serve` or
 `mempalace serve --stdio` with the same palace and federation configuration to deliver it. Restarting
 finishes staged local effects from durable snapshots, then resumes unacknowledged remote
 records. Files not yet staged when a process crashes require another mine. Keep SQLite,
-LanceDB, the outbox and receipts in the same consistent palace backup; snapshots retain
-prepared content and embeddings. Do not delete `ingest-locks/` files while processes run.
+LanceDB, the outbox and receipts in the same consistent palace backup. Recovery snapshots
+retain prepared content and embeddings while staged; activation atomically discards these local
+snapshots and old drawer IDs, retaining a fingerprint and source metadata. Remote request content
+remains in the outbox. Do not delete `ingest-locks/` files while processes run.
 
 Observe the replication pipeline through `mempalace_status` (and the status
 embedded in `mempalace_wake_up`):

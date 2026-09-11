@@ -593,7 +593,9 @@ without claiming a new durable batch.
 Keep `mempalace serve` (HTTP or `--stdio`) running against the same palace and federation
 configuration for delivery. Startup and periodic reconciliation finish staged local file
 effects from their saved snapshots, without reading a changed or missing checkout. Recovery
-and foreground ingestion use process-safe source locks. Lock files under `ingest-locks/`
+and foreground ingestion use process-safe source locks. The receiver locks each source
+through receipt completion; legacy batches release each file's lock before processing the
+next file, so unrelated sources can progress independently. Lock files under `ingest-locks/`
 are retained; their existence does not mean a process holds a lock.
 
 The existing replication worker sends one file record per request. Individual durable
@@ -634,7 +636,9 @@ sources that are no longer eligible. Limited or incomplete discovery does not sw
 does not delete remote-only historical files absent from the local manifest. Branch-view
 and conversation mining remain local. `--batch-size` still controls local embedding batches;
 durable delivery always acknowledges one file at a time. Recovery snapshots include prepared
-content and embeddings and increase SQLite backup size; retain the full palace backup.
+content and embeddings only while staged. Activation atomically drops the local drawer snapshot
+and old drawer IDs, retaining a compact effect fingerprint and source metadata for keyed replay
+and diagnostics. Remote request content remains in the outbox; retain the full palace backup.
 
 ## Part 4 — Branch-aware mining
 

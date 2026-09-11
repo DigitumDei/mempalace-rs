@@ -438,11 +438,13 @@ token entries, not a field of `config.json`. Its shape (`token`/`name`/
   rows for mined files pushed from remote clients.
 - When a wing is present in the map, snippet text is resolved from the
   configured path at search time, giving fresh locator results.
-- When a wing is **absent** from the map (or the `checkouts` field is omitted
-  entirely), the server stores locator rows with an empty `resolve_root`. Every
-  search result for that wing resolves as a stale placeholder, and the batch
-  response `warnings` array contains:
-  `"no checkout configured for wing '<w>'; locator results will resolve as stale placeholders until server.checkouts is set"`
+- When a wing is **absent** from the map (or the `checkouts` field is omitted),
+  locator-backed batches fail with HTTP 409 `checkout_unavailable` before writes.
+  The configured directory must contain the matching file bytes. If both client
+  and server Git commits are known, they must match too. Content-only batches and
+  durable removals do not require this mapping. The server does not fetch code;
+  operators maintain these directories. See the checkout preflight protocol in
+  [Federation.md](Federation.md#checkout-preflight-issue-91-phase-1).
 - Only the server that receives `POST /v1/ingest/batch` reads this field;
   clients that push batches do not need it.
 

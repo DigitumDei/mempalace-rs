@@ -444,7 +444,12 @@ async fn unreachable_remote_is_degradable() {
 async fn ingest_batch_round_trip() {
     let tempdir = TempDir::new().unwrap();
     let token_file = write_token_file(&tempdir);
-    let config = test_config(&tempdir);
+    let mut config = test_config(&tempdir);
+    let checkout = tempdir.path().join("checkout");
+    std::fs::create_dir_all(checkout.join("src")).unwrap();
+    let beta_text = "beta module handles the wibbleplonk dispatcher initialization";
+    std::fs::write(checkout.join("src/beta.rs"), beta_text).unwrap();
+    config.server.checkouts.insert("wing_ingest".to_owned(), checkout);
     let addr = spawn_server(config, token_file).await;
     let client = client_for(addr, Some(TEST_TOKEN));
 
@@ -481,16 +486,14 @@ async fn ingest_batch_round_trip() {
             IngestFileDto {
                 relative_path: "src/beta.rs".to_owned(),
                 content_hash: "contenthash_beta_002".to_owned(),
-                file_hash: Some(
-                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
-                ),
+                file_hash: Some(mempalace_core::hash_bytes(beta_text.as_bytes())),
                 chunks: vec![IngestChunkDto {
                     chunk_index: 0,
                     room: "code".to_owned(),
                     text: "beta module handles the wibbleplonk dispatcher initialization"
                         .to_owned(),
                     byte_start: Some(0),
-                    byte_end: Some(62),
+                    byte_end: Some(beta_text.len() as u64),
                     line_start: Some(1),
                     line_end: Some(1),
                 }],

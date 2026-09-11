@@ -1886,7 +1886,7 @@ fn execute_remote_mine(
             Ok(resp) => resp,
             Err(e) => {
                 let msg = format!(
-                    "remote '{}' transport error after {} batch(es): {e}",
+                    "remote '{}' ingestion failed after {} batch(es): {e}",
                     remote_name, batches_sent
                 );
                 if dual_write && batches_sent > 0 {
@@ -4885,12 +4885,23 @@ mod tests {
     /// Spawn a federation server in-process on an ephemeral port.
     /// Returns the bound address.
     fn spawn_test_server(palace_dir: PathBuf, token: &str) -> std::net::SocketAddr {
+        spawn_test_server_with_checkout(palace_dir, token, None)
+    }
+
+    fn spawn_test_server_with_checkout(
+        palace_dir: PathBuf,
+        token: &str,
+        checkout: Option<(&str, PathBuf)>,
+    ) -> std::net::SocketAddr {
         use mempalace_embeddings::DeterministicStubProvider;
         use mempalace_server::{TokenRegistry, build_router};
 
         let token_dir = tempfile::tempdir().unwrap();
         let token_file = write_test_token_file(token_dir.path(), token);
-        let config = remote_test_config(palace_dir, token_file.clone());
+        let mut config = remote_test_config(palace_dir, token_file.clone());
+        if let Some((wing, root)) = checkout {
+            config.server.checkouts.insert(wing.to_owned(), root);
+        }
 
         // Build a dedicated tokio runtime to host the server.
         let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
@@ -5068,7 +5079,11 @@ mod tests {
         let server_palace = workspace.path().join("server-palace");
         fs::create_dir_all(&server_palace).unwrap();
 
-        let addr = spawn_test_server(server_palace.clone(), TOKEN);
+        let addr = spawn_test_server_with_checkout(
+            server_palace.clone(),
+            TOKEN,
+            Some(("wing_myproject", workspace.path().join("myproject"))),
+        );
         let server_url = format!("http://{addr}");
 
         // Project dir.
@@ -5248,6 +5263,67 @@ mod tests {
     }
 
     #[test]
+    fn mine_checkout_rejection_is_visible_and_fresh_mine_recovers_after_repair() {
+        const TOKEN: &str = "checkout-repair-token";
+        let workspace = tempdir().unwrap();
+        let project_dir = workspace.path().join("repair-project");
+        fs::create_dir_all(&project_dir).unwrap();
+        write_file(&project_dir.join("code.rs"), &"fn example() -> bool { true }\n".repeat(10));
+        let config_root = temp_config_root("checkout-repair");
+        let context = CliContext::for_tests(config_root.clone());
+        run_cli(["init", project_dir.to_str().unwrap(), "--yes"], &context, stub_provider).unwrap();
+        let palace_dir = config_root.join("palace");
+        let addr = spawn_test_server(workspace.path().join("unmapped-palace"), TOKEN);
+        write_combined_cli_config(
+            &config_root,
+            "hub",
+            &format!("http://{addr}"),
+            TOKEN,
+            "wing_repair",
+            &palace_dir,
+            &project_dir,
+        );
+        let context = CliContext::for_tests(config_root.clone());
+        let output =
+            run_cli(["mine", project_dir.to_str().unwrap()], &context, stub_provider).unwrap();
+        assert_eq!(output.exit_code, 0, "local mine must succeed: {output:?}");
+        drain_mine_replication(load_runtime_config(None, &context).unwrap(), 1);
+        let outbox = mempalace_storage::OutboxStore::new(palace_dir.join("storage.sqlite3"));
+        let failures = outbox.list_failed(10).unwrap();
+        assert!(failures[0].last_error.as_deref().unwrap().contains("checkout_unavailable"));
+        assert_eq!(outbox.ingestion_backlog().unwrap()["failed_batches"], 1);
+
+        let addr = spawn_test_server_with_checkout(
+            workspace.path().join("repaired-palace"),
+            TOKEN,
+            Some(("wing_repair", project_dir.clone())),
+        );
+        write_combined_cli_config(
+            &config_root,
+            "hub",
+            &format!("http://{addr}"),
+            TOKEN,
+            "wing_repair",
+            &palace_dir,
+            &project_dir,
+        );
+        let context = CliContext::for_tests(config_root.clone());
+        let output =
+            run_cli(["mine", project_dir.to_str().unwrap()], &context, stub_provider).unwrap();
+        assert_eq!(output.exit_code, 0);
+        assert!(
+            outbox.backlog(None).unwrap().pending_count > 0,
+            "unchanged source must be queued again"
+        );
+        drain_mine_replication(load_runtime_config(None, &context).unwrap(), 1);
+        let status = outbox.ingestion_backlog().unwrap();
+        assert_eq!(status["total_batches"], 2);
+        assert_eq!(status["failed_batches"], 1, "historical failure remains visible");
+        assert_eq!(status["pending_batches"], 0);
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
     fn mine_combined_both_unreachable_returns_local_success() {
         let workspace = tempdir().unwrap();
         let project_dir = workspace.path().join("combinedproject");
@@ -5291,9 +5367,10 @@ mod tests {
         assert_eq!(backlog.retryable_count, 0, "foreground mine never attempts delivery");
 
         // Recover the destination after the CLI process has already returned.
-        let addr = spawn_test_server(
+        let addr = spawn_test_server_with_checkout(
             workspace.path().join("recovered-palace"),
             "combined-unreachable-tok",
+            Some(("wing_combinedproject", project_dir.clone())),
         );
         let mut config = load_runtime_config(None, &context).unwrap();
         config.federation.remotes.get_mut(remote_name).unwrap().url = format!("http://{addr}");
@@ -5310,7 +5387,11 @@ mod tests {
         // Server palace dir.
         let server_palace = workspace.path().join("server-palace");
         fs::create_dir_all(&server_palace).unwrap();
-        let addr = spawn_test_server(server_palace.clone(), TOKEN);
+        let addr = spawn_test_server_with_checkout(
+            server_palace.clone(),
+            TOKEN,
+            Some(("wing_myproject", workspace.path().join("myproject"))),
+        );
         let server_url = format!("http://{addr}");
 
         // Project dir.
@@ -5448,13 +5529,19 @@ mod tests {
     /// first ingest batch are fast; the third is the second ingest batch) to
     /// exceed the client's 5-second timeout, causing a deterministic transport
     /// failure. Subsequent requests respond normally, so a retry works.
-    fn spawn_self_destruct_server(palace_dir: PathBuf, token: &str) -> std::net::SocketAddr {
+    fn spawn_self_destruct_server(
+        palace_dir: PathBuf,
+        token: &str,
+        wing: &str,
+        checkout: PathBuf,
+    ) -> std::net::SocketAddr {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let token_dir = tempfile::tempdir().unwrap();
         let token_file = write_test_token_file(token_dir.path(), token);
-        let config = remote_test_config(palace_dir, token_file.clone());
+        let mut config = remote_test_config(palace_dir, token_file.clone());
+        config.server.checkouts.insert(wing.to_owned(), checkout);
 
         let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
 
@@ -5506,7 +5593,12 @@ mod tests {
         // Server palace dir.
         let server_palace = workspace.path().join("server-palace");
         fs::create_dir_all(&server_palace).unwrap();
-        let proxy_addr = spawn_self_destruct_server(server_palace.clone(), TOKEN);
+        let proxy_addr = spawn_self_destruct_server(
+            server_palace.clone(),
+            TOKEN,
+            "wing_multibatch",
+            workspace.path().join("multi-batch-project"),
+        );
         let proxy_url = format!("http://{proxy_addr}");
 
         // Project dir with enough files for 3 batches at batch-size 1.
@@ -5571,7 +5663,12 @@ mod tests {
         // Server palace dir — single server used for both mines.
         let server_palace = workspace.path().join("server-palace");
         fs::create_dir_all(&server_palace).unwrap();
-        let proxy_addr = spawn_self_destruct_server(server_palace.clone(), TOKEN);
+        let proxy_addr = spawn_self_destruct_server(
+            server_palace.clone(),
+            TOKEN,
+            "wing_retryproject",
+            workspace.path().join("retry-project"),
+        );
         let proxy_url = format!("http://{proxy_addr}");
 
         // Project dir with 3 files so batch-size 1 produces 3 batches.

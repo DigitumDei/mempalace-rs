@@ -461,7 +461,7 @@ Response body `IngestBatchResponse`:
 ```
 IngestBatchResponse {
     files:    Vec<IngestFileResult>,
-    warnings: Vec<String>,         // non-fatal; e.g. missing checkout mapping
+    warnings: Vec<String>,         // non-fatal warnings; checkout failures are HTTP errors
 }
 ```
 
@@ -530,10 +530,12 @@ from `server.checkouts[wing]` (see [Config-Schema.md](Config-Schema.md)).
 
 - **Checkout mapped:** locators resolve fresh text from the server's local
   checkout.
-- **Checkout not mapped:** `resolve_root` is stored as an empty string. Every
-  search result for those rows resolves as a stale placeholder until
-  `server.checkouts` is configured. The response `warnings` array contains:
-  `"no checkout configured for wing '<w>'; locator results will resolve as stale placeholders until server.checkouts is set"`.
+- **Checkout not mapped:** locator-backed batches fail with HTTP 409
+  `checkout_unavailable` before writing drawers. Mismatched known commits or file
+  hashes also reject the batch. Clients use a content-free preflight when the
+  server advertises `ingest_preflight`; the server rechecks on ingestion.
+  Existing stale rows are not rewritten. Later changes to a mapped checkout can
+  still make previously valid locators stale.
 
 Files whose `file_hash` is `None` (non-UTF-8 fallback) are stored as legacy
 content rows — chunk text is persisted verbatim with no locator.

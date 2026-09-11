@@ -122,12 +122,12 @@ In `~/.mempalace/config.json`:
 It is how the hub resolves locator-backed mined drawers (see
 [Federated mining](#part-3--federated-mining) and [Mined Storage](Mined-Storage.md)):
 
-- **Mapped** — the server reads snippet text from that checkout at search time, so
-  results are fresh and non-stale.
-- **Unmapped** — the server stores locator rows with an empty root; every result
-  for that wing resolves as a *stale placeholder* until you add the mapping, and
-  the bulk-ingest response carries a warning. This is safe (no wrong text), just
-  degraded.
+- **Mapped** — ingestion validates the checkout commit when available and the
+  actual file hashes. Search resolves snippets from that directory; later edits
+  can still make stored locators stale.
+- **Unmapped** — batches containing locator-backed files fail with HTTP 409
+  `checkout_unavailable` before storing any drawers. Content-only batches and
+  durable removals do not require a checkout.
 
 See [Config Schema → Server Config](Config-Schema.md#server-config) for the full
 field reference.
@@ -172,6 +172,7 @@ requires `Authorization: Bearer <token>`.
 | `GET /v1/rooms` | List rooms |
 | `GET /v1/changes` | Change-event feed (cursor-paginated) |
 | `POST /v1/ingest/batch` | Bulk mined-chunk ingest (16 MiB body limit) |
+| `POST /v1/ingest/preflight` | Validate locator file hashes and checkout commit without uploading chunk text (16 MiB body limit; ingest scope) |
 | `POST /v1/coordination/tasks` | Create a task |
 | `GET /v1/coordination/tasks` | Discover/list tasks (cursor-paginated) |
 | `GET /v1/coordination/tasks/{id}` | Get one task |
@@ -391,8 +392,8 @@ Clients (the CLI and the MCP server) read `federation` from
   continues (falling back to inline `token`, or unauthenticated if neither is set)
   — local-only operation never breaks because of a missing remote token.
 - `url` must be `http://` or `https://`; any other scheme fails config load.
-- A wing whose name matches `server.checkouts` on the hub gets fresh locator
-  resolution; otherwise its remote results surface as stale.
+- Locator-backed ingestion requires a matching `server.checkouts` directory.
+  Missing mappings reject new batches; previously stored stale rows are unchanged.
 
 ### Route resolution precedence
 
@@ -579,9 +580,52 @@ a purely local concept — see [Part 4](#part-4--branch-aware-mining).
   → explicit error, no local fallback.
 - Remote unreachable during `write: both` replication → local mine succeeds;
    the mine output reports a durable queue entry. The worker retries after recovery.
-- A bad single file → reported `failed` in the 200 response body; the rest of the
+- Missing checkout, a different known HEAD, or mismatched/unreadable locator files
+  → HTTP 409 `checkout_unavailable` with one actionable diagnostic, before any
+  drawers in that batch are written. Previously completed batches are unchanged.
+- Other bad single files → reported `failed` in the 200 response body; the rest of the
    batch still commits.
 - Diary-shaped wing/room → rejected with HTTP 422.
+
+### Checkout preflight (issue #91, Phase 1)
+
+Servers advertise `ingest_preflight` in `GET /v1/info`. Before each synchronous
+locator-backed batch, `RemoteClient` sends `POST /v1/ingest/preflight` with:
+
+```json
+{
+  "wing": "wing_myproject",
+  "commit_hash": "<full client commit, or null>",
+  "files": [{"relative_path": "src/lib.rs", "file_hash": "<BLAKE3 hash>"}]
+}
+```
+
+The endpoint requires the same ingest operation and wing scope as batch ingestion.
+It accepts at most 128 files and rejects duplicate relative paths with HTTP 400
+before checkout I/O; direct batch locator validation uses the same checks.
+It sends no source text and returns `{"checkout_commit":"<HEAD or null>"}` on
+success. When both commits are known they must match; every listed file must also
+match its hash, including on dirty working trees. Git HEAD lookup has a five-second
+timeout. Exported directories or unavailable Git metadata report a null commit;
+file-hash validation still applies. Errors include a count and the first failing
+file rather than a repeated message for every file. Unsafe relative paths use
+the same containment checks as ingestion.
+
+Older servers without this capability retain their existing client protocol.
+Current servers also validate batches directly, so skipping preflight cannot
+bypass the checkout requirement. Durable records skip client preflight to allow
+receipt replay after checkout drift. Recovery of a write committed before its
+receipt also uses stored receipt details and matching source metadata to finish
+stale-drawer cleanup and receipt completion without reading the changed checkout.
+Records that still need application must validate. Content-only batches and
+removals need no checkout. Preflight
+does not reserve or freeze a directory: later edits can still make locators stale.
+
+Checkouts remain operator-managed in this phase. Automatic fetch and remote-side
+mining (Phases 2–3) are not implemented. Update the remote checkout to the mined
+commit/bytes, then retry; after a terminal durable rejection, run a fresh mine.
+Existing `replication.ingestion` and `replication.recent_terminal_failures` in
+status and wake-up expose the remaining replication work and its errors.
 
 ### Durable canonical mining (`write: both`)
 
@@ -1323,8 +1367,11 @@ normalised wing before this check existed, so it was already inert (silently fal
 written. Fix the key to its canonical form. `federation.wings` keys are not checked this way.
 
 ### Search results from a remote wing are all stale placeholders
-The hub has no `server.checkouts` entry for that wing. Add the mapping and restart
-`serve`; existing rows resolve fresh on the next search (no re-mine needed).
+Check whether the mapped source files have moved or changed since mining. Older
+servers could also store locators with an empty root; current servers reject new
+locator batches without a checkout. Adding a mapping does not rewrite stored
+locator roots. Legacy empty-root rows need to be removed and mined again;
+an unchanged re-mine alone can skip those rows.
 
 ### Config load warns about a missing token env var
 `token_env` names a variable that is not set. Export it, or the client proceeds

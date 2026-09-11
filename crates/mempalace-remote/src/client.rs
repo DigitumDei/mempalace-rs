@@ -577,7 +577,35 @@ impl RemoteApi for RemoteClient {
     /// [`RemoteError::RemoteRejected`] with `status: 413`; no client-side
     /// splitting is attempted.
     async fn ingest_batch(&self, req: IngestBatchRequest) -> Result<IngestBatchResponse> {
-        self.ensure_handshake().await?;
+        let info = self.ensure_handshake().await?;
+        // Durable records must reach receipt replay even if the checkout has
+        // moved since their first application. The server validates fresh records.
+        if req.replication.is_none()
+            && info.capabilities.iter().any(|capability| capability == "ingest_preflight")
+        {
+            let preflight = mempalace_federation::IngestPreflightRequest {
+                wing: req.wing.clone(),
+                commit_hash: req.commit_hash.clone(),
+                files: req
+                    .files
+                    .iter()
+                    .filter(|file| !file.chunks.is_empty())
+                    .filter_map(|file| {
+                        file.file_hash.as_ref().map(|file_hash| {
+                            mempalace_federation::IngestPreflightFile {
+                                relative_path: file.relative_path.clone(),
+                                file_hash: file_hash.clone(),
+                            }
+                        })
+                    })
+                    .collect(),
+            };
+            if !preflight.files.is_empty() {
+                let url = self.url("v1/ingest/preflight")?;
+                let _: mempalace_federation::IngestPreflightResponse =
+                    self.execute(self.http.post(url).json(&preflight), CallKind::Read).await?;
+            }
+        }
         let url = self.url("v1/ingest/batch")?;
         let rb = self.http.post(url).json(&req);
         self.execute(rb, CallKind::Mutation).await
@@ -965,6 +993,67 @@ mod tests {
             added_by: None,
             drawer_id: None,
             operation_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn ingest_preflight_blocks_upload_but_preserves_legacy_and_receipt_replay() {
+        for (capable, locator, durable, rejected) in [
+            (true, true, false, true),
+            (true, true, false, false),
+            (false, true, false, true),
+            (true, false, false, true),
+            (true, true, true, true),
+        ] {
+            let uploads = Arc::new(AtomicUsize::new(0));
+            let preflights = Arc::new(AtomicUsize::new(0));
+            let upload_hits = Arc::clone(&uploads);
+            let preflight_hits = Arc::clone(&preflights);
+            let app = axum::Router::new()
+                .route("/v1/info", axum::routing::get(move || async move {
+                    axum::Json(serde_json::json!({"server_version":"test", "federation_api_version":1,
+                        "embedding_profile":"balanced", "capabilities":if capable {
+                            vec!["ingest", "ingest_preflight"] } else { vec!["ingest"] }}))
+                }))
+                .route("/v1/ingest/preflight", axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                    let hits = Arc::clone(&preflight_hits);
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        assert_eq!(body["files"][0]["relative_path"], "a.rs");
+                        assert!(!body.to_string().contains("private source text"));
+                        if rejected {
+                            (axum::http::StatusCode::CONFLICT, axum::Json(serde_json::json!({
+                                "code":"checkout_unavailable", "message":"remote checkout commit differs"})))
+                        } else {
+                            (axum::http::StatusCode::OK, axum::Json(serde_json::json!({"checkout_commit":null})))
+                        }
+                    }
+                }))
+                .route("/v1/ingest/batch", axum::routing::post(move || {
+                    let hits = Arc::clone(&upload_hits);
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        axum::Json(serde_json::json!({"files":[{"relative_path":"a.rs","status":"ingested"}]}))
+                    }
+                }));
+            let addr = spawn_stub(app).await;
+            let client = client_for_addr(addr, Duration::from_secs(5));
+            let request = serde_json::from_value(serde_json::json!({
+                "wing":"wing_test","repo_id":"repo", "replication":if durable {
+                    serde_json::json!({"batch_id":"b","record_id":"r"}) } else { serde_json::Value::Null },
+                "files":[{"relative_path":"a.rs", "content_hash":"h", "file_hash":if locator { Some("hash") } else {None},
+                    "chunks":[{"chunk_index":0,"room":"general","text":"private source text"}]}]
+            })).unwrap();
+            let result = client.ingest_batch(request).await;
+            let checked = capable && locator && !durable;
+            assert_eq!(preflights.load(Ordering::SeqCst), usize::from(checked));
+            if checked && rejected {
+                assert!(matches!(result, Err(RemoteError::RemoteRejected { status: 409, .. })));
+                assert_eq!(uploads.load(Ordering::SeqCst), 0);
+            } else {
+                assert!(result.is_ok(), "{result:?}");
+                assert_eq!(uploads.load(Ordering::SeqCst), 1);
+            }
         }
     }
 

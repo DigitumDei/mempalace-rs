@@ -111,6 +111,9 @@ const MAX_LEASE_SECONDS: i64 = 100 * 365 * 24 * 60 * 60;
 /// Top-level error type for the federation server.
 #[derive(Debug, Error)]
 pub enum ServerError {
+    /// The configured checkout cannot resolve the requested locator bytes.
+    #[error("checkout unavailable: {0}")]
+    CheckoutUnavailable(String),
     /// Invalid or missing request parameters.
     #[error("invalid params: {0}")]
     InvalidParams(String),
@@ -224,6 +227,9 @@ impl IntoResponse for ServerError {
             warn!(error = %self, "federation request failed with internal error");
         }
         let (status, code, message) = match &self {
+            Self::CheckoutUnavailable(msg) => {
+                (StatusCode::CONFLICT, "checkout_unavailable", msg.clone())
+            }
             Self::InvalidParams(msg) => {
                 (StatusCode::BAD_REQUEST, "invalid_params", msg.as_str().to_owned())
             }
@@ -973,10 +979,13 @@ where
     // operation that route requires. `/v1/info` carries no gate: any
     // authenticated token may call it.
     //
-    // The ingest/batch route gets a 16 MiB body limit (vs axum's 2 MiB default)
-    // and is merged in as a separate sub-router so the limit is scoped to it
-    // only; all other routes keep the default.
+    // Ingest batch/preflight get a 16 MiB body limit (vs axum's 2 MiB default)
+    // through this separate sub-router; other routes keep the default.
     let ingest_route = Router::new()
+        .route(
+            "/v1/ingest/preflight",
+            post(route_ingest_preflight::<P>).layer(middleware::from_fn(require_ingest)),
+        )
         .route(
             "/v1/ingest/batch",
             post(route_ingest_batch::<P>).layer(middleware::from_fn(require_ingest)),
@@ -1297,6 +1306,7 @@ where
             "coordination_task_list".to_owned(),
             "idempotent_mutations".to_owned(),
             "resumable_ingest".to_owned(),
+            "ingest_preflight".to_owned(),
         ],
         maintenance_enabled: state.config.maintenance.enabled,
         maintenance_background_enabled: state.config.maintenance.background_enabled,
@@ -2625,6 +2635,109 @@ where
 
 // ─── Ingest: batch ───────────────────────────────────────────────────────────
 
+async fn validate_ingest_checkout(
+    root: Option<&std::path::Path>,
+    request: &mempalace_federation::IngestPreflightRequest,
+) -> Result<mempalace_federation::IngestPreflightResponse, ServerError> {
+    use mempalace_federation::IngestPreflightResponse;
+    if request.files.len() > MAX_INGEST_FILES {
+        return Err(ServerError::InvalidParams(format!(
+            "files must contain at most {MAX_INGEST_FILES} entries"
+        )));
+    }
+    if request.files.is_empty() {
+        return Ok(IngestPreflightResponse { checkout_commit: None });
+    }
+    let mut paths = std::collections::BTreeSet::new();
+    for file in &request.files {
+        if let Some(error) = invalid_ingest_relative_path(&file.relative_path) {
+            return Err(ServerError::InvalidParams(error));
+        }
+        if !paths.insert(&file.relative_path) {
+            return Err(ServerError::InvalidParams(format!(
+                "duplicate relative_path '{}' in checkout preflight",
+                file.relative_path
+            )));
+        }
+    }
+    let remedy = format!(
+        "update server.checkouts for wing '{}' to the mined source bytes and retry; \
+         push any unpushed commit first, and keep uncommitted branch mines local",
+        request.wing
+    );
+    let root = root.ok_or_else(|| {
+        ServerError::CheckoutUnavailable(format!(
+            "no checkout configured for wing '{}'; {remedy}",
+            request.wing
+        ))
+    })?;
+    if !root.is_dir() {
+        return Err(ServerError::CheckoutUnavailable(format!(
+            "configured checkout is not an accessible directory; {remedy}"
+        )));
+    }
+    // Git is diagnostic only for exported source directories. Always validate the
+    // actual bytes as well: matching HEAD does not imply a clean working tree.
+    let mut command = tokio::process::Command::new("git");
+    command.args(["rev-parse", "--verify", "HEAD"]).current_dir(root).kill_on_drop(true);
+    let checkout_commit =
+        match tokio::time::timeout(std::time::Duration::from_secs(5), command.output()).await {
+            Ok(Ok(output)) if output.status.success() => {
+                String::from_utf8(output.stdout).ok().map(|s| s.trim().to_owned())
+            }
+            _ => None,
+        };
+    if let (Some(expected), Some(actual)) = (&request.commit_hash, &checkout_commit)
+        && !expected.eq_ignore_ascii_case(actual)
+    {
+        return Err(ServerError::CheckoutUnavailable(format!(
+            "remote checkout commit {actual} differs from client commit {expected}; {remedy}"
+        )));
+    }
+    let mut failures = 0usize;
+    let mut first = None;
+    for file in &request.files {
+        let error = match read_checkout_file_for_locator(root, &file.relative_path) {
+            Ok(bytes) if hash_bytes(&bytes) == file.file_hash => None,
+            Ok(_) => Some("file_hash does not match server checkout file".to_owned()),
+            Err(error) => Some(error),
+        };
+        if let Some(error) = error {
+            failures += 1;
+            first.get_or_insert_with(|| format!("{}: {error}", file.relative_path));
+        }
+    }
+    if let Some(first) = first {
+        return Err(ServerError::CheckoutUnavailable(format!(
+            "{failures} file(s) do not match the remote checkout (first: {first}); \
+             remote commit {}, client commit {}; {remedy}",
+            checkout_commit.as_deref().unwrap_or("unknown"),
+            request.commit_hash.as_deref().unwrap_or("unknown")
+        )));
+    }
+    Ok(IngestPreflightResponse { checkout_commit })
+}
+
+async fn route_ingest_preflight<P>(
+    State(state): State<Arc<ServerState<P>>>,
+    auth: axum::extract::Extension<AuthIdentity>,
+    Json(mut body): Json<mempalace_federation::IngestPreflightRequest>,
+) -> Result<Json<mempalace_federation::IngestPreflightResponse>, ServerError>
+where
+    P: EmbeddingProvider + Send + Sync + 'static,
+{
+    let wing = WingId::new(&body.wing)?;
+    if is_diary_wing_or_room(wing.as_str(), "") {
+        return Err(ServerError::DiaryNotFederated);
+    }
+    if !auth.0.allows_wing(Operation::Ingest, wing.as_str()) {
+        return Err(ServerError::Forbidden);
+    }
+    body.wing = wing.as_str().to_owned();
+    let root = state.config.server.checkouts.get(wing.as_str()).map(PathBuf::as_path);
+    Ok(Json(validate_ingest_checkout(root, &body).await?))
+}
+
 async fn route_ingest_batch<P>(
     State(state): State<Arc<ServerState<P>>>,
     auth: axum::extract::Extension<AuthIdentity>,
@@ -2697,6 +2810,7 @@ where
     // Hold a resumable file's lock through receipt completion. Unrelated sources can
     // progress independently; legacy batches lock one file at a time.
     let _ingest_guard;
+    let mut recovering_committed_ingest = false;
     if let Some(replication) = &body.replication {
         if body.files.len() != 1
             || replication.batch_id.trim().is_empty()
@@ -2736,12 +2850,48 @@ where
                     "ingest record identity was reused with a different request".to_owned(),
                 ));
             }
-            ReceiptOutcome::Fresh(_) | ReceiptOutcome::Recover(_) => {}
+            ReceiptOutcome::Recover(receipt) => {
+                // Resolve the crash-after-commit window while holding the source
+                // lock, before touching checkout bytes. Details establish that a
+                // prior attempt reached application; matching metadata identifies
+                // its committed effect. Fresh/unapplied records still validate.
+                recovering_committed_ingest = receipt.details.is_some()
+                    && !replication.remove
+                    && state
+                        .storage
+                        .operational_store()
+                        .get_ingested_file(&format!(
+                            "projects:{wing_str}:{repo_id_hash}:{}",
+                            body.files[0].relative_path
+                        ))?
+                        .is_some_and(|record| record.content_hash == body.files[0].content_hash);
+            }
+            ReceiptOutcome::Fresh(_) => {}
         }
     }
 
     // ── resolve_root for this wing (may be empty) ─────────────────────────────
     let resolve_root_path = state.config.server.checkouts.get(wing.as_str()).cloned();
+    // Receipt replay above intentionally wins over checkout drift: an already
+    // acknowledged record must remain replayable after the checkout moves.
+    let preflight = mempalace_federation::IngestPreflightRequest {
+        wing: wing.as_str().to_owned(),
+        commit_hash: body.commit_hash.clone(),
+        files: body
+            .files
+            .iter()
+            .filter(|file| !file.chunks.is_empty())
+            .filter_map(|file| {
+                file.file_hash.as_ref().map(|file_hash| mempalace_federation::IngestPreflightFile {
+                    relative_path: file.relative_path.clone(),
+                    file_hash: file_hash.clone(),
+                })
+            })
+            .collect(),
+    };
+    if !recovering_committed_ingest {
+        validate_ingest_checkout(resolve_root_path.as_deref(), &preflight).await?;
+    }
     let resolve_root =
         resolve_root_path.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
 
@@ -2764,8 +2914,6 @@ where
     let mut files_skipped: usize = 0;
     let mut files_failed: usize = 0;
     let mut total_drawers_written: usize = 0;
-    // Track whether we emitted the missing-checkout warning (at most once per request)
-    let mut warned_missing_checkout = false;
 
     for file in &body.files {
         let source_key = format!("projects:{wing_str}:{repo_id_hash}:{}", file.relative_path);
@@ -2828,13 +2976,7 @@ where
                     &replication.record_id,
                     &json!({"previous_ids": previous, "source_key": source_key}),
                 )?;
-            } else if !replication.remove
-                && state
-                    .storage
-                    .operational_store()
-                    .get_ingested_file(&source_key)?
-                    .is_some_and(|record| record.content_hash == file.content_hash)
-            {
+            } else if recovering_committed_ingest {
                 // A prior attempt committed before its receipt. Finish cleanup without
                 // revalidating a checkout that may have changed since that successful write.
                 file_results.push(IngestFileResult {
@@ -3063,7 +3205,6 @@ where
         // ── Build DrawerRecords ───────────────────────────────────────────────
         let mut drawers: Vec<DrawerRecord> = Vec::with_capacity(file.chunks.len());
         let mut build_error: Option<String> = None;
-        let mut built_locator_row = false;
 
         for (i, chunk) in file.chunks.iter().enumerate() {
             let room = chunk_rooms[i].clone();
@@ -3090,7 +3231,6 @@ where
                 let be = chunk.byte_end.unwrap_or(0);
                 let ls = chunk.line_start.unwrap_or(1);
                 let le = chunk.line_end.unwrap_or(1);
-                built_locator_row = true;
                 (
                     Some(SourceLocator {
                         byte_start: bs,
@@ -3142,11 +3282,6 @@ where
             continue;
         }
 
-        // Warn once if we built locator rows but have no resolve_root
-        if built_locator_row && resolve_root.is_empty() && !warned_missing_checkout {
-            warned_missing_checkout = true;
-        }
-
         // ── Commit ────────────────────────────────────────────────────────────
         let n = drawers.len();
         match state
@@ -3183,13 +3318,7 @@ where
     }
 
     // ── Warnings ──────────────────────────────────────────────────────────────
-    let mut warnings: Vec<String> = Vec::new();
-    if warned_missing_checkout {
-        warnings.push(format!(
-            "no checkout configured for wing '{wing_str}'; locator results will resolve as \
-             stale placeholders until server.checkouts is set"
-        ));
-    }
+    let warnings: Vec<String> = Vec::new();
 
     // ── Change event (only when at least one file was ingested) ───────────────
     if files_ingested > 0 || (body.replication.is_some() && files_skipped > 0) {
@@ -8403,11 +8532,313 @@ mod tests {
 
     // ─── 9. Ingest batch ──────────────────────────────────────────────────────
 
+    #[tokio::test]
+    async fn checkout_preflight_bounds_entries_before_checkout_io() {
+        let harness = make_harness().await;
+        for (count, repeated, expected) in [
+            (MAX_INGEST_FILES + 1, false, StatusCode::BAD_REQUEST),
+            (2, true, StatusCode::BAD_REQUEST),
+            (MAX_INGEST_FILES, false, StatusCode::CONFLICT),
+        ] {
+            let files: Vec<_> = (0..count)
+                .map(|index| {
+                    json!({
+                        "relative_path":format!("file{}.rs", if repeated {0} else {index}),
+                        "file_hash":"hash"
+                    })
+                })
+                .collect();
+            let response = harness
+                .router
+                .clone()
+                .oneshot(authed_json_request(
+                    Method::POST,
+                    "/v1/ingest/preflight",
+                    ALICE_TOKEN,
+                    json!({"wing":"wing_unmapped", "files":files}),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "count={count}, repeated={repeated}");
+        }
+    }
+
+    #[tokio::test]
+    async fn checkout_recovery_finishes_committed_effect_after_drift() {
+        for (applied, missing) in [(true, false), (true, true), (false, false), (false, true)] {
+            let checkout = TempDir::new().unwrap();
+            let path = checkout.path().join("a.rs");
+            std::fs::write(&path, "original").unwrap();
+            let harness = make_harness_with_checkouts(std::collections::BTreeMap::from([(
+                "wing_checkout".to_owned(),
+                checkout.path().to_path_buf(),
+            )]))
+            .await;
+            let request: IngestBatchRequest = serde_json::from_value(json!({
+                "wing":"wing_checkout", "repo_id":"repo",
+                "replication":{"batch_id":"batch", "record_id":"crash-record"},
+                "files":[{"relative_path":"a.rs", "content_hash":"v1", "file_hash":hash_bytes(b"original"),
+                    "chunks":[{"chunk_index":0,"room":"general","text":"original",
+                        "byte_start":0,"byte_end":8,"line_start":1,"line_end":1}]}]
+            })).unwrap();
+            let source_key = format!("projects:wing_checkout:{}:a.rs", hash_text("repo"));
+            let stale_id = DrawerId::new("stale-recovery-drawer").unwrap();
+            if applied {
+                let mut legacy = request.clone();
+                legacy.replication = None;
+                let response = harness
+                    .router
+                    .clone()
+                    .oneshot(authed_json_request(
+                        Method::POST,
+                        "/v1/ingest/batch",
+                        ALICE_TOKEN,
+                        json!(legacy),
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                // Recreate the crash window: current metadata committed, but an
+                // obsolete drawer remains until receipt completion runs cleanup.
+                let current = harness
+                    .state
+                    .storage
+                    .operational_store()
+                    .committed_drawer_ids_for_source_key(&source_key)
+                    .unwrap();
+                let mut stale = harness
+                    .state
+                    .storage
+                    .drawer_store()
+                    .get_drawer(&current[0])
+                    .await
+                    .unwrap()
+                    .unwrap();
+                stale.id = stale_id.clone();
+                harness
+                    .state
+                    .storage
+                    .drawer_store()
+                    .put_drawers(&[stale], DuplicateStrategy::Error)
+                    .await
+                    .unwrap();
+            }
+            let receipts = harness.state.storage.receipt_store();
+            receipts
+                .begin_receipt(&NewReceipt {
+                    operation_id: "crash-record".to_owned(),
+                    operation_kind: "ingest_file".to_owned(),
+                    request_hash: mutation_request_hash(&[
+                        ("request", json!(&request)),
+                        ("identity", json!("alice")),
+                    ]),
+                    target_id: hash_text("wing_checkout:repo:a.rs"),
+                })
+                .unwrap();
+            receipts.set_receipt_details("crash-record", &json!({
+                "source_key":source_key, "previous_ids":if applied {vec![stale_id.clone()]} else {vec![]}
+            })).unwrap();
+            if missing {
+                std::fs::remove_file(&path).unwrap();
+            } else {
+                std::fs::write(&path, "changed").unwrap();
+            }
+            let response = harness
+                .router
+                .clone()
+                .oneshot(authed_json_request(
+                    Method::POST,
+                    "/v1/ingest/batch",
+                    ALICE_TOKEN,
+                    json!(request),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                if applied { StatusCode::OK } else { StatusCode::CONFLICT }
+            );
+            if applied {
+                assert_eq!(body_json(response).await["files"][0]["status"], "skipped_unchanged");
+                assert!(
+                    harness
+                        .state
+                        .storage
+                        .drawer_store()
+                        .get_drawer(&stale_id)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            assert_eq!(
+                receipts.get_receipt("crash-record").unwrap().unwrap().response.is_some(),
+                applied
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn checkout_preflight_detects_commit_drift_and_dirty_bytes() {
+        let checkout = TempDir::new().unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(checkout.path())
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        git(&["init"]);
+        std::fs::write(checkout.path().join("a.rs"), "original").unwrap();
+        git(&["add", "a.rs"]);
+        git(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            "initial",
+        ]);
+        let commit = git(&["rev-parse", "HEAD"]);
+        let harness = make_harness_with_checkouts(std::collections::BTreeMap::from([(
+            "wing_checkout".to_owned(),
+            checkout.path().to_path_buf(),
+        )]))
+        .await;
+        let send = |request| {
+            harness.router.clone().oneshot(authed_json_request(
+                Method::POST,
+                "/v1/ingest/preflight",
+                ALICE_TOKEN,
+                request,
+            ))
+        };
+        let mut request = json!({"wing":"wing_checkout", "commit_hash":commit,
+            "files":[{"relative_path":"a.rs", "file_hash":hash_bytes(b"original")}]});
+        let response = send(request.clone()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response).await["checkout_commit"], commit);
+        request["commit_hash"] = json!("0000000000000000000000000000000000000000");
+        let response = send(request.clone()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(body_json(response).await["message"].as_str().unwrap().contains(&commit));
+        request["commit_hash"] = json!(commit);
+        std::fs::write(checkout.path().join("a.rs"), "dirty").unwrap();
+        let response = send(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(body_json(response).await["message"].as_str().unwrap().contains("file_hash"));
+    }
+
+    #[tokio::test]
+    async fn checkout_preflight_enforces_scope_before_disclosing_checkout_state() {
+        let harness = make_harness().await;
+        for (token, wing, expected) in [
+            ("invalid-token", "wing_beta", StatusCode::UNAUTHORIZED),
+            (SCOPED_ALPHA_TOKEN, "wing_beta", StatusCode::FORBIDDEN),
+            (ALICE_TOKEN, "wing_agents", StatusCode::UNPROCESSABLE_ENTITY),
+        ] {
+            let response = harness
+                .router
+                .clone()
+                .oneshot(authed_json_request(
+                    Method::POST,
+                    "/v1/ingest/preflight",
+                    token,
+                    json!({"wing":wing,"files":[{"relative_path":"a.rs","file_hash":"hash"}]}),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
+        for path in
+            ["../outside.rs", "/absolute", "C:/absolute", ".git/config", ".env", "src\\a.rs"]
+        {
+            let response = harness
+                .router
+                .clone()
+                .oneshot(authed_json_request(
+                    Method::POST,
+                    "/v1/ingest/preflight",
+                    ALICE_TOKEN,
+                    json!({"wing":"wing_test","files":[{"relative_path":path,"file_hash":"hash"}]}),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[tokio::test]
+    async fn checkout_rejection_is_atomic_and_receipt_can_retry_after_repair() {
+        let checkout = TempDir::new().unwrap();
+        std::fs::write(checkout.path().join("a.rs"), "original").unwrap();
+        let harness = make_harness_with_checkouts(std::collections::BTreeMap::from([(
+            "wing_checkout".to_owned(),
+            checkout.path().to_path_buf(),
+        )]))
+        .await;
+        let send = |request| {
+            harness.router.clone().oneshot(authed_json_request(
+                Method::POST,
+                "/v1/ingest/batch",
+                ALICE_TOKEN,
+                request,
+            ))
+        };
+        let file = |path: &str| {
+            json!({"relative_path":path,"content_hash":"v1",
+            "file_hash":hash_bytes(b"original"), "chunks":[{"chunk_index":0,"room":"general",
+            "text":"original","byte_start":0,"byte_end":8,"line_start":1,"line_end":1}]})
+        };
+        let request = json!({"wing":"wing_checkout","repo_id":"repo",
+            "files":[file("a.rs"),file("missing.rs"),file("also-missing.rs")]});
+        let response = send(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(body_json(response).await["message"].as_str().unwrap().contains("2 file(s)"));
+        let source_key = format!("projects:wing_checkout:{}:a.rs", hash_text("repo"));
+        assert!(
+            harness
+                .state
+                .storage
+                .operational_store()
+                .get_ingested_file(&source_key)
+                .unwrap()
+                .is_none()
+        );
+
+        let request = json!({"wing":"wing_checkout","repo_id":"repo",
+            "replication":{"batch_id":"b","record_id":"checkout-record"},
+            "files":[file("missing.rs")]});
+        assert_eq!(send(request.clone()).await.unwrap().status(), StatusCode::CONFLICT);
+        std::fs::write(checkout.path().join("missing.rs"), "original").unwrap();
+        let response = send(request.clone()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let original = body_json(response).await;
+        assert_eq!(original["files"][0]["status"], "ingested");
+        std::fs::write(checkout.path().join("missing.rs"), "moved on").unwrap();
+        let response = send(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response).await, original);
+    }
+
     /// Happy path: 2 files (one with file_hash+ranges, one content-row without)
     /// → both "ingested", correct drawers_written, search finds them.
     #[tokio::test]
     async fn ingest_batch_happy_path_two_files() {
-        let harness = make_harness().await;
+        let checkout = TempDir::new().unwrap();
+        std::fs::create_dir(checkout.path().join("src")).unwrap();
+        let source = "authentication logic password hashing";
+        std::fs::write(checkout.path().join("src/auth.rs"), source).unwrap();
+        let harness = make_harness_with_checkouts(std::collections::BTreeMap::from([(
+            "wing_project".to_owned(),
+            checkout.path().to_path_buf(),
+        )]))
+        .await;
 
         let req = json!({
             "wing": "wing_project",
@@ -8415,10 +8846,10 @@ mod tests {
             "commit_hash": "abc123",
             "files": [
                 {
-                    // file_hash present → locator rows (will be stale since no checkout)
+                    // file_hash present → locator rows backed by matching bytes
                     "relative_path": "src/auth.rs",
                     "content_hash": "ch-auth-v1",
-                    "file_hash": "fh-auth-v1",
+                    "file_hash": hash_bytes(source.as_bytes()),
                     "chunks": [
                         {
                             "chunk_index": 0,
@@ -8461,10 +8892,9 @@ mod tests {
         assert_eq!(files[1]["status"], "ingested");
         assert_eq!(files[1]["drawers_written"], 1u64);
 
-        // Warnings should mention missing checkout since file_hash was set
+        // Validated checkout needs no warning.
         let warnings = body["warnings"].as_array().unwrap();
-        assert!(!warnings.is_empty(), "expected missing-checkout warning");
-        assert!(warnings[0].as_str().unwrap().contains("no checkout configured"));
+        assert!(warnings.is_empty());
 
         // List drawers should show 2 rows in the wing
         let list_resp = harness
@@ -8943,7 +9373,14 @@ mod tests {
     /// byte_end < byte_start → file result "failed" (200 with per-file error).
     #[tokio::test]
     async fn ingest_batch_invalid_byte_range_fails_file_not_request() {
-        let harness = make_harness().await;
+        let checkout = TempDir::new().unwrap();
+        std::fs::create_dir(checkout.path().join("src")).unwrap();
+        std::fs::write(checkout.path().join("src/bad.rs"), "some code here").unwrap();
+        let harness = make_harness_with_checkouts(std::collections::BTreeMap::from([(
+            "wing_range".to_owned(),
+            checkout.path().to_path_buf(),
+        )]))
+        .await;
         let resp = harness
             .router
             .clone()
@@ -8958,7 +9395,7 @@ mod tests {
                         {
                             "relative_path": "src/bad.rs",
                             "content_hash": "ch-bad",
-                            "file_hash": "fh-bad",
+                            "file_hash": hash_bytes(b"some code here"),
                             "chunks": [
                                 {
                                     "chunk_index": 0, "room": "backend",
@@ -8983,7 +9420,14 @@ mod tests {
     /// line_end < line_start → file result "failed" (200 with per-file error).
     #[tokio::test]
     async fn ingest_batch_invalid_line_range_fails_file() {
-        let harness = make_harness().await;
+        let checkout = TempDir::new().unwrap();
+        std::fs::create_dir(checkout.path().join("src")).unwrap();
+        std::fs::write(checkout.path().join("src/bad.rs"), "some code here").unwrap();
+        let harness = make_harness_with_checkouts(std::collections::BTreeMap::from([(
+            "wing_lines".to_owned(),
+            checkout.path().to_path_buf(),
+        )]))
+        .await;
         let resp = harness
             .router
             .clone()
@@ -8998,7 +9442,7 @@ mod tests {
                         {
                             "relative_path": "src/bad.rs",
                             "content_hash": "ch-bad",
-                            "file_hash": "fh-bad",
+                            "file_hash": hash_bytes(b"some code here"),
                             "chunks": [
                                 {
                                     "chunk_index": 0, "room": "backend",
@@ -9150,15 +9594,14 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
         let body = body_json(resp).await;
-        assert_eq!(body["files"][0]["status"], "failed");
-        assert!(body["files"][0]["error"].as_str().unwrap().contains("file_hash does not match"));
+        assert!(body.to_string().contains("file_hash does not match"));
     }
 
-    /// Unmapped wing: locator rows with empty resolve_root → search returns stale.
+    /// Unmapped wing fails before storing any unresolvable rows.
     #[tokio::test]
-    async fn ingest_batch_unmapped_wing_produces_stale_and_warning() {
+    async fn ingest_batch_unmapped_wing_rejected_without_writes() {
         // No checkouts configured — use default harness
         let harness = make_harness().await;
 
@@ -9193,15 +9636,12 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
         let body = body_json(resp).await;
-        assert_eq!(body["files"][0]["status"], "ingested");
+        assert!(body.to_string().contains("no checkout configured"));
+        assert!(body.to_string().contains("wing_unmapped"));
 
-        let warnings = body["warnings"].as_array().unwrap();
-        assert!(!warnings.is_empty(), "should warn about missing checkout");
-        assert!(warnings[0].as_str().unwrap().contains("wing_unmapped"));
-
-        // Search should find it but stale=true
+        // Rejected batch left no searchable rows.
         let search_resp = harness
             .router
             .clone()
@@ -9216,9 +9656,7 @@ mod tests {
         assert_eq!(search_resp.status(), StatusCode::OK);
         let search_body = body_json(search_resp).await;
         let results = search_body["results"].as_array().unwrap();
-        assert!(!results.is_empty(), "search must find the drawer");
-        let stale = results[0].get("stale").and_then(|v| v.as_bool()).unwrap_or(false);
-        assert!(stale, "result from unmapped wing must be stale=true");
+        assert!(results.is_empty(), "rejected batch must not write drawers");
     }
 
     /// Path traversal / absolute / backslash relative_path → per-file "failed".

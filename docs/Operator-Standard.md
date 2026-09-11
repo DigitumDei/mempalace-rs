@@ -160,6 +160,15 @@ Operational notes:
   right scope for that route.
 - To resolve mined locator snippets server-side, map wings to local checkout paths
   via `server.checkouts` in `config.json`.
+- Locator ingestion now rejects missing checkouts, differing known commits, or
+  mismatched file bytes with `checkout_unavailable` (HTTP 409). Update the mapped
+  checkout to the mined commit/bytes and retry. For a terminal durable rejection,
+  run a fresh mine after repair; status/wake-up retain the failed record and error.
+  Phase 1 of #91 adds validation/preflight, not automatic Git fetch.
+- Install Git on the receiving server's PATH to enable checkout HEAD diagnostics.
+  Without Git or readable Git metadata, commit diagnostics are unavailable but
+  file-hash validation still runs. A committed write whose receipt was interrupted
+  can finish recovery even if the checkout changes before retry.
 - Cold cache bootstrap uses the same `MEMPALACE_EMBED_ALLOW_DOWNLOADS` rule as the
   other binaries; `MEMPALACE_STUB_EMBEDDINGS` runs the server with deterministic
   stub vectors for offline testing.

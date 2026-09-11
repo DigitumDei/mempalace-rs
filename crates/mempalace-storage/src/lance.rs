@@ -604,6 +604,143 @@ impl DrawerStore for LanceDrawerStore {
         let batches = stream.try_collect::<Vec<_>>().await?;
         records_from_batches(&batches)
     }
+
+    async fn count_by_wing_room(
+        &self,
+        filter: &DrawerFilter,
+        exclude_diary: bool,
+    ) -> Result<std::collections::BTreeMap<String, std::collections::BTreeMap<String, usize>>> {
+        let table = self.table().await?;
+        let mut predicate = compile_filter(filter);
+        if exclude_diary {
+            if !predicate.is_empty() {
+                predicate.push_str(" AND ");
+            }
+            predicate.push_str(&format!(
+                "wing != '{}' AND room != '{}'",
+                escape_sql(mempalace_core::SHARED_AGENT_DIARY_WING),
+                escape_sql(mempalace_core::DIARY_ROOM)
+            ));
+        }
+        let mut query = table.query().select(Select::columns(&["wing", "room"]));
+        if !predicate.is_empty() {
+            query = query.only_if(predicate);
+        }
+        let mut stream = query.execute().await?;
+        let mut counts =
+            std::collections::BTreeMap::<String, std::collections::BTreeMap<String, usize>>::new();
+        // Never collect batches: memory grows with taxonomy size, not drawer count.
+        while let Some(batch) = stream.try_next().await? {
+            let wings = batch.column(0).as_string::<i32>();
+            let rooms = batch.column(1).as_string::<i32>();
+            for row in 0..batch.num_rows() {
+                *counts
+                    .entry(wings.value(row).to_owned())
+                    .or_default()
+                    .entry(rooms.value(row).to_owned())
+                    .or_default() += 1;
+            }
+        }
+        Ok(counts)
+    }
+
+    async fn list_layer_drawers(
+        &self,
+        filter: &DrawerFilter,
+        limit: usize,
+    ) -> Result<Vec<DrawerRecord>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let table = self.table().await?;
+        let mut query = table.query().select(Select::columns(&[
+            "id",
+            "wing",
+            "room",
+            "date",
+            "filed_at",
+            "source_file",
+            "chunk_index",
+            "importance",
+            "emotional_weight",
+            "weight",
+        ]));
+        let predicate = compile_filter(filter);
+        if !predicate.is_empty() {
+            query = query.only_if(predicate);
+        }
+        let mut stream = query.execute().await?;
+        let mut top = Vec::<DrawerRecord>::new();
+        // Ranking includes weight fallbacks and platform-native source basenames.
+        // Stream only those metadata columns, retaining at most `limit` candidates.
+        while let Some(batch) = stream.try_next().await? {
+            for candidate in layer_metadata_from_batch(&batch)? {
+                let position = top.partition_point(|existing| {
+                    !mempalace_core::compare_layer_drawers(existing, &candidate).is_gt()
+                });
+                if position < limit {
+                    top.insert(position, candidate);
+                    top.truncate(limit);
+                }
+            }
+        }
+        if top.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Use the same table handle for the body fetch; never resolve locators here.
+        let ids = top.into_iter().map(|record| record.id).collect::<Vec<_>>();
+        let stream = table
+            .query()
+            .only_if(format!("id IN ({})", quote_ids(&ids)))
+            .limit(limit)
+            .execute()
+            .await?;
+        let mut drawers = records_from_batches(&stream.try_collect::<Vec<_>>().await?)?;
+        drawers.sort_by(mempalace_core::compare_layer_drawers);
+        Ok(drawers)
+    }
+}
+
+/// Decode only ranking metadata; bodies, embeddings, and locators are never read.
+fn layer_metadata_from_batch(batch: &RecordBatch) -> Result<Vec<DrawerRecord>> {
+    let ids = batch.column(0).as_string::<i32>();
+    let wings = batch.column(1).as_string::<i32>();
+    let rooms = batch.column(2).as_string::<i32>();
+    let dates = batch.column(3).as_primitive::<arrow_array::types::Date32Type>();
+    let filed = batch.column(4).as_primitive::<arrow_array::types::TimestampMicrosecondType>();
+    let sources = batch.column(5).as_string::<i32>();
+    let chunks = batch.column(6).as_primitive::<arrow_array::types::UInt32Type>();
+    let importance = batch.column(7).as_primitive::<Float32Type>();
+    let emotional = batch.column(8).as_primitive::<Float32Type>();
+    let weight = batch.column(9).as_primitive::<Float32Type>();
+    (0..batch.num_rows())
+        .map(|row| {
+            Ok(DrawerRecord {
+                id: DrawerId::new(ids.value(row))?,
+                wing: WingId::new(wings.value(row))?,
+                room: mempalace_core::RoomId::new(rooms.value(row))?,
+                date: if dates.is_null(row) { None } else { Some(days_to_date(dates.value(row))?) },
+                filed_at: OffsetDateTime::from_unix_timestamp_nanos(
+                    i128::from(filed.value(row)) * 1_000,
+                )
+                .map_err(|err| StorageError::Invariant(err.to_string()))?,
+                source_file: sources.value(row).to_owned(),
+                chunk_index: chunks.value(row),
+                importance: (!importance.is_null(row)).then(|| importance.value(row)),
+                emotional_weight: (!emotional.is_null(row)).then(|| emotional.value(row)),
+                weight: (!weight.is_null(row)).then(|| weight.value(row)),
+                hall: None,
+                ingest_mode: String::new(),
+                extract_mode: None,
+                added_by: String::new(),
+                content: String::new(),
+                content_hash: String::new(),
+                embedding: Vec::new(),
+                locator: None,
+                view_metadata: None,
+            })
+        })
+        .collect()
 }
 
 fn drawers_to_reader(
@@ -1390,6 +1527,94 @@ mod tests {
             .unwrap();
 
         assert_eq!(results.len(), 10_005);
+        let counts = store
+            .count_by_wing_room(&DrawerFilter { limit: Some(1), ..DrawerFilter::default() }, false)
+            .await
+            .unwrap();
+        assert_eq!(counts["project_alpha"]["backend"], 10_005);
+        let top = store.list_layer_drawers(&DrawerFilter::default(), 15).await.unwrap();
+        let mut expected = results;
+        expected.sort_by(mempalace_core::compare_layer_drawers);
+        expected.truncate(15);
+        assert_eq!(top, expected);
+    }
+
+    #[tokio::test]
+    async fn metadata_counts_preserve_views_diary_filters_and_mutations() {
+        let tempdir = tempdir().unwrap();
+        let store = LanceDrawerStore::new(tempdir.path().join("lance"), EmbeddingProfile::Balanced);
+        store.ensure_schema().await.unwrap();
+        assert!(
+            store.count_by_wing_room(&DrawerFilter::default(), false).await.unwrap().is_empty()
+        );
+        let mut drawers = vec![
+            record("a", "alpha", "shared", "a", [0.0; 4]),
+            record("b", "beta", "shared", "b", [0.0; 4]),
+            record("c", "alpha", "diary", "c", [0.0; 4]),
+            record("d", "wing_agents", "general", "d", [0.0; 4]),
+            record("e", "alpha", "branch", "e", [0.0; 4]),
+        ];
+        drawers[4].ingest_mode = "projects-branch".to_owned();
+        store.put_drawers(&drawers, DuplicateStrategy::Error).await.unwrap();
+        let counts = store.count_by_wing_room(&DrawerFilter::default(), false).await.unwrap();
+        assert_eq!(counts.values().flat_map(|rooms| rooms.values()).sum::<usize>(), 4);
+        assert_eq!(counts["alpha"]["diary"], 1);
+        let counts = store.count_by_wing_room(&DrawerFilter::default(), true).await.unwrap();
+        assert_eq!(counts.len(), 2);
+        assert_eq!(counts["alpha"].len(), 1);
+        let scoped =
+            DrawerFilter { wings: vec![WingId::new("alpha").unwrap()], ..DrawerFilter::default() };
+        assert_eq!(store.count_by_wing_room(&scoped, true).await.unwrap().len(), 1);
+        let mismatch = DrawerFilter { wing: Some(WingId::new("beta").unwrap()), ..scoped.clone() };
+        assert!(store.count_by_wing_room(&mismatch, true).await.unwrap().is_empty());
+        let all = DrawerFilter { include_all_views: true, ..DrawerFilter::default() };
+        assert_eq!(store.count_by_wing_room(&all, true).await.unwrap()["alpha"]["branch"], 1);
+        store.delete_drawers(&[drawers[0].id.clone()]).await.unwrap();
+        assert!(store.count_by_wing_room(&scoped, true).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn bounded_layer_selection_matches_full_sort_with_ties_and_filters() {
+        let tempdir = tempdir().unwrap();
+        let store = LanceDrawerStore::new(tempdir.path().join("lance"), EmbeddingProfile::Balanced);
+        store.ensure_schema().await.unwrap();
+        let drawers = (0..1100)
+            .rev()
+            .map(|index| {
+                let mut drawer = record(
+                    &format!("d{index:04}"),
+                    if index % 2 == 0 { "alpha" } else { "beta" },
+                    if index % 3 == 0 { "a" } else { "z" },
+                    if index % 5 == 0 { "folder/a.txt" } else { "other/z.txt" },
+                    [0.1; 4],
+                );
+                drawer.importance = (index % 4 == 0).then_some(3.0);
+                drawer.emotional_weight = (index % 4 == 1).then_some(4.0);
+                drawer.weight = (index % 4 == 2).then_some(5.0);
+                drawer.date = (index % 7 == 0).then_some(date!(2025 - 01 - 01));
+                drawer.filed_at += time::Duration::seconds(index % 11);
+                drawer.chunk_index = (index % 13) as u32;
+                if index % 17 == 0 {
+                    drawer.ingest_mode = "projects-branch".to_owned();
+                }
+                drawer
+            })
+            .collect::<Vec<_>>();
+        store.put_drawers(&drawers, DuplicateStrategy::Error).await.unwrap();
+        for filter in [
+            DrawerFilter::default(),
+            DrawerFilter { wing: Some(WingId::new("alpha").unwrap()), ..DrawerFilter::default() },
+            DrawerFilter { include_all_views: true, ..DrawerFilter::default() },
+        ] {
+            let mut expected = store.list_drawers(&filter).await.unwrap();
+            expected.sort_by(mempalace_core::compare_layer_drawers);
+            for limit in [0, 1, 15, 1200] {
+                assert_eq!(
+                    store.list_layer_drawers(&filter, limit).await.unwrap(),
+                    expected.iter().take(limit).cloned().collect::<Vec<_>>()
+                );
+            }
+        }
     }
 
     #[tokio::test]

@@ -188,6 +188,13 @@ requires `Authorization: Bearer <token>`.
 | `GET /v1/coordination/results/{id}` | Get one task result |
 | `GET /v1/coordination/events` | Coordination audit-event feed (cursor-paginated) |
 
+Taxonomy, wings, and rooms counts stream projected wing/room metadata, with
+visible-wing and diary exclusions applied in the storage query. They do not load
+drawer bodies or embeddings and do not truncate counts to a drawer-list limit.
+CLI and MCP status use the same metadata aggregation while retaining their
+existing inclusion of diary drawers. Counts are read from the current table;
+there is no separately maintained count cache.
+
 `GET /v1/info` advertises a `capabilities` list; the `"ingest"` capability is what
 a client checks before attempting federated mining, and the `"coordination"`
 capability (added in issue #102 Stage 3) is what a client would check before

@@ -1,6 +1,5 @@
 #![allow(missing_docs)]
 
-use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
@@ -516,30 +515,7 @@ pub fn count_tokens(text: &str) -> usize {
 }
 
 fn order_drawers(drawers: &mut [DrawerRecord]) {
-    drawers.sort_by(|left, right| {
-        right
-            .importance
-            .or(right.emotional_weight)
-            .or(right.weight)
-            .unwrap_or(3.0)
-            .partial_cmp(&left.importance.or(left.emotional_weight).or(left.weight).unwrap_or(3.0))
-            .unwrap_or(Ordering::Equal)
-            .then_with(|| left.room.as_str().cmp(right.room.as_str()))
-            .then_with(|| compare_option_dates(right.date, left.date))
-            .then_with(|| right.filed_at.cmp(&left.filed_at))
-            .then_with(|| source_label(&left.source_file).cmp(source_label(&right.source_file)))
-            .then_with(|| left.chunk_index.cmp(&right.chunk_index))
-            .then_with(|| left.id.as_str().cmp(right.id.as_str()))
-    });
-}
-
-fn compare_option_dates(left: Option<time::Date>, right: Option<time::Date>) -> Ordering {
-    match (left, right) {
-        (Some(left), Some(right)) => left.cmp(&right),
-        (Some(_), None) => Ordering::Greater,
-        (None, Some(_)) => Ordering::Less,
-        (None, None) => Ordering::Equal,
-    }
+    drawers.sort_by(mempalace_core::compare_layer_drawers);
 }
 
 fn tokenize_words(text: &str) -> Vec<String> {

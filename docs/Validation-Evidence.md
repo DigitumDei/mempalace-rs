@@ -210,3 +210,35 @@ per-crate warning counts are from that run and have not been re-measured.
 ## Release decision
 
 This document covers only the small-VM runtime row of the validation matrix, and today it is still based on local builds. Per the release decision rule in `Packaging-And-Validation.md`, Rust v1 must not be marked release-ready from this document alone — attach the successful GitHub Actions packaging row and the artifact-based runtime rerun before cutting a release tag.
+
+## Supplemental Windows validation — bounded drawer reads (2026-09-11)
+
+Issues #136 and #39 were tested locally on `fix/bounded-wakeup-taxonomy` with
+856 passing regular tests across core, dialect, storage, search, server, MCP,
+and CLI, plus the ignored scale benchmark below. Workspace check and Clippy
+passed with existing warnings. This is separate from the small-VM and release
+artifact evidence above.
+
+The synthetic fixture has 150,000 locator-backed drawers, 10,000 source files,
+and Balanced embeddings. It is a single-wing fixture, built in batches of 1,000.
+Timings use the unoptimized test profile and exclude fixture creation,
+maintenance, and embedding-model/CLI startup:
+
+| Table state | L1 rendering, runs 1 / 2 | Wing/room counts, runs 1 / 2 |
+|---|---|---|
+| 150 ingestion fragments | 6.045 / 6.011 s | 2.945 / 2.928 s |
+| After fragment compaction | 1.394 / 1.390 s | 0.572 / 0.571 s |
+
+The post-compaction probe can be reproduced with:
+
+```sh
+cargo test -p mempalace-search large_palace_wakeup_metadata_benchmark --locked -- --ignored --nocapture
+```
+
+Ranking still scans projected metadata, retaining only the selected candidates
+before fetching full records and resolving locators. Counts stream projected
+wing/room metadata. Neither path materializes all drawer bodies or embeddings.
+Separate regressions compare bounded selection with a full sort across batches,
+verify fresh/stale locator output in both story formats, and verify counts above
+10,000 rows, view/diary/wing filters, and deletions. These results do not establish
+full CLI latency or performance on the original production palace.

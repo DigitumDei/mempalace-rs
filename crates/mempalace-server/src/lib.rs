@@ -2480,6 +2480,34 @@ where
     Ok(Json(stats))
 }
 
+/// Aggregate only authorized, non-diary metadata; an empty scope never queries all wings.
+async fn visible_drawer_counts<P>(
+    state: &ServerState<P>,
+    auth: &AuthIdentity,
+    wing: Option<WingId>,
+) -> Result<
+    std::collections::BTreeMap<String, std::collections::BTreeMap<String, usize>>,
+    ServerError,
+>
+where
+    P: EmbeddingProvider + Send + Sync + 'static,
+{
+    let wings = match auth.visible_wings(Operation::Read) {
+        WingVisibility::All => Vec::new(),
+        WingVisibility::Only(wings) => {
+            if wings.is_empty() {
+                return Ok(Default::default());
+            }
+            wings.into_iter().map(WingId::new).collect::<Result<Vec<_>, _>>()?
+        }
+    };
+    Ok(state
+        .storage
+        .drawer_store()
+        .count_by_wing_room(&DrawerFilter { wing, wings, ..DrawerFilter::default() }, true)
+        .await?)
+}
+
 // ─── Taxonomy ────────────────────────────────────────────────────────────────
 
 async fn route_taxonomy<P>(
@@ -2493,23 +2521,7 @@ where
     // handler runs), then filter to the wings the token can see rather than
     // rejecting outright — a token scoped to one wing must get that wing's
     // taxonomy, not a 403.
-    let visibility = auth.0.visible_wings(Operation::Read);
-    let drawers = state.storage.drawer_store().list_drawers(&DrawerFilter::default()).await?;
-    let mut taxonomy =
-        std::collections::BTreeMap::<String, std::collections::BTreeMap<String, usize>>::new();
-    for drawer in &drawers {
-        if is_diary_wing_or_room(drawer.wing.as_str(), drawer.room.as_str()) {
-            continue;
-        }
-        if !visibility.contains(drawer.wing.as_str()) {
-            continue;
-        }
-        *taxonomy
-            .entry(drawer.wing.as_str().to_owned())
-            .or_default()
-            .entry(drawer.room.as_str().to_owned())
-            .or_default() += 1;
-    }
+    let taxonomy = visible_drawer_counts(&state, &auth.0, None).await?;
     Ok(Json(json!({"taxonomy": taxonomy})))
 }
 
@@ -2523,18 +2535,11 @@ where
     P: EmbeddingProvider + Send + Sync + 'static,
 {
     // Group C filtering — see the identical comment in `route_taxonomy`.
-    let visibility = auth.0.visible_wings(Operation::Read);
-    let drawers = state.storage.drawer_store().list_drawers(&DrawerFilter::default()).await?;
-    let mut wings = std::collections::BTreeMap::<String, usize>::new();
-    for drawer in &drawers {
-        if is_diary_wing_or_room(drawer.wing.as_str(), drawer.room.as_str()) {
-            continue;
-        }
-        if !visibility.contains(drawer.wing.as_str()) {
-            continue;
-        }
-        *wings.entry(drawer.wing.as_str().to_owned()).or_default() += 1;
-    }
+    let counts = visible_drawer_counts(&state, &auth.0, None).await?;
+    let wings = counts
+        .into_iter()
+        .map(|(wing, rooms)| (wing, rooms.values().sum::<usize>()))
+        .collect::<std::collections::BTreeMap<_, _>>();
     Ok(Json(json!({"wings": wings})))
 }
 
@@ -2558,22 +2563,13 @@ where
     // Group C filtering — see the identical comment in `route_taxonomy`. This
     // applies even when the caller passes an explicit `?wing=`: a mismatched
     // scope filters the result to empty rather than rejecting the request.
-    let visibility = auth.0.visible_wings(Operation::Read);
     let wing = params.wing.as_deref().map(WingId::new).transpose()?;
-    let drawers = state
-        .storage
-        .drawer_store()
-        .list_drawers(&DrawerFilter { wing: wing.clone(), ..DrawerFilter::default() })
-        .await?;
+    let counts = visible_drawer_counts(&state, &auth.0, wing).await?;
     let mut rooms = std::collections::BTreeMap::<String, usize>::new();
-    for drawer in &drawers {
-        if is_diary_wing_or_room(drawer.wing.as_str(), drawer.room.as_str()) {
-            continue;
+    for wing_rooms in counts.into_values() {
+        for (room, count) in wing_rooms {
+            *rooms.entry(room).or_default() += count;
         }
-        if !visibility.contains(drawer.wing.as_str()) {
-            continue;
-        }
-        *rooms.entry(drawer.room.as_str().to_owned()).or_default() += 1;
     }
     Ok(Json(json!({
         "wing": params.wing.as_deref().unwrap_or("all"),

@@ -68,6 +68,26 @@ pub struct DrawerRecord {
     pub view_metadata: Option<RepositoryViewMetadata>,
 }
 
+/// Stable priority order used by plain-text and AAAK layer rendering.
+pub fn compare_layer_drawers(left: &DrawerRecord, right: &DrawerRecord) -> std::cmp::Ordering {
+    fn source_label(source: &str) -> &str {
+        std::path::Path::new(source).file_name().and_then(|name| name.to_str()).unwrap_or(source)
+    }
+    right
+        .importance
+        .or(right.emotional_weight)
+        .or(right.weight)
+        .unwrap_or(3.0)
+        .partial_cmp(&left.importance.or(left.emotional_weight).or(left.weight).unwrap_or(3.0))
+        .unwrap_or(std::cmp::Ordering::Equal)
+        .then_with(|| left.room.as_str().cmp(right.room.as_str()))
+        .then_with(|| right.date.cmp(&left.date))
+        .then_with(|| right.filed_at.cmp(&left.filed_at))
+        .then_with(|| source_label(&left.source_file).cmp(source_label(&right.source_file)))
+        .then_with(|| left.chunk_index.cmp(&right.chunk_index))
+        .then_with(|| left.id.as_str().cmp(right.id.as_str()))
+}
+
 /// Search request contract shared by CLI, MCP, and library APIs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchQuery {

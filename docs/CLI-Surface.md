@@ -161,7 +161,7 @@ Behavior:
 - In low-CPU mode, ingest batching is clamped by the resolved low-CPU runtime config. An explicit `--batch-size` overrides that clamp (it takes precedence over the low-CPU default).
 - `--reindex` bypasses the unchanged-content skip in both `projects` and `convos` modes.
 - When the wing's federation route targets a remote palace (mode `remote`, or mode `combined` with `write: remote`) and `--branch` is not set, the CLI prepares chunks locally and pushes them to `POST /v1/ingest/batch` on the remote server. The remote must advertise the `"ingest"` capability in `GET /v1/info`; older servers that lack this endpoint return a 404, which surfaces as a `RemoteRejected` error with a prompt to upgrade.
-- When the wing's federation route is `combined` with `write: both` and `--branch` is not set, the CLI performs a **local-first dual-write**: the full local mine (embedding, storage, summary) runs first, then a best-effort remote push is attempted. The remote result is appended to the mine output; a remote failure is reported without rolling back the local mine. See [Federation guide](Federation.md#write-both--durable-local-first-dual-write-semantics) for the full semantics.
+- Canonical `combined` / `write: both` mines stage each exact prepared file and local recovery snapshot before replacing the local source. They print `Remote replication: durably queued` and a batch ID without waiting on the network. Run `mempalace serve` (HTTP or `--stdio`) against the same palace to deliver and recover unfinished records. Check `mempalace_status` → `replication.ingestion` for progress. Branch views remain local; see [Federation guide](Federation.md#durable-canonical-mining-write-both).
 - Branch-delta mining is always local. Any resolved branch view — whether from `--branch`, `--view <name>`, or automatic detection — overrides a remote route for the wing. Only canonical mines are eligible for federated batch ingest.
 
 ### `project <register|show|list|remove|export>`
@@ -259,10 +259,9 @@ Behavior:
   invalid, or selects nothing; `1` when no palace exists at the resolved path.
 
 Known limitations:
-- Canonical stale-row reconciliation is local-only. A `write: remote` mine uploads
-  eligible files but does not delete stale remote rows; with `write: both`, only the
-  local replica is reconciled. Remote stale-row reconciliation is not currently
-  available through `mine` or `prune`.
+- A `write: remote` mine uploads eligible files without sweeping stale remote rows.
+  A complete unlimited `write: both` canonical mine replicates removals found in its local
+  manifest, but cannot sweep remote-only historical files. `prune` remains local-only.
 - Project data mined **before** the stable project-id migration is keyed by a checkout-path
   hash rather than `hash("project:<id>")`, so `--project-id` does not match those legacy
   rows. Re-mining migrates the **canonical** ones. Legacy `projects-branch` rows are never

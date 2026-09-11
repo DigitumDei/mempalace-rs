@@ -378,14 +378,14 @@ what was withheld rather than having to audit after the fact.
 When a **canonical** mine's wing routes to `mode: remote` (or `mode: combined`
 with `write: remote`), running `mine <dir>` routes to the remote palace instead
 of writing locally. When the route resolves to `mode: combined` with
-`write: both`, the mine runs locally first, then a best-effort remote push is
-attempted (see [Federation guide](Federation.md#write-both--durable-local-first-dual-write-semantics)).
+`write: both`, exact prepared files are durably staged before local commit and
+subsequently delivered by the replication worker (see [Federation guide](Federation.md#write-both--durable-local-first-dual-write-semantics)).
 
 A mine that resolves to a **branch view** — via `--branch`, `--view <name>`, or
 automatic detection on a non-canonical checkout — never routes remote. It always
 writes to the local palace, whatever the wing's route says.
 
-### Flow
+### Remote-only flow
 
 1. The CLI runs full project discovery, chunking, byte/line-offset calculation,
    and room detection locally — the same pipeline as a local mine — but skips
@@ -404,8 +404,9 @@ writes to the local palace, whatever the wing's route says.
 If the remote is unreachable and the route is `remote` or `combined` with
 `write: remote`, the run fails with an explicit error. There is no silent
 fallback to local storage (matching the write semantics of other federated
-operations). For `write: both`, the local mine still succeeds and the remote
-failure is appended to the mine output without rolling back.
+operations). For `write: both`, the CLI reports a durable batch ID. Delivery errors and
+progress appear in `mempalace_status` under `replication.ingestion`; see the
+[durability and recovery contract](Federation.md#durable-canonical-mining-write-both).
 
 If the current git branch differs from the repository's default branch, `mine`
 prints a warning line before sending. The run is not blocked.
@@ -682,9 +683,9 @@ therefore converge on the same keys.
 >
 > **Remote canonical mines are additive.** A wing routed with `write: remote` uploads
 > the currently eligible files but does not reconcile or delete stale remote rows.
-> With `write: both`, the local replica receives the reconciliation above while the
-> remote replica remains additive. Remote stale-row reconciliation is not currently
-> available through `mine` or `prune`.
+> With `write: both`, removals discovered from the local canonical manifest are also
+> durably replicated, in order with updates to the same source. Remote-only historical
+> rows absent from the local manifest cannot be swept; `prune` remains local-only.
 
 ### Overlay composition at search time
 

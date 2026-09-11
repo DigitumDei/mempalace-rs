@@ -324,12 +324,17 @@ CREATE INDEX IF NOT EXISTS idx_replication_outbox_claim
         let mut conn = self.connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some(op) = find_operation_by_key(&tx, &input.created_by, &input.idempotency_key)? {
+            let mut replay_payload = input.payload.clone();
+            if op.mutation_kind == "ingest_file" && op.payload["local"].get("effect_hash").is_some()
+            {
+                crate::replicated_ingest::compact_ingestion_payload(&mut replay_payload)?;
+            }
             if op.mutation_kind != input.mutation_kind
                 || op.entity_id != input.entity_id
                 || op.destination_remote != input.destination_remote
                 || op.ordering_key != input.ordering_key
                 || op.max_attempts != input.max_attempts
-                || op.payload != input.payload
+                || op.payload != replay_payload
             {
                 return Err(StorageError::Invariant(format!(
                     "outbox idempotency key `{}` was reused with a different mutation",
@@ -487,11 +492,15 @@ CREATE INDEX IF NOT EXISTS idx_replication_outbox_claim
         if op.state != OutboxState::Staged {
             return Err(StorageError::Invariant(OUTBOX_ONLY_STAGED_MAY_ACTIVATE.into()));
         }
+        let mut payload = op.payload;
+        if op.mutation_kind == "ingest_file" {
+            crate::replicated_ingest::compact_ingestion_payload(&mut payload)?;
+        }
         let now = OffsetDateTime::now_utc();
         let changed = tx.execute(
-            "UPDATE replication_outbox SET state='pending',revision=revision+1,updated_at=?2 \
+            "UPDATE replication_outbox SET state='pending',revision=revision+1,updated_at=?2,payload_json=?4 \
              WHERE operation_id=?1 AND revision=?3",
-            params![operation_id, format_time(now)?, expected_revision],
+            params![operation_id, format_time(now)?, expected_revision, serde_json::to_string(&payload)?],
         )?;
         if changed != 1 {
             return Ok(RevisionedWrite::Conflict { actual_revision: None });
@@ -1017,6 +1026,105 @@ CREATE INDEX IF NOT EXISTS idx_replication_outbox_claim
             cancelled_count: counts.5,
             total_count: counts.6,
         })
+    }
+
+    /// Aggregate file and distinct-batch gauges without loading payloads or embeddings.
+    /// A partially failed batch can also be pending while its other files converge.
+    pub fn ingestion_backlog(&self) -> Result<Value> {
+        let conn = self.connection()?;
+        let (pending, retryable, failed, total, oldest): (i64, i64, i64, i64, Option<String>) =
+            conn.query_row("SELECT COALESCE(SUM(pending),0), COALESCE(SUM(retrying),0),
+                COALESCE(SUM(failed),0), COUNT(*), MIN(oldest) FROM (
+                SELECT MAX(state IN ('staged','pending','leased','retryable')) AS pending,
+                MAX(state='retryable') AS retrying, MAX(state='failed') AS failed,
+                MIN(CASE WHEN state IN ('staged','pending','leased','retryable') THEN created_at END) AS oldest
+                FROM replication_outbox WHERE mutation_kind='ingest_file'
+                GROUP BY destination_remote, json_extract(payload_json,'$.request.replication.batch_id'))",
+                [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)))?;
+        let oldest_at = parse_time_opt(oldest)?;
+        let mut files = serde_json::Map::new();
+        let mut statement = conn.prepare(
+            "SELECT state, COUNT(*) FROM replication_outbox
+            WHERE mutation_kind='ingest_file' GROUP BY state",
+        )?;
+        for row in
+            statement.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?
+        {
+            let (state, count) = row?;
+            files.insert(state, Value::from(count));
+        }
+        Ok(serde_json::json!({
+            "pending_batches": pending, "retryable_batches": retryable,
+            "failed_batches": failed, "total_batches": total,
+            "oldest_pending_at": oldest_at.map(|value| value.format(&Rfc3339)).transpose()
+                .map_err(|error| StorageError::Invariant(error.to_string()))?,
+            "oldest_pending_age_seconds": oldest_at.map(|at| (OffsetDateTime::now_utc() - at).whole_seconds().max(0)),
+            "files_by_state": files,
+        }))
+    }
+
+    /// Number of durable file records actually staged by a mine invocation.
+    pub fn ingestion_batch_record_count(&self, batch_id: &str) -> Result<i64> {
+        self.connection()?
+            .query_row(
+                "SELECT COUNT(*) FROM replication_outbox WHERE mutation_kind='ingest_file'
+            AND json_extract(payload_json,'$.request.replication.batch_id')=?1",
+                [batch_id],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    /// Most recent ingestion record for one canonical source and destination.
+    pub fn latest_ingestion_for_source(
+        &self,
+        remote: &str,
+        source_key: &str,
+    ) -> Result<Option<OutboxOperation>> {
+        self.connection()?
+            .prepare(&format!(
+                "{OPERATION_COLUMNS} WHERE mutation_kind='ingest_file'
+            AND destination_remote=?1 AND entity_id=?2 ORDER BY sequence DESC LIMIT 1"
+            ))?
+            .query_row(params![remote, source_key], operation_row)
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Failed removals remain discoverable after their local source manifest was deleted.
+    pub fn failed_ingestion_removals(&self, remote: &str) -> Result<Vec<OutboxOperation>> {
+        self.connection()?.prepare(&format!("{OPERATION_COLUMNS} WHERE mutation_kind='ingest_file'
+            AND destination_remote=?1 AND state='failed'
+            AND json_extract(payload_json,'$.request.replication.remove')=1
+            AND NOT EXISTS (SELECT 1 FROM replication_outbox newer WHERE newer.destination_remote=?1
+                AND newer.entity_id=replication_outbox.entity_id AND newer.sequence>replication_outbox.sequence)
+            ORDER BY sequence"))?.query_map([remote], operation_row)?
+            .collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    }
+
+    /// Staged ingestion records for one local source, without a global page limit.
+    pub fn staged_ingestion_for_source(&self, source_key: &str) -> Result<Vec<OutboxOperation>> {
+        self.connection()?
+            .prepare(&format!(
+                "{OPERATION_COLUMNS} WHERE state='staged'
+            AND mutation_kind='ingest_file' AND json_extract(payload_json,'$.local.source_key')=?1
+            ORDER BY sequence"
+            ))?
+            .query_map([source_key], operation_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Source identities with recoverable local ingestion effects.
+    pub fn staged_ingestion_sources(&self) -> Result<Vec<String>> {
+        self.connection()?
+            .prepare(
+                "SELECT DISTINCT json_extract(payload_json,'$.local.source_key')
+            FROM replication_outbox WHERE state='staged' AND mutation_kind='ingest_file'",
+            )?
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     fn connection(&self) -> Result<Connection> {

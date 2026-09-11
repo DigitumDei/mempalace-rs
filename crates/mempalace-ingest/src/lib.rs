@@ -773,6 +773,107 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
     config: &ProjectConfig,
     project_id: Option<&str>,
 ) -> Result<IngestSummary> {
+    ingest_project_with_replication(engine, provider, request, config, project_id, None).await
+}
+
+/// One canonical mine's durable replication destination and stable batch identity.
+pub struct ProjectReplication {
+    pub remote: String,
+    pub batch_id: String,
+}
+
+impl ProjectReplication {
+    pub fn new(remote: String) -> Self {
+        Self { remote, batch_id: format!("batch_{}", uuid::Uuid::new_v4().simple()) }
+    }
+}
+
+fn prepared_file_dto(prepared: &PreparedFileChunks) -> IngestFileDto {
+    IngestFileDto {
+        relative_path: prepared.relative_path.clone(),
+        content_hash: prepared.content_hash.clone(),
+        file_hash: prepared.file_hash.clone(),
+        chunks: prepared
+            .chunks
+            .iter()
+            .map(|chunk| IngestChunkDto {
+                chunk_index: chunk.chunk_index,
+                room: chunk.room.clone(),
+                text: chunk.text.clone(),
+                byte_start: chunk.byte_start,
+                byte_end: chunk.byte_end,
+                line_start: chunk.line_start,
+                line_end: chunk.line_end,
+            })
+            .collect(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn replicate_prepared_source(
+    engine: &StorageEngine,
+    replication: &ProjectReplication,
+    wing: &str,
+    repo_id: &str,
+    agent: &str,
+    commit: Option<&str>,
+    source_key: &str,
+    file: IngestFileDto,
+    drawers: Vec<DrawerRecord>,
+    remove: bool,
+) -> Result<()> {
+    use mempalace_federation::{IngestBatchRequest, IngestReplicationIdentity};
+    use mempalace_storage::{NewOutboxOperation, ReplicatedSource};
+    let record_id = format!("ingest_{}", uuid::Uuid::new_v4().simple());
+    let ordering_key =
+        format!("{}{}", project_canonical_source_prefix(wing, repo_id), file.relative_path);
+    let local = ReplicatedSource {
+        source_key: source_key.to_owned(),
+        source_file: file.relative_path.clone(),
+        content_hash: file.content_hash.clone(),
+        drawers,
+        remove,
+        previous_ids: Vec::new(),
+    };
+    let request = IngestBatchRequest {
+        replication: Some(IngestReplicationIdentity {
+            batch_id: replication.batch_id.clone(),
+            record_id: record_id.clone(),
+            remove,
+        }),
+        wing: wing.to_owned(),
+        repo_id: repo_id.to_owned(),
+        agent: Some(agent.to_owned()),
+        commit_hash: commit.map(ToOwned::to_owned),
+        files: vec![file],
+    };
+    engine
+        .commit_replicated_source(
+            NewOutboxOperation {
+                created_by: "mine-replication".to_owned(),
+                idempotency_key: record_id,
+                mutation_kind: "ingest_file".to_owned(),
+                entity_id: ordering_key.clone(),
+                destination_remote: replication.remote.clone(),
+                ordering_key,
+                payload: serde_json::json!({"kind": "ingest_file", "request": request}),
+                max_attempts: 10,
+            },
+            local,
+        )
+        .await?;
+    Ok(())
+}
+
+/// Mine locally while journaling exact prepared records for asynchronous replication.
+pub async fn ingest_project_with_replication<P: EmbeddingProvider>(
+    engine: &StorageEngine,
+    provider: &mut P,
+    request: &ProjectIngestRequest,
+    config: &ProjectConfig,
+    project_id: Option<&str>,
+    replication: Option<&ProjectReplication>,
+) -> Result<IngestSummary> {
     let root = request
         .project_dir
         .canonicalize()
@@ -786,6 +887,10 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
     // An explicit canonical view always wins, including for direct library
     // callers that did not pass through the CLI's flag normalization.
     let branch_mode = request.branch && request.view.as_deref() != Some("canonical");
+    let replication = replication.filter(|_| !branch_mode && !request.dry_run);
+    if replication.is_some() {
+        engine.recover_replicated_ingestion().await?;
+    }
     let branch_name = match branch_mode {
         true => Some(request.view.clone().unwrap_or_else(|| {
             resolve_current_branch(&root).unwrap_or_else(|| "detached".to_owned())
@@ -901,6 +1006,73 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
                 if !request.reindex {
                     if let Some(existing) = current_existing {
                         if existing.content_hash == prepared.content_hash {
+                            if let Some(replication) = replication {
+                                let ordering_key = format!(
+                                    "{}{}",
+                                    project_canonical_source_prefix(&wing_name, &repo_id),
+                                    file.relative_path
+                                );
+                                let outbox = mempalace_storage::OutboxStore::new(
+                                    &engine.layout().sqlite_path,
+                                );
+                                let already_queued = outbox
+                                    .latest_ingestion_for_source(
+                                        &replication.remote,
+                                        &ordering_key,
+                                    )?
+                                    .is_some_and(|operation| {
+                                        !matches!(
+                                            operation.state,
+                                            mempalace_storage::OutboxState::Failed
+                                                | mempalace_storage::OutboxState::Cancelled
+                                        ) && operation.payload.pointer("/request/files/0")
+                                            == Some(&serde_json::json!(prepared_file_dto(
+                                                &prepared
+                                            )))
+                                    });
+                                if already_queued {
+                                    if let Some(old_key) = migrated_source_key.as_deref() {
+                                        engine.remove_source_key(old_key).await?;
+                                    }
+                                    summary.skipped_unchanged += 1;
+                                    continue;
+                                }
+                                // First write:both mine may follow a local-only mine. Journal the
+                                // exact prepared snapshot even when local content is unchanged.
+                                let (chunks, context) = prepared_chunks_to_ingest(
+                                    &prepared,
+                                    &resolve_root,
+                                    commit_hash.as_deref(),
+                                );
+                                let context = context.as_ref().map(PreparedLocatorStorage::as_ctx);
+                                let drawers = build_drawers(
+                                    provider,
+                                    &wing_id,
+                                    &sk,
+                                    &file.relative_path,
+                                    ingest_kind,
+                                    None,
+                                    &request.agent,
+                                    request.max_embed_batch_size,
+                                    chunks,
+                                    context.as_ref(),
+                                    None,
+                                    Some(&view_metadata),
+                                )?;
+                                replicate_prepared_source(
+                                    engine,
+                                    replication,
+                                    &wing_name,
+                                    &repo_id,
+                                    &request.agent,
+                                    commit_hash.as_deref(),
+                                    &sk,
+                                    prepared_file_dto(&prepared),
+                                    drawers,
+                                    false,
+                                )
+                                .await?;
+                            }
                             if !request.dry_run {
                                 if let Some(old_key) = migrated_source_key.as_deref() {
                                     engine.remove_source_key(old_key).await?;
@@ -913,7 +1085,24 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
                 }
 
                 if prepared.chunks.is_empty() {
-                    if !request.dry_run {
+                    if let Some(replication) = replication {
+                        replicate_prepared_source(
+                            engine,
+                            replication,
+                            &wing_name,
+                            &repo_id,
+                            &request.agent,
+                            commit_hash.as_deref(),
+                            &sk,
+                            prepared_file_dto(&prepared),
+                            Vec::new(),
+                            false,
+                        )
+                        .await?;
+                        if let Some(old_key) = migrated_source_key.as_deref() {
+                            engine.remove_source_key(old_key).await?;
+                        }
+                    } else if !request.dry_run {
                         replace_source_drawers(
                             engine,
                             &sk,
@@ -953,7 +1142,24 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
                 )?;
                 let drawer_count = source_drawers.len();
 
-                if !request.dry_run {
+                if let Some(replication) = replication {
+                    replicate_prepared_source(
+                        engine,
+                        replication,
+                        &wing_name,
+                        &repo_id,
+                        &request.agent,
+                        commit_hash.as_deref(),
+                        &sk,
+                        prepared_file_dto(&prepared),
+                        source_drawers,
+                        false,
+                    )
+                    .await?;
+                    if let Some(old_key) = migrated_source_key.as_deref() {
+                        engine.remove_source_key(old_key).await?;
+                    }
+                } else if !request.dry_run {
                     replace_source_drawers(
                         engine,
                         &sk,
@@ -1102,7 +1308,28 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
         for key in engine.operational_store().ingested_source_keys_with_prefix(&legacy_prefix)? {
             let rel = key.splitn(4, ':').nth(3).unwrap_or("");
             if !current_rel_paths.contains(rel) {
-                engine.remove_source_key(&key).await?;
+                if let Some(replication) = replication {
+                    replicate_prepared_source(
+                        engine,
+                        replication,
+                        &wing_name,
+                        &repo_id,
+                        &request.agent,
+                        commit_hash.as_deref(),
+                        &key,
+                        IngestFileDto {
+                            relative_path: rel.to_owned(),
+                            content_hash: String::new(),
+                            file_hash: None,
+                            chunks: Vec::new(),
+                        },
+                        Vec::new(),
+                        true,
+                    )
+                    .await?;
+                } else {
+                    engine.remove_source_key(&key).await?;
+                }
                 summary.removed_sources += 1;
             }
         }
@@ -1112,8 +1339,62 @@ pub async fn ingest_project_with_config<P: EmbeddingProvider>(
             // first 3 ':'-delimited segments to recover the relative path.
             let rel = key.splitn(4, ':').nth(3).unwrap_or("");
             if !current_rel_paths.contains(rel) {
-                engine.remove_source_key(&key).await?;
+                if let Some(replication) = replication {
+                    replicate_prepared_source(
+                        engine,
+                        replication,
+                        &wing_name,
+                        &repo_id,
+                        &request.agent,
+                        commit_hash.as_deref(),
+                        &key,
+                        IngestFileDto {
+                            relative_path: rel.to_owned(),
+                            content_hash: String::new(),
+                            file_hash: None,
+                            chunks: Vec::new(),
+                        },
+                        Vec::new(),
+                        true,
+                    )
+                    .await?;
+                } else {
+                    engine.remove_source_key(&key).await?;
+                }
                 summary.removed_sources += 1;
+            }
+        }
+        if let Some(replication) = replication {
+            let outbox = mempalace_storage::OutboxStore::new(&engine.layout().sqlite_path);
+            for operation in outbox.failed_ingestion_removals(&replication.remote)? {
+                let Some(key) =
+                    operation.payload.pointer("/local/source_key").and_then(Value::as_str)
+                else {
+                    continue;
+                };
+                let Some(rel) = operation.entity_id.strip_prefix(&stable_prefix) else {
+                    continue;
+                };
+                if !current_rel_paths.contains(rel) {
+                    replicate_prepared_source(
+                        engine,
+                        replication,
+                        &wing_name,
+                        &repo_id,
+                        &request.agent,
+                        commit_hash.as_deref(),
+                        key,
+                        IngestFileDto {
+                            relative_path: rel.to_owned(),
+                            content_hash: String::new(),
+                            file_hash: None,
+                            chunks: Vec::new(),
+                        },
+                        Vec::new(),
+                        true,
+                    )
+                    .await?;
+                }
             }
         }
     }

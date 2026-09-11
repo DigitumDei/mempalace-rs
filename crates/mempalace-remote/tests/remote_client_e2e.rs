@@ -455,6 +455,7 @@ async fn ingest_batch_round_trip() {
     // Use keyword clusters that are textually far apart so the
     // DeterministicStubProvider assigns distinct embeddings.
     let req = IngestBatchRequest {
+        replication: None,
         wing: "wing_ingest".to_owned(),
         repo_id: "github.com/test/myrepo".to_owned(),
         agent: Some("e2e-agent".to_owned()),
@@ -546,6 +547,7 @@ async fn ingest_batch_diary_wing_rejected_422() {
 
     // Sending to the diary room inside wing_agents must be rejected with 422.
     let req = IngestBatchRequest {
+        replication: None,
         wing: "wing_agents".to_owned(),
         repo_id: "github.com/test/repo".to_owned(),
         agent: None,
@@ -606,6 +608,7 @@ async fn ingest_batch_route_missing_returns_404() {
     let client = client_for(addr, None);
 
     let req = IngestBatchRequest {
+        replication: None,
         wing: "wing_code".to_owned(),
         repo_id: "github.com/test/repo".to_owned(),
         agent: None,

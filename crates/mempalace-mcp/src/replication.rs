@@ -21,6 +21,9 @@ pub(crate) const OUTBOX_MAX_ATTEMPTS: i64 = 10;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum ReplicationMutation {
+    IngestFile {
+        request: mempalace_federation::IngestBatchRequest,
+    },
     DrawerAdd {
         request: AddDrawerRequest,
     },
@@ -218,6 +221,44 @@ async fn deliver(remote: &dyn RemoteApi, operation: &OutboxOperation) -> Result<
             message: format!("invalid durable replication payload: {error}"),
         })?;
     match mutation {
+        ReplicationMutation::IngestFile { request } => {
+            if !info.capabilities.iter().any(|value| value == "resumable_ingest") {
+                return Err(RemoteError::CapabilityMissing {
+                    remote: operation.destination_remote.clone(),
+                    capability: "resumable_ingest".to_owned(),
+                });
+            }
+            let response = remote.ingest_batch(request.clone()).await?;
+            let file = response
+                .files
+                .first()
+                .filter(|file| {
+                    response.files.len() == 1
+                        && request
+                            .files
+                            .first()
+                            .is_some_and(|input| input.relative_path == file.relative_path)
+                })
+                .ok_or_else(|| RemoteError::UnknownOutcome {
+                    remote: operation.destination_remote.clone(),
+                    message: "ingest response did not identify exactly one requested file"
+                        .to_owned(),
+                })?;
+            match file.status.as_str() {
+                "ingested" | "skipped_unchanged" | "removed" => Ok(()),
+                "failed" => Err(RemoteError::InvalidConfig {
+                    remote: operation.destination_remote.clone(),
+                    message: file.error.clone().unwrap_or_else(|| "file rejected".to_owned()),
+                }),
+                _ => Err(RemoteError::UnknownOutcome {
+                    remote: operation.destination_remote.clone(),
+                    message: file
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "file outcome unknown".to_owned()),
+                }),
+            }
+        }
         ReplicationMutation::DrawerAdd { mut request } => {
             request.operation_id = Some(operation.operation_id.clone());
             let response = remote.add_drawer(request).await?;
@@ -278,6 +319,132 @@ pub(crate) fn expect_applied<T>(write: RevisionedWrite<T>, action: &str) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn ingest_worker_resumes_partial_batch_after_lost_ack_and_keeps_terminal_failure() {
+        use mempalace_config::{
+            FederationRuntimeConfig, LowCpuRuntimeConfig, MaintenanceRuntimeConfig,
+            MempalaceConfig, ServerRuntimeConfig,
+        };
+        use mempalace_core::EmbeddingProfile;
+        use mempalace_remote::{RemoteClient, RemoteEndpoint};
+        use mempalace_storage::{NewOutboxOperation, OutboxState};
+        use serde_json::json;
+        let directory = tempfile::tempdir().unwrap();
+        let token_path = directory.path().join("tokens.json");
+        std::fs::write(&token_path, r#"[{"token":"test-token","name":"test","enabled":true}]"#)
+            .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let config = MempalaceConfig {
+            schema_version: 1,
+            collection_name: "mempalace_drawers".into(),
+            palace_path: directory.path().join("remote"),
+            embedding_profile: EmbeddingProfile::Balanced,
+            low_cpu: LowCpuRuntimeConfig::defaults_for_profile(EmbeddingProfile::Balanced),
+            maintenance: MaintenanceRuntimeConfig::defaults(),
+            federation: FederationRuntimeConfig::default(),
+            server: ServerRuntimeConfig {
+                bind: "127.0.0.1:0".parse().unwrap(),
+                token_file: token_path.clone(),
+                checkouts: BTreeMap::new(),
+            },
+        };
+        let (router, state) = mempalace_server::build_router(
+            config,
+            mempalace_embeddings::DeterministicStubProvider::new(EmbeddingProfile::Balanced),
+            mempalace_server::TokenRegistry::load(token_path).unwrap(),
+        )
+        .await
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let remote = RemoteClient::new(RemoteEndpoint {
+            name: "hub".into(),
+            base_url: format!("http://{address}"),
+            token: Some("test-token".into()),
+            timeout: std::time::Duration::from_secs(2),
+        })
+        .unwrap();
+        let offline = RemoteClient::new(RemoteEndpoint {
+            name: "hub".into(),
+            base_url: "http://127.0.0.1:1".into(),
+            token: Some("test-token".into()),
+            timeout: std::time::Duration::from_millis(100),
+        })
+        .unwrap();
+        let path = directory.path().join("outbox.sqlite3");
+        let outbox = OutboxStore::new(&path);
+        outbox.ensure_schema().unwrap();
+        for (id, file) in [("first", "first.rs"), ("second", "second.rs"), ("bad", "../bad")] {
+            let request: mempalace_federation::IngestBatchRequest = serde_json::from_value(json!({
+                "wing":"wing_test", "repo_id":"repo", "replication":{"batch_id":"batch1","record_id":id},
+                "files":[{"relative_path":file,"content_hash":id,"chunks":[
+                    {"chunk_index":0,"room":"general","text":"durable worker source content"}]}]
+            })).unwrap();
+            let operation = outbox
+                .enqueue(&NewOutboxOperation {
+                    created_by: "test".into(),
+                    idempotency_key: id.into(),
+                    mutation_kind: "ingest_file".into(),
+                    entity_id: file.into(),
+                    destination_remote: "hub".into(),
+                    ordering_key: file.into(),
+                    payload: json!({"kind":"ingest_file","request":request}),
+                    max_attempts: 10,
+                })
+                .unwrap();
+            outbox.activate(&operation.operation_id, operation.revision).unwrap();
+        }
+        let metrics = PhaseMeter::default();
+        let first = claim_one(&outbox, "hub").unwrap().unwrap();
+        deliver_claimed(&outbox, &remote, first.clone(), &metrics).await;
+        let second = claim_one(&outbox, "hub").unwrap().unwrap();
+        deliver_claimed(&outbox, &offline, second.clone(), &metrics).await;
+        let bad = claim_one(&outbox, "hub").unwrap().unwrap();
+        deliver_claimed(&outbox, &remote, bad.clone(), &metrics).await;
+        let status = outbox.ingestion_backlog().unwrap();
+        assert_eq!(status["pending_batches"], 1);
+        assert_eq!(status["retryable_batches"], 1);
+        assert_eq!(status["failed_batches"], 1);
+        assert_eq!(status["files_by_state"]["replicated"], 1);
+        assert!(status["oldest_pending_age_seconds"].as_i64().is_some());
+        drop(outbox);
+        // Reopen after a process restart; make the persisted retry due without a wall-clock wait.
+        rusqlite::Connection::open(&path).unwrap().execute(
+            "UPDATE replication_outbox SET retry_after='2000-01-01T00:00:00Z' WHERE state='retryable'", []).unwrap();
+        let outbox = OutboxStore::new(&path);
+        let recovered = claim_one(&outbox, "hub").unwrap().unwrap();
+        assert_eq!(recovered.operation_id, second.operation_id);
+        // Crash after remote application but before durable acknowledgement.
+        deliver(&remote, &recovered).await.unwrap();
+        rusqlite::Connection::open(&path).unwrap().execute(
+            "UPDATE replication_outbox SET lease_expires_at='2000-01-01T00:00:00Z' WHERE state='leased'", []).unwrap();
+        drop(outbox);
+        let outbox = OutboxStore::new(&path);
+        let replay = claim_one(&outbox, "hub").unwrap().unwrap();
+        assert_eq!(replay.operation_id, second.operation_id);
+        deliver_claimed(&outbox, &remote, replay, &metrics).await;
+        assert!(claim_one(&outbox, "hub").unwrap().is_none());
+        assert_eq!(outbox.get_operation(&first.operation_id).unwrap().unwrap().attempt_count, 0);
+        assert_eq!(
+            outbox.get_operation(&bad.operation_id).unwrap().unwrap().state,
+            OutboxState::Failed
+        );
+        assert_eq!(outbox.ingestion_backlog().unwrap()["pending_batches"], 0);
+        assert_eq!(
+            state.storage.receipt_store().get_receipt("second").unwrap().unwrap().status,
+            mempalace_storage::ReceiptState::Completed
+        );
+        handle.abort();
+    }
 
     #[test]
     fn retry_backoff_is_bounded_and_stable() {

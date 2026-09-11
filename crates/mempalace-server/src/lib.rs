@@ -1320,6 +1320,7 @@ where
             "coordination".to_owned(),
             "coordination_task_list".to_owned(),
             "idempotent_mutations".to_owned(),
+            "resumable_ingest".to_owned(),
         ],
         maintenance_enabled: state.config.maintenance.enabled,
         maintenance_background_enabled: state.config.maintenance.background_enabled,
@@ -2656,7 +2657,7 @@ async fn route_ingest_batch<P>(
     State(state): State<Arc<ServerState<P>>>,
     auth: axum::extract::Extension<AuthIdentity>,
     Json(body): Json<IngestBatchRequest>,
-) -> Result<impl IntoResponse, ServerError>
+) -> Result<Json<IngestBatchResponse>, ServerError>
 where
     P: EmbeddingProvider + Send + Sync + 'static,
 {
@@ -2719,14 +2720,60 @@ where
         _ => identity.clone(),
     };
 
+    let wing_str = wing.as_str().to_owned();
+    let repo_id_hash = hash_text(&body.repo_id);
+    // Hold a resumable file's lock through receipt completion. Unrelated sources can
+    // progress independently; legacy batches lock one file at a time.
+    let _ingest_guard;
+    if let Some(replication) = &body.replication {
+        if body.files.len() != 1
+            || replication.batch_id.trim().is_empty()
+            || replication.batch_id.len() > 256
+            || replication.record_id.trim().is_empty()
+            || replication.record_id.len() > 256
+            || (replication.remove && !body.files[0].chunks.is_empty())
+        {
+            return Err(ServerError::InvalidParams(
+                "replicated ingest requires one file, bounded nonempty identities, and empty removal chunks".to_owned()));
+        }
+        _ingest_guard = state
+            .storage
+            .lock_ingest_source(&format!(
+                "projects:{wing_str}:{repo_id_hash}:{}",
+                body.files[0].relative_path
+            ))
+            .await?;
+        let request_hash =
+            mutation_request_hash(&[("request", json!(&body)), ("identity", json!(&identity))]);
+        match state.storage.receipt_store().begin_receipt(&NewReceipt {
+            operation_id: replication.record_id.clone(),
+            operation_kind: "ingest_file".to_owned(),
+            request_hash,
+            target_id: hash_text(&format!(
+                "{}:{}:{}",
+                wing, body.repo_id, body.files[0].relative_path
+            )),
+        })? {
+            ReceiptOutcome::Replay(receipt) => {
+                let response = serde_json::from_value(receipt.response.unwrap_or(Value::Null))
+                    .map_err(mempalace_storage::StorageError::from)?;
+                return Ok(Json(response));
+            }
+            ReceiptOutcome::Conflict { .. } => {
+                return Err(ServerError::IdempotencyConflict(
+                    "ingest record identity was reused with a different request".to_owned(),
+                ));
+            }
+            ReceiptOutcome::Fresh(_) | ReceiptOutcome::Recover(_) => {}
+        }
+    }
+
     // ── resolve_root for this wing (may be empty) ─────────────────────────────
     let resolve_root_path = state.config.server.checkouts.get(wing.as_str()).cloned();
     let resolve_root =
         resolve_root_path.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
 
     let now = OffsetDateTime::now_utc();
-    let wing_str = wing.as_str().to_owned();
-    let repo_id_hash = hash_text(&body.repo_id);
 
     // Build repository-view metadata for federated batch.
     let view_metadata = mempalace_core::RepositoryViewMetadata {
@@ -2750,8 +2797,13 @@ where
 
     for file in &body.files {
         let source_key = format!("projects:{wing_str}:{repo_id_hash}:{}", file.relative_path);
+        let _legacy_guard = if body.replication.is_none() {
+            Some(state.storage.lock_ingest_source(&source_key).await?)
+        } else {
+            None
+        };
 
-        if file.chunks.is_empty() {
+        if file.chunks.is_empty() && body.replication.is_none() {
             file_results.push(IngestFileResult {
                 relative_path: file.relative_path.clone(),
                 status: "failed".to_owned(),
@@ -2786,6 +2838,53 @@ where
                 error: Some(err),
             });
             files_failed += 1;
+            continue;
+        }
+
+        if let Some(replication) = &body.replication {
+            let receipt = state
+                .storage
+                .receipt_store()
+                .get_receipt(&replication.record_id)?
+                .expect("receipt was begun under the ingestion lock");
+            if receipt.details.is_none() {
+                let previous = state
+                    .storage
+                    .operational_store()
+                    .committed_drawer_ids_for_source_key(&source_key)?;
+                state.storage.receipt_store().set_receipt_details(
+                    &replication.record_id,
+                    &json!({"previous_ids": previous, "source_key": source_key}),
+                )?;
+            } else if !replication.remove
+                && state
+                    .storage
+                    .operational_store()
+                    .get_ingested_file(&source_key)?
+                    .is_some_and(|record| record.content_hash == file.content_hash)
+            {
+                // A prior attempt committed before its receipt. Finish cleanup without
+                // revalidating a checkout that may have changed since that successful write.
+                file_results.push(IngestFileResult {
+                    relative_path: file.relative_path.clone(),
+                    status: "skipped_unchanged".to_owned(),
+                    drawers_written: 0,
+                    error: None,
+                });
+                files_skipped += 1;
+                continue;
+            }
+        }
+
+        if body.replication.as_ref().is_some_and(|identity| identity.remove) {
+            state.storage.remove_source_key(&source_key).await?;
+            file_results.push(IngestFileResult {
+                relative_path: file.relative_path.clone(),
+                status: "removed".to_owned(),
+                drawers_written: 0,
+                error: None,
+            });
+            files_ingested += 1;
             continue;
         }
 
@@ -3121,8 +3220,8 @@ where
     }
 
     // ── Change event (only when at least one file was ingested) ───────────────
-    if files_ingested > 0 {
-        state.storage.operational_store().append_event(&ChangeEvent {
+    if files_ingested > 0 || (body.replication.is_some() && files_skipped > 0) {
+        let event = ChangeEvent {
             event_type: "mine_batch".to_owned(),
             occurred_at: now,
             entity_id: format!("mine_batch:{wing_str}"),
@@ -3138,10 +3237,64 @@ where
                 })
                 .to_string(),
             ),
-        })?;
+        };
+        if let Some(replication) = &body.replication {
+            state
+                .storage
+                .operational_store()
+                .append_event_if_absent_with_operation(&event, &replication.record_id)?;
+        } else {
+            state.storage.operational_store().append_event(&event)?;
+        }
     }
 
-    Ok(Json(IngestBatchResponse { files: file_results, warnings }))
+    // Infrastructure failures remain retryable; validation failures are terminal per file.
+    if body.replication.is_some() {
+        for file in &mut file_results {
+            if file.error.as_deref().is_some_and(|error| {
+                matches!(
+                    error,
+                    "ingest metadata lookup failed"
+                        | "embedding operation failed"
+                        | "ingest storage operation failed"
+                ) || error.contains("no embedding vector returned")
+            }) {
+                file.status = "retryable".to_owned();
+            }
+        }
+    }
+    let response = IngestBatchResponse { files: file_results, warnings };
+    if let Some(replication) = &body.replication {
+        if response.files.iter().all(|file| file.status != "retryable") {
+            if response.files.iter().all(|file| file.status != "failed") {
+                let receipt = state
+                    .storage
+                    .receipt_store()
+                    .get_receipt(&replication.record_id)?
+                    .expect("ingest receipt exists");
+                if let Some(details) = receipt.details {
+                    let previous: Vec<DrawerId> =
+                        serde_json::from_value(details["previous_ids"].clone())
+                            .map_err(mempalace_storage::StorageError::from)?;
+                    let source_key = details["source_key"].as_str().expect("stored source key");
+                    let current = state
+                        .storage
+                        .operational_store()
+                        .committed_drawer_ids_for_source_key(source_key)?;
+                    let stale: Vec<_> =
+                        previous.into_iter().filter(|id| !current.contains(id)).collect();
+                    if !stale.is_empty() {
+                        state.storage.drawer_store().delete_drawers(&stale).await?;
+                    }
+                }
+            }
+            state
+                .storage
+                .receipt_store()
+                .complete_receipt(&replication.record_id, &json!(&response))?;
+        }
+    }
+    Ok(Json(response))
 }
 
 // ─── Coordination (issue #102 Stage 3) ─────────────────────────────────────────
@@ -8403,6 +8556,240 @@ mod tests {
         let body2 = body_json(resp2).await;
         assert_eq!(body2["files"][0]["status"], "skipped_unchanged");
         assert_eq!(body2["files"][0]["drawers_written"], 0u64);
+    }
+
+    #[tokio::test]
+    async fn resumable_ingest_locks_each_source_without_blocking_other_files() {
+        let harness = make_harness().await;
+        let locked_key = format!("projects:wing_parallel:{}:b.rs", hash_text("repo"));
+        let guard = harness.state.storage.lock_ingest_source(&locked_key).await.unwrap();
+        let file = |path: &str| {
+            json!({"relative_path":path,"content_hash":"v1",
+            "chunks":[{"chunk_index":0,"room":"general","text":"source content"}]})
+        };
+        let send = |request| {
+            harness.router.clone().oneshot(authed_json_request(
+                Method::POST,
+                "/v1/ingest/batch",
+                ALICE_TOKEN,
+                request,
+            ))
+        };
+        let legacy = send(json!({"wing":"wing_parallel","repo_id":"repo",
+            "files":[file("a.rs"),file("b.rs")]}));
+        tokio::pin!(legacy);
+        let first_key = format!("projects:wing_parallel:{}:a.rs", hash_text("repo"));
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                tokio::select! {
+                    response = &mut legacy => panic!("batch passed locked source: {:?}", response),
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(25)) => {
+                        if harness.state.storage.operational_store().get_ingested_file(&first_key).unwrap().is_some() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }).await.unwrap();
+        // The batch waits on b.rs, having released a.rs. A receipt for a.rs must complete.
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            send(json!({
+            "wing":"wing_parallel","repo_id":"repo",
+            "replication":{"batch_id":"parallel","record_id":"free"},
+            "files":[file("a.rs")]})),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let same = send(json!({"wing":"wing_parallel","repo_id":"repo",
+            "replication":{"batch_id":"parallel","record_id":"blocked"},
+            "files":[file("b.rs")]}));
+        tokio::pin!(same);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut same).await.is_err()
+        );
+        assert!(harness.state.storage.receipt_store().get_receipt("blocked").unwrap().is_none());
+        drop(guard);
+        let (legacy, same) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(legacy, same)
+        })
+        .await
+        .unwrap();
+        assert_eq!(legacy.unwrap().status(), StatusCode::OK);
+        assert_eq!(same.unwrap().status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn resumable_ingest_replay_preserves_newer_updates_and_removals() {
+        let harness = make_harness().await;
+        let first = json!({
+            "wing":"wing_replay", "repo_id":"repo",
+            "replication":{"batch_id":"batch1", "record_id":"record1"},
+            "files":[{"relative_path":"a.rs", "content_hash":"v1",
+                "chunks":[{"chunk_index":0,"room":"general","text":"first source content"}]}]
+        });
+        let send = |request| {
+            harness.router.clone().oneshot(authed_json_request(
+                Method::POST,
+                "/v1/ingest/batch",
+                ALICE_TOKEN,
+                request,
+            ))
+        };
+        let original = body_json(send(first.clone()).await.unwrap()).await;
+        assert_eq!(original["files"][0]["status"], "ingested");
+        let mut second = first.clone();
+        second["replication"]["record_id"] = json!("record2");
+        second["files"][0]["content_hash"] = json!("v2");
+        second["files"][0]["chunks"][0]["text"] = json!("newer source content");
+        assert_eq!(
+            body_json(send(second.clone()).await.unwrap()).await["files"][0]["status"],
+            "ingested"
+        );
+        assert_eq!(body_json(send(first.clone()).await.unwrap()).await, original);
+        let source_key = format!("projects:wing_replay:{}:a.rs", hash_text("repo"));
+        assert_eq!(
+            harness
+                .state
+                .storage
+                .operational_store()
+                .get_ingested_file(&source_key)
+                .unwrap()
+                .unwrap()
+                .content_hash,
+            "v2"
+        );
+        let mut conflicting = first.clone();
+        conflicting["files"][0]["content_hash"] = json!("conflict");
+        assert_eq!(send(conflicting).await.unwrap().status(), StatusCode::CONFLICT);
+
+        let mut removal = first.clone();
+        removal["replication"]["record_id"] = json!("record3");
+        removal["replication"]["remove"] = json!(true);
+        removal["files"][0]["chunks"] = json!([]);
+        assert_eq!(
+            body_json(send(removal.clone()).await.unwrap()).await["files"][0]["status"],
+            "removed"
+        );
+        assert_eq!(body_json(send(second).await.unwrap()).await["files"][0]["status"], "ingested");
+        assert!(
+            harness
+                .state
+                .storage
+                .operational_store()
+                .get_ingested_file(&source_key)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(body_json(send(removal).await.unwrap()).await["files"][0]["status"], "removed");
+    }
+
+    #[tokio::test]
+    async fn resumable_ingest_recovers_receipt_before_and_after_effect() {
+        for applied in [false, true] {
+            let harness = make_harness().await;
+            let request: IngestBatchRequest = serde_json::from_value(json!({
+                "wing":"wing_recover", "repo_id":"repo",
+                "replication":{"batch_id":"batch1", "record_id":"record1"},
+                "files":[{"relative_path":"a.rs","content_hash":"v1", "chunks":[
+                    {"chunk_index":0,"room":"general","text":"recoverable source content"}]}]
+            }))
+            .unwrap();
+            if applied {
+                let mut legacy = request.clone();
+                legacy.replication = None;
+                let response = harness
+                    .router
+                    .clone()
+                    .oneshot(authed_json_request(
+                        Method::POST,
+                        "/v1/ingest/batch",
+                        ALICE_TOKEN,
+                        json!(legacy),
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+            harness
+                .state
+                .storage
+                .receipt_store()
+                .begin_receipt(&NewReceipt {
+                    operation_id: "record1".into(),
+                    operation_kind: "ingest_file".into(),
+                    request_hash: mutation_request_hash(&[
+                        ("request", json!(&request)),
+                        ("identity", json!("alice")),
+                    ]),
+                    target_id: hash_text("wing_recover:repo:a.rs"),
+                })
+                .unwrap();
+            let response = harness
+                .router
+                .clone()
+                .oneshot(authed_json_request(
+                    Method::POST,
+                    "/v1/ingest/batch",
+                    ALICE_TOKEN,
+                    json!(request),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = body_json(response).await;
+            assert_eq!(
+                body["files"][0]["status"],
+                if applied { "skipped_unchanged" } else { "ingested" }
+            );
+            assert_eq!(
+                harness
+                    .state
+                    .storage
+                    .receipt_store()
+                    .get_receipt("record1")
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                mempalace_storage::ReceiptState::Completed
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resumable_ingest_terminal_file_rejection_is_receipted() {
+        let harness = make_harness().await;
+        let request = json!({"wing":"wing_reject", "repo_id":"repo",
+            "replication":{"batch_id":"batch1", "record_id":"bad-record"},
+            "files":[{"relative_path":"../secret", "content_hash":"bad", "chunks":[]}]});
+        for _ in 0..2 {
+            let response = harness
+                .router
+                .clone()
+                .oneshot(authed_json_request(
+                    Method::POST,
+                    "/v1/ingest/batch",
+                    ALICE_TOKEN,
+                    request.clone(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(body_json(response).await["files"][0]["status"], "failed");
+        }
+        assert_eq!(
+            harness
+                .state
+                .storage
+                .receipt_store()
+                .get_receipt("bad-record")
+                .unwrap()
+                .unwrap()
+                .status,
+            mempalace_storage::ReceiptState::Completed
+        );
     }
 
     /// Changed file: modified content_hash + fewer chunks → "ingested" and dropped

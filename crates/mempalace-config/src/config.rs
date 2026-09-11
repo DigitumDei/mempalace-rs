@@ -262,7 +262,7 @@ impl LowCpuRuntimeConfig {
 pub struct MaintenanceConfigFileV1 {
     #[serde(default)]
     pub enabled: Option<bool>,
-    /// Whether the HTTP server schedules maintenance in the background.
+    /// Whether HTTP and stdio MCP schedule maintenance in the background.
     #[serde(default)]
     pub background_enabled: Option<bool>,
     #[serde(default)]
@@ -280,7 +280,7 @@ pub struct MaintenanceConfigFileV1 {
 pub struct MaintenanceRuntimeConfig {
     /// Whether the maintenance subsystem is enabled (default: true).
     pub enabled: bool,
-    /// Whether the HTTP server schedules maintenance automatically (default: true).
+    /// Whether HTTP and stdio MCP schedule maintenance automatically (default: true).
     pub background_enabled: bool,
     /// Minimum idle seconds since last write before maintenance runs (default: 300).
     pub idle_secs: usize,

@@ -258,6 +258,10 @@ fn migrate_data(from: &Path, to: &Path) -> io::Result<()> {
 }
 
 fn copy_tree(from: &Path, to: &Path, root: bool) -> io::Result<()> {
+    copy_tree_within(from, to, root, &fs::canonicalize(from)?)
+}
+
+fn copy_tree_within(from: &Path, to: &Path, root: bool, boundary: &Path) -> io::Result<()> {
     fs::set_permissions(to, fs::metadata(from)?.permissions())?;
     for entry in fs::read_dir(from)? {
         let entry = entry?;
@@ -267,13 +271,21 @@ fn copy_tree(from: &Path, to: &Path, root: bool) -> io::Result<()> {
         let kind = entry.file_type()?;
         let target = to.join(entry.file_name());
         if kind.is_symlink() {
-            return Err(invalid(format!(
-                "Refusing to follow migration symlink {}. Keep custom storage outside the default home and configure its path explicitly",
-                entry.path().display()
-            )));
+            // Hugging Face snapshots link to blobs in the same cache. Materialize
+            // internal file links so retiring the old home cannot break them.
+            // Canonicalization also rejects dangling links and link cycles.
+            let resolved = fs::canonicalize(entry.path())?;
+            if !resolved.starts_with(boundary) || !fs::metadata(&resolved)?.is_file() {
+                return Err(invalid(format!(
+                    "Refusing migration symlink {}: target must be a regular file inside {}",
+                    entry.path().display(),
+                    boundary.display()
+                )));
+            }
+            fs::copy(&resolved, &target)?;
         } else if kind.is_dir() {
             fs::create_dir(&target)?;
-            copy_tree(&entry.path(), &target, false)?;
+            copy_tree_within(&entry.path(), &target, false, boundary)?;
         } else if kind.is_file() {
             fs::copy(entry.path(), &target)?;
         } else {
@@ -538,6 +550,83 @@ fn backup_and_write(path: &Path, text: &str) -> io::Result<()> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[cfg(any(unix, windows))]
+    fn link_file(source: &Path, link: &Path) {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(source, link).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(source, link).unwrap();
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn migration_materializes_internal_snapshot_links_after_retiring_source() {
+        let home = tempfile::tempdir().unwrap();
+        let from = home.path().join("cache");
+        let to = home.path().join("new-cache");
+        fs::create_dir_all(from.join("models/blobs")).unwrap();
+        fs::create_dir_all(from.join("models/snapshots/revision")).unwrap();
+        fs::write(from.join("models/blobs/config"), b"model config").unwrap();
+        let relative = Path::new("models/snapshots/revision/config.json");
+        link_file(&Path::new("..").join("..").join("blobs").join("config"), &from.join(relative));
+        link_file(&from.join("models/blobs/config"), &from.join("absolute-link"));
+        migrate_data(&from, &to).unwrap();
+        assert!(!from.exists());
+        for name in [relative, Path::new("absolute-link")] {
+            assert_eq!(fs::read(to.join(name)).unwrap(), b"model config");
+            assert!(!fs::symlink_metadata(to.join(name)).unwrap().file_type().is_symlink());
+        }
+        assert!(
+            fs::symlink_metadata(backup_path(&from).join(relative))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn migration_rejects_external_dangling_and_cyclic_file_links() {
+        for case in ["external", "dangling", "cycle", "chain-escape"] {
+            let home = tempfile::tempdir().unwrap();
+            let from = home.path().join("cache");
+            let to = home.path().join("new-cache");
+            fs::create_dir(&from).unwrap();
+            fs::write(home.path().join("outside"), b"private").unwrap();
+            let target = match case {
+                "external" => home.path().join("outside"),
+                "dangling" => from.join("missing"),
+                "cycle" => from.join("link"),
+                _ => {
+                    link_file(&home.path().join("outside"), &from.join("intermediate"));
+                    from.join("intermediate")
+                }
+            };
+            link_file(&target, &from.join("link"));
+            assert!(migrate_data(&from, &to).is_err(), "{case}");
+            assert!(from.is_dir());
+            assert!(!to.exists());
+            assert!(!backup_path(&from).exists());
+            assert_eq!(fs::read(home.path().join("outside")).unwrap(), b"private");
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn migration_rejects_directory_links() {
+        let home = tempfile::tempdir().unwrap();
+        let from = home.path().join("cache");
+        let to = home.path().join("new-cache");
+        fs::create_dir_all(from.join("directory")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(from.join("directory"), from.join("link")).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(from.join("directory"), from.join("link")).unwrap();
+        assert!(migrate_data(&from, &to).is_err());
+        assert!(from.is_dir());
+        assert!(!to.exists());
+    }
 
     #[cfg(unix)]
     #[test]

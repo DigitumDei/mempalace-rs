@@ -406,6 +406,34 @@ pub struct ChangeEventDto {
 
 // ─── Bulk ingest ──────────────────────────────────────────────────────────────
 
+/// Content-free checkout validation for `POST /v1/ingest/preflight`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IngestPreflightRequest {
+    /// Target wing, subject to the same ingest authorization as a batch.
+    pub wing: String,
+    /// Full commit identifier reported by the client, if available.
+    #[serde(default)]
+    pub commit_hash: Option<String>,
+    /// Locator-backed files only; no source text is uploaded.
+    pub files: Vec<IngestPreflightFile>,
+}
+
+/// Expected bytes for one locator-backed file.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IngestPreflightFile {
+    /// Checkout-relative source path.
+    pub relative_path: String,
+    /// BLAKE3 hash of the complete source file.
+    pub file_hash: String,
+}
+
+/// Successful checkout validation. File bytes are checked even when Git metadata is absent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IngestPreflightResponse {
+    /// Current checkout HEAD, or null for a directory without readable Git metadata.
+    pub checkout_commit: Option<String>,
+}
+
 /// Request body for `POST /v1/ingest/batch`.
 ///
 /// The client sends one or more pre-chunked files; the server embeds them and
@@ -424,7 +452,8 @@ pub struct IngestBatchRequest {
     /// Client-declared agent name; server may augment from auth token.
     #[serde(default)]
     pub agent: Option<String>,
-    /// Git commit hash at the time of mining, for audit / change-event details.
+    /// Git commit hash at mining time. Locator batches require it to match the
+    /// receiver's HEAD when both are known; also retained in audit metadata.
     #[serde(default)]
     pub commit_hash: Option<String>,
     /// Files included in this batch.
@@ -493,7 +522,7 @@ pub struct IngestChunkDto {
 pub struct IngestBatchResponse {
     /// Per-file outcomes, in the same order as the request's `files` array.
     pub files: Vec<IngestFileResult>,
-    /// Non-fatal warnings (e.g. missing checkout mapping → stale placeholders).
+    /// Non-fatal warnings. Missing or mismatched checkouts are request errors.
     #[serde(default)]
     pub warnings: Vec<String>,
 }

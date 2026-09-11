@@ -13,7 +13,7 @@ This is the frozen command surface for `mempalace` v1.
 
 Purpose:
 - Detect rooms from the project's safe source directories.
-- Register the project centrally under the configured MemPalace base directory.
+- Register the project centrally under the configured AgentPalace base directory.
 - Initialize the default global config tree if needed.
 - Run embedding startup validation and report the status.
 

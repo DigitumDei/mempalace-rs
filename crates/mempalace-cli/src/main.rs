@@ -158,7 +158,7 @@ fn init_tracing(default_filter: &str) {
 #[derive(Debug, Parser)]
 #[command(
     name = "mempalace",
-    about = "MemPalace — Give your AI a memory. No API key required.",
+    about = "AgentPalace — Local-first memory, continuity, and coordination for AI agents.",
     version = mempalace_core::BUILD_VERSION
 )]
 struct Cli {
@@ -746,7 +746,7 @@ where
 
     let mut lines = vec![
         format!("\n{}", "=".repeat(INIT_HEADER_WIDTH)),
-        "  MemPalace Init — Local setup".to_owned(),
+        "  AgentPalace Init — Local setup".to_owned(),
         "=".repeat(INIT_HEADER_WIDTH),
         String::new(),
         format!("  WING: {}", project_config.wing),
@@ -1159,7 +1159,7 @@ fn execute_prune(
     let kind_labels = kinds.iter().map(|k| k.ingest_kind()).collect::<Vec<_>>().join(", ");
     let mut lines = vec![
         format!("\n{}", "=".repeat(STATUS_HEADER_WIDTH)),
-        "  MemPalace Prune (local palace only)".to_owned(),
+        "  AgentPalace Prune (local palace only)".to_owned(),
         "=".repeat(STATUS_HEADER_WIDTH),
         String::new(),
         format!("  Wing   : {effective_wing}"),
@@ -2174,7 +2174,7 @@ fn execute_status(
     let mut lines = vec![
         format!("\n{}", "=".repeat(STATUS_HEADER_WIDTH)),
         format!(
-            "  MemPalace Status — {} drawers",
+            "  AgentPalace Status — {} drawers",
             wing_rooms.values().map(|rooms| rooms.values().sum::<usize>()).sum::<usize>()
         ),
         "=".repeat(STATUS_HEADER_WIDTH),
@@ -2388,7 +2388,7 @@ where
         "WARNING: The federation server speaks plain HTTP. Bearer tokens must only be used \
          on trusted networks or behind a TLS-terminating reverse proxy."
     );
-    eprintln!("Starting MemPalace federation server");
+    eprintln!("Starting AgentPalace federation server");
     eprintln!("  Palace:     {}", config.palace_path.display());
     eprintln!("  Bind:       {bind}");
     eprintln!("  Token file: {}", token_file.display());
@@ -3237,7 +3237,7 @@ mod tests {
             run_cli(["init", project_dir.to_str().unwrap()], &context, stub_provider).unwrap();
 
         assert_eq!(output.exit_code, 0);
-        assert!(output.stdout.contains("MemPalace Init"));
+        assert!(output.stdout.contains("AgentPalace Init"));
         assert!(!project_dir.join("mempalace.yaml").exists());
         assert!(config_root.join("projects.json").exists());
         assert!(config_root.join("config.json").exists());
@@ -3458,7 +3458,7 @@ mod tests {
 
         let status = run_cli(["status"], &context, stub_provider).unwrap();
         assert_eq!(status.exit_code, 0);
-        assert!(status.stdout.contains("MemPalace Status"));
+        assert!(status.stdout.contains("AgentPalace Status"));
         assert!(status.stdout.contains("WING: wing_project_alpha"));
 
         let wake_up = run_cli(["wake-up"], &context, stub_provider).unwrap();

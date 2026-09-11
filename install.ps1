@@ -1,8 +1,8 @@
-# MemPalace installer - downloads the Windows x86_64 stable build, verifies its
+# AgentPalace installer - downloads the Windows x86_64 stable build, verifies its
 # signed manifest and checksums, installs to ~\.mempalace\bin, registers the MCP server with
 # detected AI tools, and warms the embedding model.
 #
-#   irm https://raw.githubusercontent.com/DigitumDei/mempalace-rs/main/install.ps1 | iex
+#   irm https://raw.githubusercontent.com/DigitumDei/agentpalace/main/install.ps1 | iex
 #
 # Piped `iex` cannot pass parameters; either download the script first and run
 # it with parameters, or set the env-var equivalents before the one-liner:
@@ -35,7 +35,7 @@ if (-not $InstallDir) {
     else { $InstallDir = Join-Path $HOME '.mempalace\bin' }
 }
 
-$repo = 'DigitumDei/mempalace-rs'
+$repo = 'DigitumDei/agentpalace'
 if ($Channel -eq 'stable') {
     if ($Version) { throw '-Version is only supported with -Channel nightly' }
     $releaseUrl = "https://github.com/$repo/releases/latest/download"
@@ -73,7 +73,7 @@ $tmpDir = Join-Path ([System.IO.Path]::GetTempPath()) ("mempalace-install-" + [S
 New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
 
 try {
-    Write-Host "Downloading MemPalace $Channel (windows-x86_64)..."
+    Write-Host "Downloading AgentPalace $Channel (windows-x86_64)..."
     $prevProgress = $ProgressPreference
     $ProgressPreference = 'SilentlyContinue'
     try {
@@ -256,7 +256,7 @@ or stage the model cache yourself and re-run with the warm-up skipped:
     }
 
     Write-Host ''
-    Write-Host 'MemPalace is installed. Next steps:'
+    Write-Host 'AgentPalace is installed. Next steps:'
     Write-Host '  mempalace init C:\path\to\your\project    # create a palace for a project'
     Write-Host '  mempalace mine C:\path\to\your\project    # ingest its files'
     Write-Host ''

@@ -1,6 +1,6 @@
 # Native local coordination
 
-MemPalace stores durable coordination state in the palace's local `storage.sqlite3`. It provides persistence and concurrency control; the host agent runtime still owns worker spawning, scheduling, tool execution, and live budget enforcement. Federation is opt-in and, as of issue #102 Stage 4, extends all the way to the MCP tool surface on this page: `mempalace-server` exposes tasks, messages, artifacts, results, and audit events over `/v1/coordination/*` to a caller holding the right scoped token, under the same wing-scoped authorization as the rest of the federation REST surface, and `mempalace-mcp`'s `RemoteApi`/`FederationRouter` route the MCP tools below to a configured remote when a wing's `federation.coordination` rule (or, for the ID-keyed tools, the mere presence of a configured remote) calls for it. The CLI is unaffected — it has never read or written coordination state. See [Federation → Part 7, Federated coordination](Federation.md#part-7--federated-coordination) for the full routing and wire behaviour.
+AgentPalace stores durable coordination state in the palace's local `storage.sqlite3`. It provides persistence and concurrency control; the host agent runtime still owns worker spawning, scheduling, tool execution, and live budget enforcement. Federation is opt-in and, as of issue #102 Stage 4, extends all the way to the MCP tool surface on this page: `mempalace-server` exposes tasks, messages, artifacts, results, and audit events over `/v1/coordination/*` to a caller holding the right scoped token, under the same wing-scoped authorization as the rest of the federation REST surface, and `mempalace-mcp`'s `RemoteApi`/`FederationRouter` route the MCP tools below to a configured remote when a wing's `federation.coordination` rule (or, for the ID-keyed tools, the mere presence of a configured remote) calls for it. The CLI is unaffected — it has never read or written coordination state. See [Federation → Part 7, Federated coordination](Federation.md#part-7--federated-coordination) for the full routing and wire behaviour.
 
 The discovery tool described below is local-only: it reports this palace's known coordination
 scope and configured destinations without querying remote records.
@@ -19,11 +19,11 @@ scope and configured destinations without querying remote records.
 - `mempalace_coordination_events` and `mempalace_inbox_read` accept an optional wing filter, normalised the same way as task creation, so a filter of `myproject` matches records stored under `wing_myproject`. Omitting the filter is unscoped and spans every wing, matching how visibility already worked before wings existed.
 - `wing_agents` — the shared agent diary wing — never federates, regardless of token scope. A remote `POST /v1/coordination/tasks` targeting it fails with 422; every other coordination route, and the inbox and event feeds, treat `wing_agents` state as though it does not exist. This is the same diary hard-override applied everywhere else in the palace; see [Federation → Part 7, Federated coordination](Federation.md#part-7--federated-coordination).
 
-Delivery is at least once with idempotent writes. MemPalace does not promise exactly-once task execution.
+Delivery is at least once with idempotent writes. AgentPalace does not promise exactly-once task execution.
 
 Task states are `pending`, `running`, `input_required`, `completed`, `cancelled`, `failed`, and `expired`. Terminal states cannot transition again. Only a current owner may transition owned work, except that another actor may request cancellation. An acknowledgement must name the message's addressed recipient.
 
-Actor IDs are asserted by the local host runtime. MemPalace enforces ownership and recipient checks against those IDs; transport-level authentication and worker execution remain host-runtime responsibilities.
+Actor IDs are asserted by the local host runtime. AgentPalace enforces ownership and recipient checks against those IDs; transport-level authentication and worker execution remain host-runtime responsibilities.
 
 **Acknowledgement is scoped to the wing, not to the acknowledging agent.** A recipient is a free-form string the sender chooses; it is not an authenticated identity and nothing verifies that the agent acknowledging a message is the agent it was addressed to. The check is that the acknowledgement names the recipient the message was stored with — so any caller who can reach the message can satisfy it. Locally that is any agent on the palace; over federation it is any token holding `coordination_write` on that message's wing. The wing is the authorization boundary here, and it is the same boundary `mempalace_inbox_read` already uses, which accepts any `recipient` argument rather than binding to the caller. Do not treat an acknowledgement as proof that a particular agent saw a message.
 
@@ -138,7 +138,7 @@ received or is about to send over its own transport, they do not speak either pr
 network themselves.
 
 Both adapters follow the same "translate AND persist" contract: an "import" tool does not just
-convert a wire shape into a MemPalace type and hand it back — it also performs the storage write
+convert a wire shape into an AgentPalace type and hand it back — it also performs the storage write
 and, for task imports, records the raw wire JSON verbatim as an immutable `protocol_envelope`-role
 artifact. The audit trail exists only because the tool writes it; a caller that instead calls a
 bare translation function and does its own storage writes would not automatically produce one.
@@ -222,7 +222,7 @@ writes to a remote:
   into its mapped `target_state` via `import_task`, per the state-preservation rule above. It
   reports `replayed` and refuses a state-mismatched replay on the same terms as
   `mempalace_a2a_task_import`. `ttlMs`
-  is a retention hint, never a MemPalace lifecycle deadline — it is surfaced only as
+  is a retention hint, never an AgentPalace lifecycle deadline — it is surfaced only as
   `provenance.retention_deadline`, never written to the task's `expires_at`. `NewTask` has no
   column for the source `taskId`/`createdAt`/`lastUpdatedAt` either, so this tool returns them all
   as `provenance`; **the caller must persist `provenance` itself** (e.g. as a knowledge-graph fact)

@@ -1,9 +1,9 @@
 # Delegation-loop telemetry
 
-MemPalace records what a delegated agent run declared it was allowed to spend, what it actually
+AgentPalace records what a delegated agent run declared it was allowed to spend, what it actually
 did, and why it stopped — durably, in the palace's local `storage.sqlite3`, and without storing
 transcripts. The host agent runtime still spawns workers, schedules models, executes tools, and
-**enforces budgets during execution**. MemPalace stores the declarations, checkpoints, and
+**enforces budgets during execution**. AgentPalace stores the declarations, checkpoints, and
 outcomes so a run stays reconstructable after a restart. Telemetry is local-only and is not
 federated.
 
@@ -47,11 +47,11 @@ itself.
 ## Budgets are stored, never enforced
 
 `budgets` is opaque JSON — declared maxima for depth, fan-out, turns, tool calls, tokens, wall
-time, retries, and concurrency. MemPalace persists it and never acts on it. Nothing in this
+time, retries, and concurrency. AgentPalace persists it and never acts on it. Nothing in this
 module refuses work for exceeding a budget; that decision belongs to the host runtime, per the
-product boundary in [issue #98](https://github.com/DigitumDei/mempalace-rs/issues/98).
+product boundary in [issue #98](https://github.com/DigitumDei/agentpalace/issues/98).
 
-What MemPalace *does* guarantee is that curtailment stays visible. Every close records an
+What AgentPalace *does* guarantee is that curtailment stays visible. Every close records an
 explicit `stop_reason`:
 
 `completed`, `budget_exhausted`, `max_depth_reached`, `max_fan_out_reached`, `cancelled`,
@@ -77,14 +77,14 @@ effectively unbounded transcript by splitting it across many under-the-cap check
 cumulative per-span cap is what actually makes that structurally impractical, which is the
 enforceable half of "sensitive complete traces and secrets are not persisted by default." Not
 storing *secrets* remains a caller responsibility, exactly as actor authentication does —
-MemPalace cannot detect them.
+AgentPalace cannot detect them.
 
 ## Reconstructing a run
 
 `mempalace_delegation_trace` returns the root span, every descendant span, and each of their
 checkpoints in sequence order. The node list is **flat**, with each node carrying
 `parent_span_id`, so a consumer rebuilds the tree itself and the response imposes no recursion
-depth. This is the export path for trace visualization; MemPalace does not ship a viewer.
+depth. This is the export path for trace visualization; AgentPalace does not ship a viewer.
 
 Because spans, checkpoints, and artifacts are all durable and exact-ID retrievable, a run
 reconstructs after a process restart from stored references alone — no prior conversation

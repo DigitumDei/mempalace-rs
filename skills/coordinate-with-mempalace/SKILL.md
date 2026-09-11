@@ -1,9 +1,9 @@
 ---
 name: coordinate-with-mempalace
-description: Coordinate multiple agents or resumable work with existing MemPalace drawer and change-cursor tools. Use for manager-as-tools delegation, explicit agent handoffs, restart-safe work queues, or passing large results by stable reference without copying transcripts. This experimental skill does not provide atomic claims or reliable queue delivery.
+description: Coordinate multiple agents or resumable work with existing AgentPalace drawer and change-cursor tools. Use for manager-as-tools delegation, explicit agent handoffs, restart-safe work queues, or passing large results by stable reference without copying transcripts. This experimental skill does not provide atomic claims or reliable queue delivery.
 ---
 
-# Coordinate with MemPalace
+# Coordinate with AgentPalace
 
 Use drawers as a durable coordination log and opaque change cursors as discovery checkpoints. Do not use semantic search as a queue.
 

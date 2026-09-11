@@ -76,11 +76,11 @@ Repository owners can independently verify the live controls:
 
 ```powershell
 gh api -H "X-GitHub-Api-Version: 2026-03-10" `
-  repos/DigitumDei/mempalace-rs/immutable-releases
-gh api repos/DigitumDei/mempalace-rs/environments/stable-release
-gh secret list --repo DigitumDei/mempalace-rs --env stable-release
+  repos/DigitumDei/agentpalace/immutable-releases
+gh api repos/DigitumDei/agentpalace/environments/stable-release
+gh secret list --repo DigitumDei/agentpalace --env stable-release
 gh variable get MEMPALACE_IMMUTABLE_RELEASES_ENABLED `
-  --repo DigitumDei/mempalace-rs --env stable-release
+  --repo DigitumDei/agentpalace --env stable-release
 ```
 
 ## Release versions

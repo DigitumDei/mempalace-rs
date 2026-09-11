@@ -1,14 +1,25 @@
 <div align="center">
-  <img src="docs/assets/mempalace-rs-logo.png" alt="mempalace-rs" width="280">
+  <img src="docs/assets/agentpalace-icon.png" alt="AgentPalace" width="280">
 </div>
 
-# mempalace-rs
+# AgentPalace
 
-Rust implementation of MemPalace — a persistent, structured memory system for LLM agents.
+Local-first memory, continuity, and coordination for AI agents, built in Rust.
+
+AgentPalace began as `mempalace-rs`, a Rust implementation of MemPalace, and has grown
+to include durable agent workflows, identity continuity, and opt-in federation.
+
+## Existing installations
+
+This is a product and repository rename. The executable remains `mempalace`; MCP
+tools retain their `mempalace_` prefix. Crate names, release asset names, `MEMPALACE_*`
+environment variables, `mempalace.yaml`, and `~/.mempalace` stay unchanged. Existing
+palaces, project IDs, integrations, and configuration need no migration. Historical
+design and validation documents may still use the earlier name.
 
 ## Overview
 
-MemPalace stores conversation and project context locally so your AI can search decisions, debugging history, and project knowledge instead of starting from zero each session. Embeddings, search, and graph operations run locally with no third-party inference API, telemetry, or analytics. Federation is an explicit opt-in exception for sharing selected wings with a palace endpoint you configure.
+AgentPalace stores conversation and project context locally so your AI can search decisions, debugging history, and project knowledge instead of starting from zero each session. Embeddings, search, and graph operations run locally with no third-party inference API, telemetry, or analytics. Federation is an explicit opt-in exception for sharing selected wings with a palace endpoint you configure.
 
 It provides:
 
@@ -33,13 +44,13 @@ The fastest path is to install the latest stable release, initialize a palace fo
 **macOS (Apple Silicon) / Linux (x86_64, glibc 2.38+):**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/DigitumDei/mempalace-rs/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/DigitumDei/agentpalace/main/install.sh | sh
 ```
 
 **Windows (x86_64, PowerShell 7.1+):**
 
 ```powershell
-irm https://raw.githubusercontent.com/DigitumDei/mempalace-rs/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/DigitumDei/agentpalace/main/install.ps1 | iex
 ```
 
 Then initialize and mine a project:

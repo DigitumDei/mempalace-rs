@@ -1,6 +1,6 @@
-# MemPalace Hooks — Auto-Save and Auto-Orient for Terminal AI Tools
+# AgentPalace Hooks — Auto-Save and Auto-Orient for Terminal AI Tools
 
-These hook scripts make MemPalace work automatically. No manual "save" or "orient" commands needed.
+These hook scripts make AgentPalace work automatically. No manual "save" or "orient" commands needed.
 
 ## What They Do
 

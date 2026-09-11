@@ -1,8 +1,8 @@
 # Skill registry
 
-MemPalace stores reusable, governed procedures in the palace's local `storage.sqlite3`. A skill
+AgentPalace stores reusable, governed procedures in the palace's local `storage.sqlite3`. A skill
 is a versioned, provenance-carrying procedure that an agent can discover, apply, and record
-outcomes against. MemPalace persists and governs the records; the host agent runtime still
+outcomes against. AgentPalace persists and governs the records; the host agent runtime still
 chooses when to apply a skill, executes it, and selects evaluators and approval policy. The
 registry is local-only and is not federated.
 
@@ -74,7 +74,7 @@ it displaces. Proposing an `agent`-scoped successor to a promoted project- or or
 skill therefore does not escape shared review — the displaced version's scope still governs. A
 scope change is a change to a governed record, not a way around the governance.
 
-Actor IDs are asserted by the local host runtime. MemPalace enforces the author/reviewer
+Actor IDs are asserted by the local host runtime. AgentPalace enforces the author/reviewer
 distinction and scope rules against those IDs; transport-level authentication remains a host
 responsibility, as it is for coordination.
 

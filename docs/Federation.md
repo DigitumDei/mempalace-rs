@@ -1,10 +1,10 @@
 # Federation Guide
 
 <div align="center">
-  <img src="assets/mempalace-rs-banner.png" alt="Federated MemPalace — a central palace linked to remote palaces" width="100%">
+  <img src="assets/agentpalace-icon.png" alt="AgentPalace" width="180">
 </div>
 
-Federation lets several MemPalace clients share one or more **remote palaces** over
+Federation lets several AgentPalace clients share one or more **remote palaces** over
 an HTTP REST API. An agent talking to its local MCP server sees a single seamless
 palace: reads for selected wings are transparently merged across local and remote,
 and writes are routed per the wing's rule. (The `mempalace` is federation-aware
@@ -22,7 +22,7 @@ it all locally for dev testing.
 
 ## Concepts
 
-- **Remote** — a named MemPalace server reachable over HTTP, defined in
+- **Remote** — a named AgentPalace server reachable over HTTP, defined in
   `federation.remotes`. Each remote has a `name`, `url`, optional bearer token,
   and timeout.
 - **Route** — per wing (and for the knowledge graph), one of three modes:
@@ -1261,7 +1261,7 @@ reports it via the same `{"success": false, "conflict": {"expected_revision": ..
 shape a local conflict already uses (see [Part 7 → Revision and lease
 conflicts](#revision-and-lease-conflicts)). A `409 coordination_conflict` (a live lease held by
 someone else, a terminal task, an invalid transition) has no revision pair to report and stays
-a hard error — MemPalace never retries a conflicting write on the caller's behalf, locally or
+a hard error — AgentPalace never retries a conflicting write on the caller's behalf, locally or
 federated.
 
 ### Discovering coordination routing

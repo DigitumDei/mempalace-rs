@@ -176,12 +176,14 @@ try {
         }
     }
 
-    $updated = Test-Path (Join-Path $InstallDir 'mempalace.exe')
+    $updated = (Test-Path (Join-Path $InstallDir 'mempalace.exe')) -or
+        (Test-Path (Join-Path $InstallDir 'mempalace-cli.exe')) -or
+        (Test-Path (Join-Path $InstallDir 'mempalace-mcp.exe'))
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
 
     # Clean up .old files left behind by a previous locked-file update.
-    Get-ChildItem -Path $InstallDir -Filter '*.exe.old' -ErrorAction SilentlyContinue | ForEach-Object {
-        try { Remove-Item $_.FullName -Force -Confirm:$false -ErrorAction Stop } catch {}
+    Get-ChildItem -LiteralPath $InstallDir -Filter 'mempalace*.old' -File -ErrorAction SilentlyContinue | ForEach-Object {
+        try { Remove-Item -LiteralPath $_.FullName -Force -Confirm:$false -ErrorAction Stop } catch {}
     }
 
     foreach ($asset in $assets) {
@@ -196,6 +198,20 @@ try {
             $oldTarget = "$target.$([guid]::NewGuid().ToString('N')).old"
             Move-Item -LiteralPath $target -Destination $oldTarget
             Move-Item -Path $source -Destination $target -Force
+        }
+    }
+
+    # Retire legacy entry points after installing the replacement. A running
+    # legacy server may lock its executable; rename it out of PATH for now.
+    foreach ($legacyName in @('mempalace-cli.exe', 'mempalace-mcp.exe')) {
+        $legacyPath = Join-Path $InstallDir $legacyName
+        if (Test-Path -LiteralPath $legacyPath -PathType Leaf) {
+            try {
+                Remove-Item -LiteralPath $legacyPath -Force -ErrorAction Stop
+            } catch {
+                $retiredPath = "$legacyPath.$([guid]::NewGuid().ToString('N')).old"
+                Move-Item -LiteralPath $legacyPath -Destination $retiredPath -ErrorAction Stop
+            }
         }
     }
 
@@ -226,7 +242,7 @@ try {
             # itself succeeded, so warn with remediation rather than aborting.
             Write-Warning @"
 The embedding-model warm-up in setup failed.
-mempalace (with built-in ONNX Runtime) are installed and usable, but the MCP server
+mempalace (with built-in ONNX Runtime) is installed and usable, but the MCP server
 will abort with OfflineStartup until the model cache is complete.
 Fix: re-run setup with network access to download the model:
   $(Join-Path $InstallDir 'mempalace.exe') setup

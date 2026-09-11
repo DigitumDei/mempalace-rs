@@ -111,4 +111,23 @@ async fn single_executable_serves_mcp_and_rest_with_authentication() {
             .status(),
         400
     );
+    // A malformed later item must reject the batch before an earlier write runs.
+    for invalid in [json!(42), json!({"jsonrpc":"1.0","id":6,"method":"ping"})] {
+        let batch = json!([
+            {"jsonrpc":"2.0","id":5,"method":"tools/call","params":{
+                "name":"mempalace_add_drawer","arguments":{
+                    "wing":"wing_batch_rejected","room":"general",
+                    "content":"Rejected batch must never store this telescope record.",
+                    "added_by":"batch-test"
+                }
+            }},
+            invalid
+        ]);
+        assert_eq!(post("owner-secret", batch).send().await.unwrap().status(), 400);
+    }
+    let search: Value = post("owner-secret", json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{
+        "name":"mempalace_search","arguments":{"query":"telescope record","wing":"wing_batch_rejected","limit":5}
+    }})).send().await.unwrap().json().await.unwrap();
+    let payload = mempalace_mcp::decode_tool_payload(&search).unwrap();
+    assert!(payload["results"].as_array().unwrap().is_empty(), "{search}");
 }

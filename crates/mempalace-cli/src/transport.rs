@@ -156,15 +156,18 @@ async fn handle<P: EmbeddingProvider + Send + Sync + 'static>(
     } else {
         vec![request.clone()]
     };
+    // Reject malformed envelopes before any tool can mutate storage.
+    if requests.iter().any(|request| !request.is_object() || request["jsonrpc"] != "2.0") {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
     let mut responses = Vec::new();
     for request in requests {
-        if !request.is_object() || request["jsonrpc"] != "2.0" {
-            return StatusCode::BAD_REQUEST.into_response();
-        }
         let initialize = request["method"] == "initialize";
         let mut response = state.server.handle_json_value(request).await;
-        if initialize && response.get("result").is_some() {
-            response["result"]["protocolVersion"] = Value::String("2025-03-26".into());
+        if initialize
+            && let Some(result) = response.get_mut("result").and_then(Value::as_object_mut)
+        {
+            result.insert("protocolVersion".into(), Value::String("2025-03-26".into()));
         }
         if !response.is_null() {
             responses.push(response);

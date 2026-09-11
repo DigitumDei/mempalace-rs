@@ -230,11 +230,15 @@ fi
 
 # --- Install ----------------------------------------------------------------
 UPDATED=0
-[ -f "${INSTALL_DIR}/mempalace" ] && UPDATED=1
+if [ -f "${INSTALL_DIR}/mempalace" ] || [ -f "${INSTALL_DIR}/mempalace-cli" ] || [ -f "${INSTALL_DIR}/mempalace-mcp" ]; then
+    UPDATED=1
+fi
 mkdir -p "${INSTALL_DIR}"
 mv "${TMP_DIR}/${NOTICES_ASSET}" "${INSTALL_DIR}/ONNXRuntime-NOTICES.txt"
 mv "${TMP_DIR}/${CLI_ASSET}" "${INSTALL_DIR}/mempalace"
 chmod +x "${INSTALL_DIR}/mempalace"
+# Retire the old entry points only after the unified executable is installed.
+rm -f "${INSTALL_DIR}/mempalace-cli" "${INSTALL_DIR}/mempalace-mcp"
 
 if [ "${UPDATED}" -eq 1 ]; then
     echo "Updated existing install in ${INSTALL_DIR}"
@@ -275,7 +279,7 @@ if [ "${RUN_SETUP}" -eq 1 ]; then
         cat >&2 <<EOF
 
 warning: the embedding-model warm-up in \`setup\` failed.
-  mempalace (with built-in ONNX Runtime) are installed and usable, but the MCP server
+  mempalace (with built-in ONNX Runtime) is installed and usable, but the MCP server
   will abort with OfflineStartup until the model cache is complete.
   Fix: re-run \`setup\` with network access to download the model:
     ${INSTALL_DIR}/mempalace setup

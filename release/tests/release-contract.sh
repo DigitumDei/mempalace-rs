@@ -41,12 +41,12 @@ make_assets() {
     local marker="$2"
     mkdir -p "$directory"
     for name in \
-        mempalace-cli-linux-x86_64 \
-        mempalace-mcp-linux-x86_64 \
-        mempalace-cli-macos-arm64 \
-        mempalace-mcp-macos-arm64 \
-        mempalace-cli-windows-x86_64.exe \
-        mempalace-mcp-windows-x86_64.exe
+        mempalace-linux-x86_64 \
+        mempalace-macos-arm64 \
+        mempalace-windows-x86_64.exe \
+        mempalace-notices-linux-x86_64.txt \
+        mempalace-notices-macos-arm64.txt \
+        mempalace-notices-windows-x86_64.txt
     do
         printf '%s:%s\n' "$marker" "$name" > "$directory/$name"
     done
@@ -83,7 +83,7 @@ bash "$repo_root/release/verify-manifest.sh" \
 
 tampered_binary="$temporary_root/tampered-binary"
 cp -R "$candidate_a" "$tampered_binary"
-printf 'tampered\n' >> "$tampered_binary/mempalace-cli-linux-x86_64"
+printf 'tampered\n' >> "$tampered_binary/mempalace-linux-x86_64"
 expect_failure "tampered binary" \
     bash "$repo_root/release/verify-manifest.sh" \
     "$tampered_binary" nightly "v0.1.0-nightly.$commit_a" 0.1.0 "$public_key"

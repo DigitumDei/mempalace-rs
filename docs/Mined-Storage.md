@@ -143,7 +143,7 @@ Run `mine --reindex <dir>` to re-mine a directory and replace content rows with
 locator rows:
 
 ```bash
-mempalace-cli mine /path/to/project --reindex
+mempalace mine /path/to/project --reindex
 ```
 
 `--reindex` bypasses the unchanged-content skip that would normally leave

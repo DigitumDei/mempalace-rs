@@ -1,8 +1,8 @@
 //! `mempalace setup` — detect installed AI coding tools and register the
 //! mempalace MCP server with each, idempotently.
 //!
-//! The MCP server is the local `mempalace-mcp` binary (by default
-//! `~/.mempalace/bin/mempalace-mcp[.exe]`), launched over stdio. For each
+//! The MCP server is the local `mempalace` binary (by default
+//! the currently running executable), launched with `serve --stdio`. For each
 //! supported tool we either run its own `mcp add` CLI (Claude Code, Codex,
 //! Gemini CLI) or merge an entry into its JSON config file (opencode, GitHub
 //! Copilot CLI, Antigravity). Cloud-only agents that cannot run a local stdio
@@ -25,8 +25,8 @@ const ALL_TOOLS: &[&str] =
 
 /// Options parsed from the `setup` subcommand.
 pub struct SetupOptions {
-    /// Override for the mempalace-mcp binary path. When `None`, defaults to
-    /// `~/.mempalace/bin/mempalace-mcp[.exe]`.
+    /// Override for the mempalace binary path. When `None`, defaults to
+    /// the currently running executable.
     pub mcp_path: Option<PathBuf>,
     /// Preview changes without running commands or writing files.
     pub dry_run: bool,
@@ -106,7 +106,7 @@ impl SetupReport {
         if !self.mcp_binary_present {
             lines
                 .push("  ! binary not found at that path yet — tools are pointed here;".to_owned());
-            lines.push("    install mempalace-mcp there for them to launch it.".to_owned());
+            lines.push("    install mempalace there for them to launch it.".to_owned());
         }
         lines.push(String::new());
 
@@ -136,7 +136,7 @@ fn handle_tool(key: &'static str, mcp: &str, dry_run: bool) -> ToolOutcome {
         return outcome(
             key,
             Status::Failed,
-            "could not resolve a mempalace-mcp path (no home directory; pass --mcp-path)",
+            "could not resolve a mempalace path (no home directory; pass --mcp-path)",
         );
     }
     match key {
@@ -193,11 +193,16 @@ fn handle_tool(key: &'static str, mcp: &str, dry_run: bool) -> ToolOutcome {
 // ─── CLI-based tools ─────────────────────────────────────────────────────────
 
 fn configure_claude(bin: &Path, mcp: &str, dry_run: bool) -> ToolOutcome {
+    if let Some(result) =
+        migrate_json_launcher("claude", home_dir().map(|p| p.join(".claude.json")), mcp, dry_run)
+    {
+        return result;
+    }
     if dry_run {
         return outcome(
             "claude",
             Status::WouldConfigure,
-            format!("would run: claude mcp add --scope user mempalace -- {mcp}"),
+            format!("would run: claude mcp add --scope user mempalace -- {mcp} serve --stdio"),
         );
     }
     // `claude mcp get` exits non-zero when the server is absent.
@@ -206,7 +211,10 @@ fn configure_claude(bin: &Path, mcp: &str, dry_run: bool) -> ToolOutcome {
             return outcome("claude", Status::AlreadyConfigured, "already registered (user scope)");
         }
     }
-    match run_tool(bin, &["mcp", "add", "--scope", "user", "mempalace", "--", mcp]) {
+    match run_tool(
+        bin,
+        &["mcp", "add", "--scope", "user", "mempalace", "--", mcp, "serve", "--stdio"],
+    ) {
         Ok(out) if out.status.success() => {
             outcome("claude", Status::Configured, "registered via `claude mcp add --scope user`")
         }
@@ -220,11 +228,14 @@ fn configure_claude(bin: &Path, mcp: &str, dry_run: bool) -> ToolOutcome {
 }
 
 fn configure_codex(bin: &Path, mcp: &str, dry_run: bool) -> ToolOutcome {
+    if let Some(result) = migrate_codex_launcher(mcp, dry_run) {
+        return result;
+    }
     if dry_run {
         return outcome(
             "codex",
             Status::WouldConfigure,
-            format!("would run: codex mcp add mempalace -- {mcp}"),
+            format!("would run: codex mcp add mempalace -- {mcp} serve --stdio"),
         );
     }
     if let Ok(out) = run_tool(bin, &["mcp", "get", "mempalace"]) {
@@ -236,7 +247,7 @@ fn configure_codex(bin: &Path, mcp: &str, dry_run: bool) -> ToolOutcome {
             );
         }
     }
-    match run_tool(bin, &["mcp", "add", "mempalace", "--", mcp]) {
+    match run_tool(bin, &["mcp", "add", "mempalace", "--", mcp, "serve", "--stdio"]) {
         Ok(out) if out.status.success() => {
             outcome("codex", Status::Configured, "registered via `codex mcp add`")
         }
@@ -250,6 +261,14 @@ fn configure_codex(bin: &Path, mcp: &str, dry_run: bool) -> ToolOutcome {
 }
 
 fn configure_gemini(bin: &Path, mcp: &str, dry_run: bool) -> ToolOutcome {
+    if let Some(result) = migrate_json_launcher(
+        "gemini",
+        home_dir().map(|p| p.join(".gemini/settings.json")),
+        mcp,
+        dry_run,
+    ) {
+        return result;
+    }
     if dry_run {
         return outcome(
             "gemini",
@@ -267,7 +286,7 @@ fn configure_gemini(bin: &Path, mcp: &str, dry_run: bool) -> ToolOutcome {
             return outcome("gemini", Status::AlreadyConfigured, "already registered (user scope)");
         }
     }
-    match run_tool(bin, &["mcp", "add", "-s", "user", "mempalace", mcp]) {
+    match run_tool(bin, &["mcp", "add", "-s", "user", "mempalace", mcp, "serve", "--stdio"]) {
         Ok(out) if out.status.success() => {
             outcome("gemini", Status::Configured, "registered via `gemini mcp add -s user`")
         }
@@ -310,7 +329,7 @@ fn configure_opencode(mcp: &str, dry_run: bool) -> ToolOutcome {
     };
     // opencode: top-level "mcp", stdio server is type "local" with command as
     // a single [exe, ...args] array.
-    let entry = json!({ "type": "local", "command": [mcp], "enabled": true });
+    let entry = json!({ "type": "local", "command": [mcp, "serve", "--stdio"], "enabled": true });
     apply_json("opencode", &path, "mcp", entry, dry_run)
 }
 
@@ -321,7 +340,7 @@ fn configure_copilot(mcp: &str, dry_run: bool) -> ToolOutcome {
     let entry = json!({
         "type": "local",
         "command": mcp,
-        "args": [],
+        "args": ["serve", "--stdio"],
         "env": {},
         "tools": ["*"],
     });
@@ -332,7 +351,7 @@ fn configure_antigravity(mcp: &str, dry_run: bool) -> ToolOutcome {
     let Some(gemini) = home_dir().map(|h| h.join(".gemini")) else {
         return outcome("antigravity", Status::Failed, "could not resolve the home directory");
     };
-    let entry = json!({ "command": mcp });
+    let entry = json!({ "command": mcp, "args": ["serve", "--stdio"] });
     // Antigravity's MCP config location has shifted across versions: the shared
     // "central" config at ~/.gemini/config/mcp_config.json and the CLI's own
     // ~/.gemini/antigravity-cli/mcp_config.json. Write both — an extra inert
@@ -467,7 +486,21 @@ fn upsert_mcp_entry(
     let mut changed = !had_object;
     if let Some(Value::Object(servers)) = root.get_mut(top_key) {
         if servers.get(name) != Some(entry) {
-            servers.insert(name.to_owned(), entry.clone());
+            let mut merged = servers.get(name).cloned().unwrap_or_else(|| json!({}));
+            if let (Some(existing), Some(updates)) = (merged.as_object_mut(), entry.as_object()) {
+                for (key, value) in updates {
+                    if key == "env" && existing.contains_key(key) {
+                        continue;
+                    }
+                    existing.insert(key.clone(), value.clone());
+                }
+            } else {
+                merged = entry.clone();
+            }
+            if servers.get(name) == Some(&merged) {
+                return (Value::Object(root), changed);
+            }
+            servers.insert(name.to_owned(), merged);
             changed = true;
         }
     }
@@ -475,6 +508,83 @@ fn upsert_mcp_entry(
 }
 
 // ─── Detection + path helpers ────────────────────────────────────────────────
+
+fn legacy_launcher(command: &str) -> bool {
+    matches!(command.rsplit(['/', '\\']).next(), Some("mempalace-mcp" | "mempalace-mcp.exe"))
+}
+
+fn migrate_json_launcher(
+    key: &'static str,
+    path: Option<PathBuf>,
+    mcp: &str,
+    dry_run: bool,
+) -> Option<ToolOutcome> {
+    let path = path?;
+    let mut document = read_json(&path).ok()??;
+    let entry = document.get_mut("mcpServers")?.get_mut("mempalace")?;
+    if !legacy_launcher(entry.get("command")?.as_str()?) {
+        return None;
+    }
+    entry["command"] = json!(mcp);
+    entry["args"] = json!(["serve", "--stdio"]);
+    if dry_run {
+        return Some(outcome(key, Status::WouldConfigure, "would migrate existing MCP launcher"));
+    }
+    Some(match write_json(&path, &document) {
+        Ok(()) => outcome(
+            key,
+            Status::Configured,
+            "migrated MCP launcher; preserved environment and other settings",
+        ),
+        Err(err) => {
+            outcome(key, Status::Failed, format!("could not migrate {}: {err}", path.display()))
+        }
+    })
+}
+
+fn migrate_codex_launcher(mcp: &str, dry_run: bool) -> Option<ToolOutcome> {
+    let base = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home_dir().map(|p| p.join(".codex")))?;
+    let path = base.join("config.toml");
+    migrate_codex_at_path(path, mcp, dry_run)
+}
+
+fn migrate_codex_at_path(path: PathBuf, mcp: &str, dry_run: bool) -> Option<ToolOutcome> {
+    let source = fs::read_to_string(&path).ok()?;
+    let mut document = source.parse::<toml_edit::DocumentMut>().ok()?;
+    let entry = document.get_mut("mcp_servers")?.get_mut("mempalace")?;
+    if !legacy_launcher(entry.get("command")?.as_str()?) {
+        return None;
+    }
+    entry["command"] = toml_edit::value(mcp);
+    entry["args"] =
+        toml_edit::value(["serve", "--stdio"].into_iter().collect::<toml_edit::Array>());
+    if dry_run {
+        return Some(outcome(
+            "codex",
+            Status::WouldConfigure,
+            "would migrate existing MCP launcher",
+        ));
+    }
+    let temporary = path.with_extension("mempalace-tmp");
+    Some(
+        match fs::write(&temporary, document.to_string())
+            .and_then(|()| fs::rename(&temporary, &path))
+        {
+            Ok(()) => outcome(
+                "codex",
+                Status::Configured,
+                "migrated MCP launcher; preserved environment and other settings",
+            ),
+            Err(err) => outcome(
+                "codex",
+                Status::Failed,
+                format!("could not migrate {}: {err}", path.display()),
+            ),
+        },
+    )
+}
 
 fn detect_antigravity() -> bool {
     if find_on_path("antigravity").is_some() {
@@ -529,8 +639,7 @@ fn resolve_mcp_binary(override_path: Option<&Path>) -> Option<PathBuf> {
     if let Some(p) = override_path {
         return Some(p.to_path_buf());
     }
-    let bin = if cfg!(windows) { "mempalace-mcp.exe" } else { "mempalace-mcp" };
-    home_dir().map(|h| h.join(".mempalace").join("bin").join(bin))
+    std::env::current_exe().ok()
 }
 
 /// Locate an executable named `name` on `PATH`.
@@ -594,20 +703,60 @@ fn not_installed(key: &'static str) -> ToolOutcome {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    #[test]
+    fn migrations_preserve_environment_and_respect_dry_run() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        let source = "# keep this comment\n[mcp_servers.mempalace]\ncommand = 'C:/bin/mempalace-mcp.exe'\n[mcp_servers.mempalace.env]\nMEMPALACE_LINEAGE_ID = 'default'\n";
+        std::fs::write(&path, source).unwrap();
+        assert_eq!(
+            super::migrate_codex_at_path(path.clone(), "C:/bin/mempalace.exe", true)
+                .unwrap()
+                .status,
+            super::Status::WouldConfigure
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+        assert_eq!(
+            super::migrate_codex_at_path(path.clone(), "C:/bin/mempalace.exe", false)
+                .unwrap()
+                .status,
+            super::Status::Configured
+        );
+        let updated = std::fs::read_to_string(&path).unwrap();
+        assert!(updated.contains("# keep this comment"));
+        let doc = updated.parse::<toml_edit::DocumentMut>().unwrap();
+        assert_eq!(
+            doc["mcp_servers"]["mempalace"]["env"]["MEMPALACE_LINEAGE_ID"].as_str(),
+            Some("default")
+        );
+        assert_eq!(doc["mcp_servers"]["mempalace"]["args"][0].as_str(), Some("serve"));
+        assert!(super::migrate_codex_at_path(path, "C:/bin/mempalace.exe", false).is_none());
+
+        let path = temp.path().join("claude.json");
+        std::fs::write(&path, r#"{"mcpServers":{"mempalace":{"command":"/bin/mempalace-mcp","env":{"MEMPALACE_LINEAGE_ID":"default"}}},"theme":"dark"}"#).unwrap();
+        super::migrate_json_launcher("claude", Some(path.clone()), "/bin/mempalace", false)
+            .unwrap();
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(doc["theme"], "dark");
+        assert_eq!(doc["mcpServers"]["mempalace"]["env"]["MEMPALACE_LINEAGE_ID"], "default");
+        assert_eq!(doc["mcpServers"]["mempalace"]["args"], serde_json::json!(["serve", "--stdio"]));
+    }
+
     use super::*;
     use std::ffi::OsString;
 
     #[test]
     fn upsert_creates_top_key_and_entry() {
-        let entry = json!({ "command": "/bin/mempalace-mcp" });
+        let entry = json!({ "command": "/bin/mempalace" });
         let (merged, changed) = upsert_mcp_entry(None, "mcpServers", "mempalace", &entry);
         assert!(changed);
-        assert_eq!(merged["mcpServers"]["mempalace"]["command"], "/bin/mempalace-mcp");
+        assert_eq!(merged["mcpServers"]["mempalace"]["command"], "/bin/mempalace");
     }
 
     #[test]
     fn upsert_is_idempotent_for_same_entry() {
-        let entry = json!({ "command": "/bin/mempalace-mcp" });
+        let entry = json!({ "command": "/bin/mempalace" });
         let (first, _) = upsert_mcp_entry(None, "mcpServers", "mempalace", &entry);
         let (_, changed) = upsert_mcp_entry(Some(first), "mcpServers", "mempalace", &entry);
         assert!(!changed, "re-applying the same entry must report no change");
@@ -619,12 +768,12 @@ mod tests {
             "theme": "dark",
             "mcpServers": { "other": { "command": "/x" } }
         });
-        let entry = json!({ "command": "/bin/mempalace-mcp" });
+        let entry = json!({ "command": "/bin/mempalace" });
         let (merged, changed) = upsert_mcp_entry(Some(existing), "mcpServers", "mempalace", &entry);
         assert!(changed);
         assert_eq!(merged["theme"], "dark", "unrelated top-level keys preserved");
         assert_eq!(merged["mcpServers"]["other"]["command"], "/x", "sibling server preserved");
-        assert_eq!(merged["mcpServers"]["mempalace"]["command"], "/bin/mempalace-mcp");
+        assert_eq!(merged["mcpServers"]["mempalace"]["command"], "/bin/mempalace");
     }
 
     #[test]
@@ -743,7 +892,7 @@ mod tests {
     fn gemini_list_matches_name_as_token_not_substring() {
         // Exact name (with trailing detail) and decorated lines match.
         assert!(list_contains_server(
-            "mempalace  stdio  /home/u/.mempalace/bin/mempalace-mcp",
+            "mempalace  stdio  /home/u/.mempalace/bin/mempalace",
             "mempalace"
         ));
         assert!(list_contains_server("  * mempalace: connected", "mempalace"));
@@ -752,7 +901,7 @@ mod tests {
         assert!(!list_contains_server("mempalace-old  stdio", "mempalace"));
         assert!(!list_contains_server("my-mempalace  stdio", "mempalace"));
         // A line that only contains the binary path (different server) must NOT match.
-        assert!(!list_contains_server("github: /home/u/.mempalace/bin/mempalace-mcp", "mempalace"));
+        assert!(!list_contains_server("github: /home/u/.mempalace/bin/mempalace", "mempalace"));
         assert!(!list_contains_server("", "mempalace"));
     }
 
@@ -774,7 +923,7 @@ mod tests {
     #[test]
     fn jules_is_never_configured() {
         // Whether or not `jules` is on PATH, it must never be Configured.
-        let res = handle_tool("jules", "/home/u/.mempalace/bin/mempalace-mcp", false);
+        let res = handle_tool("jules", "/home/u/.mempalace/bin/mempalace", false);
         assert!(matches!(res.status, Status::Unsupported | Status::NotInstalled));
     }
 
@@ -787,7 +936,7 @@ mod tests {
     #[test]
     fn report_renders_all_statuses() {
         let report = SetupReport {
-            mcp_path: PathBuf::from("/home/u/.mempalace/bin/mempalace-mcp"),
+            mcp_path: PathBuf::from("/home/u/.mempalace/bin/mempalace"),
             mcp_binary_present: false,
             dry_run: true,
             outcomes: vec![

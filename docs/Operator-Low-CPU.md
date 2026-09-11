@@ -22,7 +22,7 @@ In `~/.mempalace/config.json`:
 Or per-process:
 
 ```bash
-MEMPALACE_EMBEDDING_PROFILE=low_cpu target/release/mempalace-cli status
+MEMPALACE_EMBEDDING_PROFILE=low_cpu target/release/mempalace status
 ```
 
 ## Default Low-CPU Runtime
@@ -67,13 +67,13 @@ not compete with periodic LanceDB metadata scans, compaction, or version pruning
 }
 ```
 
-Run `mempalace-cli maintain` during an explicit maintenance window. This preserves
+Run `mempalace maintain` during an explicit maintenance window. This preserves
 compaction, vector-index optimization, and version retention without generating
 background storage I/O. It does not reduce the I/O required by an individual ingest or
 search request; scope those requests to a wing or room where possible.
 
 Keep `maintenance.enabled` set to `true`: setting it to `false` disables both the
-background scheduler and the `mempalace-cli maintain` command.
+background scheduler and the `mempalace maintain` command.
 
 ## Warm Cache Expectations
 

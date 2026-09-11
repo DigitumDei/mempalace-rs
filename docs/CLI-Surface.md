@@ -1,6 +1,6 @@
 # Rust CLI Surface Freeze
 
-This is the frozen command surface for `mempalace-cli` v1.
+This is the frozen command surface for `mempalace` v1.
 
 ## Global Flag
 
@@ -295,14 +295,14 @@ Behavior:
 ### `setup`
 
 Purpose:
-- Detect which supported AI coding tools are installed and register the mempalace MCP server (`mempalace-mcp`) with each, idempotently.
-- Warm and verify the embedding model so the very next `mempalace-mcp` start succeeds even with no `MEMPALACE_EMBED_ALLOW_DOWNLOADS` set.
+- Detect which supported AI coding tools are installed and register the mempalace MCP server (`mempalace serve --stdio`) with each, idempotently.
+- Warm and verify the embedding model so the very next `mempalace serve --stdio` start succeeds even with no `MEMPALACE_EMBED_ALLOW_DOWNLOADS` set.
 
 Flags:
 - `--dry-run`
   Preview what would change — print the command that would run / file that would be written for each detected tool — without running anything or writing any file. The embedding model warm-up is skipped.
-- `--mcp-path <PATH>` default: `~/.mempalace/bin/mempalace-mcp` (`.exe` on Windows)
-  Absolute path to the `mempalace-mcp` binary that tools are pointed at. A warning is printed if the binary is not present there yet (tools are still configured to launch it once installed).
+- `--mcp-path <PATH>` default: the currently running executable
+  Absolute path to the `mempalace` executable that tools are pointed at. A warning is printed if the binary is not present there yet (tools are still configured to launch it once installed).
 - `--tools <LIST>` default: all
   Comma-separated subset of tool keys to limit setup to: `claude,codex,gemini,opencode,copilot,antigravity,jules`.
 - `--no-model-warmup`
@@ -318,8 +318,8 @@ Behavior:
 - JSON merges preserve all other keys and are idempotent (re-running reports "already configured"). If an existing config file is not valid JSON, setup refuses to clobber it and reports a failure for that tool.
 - Tools that are not installed are skipped with a note. Tool registration is best-effort across tools; per-tool status is shown in the summary.
 - Embedding-model warm-up (unless `--dry-run` or `--no-model-warmup`):
-  1. Initialises a download-enabled provider so missing model assets are fetched on a fresh machine (a no-op on a warm cache). The profile and cache are resolved the same way `mempalace-mcp` resolves them at startup.
-  2. Re-initialises with downloads disabled — exactly how `mempalace-mcp` starts by default — proving the cache is complete before the MCP server is ever launched.
+  1. Initialises a download-enabled provider so missing model assets are fetched on a fresh machine (a no-op on a warm cache). The profile and cache are resolved the same way `mempalace serve --stdio` resolves them at startup.
+  2. Re-initialises with downloads disabled — exactly how `mempalace serve --stdio` starts by default — proving the cache is complete before the MCP server is ever launched.
   3. Prints a summary (model, cache path, warm and offline-check status). If the offline check fails, the command prints the remediation explicitly and exits non-zero. The installers (`install.sh`/`install.ps1`) treat that as a warning — the install itself has already succeeded — and print their own remediation, so a no-network fresh install still completes.
 - Exit codes:
   - `0` — tools registered/checked; when a warm-up ran, the model is usable offline.
@@ -365,11 +365,12 @@ Behavior:
 ### `serve`
 
 Purpose:
-- Run the federation HTTP server over the current palace, exposing it to remote
-  clients via the REST API. See the [Federation guide](Federation.md) for the full
+- Serve MCP at `/mcp` and the federation REST API over HTTP, or MCP over stdio. See the [Federation guide](Federation.md) for the full
   setup.
 
 Flags:
+- `--stdio`: serve newline-delimited MCP on stdin/stdout, without opening an HTTP port
+  or reading a token file. Conflicts with `--bind` and `--token-file`.
 - `--bind <ADDR>`
   Socket address to listen on, e.g. `127.0.0.1:8765`. Default: `server.bind` from
   `config.json`, falling back to `127.0.0.1:8765`.
@@ -405,3 +406,13 @@ the current boundary of the deferred commands.
 - Successful command execution returns exit code `0`.
 - Deferred-command and missing-palace flows return a non-zero result with explicit guidance.
 - Clap parse failures still use Clap's normal non-zero error flow.
+
+## Upgrading from separate executables
+
+The only executable is now `mempalace` (`mempalace.exe` on Windows). Run
+`mempalace setup` after upgrading. Standard legacy Claude, Codex, and Gemini
+registrations are migrated while preserving their environment and other settings;
+JSON-based integrations are merged idempotently. Custom client launchers must use
+`mempalace` with arguments `["serve", "--stdio"]`. Existing running MCP processes
+continue until the client restarts. `--mcp-path` overrides the executable path;
+setup always adds `serve --stdio`.

@@ -59,7 +59,7 @@ wake-up.
 
 ## Binding a lineage to an MCP client
 
-Set `MEMPALACE_LINEAGE_ID` in the environment of the local `mempalace-mcp` process to bind that
+Set `MEMPALACE_LINEAGE_ID` in the environment of the local `mempalace serve --stdio` process to bind that
 MCP connection to one lineage. This is a host-controlled capability boundary: the model cannot
 override the binding in a tool call, even if it knows another valid lineage ID. A configured ID is
 syntax-checked when the server starts. If the ID does not exist in the palace, identity packet and
@@ -74,7 +74,8 @@ Codex `config.toml`:
 
 ```toml
 [mcp_servers.mempalace]
-command = "/absolute/path/to/mempalace-mcp"
+command = "/absolute/path/to/mempalace"
+args = ["serve", "--stdio"]
 
 [mcp_servers.mempalace.env]
 MEMPALACE_LINEAGE_ID = "codex-dion"
@@ -83,7 +84,7 @@ MEMPALACE_LINEAGE_ID = "codex-dion"
 Equivalent Codex CLI registration:
 
 ```bash
-codex mcp add mempalace --env MEMPALACE_LINEAGE_ID=codex-dion -- /absolute/path/to/mempalace-mcp
+codex mcp add mempalace --env MEMPALACE_LINEAGE_ID=codex-dion -- /absolute/path/to/mempalace serve --stdio
 ```
 
 OpenCode V2 configuration:
@@ -95,7 +96,7 @@ OpenCode V2 configuration:
     "servers": {
       "mempalace": {
         "type": "local",
-        "command": ["/absolute/path/to/mempalace-mcp"],
+        "command": ["/absolute/path/to/mempalace", "serve", "--stdio"],
         "environment": {
           "MEMPALACE_LINEAGE_ID": "opencode-dion"
         }

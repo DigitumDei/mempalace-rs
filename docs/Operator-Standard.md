@@ -2,7 +2,7 @@
 
 Native coordination state is stored in `storage.sqlite3` and follows the same backup and restore boundary as other operational SQLite data. Preserve this file to retain task revisions, leases, inbox acknowledgements, results, artifacts, idempotency records, and event cursors. See [Native local coordination](Coordination.md#recovery-and-maintenance).
 
-This guide covers the normal Rust deployment path for `mempalace-cli` and `mempalace-mcp`.
+This guide covers the normal Rust deployment path for the single `mempalace` executable.
 
 ## Prerequisites
 
@@ -15,20 +15,21 @@ This guide covers the normal Rust deployment path for `mempalace-cli` and `mempa
 From the `mempalace-rs` directory:
 
 ```bash
-cargo build --release -p mempalace-cli -p mempalace-mcp
+cargo build --release -p mempalace-cli
 ```
 
-Expected binaries:
+Expected executable:
 
-- `target/release/mempalace-cli`
-- `target/release/mempalace-mcp`
+- `target/release/mempalace`
+
+ONNX Runtime is statically linked into this executable; no separate runtime library is required.
 
 ## First-Time Bootstrap
 
 1. Initialize project-local room config.
 
 ```bash
-target/release/mempalace-cli init /path/to/project
+target/release/mempalace init /path/to/project
 ```
 
 2. Confirm the reported startup validation status.
@@ -43,15 +44,15 @@ Expected statuses:
 3. Ingest data.
 
 ```bash
-target/release/mempalace-cli mine /path/to/project
+target/release/mempalace mine /path/to/project
 ```
 
 4. Validate retrieval.
 
 ```bash
-target/release/mempalace-cli search "auth migration"
-target/release/mempalace-cli status
-target/release/mempalace-cli wake-up
+target/release/mempalace search "auth migration"
+target/release/mempalace status
+target/release/mempalace wake-up
 ```
 
 ## Paths And State
@@ -82,7 +83,7 @@ Operational rule:
 
 - Do not treat `init` as proof that assets are already present.
 - Treat the startup validation status as the source of truth.
-- By default both `mempalace-cli` and `mempalace-mcp` stay offline and will not download embedding assets. The one deliberate exception is `mempalace-cli setup`, which runs a model warm-up phase (download-enabled) precisely because it is the step every install path executes; pass `--no-model-warmup` to skip it when you stage the cache yourself.
+- By default both `mempalace` and `mempalace serve --stdio` stay offline and will not download embedding assets. The one deliberate exception is `mempalace setup`, which runs a model warm-up phase (download-enabled) precisely because it is the step every install path executes; pass `--no-model-warmup` to skip it when you stage the cache yourself.
 - Set `MEMPALACE_EMBED_ALLOW_DOWNLOADS` to an explicit truthy value (`1`, `true`, or `yes`) on first run when you want either binary to bootstrap missing model assets into the local cache.
 
 Recommended sequence:
@@ -90,7 +91,7 @@ Recommended sequence:
 1. Run `init`.
 2. If validation is not `ready`, either:
    set `MEMPALACE_EMBED_ALLOW_DOWNLOADS=1` and re-run the command to let the binary fetch missing assets, or
-   run `mempalace-cli setup` to warm the embedding model (installer users get this for free), or
+   run `mempalace setup` to warm the embedding model (installer users get this for free), or
    pre-stage/repair the embedding cache out of band before relying on offline operation.
 3. Run a small `mine` or `search` flow to warm the chosen profile on the target host.
 4. Re-run `search` once to confirm warm-path behavior before calling the host production-ready.
@@ -98,7 +99,7 @@ Recommended sequence:
 Example first-run bootstrap:
 
 ```bash
-MEMPALACE_EMBED_ALLOW_DOWNLOADS=1 target/release/mempalace-cli mine /path/to/project
+MEMPALACE_EMBED_ALLOW_DOWNLOADS=1 target/release/mempalace mine /path/to/project
 ```
 
 ## MCP Deployment
@@ -106,13 +107,13 @@ MEMPALACE_EMBED_ALLOW_DOWNLOADS=1 target/release/mempalace-cli mine /path/to/pro
 The MCP binary is the Rust server entrypoint:
 
 ```bash
-target/release/mempalace-mcp
+target/release/mempalace serve --stdio
 ```
 
 The server exposes the frozen v1 tool set listed in [Release Scope](Release-Scope.md).
 
 Set `MEMPALACE_LINEAGE_ID` in an MCP host's server environment to bind wake-up and identity
-packets to one lineage. The binding is validated by `mempalace-mcp` and cannot be overridden by
+packets to one lineage. The binding is validated by `mempalace serve --stdio` and cannot be overridden by
 model-facing tool arguments. If its target does not exist, the response uses the palace default and
 includes instructions for creating the requested lineage with `mempalace_lineage_set`. Leave it
 unset to use the palace default. See [Self-continuity](Self-Continuity.md#binding-a-lineage-to-an-mcp-client).
@@ -120,7 +121,7 @@ unset to use the palace default. See [Self-continuity](Self-Continuity.md#bindin
 If the MCP host needs to bootstrap a cold cache on first start, launch it with:
 
 ```bash
-MEMPALACE_EMBED_ALLOW_DOWNLOADS=1 target/release/mempalace-mcp
+MEMPALACE_EMBED_ALLOW_DOWNLOADS=1 target/release/mempalace serve --stdio
 ```
 
 ## Federation Server Deployment
@@ -128,7 +129,7 @@ MEMPALACE_EMBED_ALLOW_DOWNLOADS=1 target/release/mempalace-mcp
 To share a palace with other clients, run the federation HTTP server:
 
 ```bash
-target/release/mempalace-cli serve --bind 127.0.0.1:8765 \
+target/release/mempalace serve --bind 127.0.0.1:8765 \
   --token-file ~/.mempalace/server_tokens.json
 ```
 
@@ -170,9 +171,9 @@ Full setup, client configuration, and the team mining workflow are in the
 
 The maintenance subsystem keeps the palace storage healthy by compacting
 fragments, pruning old version data, and optimising vector indices. It is
-**enabled by default** and the long-lived HTTP hub (`mempalace-cli serve`)
+**enabled by default** and the long-lived HTTP hub (`mempalace serve`)
 schedules it automatically by default. Set `background_enabled: false` to
-use manual-only maintenance; the one-shot CLI command (`mempalace-cli maintain`)
+use manual-only maintenance; the one-shot CLI command (`mempalace maintain`)
 remains available while `enabled` is `true`.
 
 ### Maintenance Tiers
@@ -192,7 +193,7 @@ Each run executes up to three tiers in order:
 
 | Field | Default | Description |
 |---|---|---|
-| `enabled` | `true` | Master switch for all maintenance, including `mempalace-cli maintain`. |
+| `enabled` | `true` | Master switch for all maintenance, including `mempalace maintain`. |
 | `background_enabled` | `true` | Whether the HTTP hub schedules maintenance automatically. |
 | `idle_secs` | `300` | Minimum wall-clock seconds since the last write before a run starts. |
 | `version_retention_hours` | `24` | Maximum age in hours for retained version rows. |
@@ -207,7 +208,7 @@ variables, which take precedence over `config.json`:
 - `MEMPALACE_MAINTENANCE_ENABLED` — true values: `1`, `true`, `TRUE`, `yes`,
   `YES`; false values: `0`, `false`, `FALSE`, `no`, `NO`. Other values are rejected.
 - `MEMPALACE_MAINTENANCE_BACKGROUND_ENABLED` — same boolean values; set it to
-  `false` for manual-only maintenance while retaining `mempalace-cli maintain`.
+  `false` for manual-only maintenance while retaining `mempalace maintain`.
 - `MEMPALACE_MAINTENANCE_IDLE_SECS` — positive integer; zero is rejected.
 - `MEMPALACE_MAINTENANCE_VERSION_RETENTION_HOURS` — positive integer;
   zero is rejected.
@@ -218,7 +219,7 @@ variables, which take precedence over `config.json`:
 
 ### Idle-Only Hub Scheduling
 
-When `background_enabled` is `true`, the HTTP hub (`mempalace-cli serve`) runs
+When `background_enabled` is `true`, the HTTP hub (`mempalace serve`) runs
 maintenance in a background tokio task. The scheduling rules are:
 
 - **Startup eligibility check**: on hub startup, one maintenance
@@ -240,7 +241,7 @@ maintenance in a background tokio task. The scheduling rules are:
   also call `signal_activity()`, so maintenance never runs concurrently
   with active writes from the same process.
 
-The one-shot CLI command (`mempalace-cli maintain`) bypasses the
+The one-shot CLI command (`mempalace maintain`) bypasses the
 process-local idle gate entirely (sets `idle_secs` to `0`) so the pass
 runs immediately.  It still respects the cross-process lease.
 
@@ -304,7 +305,7 @@ from an older MemPalace release), the recommended procedure is:
    together) before running maintenance, in case of unexpected issues.
 2. **Run the one-shot CLI command**:
    ```bash
-   mempalace-cli maintain --palace /path/to/palace
+   mempalace maintain --palace /path/to/palace
    ```
 3. **Inspect the output** for per-tier outcomes.  Tiers report
    `completed`, `skipped {reason}`, `aborted {reason}`, or `failed`.
@@ -315,7 +316,7 @@ from an older MemPalace release), the recommended procedure is:
 5. **After the initial one-shot pass**, the hub's background maintenance
    will handle incremental compaction and pruning automatically during
    idle periods when `background_enabled` is `true`. When it is `false`,
-   schedule further `mempalace-cli maintain` runs yourself.
+   schedule further `mempalace maintain` runs yourself.
 
 The `maintain` command respects the same `enabled`, `version_retention_hours`,
 `tail_threshold_rows`, and `small_fragment_threshold` settings from
@@ -325,18 +326,18 @@ starts immediately.
 
 ## Reclaiming Space From Mined Data
 
-`mempalace-cli prune` deletes mined project data from the **local** palace by scope. It
+`mempalace prune` deletes mined project data from the **local** palace by scope. It
 previews by default and only deletes with `--yes`:
 
 ```bash
 # preview everything mined for one project
-mempalace-cli prune --project-id github.com/acme/repo
+mempalace prune --project-id github.com/acme/repo
 
 # drop a single stale branch view
-mempalace-cli prune --project-id github.com/acme/repo --view old-feature --yes
+mempalace prune --project-id github.com/acme/repo --view old-feature --yes
 
 # drop one subtree of a branch view
-mempalace-cli prune --project-id github.com/acme/repo --view old-feature \
+mempalace prune --project-id github.com/acme/repo --view old-feature \
   --source-prefix crates/legacy/ --yes
 ```
 
@@ -381,7 +382,7 @@ worktree's rows. Scope it instead by what actually distinguishes the worktree's 
 
 ```bash
 # a worktree mined on its own branch is a branch view — prune that view
-mempalace-cli prune --project-id github.com/acme/repo --view worktree-branch --yes
+mempalace prune --project-id github.com/acme/repo --view worktree-branch --yes
 ```
 
 If you need worktrees to be independently prunable, give them a distinct identity **at mine

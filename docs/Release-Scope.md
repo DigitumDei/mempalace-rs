@@ -4,10 +4,10 @@ This document defines the first Rust release surface for `mempalace-rs`.
 
 ## In Scope
 
-### CLI binaries
+### Executable and runtime
 
-- `mempalace-cli`
-- `mempalace-mcp`
+- `mempalace` (`mempalace.exe` on Windows): CLI, HTTP, and stdio MCP
+- Statically linked ONNX Runtime 1.23.2 and upstream license notices
 
 ### CLI commands frozen for v1
 
@@ -21,7 +21,7 @@ This document defines the first Rust release surface for `mempalace-rs`.
 - `wake-up`
 - `setup` — register the MCP server with detected AI coding tools
 - `maintain` — one-shot maintenance pass (compact, prune, optimize)
-- `serve` (federation HTTP server; see Federation below)
+- `serve` (HTTP MCP plus federation REST, or `--stdio`; see Federation below)
 
 Full flag reference: [CLI Surface](CLI-Surface.md).
 
@@ -38,7 +38,7 @@ Full flag reference: [CLI Surface](CLI-Surface.md).
 ### Maintenance
 
 - Enabled by default; runs in the background of the HTTP hub (`serve`) and on demand via
-  `mempalace-cli maintain`. Three tiers — vector-index optimization, fragment compaction,
+  `mempalace maintain`. Three tiers — vector-index optimization, fragment compaction,
   version retention — coordinated by a cross-process SQLite advisory lease. See
   [Operator guide](Operator-Standard.md#maintenance).
 
@@ -160,7 +160,7 @@ an exhaustive scan of remote palaces.
 Added after the initial v1 freeze; now part of the shipped surface.
 
 - `mempalace-server` — Axum REST server exposing a palace, started via
-  `mempalace-cli serve`. Bearer-token auth; `GET /v1/health` is public.
+  `mempalace serve`. Bearer-token auth; `GET /v1/health` is public.
 - `mempalace-remote` — HTTP client (`RemoteApi` trait + `RemoteClient`).
 - `mempalace-federation` — shared wire DTOs.
 - REST surface under `/v1`: `info`, `drawers` (search, check_duplicate, add, list,

@@ -103,6 +103,19 @@ pub const NOT_FOUND_SUFFIX: &str = " not found";
 /// A checkpoint is assigned to another executor; lease expiry cannot transfer it.
 pub const EXECUTOR_AFFINITY_CONFLICT: &str = "task checkpoint is assigned to another executor";
 
+#[derive(Deserialize)]
+struct YieldDetails {
+    reason: String,
+    #[serde(default)]
+    checkpoint_handoff: Option<CheckpointHandoff>,
+}
+
+#[derive(Deserialize)]
+struct CheckpointHandoff {
+    executor: String,
+    artifact_id: String,
+}
+
 /// Durable task lifecycle state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -181,7 +194,7 @@ pub struct Task {
     pub wing: String,
     pub owner: Option<String>,
     /// Executor allowed to resume checkpointed work, independent of lease expiry.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executor_affinity: Option<String>,
     pub parent_id: Option<String>,
     pub dependencies: Vec<String>,
@@ -301,10 +314,10 @@ pub struct TaskListItem {
     pub title: String,
     /// Whether the title is a prefix of the stored title.
     pub title_truncated: bool,
-    /// Exact lease owner identity, when present.
+    /// Assigned owner identity, retained during a scheduling wait without a lease.
     pub owner: Option<String>,
     /// Executor allowed to resume checkpointed work, independent of lease expiry.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executor_affinity: Option<String>,
     /// Lease deadline in RFC3339; the owning server decides expiry.
     pub lease_expires_at: Option<String>,
@@ -327,7 +340,7 @@ pub struct TaskListFilter {
     pub wing: Option<String>,
     /// Task lifecycle state.
     pub state: Option<TaskState>,
-    /// Exact lease owner identity, when present.
+    /// Assigned owner identity, retained during a scheduling wait without a lease.
     pub owner: Option<String>,
     /// Exact task creator identity.
     pub created_by: Option<String>,
@@ -756,7 +769,16 @@ END;
             id,
             Some(id),
             &task.wing,
-            if task.owner.is_some() { "task_reclaimed" } else { "task_claimed" },
+            if task.state == TaskState::Pending
+                && task.executor_affinity.is_some()
+                && task.lease_expires_at.is_none()
+            {
+                "task_resumed"
+            } else if task.owner.is_some() {
+                "task_reclaimed"
+            } else {
+                "task_claimed"
+            },
             worker,
             Some(task.state),
             Some(TaskState::Running),
@@ -864,30 +886,46 @@ END;
                 .as_ref()
                 .ok_or_else(|| StorageError::Invariant("yield requires details.reason".into()))?;
             bounded_json(details)?;
-            let reason = details.get("reason").and_then(Value::as_str).unwrap_or("");
-            if reason.trim().is_empty() {
+            let parsed: YieldDetails =
+                serde_json::from_value(details.clone()).map_err(|error| {
+                    StorageError::Invariant(format!("invalid yield details: {error}"))
+                })?;
+            if parsed.reason.trim().is_empty() {
                 return Err(StorageError::Invariant(
                     "yield requires non-empty details.reason".into(),
                 ));
             }
-            let mut executor = actor;
-            let handoff = details.get("checkpoint_handoff");
+            let handoff = parsed.checkpoint_handoff.as_ref();
+            let executor = handoff.map_or(actor, |handoff| handoff.executor.as_str());
             if let Some(handoff) = handoff {
-                executor = handoff.get("executor").and_then(Value::as_str).unwrap_or("");
-                validate_actor(executor)?;
-                let artifact_id = handoff.get("artifact_id").and_then(Value::as_str).unwrap_or("");
-                let artifact = get_artifact_tx(&tx, artifact_id)?.ok_or_else(|| {
+                if executor.trim().is_empty() {
+                    return Err(StorageError::Invariant(
+                        "checkpoint_handoff.executor must not be empty".into(),
+                    ));
+                }
+                // Validation needs only metadata, never the checkpoint content under the write lock.
+                let metadata: Option<(String, String)> = tx
+                    .query_row(
+                        "SELECT task_id,role FROM coordination_artifacts WHERE artifact_id=?1",
+                        [&handoff.artifact_id],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()?;
+                let (artifact_task, role) = metadata.ok_or_else(|| {
                     StorageError::Invariant(
                         "checkpoint handoff requires an existing artifact".into(),
                     )
                 })?;
-                if artifact.task_id != id || artifact.role != "checkpoint" {
+                if artifact_task != id || role != "checkpoint" {
                     return Err(StorageError::Invariant(
                         "handoff artifact must be a checkpoint for this task".into(),
                     ));
                 }
             }
-            if task.state == TaskState::Pending && handoff.is_none() {
+            if task.state == TaskState::Pending
+                && task.lease_expires_at.is_none()
+                && handoff.is_none()
+            {
                 return Ok(RevisionedWrite::Applied(task));
             }
             let next = task.revision + 1;
@@ -1759,6 +1797,108 @@ mod tests {
             )
             .expect("yield"),
         )
+    }
+
+    #[test]
+    fn yield_null_handoff_and_human_wait_release_the_lease() {
+        let (_dir, s) = store();
+        let task = task(&s);
+        let running = applied_task(
+            s.claim_task(&task.task_id, "worker-a", 0, Duration::minutes(1)).expect("claim"),
+        );
+        let yielded = applied_task(
+            s.transition_task(
+                &task.task_id,
+                "worker-a",
+                running.revision,
+                TaskState::Pending,
+                Some(serde_json::json!({"reason":"wait", "checkpoint_handoff":null})),
+            )
+            .expect("null means absent"),
+        );
+        assert!(yielded.lease_expires_at.is_none());
+        assert_eq!(yield_task(&s, &yielded), yielded);
+        let running = applied_task(
+            s.claim_task(&task.task_id, "worker-a", yielded.revision, Duration::minutes(1))
+                .expect("resume"),
+        );
+        let input = applied_task(
+            s.transition_task(
+                &task.task_id,
+                "worker-a",
+                running.revision,
+                TaskState::InputRequired,
+                None,
+            )
+            .expect("human wait"),
+        );
+        let pending = applied_task(
+            s.transition_task(&task.task_id, "worker-a", input.revision, TaskState::Pending, None)
+                .expect("answered"),
+        );
+        assert!(pending.lease_expires_at.is_some());
+        let yielded = yield_task(&s, &pending);
+        assert_eq!(yielded.revision, pending.revision + 1);
+        assert!(yielded.lease_expires_at.is_none());
+        assert!(
+            s.transition_task(&task.task_id, "manager", yielded.revision, TaskState::Expired, None)
+                .is_err()
+        );
+        let conn = s.connection().expect("connection");
+        let resumed: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM coordination_events WHERE event_type='task_resumed'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("resumes");
+        let yields: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM coordination_events WHERE event_type='task_yielded'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("yields");
+        assert_eq!(resumed, 1);
+        assert_eq!(yields, 2);
+    }
+
+    #[test]
+    fn yield_malformed_handoff_names_the_invalid_field() {
+        let (_dir, s) = store();
+        let task = task(&s);
+        let running = applied_task(
+            s.claim_task(&task.task_id, "worker-a", 0, Duration::minutes(1)).expect("claim"),
+        );
+        for (handoff, message) in [
+            (serde_json::json!({"executor_id":"b", "artifact_id":"x"}), "executor"),
+            (serde_json::json!({"executor":"b", "artifact_id":42}), "invalid type"),
+        ] {
+            let error = s
+                .transition_task(
+                    &task.task_id,
+                    "worker-a",
+                    running.revision,
+                    TaskState::Pending,
+                    Some(serde_json::json!({"reason":"wait", "checkpoint_handoff":handoff})),
+                )
+                .expect_err("invalid handoff");
+            assert!(error.to_string().contains(message), "{error}");
+        }
+        assert!(serde_json::to_value(&running).expect("json").get("executor_affinity").is_none());
+        assert_eq!(s.get_task(&task.task_id).expect("get"), Some(running));
+        let list = s
+            .tasks(
+                None,
+                &TaskListFilter::default(),
+                50,
+                TASK_LIST_PAGE_BYTES,
+                CoordinationVisibility::Trusted,
+            )
+            .expect("list");
+        assert!(
+            serde_json::to_value(&list.tasks[0]).expect("json").get("executor_affinity").is_none()
+        );
     }
 
     #[test]

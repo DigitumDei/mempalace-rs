@@ -53,12 +53,15 @@ hold an unexpired lease and the task deadline must not have elapsed.
 
 This atomically releases `lease_expires_at`, retains `owner`, sets
 `executor_affinity` to that owner, and emits `task_yielded` with the supplied
-reason. There is no `input_required` transition. A pending task with affinity is
+reason. An explicit `checkpoint_handoff: null` is equivalent to omitting it.
+There is no `input_required` transition. A pending task with affinity is
 a scheduling wait; task reads and list rows expose the affinity, and the event
 records the reason. Use the owner filter to discover your continuations.
 
 Affinity persists when execution resumes and after subsequent lease expiry.
-Only that executor can use `task_claim` to resume. After restart, use the same
+Only that executor can use `task_claim` to resume. Resuming a lease-free affine
+pending task emits `task_resumed`; reclaiming an existing lease emits
+`task_reclaimed`. After restart, use the same
 stable worker identity, read the current task, and claim its revision. A lost
 claim or yield response can be resolved by reading the authoritative task:
 stale revisions return the existing CAS conflict envelope without mutation.
@@ -72,7 +75,9 @@ retain their existing lease-expiry takeover behavior. The task's `expires_at`
 deadline still prevents reclaim: a claim after that deadline records
 `task_expired` and clears ownership and affinity. Any actor may cancel a yielded
 task with its current revision; terminal transitions clear owner, affinity and
-lease. There is no automatic failover for a checkpoint held by an unavailable
+lease. Explicit `pending → expired` transitions still require the assigned
+owner; a coordinator may cancel, or call claim after the task deadline to record
+expiry without executing work. There is no automatic failover for a checkpoint held by an unavailable
 executor: restore that executor's durable state or cancel and create fresh work.
 
 To transfer execution explicitly, first publish an immutable artifact for this
@@ -95,9 +100,14 @@ checkpoint role, and belongs to the same task, then atomically assigns owner and
 affinity to the target, releases the lease, and records
 `task_checkpoint_handed_off` with the reason and artifact reference. Only the
 new executor may reclaim. The host must ensure the checkpoint is complete and
-usable; AgentPalace cannot interpret a host's private SQLite checkpoint.
+usable and current. Validation does not establish authorship or freshness, and
+the owner explicitly selects the artifact; reusing a checkpoint from an earlier
+owner is permitted. AgentPalace cannot interpret a host's private SQLite checkpoint.
 `executor` is the exact authoritative identity: over federation this is typically
-`token-name:worker-name`, as returned in task `owner`. The new worker continues
+`token-name:worker-name`, as returned in task `owner`. The REST route accepts
+only the authenticated token identity itself or a worker in that token namespace.
+Cross-token and remote-to-local handoffs are rejected; they require a separate
+receiving authorization workflow, which this API does not implement. The new worker continues
 to submit its normal unqualified `worker` claim under its own token. Handoff
 never impersonates the target actor; the audit event names the current owner.
 A lost handoff response is resolved by reading owner/affinity and its audit event;

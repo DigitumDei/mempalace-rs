@@ -1039,10 +1039,32 @@ or lease ownership, returns **409** with one of two `code` values in the body:
   decide whether to reload and retry without a second round trip. Retry is the
   caller's decision; the server never retries a conflicting write on its behalf.
 - `"coordination_conflict"` — the write is not permitted regardless of revision:
-  another worker's lease has not expired yet, the task is in a terminal state, the
+  another worker's lease has not expired yet, checkpoint `executor_affinity` belongs
+  to another executor (even after lease expiry), the task is in a terminal state, the
   requested state transition is not a valid one, or the caller is not the current
   owner. `expected_revision`/`actual_revision` are both `null` here — reloading
   will not change the outcome.
+
+### Checkpointed yield and handoff
+
+Task DTOs and list rows include optional `executor_affinity` (omitted when absent).
+`owner` remains assigned during a yielded scheduling wait even though the lease
+is cleared. `POST /v1/coordination/tasks/{id}/transition` accepts running to pending
+with `details: {"reason":"next stage"}`. This emits `task_yielded`; a subsequent
+claim by the assigned executor emits `task_resumed`. Affinity survives lease expiry.
+
+An optional `details.checkpoint_handoff` object contains string fields `executor`
+and `artifact_id`; null means no handoff. The artifact must have role `checkpoint`
+and belong to the task. The current owner explicitly chooses the checkpoint and
+is responsible for its freshness and usability. The target must be the authenticated
+token identity or `token-name:worker-name` within the same token namespace. Bare
+local identities and other token namespaces are rejected with 400. Cross-token
+handoff needs a separate receiver authorization workflow and is unsupported here.
+
+For an affinity conflict, use the assigned executor or an explicit authorized
+checkpoint handoff; waiting for lease expiry will never remove affinity. Any
+wing-authorized actor may cancel yielded work. See [Coordination](Coordination.md#yielding-between-checkpointed-stages)
+for retry, deadline, and cancellation behavior.
 
 ### A minimal example
 
@@ -1403,6 +1425,11 @@ and retry with that revision if the retry is still appropriate. See
 [Part 7 → Revision and lease conflicts](#revision-and-lease-conflicts).
 
 ### A coordination write returns 409 with code `coordination_conflict`
+
+If the task has `executor_affinity` assigned to another executor, use that executor
+or arrange an explicit checkpoint handoff. Lease expiry cannot resolve this cause.
+The lease-wait guidance below applies only to a live-lease conflict without affinity.
+
 The write is not permitted regardless of revision: another worker's lease on the
 task has not expired, the task is in a terminal state, the requested state
 transition is invalid, or you are not the task's current owner. Retrying with a

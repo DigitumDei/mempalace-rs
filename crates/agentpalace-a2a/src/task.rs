@@ -37,9 +37,11 @@
 //!
 //! Use `CoordinationStore::import_task(&new_task, target_state.value)`, which creates the task
 //! *directly* in that state. Do **not** try to reach it through the transition machine.
-//! `allowed_transition` (`crates/agentpalace-storage/src/coordination.rs`) permits only
+//! The ordinary `allowed_transition` table (`crates/agentpalace-storage/src/coordination.rs`) permits
 //! `Pending -> Cancelled | Expired`, `Running -> InputRequired | Completed | Cancelled | Failed |
 //! Expired`, and `InputRequired -> Pending | Running | Cancelled | Failed | Expired`.
+//! A separate validated scheduling-yield path permits `Running -> Pending` and affine
+//! `Pending -> Pending` with a reason and optional checkpoint handoff.
 //! `Pending -> Running` is not in that table: the only route into `Running` is `claim_task`,
 //! which requires a worker identity and a lease. So creating with `create_task` and then
 //! transitioning would mean **fabricating a claim by a worker that never existed** in order to
@@ -345,6 +347,7 @@ mod tests {
             created_by: "alice".to_owned(),
             wing: "wing_myproject".to_owned(),
             owner: None,
+            executor_affinity: None,
             parent_id: None,
             dependencies: Vec::new(),
             budget: None,

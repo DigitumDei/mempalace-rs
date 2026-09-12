@@ -43,6 +43,81 @@ Treat returned cursors as opaque and persist them with worker state. After resta
 
 As of issue #102 Stage 4, this tool surface is federation-aware: `agentpalace_task_create` routes by its wing's `federation.coordination` rule, and the other ID-keyed tools above fall back across configured remotes by ID after a local miss (mirroring `agentpalace_delete_drawer`'s existing local-first pattern) — a task's `wing` is never supplied to those calls, so there is nothing else to route by. `agentpalace_inbox_read`/`agentpalace_coordination_events` always read local and additionally fan out to every configured remote, reporting `remote_messages`/`remote_events` alongside the local result — `agentpalace_coordination_event_get` is the one exception, staying local-only because Stage 3 never exposed a single-event GET route on the wire. Both fan-out tools also accept a `remote_cursors` object argument (`{"<remote_name>": "<opaque_cursor>"}`) to continue a specific remote's page independently of the local `cursor`; a page's own `remote_messages`/`remote_events` entries carry the `next_cursor` to feed back for that remote. See [Federation → Part 7, Federated coordination](Federation.md#part-7--federated-coordination) for the full routing rules, the server-side REST surface used by a remote peer, and the conflict/capability-gate error shapes.
 
+## Yielding between checkpointed stages
+
+After persisting its checkpoint, a worker calls `agentpalace_task_transition` with
+`state: "pending"`, its current `expected_revision`, and
+`details: {"reason": "next stage queued"}`. The same body works on the REST
+`POST /v1/coordination/tasks/{id}/transition` route. The current running owner must
+hold an unexpired lease and the task deadline must not have elapsed.
+
+This atomically releases `lease_expires_at`, retains `owner`, sets
+`executor_affinity` to that owner, and emits `task_yielded` with the supplied
+reason. An explicit `checkpoint_handoff: null` is equivalent to omitting it.
+There is no `input_required` transition. A pending task with affinity is
+a scheduling wait; task reads and list rows expose the affinity, and the event
+records the reason. Use the owner filter to discover your continuations.
+
+Affinity persists when execution resumes and after subsequent lease expiry.
+Only that executor can use `task_claim` to resume. Resuming a lease-free affine
+pending task emits `task_resumed`; reclaiming an existing lease emits
+`task_reclaimed`. After restart, use the same
+stable worker identity, read the current task, and claim its revision. A lost
+claim or yield response can be resolved by reading the authoritative task:
+stale revisions return the existing CAS conflict envelope without mutation.
+Repeating a yield against a currently yielded task with the refreshed revision
+is a no-op (no revision or event is added). Never blindly refresh and replay an
+old yield if the task is already running a later stage. Claims still use the
+existing revision semantics and do not promise exactly-once execution.
+
+Lease expiry never removes checkpoint affinity. Tasks that have never yielded
+retain their existing lease-expiry takeover behavior. The task's `expires_at`
+deadline still prevents reclaim: a claim after that deadline records
+`task_expired` and clears ownership and affinity. Any actor may cancel a yielded
+task with its current revision; terminal transitions clear owner, affinity and
+lease. Explicit `pending → expired` transitions still require the assigned
+owner; a coordinator may cancel, or call claim after the task deadline to record
+expiry without executing work. There is no automatic failover for a checkpoint held by an unavailable
+executor: restore that executor's durable state or cancel and create fresh work.
+
+To transfer execution explicitly, first publish an immutable artifact for this
+task with `role: "checkpoint"`, containing the checkpoint or a durable reference
+that the recipient can access. The current owner can yield (or transition an
+already yielded task to pending) with:
+
+```json
+{
+  "reason": "checkpoint transferred to replacement executor",
+  "checkpoint_handoff": {
+    "executor": "replacement-worker",
+    "artifact_id": "artifact_id_returned_by_artifact_put"
+  }
+}
+```
+
+Pass that object as `details`. AgentPalace verifies the artifact exists, has the
+checkpoint role, and belongs to the same task, then atomically assigns owner and
+affinity to the target, releases the lease, and records
+`task_checkpoint_handed_off` with the reason and artifact reference. Only the
+new executor may reclaim. The host must ensure the checkpoint is complete and
+usable and current. Validation does not establish authorship or freshness, and
+the owner explicitly selects the artifact; reusing a checkpoint from an earlier
+owner is permitted. AgentPalace cannot interpret a host's private SQLite checkpoint.
+`executor` is the exact authoritative identity: over federation this is typically
+`token-name:worker-name`, as returned in task `owner`. The REST route accepts
+only the authenticated token identity itself or a worker in that token namespace.
+Cross-token and remote-to-local handoffs are rejected; they require a separate
+receiving authorization workflow, which this API does not implement. The new worker continues
+to submit its normal unqualified `worker` claim under its own token. Handoff
+never impersonates the target actor; the audit event names the current owner.
+A lost handoff response is resolved by reading owner/affinity and its audit event;
+stale retries cannot transfer ownership twice.
+
+Existing palaces gain a nullable affinity column on schema upgrade. Older task
+responses deserialize with no affinity. An older server rejects the new
+running-to-pending edge; callers must upgrade the authoritative server before
+using yield, and must not fall back to a human-input transition.
+
 ## Task discovery
 
 `agentpalace_coordination_wings` discovers locally known coordination scope without contacting
@@ -82,7 +157,7 @@ diary and unscoped wings before pagination; explicitly filtering an excluded
 wing returns an empty page, not 403. Local MCP reads use trusted visibility.
 
 Each `TaskListItem` contains `task_id`, `wing`, `state`, `revision`, `title`,
-`title_truncated`, `owner`, `lease_expires_at`, `parent_id`, `dependency_count`,
+`title_truncated`, `owner`, `executor_affinity`, `lease_expires_at`, `parent_id`, `dependency_count`,
 `created_by`, `created_at`, and `expires_at`. Title prefixes are limited to 1,024
 UTF-8 bytes without splitting a character. Description, budget and dependency
 IDs are omitted. A zero dependency count means no declared dependencies; a

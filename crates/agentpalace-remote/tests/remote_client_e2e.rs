@@ -1047,3 +1047,194 @@ async fn replication_wire_fields_accepted_by_server() {
     assert!(second.success);
     client.delete_drawer(&second.drawer_id.expect("must return a drawer id")).await.unwrap();
 }
+
+#[tokio::test]
+async fn coordination_yield_affinity_round_trip() {
+    use agentpalace_federation::{CoordinationTaskState as State, TransitionTaskRequest};
+    let tempdir = TempDir::new().unwrap();
+    let addr = spawn_server(test_config(&tempdir), write_token_file(&tempdir)).await;
+    let client = client_for(addr, Some(TEST_TOKEN));
+    let task = client
+        .coordination_task_create(NewTaskRequest {
+            title: "stages".into(),
+            description: "checkpointed".into(),
+            wing: "wing_rt_coord".into(),
+            idempotency_key: "yield".into(),
+            created_by: Some("manager".into()),
+            parent_id: None,
+            dependencies: vec![],
+            budget: None,
+            expires_at: None,
+        })
+        .await
+        .unwrap();
+    let RemoteRevisionedWrite::Applied(running) = client
+        .coordination_task_claim(
+            &task.task_id,
+            TaskLeaseRequest {
+                expected_revision: 0,
+                lease_seconds: 300,
+                worker: Some("worker-a".into()),
+            },
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("claim")
+    };
+    let request = TransitionTaskRequest {
+        expected_revision: running.revision,
+        state: State::Pending,
+        actor: Some("worker-a".into()),
+        details: Some(serde_json::json!({"reason":"next stage"})),
+    };
+    let RemoteRevisionedWrite::Applied(yielded) =
+        client.coordination_task_transition(&task.task_id, request.clone()).await.unwrap()
+    else {
+        panic!("yield")
+    };
+    assert_eq!(yielded.state, State::Pending);
+    assert_eq!(yielded.executor_affinity.as_deref(), Some("e2e-test-user:worker-a"));
+    assert!(yielded.lease_expires_at.is_none());
+    assert!(matches!(
+        client.coordination_task_transition(&task.task_id, request).await.unwrap(),
+        RemoteRevisionedWrite::Conflict { .. }
+    ));
+    let fetched = client.coordination_task_get(&task.task_id).await.unwrap();
+    assert_eq!(fetched, yielded);
+    let page = client
+        .coordination_tasks(agentpalace_federation::CoordinationTasksQuery {
+            wing: Some("rt_coord".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(page.tasks[0].executor_affinity, yielded.executor_affinity);
+    let competing = client
+        .coordination_task_claim(
+            &task.task_id,
+            TaskLeaseRequest {
+                expected_revision: yielded.revision,
+                lease_seconds: 300,
+                worker: Some("worker-b".into()),
+            },
+        )
+        .await;
+    assert!(matches!(competing, Err(RemoteError::RemoteRejected { status: 409, .. })));
+    let RemoteRevisionedWrite::Applied(resumed) = client
+        .coordination_task_claim(
+            &task.task_id,
+            TaskLeaseRequest {
+                expected_revision: yielded.revision,
+                lease_seconds: 300,
+                worker: Some("worker-a".into()),
+            },
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("resume")
+    };
+    assert_eq!(resumed.executor_affinity, yielded.executor_affinity);
+    let RemoteRevisionedWrite::Applied(yielded) = client
+        .coordination_task_transition(
+            &task.task_id,
+            TransitionTaskRequest {
+                expected_revision: resumed.revision,
+                state: State::Pending,
+                actor: Some("worker-a".into()),
+                details: Some(serde_json::json!({"reason":"wait again"})),
+            },
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("yield again")
+    };
+    let checkpoint = client
+        .coordination_artifact_put(NewArtifactRequest {
+            task_id: task.task_id.clone(),
+            role: "checkpoint".into(),
+            media_type: "application/json".into(),
+            content: "{}".into(),
+            idempotency_key: "handoff".into(),
+            created_by: Some("worker-a".into()),
+        })
+        .await
+        .unwrap();
+    let handoff = TransitionTaskRequest {
+        expected_revision: yielded.revision,
+        state: State::Pending,
+        actor: Some("worker-a".into()),
+        details: Some(serde_json::json!({"reason":"transfer", "checkpoint_handoff": {
+            "executor":"e2e-test-user:worker-b", "artifact_id":checkpoint.artifact_id
+        }})),
+    };
+    let RemoteRevisionedWrite::Applied(yielded) =
+        client.coordination_task_transition(&task.task_id, handoff.clone()).await.unwrap()
+    else {
+        panic!("handoff")
+    };
+    assert_eq!(yielded.executor_affinity.as_deref(), Some("e2e-test-user:worker-b"));
+    assert!(matches!(
+        client.coordination_task_transition(&task.task_id, handoff).await.unwrap(),
+        RemoteRevisionedWrite::Conflict { .. }
+    ));
+    let competing = client
+        .coordination_task_claim(
+            &task.task_id,
+            TaskLeaseRequest {
+                expected_revision: yielded.revision,
+                lease_seconds: 300,
+                worker: Some("worker-a".into()),
+            },
+        )
+        .await;
+    assert!(matches!(competing, Err(RemoteError::RemoteRejected { status: 409, .. })));
+    let RemoteRevisionedWrite::Applied(resumed) = client
+        .coordination_task_claim(
+            &task.task_id,
+            TaskLeaseRequest {
+                expected_revision: yielded.revision,
+                lease_seconds: 300,
+                worker: Some("worker-b".into()),
+            },
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("handoff resume")
+    };
+    let RemoteRevisionedWrite::Applied(yielded) = client
+        .coordination_task_transition(
+            &task.task_id,
+            TransitionTaskRequest {
+                expected_revision: resumed.revision,
+                state: State::Pending,
+                actor: Some("worker-b".into()),
+                details: Some(serde_json::json!({"reason":"wait"})),
+            },
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("new owner yield")
+    };
+    let RemoteRevisionedWrite::Applied(cancelled) = client
+        .coordination_task_transition(
+            &task.task_id,
+            TransitionTaskRequest {
+                expected_revision: yielded.revision,
+                state: State::Cancelled,
+                actor: Some("manager".into()),
+                details: None,
+            },
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("cancel")
+    };
+    assert_eq!(cancelled.state, State::Cancelled);
+    assert!(cancelled.executor_affinity.is_none());
+}

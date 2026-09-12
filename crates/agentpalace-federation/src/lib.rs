@@ -604,9 +604,12 @@ pub struct CoordinationTaskDto {
     pub created_by: String,
     /// Owning wing. Authorization key for every other coordination route.
     pub wing: String,
-    /// Current lease holder, present only while `state` is `running`.
+    /// Assigned owner; retained while yielded in `pending`, without an active lease.
     #[serde(default)]
     pub owner: Option<String>,
+    /// Executor affinity persists independently of the active lease.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor_affinity: Option<String>,
     /// Parent task id, if this task was created as a subtask.
     #[serde(default)]
     pub parent_id: Option<String>,
@@ -906,7 +909,7 @@ pub struct CoordinationTasksQuery {
     pub wing: Option<String>,
     /// Task lifecycle state.
     pub state: Option<String>,
-    /// Exact lease owner identity, when present.
+    /// Assigned owner identity, retained during a scheduling wait without a lease.
     pub owner: Option<String>,
     /// Exact task creator identity.
     pub created_by: Option<String>,
@@ -933,8 +936,11 @@ pub struct CoordinationTaskListItem {
     pub title: String,
     /// Whether the title is a prefix of the stored title.
     pub title_truncated: bool,
-    /// Exact lease owner identity, when present.
+    /// Assigned owner identity, retained during a scheduling wait without a lease.
     pub owner: Option<String>,
+    /// Executor affinity persists independently of the active lease.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor_affinity: Option<String>,
     /// Lease deadline in RFC3339; the owning server decides expiry.
     pub lease_expires_at: Option<String>,
     /// Parent task identity, when present.
@@ -1484,6 +1490,7 @@ mod tests {
             created_by: "alice".to_owned(),
             wing: "wing_myproject".to_owned(),
             owner: Some("worker-1".to_owned()),
+            executor_affinity: None,
             parent_id: Some("task_0".to_owned()),
             dependencies: vec!["task_dep".to_owned()],
             budget: Some(json!({"tokens": 100})),

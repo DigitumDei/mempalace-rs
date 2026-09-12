@@ -3665,9 +3665,10 @@ fn validate_lease_seconds(seconds: i64) -> Result<(), ServerError> {
 /// 500 mapping.
 fn coordination_storage_error(err: agentpalace_storage::StorageError) -> ServerError {
     use agentpalace_storage::{
-        INVALID_TRANSITION_PREFIX, LEASE_HAS_EXPIRED, LEASE_HELD_BY_ANOTHER_WORKER,
-        NOT_FOUND_SUFFIX, ONLY_LEASE_OWNER_MAY_RENEW, ONLY_OWNER_MAY_TRANSITION,
-        ONLY_RECIPIENT_MAY_ACKNOWLEDGE, TASK_HAS_EXPIRED, TERMINAL_TASK_CANNOT_BE_CLAIMED,
+        EXECUTOR_AFFINITY_CONFLICT, INVALID_TRANSITION_PREFIX, LEASE_HAS_EXPIRED,
+        LEASE_HELD_BY_ANOTHER_WORKER, NOT_FOUND_SUFFIX, ONLY_LEASE_OWNER_MAY_RENEW,
+        ONLY_OWNER_MAY_TRANSITION, ONLY_RECIPIENT_MAY_ACKNOWLEDGE, TASK_HAS_EXPIRED,
+        TERMINAL_TASK_CANNOT_BE_CLAIMED,
     };
 
     let agentpalace_storage::StorageError::Invariant(msg) = &err else {
@@ -3679,6 +3680,7 @@ fn coordination_storage_error(err: agentpalace_storage::StorageError) -> ServerE
     // revision pair on the wire.
     const CONFLICT_PREFIXES: &[&str] = &[
         LEASE_HELD_BY_ANOTHER_WORKER,
+        EXECUTOR_AFFINITY_CONFLICT,
         TERMINAL_TASK_CANNOT_BE_CLAIMED,
         TASK_HAS_EXPIRED,
         INVALID_TRANSITION_PREFIX,
@@ -3796,6 +3798,7 @@ fn task_to_dto(task: CoordinationTask) -> Result<CoordinationTaskDto, ServerErro
         created_by: task.created_by,
         wing: task.wing,
         owner: task.owner,
+        executor_affinity: task.executor_affinity,
         parent_id: task.parent_id,
         dependencies: task.dependencies,
         budget: task.budget,
@@ -4041,6 +4044,27 @@ where
         &format!("task {id}"),
     )?;
     let actor = resolve_coordination_actor(&auth.0.0, &body.actor)?;
+    // A remote token may assign only identities in its own namespace. Cross-token
+    // and local-worker handoffs require a separately authorized receiving workflow.
+    if let Some(executor) = body
+        .details
+        .as_ref()
+        .and_then(|details| details.get("checkpoint_handoff"))
+        .and_then(|handoff| handoff.get("executor"))
+        .and_then(Value::as_str)
+    {
+        let identity = auth.0.0.as_str();
+        let same_namespace = executor == identity
+            || executor
+                .strip_prefix(identity)
+                .and_then(|suffix| suffix.strip_prefix(':'))
+                .is_some_and(|claim| !claim.trim().is_empty() && !claim.contains(':'));
+        if !same_namespace {
+            return Err(ServerError::InvalidParams(
+                "checkpoint_handoff.executor must be the authenticated identity or identity:worker in its namespace".into(),
+            ));
+        }
+    }
     let expected_revision = body.expected_revision;
     let write = state
         .coordination
@@ -10857,6 +10881,55 @@ mod tests {
             .unwrap();
         // A claimed name equal to the identity is stored bare, not doubled up.
         assert_eq!(body_json(resp2).await["created_by"], "coord_alpha");
+    }
+
+    #[tokio::test]
+    async fn coordination_handoff_rejects_foreign_identity_namespaces() {
+        let harness = make_harness().await;
+        let task_id =
+            create_task(&harness, COORD_ALPHA_TOKEN, "wing_alpha", "handoff-namespace").await;
+        let response = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                &format!("/v1/coordination/tasks/{task_id}/claim"),
+                COORD_ALPHA_TOKEN,
+                json!({"expected_revision":0,"lease_seconds":300}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = harness.router.clone().oneshot(authed_json_request(
+            Method::POST, "/v1/coordination/artifacts", COORD_ALPHA_TOKEN,
+            json!({"task_id":task_id,"role":"checkpoint","media_type":"application/json","content":"{}","idempotency_key":"checkpoint-namespace"}),
+        )).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let artifact = body_json(response).await;
+        for executor in [
+            "claude",
+            "coord_beta:worker",
+            "coord_alpha:",
+            "coord_alpha:worker:other",
+            "coord_alpha_other:worker",
+        ] {
+            let response = harness.router.clone().oneshot(authed_json_request(
+                Method::POST, &format!("/v1/coordination/tasks/{task_id}/transition"), COORD_ALPHA_TOKEN,
+                json!({"expected_revision":1,"state":"pending","details":{"reason":"move","checkpoint_handoff":{"executor":executor,"artifact_id":artifact["artifact_id"]}}}),
+            )).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{executor}");
+        }
+        // Same-token identities, including the bare token itself, are valid targets.
+        for (revision, executor, actor) in
+            [(1, "coord_alpha:worker", None), (2, "coord_alpha", Some("worker"))]
+        {
+            let response = harness.router.clone().oneshot(authed_json_request(
+                Method::POST, &format!("/v1/coordination/tasks/{task_id}/transition"), COORD_ALPHA_TOKEN,
+                json!({"expected_revision":revision,"actor":actor,"state":"pending","details":{"reason":"move","checkpoint_handoff":{"executor":executor,"artifact_id":artifact["artifact_id"]}}}),
+            )).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(body_json(response).await["owner"], executor);
+        }
     }
 
     #[tokio::test]

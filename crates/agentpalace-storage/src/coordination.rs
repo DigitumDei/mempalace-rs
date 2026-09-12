@@ -100,6 +100,9 @@ pub const LEASE_DURATION_OUT_OF_RANGE: &str = "lease duration is out of range";
 /// fallback (or misclassifying the HTTP status) for whichever path got reworded.
 pub const NOT_FOUND_SUFFIX: &str = " not found";
 
+/// A checkpoint is assigned to another executor; lease expiry cannot transfer it.
+pub const EXECUTOR_AFFINITY_CONFLICT: &str = "task checkpoint is assigned to another executor";
+
 /// Durable task lifecycle state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -177,6 +180,9 @@ pub struct Task {
     /// [`UNSCOPED_WING`].
     pub wing: String,
     pub owner: Option<String>,
+    /// Executor allowed to resume checkpointed work, independent of lease expiry.
+    #[serde(default)]
+    pub executor_affinity: Option<String>,
     pub parent_id: Option<String>,
     pub dependencies: Vec<String>,
     pub budget: Option<Value>,
@@ -297,6 +303,9 @@ pub struct TaskListItem {
     pub title_truncated: bool,
     /// Exact lease owner identity, when present.
     pub owner: Option<String>,
+    /// Executor allowed to resume checkpointed work, independent of lease expiry.
+    #[serde(default)]
+    pub executor_affinity: Option<String>,
     /// Lease deadline in RFC3339; the owning server decides expiry.
     pub lease_expires_at: Option<String>,
     /// Parent task identity, when present.
@@ -487,6 +496,7 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
             "wing",
             "TEXT NOT NULL DEFAULT 'wing_unscoped'",
         )?;
+        add_column_if_missing(&tx, "coordination_tasks", "executor_affinity", "TEXT")?;
         add_column_if_missing(&tx, "coordination_tasks", "sequence", "INTEGER")?;
         // A separate AUTOINCREMENT allocator prevents sequence reuse after deletions/VACUUM.
         // Backfill and trigger installation share the schema upgrade's write lock.
@@ -699,7 +709,7 @@ END;
         if task.expires_at.is_some_and(|v| v <= now) {
             let next = task.revision + 1;
             tx.execute(
-                "UPDATE coordination_tasks SET state='expired',revision=?2,owner=NULL,lease_expires_at=NULL,updated_at=?3 WHERE task_id=?1",
+                "UPDATE coordination_tasks SET state='expired',revision=?2,owner=NULL,executor_affinity=NULL,lease_expires_at=NULL,updated_at=?3 WHERE task_id=?1",
                 params![id, next, format_time(now)?],
             )?;
             append_event(
@@ -718,6 +728,9 @@ END;
             )?;
             tx.commit()?;
             return Err(StorageError::Invariant(TASK_HAS_EXPIRED.into()));
+        }
+        if task.executor_affinity.as_deref().is_some_and(|executor| executor != worker) {
+            return Err(StorageError::Invariant(EXECUTOR_AFFINITY_CONFLICT.into()));
         }
         if task.owner.as_deref().is_some_and(|owner| owner != worker)
             && task.lease_expires_at.is_some_and(|expiry| expiry > now)
@@ -830,6 +843,73 @@ END;
         if task.revision != expected_revision {
             return Ok(RevisionedWrite::Conflict { actual_revision: Some(task.revision) });
         }
+        // Scheduling yield releases the lease but retains checkpoint ownership.
+        // CAS is checked first: a lost response requires reload before a safe no-op retry.
+        let yielding = to == TaskState::Pending
+            && (task.state == TaskState::Running
+                || (task.state == TaskState::Pending && task.executor_affinity.is_some()));
+        if yielding {
+            if task.owner.as_deref() != Some(actor) {
+                return Err(StorageError::Invariant(ONLY_OWNER_MAY_TRANSITION.into()));
+            }
+            if task.expires_at.is_some_and(|expiry| expiry <= now) {
+                return Err(StorageError::Invariant(TASK_HAS_EXPIRED.into()));
+            }
+            if task.state == TaskState::Running
+                && task.lease_expires_at.is_none_or(|expiry| expiry <= now)
+            {
+                return Err(StorageError::Invariant(LEASE_HAS_EXPIRED.into()));
+            }
+            let details = details
+                .as_ref()
+                .ok_or_else(|| StorageError::Invariant("yield requires details.reason".into()))?;
+            bounded_json(details)?;
+            let reason = details.get("reason").and_then(Value::as_str).unwrap_or("");
+            if reason.trim().is_empty() {
+                return Err(StorageError::Invariant(
+                    "yield requires non-empty details.reason".into(),
+                ));
+            }
+            let mut executor = actor;
+            let handoff = details.get("checkpoint_handoff");
+            if let Some(handoff) = handoff {
+                executor = handoff.get("executor").and_then(Value::as_str).unwrap_or("");
+                validate_actor(executor)?;
+                let artifact_id = handoff.get("artifact_id").and_then(Value::as_str).unwrap_or("");
+                let artifact = get_artifact_tx(&tx, artifact_id)?.ok_or_else(|| {
+                    StorageError::Invariant(
+                        "checkpoint handoff requires an existing artifact".into(),
+                    )
+                })?;
+                if artifact.task_id != id || artifact.role != "checkpoint" {
+                    return Err(StorageError::Invariant(
+                        "handoff artifact must be a checkpoint for this task".into(),
+                    ));
+                }
+            }
+            if task.state == TaskState::Pending && handoff.is_none() {
+                return Ok(RevisionedWrite::Applied(task));
+            }
+            let next = task.revision + 1;
+            tx.execute("UPDATE coordination_tasks SET state='pending',revision=?2,owner=?3,executor_affinity=?3,lease_expires_at=NULL,updated_at=?4 WHERE task_id=?1", params![id,next,executor,format_time(now)?])?;
+            append_event(
+                &tx,
+                "task",
+                id,
+                Some(id),
+                &task.wing,
+                if handoff.is_some() { "task_checkpoint_handed_off" } else { "task_yielded" },
+                actor,
+                Some(task.state),
+                Some(TaskState::Pending),
+                Some(next),
+                Some(details),
+                now,
+            )?;
+            let result = require_task(&tx, id)?;
+            tx.commit()?;
+            return Ok(RevisionedWrite::Applied(result));
+        }
         if !allowed_transition(task.state, to) {
             return Err(StorageError::Invariant(format!(
                 "{INVALID_TRANSITION_PREFIX}{} -> {}",
@@ -845,7 +925,7 @@ END;
         }
         let next = task.revision + 1;
         let clear = to.terminal();
-        tx.execute("UPDATE coordination_tasks SET state=?2,revision=?3,owner=CASE WHEN ?4 THEN NULL ELSE owner END,lease_expires_at=CASE WHEN ?4 THEN NULL ELSE lease_expires_at END,updated_at=?5 WHERE task_id=?1",params![id,to.as_str(),next,clear,format_time(now)?])?;
+        tx.execute("UPDATE coordination_tasks SET state=?2,revision=?3,owner=CASE WHEN ?4 THEN NULL ELSE owner END,executor_affinity=CASE WHEN ?4 THEN NULL ELSE executor_affinity END,lease_expires_at=CASE WHEN ?4 THEN NULL ELSE lease_expires_at END,updated_at=?5 WHERE task_id=?1",params![id,to.as_str(),next,clear,format_time(now)?])?;
         append_event(
             &tx,
             "task",
@@ -1237,7 +1317,7 @@ END;
         let limit = limit.clamp(1, TASK_LIST_MAX_LIMIT);
         bindings.push(Box::new((limit + 1) as i64));
         let sql = format!(
-            "SELECT sequence,task_id,wing,state,revision,substr(CAST(title AS BLOB),1,{TASK_LIST_TITLE_BYTES}),length(CAST(title AS BLOB)),owner,lease_expires_at,parent_id,json_array_length(dependencies_json),created_by,created_at,expires_at FROM coordination_tasks WHERE {} ORDER BY sequence LIMIT ?{}",
+            "SELECT sequence,task_id,wing,state,revision,substr(CAST(title AS BLOB),1,{TASK_LIST_TITLE_BYTES}),length(CAST(title AS BLOB)),owner,lease_expires_at,parent_id,json_array_length(dependencies_json),created_by,created_at,expires_at,executor_affinity FROM coordination_tasks WHERE {} ORDER BY sequence LIMIT ?{}",
             predicates.join(" AND "),
             bindings.len()
         );
@@ -1272,6 +1352,7 @@ END;
                 title_truncated: row.get::<_, i64>(6)? > title.len() as i64,
                 title,
                 owner: row.get(7)?,
+                executor_affinity: row.get(14)?,
                 lease_expires_at: row.get(8)?,
                 parent_id: row.get(9)?,
                 dependency_count: row.get::<_, u32>(10)? as usize,
@@ -1450,7 +1531,7 @@ fn task_wing(tx: &Transaction<'_>, task_id: &str) -> Result<String> {
         .ok_or_else(|| StorageError::Invariant(format!("task `{task_id}`{NOT_FOUND_SUFFIX}")))
 }
 fn get_task_conn(conn: &Connection, id: &str) -> Result<Option<Task>> {
-    let mut s=conn.prepare("SELECT task_id,title,description,state,revision,created_by,owner,parent_id,dependencies_json,budget_json,lease_expires_at,expires_at,created_at,updated_at,wing FROM coordination_tasks WHERE task_id=?1")?;
+    let mut s=conn.prepare("SELECT task_id,title,description,state,revision,created_by,owner,parent_id,dependencies_json,budget_json,lease_expires_at,expires_at,created_at,updated_at,wing,executor_affinity FROM coordination_tasks WHERE task_id=?1")?;
     s.query_row([id], task_row).optional().map_err(Into::into)
 }
 fn get_task_tx(tx: &Transaction<'_>, id: &str) -> Result<Option<Task>> {
@@ -1484,6 +1565,7 @@ fn task_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         created_by: r.get(5)?,
         wing,
         owner: r.get(6)?,
+        executor_affinity: r.get(15)?,
         parent_id: r.get(7)?,
         dependencies: serde_json::from_str(&deps).map_err(sql_conv)?,
         budget: budget.map(|v| serde_json::from_str(&v)).transpose().map_err(sql_conv)?,
@@ -1664,6 +1746,273 @@ mod tests {
             expires_at: None,
         })
         .expect("task")
+    }
+
+    fn yield_task(s: &CoordinationStore, t: &Task) -> Task {
+        applied_task(
+            s.transition_task(
+                &t.task_id,
+                "worker-a",
+                t.revision,
+                TaskState::Pending,
+                Some(serde_json::json!({"reason":"next stage queued"})),
+            )
+            .expect("yield"),
+        )
+    }
+
+    #[test]
+    fn yield_survives_restart_and_lease_expiry_without_losing_affinity() {
+        let (dir, s) = store();
+        let t = task(&s);
+        let running = applied_task(
+            s.claim_task(&t.task_id, "worker-a", 0, Duration::minutes(1)).expect("claim"),
+        );
+        let yielded = yield_task(&s, &running);
+        assert_eq!(yielded.state, TaskState::Pending);
+        assert_eq!(yielded.owner.as_deref(), Some("worker-a"));
+        assert_eq!(yielded.executor_affinity, yielded.owner);
+        assert!(yielded.lease_expires_at.is_none());
+        assert!(
+            s.renew_lease(&t.task_id, "worker-a", yielded.revision, Duration::minutes(1)).is_err()
+        );
+        drop(s);
+        let s = CoordinationStore::new(dir.path().join("palace.sqlite3"));
+        s.ensure_schema().expect("reopen");
+        let restored = s.get_task(&t.task_id).expect("get").expect("task");
+        assert_eq!(restored, yielded);
+        let error = s
+            .claim_task(&t.task_id, "worker-b", restored.revision, Duration::minutes(1))
+            .expect_err("affinity");
+        assert_eq!(expect_invariant(&error), EXECUTOR_AFFINITY_CONFLICT);
+        let resumed = applied_task(
+            s.claim_task(&t.task_id, "worker-a", restored.revision, Duration::minutes(1))
+                .expect("resume"),
+        );
+        // Lease expiry after resumption must not expose the original private checkpoint.
+        s.connection().expect("connection").execute("UPDATE coordination_tasks SET lease_expires_at='2000-01-01T00:00:00Z' WHERE task_id=?1", [&t.task_id]).expect("expire lease");
+        assert!(
+            s.claim_task(&t.task_id, "worker-b", resumed.revision, Duration::minutes(1)).is_err()
+        );
+        assert!(
+            s.transition_task(
+                &t.task_id,
+                "worker-a",
+                resumed.revision,
+                TaskState::Pending,
+                Some(serde_json::json!({"reason":"wait"}))
+            )
+            .is_err()
+        );
+        let resumed = applied_task(
+            s.claim_task(&t.task_id, "worker-a", resumed.revision, Duration::minutes(1))
+                .expect("reclaim expired own lease"),
+        );
+        let yielded = yield_task(&s, &resumed);
+        let cancelled = applied_task(
+            s.transition_task(&t.task_id, "manager", yielded.revision, TaskState::Cancelled, None)
+                .expect("cancel yielded"),
+        );
+        assert!(cancelled.owner.is_none());
+        assert!(cancelled.executor_affinity.is_none());
+        assert!(
+            s.claim_task(&t.task_id, "worker-a", cancelled.revision, Duration::minutes(1)).is_err()
+        );
+    }
+
+    #[test]
+    fn yield_retry_is_cas_safe_and_emits_only_one_scheduling_event() {
+        let (_dir, s) = store();
+        let t = task(&s);
+        let running = applied_task(
+            s.claim_task(&t.task_id, "worker-a", 0, Duration::minutes(1)).expect("claim"),
+        );
+        assert!(
+            s.transition_task(
+                &t.task_id,
+                "worker-b",
+                running.revision,
+                TaskState::Pending,
+                Some(serde_json::json!({"reason":"wait"}))
+            )
+            .is_err()
+        );
+        for details in
+            [None, Some(serde_json::json!({"reason":"  "})), Some(serde_json::json!({"reason":42}))]
+        {
+            assert!(
+                s.transition_task(
+                    &t.task_id,
+                    "worker-a",
+                    running.revision,
+                    TaskState::Pending,
+                    details
+                )
+                .is_err()
+            );
+        }
+        let yielded = yield_task(&s, &running);
+        let retry = s
+            .transition_task(
+                &t.task_id,
+                "worker-a",
+                running.revision,
+                TaskState::Pending,
+                Some(serde_json::json!({"reason":"next stage queued"})),
+            )
+            .expect("stale response");
+        assert!(
+            matches!(retry, RevisionedWrite::Conflict { actual_revision: Some(r) } if r == yielded.revision)
+        );
+        assert_eq!(yield_task(&s, &yielded), yielded);
+        let conn = s.connection().expect("connection");
+        let events: Vec<(String, Option<String>)> = conn
+            .prepare("SELECT event_type,details_json FROM coordination_events ORDER BY sequence")
+            .expect("prepare")
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .expect("query")
+            .collect::<rusqlite::Result<_>>()
+            .expect("rows");
+        assert_eq!(
+            events.iter().map(|e| e.0.as_str()).collect::<Vec<_>>(),
+            vec!["task_created", "task_claimed", "task_yielded"]
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(events[2].1.as_ref().expect("details")).expect("json")["reason"],
+            "next stage queued"
+        );
+        let list = s
+            .tasks(
+                None,
+                &TaskListFilter {
+                    state: Some(TaskState::Pending),
+                    owner: Some("worker-a".into()),
+                    ..Default::default()
+                },
+                50,
+                TASK_LIST_PAGE_BYTES,
+                CoordinationVisibility::Trusted,
+            )
+            .expect("list");
+        assert_eq!(list.tasks[0].executor_affinity.as_deref(), Some("worker-a"));
+        // A delayed duplicate must not yield a newly reclaimed execution stage.
+        let resumed = applied_task(
+            s.claim_task(&t.task_id, "worker-a", yielded.revision, Duration::minutes(1))
+                .expect("resume"),
+        );
+        assert!(matches!(
+            s.transition_task(
+                &t.task_id,
+                "worker-a",
+                yielded.revision,
+                TaskState::Pending,
+                Some(serde_json::json!({"reason":"next stage queued"}))
+            )
+            .expect("stale"),
+            RevisionedWrite::Conflict { .. }
+        ));
+        assert_eq!(s.get_task(&t.task_id).expect("get"), Some(resumed));
+    }
+
+    #[test]
+    fn yield_checkpoint_handoff_requires_owner_and_same_task_checkpoint() {
+        let (_dir, s) = store();
+        let t = task(&s);
+        let running = applied_task(
+            s.claim_task(&t.task_id, "worker-a", 0, Duration::minutes(1)).expect("claim"),
+        );
+        let yielded = yield_task(&s, &running);
+        let other = task_with_wing(&s, "test", "other");
+        for (task_id, role, valid) in [
+            (&other.task_id, "checkpoint", false),
+            (&t.task_id, "output", false),
+            (&t.task_id, "checkpoint", true),
+        ] {
+            let artifact = s
+                .put_artifact(&NewArtifact {
+                    task_id: task_id.clone(),
+                    created_by: "worker-a".into(),
+                    role: role.into(),
+                    media_type: "application/json".into(),
+                    content: "{\"stage\":2}".into(),
+                    idempotency_key: format!("{task_id}-{role}"),
+                })
+                .expect("artifact");
+            let details = Some(
+                serde_json::json!({"reason":"move execution", "checkpoint_handoff":{"executor":"worker-b", "artifact_id":artifact.artifact_id}}),
+            );
+            assert!(
+                s.transition_task(
+                    &t.task_id,
+                    "worker-b",
+                    yielded.revision,
+                    TaskState::Pending,
+                    details.clone()
+                )
+                .is_err()
+            );
+            let result = s.transition_task(
+                &t.task_id,
+                "worker-a",
+                yielded.revision,
+                TaskState::Pending,
+                details,
+            );
+            if !valid {
+                assert!(result.is_err());
+                continue;
+            }
+            let handed = applied_task(result.expect("handoff"));
+            assert_eq!(handed.executor_affinity.as_deref(), Some("worker-b"));
+            assert!(handed.lease_expires_at.is_none());
+            assert!(
+                s.claim_task(&t.task_id, "worker-a", handed.revision, Duration::minutes(1))
+                    .is_err()
+            );
+            let resumed = applied_task(
+                s.claim_task(&t.task_id, "worker-b", handed.revision, Duration::minutes(1))
+                    .expect("new executor resume"),
+            );
+            assert_eq!(resumed.owner.as_deref(), Some("worker-b"));
+        }
+    }
+
+    #[test]
+    fn yield_task_deadline_still_expires_and_legacy_claims_remain_unaffined() {
+        let (_dir, s) = store();
+        let t = task(&s);
+        let running = applied_task(
+            s.claim_task(&t.task_id, "worker-a", 0, Duration::minutes(1)).expect("claim"),
+        );
+        assert!(running.executor_affinity.is_none());
+        s.connection().expect("connection").execute("UPDATE coordination_tasks SET lease_expires_at='2000-01-01T00:00:00Z' WHERE task_id=?1", [&t.task_id]).expect("expire lease");
+        let running = applied_task(
+            s.claim_task(&t.task_id, "worker-b", running.revision, Duration::minutes(1))
+                .expect("legacy takeover"),
+        );
+        let yielded = applied_task(
+            s.transition_task(
+                &t.task_id,
+                "worker-b",
+                running.revision,
+                TaskState::Pending,
+                Some(serde_json::json!({"reason":"wait"})),
+            )
+            .expect("yield"),
+        );
+        s.connection()
+            .expect("connection")
+            .execute(
+                "UPDATE coordination_tasks SET expires_at='2000-01-01T00:00:00Z' WHERE task_id=?1",
+                [&t.task_id],
+            )
+            .expect("expire task");
+        assert!(
+            s.claim_task(&t.task_id, "worker-b", yielded.revision, Duration::minutes(1)).is_err()
+        );
+        let expired = s.get_task(&t.task_id).expect("get").expect("task");
+        assert_eq!(expired.state, TaskState::Expired);
+        assert!(expired.executor_affinity.is_none());
     }
 
     #[test]

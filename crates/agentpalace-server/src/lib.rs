@@ -3665,9 +3665,10 @@ fn validate_lease_seconds(seconds: i64) -> Result<(), ServerError> {
 /// 500 mapping.
 fn coordination_storage_error(err: agentpalace_storage::StorageError) -> ServerError {
     use agentpalace_storage::{
-        INVALID_TRANSITION_PREFIX, LEASE_HAS_EXPIRED, LEASE_HELD_BY_ANOTHER_WORKER,
-        NOT_FOUND_SUFFIX, ONLY_LEASE_OWNER_MAY_RENEW, ONLY_OWNER_MAY_TRANSITION,
-        ONLY_RECIPIENT_MAY_ACKNOWLEDGE, TASK_HAS_EXPIRED, TERMINAL_TASK_CANNOT_BE_CLAIMED,
+        EXECUTOR_AFFINITY_CONFLICT, INVALID_TRANSITION_PREFIX, LEASE_HAS_EXPIRED,
+        LEASE_HELD_BY_ANOTHER_WORKER, NOT_FOUND_SUFFIX, ONLY_LEASE_OWNER_MAY_RENEW,
+        ONLY_OWNER_MAY_TRANSITION, ONLY_RECIPIENT_MAY_ACKNOWLEDGE, TASK_HAS_EXPIRED,
+        TERMINAL_TASK_CANNOT_BE_CLAIMED,
     };
 
     let agentpalace_storage::StorageError::Invariant(msg) = &err else {
@@ -3679,6 +3680,7 @@ fn coordination_storage_error(err: agentpalace_storage::StorageError) -> ServerE
     // revision pair on the wire.
     const CONFLICT_PREFIXES: &[&str] = &[
         LEASE_HELD_BY_ANOTHER_WORKER,
+        EXECUTOR_AFFINITY_CONFLICT,
         TERMINAL_TASK_CANNOT_BE_CLAIMED,
         TASK_HAS_EXPIRED,
         INVALID_TRANSITION_PREFIX,
@@ -3796,6 +3798,7 @@ fn task_to_dto(task: CoordinationTask) -> Result<CoordinationTaskDto, ServerErro
         created_by: task.created_by,
         wing: task.wing,
         owner: task.owner,
+        executor_affinity: task.executor_affinity,
         parent_id: task.parent_id,
         dependencies: task.dependencies,
         budget: task.budget,

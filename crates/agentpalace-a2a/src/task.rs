@@ -345,6 +345,7 @@ mod tests {
             created_by: "alice".to_owned(),
             wing: "wing_myproject".to_owned(),
             owner: None,
+            executor_affinity: None,
             parent_id: None,
             dependencies: Vec::new(),
             budget: None,

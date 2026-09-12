@@ -756,7 +756,7 @@ impl ToolName {
             ),
             Self::TaskClaim => coordination_definition(
                 self,
-                "Atomically claim or reclaim a task lease using an expected revision. Returns {\"success\": true, \"task\": {...}} on success, or {\"success\": false, \"conflict\": {expected_revision, actual_revision, message}} when the expected revision no longer matches — a conflict is data, not an error. Changed in v0.1.26: this previously returned a bare task object and raised a JSON-RPC error on conflict.",
+                "Atomically claim or reclaim a task lease using an expected revision. Checkpointed tasks may only be claimed by executor_affinity, even after lease expiry. Returns {\"success\": true, \"task\": {...}} on success, or {\"success\": false, \"conflict\": {expected_revision, actual_revision, message}} when the expected revision no longer matches — a conflict is data, not an error. Changed in v0.1.26: this previously returned a bare task object and raised a JSON-RPC error on conflict.",
                 json!({"task_id":{"type":"string"},"worker":{"type":"string"},"expected_revision":{"type":"integer"},"lease_seconds":{"type":"integer"}}),
                 &["task_id", "worker", "expected_revision", "lease_seconds"],
             ),
@@ -768,7 +768,7 @@ impl ToolName {
             ),
             Self::TaskTransition => coordination_definition(
                 self,
-                "Durably transition a task lifecycle state using compare-and-swap revision semantics. Returns {\"success\": true, \"task\": {...}} on success, or {\"success\": false, \"conflict\": {expected_revision, actual_revision, message}} when the expected revision no longer matches — a conflict is data, not an error. Changed in v0.1.26: this previously returned a bare task object and raised a JSON-RPC error on conflict.",
+                "Durably transition a task lifecycle state using compare-and-swap revision semantics. Running to pending yields the live lease, retains executor_affinity and requires details.reason. To explicitly transfer a checkpoint, include details.checkpoint_handoff={executor,artifact_id}, referencing this task's immutable checkpoint-role artifact; the current owner can also hand off while yielded. Pending affine tasks can be cancelled by any actor. Returns {\"success\": true, \"task\": {...}} on success, or {\"success\": false, \"conflict\": {expected_revision, actual_revision, message}} when the expected revision no longer matches — a conflict is data, not an error. Changed in v0.1.26: this previously returned a bare task object and raised a JSON-RPC error on conflict.",
                 json!({"task_id":{"type":"string"},"actor":{"type":"string"},"expected_revision":{"type":"integer"},"state":{"type":"string","enum":["pending","running","input_required","completed","cancelled","failed","expired"]},"details":{}}),
                 &["task_id", "actor", "expected_revision", "state"],
             ),
@@ -7898,6 +7898,43 @@ mod tests {
         let claimed = decode_tool_payload(&claimed).unwrap();
         assert_eq!(claimed["task"]["description"], "execution details");
         assert_eq!(ToolName::TaskList.routing(), ToolRoutingCategory::RoutableCoordination);
+    }
+
+    #[tokio::test]
+    async fn coordination_yield_is_available_through_mcp() {
+        let harness = test_harness().await;
+        let created = harness
+            .server
+            .handle_request(tool_call(
+                940,
+                "agentpalace_task_create",
+                json!({"title":"stages", "description":"checkpointed", "created_by":"manager",
+                "wing":"test", "idempotency_key":"yield-mcp"}),
+            ))
+            .await;
+        let task = decode_tool_payload(&created).unwrap();
+        let id = &task["task_id"];
+        let claimed = harness.server.handle_request(tool_call(941, "agentpalace_task_claim",
+            json!({"task_id":id, "worker":"worker-a", "expected_revision":0, "lease_seconds":60}))).await;
+        assert_eq!(decode_tool_payload(&claimed).unwrap()["success"], true);
+        let args = json!({"task_id":id, "actor":"worker-a", "expected_revision":1,
+            "state":"pending", "details":{"reason":"next stage"}});
+        let yielded = harness
+            .server
+            .handle_request(tool_call(942, "agentpalace_task_transition", args.clone()))
+            .await;
+        let yielded = decode_tool_payload(&yielded).unwrap();
+        assert_eq!(yielded["task"]["state"], "pending");
+        assert_eq!(yielded["task"]["executor_affinity"], "worker-a");
+        assert!(yielded["task"]["lease_expires_at"].is_null());
+        let retry = harness
+            .server
+            .handle_request(tool_call(943, "agentpalace_task_transition", args))
+            .await;
+        assert_eq!(decode_tool_payload(&retry).unwrap()["success"], false);
+        let resumed = harness.server.handle_request(tool_call(944, "agentpalace_task_claim",
+            json!({"task_id":id, "worker":"worker-a", "expected_revision":2, "lease_seconds":60}))).await;
+        assert_eq!(decode_tool_payload(&resumed).unwrap()["task"]["state"], "running");
     }
 
     #[tokio::test]
